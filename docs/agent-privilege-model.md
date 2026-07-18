@@ -71,34 +71,6 @@ The production virtual-service-account path is preferred wherever it can be used
 
 ---
 
-## macOS pf-anchor provisioning (ACTIVATION guard for pf quarantine)
-
-**Why this section exists — and what it doesn't do yet.** This is a forward-pinned ACTIVATION prerequisite for a pf-anchor rework of `quarantine.isolate` / `quarantine.release` / `quarantine.whitelist` that has not landed yet, tracked as **A-1.18**. **As the plugin stands today, `quarantine_plugin.cpp`'s `macos_load_ruleset()` (see `agents/plugins/quarantine/src/quarantine_plugin.cpp:518`) calls `pfctl -f <tempfile>` — no `-a` — which replaces macOS's entire main pf ruleset wholesale on every quarantine dispatch, and restores it the same way on release.** It does not touch a pf anchor at all, so nothing in this section is active yet. When A-1.18 lands, the plugin is expected to switch to `pfctl -a yuzu-quarantine -f <tempfile>`, which loads rules into a **pf anchor** instead of clobbering the main ruleset — but loading rules into an anchor that pf's active main ruleset never invokes is a no-op, since the anchor's rules simply don't apply to any traffic. This section is the one-time provisioning step, run by `install-agent-user.sh` today, that hooks the anchor into pf's active main ruleset ahead of that rework, so the anchor activates the moment A-1.18 ships instead of requiring a second coordinated rollout. Until A-1.18 lands, this hook is provisioned but dormant — it does not change how `quarantine.isolate` behaves today.
-
-**Pinned contract** — do not rename either without updating `agents/plugins/quarantine/src/quarantine_plugin.cpp` in lockstep, so the two sides match byte-for-byte:
-
-| | Value |
-|---|---|
-| Anchor name | `yuzu-quarantine` |
-| Anchor file | `/etc/pf.anchors/yuzu-quarantine` |
-
-**What `install-agent-user.sh` does, on every install (idempotent — safe to re-run):**
-
-1. Installs `/etc/pf.anchors/yuzu-quarantine` if it doesn't already exist, **empty** (no rules — a deliberate no-op; an anchor with no filter rules cannot pass or block anything, so hooking it into the main ruleset is safe even before A-1.18 starts writing to it). Once A-1.18 lands, `quarantine_plugin.cpp`'s `macos_load_ruleset()` is expected to overwrite this anchor's rules via `pfctl -a yuzu-quarantine -f <tempfile>` on every quarantine / whitelist / unquarantine dispatch — the on-disk file becomes a build artifact between dispatches at that point, not source of truth. If the file already exists, the installer leaves it alone.
-2. Hooks the anchor into `/etc/pf.conf`'s active main ruleset by appending:
-   ```
-   anchor "yuzu-quarantine"
-   load anchor "yuzu-quarantine" from "/etc/pf.anchors/yuzu-quarantine"
-   ```
-   **Detect-before-append:** both lines are required, exact-match — a bare `anchor "yuzu-quarantine"` with no matching `load anchor ... from ...` line is treated as *not yet hooked* and repaired, since the pinned anchor file would otherwise never actually get wired into a ruleset reload. Only when both lines are already present verbatim is this step skipped, so re-running the installer never duplicates the hook. The append happens after whatever is already in the file, so any pre-existing operator-authored pf rules (including Apple's own `com.apple/*` anchors) are preserved — the whole point of anchoring is to stop quarantine from clobbering the main ruleset. The hooked file is validated with `pfctl -nf <tempfile>` before it replaces the live `/etc/pf.conf`, the same validate-before-install discipline as the sudoers file below — a syntactically broken `pf.conf` fails pf closed.
-3. Loads the hooked ruleset (`pfctl -f /etc/pf.conf`) and enables pf (`pfctl -e`, idempotent — warns harmlessly on stderr if pf is already enabled) — **but only if step 1 or step 2 above actually changed something on this run.** If the anchor file and the `pf.conf` hook were both already fully provisioned by an earlier run, this reload is skipped entirely. This matters once A-1.18 lands: `pfctl -f /etc/pf.conf` re-sources the anchor file's on-disk contents (via the `load anchor ... from ...` directive) into the kernel, which would silently overwrite whatever quarantine rules the plugin had loaded live with `pfctl -a yuzu-quarantine -f <tempfile>` since the last reload. Reloading unconditionally on every routine, documented-idempotent re-install would therefore release an active quarantine without warning; gating the reload on "did this run actually change the on-disk hook" avoids that.
-
-**`--check` validates all of this:** that the anchor file exists; that `/etc/pf.conf` contains *both* the exact `anchor "yuzu-quarantine"` line and the exact `load anchor "yuzu-quarantine" from "/etc/pf.anchors/yuzu-quarantine"` line (a partial or differently-sourced hook fails the check); and — when run as root, since `pfctl -s rules` and `pfctl -s info` need root to query live kernel state — that the anchor is actually present in pf's **active** ruleset *and* that pf itself reports `Status: Enabled`, not just written to the on-disk `pf.conf`. That last pair of checks is what catches the gap where `pf.conf` was hand-edited, the hook was written but pf was never reloaded to pick it up, or pf was subsequently disabled (`pfctl -d`) after a correct install.
-
-**No new sudoers entry is needed for any of this.** Steps 1–3 above run as **root**, inside `install-agent-user.sh` itself (the script already requires root for the `install` action), not via a sudo shell-out from the agent account. The *runtime* anchor load the agent will perform on every quarantine dispatch once A-1.18 lands — `pfctl -a yuzu-quarantine -f <tempfile>` — is already covered by the existing `$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl` grant in `generate_sudoers_content` (see `scripts/install-agent-user.sh:454` at time of writing): the grant is a bare `/sbin/pfctl` with no argument template, so it already covers every pfctl invocation the plugin makes, `-a`-scoped or not. The plugin writes the rules to an agent-owned temp file first; root-`pfctl` only ever *reads* that path as an argument, so no write access to anything root-owned is needed by the agent account itself.
-
----
-
 ## Privilege matrix (all 217 instructions)
 
 This table is the source of truth for what each plugin requires. When you add a new privileged plugin, add a row here AND a corresponding entry in `install-agent-user.{sh,ps1}` AND a sudoers entry / LSA privilege.
@@ -127,7 +99,7 @@ This table is the source of truth for what each plugin requires. When you add a 
 
 | Plugin / Action | macOS sudoers | Linux sudoers | Windows privilege |
 |---|---|---|---|
-| `quarantine.isolate`, `quarantine.release`, `quarantine.whitelist` | `/sbin/pfctl` (also requires the pf-anchor hook — see "macOS pf-anchor provisioning" above; without it the sudoers grant is necessary but not sufficient) | `/usr/sbin/iptables`, `/usr/sbin/ip6tables`, `/usr/sbin/nft` | service account is in `Administrators` group OR has `SeAssignPrimaryTokenPrivilege` + uses `Set-NetFirewallRule` cmdlet |
+| `quarantine.isolate`, `quarantine.release`, `quarantine.whitelist` | `/sbin/pfctl` | `/usr/sbin/iptables`, `/usr/sbin/ip6tables`, `/usr/sbin/nft` | service account is in `Administrators` group OR has `SeAssignPrimaryTokenPrivilege` + uses `Set-NetFirewallRule` cmdlet |
 | `services.set_start_mode` | `/bin/launchctl bootstrap system *`, `/bin/launchctl bootout system *`, `/bin/launchctl enable system/*`, `/bin/launchctl disable system/*` | `/bin/systemctl enable *`, `/bin/systemctl disable *`, `/bin/systemctl mask *`, `/bin/systemctl unmask *` (also `/usr/bin/systemctl` on distros that mirror it) | `SeAssignPrimaryTokenPrivilege` (service control) |
 | `network_actions.flush_dns` | `/usr/bin/dscacheutil -flushcache`, `/usr/bin/killall -HUP mDNSResponder` | `/usr/bin/systemd-resolve --flush-caches`, `/usr/bin/resolvectl flush-caches` | runs as service; uses `Clear-DnsClientCache` cmdlet (no extra privilege required when running as service) |
 | `certificates.delete` (system store only) | `/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *` | (uses `update-ca-certificates` reading `/etc/ssl/certs/*` → no sudo needed for CA store; OpenSSL trust chain is filesystem-managed) | `SeBackupPrivilege` + `SeRestorePrivilege` to write the certificate store |
@@ -281,10 +253,6 @@ The shell-out used the bare command instead of `sudo -n /sbin/pfctl`. The plugin
 
 The service account is missing `SeAssignPrimaryTokenPrivilege` or isn't in `Administrators`. Run `install-agent-user.ps1 -Check` to see which.
 
-### macOS `quarantine.isolate` returns success but nothing is actually blocked
-
-The pf anchor isn't hooked into pf's active main ruleset — see "macOS pf-anchor provisioning" above. Run `sudo bash scripts/install-agent-user.sh --check` (root is required to query the live ruleset via `pfctl -s rules`); if the anchor file or the `/etc/pf.conf` hook is missing, or the hook is written but not yet loaded, re-run `sudo bash scripts/install-agent-user.sh` (the pf-anchor steps are idempotent) and re-check.
-
 ### `_yuzu` user gets created but agent still runs as `nathan`
 
 The agent process started before the install script ran, OR the launch path (e.g., `start-UAT.sh`) isn't using `sudo -u _yuzu` to launch the agent. Update the launch path. Production deployments via launchd/systemd/SCM don't have this issue because the unit/plist specifies the account.
@@ -295,7 +263,7 @@ The agent process started before the install script ran, OR the launch path (e.g
 
 | If you're touching... | Read this section |
 |---|---|
-| `agents/plugins/quarantine/src/quarantine_plugin.cpp` | "How sudoers entries are constructed", privilege matrix row for `quarantine.*`, and (macOS) "macOS pf-anchor provisioning" — the anchor name/file it must match byte-for-byte |
+| `agents/plugins/quarantine/src/quarantine_plugin.cpp` | "How sudoers entries are constructed", privilege matrix row for `quarantine.*` |
 | `agents/plugins/services/src/services_plugin.cpp` | privilege matrix row for `services.set_start_mode` |
 | Any new plugin that runs OS-level commands | "How to add a new privileged plugin" — full procedure |
 | `scripts/install-agent-user.{sh,ps1}` | the whole doc; the scripts implement what's specified here |

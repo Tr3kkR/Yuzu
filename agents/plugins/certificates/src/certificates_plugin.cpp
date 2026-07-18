@@ -19,32 +19,15 @@
 #include <yuzu/plugin.hpp>
 
 #include <array>
-#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <format>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#ifdef __APPLE__
-// geteuid() -- privilege detection for the login-keychain read's sudo hop
-// (mirrors quarantine_plugin.cpp's sudo_prefix()). macos_console_user.hpp
-// declares `namespace yuzu::macos` -- both MUST be included here, at global
-// scope, before the anonymous namespace below opens: including them inside
-// `namespace { ... }` would nest `yuzu::macos` under
-// `(anonymous namespace)::yuzu`, shadowing the global `::yuzu` namespace
-// (from <yuzu/plugin.hpp> above) for every unqualified `yuzu::` lookup in
-// this file -- e.g. `yuzu::TempFile` below would then fail to resolve,
-// since the nested `(anonymous namespace)::yuzu` has no TempFile member.
-#include <sys/wait.h> // WIFEXITED / WEXITSTATUS -- interpret the login-keychain read's pclose() status
-#include <unistd.h>
-#include <macos_console_user.hpp> // shared console-user + store/keychain mapping (A-1.11)
-#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -599,28 +582,24 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     CertRecord rec;
     rec.store = store_name;
 
-    // Write PEM to a temp file to avoid shell injection via echo (PEM
-    // content from the keychain could contain single quotes that break an
-    // echo '...' pattern). yuzu::TempFile (mkstemps/O_EXCL, mode 0600)
-    // gives each call its own unique, exclusively-created path -- the
-    // previous fixed "yuzu_cert_tmp.pem" name collided when two `details`
-    // calls ran concurrently (P6). RAII also replaces the old manual
-    // cleanup() lambda: the file is removed when tmp_file goes out of scope.
-    auto tmp_file_result = yuzu::TempFile::create("yuzu-cert-", ".pem");
-    if (!tmp_file_result) {
-        rec.subject = "(temp file error)";
-        return rec;
-    }
-    auto tmp_file = std::move(*tmp_file_result);
+    // Write PEM to a temp file to avoid shell injection via echo.
+    // PEM content from the keychain could contain single quotes that break
+    // the echo '...' pattern and enable command injection.
+    namespace fs = std::filesystem;
+    auto tmp_path = fs::temp_directory_path() / "yuzu_cert_tmp.pem";
     {
-        std::ofstream tmp(tmp_file.path(), std::ios::trunc);
+        std::ofstream tmp(tmp_path, std::ios::trunc);
         if (!tmp) {
             rec.subject = "(temp file error)";
             return rec;
         }
         tmp << pem_block;
     }
-    auto base_cmd = std::format("openssl x509 -noout -in \"{}\"", tmp_file.path());
+    auto base_cmd = std::format("openssl x509 -noout -in \"{}\"", tmp_path.string());
+    auto cleanup = [&]() {
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+    };
 
     // Subject
     auto subj = run_command(std::format("{} -subject 2>/dev/null", base_cmd).c_str());
@@ -702,171 +681,50 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
         rec.key_usage = "(none)";
     }
 
+    cleanup();
     return rec;
 }
 
-// Whether THIS process (the agent daemon) is already root. Mirrors
-// quarantine_plugin.cpp's sudo_prefix(): the shipped macOS LaunchDaemon has
-// no `UserName` key today, so it runs as root (docs/agent-privilege-model.md's
-// TL;DR) and `launchctl asuser` -- which itself requires root privileges,
-// per `man launchctl` -- already succeeds with no escalation. The target
-// least-privilege `_yuzu` account (future hardening, #1455) is NOT root, so
-// build_login_keychain_read_command() uses this to decide whether it needs
-// to add its own outer `sudo -n` hop first. Cached: EUID can't change during
-// the agent's lifetime.
-bool caller_is_root() {
-    static const bool is_root = (geteuid() == 0);
-    return is_root;
-}
+void list_certs_macos(yuzu::CommandContext& ctx, std::string_view /*store_filter*/,
+                      int expiring_days) {
+    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-/**
- * Resolve the current console (GUI) user via subprocess -- the LaunchDaemon
- * has no framework access (SystemConfiguration) available, so this shells
- * out to `stat`/`id` rather than SCDynamicStoreCopyConsoleUser. Returns
- * std::nullopt when there is no interactive console session (login window /
- * headless -- stat reports the "root" sentinel, see
- * yuzu::macos::is_no_console_user) OR when the resolved username/uid fails
- * the shared allowlist/numeric validation: an unsafe value is never
- * interpolated into a command, so it is treated exactly like "no console
- * user" rather than risking a later step trusting it.
- */
-std::optional<yuzu::macos::ConsoleUser> resolve_console_user() {
-    auto stat_out = run_command("/usr/bin/stat -f%Su /dev/console 2>/dev/null");
-    auto username = yuzu::macos::parse_console_user_output(stat_out);
-    if (yuzu::macos::is_no_console_user(username))
-        return std::nullopt;
-    if (!yuzu::macos::is_valid_username(username))
-        return std::nullopt;
-
-    auto uid =
-        run_command(std::format("/usr/bin/id -u {} 2>/dev/null", username).c_str());
-    if (!yuzu::macos::is_valid_uid(uid))
-        return std::nullopt;
-
-    return yuzu::macos::ConsoleUser{std::move(username), std::move(uid)};
-}
-
-/**
- * Like run_command(), but also reports whether the subprocess exited
- * successfully (status 0). The login-keychain read is the one call site in
- * this file where "the command failed" and "the command succeeded with no
- * output" are NOT interchangeable: a missing sudoers grant, a failed
- * `launchctl asuser` hop, or an inaccessible keychain path must surface as
- * an honest `not_available` result, never as a silent empty list that
- * reads identically to "this keychain has zero certificates" -- see the
- * package's "honest sentinel" requirement. A single popen()/pclose() pair
- * captures both output and status from ONE run of the (privileged,
- * multi-hop sudo/launchctl/sudo/security) command, rather than running it
- * twice to get each half separately.
- */
-struct CheckedCommandResult {
-    std::string output;
-    bool ok = false;
-};
-
-CheckedCommandResult run_command_checked(const char* cmd) {
-    CheckedCommandResult result;
-    std::array<char, 4096> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result.output += buf.data();
+    // System keychain
+    auto sys_pem = run_command(
+        "security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null");
+    auto sys_blocks = split_pem_blocks(sys_pem);
+    for (const auto& block : sys_blocks) {
+        auto rec = parse_pem_block_macos(block, "System.keychain");
+        if (expires_within_days(rec.not_after, expiring_days)) {
+            ctx.write_output(rec.to_row());
+        }
     }
-    int status = pclose(pipe);
-    result.ok = (status != -1) && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    while (!result.output.empty() && (result.output.back() == '\n' || result.output.back() == '\r'))
-        result.output.pop_back();
-    return result;
-}
 
-/** Enumerate one keychain's PEM blocks and emit rows for it, filtered by expiry. */
-void emit_keychain_rows_macos(yuzu::CommandContext& ctx, const std::string& pem,
-                              const std::string& store_label, int expiring_days) {
-    for (const auto& block : split_pem_blocks(pem)) {
-        auto rec = parse_pem_block_macos(block, store_label);
+    // System roots
+    auto root_pem =
+        run_command("security find-certificate -a -p "
+                    "/System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null");
+    auto root_blocks = split_pem_blocks(root_pem);
+    for (const auto& block : root_blocks) {
+        auto rec = parse_pem_block_macos(block, "SystemRootCertificates.keychain");
         if (expires_within_days(rec.not_after, expiring_days)) {
             ctx.write_output(rec.to_row());
         }
     }
 }
 
-void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
-                      int expiring_days) {
+void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    auto console_user = resolve_console_user();
-    auto plan = yuzu::macos::resolve_store_plan(store_filter, console_user.has_value());
-
-    if (plan.sentinel_required) {
-        // store=login was explicitly requested and there is no console
-        // session to read it from -- never a silent empty (the header row
-        // above with zero rows following would read as "ran fine, no
-        // certs") and never a fabricated result.
-        ctx.write_output("not_available|no console session");
-        return;
-    }
-
-    if (plan.want_system) {
-        auto sys_pem = run_command(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::system_keychain_path())
-                .c_str());
-        emit_keychain_rows_macos(ctx, sys_pem, "System.keychain", expiring_days);
-    }
-
-    if (plan.want_root) {
-        auto root_pem = run_command(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::root_keychain_path())
-                .c_str());
-        emit_keychain_rows_macos(ctx, root_pem, "SystemRootCertificates.keychain", expiring_days);
-    }
-
-    if (plan.want_login) {
-        // console_user is guaranteed engaged here: resolve_store_plan only
-        // sets want_login when has_console_user was true.
-        auto cmd = yuzu::macos::build_login_keychain_read_command(
-            console_user->uid, console_user->username, caller_is_root());
-        if (cmd.empty()) {
-            // Defensive only -- resolve_console_user() already validated
-            // uid/username before console_user was populated, so
-            // build_login_keychain_read_command()'s own re-validation
-            // should never fail here. Still an honest sentinel rather than
-            // a silent no-op if it somehow does.
-            ctx.write_output("not_available|login keychain command construction failed");
-        } else {
-            auto login_result = run_command_checked(cmd.c_str());
-            if (!login_result.ok) {
-                // A missing sudoers grant, a launchctl/sudo failure, or an
-                // inaccessible keychain path all land here. Report it
-                // honestly instead of emitting zero rows, which would be
-                // indistinguishable from "this keychain is genuinely
-                // empty" -- the exact failure mode this package's honest-
-                // sentinel requirement exists to prevent.
-                ctx.write_output("not_available|login keychain read failed");
-            } else {
-                emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
-                                         expiring_days);
-            }
-        }
-    }
-}
-
-void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
-                        std::string_view store_filter) {
-    ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
-
-    auto console_user = resolve_console_user();
-    auto plan = yuzu::macos::resolve_store_plan(store_filter, console_user.has_value());
-
-    if (plan.sentinel_required) {
-        ctx.write_output("not_available|no console session");
-        return;
-    }
+    auto sys_pem = run_command(
+        "security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null");
+    auto root_pem =
+        run_command("security find-certificate -a -p "
+                    "/System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null");
 
     auto check = [&](const std::string& pem, const std::string& store) -> bool {
-        for (const auto& block : split_pem_blocks(pem)) {
+        auto blocks = split_pem_blocks(pem);
+        for (const auto& block : blocks) {
             auto rec = parse_pem_block_macos(block, store);
             if (rec.thumbprint == thumbprint) {
                 ctx.write_output(rec.to_row());
@@ -876,158 +734,31 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
         return false;
     };
 
-    if (plan.want_system) {
-        auto sys_pem = run_command(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::system_keychain_path())
-                .c_str());
-        if (check(sys_pem, "System.keychain"))
-            return;
-    }
-
-    if (plan.want_root) {
-        auto root_pem = run_command(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::root_keychain_path())
-                .c_str());
-        if (check(root_pem, "SystemRootCertificates.keychain"))
-            return;
-    }
-
-    if (plan.want_login) {
-        auto cmd = yuzu::macos::build_login_keychain_read_command(
-            console_user->uid, console_user->username, caller_is_root());
-        if (cmd.empty()) {
-            ctx.write_output("not_available|login keychain command construction failed");
-            return;
-        }
-        auto login_result = run_command_checked(cmd.c_str());
-        if (!login_result.ok) {
-            // Don't fall through to "status|not_found" below -- that would
-            // claim a completed, negative search when the login keychain
-            // was never actually readable (missing sudoers grant,
-            // launchctl/sudo failure, ...). See list_certs_macos's
-            // matching comment.
-            ctx.write_output("not_available|login keychain read failed");
-            return;
-        }
-        if (check(login_result.output, "login.keychain-db"))
-            return;
-    }
+    if (check(sys_pem, "System.keychain"))
+        return;
+    if (check(root_pem, "SystemRootCertificates.keychain"))
+        return;
 
     ctx.write_output("status|not_found");
 }
 
-/**
- * Re-enumerate `keychain_path` and report whether `thumbprint` is still
- * present. Used by delete_cert_macos() to VERIFY a delete actually took
- * effect rather than trusting a zero exit status alone -- `security
- * delete-certificate` can exit 0 without the item actually being gone
- * (ACL/SIP quirks, an unexpected keychain state), and reporting "deleted"
- * in that case would be exactly the false-success this package's honest-
- * sentinel requirement exists to prevent. Reuses the same PEM-enumeration
- * path as list/details rather than adding a second certificate-reading
- * mechanism.
- */
-bool keychain_contains_thumbprint(const std::string& keychain_path, std::string_view thumbprint) {
-    auto pem = run_command(
-        std::format("security find-certificate -a -p {} 2>/dev/null", keychain_path).c_str());
-    for (const auto& block : split_pem_blocks(pem)) {
-        auto rec = parse_pem_block_macos(block, "");
-        if (rec.thumbprint == thumbprint)
-            return true;
-    }
-    return false;
-}
-
-bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
-                       std::string_view store) {
+void delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
+                       std::string_view /*store*/) {
     // Validate thumbprint is hex-only to prevent command injection.
     if (!is_valid_thumbprint(thumbprint)) {
         ctx.write_output("error|invalid thumbprint format (expected 40 hex characters)");
-        return false;
+        return;
     }
-
-    // SystemRootCertificates.keychain is SEALED on modern (SIP-protected)
-    // macOS -- /System/Library/Keychains/... sits under the sealed system
-    // volume and cannot be modified by `security delete-certificate` (or
-    // anything else short of disabling SIP). Advertising deletion from it
-    // as achievable would report a root-trust change that can never
-    // actually take effect (BR-04): reject outright, before ever shelling
-    // out, with the same fail-closed posture as the unsupported-store
-    // branch below -- never silently redirect to a writable keychain
-    // either.
-    if (store == "root") {
-        ctx.write_output(
-            "certificates|unsupported|SystemRootCertificates.keychain is sealed on this macOS "
-            "version (System Integrity Protection) and cannot be modified");
-        return false;
+    // macOS: use security delete-certificate with the SHA-1 hash
+    auto result = run_command(std::format("security delete-certificate -Z {} "
+                                          "/Library/Keychains/System.keychain 2>&1",
+                                          thumbprint)
+                                  .c_str());
+    if (result.find("error") != std::string::npos || result.find("Error") != std::string::npos) {
+        ctx.write_output("status|not_found");
+    } else {
+        ctx.write_output("status|deleted");
     }
-
-    // Delete acts on exactly one keychain; store otherwise preserves
-    // today's unconditional System.keychain target for the unset/"MY"
-    // default and "System" (see yuzu::macos::resolve_delete_keychain_path).
-    // store=login is deliberately NOT supported for delete here -- unlike
-    // list/details it is not part of this package's acceptance criteria,
-    // and it would require the same asuser/sudo dance (and its own honest-
-    // sentinel handling) for a destructive action that has no test
-    // coverage in this change; left for a follow-up if a real need shows
-    // up. "login", "all", and any other unrecognized value (root is
-    // already handled above) are REJECTED rather than silently redirected
-    // to System.keychain -- a destructive action must never target a
-    // keychain the caller didn't ask for.
-    auto target = yuzu::macos::resolve_delete_keychain_path(store);
-    if (!target) {
-        ctx.write_output(std::format("error|store '{}' is not supported for delete", store));
-        return false;
-    }
-
-    // Inspect the ACTUAL pclose()/exit status of `security
-    // delete-certificate` rather than grepping its combined stdout+stderr
-    // for the words "error"/"Error" (BR-04): text-only classification
-    // reports "deleted" for any output that doesn't happen to contain
-    // those words, including genuine operational failures (permission
-    // denied, locked keychain, ...).
-    auto result = run_command_checked(
-        std::format("security delete-certificate -Z {} {} 2>&1", thumbprint, *target).c_str());
-
-    if (!result.ok) {
-        // The command failed. Distinguish a genuine "not present" --
-        // idempotent, matching Windows/Linux's uniform rc=0 for a delete
-        // request that completed a search and found nothing to remove --
-        // from a real operational failure (permission denied, keychain
-        // locked, etc). The exit status alone already told us it failed;
-        // the output text here only sub-classifies WHY, it is never used
-        // to decide "deleted" on its own.
-        std::string lower = result.output;
-        for (auto& c : lower)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (lower.find("could not be found") != std::string::npos ||
-            lower.find("not found") != std::string::npos) {
-            ctx.write_output("status|not_found");
-            return true;
-        }
-        ctx.write_output(std::format("error|delete failed: {}", result.output));
-        return false;
-    }
-
-    // Exit status 0 alone is not sufficient (BR-04) -- VERIFY the
-    // certificate is actually gone from the target keychain before
-    // reporting "deleted". A denied/no-op delete that still exits 0 (a
-    // read-only or otherwise-protected keychain state) must not be
-    // reported as a security-control change that took effect.
-    if (keychain_contains_thumbprint(*target, thumbprint)) {
-        ctx.write_output("error|delete reported success but certificate is still present in the keychain");
-        return false;
-    }
-
-    ctx.write_output("status|deleted");
-    // A completed, VERIFIED delete (or a verified-absent not_found above)
-    // is a successfully EXECUTED delete request, matching Windows/Linux's
-    // uniform rc=0 for that outcome -- only a request REJECTED outright
-    // (invalid thumbprint, unsupported store, sealed root keychain) or an
-    // operational failure fails here.
-    return true;
 }
 
 #endif // __APPLE__
@@ -1091,12 +822,7 @@ public:
 #elif defined(__linux__)
             details_cert_linux(ctx, thumbprint);
 #elif defined(__APPLE__)
-            // store defaults to "all" here (unset -> legacy unfiltered
-            // behaviour, extended to include the login keychain when a
-            // console user is available) -- Windows/Linux details_cert_*
-            // don't take a store filter, so the param is only read on this
-            // branch to avoid an unused-variable warning on those platforms.
-            details_cert_macos(ctx, thumbprint, params.get("store", "all"));
+            details_cert_macos(ctx, thumbprint);
 #endif
             return 0;
         }
@@ -1118,12 +844,7 @@ public:
 #elif defined(__linux__)
             delete_cert_linux(ctx, thumbprint, store);
 #elif defined(__APPLE__)
-            // delete_cert_macos() returns false only for a request REJECTED
-            // outright (unsupported store) -- propagate that as a non-zero
-            // rc so orchestration can't mistake "nothing was deleted
-            // because the request was refused" for a successful no-op.
-            if (!delete_cert_macos(ctx, thumbprint, store))
-                return 1;
+            delete_cert_macos(ctx, thumbprint, store);
 #endif
             return 0;
         }

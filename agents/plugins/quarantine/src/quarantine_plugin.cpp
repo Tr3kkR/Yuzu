@@ -27,13 +27,6 @@
 #include <unistd.h>   // geteuid() — privilege detection for sudo prefix
 #endif
 
-#ifdef __APPLE__
-// rename() comes from <cstdio> (already included above — it's part of ISO
-// C's <stdio.h>, which C++ <cstdio> re-exports).
-#include <fcntl.h>    // open() — for fsync'ing the anchor directory after rename
-#include <sys/stat.h> // chmod()
-#endif
-
 namespace {
 
 // ── Privilege escalation helper (Unix only) ──────────────────────────────────
@@ -82,36 +75,6 @@ const char* sudo_prefix() {
 
 #ifdef __APPLE__
 constexpr const char* kPfctl = "/sbin/pfctl";
-
-// Dedicated pf anchor the quarantine plugin loads its rules into, and the
-// on-disk anchor file F-pf-provisioning (scripts/install-agent-user.sh)
-// installs and hooks into /etc/pf.conf's active main ruleset ahead of time
-// (see docs/agent-privilege-model.md, "macOS pf-anchor provisioning"). These
-// two constants MUST match that script's PF_ANCHOR_NAME / PF_ANCHOR_FILE
-// byte-for-byte, or the plugin's loads land in an anchor pf's active
-// ruleset never invokes — a silent, unenforced false quarantine.
-//
-// BR-002 fix: the plugin now ALSO writes kAnchorFile itself, in addition
-// to loading live rules into the anchor via `pfctl -a <name> -f
-// <tempfile>` — see macos_write_anchor_file_atomic(). Live-only loads
-// vanish on reboot or `pfctl -f /etc/pf.conf` (pf reconstructs the anchor
-// from this on-disk file), which used to silently release quarantine.
-// This is safe without a new sudoers grant because the macOS agent runs
-// as root (docs/agent-privilege-model.md:14), unlike the `_yuzu`
-// unprivileged-account model Linux/Windows use — root already owns
-// kAnchorFile and kAnchorDir, so the plugin writes them directly rather
-// than shelling out through `sudo -n pfctl` like every other mutation in
-// this file.
-constexpr const char* kAnchorName = "yuzu-quarantine";
-constexpr const char* kAnchorFile = "/etc/pf.anchors/yuzu-quarantine";
-
-// Directory containing kAnchorFile. Passed as the `directory` override to
-// yuzu::TempFile::create() (see macos_write_anchor_file_atomic() below) so
-// the staging temp file lands on the SAME filesystem as kAnchorFile —
-// required for the final rename() to be atomic; a cross-filesystem rename
-// isn't atomic (some libcs silently fall back to copy+unlink), which would
-// reopen the exact torn-write window this exists to close.
-constexpr const char* kAnchorDir = "/etc/pf.anchors";
 #endif
 #ifdef __linux__
 constexpr const char* kIptables = "/usr/sbin/iptables";
@@ -502,218 +465,7 @@ std::vector<std::string> linux_get_whitelist() {
 
 #ifdef __APPLE__
 
-// Backward-compat: fingerprint of the PRE-anchor design. The old
-// macos_load_ruleset() (before A-1.18) called plain `pfctl -f <tempfile>`,
-// which replaced pf's entire ACTIVE main ruleset wholesale with our
-// pass-whitelist + `block all` rules. If a host was quarantined under that
-// build and the plugin binary was then upgraded to this anchor-based one
-// without an intervening unquarantine, that inline `block all` survives in
-// the active ruleset independent of anything we do to the anchor below —
-// and would leave the host permanently blocked, since nothing here touches
-// it otherwise. A top-level `block all`/`block drop all` in `pfctl -s rules`
-// is that fingerprint: our own rules now only ever live inside the
-// yuzu-quarantine anchor, never at the top level.
-//
-// BR-03 (HIGH, fixed): this used to be paired with
-// macos_clear_stale_inline_block(), which reloaded /etc/pf.conf whenever
-// this heuristic fired. That was unsound: absence of the active
-// yuzu-quarantine anchor proves only that SOME main ruleset is active with
-// no anchor hook — NOT that Yuzu authored its `block all`. An admin / VPN /
-// security product can legitimately load its own top-level `block all`
-// with no yuzu-quarantine anchor (e.g. before F-pf-provisioning ever ran
-// on that host), and the old code would silently discard that unrelated
-// live policy on the very next quarantine/whitelist/release call — with no
-// restore, not even on release.
-//
-// There is also no reliable way to fix this by keying on a Yuzu-owned
-// marker instead: the legacy pre-anchor design (before commit 18543181,
-// "A-1.18-quarantine") loaded its `block all` via a bare
-// `pfctl -f <tempfile>` against the live ruleset — it never wrote to
-// /etc/pf.conf or any other durable file, and pfctl -s rules does not
-// preserve the rule-file comments the tempfile happened to contain (see
-// the old macos_load_ruleset() rules-header comment at that revision).
-// So the active ruleset carries no durable, uniquely-Yuzu fingerprint to
-// gate a migration on.
-//
-// Given that, this function is now advisory-only: it still reports the
-// same heuristic (top-level block-all with no anchor hook), but callers
-// must NEVER act on it by touching the main ruleset — only surface an
-// honest note asking the operator to check/clear it by hand. See callers
-// for where that note is emitted.
-bool macos_has_stale_inline_block() {
-    auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
-    auto output = run_command(cmd.c_str());
-    bool has_block_all = output.find("block drop all") != std::string::npos ||
-                         output.find("block all") != std::string::npos;
-    if (!has_block_all)
-        return false;
-
-    // A top-level `block all` alone isn't a unique fingerprint of the
-    // pre-anchor design — it's also a perfectly ordinary operator-authored
-    // default-deny policy. Only flag it as POSSIBLY our stale leftover when
-    // the yuzu-quarantine anchor hook is ALSO absent from the active
-    // ruleset: once F-pf-provisioning has hooked the anchor in, this
-    // plugin never writes to the main ruleset again, so a top-level block
-    // all from that point on is provably not ours. This still can't prove
-    // the block-all IS ours when the anchor is absent (see the function
-    // comment above) — it only narrows candidates for the advisory note.
-    bool anchor_hooked = output.find(std::format("anchor \"{}\"", kAnchorName)) != std::string::npos;
-    return !anchor_hooked;
-}
-
-// Advisory note surfaced wherever macos_has_stale_inline_block() fires.
-// Intentionally takes NO action on the main ruleset — see the rationale on
-// macos_has_stale_inline_block() above (BR-03). This is honest about what
-// it does and doesn't know: it never claims to have cleaned anything up.
-std::string macos_stale_inline_block_note() {
-    return std::format(
-        "a top-level `block all`/`block drop all` is present in the active pf ruleset with "
-        "no \"{}\" anchor hook. This MAY be a leftover from a pre-A-1.18 Yuzu build (which "
-        "wrote block-all directly into the main ruleset instead of a dedicated anchor) — or "
-        "it may be an unrelated admin/VPN/security-product policy that happens to look the "
-        "same from here. Yuzu can't tell these apart and will not touch the main ruleset to "
-        "guess; if you know it's a stale Yuzu leftover, remove it by hand (e.g. review and "
-        "reload /etc/pf.conf yourself once you've confirmed it reflects the ruleset you "
-        "actually want active). Quarantine/whitelist/release continue to work normally via "
-        "the \"{}\" anchor regardless of this note.",
-        kAnchorName, kAnchorName);
-}
-
-// P2 (verified): quarantine rules loaded into the yuzu-quarantine anchor via
-// `pfctl -a yuzu-quarantine -f <file>` only take effect if pf's ACTIVE main
-// ruleset also invokes that anchor — the `anchor "yuzu-quarantine"` (+
-// matching `load anchor ...`) hook that F-pf-provisioning
-// (scripts/install-agent-user.sh) installs into /etc/pf.conf and loads. See
-// docs/agent-privilege-model.md, "macOS pf-anchor provisioning". Without it,
-// anchor loads are a silent no-op: traffic bypasses the rules entirely. This
-// checks the ACTIVE ruleset (`pfctl -s rules`), not just the on-disk
-// /etc/pf.conf, so a host where the hook was written but never (re)loaded is
-// still correctly reported as unhooked.
-bool macos_anchor_hooked() {
-    auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
-    auto output = run_command(cmd.c_str());
-    return output.find(std::format("anchor \"{}\"", kAnchorName)) != std::string::npos;
-}
-
-// pf can retain and enforce a loaded ruleset while administratively
-// DISABLED — an anchor hook + loaded rules is necessary but not sufficient
-// for enforcement; `pfctl -e`/`pfctl -d` toggle a separate on/off switch
-// that this checks directly via `pfctl -s info`'s "Status:" line. Used to
-// (a) confirm the runtime `pfctl -e` in macos_load_ruleset() actually took
-// effect rather than trusting its exit code alone, and (b) fold into
-// macos_is_quarantined() so a host with pf disabled is never reported as
-// actively quarantined.
-enum class MacosPfState { enabled, disabled, unknown };
-
-MacosPfState macos_pf_state() {
-    auto cmd = std::format("{}{} -s info 2>/dev/null", sudo_prefix(), kPfctl);
-    auto output = run_command(cmd.c_str());
-    if (output.find("Status: Enabled") != std::string::npos)
-        return MacosPfState::enabled;
-    if (output.find("Status: Disabled") != std::string::npos)
-        return MacosPfState::disabled;
-    return MacosPfState::unknown;
-}
-
-// BR-002: rules loaded live via `pfctl -a <anchor> -f <file>` (below) live
-// only in the kernel's in-memory anchor table — they vanish on reboot or
-// on ANY `pfctl -f /etc/pf.conf` reload, because pf reconstructs the
-// yuzu-quarantine anchor from kAnchorFile on disk (via the `load anchor
-// ... from ...` directive F-pf-provisioning hooks into /etc/pf.conf — see
-// docs/agent-privilege-model.md, "macOS pf-anchor provisioning"). Until
-// this function runs, kAnchorFile is the EMPTY placeholder
-// install-agent-user.sh provisions, so a reboot silently reconstructs an
-// open anchor — the device is released while the server still believes
-// it's isolated. Every live anchor load/flush in this file is therefore
-// mirrored here to keep kAnchorFile in sync with what's enforced live.
-//
-// The macOS agent runs as root (docs/agent-privilege-model.md:14 — the
-// shipped LaunchDaemon has no UserName key, so launchd runs it as root),
-// so this writes kAnchorFile directly with no privilege escalation; unlike
-// every pfctl shell-out in this file, no sudo prefix is used or needed
-// here, and no new sudoers grant is required (root already owns the file
-// and its containing directory).
-//
-// TOCTOU-safe atomic replace: yuzu::TempFile::create() creates its file
-// via mkstemps() — O_CREAT|O_EXCL semantics, so the staging path can never
-// collide with or be raced onto an attacker-predicted name (see
-// agents/core/src/temp_file.cpp) — inside kAnchorDir so it shares
-// kAnchorFile's filesystem. Contents are fsync()'d before rename() so
-// they're durable even against a crash immediately after the call, and
-// rename() is atomic within one filesystem: a concurrent reader (or a
-// reboot re-sourcing /etc/pf.conf) can only ever observe the fully-old or
-// fully-new file, never a partially-written one.
-bool macos_write_anchor_file_atomic(const std::string& contents, std::string* error_out) {
-    auto tmp_file_result = yuzu::TempFile::create("yuzu-quarantine-", ".conf", kAnchorDir);
-    if (!tmp_file_result) {
-        *error_out = std::format(
-            "failed to create a staging temp file in {} for the persistent pf anchor file "
-            "({}) — {}",
-            kAnchorDir, kAnchorFile, tmp_file_result.error().message);
-        return false;
-    }
-    auto tmp_file = std::move(*tmp_file_result);
-
-    FILE* f = fopen(tmp_file.path().c_str(), "w");
-    if (!f) {
-        *error_out = std::format("failed to open staging file {} for the persistent pf anchor",
-                                 tmp_file.path());
-        return false;
-    }
-    bool write_ok = fputs(contents.c_str(), f) != EOF;
-    if (write_ok && fflush(f) != 0)
-        write_ok = false;
-    // fsync BEFORE fclose: fclose alone doesn't guarantee the data hit
-    // disk, only that the stdio buffer was flushed to the fd (which
-    // fflush above already did) — fsync is what forces the kernel to
-    // persist it.
-    if (write_ok && fsync(fileno(f)) != 0)
-        write_ok = false;
-    fclose(f);
-    if (!write_ok) {
-        *error_out = std::format(
-            "failed to write/fsync the persistent pf anchor staging file {}", tmp_file.path());
-        return false;
-    }
-
-    // Match install-agent-user.sh's macos_install_pf_anchor_file()
-    // convention for kAnchorFile: mode 0644 (world-readable — e.g. for a
-    // non-root operator's `pfctl -nf` validation). Owner is already root
-    // since this whole plugin process runs as root on macOS.
-    if (chmod(tmp_file.path().c_str(), 0644) != 0) {
-        *error_out =
-            std::format("failed to chmod staging file {} to 0644", tmp_file.path());
-        return false;
-    }
-
-    if (rename(tmp_file.path().c_str(), kAnchorFile) != 0) {
-        *error_out = std::format("failed to atomically replace {} (rename from {} failed)",
-                                 kAnchorFile, tmp_file.path());
-        return false;
-    }
-    // The rename moved the staging path onto kAnchorFile, so the original
-    // staging path no longer exists — tell the RAII wrapper not to try to
-    // unlink it (harmless no-op either way, but explicit is clearer).
-    tmp_file.release();
-
-    // Belt-and-suspenders durability: fsync the containing directory so
-    // the rename's directory-entry update itself survives a crash right
-    // after this call (the file's own contents were already fsync'd
-    // above; a bare rename's directory-entry update is a separate write
-    // that also needs an explicit fsync to be crash-durable on most
-    // POSIX filesystems). Best-effort — a failure here doesn't invalidate
-    // the rename that already completed, so it's intentionally not fatal.
-    int dir_fd = open(kAnchorDir, O_RDONLY);
-    if (dir_fd >= 0) {
-        fsync(dir_fd);
-        close(dir_fd);
-    }
-
-    return true;
-}
-
-// Compose-and-load the complete pf ruleset for a quarantine state into the
-// dedicated yuzu-quarantine anchor.
+// Compose-and-load the complete pf ruleset for a quarantine state.
 //
 // `rules_written_out` is set to the count of rule lines we wrote.
 // `error_out` is set to a non-empty operator-actionable string on
@@ -722,7 +474,7 @@ bool macos_write_anchor_file_atomic(const std::string& contents, std::string* er
 // Returns 0 on success, non-zero on failure. Used by both
 // macos_quarantine() and the macOS branch of do_whitelist() so the
 // "rebuild the ruleset and atomically load it" logic lives in one
-// place. See the rationale comment inside about the loopback pass rule.
+// place. See the rationale comment inside about set-skip-on-lo0.
 int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules_written_out,
                        std::string* error_out) {
     const auto* pfx = sudo_prefix();
@@ -731,16 +483,11 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
 
     rules += "# Yuzu agent quarantine — generated by quarantine_plugin.cpp\n";
     rules += "# DO NOT edit by hand; this file is overwritten on every dispatch.\n";
-    rules += std::format("# Loaded into the \"{}\" pf anchor (not the main ruleset) via\n",
-                         kAnchorName);
-    rules += "# `pfctl -a <anchor> -f <this file>`. Release via the unquarantine action,\n";
-    rules += "# which flushes the anchor (`pfctl -a <anchor> -F rules`).\n";
+    rules += "# Restore via `pfctl -f /etc/pf.conf` (macos_unquarantine does this).\n";
     rules += "\n";
-    rules += "# Keep loopback open — agent<->gateway<->server TCP rides lo0. `set skip`\n";
-    rules += "# is a main-ruleset-only pf OPTION, not a filter rule, and is not valid\n";
-    rules += "# inside an anchor body (see pf.conf(5), GRAMMAR: `option` vs `pf-rule`).\n";
-    rules += "# Use an anchor-legal quick pass rule instead, ordered before block all.\n";
-    rules += "pass quick on lo0 all\n";
+    rules += "# Bypass loopback entirely — keeps agent⇄gateway⇄server TCP alive\n";
+    rules += "# through the rule reload. See comment in quarantine_plugin.cpp.\n";
+    rules += "set skip on lo0\n";
     ++rules_written;
 
     for (const auto& ip : whitelist_ips) {
@@ -751,27 +498,6 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
 
     rules += "block all\n";
     ++rules_written;
-
-    // BR-03 (fixed): this used to run a "backward-compat cleanup" here that
-    // reloaded /etc/pf.conf whenever macos_has_stale_inline_block() fired.
-    // That heuristic cannot distinguish a stale pre-anchor Yuzu leftover
-    // from an admin/VPN/security product's own legitimate top-level
-    // `block all`, so it was capable of silently discarding an unrelated
-    // live policy on every quarantine call. Removed outright — see the
-    // rationale on macos_has_stale_inline_block() above. This function no
-    // longer touches the main ruleset at all; it only ever loads rules
-    // into the yuzu-quarantine anchor below, which is unaffected by
-    // whatever the main ruleset currently contains.
-    if (!macos_anchor_hooked()) {
-        *error_out = std::format(
-            "pf anchor \"{}\" is not hooked into the active ruleset — quarantine rules "
-            "loaded into it would have no effect on live traffic (false quarantine). "
-            "Run `sudo bash scripts/install-agent-user.sh` to provision the "
-            "F-pf-provisioning hook (installs {} and hooks it into /etc/pf.conf — see "
-            "docs/agent-privilege-model.md, \"macOS pf-anchor provisioning\"), then retry.",
-            kAnchorName, kAnchorFile);
-        return 1;
-    }
 
     auto tmp_file_result = yuzu::TempFile::create("yuzu-quarantine-", ".conf");
     if (!tmp_file_result) {
@@ -789,11 +515,11 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
         fclose(f);
     }
 
-    auto cmd = std::format("{}{} -a {} -f {}", pfx, kPfctl, kAnchorName, tmp_file.path());
+    auto cmd = std::format("{}{} -f {}", pfx, kPfctl, tmp_file.path());
     int load_rc = run_command_rc(cmd.c_str());
     if (load_rc != 0) {
         int exit_code = WIFEXITED(load_rc) ? WEXITSTATUS(load_rc) : load_rc;
-        *error_out = std::format("pfctl anchor load failed (rc={}). Likely the agent account "
+        *error_out = std::format("pfctl load failed (rc={}). Likely the agent account "
                                  "is not in /etc/sudoers.d/yuzu-agent — run "
                                  "`sudo bash scripts/install-agent-user.sh --check` to verify.",
                                  exit_code);
@@ -801,46 +527,9 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
     }
 
     // Enable pf if not already enabled. Idempotent — the kernel returns
-    // a harmless warning to stderr when called on an already-enabled pf,
-    // so a nonzero exit code alone doesn't distinguish "already enabled"
-    // from "failed to enable" (e.g. root-owned pf token held elsewhere).
-    // Confirm via `pfctl -s info` rather than trusting the exit code —
-    // anchor rules loaded above have zero effect while pf is disabled,
-    // and that would otherwise be a silent false quarantine.
+    // a harmless warning to stderr when called on an already-enabled pf.
     cmd = std::format("{}{} -e 2>/dev/null", pfx, kPfctl);
     run_command_rc(cmd.c_str());
-    if (macos_pf_state() != MacosPfState::enabled) {
-        *error_out = std::format(
-            "pf anchor \"{}\" loaded, but pf itself could not be confirmed enabled — "
-            "quarantine rules are not enforced while pf is disabled. Run "
-            "`sudo {} -e` by hand and retry.",
-            kAnchorName, kPfctl);
-        return 1;
-    }
-
-    // BR-002: mirror the rules just loaded LIVE to the persistent anchor
-    // file so a reboot / `pfctl -f /etc/pf.conf` reload reconstructs the
-    // SAME ruleset instead of the empty install-time placeholder
-    // install-agent-user.sh provisions — see
-    // macos_write_anchor_file_atomic() above. Deliberately runs AFTER the
-    // live load + enable above succeeds, so the host is already isolated
-    // live by the time we get here. If the persistent write fails, this
-    // still returns an error rather than success: the caller must never
-    // report quarantine as durably active when the on-disk anchor file
-    // doesn't back it up. The live load is intentionally left in place
-    // either way — an operator seeing "error, but the host is isolated"
-    // is a safer failure mode than this function silently tearing down
-    // live isolation just because the durability leg failed.
-    std::string persist_err;
-    if (!macos_write_anchor_file_atomic(rules, &persist_err)) {
-        *error_out = std::format(
-            "pf anchor \"{}\" loaded LIVE — the host is isolated right now — but the "
-            "persistent copy at {} could not be updated ({}). Quarantine will NOT survive "
-            "a reboot or `pfctl -f /etc/pf.conf` reload until this is fixed; live "
-            "isolation remains in effect in the meantime.",
-            kAnchorName, kAnchorFile, persist_err);
-        return 1;
-    }
 
     *rules_written_out = rules_written;
     return 0;
@@ -860,137 +549,25 @@ int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
     return 0;
 }
 
-// BR-002: on-disk replacement for kAnchorFile once quarantine is released,
-// mirroring the install-time placeholder scripts/install-agent-user.sh
-// provisions (empty — no filter rules, matches nothing). Used by
-// macos_unquarantine() so a reboot / `pfctl -f /etc/pf.conf` reload
-// reconstructs an EMPTY anchor, same as what the live flush just did,
-// instead of replaying whatever quarantine ruleset macos_load_ruleset()
-// last persisted there.
-constexpr const char* kEmptyAnchorContents =
-    "# Yuzu agent quarantine anchor — cleared by quarantine_plugin.cpp (unquarantine).\n"
-    "# DO NOT edit by hand; overwritten on every quarantine/unquarantine dispatch.\n"
-    "#\n"
-    "# Empty (no rules) — matches the install-time placeholder\n"
-    "# scripts/install-agent-user.sh provisions. An anchor with no filter rules\n"
-    "# matches nothing, so a reboot / `pfctl -f /etc/pf.conf` reload that\n"
-    "# reconstructs this anchor from this file releases quarantine, not\n"
-    "# re-imposes it.\n";
-
 int macos_unquarantine(yuzu::CommandContext& ctx) {
     const auto* pfx = sudo_prefix();
 
-    // BR-03 (fixed): this used to run a "backward-compat cleanup" here —
-    // reloading /etc/pf.conf whenever macos_has_stale_inline_block() fired,
-    // on the theory that a host mid-migration (quarantined under the
-    // pre-anchor plugin, then upgraded to this build) could carry a stale
-    // inline `block all` the anchor flush below never touches. But the
-    // heuristic can't tell a stale Yuzu leftover apart from an unrelated
-    // admin/VPN/security-product default-deny ruleset, and there's no
-    // durable Yuzu-owned marker to key a safe migration on instead (see the
-    // rationale on macos_has_stale_inline_block() above) — reloading
-    // /etc/pf.conf here could silently discard a live non-Yuzu policy, and
-    // release never restored it. Replaced with an honest advisory note
-    // only; the main ruleset is never touched by this function.
-    if (macos_has_stale_inline_block()) {
-        ctx.write_output(std::format("note|{}", macos_stale_inline_block_note()));
-    }
-
-    // Flush the anchor's rule table rather than clobbering /etc/pf.conf —
-    // the anchor is where quarantine.isolate loads rules
-    // (macos_load_ruleset), so this is the correct, minimal "undo". Safe to
-    // call even if the anchor was never hooked into the active ruleset (pf
-    // tracks a named anchor's rule table independently of whether the main
-    // ruleset references it) or was never populated.
-    auto cmd = std::format("{}{} -a {} -F rules 2>/dev/null", pfx, kPfctl, kAnchorName);
+    // Restore the system default ruleset by reloading /etc/pf.conf.
+    // macOS ships /etc/pf.conf with the platform's default anchors
+    // (com.apple/*, etc.). After our quarantine clobbered the main
+    // ruleset, this is the cleanest way to get back to "what the OS
+    // started with" without trying to remember and replay the prior
+    // state ourselves.
+    auto cmd = std::format("{}{} -f /etc/pf.conf 2>/dev/null", pfx, kPfctl);
     int rc = run_command_rc(cmd.c_str());
     if (rc != 0) {
-        // Last-resort fallback ONLY — never clobber /etc/pf.conf as the
-        // primary path (that was the pre-anchor bug this rework fixes).
-        // Disabling pf wholesale is strictly more permissive than desired,
-        // but leaves the box reachable for the operator to clean up.
+        // /etc/pf.conf might not exist or might fail to parse on a
+        // non-default OS install. Fall back to disabling pf entirely —
+        // strictly more permissive than what the user wants, but at
+        // least the box is reachable for the operator to clean up.
         cmd = std::format("{}{} -d 2>/dev/null", pfx, kPfctl);
         run_command_rc(cmd.c_str());
-        // Confirm the fallback actually landed rather than trusting its
-        // exit code (which, like `-e`'s, is unreliable on an
-        // already-toggled pf) — if pf can't be confirmed disabled, BOTH
-        // the anchor flush and the disable fallback have failed, and the
-        // device is still quarantined. Reporting "released" here would be
-        // a false release: an operator would believe connectivity was
-        // restored while the box stays blocked.
-        if (macos_pf_state() != MacosPfState::disabled) {
-            ctx.write_output(std::format(
-                "error|failed to flush anchor \"{}\" and could not confirm pf disabled — "
-                "quarantine is likely still enforced. Run `sudo {} -a {} -F rules` or "
-                "`sudo {} -d` by hand.",
-                kAnchorName, kPfctl, kAnchorName, kPfctl));
-            return 1;
-        }
-        // The anchor flush itself failed, so pf being administratively
-        // disabled here is only a temporary, orthogonal release mechanism —
-        // it makes the host reachable right now, but says nothing about the
-        // anchor's own rule table, which is still unconfirmed (that's the
-        // failure we're in) and whose persisted copy on disk still holds
-        // whatever macos_load_ruleset() last wrote. Best-effort clear the
-        // persistent anchor file with the same atomic helper the successful
-        // path uses below, so a stale `block all` doesn't survive to
-        // re-impose quarantine the next time pf is re-enabled, `pfctl -f
-        // /etc/pf.conf` reloads, or the box reboots. But never report
-        // "released"/rc 0 for this branch regardless of whether the
-        // best-effort clear lands: the live anchor's rule table was never
-        // confirmed flushed, so durable quarantine state is not confirmed
-        // cleared and the controller must keep reconciling rather than
-        // treating this host as released.
-        std::string persist_err;
-        const bool persisted =
-            macos_write_anchor_file_atomic(kEmptyAnchorContents, &persist_err);
-        if (persisted) {
-            ctx.write_output(std::format(
-                "status|release_incomplete|note|pf disabled (host reachable) but anchor "
-                "\"{}\" rule table flush failed — persistent anchor file at {} was "
-                "best-effort cleared, but the live anchor's own state is unconfirmed; "
-                "retry `sudo {} -a {} -F rules`",
-                kAnchorName, kAnchorFile, kPfctl, kAnchorName));
-        } else {
-            ctx.write_output(std::format(
-                "status|release_incomplete|note|pf disabled (host reachable) but anchor "
-                "\"{}\" rule table flush failed AND the persistent anchor file at {} could "
-                "not be cleared ({}) — durable quarantine state remains uncleared; retry "
-                "`sudo {} -a {} -F rules` or fix the anchor file by hand",
-                kAnchorName, kAnchorFile, persist_err, kPfctl, kAnchorName));
-        }
-        return 1;
-    }
-
-    // BR-002: the live anchor flush above succeeded — mirror that to the
-    // persistent anchor file so a reboot / `pfctl -f /etc/pf.conf` reload
-    // reconstructs the same released (empty) state instead of replaying a
-    // stale quarantine ruleset. Never report "released" if this fails:
-    // the box IS open right now (the live flush succeeded), but the very
-    // next reboot would silently re-quarantine it from the stale on-disk
-    // file — an operator told "released" would have no reason to expect
-    // that.
-    std::string persist_err;
-    if (!macos_write_anchor_file_atomic(kEmptyAnchorContents, &persist_err)) {
-        ctx.write_output(std::format(
-            "error|pf anchor \"{}\" flushed LIVE — the host is reachable right now — but "
-            "the persistent copy at {} could not be cleared ({}). A reboot or `pfctl -f "
-            "/etc/pf.conf` reload will re-impose the OLD quarantine ruleset until this is "
-            "fixed.",
-            kAnchorName, kAnchorFile, persist_err));
-        return 1;
-    }
-
-    if (!macos_anchor_hooked()) {
-        // Honest note, not an error: the flush above still succeeded (pf
-        // anchor rule tables are addressable whether or not the main
-        // ruleset invokes them), but since the anchor was never hooked in,
-        // nothing was actually enforcing quarantine to begin with — this is
-        // surfaced so an operator doesn't mistake "released" for evidence
-        // the quarantine mechanism itself is provisioned.
-        ctx.write_output(std::format(
-            "status|released|note|pf anchor \"{}\" is not hooked into the active ruleset "
-            "(F-pf-provisioning not run) — nothing was enforcing quarantine", kAnchorName));
+        ctx.write_output("status|released|note|pf disabled (could not restore /etc/pf.conf)");
         return 0;
     }
 
@@ -998,43 +575,20 @@ int macos_unquarantine(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-// Takes the pf-state and anchor-hooked checks as inputs rather than
-// re-querying pfctl for them, so a caller that already needs those two
-// facts for its own reporting (do_status) can compute each exactly once
-// instead of pfctl being forked twice more per status call — the two
-// results can't drift out from under each other that way either.
-bool macos_is_quarantined(MacosPfState pf_state, bool anchor_hooked) {
-    // Honest false: pf retains and inspects a loaded anchor's rules even
-    // while administratively disabled (`pfctl -d`), so rule presence alone
-    // is not proof of enforcement — never report "active" while pf itself
-    // is off or its state can't be confirmed.
-    if (pf_state != MacosPfState::enabled)
-        return false;
-
-    // Honest false (P2, verified): without the F-pf-provisioning hook (see
-    // macos_anchor_hooked()), rules loaded into the anchor have zero effect
-    // on live traffic — never report "active" for a quarantine that isn't
-    // actually enforced.
-    if (!anchor_hooked)
-        return false;
-
-    // We're quarantined iff the yuzu-quarantine anchor's own rule table has
-    // our `block all` rule (the load-bearing default-deny) — query the
-    // anchor directly, not the main ruleset, since that's where
-    // macos_load_ruleset() writes rules now.
-    auto cmd = std::format("{}{} -a {} -s rules 2>/dev/null", sudo_prefix(), kPfctl, kAnchorName);
+bool macos_is_quarantined() {
+    // We're quarantined iff the active main ruleset has our `block all`
+    // rule (the load-bearing default-deny). Pre-patch this looked at
+    // the yuzu-quarantine anchor; the new design writes the rules
+    // directly into the main ruleset so we check there instead.
+    auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
     auto output = run_command(cmd.c_str());
     return output.find("block drop all") != std::string::npos ||
            output.find("block all") != std::string::npos;
 }
 
-bool macos_is_quarantined() {
-    return macos_is_quarantined(macos_pf_state(), macos_anchor_hooked());
-}
-
 std::vector<std::string> macos_get_whitelist() {
     std::vector<std::string> ips;
-    auto cmd = std::format("{}{} -a {} -s rules 2>/dev/null", sudo_prefix(), kPfctl, kAnchorName);
+    auto cmd = std::format("{}{} -s rules 2>/dev/null", sudo_prefix(), kPfctl);
     auto output = run_command(cmd.c_str());
     std::istringstream iss(output);
     std::string line;
@@ -1193,51 +747,12 @@ private:
 #elif defined(__linux__)
         bool active = linux_is_quarantined();
 #elif defined(__APPLE__)
-        // Compute pf-state and anchor-hooked once and thread them through
-        // (rather than each of macos_is_quarantined() and the two note
-        // checks below independently re-invoking pfctl for the same two
-        // facts) — pf state can otherwise change between the separate
-        // forks, letting the state|active line and the following notes
-        // disagree about the reason.
-        MacosPfState pf_state = macos_pf_state();
-        bool anchor_hooked = macos_anchor_hooked();
-        bool active = macos_is_quarantined(pf_state, anchor_hooked);
+        bool active = macos_is_quarantined();
 #else
         ctx.write_output("error|unsupported platform");
         return 1;
 #endif
         ctx.write_output(std::format("state|{}", active ? "active" : "inactive"));
-
-#ifdef __APPLE__
-        // Honest status (P2, verified): surfaced as a separate output line
-        // so callers can distinguish "not quarantined" from "quarantine
-        // cannot be enforced at all because F-pf-provisioning hasn't run" —
-        // see macos_anchor_hooked().
-        if (!anchor_hooked) {
-            ctx.write_output(std::format(
-                "note|pf anchor \"{}\" is not hooked into the active ruleset — run "
-                "scripts/install-agent-user.sh to provision it (see "
-                "docs/agent-privilege-model.md, \"macOS pf-anchor provisioning\"); "
-                "quarantine cannot be enforced until then",
-                kAnchorName));
-        }
-        // Honest status: pf can be administratively disabled (`pfctl -d`)
-        // while still holding a hooked anchor and loaded rules — surfaced
-        // separately so "inactive" isn't mistaken for "mechanism not
-        // provisioned" when the real cause is pf being off.
-        if (pf_state != MacosPfState::enabled) {
-            ctx.write_output(
-                "note|pf is disabled or its state could not be confirmed via "
-                "`pfctl -s info` — quarantine cannot be enforced until pf is enabled");
-        }
-        // BR-03: advisory only — see macos_has_stale_inline_block() and
-        // macos_stale_inline_block_note(). Never acted on automatically;
-        // surfaced here purely so an operator querying status learns about
-        // it without having to run unquarantine first.
-        if (macos_has_stale_inline_block()) {
-            ctx.write_output(std::format("note|{}", macos_stale_inline_block_note()));
-        }
-#endif
 
         if (active) {
 #ifdef _WIN32
@@ -1301,10 +816,10 @@ private:
             }
 #elif defined(__APPLE__)
             {
-                // The anchor-based design means "add" = "rebuild the
-                // anchor's rule set with the union of current whitelist +
-                // new IPs". We get the current whitelist via
-                // macos_get_whitelist() (queries the anchor) and merge.
+                // The new design (no anchor, rules in main ruleset) means
+                // "add" = "rebuild the entire ruleset with the union of
+                // current whitelist + new IPs". We get the current
+                // whitelist via macos_get_whitelist() and merge.
                 auto current = macos_get_whitelist();
                 for (const auto& ip : new_ips) {
                     bool dup = false;
@@ -1353,11 +868,11 @@ private:
             }
 #elif defined(__APPLE__)
             {
-                // "remove" = rebuild the anchor's rule set with
-                // current-whitelist minus new_ips. macos_load_ruleset takes
-                // the final desired set; we don't manipulate individual
-                // rules in place (string-matching individual pf rules to
-                // delete them has a well-known false-match risk).
+                // "remove" = rebuild the ruleset with current-whitelist
+                // minus new_ips. macos_load_ruleset takes the final
+                // desired set; we don't manipulate individual rules
+                // (which the old anchor design tried to do via string
+                // matching, with the well-known false-match risk).
                 auto current = macos_get_whitelist();
                 std::vector<std::string> filtered;
                 for (const auto& ip : current) {

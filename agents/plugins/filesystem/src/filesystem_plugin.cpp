@@ -8,11 +8,7 @@
  *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
  *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
  *   "search_dir"      — Find directories/files by name pattern (glob/regex).
- *   "get_signature"   — Verify a code signature: Authenticode on Windows
- *                        (WinVerifyTrust), codesign on macOS.
- *   "get_version_info" — Extract version info: PE version resource on
- *                        Windows, Info.plist (CFBundleShortVersionString /
- *                        CFBundleVersion) via plutil on macOS.
+ *   "get_version_info" — Extract PE version resource info (Windows only).
  *   "search"          — Search file contents for a pattern.
  *   "replace"         — Find/replace text in a file (atomic write).
  *   "write_content"   — Write or overwrite file contents.
@@ -39,7 +35,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -75,18 +70,9 @@
 #else
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <cerrno>
-#include <csignal>
-#include <ctime>
-#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
-#include <thread>
 #include <unistd.h>
-#endif
-
-#ifdef __APPLE__
-#include "filesystem_macos_sig.hpp"
 #endif
 
 namespace {
@@ -306,262 +292,6 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
     }
     return result;
 }
-
-#ifdef __APPLE__
-
-// Bound on how long a macOS tool invocation (codesign/plutil) may run
-// before it is killed. Both tools are normally sub-second; this only
-// guards against a pathological hang (e.g. codesign blocking on a network
-// mount, or a filesystem stall) wedging the calling thread forever.
-constexpr auto kMacosToolDeadline = std::chrono::milliseconds(10'000);
-
-// Bound on how long we keep waiting, after SIGKILL, for the pipe to close
-// AND the child to be reaped -- mirrors event_logs_deadline.hpp's
-// kDrainGrace so the "drain" phase itself cannot hang forever.
-constexpr auto kMacosToolDrainGrace = std::chrono::milliseconds(2000);
-
-inline void macos_tool_sleep_briefly(long nanos) {
-    struct timespec ts{0, nanos};
-    nanosleep(&ts, nullptr);
-}
-
-// Bound on how long the final cleanup (after the run loop below) will poll
-// non-blockingly for the child to be reaped before handing the wait off to
-// an asynchronous background reaper, so the calling (worker) thread is
-// never blocked past this bound regardless of how long the child actually
-// takes to die (e.g. stuck in uninterruptible kernel I/O).
-constexpr auto kMacosToolGuardReapGrace = std::chrono::milliseconds(200);
-
-// Send SIGKILL to the child's process group; if that fails (e.g. ESRCH
-// because the group is already gone, EPERM, or the child never reached its
-// setsid() call) fall back to killing the direct child so a timeout always
-// has a real chance of landing.
-inline void macos_tool_kill_child_or_group(pid_t pid) {
-    if (kill(-pid, SIGKILL) != 0)
-        kill(pid, SIGKILL);
-}
-
-// Poll waitpid(pid, ..., WNOHANG) for up to `grace`, sleeping briefly
-// between attempts. Returns true once the child is confirmed reaped (or
-// already gone), false if `grace` elapses first. Never performs a blocking
-// wait.
-inline bool macos_tool_try_reap_bounded(pid_t pid, std::chrono::milliseconds grace) {
-    auto start = std::chrono::steady_clock::now();
-    while (true) {
-        int status = 0;
-        pid_t waited;
-        do {
-            waited = waitpid(pid, &status, WNOHANG);
-        } while (waited < 0 && errno == EINTR);
-        if (waited == pid || (waited < 0 && errno == ECHILD))
-            return true;
-        if (std::chrono::steady_clock::now() - start >= grace)
-            return false;
-        macos_tool_sleep_briefly(5'000'000L); // 5ms
-    }
-}
-
-// Reap `pid` on a detached background thread. Used when
-// macos_tool_try_reap_bounded() above could not confirm the reap within its
-// grace period — rather than block the calling thread indefinitely, hand
-// the wait off to a thread that is free to block as long as it needs to.
-// The thread owns everything it touches: `pid` is captured by value, so
-// nothing here references state on a stack that may already have unwound.
-inline void macos_tool_reap_async(pid_t pid) {
-    std::thread([pid]() {
-        int status = 0;
-        pid_t waited;
-        do {
-            waited = waitpid(pid, &status, 0);
-        } while (waited < 0 && errno == EINTR);
-    }).detach();
-}
-
-// Run a macOS command-line tool (codesign, plutil) as a fixed argv via
-// execvp -- no shell, so a path containing spaces or shell metacharacters
-// (e.g. "/Applications/Google Chrome.app") cannot inject anything. Captures
-// COMBINED stdout+stderr (codesign writes its diagnostics to stderr).
-// `tool_ran` is false when the exec itself failed (binary missing from
-// PATH) OR the deadline fired before the child exited -- either way there
-// is no real exit code to reason from, so callers (classify_codesign_result
-// / classify_plutil_extract) already treat !tool_ran as an honest
-// "unknown"/"not_available" rather than fabricating a verdict.
-//
-// The child branch performs ONLY async-signal-safe operations (POSIX
-// 2.4.3): the C-style argv is built entirely in the PARENT, before fork(),
-// so the child never allocates (no std::vector/std::string construction).
-// Allocating after fork() in a multithreaded process is unsafe -- another
-// thread can hold the allocator lock at the moment of fork, which the
-// child inherits already-locked and then deadlocks on, wedging the parent
-// forever in the old no-timeout waitpid(). See event_logs_deadline.hpp for
-// the sibling implementation of this same pattern.
-struct MacosToolResult {
-    bool tool_ran = false;
-    bool timed_out = false;
-    int exit_code = -1;
-    std::string output;
-};
-
-MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
-    MacosToolResult result;
-    if (argv.empty())
-        return result;
-
-    // Build the C-style argv BEFORE fork(): between fork() and execvp() the
-    // child may only call async-signal-safe functions. The std::string
-    // elements of `argv` outlive this call (they're a local copy already),
-    // so their .c_str() pointers stay valid through the child's execvp().
-    std::vector<const char*> c_argv;
-    c_argv.reserve(argv.size() + 1);
-    for (const auto& arg : argv)
-        c_argv.push_back(arg.c_str());
-    c_argv.push_back(nullptr);
-
-    int pipe_fd[2];
-    if (pipe(pipe_fd) != 0)
-        return result;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        return result;
-    }
-
-    if (pid == 0) {
-        // Child: async-signal-safe only from here on. New session/process
-        // group so a timeout kill can take out the whole group, not just
-        // this direct child.
-        setsid();
-
-        dup2(pipe_fd[1], STDOUT_FILENO);
-        dup2(pipe_fd[1], STDERR_FILENO);
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-
-        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
-        _exit(127); // exec failed -- codesign/plutil never legitimately exit 127
-    }
-
-    // Parent.
-    close(pipe_fd[1]);
-
-    int flags = fcntl(pipe_fd[0], F_GETFL, 0);
-    if (flags == -1 || fcntl(pipe_fd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
-        // Fail closed: without a confirmed non-blocking pipe fd, the read()
-        // below could block indefinitely before any deadline check ever
-        // runs. Kill the child now (bounded reap, falling back to an async
-        // background reaper) and return an honest "didn't complete" rather
-        // than risk an unbounded read.
-        close(pipe_fd[0]);
-        macos_tool_kill_child_or_group(pid);
-        if (!macos_tool_try_reap_bounded(pid, kMacosToolGuardReapGrace))
-            macos_tool_reap_async(pid);
-        result.timed_out = true;
-        return result;
-    }
-
-    auto start = std::chrono::steady_clock::now();
-    bool killed = false;
-    bool pipe_eof = false;
-    bool child_reaped = false;
-    std::chrono::steady_clock::time_point kill_time{};
-    std::array<char, 4096> buf{};
-
-    auto try_reap = [&]() {
-        if (child_reaped)
-            return;
-        int status = 0;
-        pid_t waited;
-        do {
-            waited = waitpid(pid, &status, WNOHANG);
-        } while (waited < 0 && errno == EINTR);
-        if (waited == pid) {
-            child_reaped = true;
-            if (WIFEXITED(status)) {
-                result.exit_code = WEXITSTATUS(status);
-                result.tool_ran = (result.exit_code != 127);
-            }
-        } else if (waited < 0 && errno == ECHILD) {
-            child_reaped = true;
-        }
-    };
-
-    while (true) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Reap opportunistically and non-blockingly every iteration. Pipe
-        // EOF alone does not prove the child exited (only that no one
-        // holds the write end open), so this must not treat EOF as "done"
-        // until the child is independently confirmed dead.
-        try_reap();
-
-        if (!killed && now - start >= kMacosToolDeadline) {
-            result.timed_out = true;
-            killed = true;
-            kill_time = now;
-            // Whole process group, not just the child; falls back to the
-            // direct child if the group kill fails.
-            macos_tool_kill_child_or_group(pid);
-        }
-
-        if (child_reaped && pipe_eof)
-            break; // child is gone and stdout+stderr is fully drained
-        if (killed && now - kill_time >= kMacosToolDrainGrace)
-            // Bounded grace after a kill: something is still holding the
-            // pipe open or hasn't been reaped yet -- stop waiting rather
-            // than block past the deadline indefinitely.
-            break;
-
-        if (pipe_eof) {
-            macos_tool_sleep_briefly(5'000'000L); // 5ms
-            continue;
-        }
-
-        ssize_t n = read(pipe_fd[0], buf.data(), buf.size());
-        if (n > 0) {
-            if (result.output.size() <= 1'000'000) // sanity cap; real output is tiny
-                result.output.append(buf.data(), static_cast<size_t>(n));
-        } else if (n == 0) {
-            pipe_eof = true; // EOF: writer(s) closed their end
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            macos_tool_sleep_briefly(killed ? 5'000'000L : 10'000'000L); // 5ms / 10ms
-            continue;
-        } else if (errno == EINTR) {
-            continue;
-        } else {
-            pipe_eof = true; // real read error: stop trying to read further
-        }
-    }
-
-    close(pipe_fd[0]);
-
-    // Cover the kDrainGrace escape hatch: if the loop above broke out
-    // without the child having been confirmed reaped yet, force a kill
-    // (process group, falling back to the direct child) and reap it with a
-    // bounded poll so no zombie is left behind. The child was already
-    // SIGKILLed on the timeout path, so in the common case this reap is
-    // prompt and completes within the poll. If the bounded poll still can't
-    // confirm the reap (e.g. a child wedged in uninterruptible kernel I/O),
-    // hand the wait off to a detached background thread instead of blocking
-    // this call — the worker thread must never hang past the deadline.
-    if (!child_reaped) {
-        macos_tool_kill_child_or_group(pid);
-        if (!macos_tool_try_reap_bounded(pid, kMacosToolGuardReapGrace))
-            macos_tool_reap_async(pid);
-    }
-
-    if (result.timed_out) {
-        // No real exit code to reason from -- honest "didn't complete"
-        // rather than a fabricated tool_ran/exit_code.
-        result.tool_ran = false;
-        result.exit_code = -1;
-    }
-
-    return result;
-}
-
-#endif // __APPLE__
 
 #endif
 
@@ -1219,7 +949,7 @@ private:
 #endif
     }
 
-    // ── get_signature: Check code signature (Authenticode/Windows, codesign/macOS) ──
+    // ── get_signature: Check Authenticode signature (Windows only) ────────
 
     int do_get_signature(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto path = params.get("path");
@@ -1287,22 +1017,8 @@ private:
         WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_id, &trust_data);
 
         return 0;
-#elif defined(__APPLE__)
-        // codesign --verify --deep --strict is the macOS analogue of
-        // WinVerifyTrust: it walks the whole bundle (or a lone Mach-O) and
-        // fails on ANY broken seal, not just a missing top-level signature.
-        // Its status vocabulary is deliberately its OWN honest enum (see
-        // filesystem_macos_sig.hpp) -- reusing the Windows Authenticode
-        // strings here would misrepresent a codesign verdict as a
-        // WinVerifyTrust one.
-        auto run = run_macos_tool({"codesign", "--verify", "--deep", "--strict", validated});
-        auto status = yuzu::filesystem_macos::classify_codesign_result(
-            run.tool_ran, run.exit_code, run.output);
-        ctx.write_output(
-            std::format("signature_status|{}", yuzu::filesystem_macos::to_string(status)));
-        return 0;
 #else
-        ctx.write_output("error|code signature verification is not supported on this platform");
+        ctx.write_output("error|Authenticode signature verification is not supported on this platform");
         return 1;
 #endif
     }
@@ -1412,7 +1128,7 @@ private:
         return 0;
     }
 
-    // ── get_version_info: PE version resource (Windows) / Info.plist via plutil (macOS) ──
+    // ── get_version_info: Extract PE version resource (Windows) ─────────
 
     int do_get_version_info(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto path = params.get("path");
@@ -1493,57 +1209,8 @@ private:
         }
 
         return 0;
-#elif defined(__APPLE__)
-        // macOS has no PE version resource; the nearest equivalent is the
-        // bundle's Info.plist, read via `plutil -extract ... raw -o -`.
-        // plutil handles BOTH binary (bplist00) and XML plists natively, so
-        // (unlike the license_scan text-plist reader) no bplist parsing is
-        // needed here. `validated` must resolve to either a .app bundle
-        // directory or an Info.plist file directly -- a plain binary with
-        // neither honestly reports not_available rather than fabricating a
-        // version.
-        fs::path vpath(validated);
-        std::error_code plist_ec;
-        std::string info_plist;
-        if (fs::is_directory(vpath, plist_ec) && vpath.extension() == ".app") {
-            info_plist = (vpath / "Contents" / "Info.plist").string();
-        } else if (vpath.filename() == "Info.plist") {
-            info_plist = validated;
-        }
-
-        if (info_plist.empty() || !fs::exists(info_plist, plist_ec)) {
-            ctx.write_output("version_status|not_available");
-            return 0;
-        }
-
-        // CFBundleShortVersionString is the user-visible "marketing"
-        // version (n.n.n) -- the closest analogue of Windows ProductVersion.
-        auto short_ver_run =
-            run_macos_tool({"plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-",
-                            info_plist});
-        auto short_ver = yuzu::filesystem_macos::classify_plutil_extract(
-            short_ver_run.tool_ran, short_ver_run.exit_code, short_ver_run.output);
-
-        // CFBundleVersion is the machine-readable, monotonically increasing
-        // build number -- the closest analogue of Windows FileVersion.
-        auto build_ver_run = run_macos_tool(
-            {"plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist});
-        auto build_ver = yuzu::filesystem_macos::classify_plutil_extract(
-            build_ver_run.tool_ran, build_ver_run.exit_code, build_ver_run.output);
-
-        if (!short_ver.available && !build_ver.available) {
-            ctx.write_output("version_status|not_available");
-            return 0;
-        }
-
-        if (short_ver.available)
-            ctx.write_output(std::format("product_version|{}", short_ver.value));
-        if (build_ver.available)
-            ctx.write_output(std::format("file_version|{}", build_ver.value));
-
-        return 0;
 #else
-        ctx.write_output("error|version info extraction is not supported on this platform");
+        ctx.write_output("error|PE version info is only available on Windows");
         return 1;
 #endif
     }

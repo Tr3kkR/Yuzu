@@ -2,11 +2,7 @@
 ## Enumerates and manages certificates in system stores.
 ## Windows: CryptoAPI (MY, ROOT, CA, Trust stores)
 ## Linux: PEM files in /etc/ssl/certs/ via openssl
-## macOS: System.keychain and SystemRootCertificates.keychain via security CLI,
-##        plus the current console user's login keychain (store=login/all) via
-##        `launchctl asuser <uid> sudo -u <user> security` -- the LaunchDaemon
-##        has no login keychain of its own, so this reaches into that user's
-##        per-user session to read it.
+## macOS: System.keychain and SystemRootCertificates.keychain via security CLI
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -19,8 +15,7 @@ metadata:
     Enumerate certificates in system certificate stores. On Windows this
     queries the CryptoAPI stores (MY, ROOT, CA, Trust). On Linux it parses
     PEM files in /etc/ssl/certs/. On macOS it reads System.keychain and
-    SystemRootCertificates.keychain, plus the current console user's login
-    keychain when one is logged in. Results can be filtered by store name
+    SystemRootCertificates.keychain. Results can be filtered by store name
     and by expiration window.
   tags: [security, certificates, compliance, inventory]
 
@@ -41,14 +36,8 @@ spec:
         displayName: Certificate Store
         description: >
           Filter by store name. On Windows: MY, ROOT, CA, Trust, or "all"
-          for all stores. On macOS: "login" (the current console user's
-          login keychain -- returns not_available|no console session if
-          nobody is logged in at the console), "System"
-          (/Library/Keychains/System.keychain), "root"
-          (SystemRootCertificates.keychain), or "all" (System and root,
-          plus login when a console user is present). Ignored on Linux,
-          which always enumerates every available certificate. Defaults
-          to "all".
+          for all stores. Ignored on Linux and macOS which enumerate all
+          available stores. Defaults to "all".
         default: "all"
       expiring_within_days:
         type: int32
@@ -145,19 +134,6 @@ spec:
         description: >
           SHA-1 thumbprint (hex string, no colons) of the certificate
           to retrieve. Case-insensitive.
-      store:
-        type: string
-        displayName: Certificate Store
-        description: >
-          On macOS, restrict the search to one store: "login" (the
-          current console user's login keychain -- returns
-          not_available|no console session if nobody is logged in at
-          the console), "System" (/Library/Keychains/System.keychain),
-          "root" (SystemRootCertificates.keychain), or "all" (System
-          and root, plus login when a console user is present). Ignored
-          on Windows and Linux, which always search every store.
-          Defaults to "all".
-        default: "all"
 
   result:
     columns:
@@ -208,12 +184,7 @@ metadata:
     Delete a certificate from a system store by SHA-1 thumbprint. On
     Windows this targets a specific named store (defaults to MY). On
     Linux it removes the matching PEM/CRT file from /etc/ssl/certs/.
-    On macOS it uses the security CLI to delete from System.keychain by
-    default; store=root is rejected as unsupported (returns a non-zero
-    exit code) because SystemRootCertificates.keychain is sealed by
-    System Integrity Protection on modern macOS and cannot actually be
-    modified. A macOS delete verifies the certificate is actually absent
-    from the target keychain afterward before reporting success.
+    On macOS it uses the security CLI to delete from System.keychain.
     This is a destructive action and requires approval.
   tags: [security, certificates, remediation]
 
@@ -241,16 +212,7 @@ spec:
         displayName: Certificate Store
         description: >
           The certificate store to delete from. On Windows: MY, ROOT, CA,
-          or Trust. Defaults to "MY". On macOS: "MY" (the default) or
-          "System" deletes from /Library/Keychains/System.keychain,
-          matching prior behaviour. "root" is REJECTED (non-zero exit,
-          unsupported) -- SystemRootCertificates.keychain is sealed by
-          System Integrity Protection on modern macOS and cannot actually
-          be modified, so attempting it would report a change that never
-          took effect. "login" and "all" are also not supported for
-          delete and are rejected with an error rather than silently
-          deleting from an unintended store, as is any other unrecognized
-          value. Ignored on Linux.
+          or Trust. Defaults to "MY". Ignored on Linux and macOS.
         default: "MY"
 
   result:

@@ -552,21 +552,18 @@ apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 metadata:
   id: device.filesystem.get_signature
-  displayName: Check Code Signature
-  version: 0.4.0
+  displayName: Check Authenticode Signature
+  version: 0.3.0
   description: >
-    Verify the code signature of an executable, DLL, or app bundle.
-    On Windows, uses WinVerifyTrust to check the Authenticode signature
-    chain (valid, unsigned, distrusted, untrusted). On macOS, runs
-    `codesign --verify --deep --strict` and reports an honest macOS
-    signature status (valid, unsigned, invalid, unknown) — a different
-    vocabulary from Authenticode, since codesign/Gatekeeper model trust
-    differently than WinVerifyTrust. Returns error on Linux.
-  tags: [filesystem, security, compliance, authenticode, codesign]
+    Verify the Authenticode digital signature of a Windows executable
+    or DLL. Uses WinVerifyTrust to check the signature chain. Returns
+    the signature status (valid, unsigned, distrusted, untrusted).
+    Windows-only; returns error on Linux/macOS.
+  tags: [filesystem, security, compliance, authenticode]
 
 spec:
   type: question
-  platforms: [windows, darwin]
+  platforms: [windows]
 
   execution:
     plugin: filesystem
@@ -580,7 +577,7 @@ spec:
       path:
         type: string
         displayName: File Path
-        description: The executable, DLL, or app bundle to verify.
+        description: The executable or DLL to verify.
         validation:
           maxLength: 4096
       base_dir:
@@ -596,7 +593,7 @@ spec:
       - name: signature_status
         type: string
 
-  readablePayload: "Check code signature of ${path}"
+  readablePayload: "Check Authenticode signature of ${path}"
 
   gather:
     ttlSeconds: 300
@@ -689,80 +686,6 @@ spec:
 
   compatibility:
     minAgentVersion: 0.3.0
-    requiredPlugins: [filesystem]
-
-status:
-  phase: active
-
----
-apiVersion: yuzu.io/v1alpha1
-kind: InstructionDefinition
-metadata:
-  id: device.filesystem.get_version_info
-  displayName: Get File Version Info
-  version: 0.4.0
-  description: >
-    Extract version information from an executable or app bundle. On
-    Windows, reads the PE version resource (FileVersion, ProductVersion,
-    and descriptive fields such as CompanyName/FileDescription/ProductName).
-    On macOS, reads CFBundleVersion and CFBundleShortVersionString from the
-    bundle's Info.plist via `plutil -extract ... raw` — plutil handles both
-    binary and XML plists, so this works on any .app regardless of how its
-    Info.plist is encoded. Reports an honest not_available when the target
-    has no version info (a plain binary with no Info.plist on macOS, or no
-    version resource on Windows). Returns error on Linux.
-  tags: [filesystem, inventory, compliance]
-
-spec:
-  type: question
-  platforms: [windows, darwin]
-
-  execution:
-    plugin: filesystem
-    action: get_version_info
-    concurrency: per-device
-
-  parameters:
-    type: object
-    required: [path]
-    properties:
-      path:
-        type: string
-        displayName: File Path
-        description: >
-          The executable, DLL, or app bundle to inspect. On macOS this may
-          be a .app bundle directory or an Info.plist file directly.
-        validation:
-          maxLength: 4096
-      base_dir:
-        type: string
-        displayName: Base Directory
-        description: >
-          Optional. Restricts access to files within this directory.
-        validation:
-          maxLength: 4096
-
-  result:
-    columns:
-      - name: file_version
-        type: string
-      - name: product_version
-        type: string
-
-  readablePayload: "Get version info for ${path}"
-
-  gather:
-    ttlSeconds: 300
-
-  approval:
-    mode: auto
-
-  permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
-    authorRoles: [content-author]
-
-  compatibility:
-    minAgentVersion: 0.4.0
     requiredPlugins: [filesystem]
 
 status:
