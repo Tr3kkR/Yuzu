@@ -113,6 +113,8 @@ spec:
     columns:
       - name: response
         type: string
+      - name: status
+        type: string
 
   readablePayload: "Show message box: {{title}} ({{buttons}})"
 
@@ -181,6 +183,8 @@ spec:
         type: string
       - name: cancelled
         type: bool
+      - name: status
+        type: string
 
   readablePayload: "Show input dialog: {{title}}"
 

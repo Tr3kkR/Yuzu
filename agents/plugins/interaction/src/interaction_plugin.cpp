@@ -307,14 +307,17 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
     int rc = run_command_status(cmd);
     if (rc == 0) {
         ctx.write_output("status|ok");
-    } else {
-        // Non-zero exit from osascript on a daemon most often means there is
-        // no reachable GUI session to post the notification to. Report that
-        // honestly rather than a bare "failed" (which reads like a bug in
-        // this plugin rather than an environment limitation).
-        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 0;
     }
-    return 0;
+    // Non-zero exit from osascript on a daemon most often means there is
+    // no reachable GUI session to post the notification to. Report that
+    // honestly rather than a bare "failed" (which reads like a bug in
+    // this plugin rather than an environment limitation) — but still
+    // return non-zero so the agent core records this command as a
+    // terminal FAILURE rather than SUCCESS, since nothing was ever shown
+    // to the user.
+    ctx.write_output("status|unavailable|no reachable GUI session");
+    return 1;
 }
 
 #elif defined(__linux__)
@@ -426,9 +429,11 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
     if (result.exit_code != 0) {
         // osascript failed outright — e.g. the daemon has no reachable GUI
         // session to display the dialog on. No dialog was ever shown, so no
-        // button was ever clicked; do not fabricate "ok".
+        // button was ever clicked; do not fabricate "ok". Return non-zero
+        // so the agent core records this command as a terminal FAILURE
+        // rather than SUCCESS.
         ctx.write_output("status|unavailable|no reachable GUI session");
-        return 0;
+        return 1;
     }
 
     // On success the script returns exactly the clicked button's label (or
@@ -436,8 +441,8 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
     // rather than by substring — only text we can attribute to one of our
     // own button labels is reported as a click; anything else on a
     // *successful* invocation is unrecognized output, not a click, so it is
-    // reported the same honest way as a hard failure rather than defaulted
-    // to "ok".
+    // reported the same honest way as a hard failure — non-zero, with a
+    // diagnostic status line — rather than defaulted to a fabricated "ok".
     const std::string& output = result.output;
     if (output == "##CANCELLED##") {
         ctx.write_output("response|cancel");
@@ -448,7 +453,8 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
     } else if (output == "OK") {
         ctx.write_output("response|ok");
     } else {
-        ctx.write_output("status|unavailable|no reachable GUI session");
+        ctx.write_output("status|unavailable|unrecognized osascript response");
+        return 1;
     }
     return 0;
 }
@@ -569,9 +575,10 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
         // "on error" above, which only catches user cancellation and still
         // exits 0) — most likely no reachable GUI session. The captured
         // text here is an error message, not user input; never wrap it in
-        // "response|...".
+        // "response|...". Return non-zero so the agent core records this
+        // command as a terminal FAILURE rather than SUCCESS.
         ctx.write_output("status|unavailable|no reachable GUI session");
-        return 0;
+        return 1;
     }
 
     if (result.output == "##CANCELLED##") {
@@ -860,23 +867,39 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
             if (result.exit_code != 0) {
                 // osascript failed outright (not the AppleScript-level "on
                 // error", which exits 0) — no reachable GUI session. Stop
-                // the survey rather than fabricate an answer.
+                // the survey rather than fabricate an answer. Non-zero
+                // return so the agent core records this command as a
+                // terminal FAILURE rather than SUCCESS.
                 ctx.write_output("status|unavailable|no reachable GUI session");
-                return 0;
+                return 1;
             }
             if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i,
-                result.output.find("Yes") != std::string::npos ? "yes" : "no"));
+            // The AppleScript's button set is exactly {"No", "Yes"}, so a
+            // successful invocation should return exactly one of those two
+            // labels. Match exactly rather than by substring — anything
+            // else is unrecognized output, not a "no" answer, so it is
+            // reported honestly (non-zero) instead of fabricated.
+            if (result.output == "Yes") {
+                ctx.write_output(std::format("answer_{}|yes", i));
+            } else if (result.output == "No") {
+                ctx.write_output(std::format("answer_{}|no", i));
+            } else {
+                ctx.write_output("status|unavailable|unrecognized osascript response");
+                return 1;
+            }
 
         } else if (q.type == "choice" && !q.choices.empty()) {
             // Build AppleScript choose from list
             std::string items;
+            std::vector<std::string> safe_choices;
+            safe_choices.reserve(q.choices.size());
             for (size_t ci = 0; ci < q.choices.size(); ++ci) {
                 if (ci > 0) items += ", ";
-                items += "\"" + sanitize(q.choices[ci]) + "\"";
+                safe_choices.push_back(sanitize(q.choices[ci]));
+                items += "\"" + safe_choices.back() + "\"";
             }
             std::string cmd =
                 "osascript -e 'try' -e 'set r to choose from list {" + items +
@@ -888,12 +911,26 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 "-e 'error number err_num' -e 'end try' 2>&1";
             auto result = run_command_capture(cmd);
             if (result.exit_code != 0) {
+                // Non-zero return so the agent core records this command
+                // as a terminal FAILURE rather than SUCCESS.
                 ctx.write_output("status|unavailable|no reachable GUI session");
-                return 0;
+                return 1;
             }
             if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
+            }
+            // "choose from list" can only return an item from the list we
+            // supplied. Confirm the output matches one of the sanitized
+            // choices we offered rather than trusting it blindly — output
+            // that matches none of them is unrecognized, not a genuine
+            // selection, so it is reported honestly (non-zero) instead of
+            // fabricated.
+            bool recognized = std::find(safe_choices.begin(), safe_choices.end(),
+                                        result.output) != safe_choices.end();
+            if (!recognized) {
+                ctx.write_output("status|unavailable|unrecognized osascript response");
+                return 1;
             }
             ctx.write_output(std::format("answer_{}|{}", i, result.output));
 
@@ -908,8 +945,10 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 safe_prompt, safe_title);
             auto result = run_command_capture(cmd);
             if (result.exit_code != 0) {
+                // Non-zero return so the agent core records this command
+                // as a terminal FAILURE rather than SUCCESS.
                 ctx.write_output("status|unavailable|no reachable GUI session");
-                return 0;
+                return 1;
             }
             if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
