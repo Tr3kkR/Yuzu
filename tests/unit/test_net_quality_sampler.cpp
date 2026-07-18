@@ -34,6 +34,14 @@ TEST_CASE("throughput_bps: delta over interval, wrap-safe", "[netq]") {
     REQUIRE(bps.has_value());
     CHECK(*bps == 2000.0);
 
+    // Non-integral quotient — pins DOUBLE division (an integer-division
+    // regression would truncate 33333.33… to 33333.0 exactly and still pass an
+    // exactly-divisible case like the one above).
+    const NetCounters cur3{true, 1000 + 60000, 2000 + 40000, t0 + seconds(3)}; // +100000 B / 3 s
+    const auto bps3 = throughput_bps(prev, cur3);
+    REQUIRE(bps3.has_value());
+    CHECK(*bps3 == Catch::Approx(100000.0 / 3.0));
+
     // First heartbeat (invalid prev) baselines — no rate.
     CHECK(throughput_bps(NetCounters{}, cur) == std::nullopt);
     // Counter wrap/reset (cur < prev) → nullopt, never a bogus huge/negative rate.
