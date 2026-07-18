@@ -2085,14 +2085,19 @@ public:
 #endif
                             }
 
-                            // Slice 4a: device network-quality facts (Linux
-                            // netlink TCP_INFO + /proc/net/dev throughput) — the
-                            // ONLY channel for the fleet net gauges + /network
+                            // Slice 4a: device network-quality facts — the ONLY
+                            // channel for the fleet net gauges + /network
                             // Overview, same as the perf tags above. Gated like
                             // perf; this is aggregate device telemetry with NO
                             // per-destination data (that warehouse tier + its
-                            // own opt-in are a later slice). Off Linux the sample
-                            // is all-invalid, so no tags ship (absent, not zero).
+                            // own opt-in are a later slice). Per-platform
+                            // coverage: Linux ships RTT + retransmit +
+                            // throughput (netlink TCP_INFO + /proc/net/dev);
+                            // Windows ships throughput + retransmit
+                            // (GetIfTable2 + GetTcpStatisticsEx, RTT deferred);
+                            // macOS ships throughput only (NET_RT_IFLIST2,
+                            // retransmit + RTT deferred); other platforms are
+                            // all-invalid, so no tags ship (absent, not zero).
                             if (!cfg_.dex_disable) {
                                 const auto net_cur = netq::read_net_counters();
                                 const auto ns =

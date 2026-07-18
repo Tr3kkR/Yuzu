@@ -453,7 +453,21 @@ NetCounters read_net_counters() {
         if (msglen < sizeof(MsgPrefix) || msglen > remaining)
             return c; // malformed/truncated — never advance by 0, never overrun
 
-        if (pfx.type == RTM_IFINFO2 && msglen >= sizeof(struct if_msghdr2)) {
+        if (pfx.type == RTM_IFINFO2) {
+            // A short RTM_IFINFO2 IS the malformation the fail-whole-sample
+            // contract above exists for (unlike a legitimately-short
+            // RTM_NEWADDR, which the generic msglen check above already lets
+            // through) — invalidate the whole sample rather than silently
+            // skip a truncated interface record and publish a partial
+            // aggregate as if it were complete.
+            if (msglen < sizeof(struct if_msghdr2))
+                return c; // invalid — truncated RTM_IFINFO2
+            // Reject a routing-message ABI version we don't know how to lay
+            // out as if_msghdr2 (prospective guard: a future kernel revision
+            // could change the layout under a new RTM_VERSION without
+            // changing msglen enough to be caught above).
+            if (pfx.version != RTM_VERSION)
+                return c; // invalid — unrecognized RTM_IFINFO2 layout version
             struct if_msghdr2 ifm2 {};
             std::memcpy(&ifm2, ptr, sizeof(ifm2));
             // Skip the loopback — it is not "the network", and dwarfs real
