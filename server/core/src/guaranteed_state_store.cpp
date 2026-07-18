@@ -913,8 +913,8 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
         platform = "windows";
     else if (platform.starts_with("lin"))
         platform = "linux";
-    else if (platform == "darwin" || platform == "macos")
-        platform = "macos";
+    else if (platform.starts_with("darwin") || platform.starts_with("macos"))
+        platform = "macos"; // prefix, like win/lin: "darwin 24.0" must not escape the lens
     // Per-version stability (slice 2b). RE-CANONICALIZE server-side (UP-4): never
     // trust the agent's string — a hostile/buggy/non-Windows agent could ship a
     // non-canonical or malicious value (e.g. "<script>…") within the 256-byte

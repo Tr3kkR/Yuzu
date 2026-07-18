@@ -9957,8 +9957,9 @@ private:
                         // filter can score a family against THAT OS's own fleet.
                         if (os.starts_with("lin"))
                             ++f.linux_online;
-                        if (os == "darwin" || os == "macos")
-                            ++f.macos_online;
+                        if (os.starts_with("darwin") || os.starts_with("macos"))
+                            ++f.macos_online; // prefix, like win/lin — keep in
+                                              // step with the store's write canon
                         // Distinct connected OS tokens → the Catalogue's "All
                         // connected" coverage scope (render normalises darwin→macos).
                         if (!os.empty() && std::find(f.connected_os.begin(),
