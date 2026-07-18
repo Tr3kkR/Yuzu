@@ -30,18 +30,17 @@ struct SwEntry {
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags / macOS codesign)
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
-    std::string bundle_id;        // macOS CFBundleIdentifier (macOS rows only)
 };
 
 /// Parse `installed_apps` `list_inventory` output (pipe-delimited
 /// `inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
-/// signature_status|distro_id|distro_version|bundle_id` lines) into
-/// machine-scope entries. Rows with any other prefix (`app|`, `user_app|`,
-/// `error|`, ...) are ignored; missing trailing tokens read as empty fields
-/// (tolerant), tokens beyond the 13th field are dropped (fields never shift).
+/// signature_status|distro_id|distro_version` lines) into machine-scope
+/// entries. Rows with any other prefix (`app|`, `user_app|`, `error|`, ...) are
+/// ignored; missing trailing tokens read as empty fields (tolerant), tokens
+/// beyond the 12th field are dropped (fields never shift).
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries
@@ -50,19 +49,6 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 /// SoftwareInventoryStore::canonical_hash) so the server-recomputed hash equals
 /// this source's. Takes its argument by value (it sorts a copy).
 YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> entries);
-
-/// LEGACY (pre-bundle_id) canonical wire blob: identical sort/dedup + field
-/// layout to `installed_software_canonical_blob`, but the 13th field
-/// (bundle_id) is OMITTED entirely — no trailing 0x1F for it either — the
-/// exact 12-field bytes this branch's PREDECESSOR agent build computes.
-/// ADR-0016 Update (version-aware hashing, BR-01): production code never
-/// calls this — an upgraded agent always sends the 13-field form via
-/// `installed_software_canonical_blob`. It exists so tests can build a
-/// faithful "un-upgraded agent" fixture and cross-pin it against the
-/// server's `SoftwareInventoryStore::canonical_hash_legacy`, instead of
-/// hand-transcribing the field/separator layout a second time — exactly the
-/// kind of one-sided drift BR-01 was about.
-YUZU_EXPORT std::string installed_software_canonical_blob_legacy(std::vector<SwEntry> entries);
 
 /// Build the `installed_software` SyncSource. `descriptor` is the loaded
 /// `installed_apps` plugin descriptor; when null (plugin not built/loaded — e.g.

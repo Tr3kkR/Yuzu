@@ -322,7 +322,7 @@ TEST_CASE("pipe_safe deletes framing/separator bytes", "[installed_apps][invento
     CHECK(pipe_safe("").empty());
 }
 
-TEST_CASE("format_inv_row owns the 14-token layout", "[installed_apps][inventory]") {
+TEST_CASE("format_inv_row owns the 13-token layout", "[installed_apps][inventory]") {
     InvRecord r;
     r.name = "bash";
     r.version = "5.2.21";
@@ -336,10 +336,9 @@ TEST_CASE("format_inv_row owns the 14-token layout", "[installed_apps][inventory
     r.signature_status = "signed";
     r.distro_id = "fedora";
     r.distro_version = "40";
-    r.bundle_id = "com.example.bash";
     CHECK(format_inv_row(r) ==
           "inv|bash|5.2.21|Fedora Project|Mon 01 Jan 2026|package|rpm|0|3.fc40|x86_64|signed|"
-          "fedora|40|com.example.bash");
+          "fedora|40");
 
     SECTION("empty fields stay empty tokens -- no placeholder synthesis") {
         InvRecord app;
@@ -348,8 +347,7 @@ TEST_CASE("format_inv_row owns the 14-token layout", "[installed_apps][inventory
         app.publisher = "Google LLC";
         app.kind = "app";
         app.ecosystem = "windows";
-        // bundle_id (position 13) is unset -- stays an empty token, not synthesised.
-        CHECK(format_inv_row(app) == "inv|Google Chrome|126.0|Google LLC||app|windows|||||||");
+        CHECK(format_inv_row(app) == "inv|Google Chrome|126.0|Google LLC||app|windows||||||");
     }
     SECTION("pipe in a value cannot shift fields") {
         InvRecord bad;
@@ -357,159 +355,8 @@ TEST_CASE("format_inv_row owns the 14-token layout", "[installed_apps][inventory
         bad.kind = "app";
         bad.ecosystem = "windows";
         const std::string row = format_inv_row(bad);
-        CHECK(row == "inv|EvilApp||||app|windows|||||||");
-        // Exactly 13 separators after the prefix regardless of input bytes.
-        CHECK(std::count(row.begin(), row.end(), '|') == 13);
-    }
-}
-
-// ── macOS: system_profiler / codesign / mdls output parsing ────────────────
-// (A-1.10 fix round finding A-3: these subprocess-output parsers are pure,
-// so they run on any test host without system_profiler/codesign/mdls.)
-
-TEST_CASE("parse_macos_app_headers splits system_profiler mini output into per-app records",
-          "[installed_apps][inventory][macos]") {
-    SECTION("one app, all three metadata fields") {
-        const auto apps = parse_macos_app_headers(
-            "    Google Chrome:\n"
-            "      Version: 121.0.6167.184\n"
-            "      Last Modified: 1/15/24, 10:23 AM\n"
-            "      Location: /Applications/Google Chrome.app\n");
-        REQUIRE(apps.size() == 1);
-        CHECK(apps[0].name == "Google Chrome");
-        CHECK(apps[0].version == "121.0.6167.184");
-        CHECK(apps[0].last_modified == "1/15/24, 10:23 AM");
-        CHECK(apps[0].location == "/Applications/Google Chrome.app");
-    }
-    SECTION("an app literally named \"Location\" is its own record, not swallowed as the "
-            "preceding app's Location: field") {
-        // Regression for A-1: the header line for an app named "Location" is a
-        // bare 4-space "    Location:" whose trimmed text equals the metadata
-        // prefix -- must be recognised by INDENTATION DEPTH, not text match.
-        const auto apps = parse_macos_app_headers(
-            "    Google Chrome:\n"
-            "      Version: 121.0\n"
-            "      Last Modified: d1\n"
-            "      Location: /Applications/Google Chrome.app\n"
-            "    Location:\n"
-            "      Version: 2.1\n"
-            "      Last Modified: d2\n"
-            "      Location: /Applications/Location.app\n");
-        REQUIRE(apps.size() == 2);
-        CHECK(apps[0].name == "Google Chrome");
-        CHECK(apps[0].location == "/Applications/Google Chrome.app");
-        CHECK(apps[1].name == "Location");
-        CHECK(apps[1].version == "2.1");
-        CHECK(apps[1].last_modified == "d2");
-        CHECK(apps[1].location == "/Applications/Location.app");
-    }
-    SECTION("an app literally named \"Version\" is its own record, not misread as the "
-            "preceding app's Version: field (A-1 fix round regression)") {
-        // Before the fix, the bare 4-space header "    Version:" matched the
-        // metadata branch unconditionally (no is_metadata guard): find(':')+2
-        // on the 8-byte view "Version:" is past-the-end, so
-        // std::string_view::substr threw std::out_of_range instead of
-        // starting a new app record.
-        const auto apps = parse_macos_app_headers(
-            "    Google Chrome:\n"
-            "      Version: 121.0\n"
-            "      Last Modified: d1\n"
-            "      Location: /Applications/Google Chrome.app\n"
-            "    Version:\n"
-            "      Version: 2.1\n"
-            "      Last Modified: d2\n"
-            "      Location: /Applications/Version.app\n");
-        REQUIRE(apps.size() == 2);
-        CHECK(apps[0].name == "Google Chrome");
-        CHECK(apps[1].name == "Version");
-        CHECK(apps[1].version == "2.1");
-        CHECK(apps[1].last_modified == "d2");
-        CHECK(apps[1].location == "/Applications/Version.app");
-    }
-    SECTION("an app literally named \"Last Modified\" is its own record (A-1 fix round "
-            "regression)") {
-        const auto apps = parse_macos_app_headers("    Last Modified:\n"
-                                                   "      Version: 3.0\n"
-                                                   "      Last Modified: d3\n"
-                                                   "      Location: /Applications/Last Modified.app\n");
-        REQUIRE(apps.size() == 1);
-        CHECK(apps[0].name == "Last Modified");
-        CHECK(apps[0].version == "3.0");
-        CHECK(apps[0].last_modified == "d3");
-        CHECK(apps[0].location == "/Applications/Last Modified.app");
-    }
-    SECTION("a metadata label with no trailing value does not throw (bare colon, "
-            "A-1 fix round regression)") {
-        // find(':')+1 (never +2) so a value-less "Label:" at metadata depth
-        // returns an empty value instead of an out-of-range substr.
-        const auto apps =
-            parse_macos_app_headers("    Solo:\n      Version:\n      Last Modified:\n");
-        REQUIRE(apps.size() == 1);
-        CHECK(apps[0].name == "Solo");
-        CHECK(apps[0].version.empty());
-        CHECK(apps[0].last_modified.empty());
-    }
-    SECTION("last record flushes with no trailing newline; unset fields stay empty") {
-        const auto apps = parse_macos_app_headers("    Solo:\n      Version: 1.0");
-        REQUIRE(apps.size() == 1);
-        CHECK(apps[0].name == "Solo");
-        CHECK(apps[0].version == "1.0");
-        CHECK(apps[0].last_modified.empty());
-        CHECK(apps[0].location.empty());
-    }
-    SECTION("empty input yields no records") {
-        CHECK(parse_macos_app_headers("").empty());
-    }
-}
-
-TEST_CASE("parse_codesign_output maps codesign -dvvv text to the signed/unsigned vocabulary",
-          "[installed_apps][inventory][macos]") {
-    SECTION("Authority= line present: signed, publisher is the leaf identity") {
-        const auto info = parse_codesign_output(
-            "Executable=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
-            "Identifier=com.google.Chrome\n"
-            "Authority=Developer ID Application: Google LLC (EQHXZ8M8AV)\n"
-            "Authority=Developer ID Certification Authority\n"
-            "Authority=Apple Root CA\n");
-        CHECK(info.signature_status == "signed");
-        // First Authority= line wins -- the leaf identity, not an issuing CA.
-        CHECK(info.publisher == "Developer ID Application: Google LLC (EQHXZ8M8AV)");
-    }
-    SECTION("\"code object is not signed at all\": unsigned, publisher empty") {
-        const auto info =
-            parse_codesign_output("/Applications/Foo.app: code object is not signed at all\n");
-        CHECK(info.signature_status == "unsigned");
-        CHECK(info.publisher.empty());
-    }
-    SECTION("no Authority= line at all (e.g. an ad-hoc signature): unsigned, never a third state") {
-        const auto info = parse_codesign_output("Signature=adhoc\nFormat=app bundle\n");
-        CHECK(info.signature_status == "unsigned");
-        CHECK(info.publisher.empty());
-    }
-    SECTION("empty output: unsigned") {
-        // Tool-UNAVAILABLE honest-empty ("" signature_status) is the caller's
-        // job (codesign_info gates on codesign_available before ever calling
-        // this parser) -- this pure function always returns signed/unsigned.
-        const auto info = parse_codesign_output("");
-        CHECK(info.signature_status == "unsigned");
-        CHECK(info.publisher.empty());
-    }
-}
-
-TEST_CASE("parse_mdls_bundle_id_output extracts CFBundleIdentifier",
-          "[installed_apps][inventory][macos]") {
-    SECTION("quoted value") {
-        CHECK(parse_mdls_bundle_id_output(
-                  "kMDItemCFBundleIdentifier = \"com.google.Chrome\"") == "com.google.Chrome");
-    }
-    SECTION("unset attribute: literal (null), honest-empty") {
-        CHECK(parse_mdls_bundle_id_output("kMDItemCFBundleIdentifier = (null)").empty());
-    }
-    SECTION("mdls error text (path doesn't resolve): honest-empty") {
-        CHECK(parse_mdls_bundle_id_output("/Applications/Ghost.app: no such file or directory")
-                  .empty());
-    }
-    SECTION("empty output: honest-empty") {
-        CHECK(parse_mdls_bundle_id_output("").empty());
+        CHECK(row == "inv|EvilApp||||app|windows||||||");
+        // Exactly 12 separators after the prefix regardless of input bytes.
+        CHECK(std::count(row.begin(), row.end(), '|') == 12);
     }
 }

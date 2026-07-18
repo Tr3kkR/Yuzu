@@ -45,22 +45,12 @@ constexpr int kMaxSources = 64;
 // Parse the canonical wire blob into rows: entries are 0x1E-separated; each is
 // 0x1F-separated in blob contract v2 field order (name, version, publisher,
 // install_date, kind, ecosystem, epoch, release, arch, signature_status,
-// distro_id, distro_version, bundle_id) — the same byte form the agent hashes
-// (ADR-0016 §4), so the server re-hash matches. A v1 4-field record parses
-// fine: the token walk stops at the record's end, leaving fields 5–13
-// default-empty (the documented mixed-version behaviour — an old agent's rows
-// store with empty v2 columns). Tokens beyond the 13th are dropped. nullopt
-// only when the blob exceeds the cap; an empty list is a legitimate "nothing
-// here".
-//
-// A 12-field (pre-bundle_id) record from an un-upgraded agent parses the
-// same way — field 13 (bundle_id) simply reads as default-empty. The hash
-// COMPARE this feeds does NOT live here: SoftwareInventoryStore's hash-only
-// path (apply_installed_software) is version-aware (ADR-0016 Update, BR-01)
-// — it accepts either the current 13-field content_hash or the legacy
-// 12-field legacy_content_hash computed from these same stored rows, so an
-// un-upgraded agent's un-changed hash-only claim still hash-skips instead of
-// permanently mismatching. See SoftwareInventoryStore::canonical_hash_legacy.
+// distro_id, distro_version) — the same byte form the agent hashes (ADR-0016
+// §4), so the server re-hash matches. A v1 4-field record parses fine: the
+// token walk stops at the record's end, leaving fields 5–12 default-empty (the
+// documented mixed-version behaviour — an old agent's rows store with empty v2
+// columns). Tokens beyond the 12th are dropped. nullopt only when the blob
+// exceeds the cap; an empty list is a legitimate "nothing here".
 std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string& blob) {
     if (blob.size() > kMaxBlobBytes)
         return std::nullopt;
@@ -73,7 +63,7 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
         std::string_view rec(blob.data() + i, rec_end - i);
         if (!rec.empty()) {
             SoftwareEntry e;
-            std::string* fields[13] = {&e.name,
+            std::string* fields[12] = {&e.name,
                                        &e.version,
                                        &e.publisher,
                                        &e.install_date,
@@ -84,11 +74,10 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
                                        &e.arch,
                                        &e.signature_status,
                                        &e.distro_id,
-                                       &e.distro_version,
-                                       &e.bundle_id};
+                                       &e.distro_version};
             std::size_t fi = 0;
             std::size_t p = 0;
-            while (fi < 13) {
+            while (fi < 12) {
                 std::size_t f_end = rec.find('\x1f', p);
                 if (f_end == std::string_view::npos)
                     f_end = rec.size();

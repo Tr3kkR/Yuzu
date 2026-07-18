@@ -58,9 +58,7 @@ namespace yuzu::server {
 /// signature populate on Linux package managers per their capability (rpm =
 /// full; deb = no signature; apk/pacman = name/EVR only); Windows/macOS rows
 /// are kind=app with name/version/publisher only; distro_id/distro_version are
-/// stamped on every Linux row from /etc/os-release. macOS rows additionally
-/// carry publisher/signature_status (codesign-derived) and bundle_id (mdls
-/// CFBundleIdentifier) — every other ecosystem leaves bundle_id EMPTY.
+/// stamped on every Linux row from /etc/os-release.
 struct SoftwareEntry {
     std::string name;
     std::string version; // upstream version, release/revision stripped (v2)
@@ -71,10 +69,9 @@ struct SoftwareEntry {
     std::string epoch;
     std::string release;   // rpm RELEASE / deb revision / apk pkgrel
     std::string arch;
-    std::string signature_status; // "signed"|"unsigned" (rpm stored tags / macOS codesign)
+    std::string signature_status; // "signed"|"unsigned" (rpm stored tags only)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
-    std::string bundle_id;        // macOS CFBundleIdentifier (macOS rows only)
 };
 
 /// One fleet-query row: which agent carries which entry.
@@ -158,32 +155,10 @@ public:
     /// (ADR-0016 §4). Pure/deterministic; takes its argument by value.
     [[nodiscard]] static std::string canonical_hash(std::vector<SoftwareEntry> entries);
 
-    /// LEGACY (pre-bundle_id) canonical content hash: identical algorithm to
-    /// `canonical_hash` but the 13th field (bundle_id) is OMITTED entirely
-    /// from the canonical string (no trailing 0x1F for it either) — the
-    /// exact bytes an un-upgraded (12-field v2) agent computes.
-    ///
-    /// ADR-0016 Update (version-aware hashing, BR-01): this branch appended
-    /// bundle_id as a 13th canonical field. Without this, ANY full re-ingest
-    /// of an un-upgraded agent's rows stores the NEW 13-field hash as
-    /// `content_hash`, and every subsequent hash-only report from that agent
-    /// (which still computes the OLD 12-field hash — its binary hasn't
-    /// changed) permanently mismatches → need_full every cycle, fleet-wide,
-    /// until every agent upgrades. `apply_installed_software` stores this
-    /// ALONGSIDE `canonical_hash`'s result at every full ingest so the
-    /// hash-only compare can accept EITHER form — the 13-field hash remains
-    /// the one true stored/replaced value; this is purely an additional
-    /// accepted match. Pure/deterministic; takes its argument by value.
-    [[nodiscard]] static std::string canonical_hash_legacy(std::vector<SoftwareEntry> entries);
-
     /// Hash-skip ingest for the `installed_software` source (ADR-0016 §4).
     ///  - `rows == std::nullopt` → hash-only report: compare `claimed_hash`
-    ///    against the stored hash, accepting EITHER the current 13-field form
-    ///    or the legacy 12-field form (`canonical_hash_legacy`) — both
-    ///    recomputed from the same rows at the last full ingest (ADR-0016
-    ///    Update, BR-01 version-aware hashing). Match against either → bump
-    ///    last_seen (kTouched); no record or a match against neither →
-    ///    kNeedFull.
+    ///    against the stored hash. Match → bump last_seen (kTouched); no record
+    ///    or mismatch → kNeedFull.
     ///  - `rows` set → full payload: the server **recomputes** the canonical
     ///    hash from these rows and stores THAT (never trusts `claimed_hash`),
     ///    replacing all of this agent's rows + upserting the parent in one

@@ -6,17 +6,14 @@
  *   "query" — Searches for a specific app by name (partial match).
  *             Params: name (required).
  *   "list_inventory" — machine-scope software inventory for the daily sync
- *             (blob contract v2, ADR-0016). Emits the extended 13-field rows;
+ *             (blob contract v2, ADR-0016). Emits the extended 12-field rows;
  *             fields an ecosystem does not store are EMPTY, never synthesised
- *             (no "-" placeholders, no sentinel row on an empty result). On
- *             macOS, publisher/signature_status/bundle_id are derived via
- *             subprocess (codesign/mdls against the app bundle path) — never
- *             fabricated; EMPTY when the relevant tool is unavailable.
+ *             (no "-" placeholders, no sentinel row on an empty result).
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   app|name|version|publisher|install_date                       (list/query)
  *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
- *       signature_status|distro_id|distro_version|bundle_id       (list_inventory)
+ *       signature_status|distro_id|distro_version                 (list_inventory)
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
  * (content/definitions/installed_apps.yaml et al.) — extend `list_inventory`,
@@ -29,7 +26,6 @@
 #include <array>
 #include <cstdio>
 #include <format>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -68,18 +64,13 @@ namespace {
 std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
-    // RAII owner: a raw FILE* would leak the pipe (and never reap the child)
-    // if appending captured output throws before a manual pclose() ran. The
-    // per-app codesign/mdls calls (A-1.10) exercise this path far more often
-    // than the prior single system_profiler call, so the exception-safety
-    // gap is worth closing now rather than deferring it.
-    std::unique_ptr<FILE, decltype(&pclose)> pipe{popen(cmd, "r"), &pclose};
+    FILE* pipe = popen(cmd, "r");
     if (!pipe)
         return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get())) {
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-    pipe.reset(); // close + reap before scanning the trailing newline/CR
+    pclose(pipe);
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
@@ -99,10 +90,6 @@ struct AppInfo {
     std::string version;
     std::string publisher;
     std::string install_date;
-    std::string path; // macOS bundle path (system_profiler Location:) -- subprocess
-                       // input for the v2 inventory's publisher/signature_status/
-                       // bundle_id only; never part of the legacy list/query/
-                       // list_per_user rows (empty on every other platform).
 };
 
 // Case-insensitive substring match
@@ -339,27 +326,43 @@ std::vector<AppInfo> get_installed_apps_linux() {
 
 // ── macOS: list GUI apps and packages ─────────────────────────────────────
 
-namespace inv = yuzu::installed_apps::inventory;
-
 #ifdef __APPLE__
 std::vector<AppInfo> get_installed_apps_macos() {
     std::vector<AppInfo> apps;
 
-    // GUI applications from system_profiler. Location: (the bundle path) is
-    // captured alongside Version:/Last Modified: -- it never reaches the
-    // legacy list/query row (do_list/do_query never read AppInfo.path), but
-    // the v2 inventory collector (get_inventory_macos, below) needs it to run
-    // per-app codesign/mdls subprocess calls. The actual header-vs-metadata
-    // parsing lives in inv::parse_macos_app_headers (installed_apps_inventory.hpp)
-    // -- a pure function, so its indentation-depth handling (an app literally
-    // named "Version"/"Last Modified"/"Location" must start a new record, not
-    // be misread as the PRECEDING app's own field) is unit-testable without
-    // system_profiler on the test host.
+    // GUI applications from system_profiler
     auto out = run_command("system_profiler SPApplicationsDataType -detailLevel mini 2>/dev/null"
-                           " | grep -E '^ {4}\\w|Version:|Last Modified:|Location:' ");
-    for (auto& hdr : inv::parse_macos_app_headers(out)) {
-        apps.push_back({std::move(hdr.name), std::move(hdr.version), "-",
-                        std::move(hdr.last_modified), std::move(hdr.location)});
+                           " | grep -E '^ {4}\\w|Version:|Last Modified:' ");
+    if (!out.empty()) {
+        std::istringstream ss(out);
+        std::string line;
+        std::string current_name;
+        std::string current_version;
+        std::string current_date;
+        while (std::getline(ss, line)) {
+            // Trim leading whitespace
+            auto start = line.find_first_not_of(" \t");
+            if (start == std::string::npos)
+                continue;
+            line = line.substr(start);
+
+            if (line.find("Version:") == 0) {
+                current_version = line.substr(line.find(':') + 2);
+            } else if (line.find("Last Modified:") == 0) {
+                current_date = line.substr(line.find(':') + 2);
+            } else if (!line.empty() && line.back() == ':') {
+                // Emit previous app
+                if (!current_name.empty()) {
+                    apps.push_back({current_name, current_version, "-", current_date});
+                }
+                current_name = line.substr(0, line.size() - 1);
+                current_version.clear();
+                current_date.clear();
+            }
+        }
+        if (!current_name.empty()) {
+            apps.push_back({current_name, current_version, "-", current_date});
+        }
     }
 
     std::sort(apps.begin(), apps.end(),
@@ -369,6 +372,8 @@ std::vector<AppInfo> get_installed_apps_macos() {
 #endif
 
 // ── list_inventory collectors (blob contract v2) ──────────────────────────
+
+namespace inv = yuzu::installed_apps::inventory;
 
 #ifdef _WIN32
 std::vector<inv::InvRecord> get_inventory_windows() {
@@ -454,87 +459,19 @@ std::vector<inv::InvRecord> get_inventory_linux() {
 #endif
 
 #ifdef __APPLE__
-
-// POSIX single-quote escaping for a subprocess argument interpolated into a
-// shell command line (mirrors agents/plugins/license_scan/src/licensing_linux.cpp's
-// shell_single_quote exactly): wrap in '...', turning each embedded ' into
-// '\'' so run_command's popen(cmd, "r") (== `/bin/sh -c cmd`) can never
-// misparse an app bundle path as extra shell syntax.
-std::string shell_single_quote(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 2);
-    out += '\'';
-    for (char c : s) {
-        if (c == '\'')
-            out += "'\\''";
-        else
-            out += c;
-    }
-    out += '\'';
-    return out;
-}
-
-// codesign-derived signing identity for one macOS app bundle (subprocess
-// only -- no Security.framework link, so installed_apps/meson.build stays
-// unchanged). Maps to the EXISTING signed/unsigned vocabulary
-// (installed_apps_inventory.hpp) via inv::parse_codesign_output -- see that
-// function for the affirmative-negative-claim policy. `codesign_available`
-// is resolved ONCE per collection by the caller (get_inventory_macos), not
-// re-probed via a `command -v` subprocess for every app: the tool's presence
-// on PATH cannot change mid-collection, so re-checking it N times only adds
-// N blocking subprocess launches for a constant answer. Honest-empty ONLY
-// when codesign itself is unavailable -- never based on the app's own
-// properties.
-inv::MacosSignature codesign_info(const std::string& app_path, bool codesign_available) {
-    if (!codesign_available)
-        return {}; // honest-empty: the tool itself is unavailable
-    const std::string out =
-        run_command(("codesign -dvvv " + shell_single_quote(app_path) + " 2>&1").c_str());
-    return inv::parse_codesign_output(out);
-}
-
-// CFBundleIdentifier for one macOS app bundle, via `mdls` (Spotlight
-// metadata -- subprocess only, no framework link). `mdls_available` is
-// resolved ONCE per collection by the caller, for the same reason as
-// `codesign_available` above. Parsing (honest-empty when mdls is unavailable,
-// the path doesn't resolve, or the attribute is genuinely unset) lives in
-// inv::parse_mdls_bundle_id_output.
-std::string mdls_bundle_id(const std::string& app_path, bool mdls_available) {
-    if (!mdls_available)
-        return {};
-    const std::string out = run_command(("mdls -name kMDItemCFBundleIdentifier " +
-                                         shell_single_quote(app_path) + " 2>/dev/null")
-                                             .c_str());
-    return inv::parse_mdls_bundle_id_output(out);
-}
-
 std::vector<inv::InvRecord> get_inventory_macos() {
     std::vector<inv::InvRecord> recs;
-    // Resolved ONCE for the whole collection, not per-app: `codesign`/`mdls`
-    // either exist on PATH for this host or they don't, so probing that via
-    // `command -v` (itself a subprocess launch) inside the per-app loop below
-    // only multiplies blocking shell launches for an answer that cannot
-    // change between apps in one collection pass.
-    const bool codesign_available = command_exists("codesign");
-    const bool mdls_available = command_exists("mdls");
     for (auto& app : get_installed_apps_macos()) {
         inv::InvRecord r;
         r.name = std::move(app.name);
         r.version = std::move(app.version);
+        // system_profiler mini exposes no publisher; the legacy collector
+        // stores a "-" placeholder which must NOT leak into v2 rows.
+        if (app.publisher != "-")
+            r.publisher = std::move(app.publisher);
         r.install_date = std::move(app.install_date); // Last Modified
         r.kind = "app";
         r.ecosystem = "macos";
-        // publisher / signature_status / bundle_id: subprocess-derived
-        // (codesign/mdls) against the bundle path system_profiler reported.
-        // AppInfo.publisher (always "-", the legacy list placeholder) is
-        // deliberately never read here -- honest-empty when the path is
-        // unknown, never the placeholder, never fabricated.
-        if (!app.path.empty()) {
-            const inv::MacosSignature cs = codesign_info(app.path, codesign_available);
-            r.publisher = cs.publisher;
-            r.signature_status = cs.signature_status;
-            r.bundle_id = mdls_bundle_id(app.path, mdls_available);
-        }
         // "homebrew" stays a reserved ecosystem value: brew is per-user
         // (list_per_user) and out of machine-scope this slice.
         recs.push_back(std::move(r));
