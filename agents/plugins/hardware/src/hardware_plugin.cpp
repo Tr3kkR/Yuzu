@@ -31,6 +31,10 @@
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+
+#include <nlohmann/json.hpp>
+
+#include "hardware_disks_macos.hpp"
 #endif
 
 #ifdef _WIN32
@@ -630,35 +634,10 @@ int do_disks(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto diskutil = run_command("diskutil list -plist 2>/dev/null");
-    // Simpler approach: use system_profiler
-    auto sp = run_command(
-        "system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType 2>/dev/null"
-        " | grep -E '(Medium Type|Capacity|Device Name|Model)'"
-        " | head -20");
-    if (!sp.empty()) {
-        // Just output raw key-value pairs
-        std::istringstream ss(sp);
-        std::string line;
-        int idx = 0;
-        while (std::getline(ss, line)) {
-            auto colon = line.find(':');
-            if (colon != std::string::npos) {
-                auto key = line.substr(0, colon);
-                auto val = line.substr(colon + 1);
-                // Trim
-                auto ks = key.find_first_not_of(" \t");
-                if (ks != std::string::npos)
-                    key = key.substr(ks);
-                auto vs = val.find_first_not_of(" \t");
-                if (vs != std::string::npos)
-                    val = val.substr(vs);
-                ctx.write_output(std::format("disk|{}|{}|{}|disk|unknown", idx++, key, val));
-            }
-        }
-    }
-    if (sp.empty()) {
-        ctx.write_output("disk|0|unknown|0|unknown|unknown");
+    auto sp_json = run_command(
+        "system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json 2>/dev/null");
+    for (const auto& row : yuzu::hardware::macos::macos_disk_rows_or_sentinel(sp_json)) {
+        ctx.write_output(row);
     }
 
 #elif defined(_WIN32)

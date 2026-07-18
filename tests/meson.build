@@ -162,6 +162,7 @@ agent_test_exe = executable(
     'unit/test_guardian_emit_decider.cpp',
     'unit/test_guardian_rule_eval.cpp',
     'unit/test_guardian_outbox.cpp',
+    'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_spark_runtime.cpp',
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',
@@ -171,6 +172,7 @@ agent_test_exe = executable(
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
+    'unit/test_firewall_parsers.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -183,15 +185,18 @@ agent_test_exe = executable(
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
+    'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly

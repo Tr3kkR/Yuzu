@@ -71,7 +71,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | event_logs | `sanitize_input()` | PowerShell, journalctl, log |
 | os_info | `format_uptime()` | uname, sysctl, registry |
 | netstat | TCP state enums, IP parsing | GetExtendedTcpTable, /proc/net |
-| firewall | Netsh output parsing | netsh, firewall-cmd, ufw |
+| firewall | Netsh output parsing; macOS parsers (`firewall_parsers.hpp` — socketfilterfw global state, pfctl status) in `test_firewall_parsers.cpp` | netsh, firewall-cmd, ufw, socketfilterfw, pfctl |
 | services | Service state/startup enums | SCManager, systemctl, launchctl |
 | diagnostics | Uptime calculation | Plugin context reads |
 | network_config | MAC formatting, IP parsing | GetAdaptersAddresses, ip/ifconfig |

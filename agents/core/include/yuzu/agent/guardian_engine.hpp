@@ -99,8 +99,12 @@ public:
     ///                   legacy - a failure must be visible (errored via
     ///                   get_status()'s existing fail-closed behaviour), not
     ///                   silently absorbed (the mutual-exclusion invariant).
-    ///   Available     - spark_runtime_/spark_scheduler_/the drain worker are
-    ///                   live; the reconcile op classifies per-rule from here.
+    ///   Available     - the spark path is wired and could run: spark_runtime_ is
+    ///                   live and the reconcile op classifies per-rule from here.
+    ///                   The convergence scheduler + drain worker are CONSTRUCTED
+    ///                   but STARTED only when prefer_spark_ is set (rung 7.7b) -
+    ///                   at prefer_spark_=false nothing places on spark, so their
+    ///                   threads would be pure overhead; see wire_spark_engine().
     enum class SparkAvailability { Unwired, SparkDisabled, SparkFailed, Available };
 
     /// The KvStore pointer may be null at construction (e.g. KV open
@@ -188,10 +192,12 @@ public:
 
     /// Wire the spark detection path, once, before start_local() (agent.cpp,
     /// rung 7.7): builds the reader, the SparkEngine backend adapter, the
-    /// runtime, registers the SparkEngine consumer, starts the convergence
-    /// scheduler and the outbox drain worker - an all-or-nothing transaction
-    /// (ANY step failing after `engine` is confirmed non-null rolls every
-    /// partial construction back and reports SparkFailed; see the .cpp for
+    /// runtime, registers the SparkEngine consumer, and constructs the
+    /// convergence scheduler and the outbox drain worker - starting their
+    /// threads only when prefer_spark_ is set (rung 7.7b); at prefer_spark_=false
+    /// they are created but idle (nothing places on spark). An all-or-nothing
+    /// transaction (ANY step failing after `engine` is confirmed non-null rolls
+    /// every partial construction back and reports SparkFailed; see the .cpp for
     /// the exact rollback sequence). `engine` is a BORROWED pointer, safe
     /// only because of the agent.cpp member-declaration-order guarantee that
     /// spark_engine_ outlives this GuardianEngine's teardown (spark_engine_ is

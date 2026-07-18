@@ -192,12 +192,24 @@ template <class Fn>
 
 class GuardianIoExecutor {
 public:
+    /// Process-wide ceiling on concurrent bounded-I/O workers, and the compile-time
+    /// tripwire for the per-class quotas. The process bound is DERIVED as the sum of
+    /// the class quotas (see the ctor), which makes the per-class bulkheads EXACT: a
+    /// class cap always binds before the process bound can, so no class is ever starved
+    /// by another saturating a different lane (ADR-0021 rung 9a, R3 - this replaces the
+    /// prior independent `total_quota{8} < sum(10)`, which let File+Registry starve
+    /// Service to 1 of its 3 slots with nothing wedged). A new IoClass or a raised
+    /// default that pushes the sum past this ceiling fails the static_assert below:
+    /// raise the ceiling deliberately, or shrink a class - never silently oversubscribe.
+    static constexpr int kMaxProcessIoWorkers = 10;
+
     struct Config {
         int file_quota{4};
         int registry_quota{3};
         int service_quota{3};
-        int total_quota{8}; ///< process bound; < sum(class quotas) so it actually binds
     };
+    // (The tripwire static_assert lives just after this class - a Config{} default
+    // member initializer cannot be read inside the still-incomplete enclosing class.)
 
     /// Cumulative, rate-safe per-class counters (no per-rejection / per-retry log).
     struct Counters {
@@ -219,10 +231,28 @@ public:
 
     GuardianIoExecutor() : GuardianIoExecutor(Config{}) {}
     explicit GuardianIoExecutor(Config cfg) : state_(std::make_shared<State>()) {
-        state_->class_quota[io_class_index(IoClass::File)] = cfg.file_quota;
-        state_->class_quota[io_class_index(IoClass::Registry)] = cfg.registry_quota;
-        state_->class_quota[io_class_index(IoClass::Service)] = cfg.service_quota;
-        state_->total_quota = cfg.total_quota;
+        // Clamp each class quota to [1, kMaxProcessIoWorkers]: a class must be able to
+        // admit at least one read (a 0 or negative quota would silently reject every
+        // read of that class), and no single class may exceed the process ceiling.
+        // Production uses the static-asserted defaults; this guards an injected Config.
+        const auto clamp_q = [](int q) {
+            return q < 1 ? 1 : (q > kMaxProcessIoWorkers ? kMaxProcessIoWorkers : q);
+        };
+        const int f = clamp_q(cfg.file_quota);
+        const int r = clamp_q(cfg.registry_quota);
+        const int s = clamp_q(cfg.service_quota);
+        state_->class_quota[io_class_index(IoClass::File)] = f;
+        state_->class_quota[io_class_index(IoClass::Registry)] = r;
+        state_->class_quota[io_class_index(IoClass::Service)] = s;
+        // Derive the process bound from the class quotas so the bulkheads are EXACT:
+        // total == sum(class quotas) means the process check can never bind before a
+        // class cap does, so it never starves a lane. But an injected Config whose
+        // quotas sum past the ceiling (tests) must still never spawn more than
+        // kMaxProcessIoWorkers - so clamp. For a well-formed Config sum <= ceiling, so
+        // the clamp is inert and the bulkheads stay exact. Kept as a live admission
+        // guard (belt-and-braces, provably inert for a well-formed Config).
+        const int sum = f + r + s;
+        state_->total_quota = sum <= kMaxProcessIoWorkers ? sum : kMaxProcessIoWorkers;
     }
     GuardianIoExecutor(const GuardianIoExecutor&) = delete;
     GuardianIoExecutor& operator=(const GuardianIoExecutor&) = delete;
@@ -489,5 +519,25 @@ private:
     std::shared_ptr<State> state_;
     std::atomic<bool> fail_launch_for_test_{false};
 };
+
+// Tripwires (ADR-0021 rung 9a R3), at namespace scope so Config{}'s default member
+// initializers are readable (they are not, inside the still-incomplete class).
+//
+// (1) Config carries EXACTLY the current IoClass set: adding an IoClass (which bumps
+// kIoClassCount) fails this assert, forcing whoever adds it to give the class a quota
+// AND extend the oversubscription sum below - so a new class can neither default to a
+// 0 quota (silent never-admit) nor escape the ceiling check.
+static_assert(kIoClassCount == 3,
+              "A new IoClass was added: give it a Config quota and extend the "
+              "oversubscription tripwire below to include it (ADR-0021 rung 9a R3).");
+// (2) The default per-class quotas must not oversubscribe the process worker ceiling.
+// A raised default (or the new class from (1)) that pushes the sum past
+// kMaxProcessIoWorkers fails here - raise the ceiling deliberately or shrink a class,
+// never silently oversubscribe.
+static_assert(GuardianIoExecutor::Config{}.file_quota
+                      + GuardianIoExecutor::Config{}.registry_quota
+                      + GuardianIoExecutor::Config{}.service_quota
+                  <= GuardianIoExecutor::kMaxProcessIoWorkers,
+              "per-class I/O quotas oversubscribe kMaxProcessIoWorkers");
 
 } // namespace yuzu::agent
