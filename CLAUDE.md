@@ -23,9 +23,9 @@ Full component reference: `docs/architecture.md`.
 
 ## Glossary — three meanings of "agent"
 
-The word **agent** is overloaded; this file relies on these definitions — use the disambiguated form in commits, PRs, and new docs:
+**Agent** is overloaded — use the disambiguated form in commits, PRs, and new docs:
 
-- **Agent daemon** — the C++ binary in `agents/core/` on each managed endpoint that executes plugins (the usual meaning of "agent" here).
+- **Agent daemon** — the C++ binary in `agents/core/` on each managed endpoint that executes plugins (the usual meaning here).
 - **Governance agent** — the `.claude/agents/*.md` review actors run during `/governance`.
 - **Agentic worker** — an external LLM-driven client driving Yuzu via MCP, REST, or the dashboard (agentic-first, `docs/agentic-first-principle.md`).
 
@@ -126,7 +126,7 @@ Every test target carries a `suite:` label (`agent`, `tar`, `server`) so `--suit
 meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
 ```
 
-Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
+Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
 
 ### Direct binary invocation
 
@@ -169,13 +169,13 @@ docs/             Architecture docs, conventions, roadmap, capability map
 
 Three-tier split: Tier 1 PR fast-path (`ci.yml`, one Linux + Windows + macOS + `proto-compat`, <10 min), Tier 2 push to dev/main (full matrix, no sanitizers/coverage, #410), Tier 3 nightly (`nightly.yml`, sanitizers + coverage — failure auto-opens `nightly-broken`; **no merge to main while it is open**). `workflow_dispatch`/cron fire only once the workflow file is on `main` — new workflows on `dev` are dormant until merged. Full reference: `docs/ci-architecture.md`; `build-ci` owns the matrix, `cross-platform` the Windows/macOS specifics.
 
-**Standing invariant — failure-path `if:` guards need an explicit status function.** A GitHub Actions `if:` containing **no** status-check function (`success()`/`failure()`/`always()`/`cancelled()`) has an implicit `success()` ANDed onto it. So `if: steps.X.outcome == 'failure'` is **unsatisfiable** — `success()` is already false the moment X fails, so the step can never run. Every failure-path step (diagnostics, stack captures, artifact uploads on red) must lead with `failure() && …` or `failure() || cancelled()` explicitly. This silently skipped the nightly TSan gdb capture on every red nightly for two months (#1038); `grep -n "outcome ==" .github/workflows/` before trusting any failure-path guard.
+**Standing invariant — failure-path `if:` guards need an explicit status function.** A GitHub Actions `if:` containing **no** status-check function (`success()`/`failure()`/`always()`/`cancelled()`) has an implicit `success()` ANDed onto it. So `if: steps.X.outcome == 'failure'` is **unsatisfiable** — `success()` is already false the moment X fails. Every failure-path step (diagnostics, stack captures, artifact uploads on red) must lead with `failure() && …` or `failure() || cancelled()` explicitly. This silently skipped the nightly TSan gdb capture on every red nightly for two months (#1038); `grep -n "outcome ==" .github/workflows/` before trusting any failure-path guard.
 
 ## Release workflow gates
 
 The `release:` job (`.github/workflows/release.yml`) runs `scripts/check-compose-versions.sh` **first** — it rejects any tracked-compose `ghcr.io/<owner>/yuzu-{server,gateway,agent}(-chisel)?:X.Y.Z` that is a bare numeric tag or a `${YUZU_VERSION:-...}` default ≠ the tag being released (floating tags ignored). **Before tagging**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify: `bash scripts/check-compose-versions.sh 0.12.0` — else the job fails only after the full build matrix. New compose file ⇒ add it to the script's `FILES` array (auto-discovery is deliberately off).
 
-Additionally, `docker-publish`/`docker-publish-chisel` run `scripts/ci/verify-healthcheck-invariants.sh` **between build and push** (#751), so an image whose compose healthcheck tool (bash+`/dev/tcp`, busybox `wget --spider`) has silently gone missing is never published. The same gate runs on PRs via `docker-healthcheck-invariants.yml`. See `docs/ci-architecture.md` → "Gates outside the tier ladder".
+`docker-publish`/`docker-publish-chisel` also run `scripts/ci/verify-healthcheck-invariants.sh` **between build and push** (#751), so an image whose compose healthcheck tool (bash+`/dev/tcp`, busybox `wget --spider`) has silently gone missing is never published. The same gate runs on PRs via `docker-healthcheck-invariants.yml`. See `docs/ci-architecture.md` → "Gates outside the tier ladder".
 
 ## Changelog
 
@@ -183,7 +183,7 @@ Additionally, `docker-publish`/`docker-publish-chisel` run `scripts/ci/verify-he
 
 ## Routed concerns (read the doc, not this file)
 
-The trigger table — one row per concern: the catastrophic-if-violated invariants, the routed doc, and which agents load it — is imported from `.claude/routed-concerns.md` (same authority and loading semantics as this file; split out only so each file stays under the 40k-per-file ceiling):
+One row per concern — catastrophic-if-violated invariants, routed doc, loading agents — imported from `.claude/routed-concerns.md` (same authority as this file; split out only for the 40k-per-file ceiling):
 
 @.claude/routed-concerns.md
 
@@ -193,7 +193,7 @@ Working on Guardian / Guaranteed State? **Read `docs/yuzu-guardian-design-v1.1.m
 
 ## Test conventions — shared helpers
 
-Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` / `yuzu::test::TempDir` from `tests/unit/test_helpers.hpp` for any test temp file, SQLite DB, or scratch dir. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation (flake #473; #482). Pass a **`yuzu_test_` (underscore) prefix** so names land inside the Wee Tam Defender path-exclusion wildcard `yuzu_*` (`scripts/windows-runner-defender-exclusions.ps1`) — the helpers' default `yuzu-test-` (hyphen) prefix does NOT match it; all three helpers take an explicit prefix for exactly this.
+Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` / `yuzu::test::TempDir` from `tests/unit/test_helpers.hpp` for any test temp file, SQLite DB, or scratch dir. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation (flake #473; #482). Pass a **`yuzu_test_` (underscore) prefix** so names land inside the Wee Tam Defender path-exclusion wildcard `yuzu_*` (`scripts/windows-runner-defender-exclusions.ps1`) — the helpers' default `yuzu-test-` (hyphen) prefix does NOT match it; all three helpers take an explicit prefix for this.
 
 **Standing invariant:** both self-hosted CI pools run 4 runner agents as ONE shared OS identity on ONE box — Windows "Wee Tam" (LOCAL SYSTEM, `deploy/windows/README.md`), Linux "Big Tam" (`runner` user sharing `$HOME`, `docs/ci-architecture.md`). A fixed registry key/port/named-object/path is a cross-JOB shared resource — two concurrent CI jobs on one box collide (#1871's `RegistryGuard` family; same bug on Linux gateway eunit `health_port`). Salt every such identifier per-test/per-process like `unique_temp_path()` — see `test_guard_registry.cpp`'s `TempRegKey`/`TempEnforceKey`.
 
@@ -205,7 +205,7 @@ For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUI
 
 The Matt Pocock engineering skills are **user-global**, not committed — they follow the operator. Re-run `/setup-matt-pocock-skills` to change.
 
-**`/dev-team`** is committed **project-level** (`.claude/skills/dev-team/`), *unlike* the Matt Pocock set above — so every collaborator gets it via git. It runs an Opus "senior" session that plans and delegates to Sonnet `junior-developer` subagents (scoped edits, targeted tests, then `/test --quick`), consulting a Fable `enterprise-architect` (both in `.claude/agents/`) for material or disputed calls, then integrates the result behind `/test` + `/governance`. Invoke `/dev-team <task>`. If Fable is unavailable in an environment, override `enterprise-architect`'s frontmatter to `model: opus` **as a local-only edit — do not commit it** (it is environment-specific; committing would force `model: opus` on every collaborator whose environment *does* have Fable). Keep the change out of any PR, or carry it via user-global config that shadows the committed agent file.
+**`/dev-team`** is committed **project-level** (`.claude/skills/dev-team/`), *unlike* the Matt Pocock set above — so every collaborator gets it via git. It runs an Opus "senior" session that plans and delegates to Sonnet `junior-developer` subagents (scoped edits, targeted tests, then `/test --quick`), consulting a Fable `enterprise-architect` (both in `.claude/agents/`) for material or disputed calls, then integrates the result behind `/test` + `/governance`. Invoke `/dev-team <task>`. If Fable is unavailable in an environment, override `enterprise-architect`'s frontmatter to `model: opus` **as a local-only edit — never committed or PR'd** (committing would force `model: opus` on collaborators whose environments *do* have Fable), or carry it via user-global config that shadows the committed agent file.
 
 ### Plugin scope — `frontend-design` is marketing-only
 
@@ -219,4 +219,4 @@ GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI (`docs/agents/issue-t
 
 ## CLAUDE.md updates
 
-Architectural decisions, new stores, churning subsystems, and cross-cutting concerns belong here; stable reference material an agent already loads belongs in `docs/` with a pointer here (heuristic: memory `feedback_claude_md_scope.md`; precedent: the Erlang gateway section → `docs/erlang-gateway-build.md`). Keep this file AND each file it imports under 40k characters each (the routed-concerns table lives in `.claude/routed-concerns.md`, imported above, precisely to give both their own budget) — routed-concern rows hold only the catastrophic-if-violated invariants + doc pointers; the detail goes in the routed doc.
+Architectural decisions, new stores, churning subsystems, and cross-cutting concerns belong here; stable reference material an agent already loads belongs in `docs/` with a pointer here (heuristic: memory `feedback_claude_md_scope.md`; precedent: the Erlang gateway section → `docs/erlang-gateway-build.md`). Keep this file AND each file it imports (the routed-concerns table, `.claude/routed-concerns.md`) under 40k characters each — routed-concern rows hold only the catastrophic-if-violated invariants + doc pointers; the detail goes in the routed doc.
