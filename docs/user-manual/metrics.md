@@ -383,8 +383,9 @@ label-exposure note under Security considerations before choosing a key.
 
 Published on every fleet-health sweep (~15 s), fed from the `yuzu.net_*`
 heartbeat tags (device-aggregate facts only — no per-destination data). A metric
-nobody reported is **absent**, never zero. **Linux and Windows agents emit
-network facts; macOS does not yet.** Windows reports throughput and an interval
+nobody reported is **absent**, never zero. **Linux, Windows, and macOS agents
+emit network facts** — macOS throughput only (retransmit + RTT deferred; see
+[Network Quality](network.md) → Platform coverage). Windows reports throughput and an interval
 retransmit rate but not RTT (per-connection RTT needs ESTATS — a later slice), so
 `yuzu_fleet_net_rtt_ms` stays Linux-only for now (see
 [Network Quality](network.md) → Platform coverage). The same numbers feed the

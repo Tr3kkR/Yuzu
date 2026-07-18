@@ -113,8 +113,8 @@ as the Linux/Windows paths. **Retransmit and RTT are deferred on macOS in v1.**
 The originally-planned retransmit source — the global `net.inet.tcp.stats` OID
 — is unusable: it returns an all-zero counter struct on current macOS (every
 field reads 0, matching Apple's own `netstat -s -p tcp`), so it cannot back a
-retransmit metric. A retransmit fact will follow from a per-flow source (the
-NetworkStatistics/`nstat` client, roadmap 2.x). Absent metrics are always
+retransmit metric. A retransmit fact will follow from a per-flow source (a planned
+NetworkStatistics/`nstat` client). Absent metrics are always
 omitted from rollups; a device that does not report a metric is excluded from
 that metric's denominator, never counted as zero.
 

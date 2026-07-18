@@ -438,6 +438,11 @@ NetCounters read_net_counters() {
         unsigned char type;
     };
     static_assert(sizeof(MsgPrefix) == 4);
+    // Pin the mirrored layout to the SDK's real headers — if Apple ever moved
+    // these fields, the walk would misparse silently without this.
+    static_assert(offsetof(struct if_msghdr2, ifm_msglen) == offsetof(MsgPrefix, msglen) &&
+                  offsetof(struct if_msghdr2, ifm_version) == offsetof(MsgPrefix, version) &&
+                  offsetof(struct if_msghdr2, ifm_type) == offsetof(MsgPrefix, type));
 
     while (remaining > 0) {
         if (remaining < sizeof(MsgPrefix))
