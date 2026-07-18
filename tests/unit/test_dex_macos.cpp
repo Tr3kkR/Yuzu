@@ -113,6 +113,18 @@ TEST_CASE("crash .ips falls back to body bundleInfo.CFBundleShortVersionString w
     CHECK(obs->version == "1.0.0.0");
 }
 
+TEST_CASE("crash .ips prefers header app_version over body bundleInfo when both are present",
+          "[dex_macos][crash][version]") {
+    const std::string ips = R"({"bug_type":"309","app_version":"3.2.1","name":"SomeApp"})"
+                            "\n"
+                            R"({"pid":1,"procName":"SomeApp","bundleInfo":{"CFBundleShortVersionString":"9.9"}})";
+    const auto obs = macos::parse_ips_report(ips);
+    REQUIRE(obs.has_value());
+    // The header value must win; a regression inverting ips_app_version's
+    // preference (or letting bundleInfo unconditionally override) yields 9.9.0.0.
+    CHECK(obs->version == "3.2.1.0");
+}
+
 TEST_CASE("crash extractor leaks no path / user content", "[dex_macos][crash][privacy]") {
     const auto obs = macos::parse_ips_report(kRealCrashIps);
     REQUIRE(obs.has_value());

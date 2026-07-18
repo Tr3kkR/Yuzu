@@ -202,6 +202,10 @@ std::string oslog_predicate() {
     // server-side so the agent never processes the full firehose (error/fault
     // pre-filter keeps the system-process clauses to the failure subset). Keep in
     // sync with the branches above when adding a signal class.
+    // NOTE the casing asymmetry: NSPredicate messageType enum values are
+    // lowercase ("error"/"fault") while the emitted JSON field is capitalized
+    // ("Error"/"Fault", matched by parse_oslog_event) — do not "clean up" either
+    // side to match the other; the predicate-parity unit test pins both.
     return R"((process == "launchd" AND eventMessage CONTAINS "exited due to"))"
            R"( OR (process == "symptomsd" AND eventMessage CONTAINS "LQM changed"))"
            R"( OR ((process == "softwareupdated" OR process == "cupsd" OR process == "mdmclient")"
