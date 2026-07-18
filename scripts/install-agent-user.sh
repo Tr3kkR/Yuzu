@@ -659,6 +659,25 @@ generate_pf_anchor_content() {
 EOF
 }
 
+# macos_anchor_file_is_released — true (0) if the anchor file is absent,
+# or present and byte-for-byte identical to the empty/released template
+# generate_pf_anchor_content() produces (i.e. no durable rules on disk).
+# False (1) if it exists and holds something else — real quarantine
+# rules that a future reload/reboot could reconstruct.
+macos_anchor_file_is_released() {
+    if [[ ! -f "$PF_ANCHOR_FILE" ]]; then
+        return 0
+    fi
+    local expected=""
+    expected=$(mktemp -t yuzu-pf-anchor-expected.XXXXXX)
+    trap 'rm -f "${expected:-}"; trap - RETURN' RETURN
+    generate_pf_anchor_content > "$expected"
+    if diff -q "$expected" "$PF_ANCHOR_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 macos_install_pf_anchor_file() {
     if [[ -f "$PF_ANCHOR_FILE" ]]; then
         log "pf anchor file already present: $PF_ANCHOR_FILE — leaving contents alone"
@@ -850,7 +869,11 @@ macos_reset_pf_anchor_file() {
     fi
 
     log "resetting $PF_ANCHOR_FILE to its empty/released form"
-    run install -m 0644 -o root -g wheel "$tmp" "$PF_ANCHOR_FILE"
+    if run install -m 0644 -o root -g wheel "$tmp" "$PF_ANCHOR_FILE"; then
+        return 0
+    fi
+    warn "could not reset $PF_ANCHOR_FILE to its empty/released form"
+    return 1
 }
 
 # 3. Remove ONLY the exact hook block macos_hook_pf_conf appends (banner
@@ -899,14 +922,65 @@ macos_unhook_pf_conf() {
     run install -m 0644 -o root -g wheel "$tmp" "$PF_CONF"
 }
 
+#
+# BR-002: a live-only flush is NOT sufficient to allow the caller to
+# proceed with removing the agent (sudoers grant, state dirs, user
+# account). It restores reachability right now, but if the DURABLE
+# on-disk state — the anchor file's contents, and/or the pf.conf hook —
+# still exists, the very next reboot or `pfctl -f /etc/pf.conf`
+# reconstructs the block, and with the agent's account/privileges gone
+# there is nothing left to release it. So each durable leg's outcome is
+# tracked, and this function returns 0 (safe to proceed) only when at
+# least one durable leg is CONFIRMED to leave no reconstructable
+# quarantine state behind — anchor file confirmed empty/released, OR
+# the pf.conf hook confirmed absent. It returns 1 (caller must abort
+# fail-closed, before touching anything else) otherwise, including the
+# terminal case where pfctl itself is missing while Yuzu pf artifacts
+# are still present, so teardown can't even be verified.
 macos_teardown_pf_anchor() {
     log "tearing down macOS pf quarantine anchor (account: $ACCOUNT_NAME)"
 
+    if ! command -v pfctl >/dev/null 2>&1; then
+        # pfctl missing entirely. If there is genuinely nothing to tear
+        # down (anchor file absent/already-released AND the pf.conf
+        # hook absent), this is a safe no-op. Otherwise teardown can be
+        # neither performed nor verified — proceeding risks stranding
+        # the host durably blocked with no agent left to release it.
+        local anchor_released=1 hook_present=0
+        macos_anchor_file_is_released || anchor_released=0
+        pf_conf_has_full_hook && hook_present=1
+
+        if [[ "$anchor_released" -eq 1 && "$hook_present" -eq 0 ]]; then
+            log "pfctl not found, but no Yuzu pf quarantine artifacts are present — nothing to tear down"
+            return 0
+        fi
+
+        warn "pfctl not found and Yuzu pf quarantine artifacts are present" \
+             "(anchor file released=$anchor_released, pf.conf hook present=$hook_present)" \
+             "— cannot verify or complete quarantine teardown without pfctl."
+        warn "refusing to remove the agent: doing so would leave this host with durable pf" \
+             "quarantine state and no agent able to release it on a future reboot or" \
+             "'pfctl -f $PF_CONF' reload."
+        warn "to proceed: make pfctl available (or run uninstall on a host where it is), or" \
+             "manually flush 'pfctl -a $PF_ANCHOR_NAME -F rules', reset $PF_ANCHOR_FILE to its" \
+             "empty form, and remove the anchor hook from $PF_CONF yourself, then re-run --uninstall."
+        return 1
+    fi
+
+    # 1. Live flush first, for temporary reachability, regardless of
+    #    what happens to the durable legs below.
     macos_flush_pf_anchor_rules
-    macos_reset_pf_anchor_file
+
+    # 2 & 3. Reset the durable legs and TRACK each outcome.
+    local anchor_safe=0 hook_safe=0
+
+    if macos_reset_pf_anchor_file; then
+        anchor_safe=1
+    fi
 
     if macos_unhook_pf_conf; then
-        if [[ "$DRY_RUN" -eq 0 ]] && command -v pfctl >/dev/null 2>&1 && [[ -f "$PF_CONF" ]]; then
+        hook_safe=1
+        if [[ "$DRY_RUN" -eq 0 ]] && [[ -f "$PF_CONF" ]]; then
             log "reloading $PF_CONF after removing the quarantine anchor hook"
             if ! pfctl -f "$PF_CONF" >/dev/null 2>&1; then
                 warn "pfctl -f $PF_CONF failed while tearing down the quarantine anchor" \
@@ -915,11 +989,23 @@ macos_teardown_pf_anchor() {
         fi
     else
         warn "failed to remove the quarantine anchor hook from $PF_CONF during uninstall" \
-             "— the live anchor rules were already flushed, so this host is not blocked right now," \
-             "but a future reboot / pfctl -f $PF_CONF reload will reconstruct an EMPTY anchor" \
-             "(step 2 already reset $PF_ANCHOR_FILE) via a hook that still points at it — finish" \
-             "removing the hook from $PF_CONF by hand to fully undo the install."
+             "— the live anchor rules were already flushed, so this host is not blocked right now."
     fi
+
+    if [[ "$anchor_safe" -eq 1 || "$hook_safe" -eq 1 ]]; then
+        log "durable pf quarantine state confirmed released (anchor reset=$anchor_safe, hook removed=$hook_safe) — safe to continue uninstall"
+        return 0
+    fi
+
+    warn "could not confirm durable pf quarantine teardown is safe: the anchor file" \
+         "$PF_ANCHOR_FILE could not be confirmed reset to its empty/released form, AND" \
+         "the pf.conf hook could not be confirmed removed from $PF_CONF."
+    warn "refusing to remove the agent: a future reboot or 'pfctl -f $PF_CONF' reload could" \
+         "reconstruct the stale quarantine ruleset with no agent left to release it."
+    warn "to proceed: fix whatever caused the failures above (permissions, a malformed" \
+         "$PF_CONF, etc.), or manually reset $PF_ANCHOR_FILE / remove the hook from $PF_CONF" \
+         "yourself, then re-run --uninstall."
+    return 1
 }
 
 # ── verification ────────────────────────────────────────────────────────────
@@ -1082,9 +1168,17 @@ case "$ACTION" in
         # pf teardown MUST run before anything else below: a host that is
         # currently quarantined must be released before we remove the
         # agent/user that would otherwise be relied on to release it —
-        # see macos_teardown_pf_anchor's block comment.
+        # see macos_teardown_pf_anchor's block comment. BR-002: if the
+        # durable side of that teardown can't be confirmed safe,
+        # macos_teardown_pf_anchor returns non-zero and we MUST abort
+        # here, before remove_sudoers/remove_state_dirs/macos_delete_user
+        # touch anything — removing those would strand the host with no
+        # agent left to release a quarantine a future reload could
+        # reconstruct.
         if [[ "$PLATFORM" == "macos" ]]; then
-            macos_teardown_pf_anchor
+            if ! macos_teardown_pf_anchor; then
+                fail "aborting uninstall: durable pf quarantine teardown could not be confirmed safe (see warnings above for manual remediation steps), re-run --uninstall once resolved"
+            fi
         fi
         remove_sudoers
         remove_state_dirs
