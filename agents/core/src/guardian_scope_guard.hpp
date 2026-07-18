@@ -27,14 +27,20 @@ namespace yuzu::agent {
 [[nodiscard]] YUZU_EXPORT std::uint64_t guardian_rollback_cleanup_failures() noexcept;
 
 /// A committed-or-rollback scope guard whose destructor NEVER propagates an
-/// exception. Set `fn` to the undo action and `committed = true` on the success
-/// path. Kept an aggregate (only data members + a user-declared destructor, which
-/// preserves aggregate-ness in C++20) so call sites can `GuardianRollback g{fn}` or
-/// default-construct then assign `g.fn`, exactly as the local ScopeExit guards did.
+/// exception. Default-construct it, set `fn` to the undo action, and set
+/// `committed = true` on the success path. NON-COPYABLE: a copy would run `fn` twice
+/// (double cleanup / double-disarm) - a real footgun now that it is a shared reusable
+/// type, so it is deleted rather than left implicitly copyable (cpp-safety + cpp-expert
+/// Gate 3). It is therefore not an aggregate; construct-then-assign `g.fn`, never
+/// `GuardianRollback g{fn}`.
 struct YUZU_EXPORT GuardianRollback {
     std::function<void()> fn;
     bool committed{false};
+
+    GuardianRollback() = default;
     ~GuardianRollback();
+    GuardianRollback(const GuardianRollback&) = delete;
+    GuardianRollback& operator=(const GuardianRollback&) = delete;
 };
 
 } // namespace yuzu::agent

@@ -219,8 +219,12 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         std::lock_guard<std::mutex> ob{outbox_mu_};
         outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
     }
-    if (known)
-        enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
+    // Disarm the shared watcher BEFORE the "disarmed" audit enqueue. enqueue_lifecycle_locked
+    // allocates; in the OLD order a throw there left the watcher ARMED while the rule was
+    // already gone from the index - a leaked OS watcher + keys_/index_ desync that breaks a
+    // future same-key re-attach (keys_.emplace no-ops on the stale key) (Gate 2 security
+    // LOW). A throw AFTER the disarm merely loses the audit entry; audit-after-teardown is
+    // the correct causal order anyway.
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
@@ -232,6 +236,8 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         if (kit != keys_.end())
             kit->second->pending_initial.erase(rule_id);
     }
+    if (known)
+        enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
 }
 
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
@@ -503,23 +509,18 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // could both peek+send the same head (duplicate delivery). drain_mu_ serialises them
     // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
     std::lock_guard<std::mutex> dg{drain_mu_};
-    // Lifecycle (audit) BEFORE compliance/health (Fable M6): a rule's "armed" entry must
-    // reach the server before its first drift.
+    // Drain lifecycle (audit) BEFORE compliance/health so a rule's "armed" precedes its
+    // first drift on the wire in the common case (stream up, both drain fully). This is
+    // BEST-EFFORT ordering, NOT a hard gate: an earlier version gated compliance on the
+    // lifecycle log being empty, but that let a lifecycle head that could not send (a
+    // persistent send throw) block ALL compliance/health for the agent indefinitely - a
+    // detection blackout, far worse than the narrow ordering blip it prevented (Gate 4
+    // UP-3). Both logs now drain every pass; failure isolation beats strict ordering.
+    // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
+    // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
+    // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
     std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_);
-    // Gate compliance on the lifecycle log fully draining. Draining lifecycle first only
-    // orders WITHIN a pass; a reconnect gap between the two phases could otherwise let a
-    // drift send while its "armed" was Retained (Fable M6 deterministic window). If the
-    // audit log did not clear (stream down, or a jammed entry surfaced by send_exceptions_
-    // above), hold compliance for the next pass rather than send a drift ahead of its arm.
-    // (A concurrent arm during the compliance phase can still be sent a pass late - the
-    // watertight fix is a merge-drain by global sequence, tracked as a follow-up.)
-    bool lifecycle_clear = false;
-    {
-        std::lock_guard<std::mutex> ob{outbox_mu_};
-        lifecycle_clear = lifecycle_log_.empty();
-    }
-    if (lifecycle_clear)
-        sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_);
+    sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_);
     return sent;
 }
 

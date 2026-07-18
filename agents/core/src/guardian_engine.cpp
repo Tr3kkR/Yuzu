@@ -302,6 +302,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (!kv_)
         return std::unexpected("kv store unavailable");
 
+    std::size_t applied = 0;
+    std::size_t reconcile_failures = 0;
     if (push.full_sync()) {
         const int cleared = kv_->clear(kKvNamespace);
         if (cleared > 0)
@@ -310,14 +312,28 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         persist_generation_locked();
         // Full sync replaces the active set - tear down BOTH backends before
         // re-arming (rung 7: a spark-attached rule the new push omits must be
-        // withdrawn too, not left dangling - Sol's rev-2 review).
-        stop_all_guards_locked();
-        if (spark_runtime_)
-            spark_runtime_->detach_all();
+        // withdrawn too, not left dangling - Sol's rev-2 review). FIREWALLED like the
+        // per-rule reconcile below: stop_all_guards_locked/detach_all allocate (lifecycle
+        // enqueue, disarm, Key strings), and a bad_alloc here would otherwise escape
+        // apply_rules onto the un-firewalled dispatch/run() thread and abort the whole
+        // agent - the same #2037 class the per-rule firewall closes, on the full_sync
+        // path (Gate 4 UP-1/UP-14). Count + hold the generation so the server retries,
+        // then proceed to re-arm what we can.
+        try {
+            stop_all_guards_locked();
+            if (spark_runtime_)
+                spark_runtime_->detach_all();
+        } catch (...) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("Guardian: full_sync teardown threw - partial teardown, "
+                              "holding generation for retry");
+            } catch (...) {
+            }
+        }
     }
 
-    std::size_t applied = 0;
-    std::size_t reconcile_failures = 0;
     for (const auto& rule : push.rules()) {
         if (rule.rule_id().empty()) {
             spdlog::warn("Guardian: skipping rule with empty rule_id (name={})", rule.name());
@@ -931,9 +947,10 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
     // the destructor always fires (Sol rung-7.5 review finding 2: the prior
     // explicit rollback_spark_wiring_locked() call inside each catch block
     // could be skipped if the logging call ahead of it threw).
-    GuardianRollback rollback{[this, engine, &registered, &consumer_id] {
+    GuardianRollback rollback;
+    rollback.fn = [this, engine, &registered, &consumer_id] {
         rollback_spark_wiring_locked(engine, registered, consumer_id);
-    }};
+    };
     try {
         spark_reader_ = std::make_shared<GuardianStateReader>();
         spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);

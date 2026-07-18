@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <latch>
 #include <memory>
 #include <string>
@@ -261,8 +262,12 @@ TEST_CASE("drain sends Lifecycle (armed) before Compliance (item 4 / Fable M6)",
     CHECK(got[1].domain == OutboxDomain::Compliance); // then the edge
 }
 
-TEST_CASE("drain holds compliance until the lifecycle log clears (item 4 / Fable M6 window)",
+TEST_CASE("drain does NOT let a stuck lifecycle head block compliance (Gate 4 UP-3)",
           "[spark][runtime]") {
+    // Regression for the M6-gate blackout: an earlier version gated compliance on the
+    // lifecycle log being empty, so a lifecycle head that could not send blocked ALL
+    // compliance/health indefinitely. Both logs must drain every pass (lifecycle first
+    // for best-effort ordering, but NO hard gate) so failure isolation holds.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
@@ -271,26 +276,16 @@ TEST_CASE("drain holds compliance until the lifecycle log clears (item 4 / Fable
     rt->evaluate_key(key, EvalReason::Initial);                           // Compliance edge
     REQUIRE(rt->outbox_size() == 1);
 
-    // A stream gap on the lifecycle send: Retain the "armed". Compliance must NOT send
-    // this pass - a drift ahead of its armed would invert the audit trail.
+    // Retain the lifecycle head (as if its send keeps failing); compliance must STILL drain.
     std::vector<OutboxDomain> got;
     rt->drain([&](const OutboxEntry& e) {
         got.push_back(e.domain);
         return e.domain == OutboxDomain::Lifecycle ? SendResult::Retain : SendResult::Sent;
     });
-    REQUIRE(got.size() == 1);                 // only the lifecycle attempt happened
-    CHECK(got[0] == OutboxDomain::Lifecycle); // ...which Retained
-    CHECK(rt->outbox_size() == 1);            // compliance HELD, not sent
-
-    // Stream restored: both send, armed first.
-    got.clear();
-    rt->drain([&](const OutboxEntry& e) {
-        got.push_back(e.domain);
-        return SendResult::Sent;
-    });
+    CHECK(rt->outbox_size() == 0); // compliance drained despite the stuck lifecycle head
     REQUIRE(got.size() == 2);
-    CHECK(got[0] == OutboxDomain::Lifecycle);
-    CHECK(got[1] == OutboxDomain::Compliance);
+    CHECK(got[0] == OutboxDomain::Lifecycle);  // attempted first (best-effort ordering)
+    CHECK(got[1] == OutboxDomain::Compliance); // then compliance, NOT blocked
 }
 
 TEST_CASE("drain counts a send that throws and retains the head (item 4 hardening)",
@@ -321,14 +316,23 @@ TEST_CASE("drain releases outbox_mu_ during send - no head-of-line block (item 4
     auto rt = make_rt(r, b);
     rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // enqueues an "armed"
 
-    bool callback_ran = false;
-    const std::size_t sent = rt->drain([&](const OutboxEntry&) {
-        (void)rt->outbox_size(); // takes outbox_mu_ - would DEADLOCK if held across send
-        callback_ran = true;
-        return SendResult::Sent;
+    // Run the drain on a separate thread with a timeout so a REGRESSION (self-deadlock
+    // when the send runs under outbox_mu_) fails FAST here instead of burning the 240s
+    // binary-level CI timeout and killing every other test in the run (quality Gate 3).
+    // The blocked thread would hold only locks local to this test's rt - safe to abandon.
+    std::atomic<bool> callback_ran{false};
+    std::atomic<std::size_t> sent{0};
+    auto fut = std::async(std::launch::async, [&] {
+        sent = rt->drain([&](const OutboxEntry&) {
+            (void)rt->outbox_size(); // takes outbox_mu_ - would DEADLOCK if held across send
+            callback_ran = true;
+            return SendResult::Sent;
+        });
     });
-    CHECK(callback_ran);
-    CHECK(sent == 1);
+    REQUIRE(fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready); // no deadlock
+    fut.get();
+    CHECK(callback_ran.load());
+    CHECK(sent.load() == 1);
 }
 
 TEST_CASE("detach purges a rule's buffered (undrained) outbox entries", "[spark][runtime]") {

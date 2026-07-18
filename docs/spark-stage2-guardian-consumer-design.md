@@ -283,7 +283,9 @@ their normal lane cadence.
    (`:441`) across `send_guardian_outbox_entry`'s synchronous gRPC `Write()`
    (`agent.cpp:2700`); the stall cascade is `Write` → `outbox_mu_` → `evaluate_key`
    commit under `registry_mu_` → `apply_rules` under engine `mtx_` → heartbeat/status.
-   Restructure to peek/copy → unlock → send → conditional-remove by `event_id`+generation.
+   Restructure to peek/copy → unlock → send → conditional-remove by `event_id` alone
+   (globally unique per enqueue — `agent_id`+boot-nonce+`rule_id`+ms+seq — so it pins the
+   exact sent node with no separate generation check; as implemented, `pop_front_if`).
    Sub-contracts: `drain_once()` is public/off-thread-callable → keep a drain-in-progress
    guard; the lifecycle log has no index (`guardian_outbox.hpp:294`) → conditional-remove
    needs a front-`event_id` check; a coalesce during the unlocked send replaces the node
@@ -1015,6 +1017,24 @@ Each rung is an independently-governed PR on `dev`, run through the full
    - **7.7b — SPLIT into two governed PRs (settled 2026-07-18, §7.7b split below).**
      Three reviewers (Sol/Codex, Claude, Fable) found the send/placement path is not
      yet safe to make live in one PR. The flip is the **last commit** either way.
+
+     **PR-1 is itself landed as two governed PRs (decided 2026-07-18) so each is
+     reviewable as one unit and item 9's counters land before their consumers:**
+     - **PR-1a** = the send/exception/drain cluster: items 1 (shared drift builder),
+       2 (guard_type/rule_name), 3 (exception firewall), 4 (drain-without-lock), plus
+       their two Sol/Fable hardening folds and this governance round. Behaviourally
+       inert (`prefer_spark` false), but item 3's `apply_rules` firewall is a **live
+       legacy-path** crash-prevention fix (see the changelog fragment).
+     - **PR-1b** = items 5 (two-count executor + orphan ceiling), 6 (F3 marker),
+       7 (KV lifecycle journal), 9 (R4 telemetry + the heartbeat wiring for the
+       PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
+       fix)**, and the R2 `unsupported` terminal state.
+     - **FLIP GATE:** M1, item 9's heartbeat wiring, #2270, and the lifecycle-audit
+       journal ALL land in PR-1b and **gate PR-2** — the `prefer_spark` flip must not
+       ship while any is open. M1 in particular is a fleet ingest-DoS if the flip
+       precedes it, so it is not enough that it is "in PR-1" — it is specifically in
+       PR-1b, after PR-1a.
+
      - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
        detection/enforcement *placement*).** The shared drift-event builder;
        OutboxEntry guard_type/rule_name for Health/Lifecycle; attach_rule + live

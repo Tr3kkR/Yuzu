@@ -2348,11 +2348,27 @@ public:
                             resp.set_exit_code(1);
                             resp.set_output("guardian engine not initialised");
                         } else {
-                            auto dr = guardian_->dispatch(cmd);
-                            resp.set_status(dr.exit_code == 0 ? pb::CommandResponse::SUCCESS
-                                                              : pb::CommandResponse::FAILURE);
-                            resp.set_exit_code(dr.exit_code);
-                            resp.set_output(std::move(dr.output));
+                            // Thread-boundary backstop (#2037 class): guardian_->dispatch
+                            // (apply_rules teardown/reconcile) allocates and can throw a
+                            // bad_alloc under memory pressure. This runs on the run() thread,
+                            // which has no enclosing catch, so an escape aborts the whole
+                            // agent daemon. apply_rules firewalls internally, but keep a
+                            // defensive boundary here so ANY guardian command that throws
+                            // degrades to a FAILURE response instead of a crash (Gate 4 UP-1).
+                            try {
+                                auto dr = guardian_->dispatch(cmd);
+                                resp.set_status(dr.exit_code == 0 ? pb::CommandResponse::SUCCESS
+                                                                  : pb::CommandResponse::FAILURE);
+                                resp.set_exit_code(dr.exit_code);
+                                resp.set_output(std::move(dr.output));
+                            } catch (...) {
+                                resp.set_status(pb::CommandResponse::FAILURE);
+                                resp.set_exit_code(1);
+                                try {
+                                    resp.set_output("guardian dispatch threw (firewalled)");
+                                } catch (...) {
+                                }
+                            }
                         }
                         // Stamp the response so the server routes it via the Guardian
                         // ingest branch (plugin=="__guard__") and skips the response

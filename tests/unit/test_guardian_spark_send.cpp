@@ -148,7 +148,7 @@ TEST_CASE("send-map: Lifecycle kind becomes guard.<kind>", "[spark][sendmap]") {
     }
 }
 
-TEST_CASE("send-map: Health + Lifecycle carry guard_type/rule_name (#2237 item 4)",
+TEST_CASE("send-map: Health + Lifecycle carry guard_type/rule_name (PR-1 item 2)",
           "[spark][sendmap]") {
     SECTION("Health") {
         auto ev = guardian_outbox_entry_to_event(
