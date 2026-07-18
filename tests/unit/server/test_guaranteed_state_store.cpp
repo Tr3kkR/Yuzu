@@ -338,6 +338,28 @@ TEST_CASE("GuaranteedStateStore: matching-fields redelivery is quiet + counted a
     CHECK(store.events_dropped_total() == 1); // no new drop
 }
 
+TEST_CASE("GuaranteedStateStore: an embedded-NUL event field is rejected as malformed (item-7)",
+          "[guaranteed_state_store][events][redelivery]") {
+    // A NUL would be silently truncated by SQLite's -1 text binds and corrupt both the
+    // event_id PK dedup and the redelivery compare — reject it as Error (malformed),
+    // never store-truncate it, and never count it as a collision. Guardian fields are
+    // structured text / JSON and never legitimately carry a NUL.
+    GuaranteedStateStore store(":memory:");
+
+    auto e = make_event("evt-nul", "rule-1", "agent-A");
+    e.detected_value = std::string("a\0b", 3); // embedded NUL
+    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Error);
+    CHECK(store.event_count() == 0);
+    CHECK(store.events_dropped_total() == 0);       // malformed, NOT a collision
+    CHECK(store.events_redelivered_total() == 0);
+    CHECK_FALSE(store.insert_event(e).has_value()); // wrapper maps Error -> unexpected
+
+    // A NUL in event_id (would truncate the PK) is likewise rejected.
+    auto e2 = make_event(std::string("evt\0x", 5), "rule-1", "agent-A");
+    CHECK(store.insert_event_classified(e2).outcome == EventInsertOutcome::Error);
+    CHECK(store.event_count() == 0);
+}
+
 TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
           "[guaranteed_state_store][events][crash]") {
     // Guardian DEX slice 1: a fleet-wide process crash is RULELESS — sentinel

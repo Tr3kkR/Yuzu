@@ -133,7 +133,7 @@ struct GuardianDayCount {
 };
 
 // One agent's CURRENT compliance state for one rule (Slice B compliance census).
-// Maintained by insert_event from the agent's on-change status feed (guard.compliant
+// Maintained by insert_event_classified from the agent's on-change status feed (guard.compliant
 // / drift.detected / drift.remediated / remediation.failed / guard.unhealthy). The
 // route folds in agent liveness (offline → "unknown") at query time — this row is the
 // last state the agent REPORTED, not a live probe.
@@ -549,9 +549,11 @@ private:
     // On an event_id PK conflict, compare the STORED row against the incoming event
     // across every immutable agent-supplied field — EXCLUDING server-enriched severity
     // and the receipt-derived ttl_expires_at. true => an idempotent redelivery (quiet);
-    // false => a genuine collision (kept loud). Caller MUST hold mtx_ (unique) with the
-    // ingest transaction open.
-    bool stored_event_matches_locked(const GuaranteedStateEventRow& incoming) const;
+    // false => a genuine collision (kept loud); std::unexpected => the compare itself
+    // could not run (operational error — mapped to Error, never a false collision).
+    // Caller MUST hold mtx_ (unique) with the ingest transaction open.
+    std::expected<bool, std::string>
+    stored_event_matches_locked(const GuaranteedStateEventRow& incoming) const;
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the
