@@ -67,15 +67,24 @@ Performance, File system, Network, Identity & logon, Security & protection,
 Updates & installs, Policy & management, Printing). The Catalogue is
 **coverage-first**: a family card shows how many of its types are **monitored**
 (collected by a connected platform — lit even when nothing has fired) and a
-0–100 **health score** (the family's slice of the fleet health composite). A
+0–100 **health score**. Under **All connected** the score is the family's slice
+of the fleet health composite; under a **single-OS chip** (Windows / Linux /
+macOS) the family is **rescored against that platform's own online agents and
+its own signals**, so a Linux or macOS score is never a Windows-derived number
+read under another OS's heading. A
 monitored type with no events reads as **watched, nothing happened** — real
 information, not a gap; a type that **no connected platform collects** shows
 dimmed as **not collected**, never as healthy. (A type is *not collected* when no
 currently-connected platform in your fleet emits it — e.g. a Linux-only signal on
 an all-Windows fleet; it lights automatically when the first eligible device
 connects, so this is a coverage fact, not a broken collector.) An **OS filter** (All connected /
-Windows / Linux / macOS) narrows coverage to one platform and **persists** when
-you open a family or drill into a type. Opening a family lists **every** type
+Windows / Linux / macOS) narrows coverage to one platform, **rescores each
+family for that platform**, and **persists** when you open a family or drill
+into a type — the drill-down's rollup, per-signal rows, and score all follow
+the selected lens. **Note:** the All connected composite keeps the established
+Windows-online denominator (the coverage-honest fleet composite); on a macOS-
+or Linux-only fleet the default lens can therefore show **—** — click your
+platform's chip for a real per-family score. Opening a family lists **every** type
 with its coverage (which platforms collect it) and, for the ones that fired,
 event and device counts. Each type drills into a per-type view: top subjects,
 the live OS split, the most-affected devices, and an activity trend. Any signal
