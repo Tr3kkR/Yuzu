@@ -79,6 +79,12 @@ struct OutboxEntry {
 
     std::string lifecycle_kind;  ///< Lifecycle payload: "armed" | "disarmed" | "errored"
 
+    // Health + Lifecycle carry the guard identity explicitly (the Compliance domain
+    // carries both inside `drift`). Empty on Compliance entries. Without these the
+    // wire event's guard_type/rule_name were blank on every health/lifecycle event.
+    std::string guard_type;      ///< Health/Lifecycle: "file" | "registry" | "service"
+    std::string rule_name;       ///< Health/Lifecycle: human-readable rule name
+
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
                                   std::string event_id, std::int64_t enqueued_ns, GuardDrift drift) {
         OutboxEntry e;
@@ -91,7 +97,8 @@ struct OutboxEntry {
         return e;
     }
     static OutboxEntry health(std::string rule_id, std::uint64_t generation, std::string event_id,
-                              std::int64_t enqueued_ns, bool healthy, std::string detail) {
+                              std::int64_t enqueued_ns, bool healthy, std::string detail,
+                              std::string guard_type = {}, std::string rule_name = {}) {
         OutboxEntry e;
         e.domain = OutboxDomain::Health;
         e.rule_id = std::move(rule_id);
@@ -100,10 +107,13 @@ struct OutboxEntry {
         e.enqueued_ns = enqueued_ns;
         e.healthy = healthy;
         e.health_detail = std::move(detail);
+        e.guard_type = std::move(guard_type);
+        e.rule_name = std::move(rule_name);
         return e;
     }
     static OutboxEntry lifecycle(std::string rule_id, std::uint64_t generation, std::string event_id,
-                                 std::int64_t enqueued_ns, std::string kind) {
+                                 std::int64_t enqueued_ns, std::string kind,
+                                 std::string guard_type = {}, std::string rule_name = {}) {
         OutboxEntry e;
         e.domain = OutboxDomain::Lifecycle;
         e.rule_id = std::move(rule_id);
@@ -111,6 +121,8 @@ struct OutboxEntry {
         e.event_id = std::move(event_id);
         e.enqueued_ns = enqueued_ns;
         e.lifecycle_kind = std::move(kind);
+        e.guard_type = std::move(guard_type);
+        e.rule_name = std::move(rule_name);
         return e;
     }
 };

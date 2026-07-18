@@ -650,18 +650,25 @@ TEST_CASE("attach_rule enqueues a Lifecycle 'armed' entry; detach_rule enqueues 
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
-    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    auto rule = file_exists_rule("r1");
+    rule.rule_name = "Hosts integrity";
+    rt->attach_rule("r1", file_spec("/a"), rule, true);
 
     auto lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 1);
     CHECK(lc[0].rule_id == "r1");
     CHECK(lc[0].lifecycle_kind == "armed");
+    // The entry carries the guard identity so the wire event is not blank (#2237 item 4).
+    CHECK(lc[0].guard_type == "file");
+    CHECK(lc[0].rule_name == "Hosts integrity");
 
     rt->detach_rule("r1");
     lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 1);
     CHECK(lc[0].rule_id == "r1");
     CHECK(lc[0].lifecycle_kind == "disarmed");
+    CHECK(lc[0].guard_type == "file"); // disarmed carries the identity too (captured pre-erase)
+    CHECK(lc[0].rule_name == "Hosts integrity");
 }
 
 TEST_CASE("Lifecycle audit entries are NOT coalesced or purged like compliance/health",

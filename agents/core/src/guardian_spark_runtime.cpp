@@ -98,6 +98,10 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         detach_rule_locked(rule_id);
 
         const std::uint64_t gen = ++gen_counter_;
+        // Capture the lifecycle metadata before `assertion` is moved into rg below;
+        // the "armed" audit entry (and any prior "disarmed" from detach above) needs it.
+        const std::string rule_name = assertion.rule_name;
+        const char* guard_type = guard_type_for(assertion.kind);
         auto rg = std::make_shared<RuleGeneration>();
         rg->generation = gen;
         rg->active = true;
@@ -155,7 +159,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // must not go unaudited. Failure here is counted, never rolls back the
         // arm itself (the audit trail must not compromise real detection
         // capability); see enqueue_lifecycle_locked's doc.
-        enqueue_lifecycle_locked(rule_id, gen, "armed");
+        enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
         // waker/outbox_waker are copied BEFORE commit: if either copy itself
         // throws, rollback still runs rather than reporting an exception on
         // an already-committed arm (Sol rung-7.5 review finding 1).
@@ -205,6 +209,9 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
     const auto rit = rules_.find(rule_id);
     const bool known = (rit != rules_.end());
     const std::uint64_t gen = known ? rit->second->generation : 0;
+    // Capture the lifecycle metadata before rules_.erase below drops the generation.
+    const std::string rule_name = known ? rit->second->assertion.rule_name : std::string{};
+    const char* guard_type = known ? guard_type_for(rit->second->assertion.kind) : "";
     const auto key_opt = index_->key_for_rule(rule_id); // capture BEFORE removal
     if (known)
         rit->second->active = false; // in-flight evals will not commit
@@ -216,7 +223,7 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
     }
     if (known)
-        enqueue_lifecycle_locked(rule_id, gen, "disarmed");
+        enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
@@ -399,16 +406,20 @@ std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneratio
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
     const std::string& rid = gen.assertion.rule_id;
+    // Health entries carry guard_type/rule_name explicitly (the compliance path carries
+    // both inside out.drift). Derived from the assertion, not a spec (#2237 item 4).
+    const char* gtype = guard_type_for(gen.assertion.kind);
+    const std::string& rname = gen.assertion.rule_name;
     std::vector<OutboxEntry> v;
     if (out.recovered) // Unknown -> Known: clear the health stream's errored state first
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
-                                        /*healthy=*/true, {}));
+                                        /*healthy=*/true, {}, gtype, rname));
     if (out.status == EvalStatus::Emit)
         v.push_back(OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms, agent_id),
                                             ns, out.drift));
     else if (out.status == EvalStatus::Unhealthy)
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
-                                        /*healthy=*/false, out.health_detail));
+                                        /*healthy=*/false, out.health_detail, gtype, rname));
     // Silent + !recovered -> empty (nothing to publish).
     return v;
 }
@@ -424,7 +435,9 @@ std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std:
 
 bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
                                                     std::uint64_t generation,
-                                                    const std::string& kind) {
+                                                    const std::string& kind,
+                                                    const std::string& guard_type,
+                                                    const std::string& rule_name) {
     // Called from attach_rule/detach_rule_locked - never on the detached-post-
     // read path - so calling agent_id_fn_() directly (not pre-snapshotted) is
     // safe here, unlike evaluate_key's read path.
@@ -433,7 +446,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
     const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
     auto entry = OutboxEntry::lifecycle(rule_id, generation, make_event_id(rule_id, ms, agent_id),
-                                        ns, kind);
+                                        ns, kind, guard_type, rule_name);
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return lifecycle_log_.enqueue(std::move(entry));
 }

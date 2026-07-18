@@ -352,7 +352,8 @@ private:
     /// path, only from attach_rule/detach_rule_locked which already hold the
     /// lock and are not blocking-I/O call sites).
     bool enqueue_lifecycle_locked(const std::string& rule_id, std::uint64_t generation,
-                                  const std::string& kind);
+                                  const std::string& kind, const std::string& guard_type,
+                                  const std::string& rule_name);
 
     std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
     std::shared_ptr<ISparkBackend> backend_; ///< OWNED

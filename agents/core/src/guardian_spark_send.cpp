@@ -56,6 +56,10 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
         apply_drift_to_event(e.drift, ev);
         break;
     case OutboxDomain::Health:
+        // Health/Lifecycle carry guard_type/rule_name on the entry (Compliance carries
+        // them inside drift); set them so the wire event is fully identified (#2237).
+        ev.set_guard_type(e.guard_type);
+        ev.set_rule_name(e.rule_name);
         // healthy = the watch recovered (Unknown -> Known); !healthy = a read error
         // left the guard unable to evaluate. Separate from compliance state. The
         // read-error text goes into detail_json as a STRUCTURED JSON object
@@ -74,6 +78,8 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
         }
         break;
     case OutboxDomain::Lifecycle:
+        ev.set_guard_type(e.guard_type);
+        ev.set_rule_name(e.rule_name);
         // lifecycle_kind is one of "armed" | "disarmed" | "errored"; the wire token
         // is "guard." + kind. (Routed here only via GuardianLifecycleLog, whose drain
         // shares this send path - GuardianOutbox itself rejects Lifecycle entries.)
