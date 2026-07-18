@@ -27,6 +27,13 @@
 #include <unistd.h>   // geteuid() — privilege detection for sudo prefix
 #endif
 
+#ifdef __APPLE__
+// rename() comes from <cstdio> (already included above — it's part of ISO
+// C's <stdio.h>, which C++ <cstdio> re-exports).
+#include <fcntl.h>    // open() — for fsync'ing the anchor directory after rename
+#include <sys/stat.h> // chmod()
+#endif
+
 namespace {
 
 // ── Privilege escalation helper (Unix only) ──────────────────────────────────
@@ -81,13 +88,30 @@ constexpr const char* kPfctl = "/sbin/pfctl";
 // installs and hooks into /etc/pf.conf's active main ruleset ahead of time
 // (see docs/agent-privilege-model.md, "macOS pf-anchor provisioning"). These
 // two constants MUST match that script's PF_ANCHOR_NAME / PF_ANCHOR_FILE
-// byte-for-byte — the plugin never writes PF_ANCHOR_FILE itself (that's
-// root-owned; the agent has no write access to it), it only loads live rules
-// into the anchor via `pfctl -a <name> -f <tempfile>`, but the anchor NAME
-// has to line up exactly or the plugin's loads land in an anchor pf's active
+// byte-for-byte, or the plugin's loads land in an anchor pf's active
 // ruleset never invokes — a silent, unenforced false quarantine.
+//
+// BR-002 fix: the plugin now ALSO writes kAnchorFile itself, in addition
+// to loading live rules into the anchor via `pfctl -a <name> -f
+// <tempfile>` — see macos_write_anchor_file_atomic(). Live-only loads
+// vanish on reboot or `pfctl -f /etc/pf.conf` (pf reconstructs the anchor
+// from this on-disk file), which used to silently release quarantine.
+// This is safe without a new sudoers grant because the macOS agent runs
+// as root (docs/agent-privilege-model.md:14), unlike the `_yuzu`
+// unprivileged-account model Linux/Windows use — root already owns
+// kAnchorFile and kAnchorDir, so the plugin writes them directly rather
+// than shelling out through `sudo -n pfctl` like every other mutation in
+// this file.
 constexpr const char* kAnchorName = "yuzu-quarantine";
 constexpr const char* kAnchorFile = "/etc/pf.anchors/yuzu-quarantine";
+
+// Directory containing kAnchorFile. Passed as the `directory` override to
+// yuzu::TempFile::create() (see macos_write_anchor_file_atomic() below) so
+// the staging temp file lands on the SAME filesystem as kAnchorFile —
+// required for the final rename() to be atomic; a cross-filesystem rename
+// isn't atomic (some libcs silently fall back to copy+unlink), which would
+// reopen the exact torn-write window this exists to close.
+constexpr const char* kAnchorDir = "/etc/pf.anchors";
 #endif
 #ifdef __linux__
 constexpr const char* kIptables = "/usr/sbin/iptables";
@@ -570,6 +594,103 @@ MacosPfState macos_pf_state() {
     return MacosPfState::unknown;
 }
 
+// BR-002: rules loaded live via `pfctl -a <anchor> -f <file>` (below) live
+// only in the kernel's in-memory anchor table — they vanish on reboot or
+// on ANY `pfctl -f /etc/pf.conf` reload, because pf reconstructs the
+// yuzu-quarantine anchor from kAnchorFile on disk (via the `load anchor
+// ... from ...` directive F-pf-provisioning hooks into /etc/pf.conf — see
+// docs/agent-privilege-model.md, "macOS pf-anchor provisioning"). Until
+// this function runs, kAnchorFile is the EMPTY placeholder
+// install-agent-user.sh provisions, so a reboot silently reconstructs an
+// open anchor — the device is released while the server still believes
+// it's isolated. Every live anchor load/flush in this file is therefore
+// mirrored here to keep kAnchorFile in sync with what's enforced live.
+//
+// The macOS agent runs as root (docs/agent-privilege-model.md:14 — the
+// shipped LaunchDaemon has no UserName key, so launchd runs it as root),
+// so this writes kAnchorFile directly with no privilege escalation; unlike
+// every pfctl shell-out in this file, no sudo prefix is used or needed
+// here, and no new sudoers grant is required (root already owns the file
+// and its containing directory).
+//
+// TOCTOU-safe atomic replace: yuzu::TempFile::create() creates its file
+// via mkstemps() — O_CREAT|O_EXCL semantics, so the staging path can never
+// collide with or be raced onto an attacker-predicted name (see
+// agents/core/src/temp_file.cpp) — inside kAnchorDir so it shares
+// kAnchorFile's filesystem. Contents are fsync()'d before rename() so
+// they're durable even against a crash immediately after the call, and
+// rename() is atomic within one filesystem: a concurrent reader (or a
+// reboot re-sourcing /etc/pf.conf) can only ever observe the fully-old or
+// fully-new file, never a partially-written one.
+bool macos_write_anchor_file_atomic(const std::string& contents, std::string* error_out) {
+    auto tmp_file_result = yuzu::TempFile::create("yuzu-quarantine-", ".conf", kAnchorDir);
+    if (!tmp_file_result) {
+        *error_out = std::format(
+            "failed to create a staging temp file in {} for the persistent pf anchor file "
+            "({}) — {}",
+            kAnchorDir, kAnchorFile, tmp_file_result.error().message);
+        return false;
+    }
+    auto tmp_file = std::move(*tmp_file_result);
+
+    FILE* f = fopen(tmp_file.path().c_str(), "w");
+    if (!f) {
+        *error_out = std::format("failed to open staging file {} for the persistent pf anchor",
+                                 tmp_file.path());
+        return false;
+    }
+    bool write_ok = fputs(contents.c_str(), f) != EOF;
+    if (write_ok && fflush(f) != 0)
+        write_ok = false;
+    // fsync BEFORE fclose: fclose alone doesn't guarantee the data hit
+    // disk, only that the stdio buffer was flushed to the fd (which
+    // fflush above already did) — fsync is what forces the kernel to
+    // persist it.
+    if (write_ok && fsync(fileno(f)) != 0)
+        write_ok = false;
+    fclose(f);
+    if (!write_ok) {
+        *error_out = std::format(
+            "failed to write/fsync the persistent pf anchor staging file {}", tmp_file.path());
+        return false;
+    }
+
+    // Match install-agent-user.sh's macos_install_pf_anchor_file()
+    // convention for kAnchorFile: mode 0644 (world-readable — e.g. for a
+    // non-root operator's `pfctl -nf` validation). Owner is already root
+    // since this whole plugin process runs as root on macOS.
+    if (chmod(tmp_file.path().c_str(), 0644) != 0) {
+        *error_out =
+            std::format("failed to chmod staging file {} to 0644", tmp_file.path());
+        return false;
+    }
+
+    if (rename(tmp_file.path().c_str(), kAnchorFile) != 0) {
+        *error_out = std::format("failed to atomically replace {} (rename from {} failed)",
+                                 kAnchorFile, tmp_file.path());
+        return false;
+    }
+    // The rename moved the staging path onto kAnchorFile, so the original
+    // staging path no longer exists — tell the RAII wrapper not to try to
+    // unlink it (harmless no-op either way, but explicit is clearer).
+    tmp_file.release();
+
+    // Belt-and-suspenders durability: fsync the containing directory so
+    // the rename's directory-entry update itself survives a crash right
+    // after this call (the file's own contents were already fsync'd
+    // above; a bare rename's directory-entry update is a separate write
+    // that also needs an explicit fsync to be crash-durable on most
+    // POSIX filesystems). Best-effort — a failure here doesn't invalidate
+    // the rename that already completed, so it's intentionally not fatal.
+    int dir_fd = open(kAnchorDir, O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    return true;
+}
+
 // Compose-and-load the complete pf ruleset for a quarantine state into the
 // dedicated yuzu-quarantine anchor.
 //
@@ -688,6 +809,30 @@ int macos_load_ruleset(const std::vector<std::string>& whitelist_ips, int* rules
         return 1;
     }
 
+    // BR-002: mirror the rules just loaded LIVE to the persistent anchor
+    // file so a reboot / `pfctl -f /etc/pf.conf` reload reconstructs the
+    // SAME ruleset instead of the empty install-time placeholder
+    // install-agent-user.sh provisions — see
+    // macos_write_anchor_file_atomic() above. Deliberately runs AFTER the
+    // live load + enable above succeeds, so the host is already isolated
+    // live by the time we get here. If the persistent write fails, this
+    // still returns an error rather than success: the caller must never
+    // report quarantine as durably active when the on-disk anchor file
+    // doesn't back it up. The live load is intentionally left in place
+    // either way — an operator seeing "error, but the host is isolated"
+    // is a safer failure mode than this function silently tearing down
+    // live isolation just because the durability leg failed.
+    std::string persist_err;
+    if (!macos_write_anchor_file_atomic(rules, &persist_err)) {
+        *error_out = std::format(
+            "pf anchor \"{}\" loaded LIVE — the host is isolated right now — but the "
+            "persistent copy at {} could not be updated ({}). Quarantine will NOT survive "
+            "a reboot or `pfctl -f /etc/pf.conf` reload until this is fixed; live "
+            "isolation remains in effect in the meantime.",
+            kAnchorName, kAnchorFile, persist_err);
+        return 1;
+    }
+
     *rules_written_out = rules_written;
     return 0;
 }
@@ -705,6 +850,23 @@ int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
     ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_written));
     return 0;
 }
+
+// BR-002: on-disk replacement for kAnchorFile once quarantine is released,
+// mirroring the install-time placeholder scripts/install-agent-user.sh
+// provisions (empty — no filter rules, matches nothing). Used by
+// macos_unquarantine() so a reboot / `pfctl -f /etc/pf.conf` reload
+// reconstructs an EMPTY anchor, same as what the live flush just did,
+// instead of replaying whatever quarantine ruleset macos_load_ruleset()
+// last persisted there.
+constexpr const char* kEmptyAnchorContents =
+    "# Yuzu agent quarantine anchor — cleared by quarantine_plugin.cpp (unquarantine).\n"
+    "# DO NOT edit by hand; overwritten on every quarantine/unquarantine dispatch.\n"
+    "#\n"
+    "# Empty (no rules) — matches the install-time placeholder\n"
+    "# scripts/install-agent-user.sh provisions. An anchor with no filter rules\n"
+    "# matches nothing, so a reboot / `pfctl -f /etc/pf.conf` reload that\n"
+    "# reconstructs this anchor from this file releases quarantine, not\n"
+    "# re-imposes it.\n";
 
 int macos_unquarantine(yuzu::CommandContext& ctx) {
     const auto* pfx = sudo_prefix();
@@ -751,9 +913,37 @@ int macos_unquarantine(yuzu::CommandContext& ctx) {
                 kAnchorName, kPfctl, kAnchorName, kPfctl));
             return 1;
         }
+        // The anchor flush itself failed, so its persisted rules (still
+        // whatever macos_load_ruleset() last wrote) are the honest
+        // reflection of what's addressable in the anchor's rule table —
+        // pf being administratively disabled is an orthogonal, separate
+        // release mechanism (see the comment above), not evidence the
+        // anchor's own on-disk contents should be cleared. Leave
+        // kAnchorFile as-is here; the note below already tells the
+        // operator the flush failed and to run the anchor-flush command
+        // by hand, which is what would trigger the clear on a retry.
         ctx.write_output(std::format(
             "status|released|note|pf disabled (failed to flush anchor \"{}\")", kAnchorName));
         return 0;
+    }
+
+    // BR-002: the live anchor flush above succeeded — mirror that to the
+    // persistent anchor file so a reboot / `pfctl -f /etc/pf.conf` reload
+    // reconstructs the same released (empty) state instead of replaying a
+    // stale quarantine ruleset. Never report "released" if this fails:
+    // the box IS open right now (the live flush succeeded), but the very
+    // next reboot would silently re-quarantine it from the stale on-disk
+    // file — an operator told "released" would have no reason to expect
+    // that.
+    std::string persist_err;
+    if (!macos_write_anchor_file_atomic(kEmptyAnchorContents, &persist_err)) {
+        ctx.write_output(std::format(
+            "error|pf anchor \"{}\" flushed LIVE — the host is reachable right now — but "
+            "the persistent copy at {} could not be cleared ({}). A reboot or `pfctl -f "
+            "/etc/pf.conf` reload will re-impose the OLD quarantine ruleset until this is "
+            "fixed.",
+            kAnchorName, kAnchorFile, persist_err));
+        return 1;
     }
 
     if (!macos_anchor_hooked()) {
