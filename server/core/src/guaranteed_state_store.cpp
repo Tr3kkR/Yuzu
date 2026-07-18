@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <mutex>
 #include <shared_mutex>
@@ -899,7 +900,21 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
     std::string component = field("component");
     if (component.empty())
         component = field("faulting_module");
-    const std::string platform = field("platform");
+    // Canonicalize platform at write (same UP-4 never-trust-the-agent posture as
+    // version below): the per-OS catalogue lens filters on exact `platform = ?`,
+    // so a non-canonical token from a buggy/hostile agent ("Darwin", "Windows")
+    // would silently drop that device's observations out of every single-OS lens
+    // while keeping them in "all". Mirror the DexFleet FleetFn normalization so
+    // the numerator (observations) and denominator (online counts) agree.
+    std::string platform = field("platform");
+    for (auto& c : platform)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (platform.starts_with("win"))
+        platform = "windows";
+    else if (platform.starts_with("lin"))
+        platform = "linux";
+    else if (platform == "darwin" || platform == "macos")
+        platform = "macos";
     // Per-version stability (slice 2b). RE-CANONICALIZE server-side (UP-4): never
     // trust the agent's string — a hostile/buggy/non-Windows agent could ship a
     // non-canonical or malicious value (e.g. "<script>…") within the 256-byte

@@ -950,14 +950,19 @@ TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; 
     sig("l1", "agent-C", "process.crashed", "linux", "2026-06-09T10:10:00Z");
     sig("m1", "agent-D", "process.crashed", "macos", "2026-06-09T10:15:00Z");
     sig("m2", "agent-D", "network.wifi_drop", "macos", "2026-06-09T10:20:00Z");
+    // Non-canonical agent token: canonicalized at projection write (the per-OS
+    // lens filters on exact platform match, so "Darwin" must land in "macos"
+    // rather than silently vanishing from every single-OS lens).
+    sig("m3", "agent-E", "network.wifi_drop", "Darwin", "2026-06-09T10:25:00Z");
 
     // Scoped to macOS: only macOS's own rows — its slice of process.crashed AND
-    // its exclusive network.wifi_drop. Windows/Linux crashes never leak in.
+    // its exclusive network.wifi_drop (including the "Darwin"-token agent).
+    // Windows/Linux crashes never leak in.
     auto mac = store.dex_signal_summary("", "macos");
     REQUIRE(mac.size() == 2);
-    CHECK(mac[0].obs_type == "network.wifi_drop"); // tie at count=1, obs_type ASC
-    CHECK(mac[0].count == 1);
-    CHECK(mac[0].distinct_devices == 1);
+    CHECK(mac[0].obs_type == "network.wifi_drop"); // count 2 > crashed's 1
+    CHECK(mac[0].count == 2);
+    CHECK(mac[0].distinct_devices == 2);
     CHECK(mac[1].obs_type == "process.crashed");
     CHECK(mac[1].count == 1);
     CHECK(mac[1].distinct_devices == 1);
@@ -978,14 +983,15 @@ TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; 
 
     // Unscoped (platform="", the default parameter): the full all-OS rollup is
     // unchanged — process.crashed spans all 3 platforms (4 rows, 4 distinct
-    // agents), network.wifi_drop is macOS-only (1 row).
+    // agents), network.wifi_drop is macOS-only (2 rows incl. the canonicalized
+    // "Darwin" agent).
     auto all = store.dex_signal_summary();
     REQUIRE(all.size() == 2);
-    CHECK(all[0].obs_type == "process.crashed"); // count=4 beats wifi_drop's count=1
+    CHECK(all[0].obs_type == "process.crashed"); // count=4 beats wifi_drop's count=2
     CHECK(all[0].count == 4);
     CHECK(all[0].distinct_devices == 4);
     CHECK(all[1].obs_type == "network.wifi_drop");
-    CHECK(all[1].count == 1);
+    CHECK(all[1].count == 2);
 }
 
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
