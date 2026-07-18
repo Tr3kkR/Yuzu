@@ -96,9 +96,27 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             ev_row.severity = rule->severity;
         if (ev_row.severity.empty())
             ev_row.severity = "unknown";
-        if (auto r = store.insert_event(ev_row); !r) {
+        // Tri-state ingest (item-7 PR-Sv): the durable agent journal re-sends on every
+        // reconnect, so a matching-fields redelivery is EXPECTED. The DEX blast-radius
+        // + alert observers below run ONLY on a genuine first insert (`Inserted`) — a
+        // redelivery must NOT re-fire them (false blast-radius sightings / duplicate
+        // routed alerts), and a mismatched collision stays on the loud CC7.3 metric.
+        switch (auto res = store.insert_event_classified(ev_row); res.outcome) {
+        case EventInsertOutcome::Inserted:
+            break; // fall through to the observers below
+        case EventInsertOutcome::Redelivered:
+            spdlog::debug("Guardian: idempotent event redelivery (no re-observe) "
+                          "event_id={} agent={} rule={}",
+                          ev_row.event_id, agent_id, ev_row.rule_id);
+            return;
+        case EventInsertOutcome::Conflict:
+            spdlog::warn("Guardian: event_id collision with MISMATCHED fields (possible "
+                         "forged-id pre-claim / seq-reset) event_id={} agent={} rule={}: {}",
+                         ev_row.event_id, agent_id, ev_row.rule_id, res.error);
+            return;
+        case EventInsertOutcome::Error:
             spdlog::warn("Guardian: insert_event failed (agent={}, rule={}): {}", agent_id,
-                         ev_row.rule_id, r.error());
+                         ev_row.rule_id, res.error);
             return;
         }
         // Fleet-wide incident detection — RULELESS observations only, and only

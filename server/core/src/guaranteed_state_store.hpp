@@ -268,6 +268,19 @@ inline constexpr int kMaxEventsLimit = 10'000;
 // workstream E. Override via the GuaranteedStateStore constructor.
 inline constexpr int kDefaultEventRetentionDays = 30;
 
+// Outcome of a single-event ingest (item-7 durable lifecycle journal, PR-Sv). The
+// agent journal re-sends on every reconnect, so a matching-fields event_id
+// redelivery is EXPECTED + idempotent — it must be quiet and counted apart from a
+// genuine collision (same event_id but MISMATCHED immutable fields: a forged-id
+// pre-claim #1360, or an agent event_seq_ reset / clock skew carrying a different
+// payload). Ingest runs the DEX blast-radius + alert observers ONLY on `Inserted`;
+// Redelivered / Conflict / Error all return before the observers.
+enum class EventInsertOutcome { Inserted, Redelivered, Conflict, Error };
+struct EventInsertResult {
+    EventInsertOutcome outcome{EventInsertOutcome::Error};
+    std::string error; // set for Conflict (mismatch detail) + Error (db message); empty otherwise
+};
+
 class GuaranteedStateStore {
 public:
     explicit GuaranteedStateStore(const std::filesystem::path& db_path,
@@ -291,6 +304,14 @@ public:
     std::vector<GuaranteedStateRuleRow> list_rules() const;
 
     // Event ingest + query.
+    //
+    // insert_event_classified() is the primary ingest entry point: it returns the
+    // four-way EventInsertResult so the caller gates DEX observers on `Inserted`,
+    // treats a matching `Redelivered` as a quiet idempotent no-op, and keeps a
+    // mismatched `Conflict` on the loud CC7.3 drop metric. insert_event() is the
+    // back-compat convenience wrapper (Inserted/Redelivered -> ok; Conflict/Error ->
+    // unexpected) for callers that don't distinguish redelivery (tests, batch seed).
+    EventInsertResult insert_event_classified(const GuaranteedStateEventRow& row);
     std::expected<void, std::string> insert_event(const GuaranteedStateEventRow& row);
 
     // Batch ingest: wraps all rows in a single transaction. At 10–50x the
@@ -457,14 +478,19 @@ public:
         return observations_proj_failures_.load();
     }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
-    // PK/UNIQUE-conflict drops at the single-row insert_event (redelivery, an
-    // event_seq_ reset on an agent crash-loop, a clock-skewed fleet, or a forged
-    // event_id pre-claim #1360). The conflicting event is NOT written; counting it
-    // closes the CC7.3 evidence gap (#1414) so an auditor can distinguish "no
-    // drift observed" from "drift observed but silently discarded". The batch
-    // insert_events path is excluded by design — it aborts the whole batch loudly
-    // (returns an error) rather than dropping one row and continuing.
+    // A single-row insert_event event_id PK/UNIQUE conflict is classified (item-7
+    // PR-Sv). MATCHING immutable fields => `Redelivered` (the durable agent journal's
+    // expected at-least-once retry): quiet, counted in events_redelivered_total().
+    // MISMATCHED immutable fields => `Conflict` (a forged event_id pre-claim #1360, or
+    // an agent event_seq_ reset / clock skew carrying a DIFFERENT payload): the event
+    // is NOT written, counted here — the CC7.3 evidence signal (#1414) distinguishing
+    // "no drift observed" from "drift observed but silently discarded". The batch
+    // insert_events path is excluded by design — it aborts the whole batch loudly.
     uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
+    // Cumulative idempotent redeliveries (matching-fields event_id conflict) — the
+    // agent journal's expected at-least-once retries. High is normal after outages;
+    // it is NOT a loss signal (that is events_dropped_total()).
+    uint64_t events_redelivered_total() const noexcept { return events_redelivered_.load(); }
 
     void start_cleanup();
     void stop_cleanup();
@@ -479,7 +505,8 @@ private:
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
-    std::atomic<uint64_t> events_dropped_{0}; // #1414: PK/UNIQUE-conflict ingest drops
+    std::atomic<uint64_t> events_dropped_{0};     // #1414: event_id conflict, MISMATCHED payload
+    std::atomic<uint64_t> events_redelivered_{0}; // item-7: event_id conflict, MATCHING payload
 
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
@@ -518,6 +545,13 @@ private:
     // `ttl` is the parent event's expiry so the reaper sweeps both in lockstep.
     std::expected<void, std::string>
     project_observation_locked(const GuaranteedStateEventRow& row, int64_t ttl);
+
+    // On an event_id PK conflict, compare the STORED row against the incoming event
+    // across every immutable agent-supplied field — EXCLUDING server-enriched severity
+    // and the receipt-derived ttl_expires_at. true => an idempotent redelivery (quiet);
+    // false => a genuine collision (kept loud). Caller MUST hold mtx_ (unique) with the
+    // ingest transaction open.
+    bool stored_event_matches_locked(const GuaranteedStateEventRow& incoming) const;
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the

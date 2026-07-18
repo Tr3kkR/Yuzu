@@ -661,17 +661,48 @@ std::vector<GuaranteedStateRuleRow> GuaranteedStateStore::list_rules() const {
     return rows;
 }
 
-std::expected<void, std::string>
-GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
+bool GuaranteedStateStore::stored_event_matches_locked(const GuaranteedStateEventRow& in) const {
+    // Compare the persisted row against `in` across every immutable agent-supplied
+    // field. EXCLUDED: severity (server-enriched at ingest — it can legitimately
+    // differ across a redelivery if the rule's severity changed) and ttl_expires_at
+    // (receipt-derived). event_id is the PK (equal by definition). Caller holds mtx_.
+    const char* sql = R"(
+        SELECT rule_id, agent_id, event_type, guard_type, guard_category,
+               detected_value, expected_value, remediation_action, remediation_success,
+               detection_latency_us, remediation_latency_us, timestamp, detail_json
+        FROM guaranteed_state_events WHERE event_id = ?
+    )";
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return false; // cannot verify -> treat as NOT a match (stays loud; fail-safe)
+    sqlite3_bind_text(stmt.get(), 1, in.event_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return false; // row vanished (e.g. reaped between step and read) -> not a match
+    const auto text = [&](int i) {
+        const auto* p = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), i));
+        return std::string(p ? p : "");
+    };
+    return text(0) == in.rule_id && text(1) == in.agent_id && text(2) == in.event_type &&
+           text(3) == in.guard_type && text(4) == in.guard_category &&
+           text(5) == in.detected_value && text(6) == in.expected_value &&
+           text(7) == in.remediation_action &&
+           (sqlite3_column_int(stmt.get(), 8) != 0) == in.remediation_success &&
+           sqlite3_column_int64(stmt.get(), 9) == in.detection_latency_us &&
+           sqlite3_column_int64(stmt.get(), 10) == in.remediation_latency_us &&
+           text(11) == in.timestamp && text(12) == in.detail_json;
+}
+
+EventInsertResult
+GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row) {
     std::unique_lock lock(mtx_);
     if (!db_)
-        return std::unexpected("database not open");
+        return {EventInsertOutcome::Error, "database not open"};
 
     // Wrap the event INSERT and the DEX projection in ONE transaction so they are
     // atomic: a redelivered event_id fails the event PK below and rolls back BOTH,
     // so the projection inherits the at-least-once dedup and never double-counts.
     if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("BEGIN failed: ") + sqlite3_errmsg(db_));
+        return {EventInsertOutcome::Error, std::string("BEGIN failed: ") + sqlite3_errmsg(db_)};
     SqliteTxn txn(db_);
     const int64_t ttl = compute_ttl_epoch();
 
@@ -686,7 +717,7 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     )";
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        return {EventInsertOutcome::Error, std::string("prepare failed: ") + sqlite3_errmsg(db_)};
 
     sqlite3_bind_text(stmt.get(), 1, row.event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -710,15 +741,23 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
         const int ext = sqlite3_extended_errcode(db_);
         const std::string err = sqlite3_errmsg(db_);
         if (is_sqlite_uniqueness_violation(ext)) {
-            // Silent-drop visibility (#1414, CC7.3): the conflicting event is
-            // discarded here and guardian_ingest only warns. Count it so the loss
-            // is alertable in Prometheus rather than grep-only. Surfaced as
-            // yuzu_server_guardian_events_dropped_total.
+            // event_id already present. Classify (item-7 PR-Sv): a redelivery of the
+            // SAME event (matching immutable fields) is the durable agent journal's
+            // expected at-least-once retry — quiet + counted apart; a MISMATCH is a
+            // genuine collision (forged-id pre-claim #1360 / seq-reset with a different
+            // payload) — kept on the loud CC7.3 drop path. The compare SELECT runs in
+            // the open txn (rolled back on return — nothing here is committed).
+            stmt.reset(); // finalize the failed INSERT before the compare SELECT
+            if (stored_event_matches_locked(row)) {
+                events_redelivered_.fetch_add(1, std::memory_order_relaxed);
+                return {EventInsertOutcome::Redelivered, {}};
+            }
             events_dropped_.fetch_add(1, std::memory_order_relaxed);
-            return std::unexpected(
-                format_conflict("event_id '" + row.event_id + "' already exists"));
+            return {EventInsertOutcome::Conflict,
+                    format_conflict("event_id '" + row.event_id +
+                                    "' already exists with different fields")};
         }
-        return std::unexpected("insert failed: " + err);
+        return {EventInsertOutcome::Error, "insert failed: " + err};
     }
     stmt.reset(); // finalize the event INSERT before the projection + COMMIT
 
@@ -741,7 +780,7 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
         }
     }
     if (txn.commit() != SQLITE_OK)
-        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
+        return {EventInsertOutcome::Error, std::string("commit failed: ") + sqlite3_errmsg(db_)};
 
     events_written_.fetch_add(1, std::memory_order_relaxed);
     // Maintain the per-(agent, rule) compliance census in lock-step with the event
@@ -752,7 +791,24 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     if (!is_reserved_rule_id(row.rule_id))
         if (const char* state = event_state_from_type(row.event_type))
             upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
-    return {};
+    return {EventInsertOutcome::Inserted, {}};
+}
+
+std::expected<void, std::string>
+GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
+    // Back-compat wrapper: an idempotent redelivery is a benign success for callers
+    // that don't distinguish it (tests, batch seed); a mismatched Conflict + a hard
+    // Error stay failures. The redelivery/collision split lives in _classified.
+    EventInsertResult r = insert_event_classified(row);
+    switch (r.outcome) {
+    case EventInsertOutcome::Inserted:
+    case EventInsertOutcome::Redelivered:
+        return {};
+    case EventInsertOutcome::Conflict:
+    case EventInsertOutcome::Error:
+        return std::unexpected(std::move(r.error));
+    }
+    return std::unexpected("insert_event: unreachable outcome");
 }
 
 std::expected<std::size_t, std::string>
