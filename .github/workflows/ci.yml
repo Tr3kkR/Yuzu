@@ -304,6 +304,17 @@ jobs:
           clean: false
           persist-credentials: false
 
+      # One DB per runner agent, below runner.tool_cache and therefore outside
+      # the checkout. ci-telemetry exports YUZU_TEST_DB for later steps and
+      # records this exact matrix leg; reruns remain distinct by run_attempt.
+      - name: Start persistent CI telemetry
+        env:
+          YUZU_TEST_DB: ${{ runner.tool_cache }}/yuzu-test-runs/${{ runner.name }}/test-runs.db
+        run: >-
+          python3 scripts/ci/ci-telemetry.py start
+          --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+          --triplet x64-linux
+
       - name: Install system packages
         run: |
           # The Big Tam host runs 4 runners (r0-r3), so the matrix legs hit apt
@@ -554,6 +565,15 @@ jobs:
           fi
           exit 0
 
+      - name: Finish persistent CI telemetry
+        if: always()
+        run: >-
+          python3 scripts/ci/ci-telemetry.py finish
+          --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+          --triplet x64-linux
+          --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          --conclusion ${{ job.status }}
+
   # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
@@ -631,6 +651,16 @@ jobs:
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: false
           persist-credentials: false
+
+      - name: Start persistent CI telemetry
+        env:
+          # Keep the workflow path identical to Start-PinnedRunner.ps1 even
+          # before the next safe runner restart propagates its process env.
+          YUZU_TEST_DB: D:\ci\test-runs\${{ runner.name }}\test-runs.db
+        run: >-
+          python scripts/ci/ci-telemetry.py start
+          --job-name "Windows MSVC ${{ matrix.build_type }}"
+          --triplet x64-windows
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -858,6 +888,15 @@ jobs:
             echo "::warning::ccache hit rate ${rate}% over ${total} compiles is low on a self-hosted runner — caches may be cold/fragmented (see deploy/windows/README.md: shared RUNNER_TOOL_CACHE)"
           fi
           exit 0
+
+      - name: Finish persistent CI telemetry
+        if: always()
+        run: >-
+          python scripts/ci/ci-telemetry.py finish
+          --job-name "Windows MSVC ${{ matrix.build_type }}"
+          --triplet x64-windows
+          --builddir build-windows-${{ matrix.build_type }}
+          --conclusion ${{ job.status }}
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:

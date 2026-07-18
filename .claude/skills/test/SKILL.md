@@ -644,7 +644,8 @@ Overall: N FAIL, M WARN — <commit decision>
 
 ## Querying the test-runs DB
 
-The DB lives at `~/.local/share/yuzu/test-runs.db` and persists across runs. Common queries:
+The developer-local `/test` DB lives at `~/.local/share/yuzu/test-runs.db` and
+persists across runs. Common queries:
 
 ```bash
 # Most recent run with full gate detail
@@ -673,6 +674,34 @@ bash scripts/test/test-db-query.sh --prune 100
 ```
 
 Power users can `python3 scripts/test/test_db.py query ...` directly, or `python3 -c "import sqlite3; ..."` against the DB for ad-hoc analysis.
+
+Self-hosted CI uses the same schema but never shares one host-wide SQLite file.
+Each runner agent owns a durable database outside its checkout:
+
+- Big Tam: `/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`
+- Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
+
+`ci.yml` initializes and finalizes the current runner's row automatically.
+Schema v3 keeps GitHub rerun attempts distinct and records the job result and
+duration, platform/runner/commit/event, ccache ratio, Meson test-entry
+result/duration/timeout, and known flakes recovered by isolated retry. Query a
+runner in place by setting `YUZU_TEST_DB`:
+
+```bash
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-stats --since 30d
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
+YUZU_TEST_DB=/path/to/runner/test-runs.db \
+  bash scripts/test/test-db-query.sh ci-flakes --since 30d
+```
+
+Provision or repair all runner DBs with
+`deploy/linux/Provision-BigTam-Runner-Telemetry.sh` or
+`deploy/windows/Provision-Windows-Runner.ps1`. The reviewed
+`tests/known-flaky.json` file remains the allowlist; database observations never
+change pass/fail policy. GitHub-hosted macOS runners are ephemeral, so their
+Meson logs remain Actions artifacts rather than runner-local history.
 
 ## Failure handling
 
@@ -703,8 +732,14 @@ Default mode is the recommended pre-push gate. The upgrade test in Phase 2 catch
 4. **WSL2 + native dockerd** — preflight verifies `docker context show` is `default`, not `desktop-linux`.
 5. **Erlang rebar3 cache pollution** — gateway gates always source `scripts/ensure-erlang.sh` first; the `--dir apps/yuzu_gw/test` flag is mandatory per bug #337.
 6. **Fixture write race with migrations** — `test-fixtures-write.sh` polls `/readyz` for `{"status":"ready"}` (not `/livez`) before writing — uses the #339 compound-fix readiness contract.
-7. **Self-hosted runner availability** (PR2/PR3) — sanitizers and Windows OTA depend on `yuzu-wsl2-linux` and `yuzu-local-windows` runners being online; offline → WARN, not FAIL.
-8. **DB grows unbounded** — auto-prune kicks in after 100 runs by default (`YUZU_TEST_DB_RETENTION_RUNS`).
+7. **Self-hosted runner availability** — Linux jobs depend on the Big Tam
+   `yuzu-bigtam-linux-{0..3}` pool and Windows jobs on Wee Tam's
+   `yuzu-weetam-windows-{0..3}` pool; offline → WARN or fail-closed skip,
+   depending on the workflow gate.
+8. **DB retention is explicit** — local `/test` rows can be pruned with
+   `test-db-query.sh --prune N`; runner-local CI telemetry is intentionally
+   append-only for now so evidence is not silently aged out before a retention
+   and export policy is measured.
 
 ## Post-run follow-ups
 
