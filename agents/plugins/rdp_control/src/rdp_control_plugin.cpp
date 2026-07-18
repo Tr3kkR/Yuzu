@@ -319,9 +319,15 @@ public:
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
         (void)params;
-        (void)action;
         ctx.write_output("rdp_control|unsupported|Windows Remote Desktop has no macOS equivalent; use Screen Sharing / com.apple.screensharing");
-        return 0;
+        // set_state is a STATE-CHANGING security-control action (enable/
+        // disable remote access). On non-Windows it never touches anything,
+        // so reporting rc=0 (terminal SUCCESS) would be a false success for
+        // an RDP posture change that did not happen (BR-03) -- exactly the
+        // kind of false "security control changed" report a ServiceNow
+        // change-window caller must not receive. "status" is a read-only
+        // action honestly reporting "unsupported" and may keep rc=0.
+        return (action == "set_state") ? 1 : 0;
 #else
         if (action == "set_state") return do_set_state(ctx, params);
         if (action == "status")    return do_status(ctx);

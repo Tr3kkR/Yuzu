@@ -19,6 +19,7 @@
 #include <yuzu/plugin.hpp>
 
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -917,6 +918,28 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     ctx.write_output("status|not_found");
 }
 
+/**
+ * Re-enumerate `keychain_path` and report whether `thumbprint` is still
+ * present. Used by delete_cert_macos() to VERIFY a delete actually took
+ * effect rather than trusting a zero exit status alone -- `security
+ * delete-certificate` can exit 0 without the item actually being gone
+ * (ACL/SIP quirks, an unexpected keychain state), and reporting "deleted"
+ * in that case would be exactly the false-success this package's honest-
+ * sentinel requirement exists to prevent. Reuses the same PEM-enumeration
+ * path as list/details rather than adding a second certificate-reading
+ * mechanism.
+ */
+bool keychain_contains_thumbprint(const std::string& keychain_path, std::string_view thumbprint) {
+    auto pem = run_command(
+        std::format("security find-certificate -a -p {} 2>/dev/null", keychain_path).c_str());
+    for (const auto& block : split_pem_blocks(pem)) {
+        auto rec = parse_pem_block_macos(block, "");
+        if (rec.thumbprint == thumbprint)
+            return true;
+    }
+    return false;
+}
+
 bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                        std::string_view store) {
     // Validate thumbprint is hex-only to prevent command injection.
@@ -924,35 +947,86 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
         ctx.write_output("error|invalid thumbprint format (expected 40 hex characters)");
         return false;
     }
-    // Delete acts on exactly one keychain; store honours "root" explicitly
-    // and otherwise preserves today's unconditional System.keychain target
-    // for the unset/"MY" default and "System" (see
-    // yuzu::macos::resolve_delete_keychain_path). store=login is
-    // deliberately NOT supported for delete here -- unlike list/details it
-    // is not part of this package's acceptance criteria, and it would
-    // require the same asuser/sudo dance (and its own honest-sentinel
-    // handling) for a destructive action that has no test coverage in this
-    // change; left for a follow-up if a real need shows up. "login", "all",
-    // and any other unrecognized value are REJECTED rather than silently
-    // redirected to System.keychain -- a destructive action must never
-    // target a keychain the caller didn't ask for.
+
+    // SystemRootCertificates.keychain is SEALED on modern (SIP-protected)
+    // macOS -- /System/Library/Keychains/... sits under the sealed system
+    // volume and cannot be modified by `security delete-certificate` (or
+    // anything else short of disabling SIP). Advertising deletion from it
+    // as achievable would report a root-trust change that can never
+    // actually take effect (BR-04): reject outright, before ever shelling
+    // out, with the same fail-closed posture as the unsupported-store
+    // branch below -- never silently redirect to a writable keychain
+    // either.
+    if (store == "root") {
+        ctx.write_output(
+            "certificates|unsupported|SystemRootCertificates.keychain is sealed on this macOS "
+            "version (System Integrity Protection) and cannot be modified");
+        return false;
+    }
+
+    // Delete acts on exactly one keychain; store otherwise preserves
+    // today's unconditional System.keychain target for the unset/"MY"
+    // default and "System" (see yuzu::macos::resolve_delete_keychain_path).
+    // store=login is deliberately NOT supported for delete here -- unlike
+    // list/details it is not part of this package's acceptance criteria,
+    // and it would require the same asuser/sudo dance (and its own honest-
+    // sentinel handling) for a destructive action that has no test
+    // coverage in this change; left for a follow-up if a real need shows
+    // up. "login", "all", and any other unrecognized value (root is
+    // already handled above) are REJECTED rather than silently redirected
+    // to System.keychain -- a destructive action must never target a
+    // keychain the caller didn't ask for.
     auto target = yuzu::macos::resolve_delete_keychain_path(store);
     if (!target) {
         ctx.write_output(std::format("error|store '{}' is not supported for delete", store));
         return false;
     }
-    auto result =
-        run_command(std::format("security delete-certificate -Z {} {} 2>&1", thumbprint, *target)
-                        .c_str());
-    if (result.find("error") != std::string::npos || result.find("Error") != std::string::npos) {
-        ctx.write_output("status|not_found");
-    } else {
-        ctx.write_output("status|deleted");
+
+    // Inspect the ACTUAL pclose()/exit status of `security
+    // delete-certificate` rather than grepping its combined stdout+stderr
+    // for the words "error"/"Error" (BR-04): text-only classification
+    // reports "deleted" for any output that doesn't happen to contain
+    // those words, including genuine operational failures (permission
+    // denied, locked keychain, ...).
+    auto result = run_command_checked(
+        std::format("security delete-certificate -Z {} {} 2>&1", thumbprint, *target).c_str());
+
+    if (!result.ok) {
+        // The command failed. Distinguish a genuine "not present" --
+        // idempotent, matching Windows/Linux's uniform rc=0 for a delete
+        // request that completed a search and found nothing to remove --
+        // from a real operational failure (permission denied, keychain
+        // locked, etc). The exit status alone already told us it failed;
+        // the output text here only sub-classifies WHY, it is never used
+        // to decide "deleted" on its own.
+        std::string lower = result.output;
+        for (auto& c : lower)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower.find("could not be found") != std::string::npos ||
+            lower.find("not found") != std::string::npos) {
+            ctx.write_output("status|not_found");
+            return true;
+        }
+        ctx.write_output(std::format("error|delete failed: {}", result.output));
+        return false;
     }
-    // A completed search that came up empty (not_found) is still a
-    // successfully EXECUTED delete request, matching Windows/Linux's
+
+    // Exit status 0 alone is not sufficient (BR-04) -- VERIFY the
+    // certificate is actually gone from the target keychain before
+    // reporting "deleted". A denied/no-op delete that still exits 0 (a
+    // read-only or otherwise-protected keychain state) must not be
+    // reported as a security-control change that took effect.
+    if (keychain_contains_thumbprint(*target, thumbprint)) {
+        ctx.write_output("error|delete reported success but certificate is still present in the keychain");
+        return false;
+    }
+
+    ctx.write_output("status|deleted");
+    // A completed, VERIFIED delete (or a verified-absent not_found above)
+    // is a successfully EXECUTED delete request, matching Windows/Linux's
     // uniform rc=0 for that outcome -- only a request REJECTED outright
-    // (invalid thumbprint above, unsupported store above) fails here.
+    // (invalid thumbprint, unsupported store, sealed root keychain) or an
+    // operational failure fails here.
     return true;
 }
 

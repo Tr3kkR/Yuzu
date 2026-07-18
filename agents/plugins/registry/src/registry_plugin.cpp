@@ -90,7 +90,18 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
+        (void)params;
         ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
+        // set_value/delete_value/delete_key are STATE-CHANGING (write/delete)
+        // actions. On non-Windows they never touch anything, so reporting
+        // rc=0 (terminal SUCCESS) would be a false success for a security-
+        // relevant write/delete that did not happen (BR-03). Read-only
+        // actions (get_value, key_exists, enumerate_*, get_user_value)
+        // honestly determined "unsupported" and may keep rc=0 -- a read
+        // correctly reporting unavailability is itself a successful read.
+        if (action == "set_value" || action == "delete_value" || action == "delete_key") {
+            return 1;
+        }
         return 0;
 #else
         if (action == "get_value")        return do_get_value(ctx, params);

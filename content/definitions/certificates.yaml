@@ -209,7 +209,11 @@ metadata:
     Windows this targets a specific named store (defaults to MY). On
     Linux it removes the matching PEM/CRT file from /etc/ssl/certs/.
     On macOS it uses the security CLI to delete from System.keychain by
-    default, or SystemRootCertificates.keychain when store=root.
+    default; store=root is rejected as unsupported (returns a non-zero
+    exit code) because SystemRootCertificates.keychain is sealed by
+    System Integrity Protection on modern macOS and cannot actually be
+    modified. A macOS delete verifies the certificate is actually absent
+    from the target keychain afterward before reporting success.
     This is a destructive action and requires approval.
   tags: [security, certificates, remediation]
 
@@ -237,13 +241,16 @@ spec:
         displayName: Certificate Store
         description: >
           The certificate store to delete from. On Windows: MY, ROOT, CA,
-          or Trust. Defaults to "MY". On macOS: "root" deletes from
-          SystemRootCertificates.keychain; "MY" (the default) or "System"
-          deletes from /Library/Keychains/System.keychain, matching prior
-          behaviour. "login" and "all" are not supported for delete and
-          are rejected with an error rather than silently deleting from an
-          unintended store, as is any other unrecognized value. Ignored on
-          Linux.
+          or Trust. Defaults to "MY". On macOS: "MY" (the default) or
+          "System" deletes from /Library/Keychains/System.keychain,
+          matching prior behaviour. "root" is REJECTED (non-zero exit,
+          unsupported) -- SystemRootCertificates.keychain is sealed by
+          System Integrity Protection on modern macOS and cannot actually
+          be modified, so attempting it would report a change that never
+          took effect. "login" and "all" are also not supported for
+          delete and are rejected with an error rather than silently
+          deleting from an unintended store, as is any other unrecognized
+          value. Ignored on Linux.
         default: "MY"
 
   result:
