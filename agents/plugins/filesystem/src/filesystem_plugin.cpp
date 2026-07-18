@@ -81,6 +81,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <thread>
 #include <unistd.h>
 #endif
 
@@ -324,6 +325,58 @@ inline void macos_tool_sleep_briefly(long nanos) {
     nanosleep(&ts, nullptr);
 }
 
+// Bound on how long the final cleanup (after the run loop below) will poll
+// non-blockingly for the child to be reaped before handing the wait off to
+// an asynchronous background reaper, so the calling (worker) thread is
+// never blocked past this bound regardless of how long the child actually
+// takes to die (e.g. stuck in uninterruptible kernel I/O).
+constexpr auto kMacosToolGuardReapGrace = std::chrono::milliseconds(200);
+
+// Send SIGKILL to the child's process group; if that fails (e.g. ESRCH
+// because the group is already gone, EPERM, or the child never reached its
+// setsid() call) fall back to killing the direct child so a timeout always
+// has a real chance of landing.
+inline void macos_tool_kill_child_or_group(pid_t pid) {
+    if (kill(-pid, SIGKILL) != 0)
+        kill(pid, SIGKILL);
+}
+
+// Poll waitpid(pid, ..., WNOHANG) for up to `grace`, sleeping briefly
+// between attempts. Returns true once the child is confirmed reaped (or
+// already gone), false if `grace` elapses first. Never performs a blocking
+// wait.
+inline bool macos_tool_try_reap_bounded(pid_t pid, std::chrono::milliseconds grace) {
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid || (waited < 0 && errno == ECHILD))
+            return true;
+        if (std::chrono::steady_clock::now() - start >= grace)
+            return false;
+        macos_tool_sleep_briefly(5'000'000L); // 5ms
+    }
+}
+
+// Reap `pid` on a detached background thread. Used when
+// macos_tool_try_reap_bounded() above could not confirm the reap within its
+// grace period — rather than block the calling thread indefinitely, hand
+// the wait off to a thread that is free to block as long as it needs to.
+// The thread owns everything it touches: `pid` is captured by value, so
+// nothing here references state on a stack that may already have unwound.
+inline void macos_tool_reap_async(pid_t pid) {
+    std::thread([pid]() {
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+    }).detach();
+}
+
 // Run a macOS command-line tool (codesign, plutil) as a fixed argv via
 // execvp -- no shell, so a path containing spaces or shell metacharacters
 // (e.g. "/Applications/Google Chrome.app") cannot inject anything. Captures
@@ -394,7 +447,19 @@ MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
     close(pipe_fd[1]);
 
     int flags = fcntl(pipe_fd[0], F_GETFL, 0);
-    fcntl(pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
+    if (flags == -1 || fcntl(pipe_fd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        // Fail closed: without a confirmed non-blocking pipe fd, the read()
+        // below could block indefinitely before any deadline check ever
+        // runs. Kill the child now (bounded reap, falling back to an async
+        // background reaper) and return an honest "didn't complete" rather
+        // than risk an unbounded read.
+        close(pipe_fd[0]);
+        macos_tool_kill_child_or_group(pid);
+        if (!macos_tool_try_reap_bounded(pid, kMacosToolGuardReapGrace))
+            macos_tool_reap_async(pid);
+        result.timed_out = true;
+        return result;
+    }
 
     auto start = std::chrono::steady_clock::now();
     bool killed = false;
@@ -435,7 +500,9 @@ MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
             result.timed_out = true;
             killed = true;
             kill_time = now;
-            kill(-pid, SIGKILL); // whole process group, not just the child
+            // Whole process group, not just the child; falls back to the
+            // direct child if the group kill fails.
+            macos_tool_kill_child_or_group(pid);
         }
 
         if (child_reaped && pipe_eof)
@@ -470,16 +537,18 @@ MacosToolResult run_macos_tool(const std::vector<std::string>& argv) {
     close(pipe_fd[0]);
 
     // Cover the kDrainGrace escape hatch: if the loop above broke out
-    // without the child having been confirmed reaped yet, force a final
-    // blocking kill+reap here so no zombie is ever left behind. The child
-    // was already SIGKILLed on the timeout path, so this reap is prompt.
+    // without the child having been confirmed reaped yet, force a kill
+    // (process group, falling back to the direct child) and reap it with a
+    // bounded poll so no zombie is left behind. The child was already
+    // SIGKILLed on the timeout path, so in the common case this reap is
+    // prompt and completes within the poll. If the bounded poll still can't
+    // confirm the reap (e.g. a child wedged in uninterruptible kernel I/O),
+    // hand the wait off to a detached background thread instead of blocking
+    // this call — the worker thread must never hang past the deadline.
     if (!child_reaped) {
-        kill(-pid, SIGKILL);
-        int status = 0;
-        pid_t waited;
-        do {
-            waited = waitpid(pid, &status, 0);
-        } while (waited < 0 && errno == EINTR);
+        macos_tool_kill_child_or_group(pid);
+        if (!macos_tool_try_reap_bounded(pid, kMacosToolGuardReapGrace))
+            macos_tool_reap_async(pid);
     }
 
     if (result.timed_out) {

@@ -39,6 +39,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #endif
 
@@ -60,9 +61,66 @@ namespace detail {
 // descendant holding the pipe open, or a kernel-uninterruptible child).
 constexpr auto kDrainGrace = std::chrono::milliseconds(2000);
 
+// Bound on how long the exception-safety backstop (ChildGuard) will poll
+// non-blockingly for the child to be reaped before handing the wait off to
+// an asynchronous background reaper. This keeps the guard's destructor
+// itself from ever performing an unbounded blocking waitpid() — the one
+// case bounded_run()'s own run loop cannot cover, since the loop only runs
+// on the normal path and the guard exists specifically for early
+// returns/exceptions.
+constexpr auto kGuardReapGrace = std::chrono::milliseconds(200);
+
 inline void sleep_briefly(long nanos) {
     struct timespec ts{0, nanos};
     nanosleep(&ts, nullptr);
+}
+
+// Send SIGKILL to the child's process group; if that fails (e.g. ESRCH
+// because the group is already gone, EPERM, or the child never reached its
+// setsid() call before being reaped/killed) fall back to killing the direct
+// child so a timeout always has a real chance of landing.
+inline void kill_child_or_group(pid_t pid) {
+    if (kill(-pid, SIGKILL) != 0)
+        kill(pid, SIGKILL);
+}
+
+// Poll waitpid(pid, ..., WNOHANG) for up to `grace`, sleeping briefly
+// between attempts. Returns true once the child is confirmed reaped (or
+// already gone), false if `grace` elapses first. Never performs a blocking
+// wait — the point is to bound how long a caller can be held up while still
+// giving a well-behaved (already-SIGKILLed) child a chance to be reaped
+// inline rather than always paying for a thread spawn.
+inline bool try_reap_bounded(pid_t pid, std::chrono::milliseconds grace) {
+    auto start = std::chrono::steady_clock::now();
+    while (true) {
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid || (waited < 0 && errno == ECHILD))
+            return true;
+        if (std::chrono::steady_clock::now() - start >= grace)
+            return false;
+        sleep_briefly(5'000'000L); // 5ms
+    }
+}
+
+// Reap `pid` on a detached background thread. Used when try_reap_bounded()
+// above could not confirm the reap within its grace period — e.g. the child
+// is stuck in uninterruptible kernel I/O, or the process-group kill didn't
+// fully land. Rather than block the calling (worker) thread indefinitely,
+// hand the wait off to a thread that is free to block as long as it needs
+// to. The thread owns everything it touches: `pid` is captured by value, so
+// nothing here references state on a stack that may already have unwound.
+inline void reap_async(pid_t pid) {
+    std::thread([pid]() {
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+    }).detach();
 }
 
 // RAII owner for a POSIX file descriptor in the parent process — closes on
@@ -104,13 +162,20 @@ private:
 };
 
 // RAII guard over a forked child: unless discharged, the destructor
-// SIGKILLs the child's process group and reaps it (blocking). This is the
-// exception-safety backstop for bounded_run() — the normal path already
-// kills-if-needed and reaps the child via the poll loop below and
-// discharges the guard once that is confirmed, so the destructor only
-// fires on an early return or an exception unwinding out of the function.
-// A SIGKILLed process dies promptly (barring kernel-uninterruptible I/O),
-// so this does not itself introduce an unbounded block in practice.
+// SIGKILLs the child (process group, falling back to the direct child) and
+// reaps it. This is the exception-safety backstop for bounded_run() — the
+// normal path already kills-if-needed and reaps the child via the poll loop
+// below and discharges the guard once that is confirmed, so the destructor
+// only fires on an early return or an exception unwinding out of the
+// function.
+//
+// The reap here is BOUNDED, never a raw blocking waitpid(): a SIGKILLed
+// process usually dies promptly, but a child wedged in uninterruptible
+// kernel I/O (or a kill that didn't fully land) would otherwise hang this
+// destructor — and therefore the calling thread — forever. If the short
+// foreground poll can't confirm the reap, the wait is hedged off to a
+// detached background thread instead, so ChildGuard's destructor always
+// returns promptly.
 class ChildGuard {
 public:
     explicit ChildGuard(pid_t pid) : pid_(pid) {}
@@ -119,12 +184,9 @@ public:
     ~ChildGuard() {
         if (pid_ <= 0)
             return;
-        kill(-pid_, SIGKILL);
-        int status = 0;
-        pid_t waited;
-        do {
-            waited = waitpid(pid_, &status, 0);
-        } while (waited < 0 && errno == EINTR);
+        kill_child_or_group(pid_);
+        if (!try_reap_bounded(pid_, kGuardReapGrace))
+            reap_async(pid_);
     }
     void discharge() { pid_ = -1; }
 
@@ -211,7 +273,15 @@ inline BoundedRunResult bounded_run(const std::vector<std::string>& argv,
     write_fd.reset(); // only needed by the child
 
     int flags = fcntl(read_fd.get(), F_GETFL, 0);
-    fcntl(read_fd.get(), F_SETFL, flags | O_NONBLOCK);
+    if (flags == -1 || fcntl(read_fd.get(), F_SETFL, flags | O_NONBLOCK) == -1) {
+        // Fail closed: without a confirmed non-blocking pipe fd, the read()
+        // below could block indefinitely before any deadline check ever
+        // runs. Rather than risk that, treat this as an honest timeout with
+        // no collected output — the still-armed guard above kills the child
+        // (with its own bounded reap / async fallback) when it unwinds.
+        result.timed_out = true;
+        return result;
+    }
 
     auto start = std::chrono::steady_clock::now();
     bool killed = false;
@@ -255,7 +325,9 @@ inline BoundedRunResult bounded_run(const std::vector<std::string>& argv,
             result.timed_out = true;
             killed = true;
             kill_time = now;
-            kill(-pid, SIGKILL); // whole process group, not just the child
+            // Whole process group, not just the child; falls back to the
+            // direct child if the group kill fails.
+            detail::kill_child_or_group(pid);
         }
 
         if (child_reaped && pipe_eof)
@@ -306,9 +378,10 @@ inline BoundedRunResult bounded_run(const std::vector<std::string>& argv,
     // The loop above exits with child_reaped == true except via the
     // kDrainGrace escape hatch — one last non-blocking check covers that,
     // then the guard is discharged only once reap is confirmed. If the
-    // child is somehow still alive, the guard's destructor forcibly
-    // kills+reaps (blocking) it; a SIGKILLed child dies promptly, so this
-    // does not itself block past the deadline in practice.
+    // child is somehow still alive, the guard's destructor forcibly kills
+    // it and reaps it with its own bounded poll / async-thread fallback
+    // (see ChildGuard above) — this worker thread is never held up past
+    // that bound, regardless of how long the child takes to actually die.
     try_reap();
     if (child_reaped)
         guard.discharge();
