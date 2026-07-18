@@ -2134,8 +2134,11 @@ public:
                                 if (ns.throughput_valid)
                                     tags["yuzu.net_throughput_bps"] =
                                         std::format("{:.0f}", ns.throughput_bps);
-                            } catch (const std::exception&) {
+                            } catch (...) {
                                 // Omitted this cycle; next heartbeat retries.
+                                // catch (...) like the perf/spark blocks: the
+                                // heartbeat thread has no top-level handler, so
+                                // anything narrower risks std::terminate.
                             }
 
                             // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 —
