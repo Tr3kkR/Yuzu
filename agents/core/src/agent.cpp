@@ -2098,7 +2098,11 @@ public:
                             // macOS ships throughput only (NET_RT_IFLIST2,
                             // retransmit + RTT deferred); other platforms are
                             // all-invalid, so no tags ship (absent, not zero).
-                            if (!cfg_.dex_disable) {
+                            // Same containment as the perf block above: a throw
+                            // here (bad_alloc sizing the routing buffer,
+                            // std::format) must not unwind out of the heartbeat
+                            // thread. Swallow; the tags are omitted this cycle.
+                            if (!cfg_.dex_disable) try {
                                 const auto net_cur = netq::read_net_counters();
                                 const auto ns =
                                     netq::sample_net_quality(hb_prev_net, net_cur);
@@ -2130,6 +2134,8 @@ public:
                                 if (ns.throughput_valid)
                                     tags["yuzu.net_throughput_bps"] =
                                         std::format("{:.0f}", ns.throughput_bps);
+                            } catch (const std::exception&) {
+                                // Omitted this cycle; next heartbeat retries.
                             }
 
                             // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 —
