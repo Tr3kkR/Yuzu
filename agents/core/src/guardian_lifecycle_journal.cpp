@@ -39,7 +39,8 @@ std::size_t json_escaped_bytes(std::string_view s) {
 std::size_t est_entry_bytes(const JournalRecord& r) {
     return json_escaped_bytes(r.rule_id) + json_escaped_bytes(r.event_id) +
            json_escaped_bytes(r.kind) + json_escaped_bytes(r.guard_type) +
-           json_escaped_bytes(r.rule_name) + 128; // 128 = JSON keys/punctuation/number fields
+           json_escaped_bytes(r.rule_name) + 160; // JSON keys/punctuation + worst-case number
+                                                   // digits (review round 2 MINOR-2)
 }
 
 } // namespace
@@ -117,6 +118,11 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
             case KvInsert::Inserted:
                 ++batch_seq_;
                 batches_written_.fetch_add(1, std::memory_order_relaxed);
+                i += consumed;
+                written = i; // count the durably-committed slots BEFORE building the best-effort
+                             // provenance record, so a throw there loses only the sent-label
+                             // back-fill (best-effort), not by re-persisting a duplicate batch
+                             // under a new key next retry (review round 2 MINOR-3).
                 if (out_batches) { // provenance back-fill source (review M3)
                     PersistedBatch pb{key, {}};
                     pb.event_ids.reserve(entries.size());
@@ -124,8 +130,6 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
                         pb.event_ids.push_back(e.event_id);
                     out_batches->push_back(std::move(pb));
                 }
-                i += consumed;
-                written = i; // slots durably committed so far
                 break;
             case KvInsert::Exists:
                 // ~2^-64 boot-nonce+seq collision: DON'T overwrite. Count it, advance the seq
@@ -153,6 +157,15 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
 }
 
 JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
+    // Serialise retention against paging (review round 2 MINOR-1): the maintenance tick calls
+    // prune() bare while a concurrent reconnect-hook page_into_window may be renaming/deleting
+    // the same keys under paging_mutex_. Without this, the loser of a race falsely counts
+    // quarantine_failures / prune_failures on operator-facing integrity counters.
+    std::lock_guard<std::mutex> pg{paging_mutex_};
+    return prune_locked_(now_ms);
+}
+
+JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     JournalPruneStats stats;
     if (!kv_)
         return stats;
@@ -278,7 +291,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // the barrier only on a SUCCESSFUL prune scan (review M5) so a transient read error does not
     // permanently mark the boot prune done and let over-cap data page unpruned.
     if (!boot_pruned_) {
-        if (prune(now_ms).read_ok) // prune does NOT take paging_mutex_: safe to call while held
+        // Call prune_locked_ directly: we already hold paging_mutex_ (prune() would re-lock it).
+        if (prune_locked_(now_ms).read_ok)
             boot_pruned_ = true;
     }
 

@@ -199,6 +199,11 @@ public:
     }
 
 private:
+    /// The retention/quarantine body, serialised by paging_mutex_ against page_into_window
+    /// (review round 2 MINOR-1). prune() is the public wrapper that takes the mutex; the
+    /// boot-prune barrier inside page_into_window calls this directly (it already holds it).
+    JournalPruneStats prune_locked_(std::int64_t now_ms);
+
     KvStore* kv_;                ///< BORROWED; outlives this (agent owns it)
     std::string boot_nonce_;     ///< random, fixed at construction - batch-key uniqueness across restarts
     std::uint64_t batch_seq_{0}; ///< per-process monotonic batch-key sequence (persist runs single-threaded under mtx_)
