@@ -859,6 +859,261 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
     return html;
 }
 
+std::string SettingsRoutes::render_engine_principals_fragment() {
+    if (!engine_principal_store_ || !engine_principal_store_->is_open()) {
+        return "<span style=\"color:#484f58\">Engine Principals store unavailable "
+               "(not configured — requires PostgreSQL, design doc §3.1).</span>";
+    }
+
+    auto fmt_epoch = [](int64_t epoch) -> std::string {
+        if (epoch == 0)
+            return "—";
+        auto tt = static_cast<std::time_t>(epoch);
+        std::tm tm_buf{};
+#ifdef _WIN32
+        gmtime_s(&tm_buf, &tt);
+#else
+        gmtime_r(&tt, &tm_buf);
+#endif
+        char buf[32]{};
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
+        return std::string(buf) + " UTC";
+    };
+
+    // Admin/auditor list surface — every engine principal, any lifecycle
+    // state, so revoked rows stay visible (never quietly dropped from the
+    // console — design doc §3.1 / §12 decision 1).
+    auto principals = engine_principal_store_->list_all(/*include_revoked=*/true);
+
+    std::string html = "<table class=\"user-table\">"
+                       "  <thead><tr><th>Principal ID</th><th>Display Name</th><th>Owner</th>"
+                       "  <th>Classification</th><th>Lifecycle</th><th>Active Creds</th>"
+                       "  <th>Revocation</th><th></th></tr></thead>"
+                       "  <tbody>";
+
+    if (principals.empty()) {
+        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">No engine principals</td></tr>";
+    } else {
+        for (const auto& p : principals) {
+            const bool active = p.lifecycle_state == "active";
+            const std::string status_cls = active ? "role-admin" : "role-user";
+            const std::string status_txt = active ? "Active" : "Revoked";
+
+            std::size_t active_creds = 0;
+            if (api_token_store_ && api_token_store_->is_open()) {
+                active_creds = api_token_store_->list_active_for_principal(p.principal_id).size();
+            }
+
+            // Revoked rows MUST surface the `superseded_by` linkage AND the
+            // recorded revoke detail explicitly (design doc §3.1 / §12
+            // decision 1) — never a seamless merged history that hides that
+            // a revocation occurred. `EnginePrincipalRow` carries no reason
+            // column of its own (`revoke()` takes no reason parameter —
+            // store schema is frozen for this PR); best-effort recover the
+            // audit trail's own detail string, which the REAL REST DELETE
+            // route (rest_api_v1.cpp) records as
+            // "credentials_revoked=N[; superseded_by=X]" — NOT an
+            // operator-supplied free-text reason (the route has no such
+            // field; an earlier draft of this fragment assumed one).
+            // Degrades honestly to "(not recorded)" if that audit row is
+            // absent or pruned.
+            std::string revocation_cell = "—";
+            if (!active) {
+                std::string linkage =
+                    p.superseded_by.empty()
+                        ? "<em style=\"color:#484f58\">no successor recorded</em>"
+                        : ("superseded by <code>" + html_escape(p.superseded_by) + "</code>");
+                std::string audit_detail = "(not recorded)";
+                if (audit_store_) {
+                    AuditQuery q;
+                    q.target_type = "EnginePrincipal";
+                    q.target_id = p.principal_id;
+                    q.action_prefixes = {"engine_principal.revoke"};
+                    q.limit = 1;
+                    auto events = audit_store_->query(q);
+                    if (!events.empty() && !events.front().detail.empty())
+                        audit_detail = events.front().detail;
+                }
+                revocation_cell = linkage +
+                                  "<br><span style=\"font-size:0.7rem;color:"
+                                  "var(--mds-color-theme-text-tertiary)\">Detail: " +
+                                  html_escape(audit_detail) + "</span>";
+                if (p.revoked_at > 0) {
+                    revocation_cell += "<br><span style=\"font-size:0.7rem;color:"
+                                        "var(--mds-color-theme-text-tertiary)\">" +
+                                        fmt_epoch(p.revoked_at) + "</span>";
+                }
+            }
+
+            html += "<tr><td><code>" + html_escape(p.principal_id) +
+                    "</code></td>"
+                    "<td>" +
+                    html_escape(p.display_name) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(p.owner_username) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(p.classification) +
+                    "</td>"
+                    "<td><span class=\"role-badge " +
+                    status_cls + "\">" + status_txt +
+                    "</span></td>"
+                    "<td>" +
+                    std::to_string(active_creds) +
+                    "</td>"
+                    "<td style=\"font-size:0.75rem\">" +
+                    revocation_cell +
+                    "</td>"
+                    "<td>";
+
+            if (active) {
+                // Every mutation form below is a PLAIN <form> — deliberately
+                // NO hx-post/hx-target/hx-swap. The real REST surface
+                // (rest_api_v1.cpp's /api/v1/engine-principals/*) parses a
+                // JSON body (`nlohmann::json::parse(req.body, ...)`), but
+                // htmx's native form submission serializes
+                // `application/x-www-form-urlencoded` — every one of those
+                // routes would 400 "invalid JSON" if htmx submitted them
+                // directly (there is no bundled json-enc extension). The
+                // page's body-level delegated `submit` listener
+                // (settings_ui.cpp) intercepts these via their
+                // `data-engine-action`/`data-principal-id` markers, builds
+                // the JSON body itself, and does a plain `fetch()` — the
+                // SAME pattern instruction_ui.cpp's execute-instruction
+                // button already uses for a JSON REST endpoint. That
+                // listener also fires `refreshEnginePrincipals` on success
+                // (the fragment's own `hx-trigger` above listens for it) and
+                // extracts a freshly-minted/rotated secret from the response
+                // body's real key (`data.token`, under the `ok_json`
+                // envelope's `data` wrapper) into #engine-principal-reveal
+                // below — never the guessed `token|raw_token|secret|
+                // raw_secret` union an earlier draft used before the actual
+                // route was read.
+                //
+                // `data-confirm` is a plain string the same listener passes
+                // to `window.confirm()` before firing the request — NOT
+                // htmx's own `hx-confirm` (that only fires for htmx-owned
+                // hx-post/hx-get triggers, which these forms deliberately
+                // are not).
+                if (active_creds == 0) {
+                    // No live credential yet — this principal needs an
+                    // initial mint (POST .../credentials), not a rotate
+                    // (rotate_engine_credential requires exactly one active
+                    // credential already).
+                    html += "<form style=\"display:inline\" data-engine-action=\"mint\" "
+                            "data-principal-id=\"" +
+                            html_escape(p.principal_id) +
+                            "\">"
+                            "<input type=\"hidden\" name=\"ttl_days\" value=\"90\">"
+                            "<button class=\"btn btn-secondary\" type=\"submit\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\">"
+                            "Mint</button></form> ";
+                } else {
+                    // Rotate credential — overlap-pair rotation (design doc §7).
+                    html += "<form style=\"display:inline\" data-engine-action=\"rotate\" "
+                            "data-principal-id=\"" +
+                            html_escape(p.principal_id) +
+                            "\">"
+                            "<input type=\"hidden\" name=\"overlap_secs\" value=\"86400\">"
+                            "<button class=\"btn btn-secondary\" type=\"submit\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "data-confirm=\"Rotate credential for &quot;" +
+                            html_escape(p.principal_id) +
+                            "&quot;? A 24h overlap window keeps both credentials valid.\">"
+                            "Rotate</button></form> ";
+                }
+
+                // Admin-forced owner transfer — never depends on the
+                // outgoing owner's cooperation (design doc §3.1).
+                html += "<form style=\"display:inline\" data-engine-action=\"transfer\" "
+                        "data-principal-id=\"" +
+                        html_escape(p.principal_id) +
+                        "\">"
+                        "<input type=\"text\" name=\"new_owner\" placeholder=\"new owner\" "
+                        "style=\"width:90px;font-size:0.7rem\" required>"
+                        "<button class=\"btn btn-secondary\" type=\"submit\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\">"
+                        "Transfer</button></form> ";
+
+                // Revoke — terminal, never un-revocable (design doc §3.1 /
+                // §12 decision 1). The REST DELETE route's only body field
+                // is the OPTIONAL `superseded_by` (a revoke-and-replace
+                // link) — it has no operator-reason field at all, so this
+                // input is optional, not required (an earlier draft
+                // required a free-text "reason" the route never consumed).
+                html += "<form style=\"display:inline\" data-engine-action=\"revoke\" "
+                        "data-principal-id=\"" +
+                        html_escape(p.principal_id) +
+                        "\">"
+                        "<input type=\"text\" name=\"superseded_by\" "
+                        "placeholder=\"successor id (optional)\" "
+                        "style=\"width:130px;font-size:0.7rem\">"
+                        "<button class=\"btn btn-danger\" type=\"submit\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "data-confirm=\"Revoke engine principal &quot;" +
+                        html_escape(p.principal_id) +
+                        "&quot;? This is TERMINAL — never un-revocable; recovery mints a "
+                        "successor.\">Revoke</button></form>";
+            }
+
+            html += "</td></tr>";
+        }
+    }
+
+    html += "  </tbody></table>";
+
+    // NOTE: the one-time-reveal target (#engine-principal-reveal) is
+    // DELIBERATELY NOT emitted here — it lives in the static page shell
+    // (settings_ui.cpp), OUTSIDE this fragment's own auto-refreshing
+    // container. This fragment's entire innerHTML is replaced on every
+    // `refreshEnginePrincipals` trigger — including the one a successful
+    // mint/rotate fires immediately after populating the reveal panel — so
+    // a reveal element nested in here would be wiped the instant it
+    // appeared. See settings_ui.cpp's comment at the same id.
+
+    // Plain <form> (no hx-post) — same JSON-vs-form-urlencoded reasoning as
+    // the per-row mutation forms above; the body-level submit listener
+    // (settings_ui.cpp) builds the REST route's actual JSON body
+    // `{slug, display_name, owner_username, justification, classification}`
+    // (the route derives `principal_id = "engine:" + slug` itself — the
+    // field the form submits is the bare slug, not a pre-built
+    // "engine:"-prefixed principal_id).
+    html += "<form class=\"add-user-form\" data-engine-action=\"create\">"
+            "  <div class=\"mini-field\">"
+            "    <label>Slug</label>"
+            "    <input type=\"text\" name=\"slug\" placeholder=\"vuln-uce\" "
+            "style=\"width:140px\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Display Name</label>"
+            "    <input type=\"text\" name=\"display_name\" placeholder=\"Vuln UCE\" "
+            "style=\"width:120px\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Owner</label>"
+            "    <input type=\"text\" name=\"owner_username\" placeholder=\"username\" "
+            "style=\"width:100px\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Classification</label>"
+            "    <select name=\"classification\" style=\"width:90px\" required>"
+            "      <option value=\"internal\">internal</option>"
+            "      <option value=\"external\">external</option>"
+            "    </select>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Justification</label>"
+            "    <input type=\"text\" name=\"justification\" placeholder=\"grant reason\" "
+            "style=\"width:140px\" required>"
+            "  </div>"
+            "  <button class=\"btn btn-primary\" type=\"submit\">Create</button>"
+            "</form>"
+            "<div class=\"feedback\" id=\"engine-principal-feedback\"></div>";
+
+    return html;
+}
+
 std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
                                                 const std::string& new_otpauth_uri,
                                                 const std::string& new_secret_b32,
@@ -2491,6 +2746,20 @@ void SettingsRoutes::register_routes(
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
+    // Engine Principals admin console (design doc §3.1, plan PR 4.3). Read-
+    // only render — every mutation (create/rotate/revoke/transfer-owner)
+    // posts directly to the REST surface at /api/v1/engine-principals/...
+    // (built alongside this task); this fragment refreshes on the
+    // `refreshEnginePrincipals` body event that REST mutation's `HX-Trigger`
+    // response header fires, mirroring the API-tokens block's refresh
+    // pattern. Admin-only, same posture as /fragments/settings/tokens.
+    sink.Get("/fragments/settings/engine-principals",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!admin_fn_(req, res))
+                     return;
+                 res.set_content(render_engine_principals_fragment(), "text/html; charset=utf-8");
+             });
+
     sink.Get("/fragments/settings/management-groups",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ManagementGroup", "Read"))
@@ -3596,6 +3865,50 @@ void SettingsRoutes::register_routes(
                 R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
+        }
+        // Owner-delete guard (design doc §3.1, GOVERNANCE HARD PRECONDITION).
+        // A user who owns an active engine principal must transfer that
+        // ownership (via the engine-principal transfer-owner surface) before
+        // their account can be deleted — otherwise the principal's audit
+        // trail loses its named responsible human. FAIL CLOSED: once the
+        // store is wired, treat `count_active_owned_by`'s nullopt
+        // (store-unreachable / cannot verify) the SAME as ">0 owned" — both
+        // block the delete. There is no downgrade path from "cannot verify"
+        // to "safe to delete".
+        //
+        // G6 (governance hardening, security-guardian): a null
+        // `engine_principal_store_` skips this guard entirely rather than
+        // failing closed — deliberately, and ONLY defensible because it is
+        // provably unreachable in production. server.cpp constructs
+        // EnginePrincipalStore unconditionally whenever `pg_pool_` is set
+        // (server.cpp's boot sequence, "EnginePrincipalStore — born-on-PG
+        // identity store") and sets `startup_failed_ = true` — refusing to
+        // start serving at all — if it fails to open; a live server
+        // therefore NEVER reaches this handler with a null store. The null
+        // path exists solely so `test_settings_routes_users.cpp`'s
+        // pre-existing harness (which predates this feature and does not
+        // wire an EnginePrincipalStore) keeps passing — see
+        // SettingsOwnerDeleteHarness in test_engine_principal_lifecycle.cpp
+        // for the wired-store coverage of the 409/nullopt paths themselves.
+        // If a future change ever makes EnginePrincipalStore constructible
+        // without a hard-fail boot path (e.g. an optional/feature-flagged
+        // deployment mode), this skip becomes a real fail-open and MUST be
+        // revisited — do not carry this comment forward unexamined.
+        if (engine_principal_store_) {
+            auto owned = engine_principal_store_->count_active_owned_by(username);
+            if (!owned.has_value() || *owned > 0) {
+                audit_fn_(req, "user.delete", "denied", "User", username,
+                          owned.has_value() ? "owns_active_engine_principal"
+                                             : "engine_store_unreachable");
+                res.status = 409;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Cannot delete: user owns an active engine )"
+                    R"(principal — transfer ownership first","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
         }
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {

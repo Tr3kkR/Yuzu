@@ -1,6 +1,7 @@
 #include "scim_routes.hpp"
 
 #include "audit_store.hpp"
+#include "engine_principal_store.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -231,6 +232,32 @@ bool audit(auth::AuthManager* auth_mgr, AuditStore* audit_store, const httplib::
         bump_audit_write_failure(auth_mgr, action);
     }
     return ok;
+}
+
+// Two-mode owner-deprovision enforcement (engine principals, PR 4.3
+// governance hardening; enterprise-architect ruling). The interactive
+// dashboard delete (settings_routes.cpp) PREVENTS removing a user who owns
+// active engine principals (409 — the admin can transfer ownership first).
+// Automated SCIM deprovision is a CC6.8-mandated termination with no such
+// actor: refusing would leave a terminated employee active; cascade
+// auto-revoke is rejected because revoke() is terminal/irreversible. So SCIM
+// deprovision is DETECTIVE — it always succeeds, but a deprovisioned owner
+// (or an unverifiable count) raises a high-signal audit + metric for
+// out-of-band ownership reassignment. The principal authenticates on its own
+// credential and never re-derived authority from the owner.
+void flag_owner_deprovisioned(EnginePrincipalStore* engine_principal_store,
+                              auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                              const httplib::Request& req, const std::string& username) {
+    if (!engine_principal_store) return;
+    auto owned = engine_principal_store->count_active_owned_by(username);
+    if (owned.has_value() && *owned == 0) return; // clean — common case
+    std::string detail = owned.has_value()
+        ? "orphaned_active_engine_principals=" + std::to_string(*owned)
+        : "engine_ownership_unverifiable";
+    audit(auth_mgr, audit_store, req, "engine_principal.owner_deprovisioned", "success",
+         username, detail, "EnginePrincipal");
+    if (auto* m = auth_mgr ? auth_mgr->metrics_registry() : nullptr)
+        m->counter("yuzu_engine_principal_owner_deprovisioned_total").increment();
 }
 
 /// Build the `/scim/v2/Users` collection URL for this request so
@@ -616,7 +643,8 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
 /// comment (set-and-proceed, CC6.8 enforced via the failure-counter alert).
 bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                 const httplib::Request& req, httplib::Response& res, const ScimResource& resource,
-                const std::string& audit_action) {
+                const std::string& audit_action,
+                EnginePrincipalStore* engine_principal_store = nullptr) {
     if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
         return false;
     if (!deprovision_role_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
@@ -665,6 +693,12 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
     // every failure), not by refusing to report the 2xx that already
     // happened.
     audit(auth_mgr, audit_store, req, audit_action, "success", resource.scim_id);
+    // Detective control (PR 4.3, engine principals): the deprovision above
+    // already committed — flag (never block) if the deprovisioned operator
+    // owned active engine principals. See `flag_owner_deprovisioned`'s doc
+    // comment.
+    flag_owner_deprovisioned(engine_principal_store, auth_mgr, audit_store, req,
+                             resource.username);
     return true;
 }
 
@@ -708,14 +742,17 @@ bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
 
 void ScimRoutes::register_routes(httplib::Server& svr, ScimStore* scim_store,
                                  auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                                 std::string scim_admin_group) {
+                                 std::string scim_admin_group,
+                                 EnginePrincipalStore* engine_principal_store) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, scim_store, auth_mgr, audit_store, std::move(scim_admin_group));
+    register_routes(sink, scim_store, auth_mgr, audit_store, std::move(scim_admin_group),
+                    engine_principal_store);
 }
 
 void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                  auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                                 std::string scim_admin_group) {
+                                 std::string scim_admin_group,
+                                 EnginePrincipalStore* engine_principal_store) {
     spdlog::info("SCIM routes: registering /scim/v2/* (provisioning surface)");
 
     // ── Discovery documents — PUBLIC-behind-the-bearer-gate (least exposure:
@@ -1205,7 +1242,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── PUT /scim/v2/Users/{id} — full replace (identity fields only). ────
 
     sink.Put(R"(/scim/v2/Users/([0-9a-fA-F]+))",
-            [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+            [scim_store, auth_mgr, audit_store,
+             engine_principal_store](const httplib::Request& req,
                                                 httplib::Response& res) {
                 if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                     record_request(auth_mgr, "replace", res.status);
@@ -1254,7 +1292,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 bool active_transitioned = false;
                 if (input.active.has_value() && !*input.active && resource->active) {
                     if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
-                                    "scim.user.deactivated")) {
+                                    "scim.user.deactivated", engine_principal_store)) {
                         record_request(auth_mgr, "replace", res.status);
                         return;
                     }
@@ -1285,7 +1323,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                             "re-running deactivation",
                             resource->username, resource->scim_id);
                         if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
-                                        "scim.user.deactivated")) {
+                                        "scim.user.deactivated", engine_principal_store)) {
                             record_request(auth_mgr, "replace", res.status);
                             return;
                         }
@@ -1357,7 +1395,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── PATCH /scim/v2/Users/{id} — the critical deprovision path. ────────
 
     sink.Patch(R"(/scim/v2/Users/([0-9a-fA-F]+))",
-              [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+              [scim_store, auth_mgr, audit_store,
+               engine_principal_store](const httplib::Request& req,
                                                   httplib::Response& res) {
                   if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                       record_request(auth_mgr, "patch", res.status);
@@ -1408,7 +1447,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   if (patch.active.has_value()) {
                       if (!*patch.active && resource->active) {
                           if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
-                                          "scim.user.deactivated")) {
+                                          "scim.user.deactivated", engine_principal_store)) {
                               record_request(auth_mgr, "patch", res.status);
                               return;
                           }
@@ -1435,7 +1474,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                   "still live; re-running deactivation",
                                   resource->username, resource->scim_id);
                               if (!deactivate(scim_store, auth_mgr, audit_store, req, res,
-                                              *resource, "scim.user.deactivated")) {
+                                              *resource, "scim.user.deactivated",
+                                              engine_principal_store)) {
                                   record_request(auth_mgr, "patch", res.status);
                                   return;
                               }
@@ -1503,7 +1543,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── DELETE /scim/v2/Users/{id} ─────────────────────────────────────────
 
     sink.Delete(R"(/scim/v2/Users/([0-9a-fA-F]+))",
-               [scim_store, auth_mgr, audit_store](const httplib::Request& req,
+               [scim_store, auth_mgr, audit_store,
+                engine_principal_store](const httplib::Request& req,
                                                    httplib::Response& res) {
                    if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                        record_request(auth_mgr, "delete", res.status);
@@ -1584,6 +1625,12 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    // Set-and-proceed (UP-N2) — see the matching comment in
                    // `deactivate()`.
                    audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id);
+                   // Detective control (PR 4.3, engine principals): flag
+                   // (never block) if the deprovisioned operator owned
+                   // active engine principals — see
+                   // `flag_owner_deprovisioned`'s doc comment.
+                   flag_owner_deprovisioned(engine_principal_store, auth_mgr, audit_store, req,
+                                            resource->username);
                    res.status = 204;
                    record_request(auth_mgr, "delete", 204);
                });
