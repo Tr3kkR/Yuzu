@@ -925,6 +925,28 @@ public:
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
+        // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
+        // Deliberately a bounded `reason` label set (currently one value,
+        // "successor_unused") and NOT `event="security"` — this is an
+        // OPERATIONAL health signal (the module hasn't picked up its new
+        // credential yet), distinct from the theft-detection alert channel.
+        metrics_.describe("yuzu_engine_principal_rotation_events_total",
+                          "Cumulative engine-credential rotation sweep events, by reason "
+                          "(bounded label set)",
+                          "counter");
+        metrics_.describe("yuzu_engine_principal_rotation_auto_revoked_total",
+                          "Cumulative engine-credential predecessors auto-revoked at overlap "
+                          "window end",
+                          "counter");
+        // A persistent sweep fault (PG unreachable / audit throw every tick)
+        // silently stops predecessor auto-revocation — overlap windows then
+        // never close (two live credentials persist). The per-tick try/catch
+        // keeps the thread alive; this counter makes that degradation
+        // alertable instead of log-only (Gate 8 UP8-6).
+        metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
+                          "Cumulative engine-credential rotation-sweep ticks that failed with an "
+                          "exception (predecessor auto-revocation skipped for that tick)",
+                          "counter");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");
@@ -3550,6 +3572,151 @@ public:
                 });
         }
 
+        // T12 (design doc §7): engine-credential overlap-pair rotation
+        // sweep — auto-revoke + successor-unused warning. Only started when
+        // api_token_store_ is actually open (nothing to sweep otherwise).
+        // 60s cadence: overlap windows floor at 24h (kOverlapFloorSecs in
+        // api_token_store.cpp), so a minute of sweep latency is immaterial
+        // to either half's correctness — the sweep is idempotent and a
+        // missed tick simply defers to the next one (see
+        // sweep_expired_rotations's doc comment).
+        if (api_token_store_ && api_token_store_->is_open()) {
+            engine_rotation_sweep_thread_ = std::thread([this]() {
+                spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
+                // Successor-unused warnings are process-local, best-effort
+                // de-duplication (mirrors ApiTokenStore's own rotation-grace
+                // cache precedent) — keyed on rotation_group, so the SAME
+                // pair isn't re-audited/re-counted every tick while its
+                // window is still open. Pruned each tick to whatever
+                // list_rotations_nearing_expiry_unused still returns, so a
+                // resolved pair (revoked, confirmed, or finally used) frees
+                // its slot for a future rotation on the same principal. A
+                // process restart forfeits the de-dup state and re-warns
+                // once — acceptable for an operational signal.
+                std::unordered_set<std::string> warned_rotation_groups;
+                // Warn once the predecessor's overlap window has this much
+                // time left — matches the 24h overlap floor: the operator
+                // gets a full floor-window's notice before auto-revoke, the
+                // shortest lead time that is never a false "already gone"
+                // read against the shortest window an operator can even set.
+                constexpr std::int64_t kSuccessorUnusedWarnLeadSecs = 24 * 3600;
+
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
+                         ++i) {
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    // S-SWEEP-EXCEPTION-GUARD: an exception escaping a
+                    // std::thread body calls std::terminate (whole-process
+                    // crash) — a transient failure here (e.g. an
+                    // audit_store_->log throw, bad_alloc) must instead log
+                    // and let the loop continue to the next tick
+                    // (fail-safe, self-healing; matches the sweep's own
+                    // "a missed tick simply defers to the next one" posture).
+                    try {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        continue; // defensive — construction-time guard above should hold
+
+                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+
+                    // Half 1: auto-revoke elapsed predecessors + clear the
+                    // surviving successor's rotation state. A failed tick (pool
+                    // contention / query error) is reported via the out-param —
+                    // the store swallows it (returns empty) rather than throwing,
+                    // so without this the sweep-failures alert would stay at zero
+                    // while rotated-out credentials silently outlive their window.
+                    bool sweep_tick_failed = false;
+                    auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
+                    if (sweep_tick_failed) {
+                        spdlog::warn("Engine-credential rotation sweep tick could not run (pool "
+                                     "contention / query failure) — predecessor auto-revoke deferred "
+                                     "to the next tick");
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                    for (const auto& predecessor : revoked) {
+                        metrics_.counter("yuzu_engine_principal_rotation_auto_revoked_total")
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log(
+                                {.timestamp = now,
+                                 .principal = "system",
+                                 .principal_role = "system",
+                                 .action = "engine_principal.rotation.auto_revoke",
+                                 .target_type = "ApiToken",
+                                 .target_id = predecessor.token_id,
+                                 .detail = "principal_id=" + predecessor.principal_id +
+                                           " reason=overlap_window_elapsed",
+                                 .result = "success"});
+                        }
+                        // Any pair that just resolved no longer needs its
+                        // warned-state tracked — the token_id it was keyed
+                        // under (rotation_group == successor's token_id,
+                        // never the predecessor's) is pruned below anyway,
+                        // but drop it here too for clarity/promptness.
+                        warned_rotation_groups.erase(predecessor.rotation_group);
+                    }
+
+                    // Half 2: successor-unused warning — an OPERATIONAL
+                    // health signal (bounded reason label, NOT
+                    // event="security"; see the design doc §7 / the
+                    // metrics_.describe comment above), kept on its own
+                    // channel from any theft-detection alert.
+                    auto nearing = api_token_store_->list_rotations_nearing_expiry_unused(
+                        now, kSuccessorUnusedWarnLeadSecs);
+                    std::unordered_set<std::string> still_nearing;
+                    for (const auto& pair : nearing) {
+                        still_nearing.insert(pair.successor.rotation_group);
+                        if (warned_rotation_groups.contains(pair.successor.rotation_group))
+                            continue; // already warned this rotation attempt — don't re-spam
+                        warned_rotation_groups.insert(pair.successor.rotation_group);
+
+                        metrics_
+                            .counter("yuzu_engine_principal_rotation_events_total",
+                                     {{"reason", "successor_unused"}})
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log(
+                                {.timestamp = now,
+                                 .principal = "system",
+                                 .principal_role = "system",
+                                 .action = "engine_principal.rotation.successor_unused",
+                                 .target_type = "ApiToken",
+                                 .target_id = pair.successor.token_id,
+                                 .detail = "principal_id=" + pair.predecessor.principal_id +
+                                           " predecessor_token_id=" + pair.predecessor.token_id +
+                                           " overlap_expires_at=" +
+                                           std::to_string(pair.predecessor.overlap_expires_at),
+                                 .result = "warning"});
+                        }
+                    }
+                    // Prune de-dup entries for pairs that no longer appear
+                    // (resolved via revoke, confirm, or the successor
+                    // finally being used) so a later rotation on the same
+                    // principal can warn again.
+                    std::erase_if(warned_rotation_groups, [&](const std::string& group) {
+                        return !still_nearing.contains(group);
+                    });
+                    } catch (const std::exception& e) {
+                        spdlog::error("Engine-credential rotation sweep tick failed: {}",
+                                     e.what());
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    } catch (...) {
+                        spdlog::error("Engine-credential rotation sweep tick failed: unknown "
+                                      "exception");
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                }
+                spdlog::info("Engine-credential rotation sweep thread stopped");
+            });
+        }
+
         agent_server_->Wait();
     }
 
@@ -3661,6 +3828,15 @@ public:
         // Join the insecure-TLS reminder thread (issue #79)
         if (insecure_tls_reminder_thread_.joinable()) {
             insecure_tls_reminder_thread_.join();
+        }
+
+        // T12: join the engine-credential rotation sweep thread (borrows
+        // api_token_store_ + audit_store_ — must stop before either is torn
+        // down; api_token_store_.reset() happens further below alongside
+        // engine_principal_store_, per the F5 destruct-before-pool ordering
+        // note on those members).
+        if (engine_rotation_sweep_thread_.joinable()) {
+            engine_rotation_sweep_thread_.join();
         }
 
         if (schedule_engine_)
@@ -6363,6 +6539,14 @@ private:
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
+        // PR 4.3 (T13): wire the LIVE owner-delete guard + admin console
+        // fragment. Nullable — a null/unwired engine_principal_store_ leaves
+        // the guard permissive (documented on set_engine_principal_store) and
+        // the console fragment renders "not configured", same posture as
+        // every other optional-store wiring in this file.
+        if (engine_principal_store_) {
+            settings_routes_->set_engine_principal_store(engine_principal_store_.get());
+        }
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -10855,7 +11039,8 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get(), cfg_.scim_admin_group);
+                                          audit_store_.get(), cfg_.scim_admin_group,
+                                          engine_principal_store_.get());
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
@@ -10896,7 +11081,33 @@ private:
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
+        // PR 4.3 (T13): shared owner-existence resolver for the
+        // engine-principal create/transfer-owner FK check — RestApiV1 and
+        // McpServer both need the identical "does this username name a real
+        // user" predicate. AuthDB::user_exists is non-const and returns
+        // std::expected<bool, AuthDBError> (no value_or on std::expected);
+        // a lookup failure reads as "does not exist" — fail-closed on the
+        // owner FK, same posture break_glass_account_problem uses elsewhere
+        // in auth_db.cpp.
+        auto engine_owner_exists_fn = [this](const std::string& username) -> bool {
+            auto* db = auth_mgr_.auth_db_ptr();
+            if (db == nullptr)
+                return false;
+            auto exists = db->user_exists(username);
+            return exists.has_value() && *exists;
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
+        // Both setters MUST run BEFORE register_routes() (captured by value
+        // at registration time, not `this`) — see set_engine_principal_store/
+        // set_user_exists_fn's doc comments in rest_api_v1.hpp. Nullable:
+        // an unwired engine_principal_store_ leaves the engine-principal
+        // routes answering 503, same posture as every other optional-store
+        // wiring in this file.
+        if (engine_principal_store_) {
+            rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
+            rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
+        }
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -11184,6 +11395,20 @@ private:
             // → web_server_->stop()) before any member destructs — no handler
             // runs after the join, so member-destruction order is irrelevant.
             mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
+            // PR 4.3 (T13): wire the engine-principal store + the SAME
+            // engine-credential store (api_token_store_) + the shared
+            // owner-existence predicate the 8 engine tools need. Setters
+            // are safe before OR after register_routes (the handler
+            // captures `this`, see mcp_server.hpp's doc comment) but set
+            // here, before build_handler() runs, for consistency with the
+            // REST/settings wiring above. Nullable — an unwired
+            // engine_principal_store_ leaves every engine-principal tool
+            // answering "unavailable" rather than 503/crashing.
+            if (engine_principal_store_) {
+                mcp_server_->set_engine_principal_store(engine_principal_store_.get());
+                mcp_server_->set_engine_credential_store(api_token_store_.get());
+                mcp_server_->set_owner_exists_fn(engine_owner_exists_fn);
+            }
             mcp_server_->register_routes(
                 *web_server_,
                 [this](const httplib::Request& req, httplib::Response& res)
@@ -11850,6 +12075,18 @@ private:
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;
+
+    // T12 (design doc §7): engine-credential overlap-pair rotation sweep —
+    // auto-revoke elapsed predecessors + the successor-unused warning. A
+    // dedicated thread rather than piggybacking on health_recompute_thread_:
+    // that thread's own comment (see start_web_server()) already flags its
+    // sweep body as a serial budget shared with a SECURITY-relevant
+    // revocation sweep — adding unrelated PG-bound work there would grow
+    // that shared stall window. Joined before api_token_store_ resets in
+    // stop() (it borrows api_token_store_ + audit_store_, same ADR-0012
+    // destruct-before-pool discipline as every other PG-borrowing thread
+    // here).
+    std::thread engine_rotation_sweep_thread_;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> stop_entered_{false};
