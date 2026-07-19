@@ -52,6 +52,10 @@ inline constexpr int kJournalRetentionDays = 7;
 inline constexpr std::size_t kMaxJournalBatches = 1000;
 inline constexpr std::size_t kMaxJournalBytes = 32ull * 1024 * 1024; // 32 MiB
 
+/// Corrupt batches moved aside are ALSO bounded (counted + pruned) so they cannot
+/// accumulate outside the caps above.
+inline constexpr std::size_t kMaxQuarantineBatches = 100;
+
 /// Key prefixes within kJournalNamespace. A batch key is "lc:<nonce>:<seq12>";
 /// its sent-label is "sent:<nonce>:<seq12>"; a quarantined batch is
 /// "quarantine:" + the original batch key. The three prefixes are disjoint so a
@@ -89,6 +93,11 @@ YUZU_EXPORT std::string journal_sent_key(std::string_view boot_nonce, std::uint6
 
 /// "quarantine:" + batch_key — where a corrupt/unparseable batch is moved.
 YUZU_EXPORT std::string journal_quarantine_key(std::string_view batch_key);
+
+/// Derive the batch key a sent-label refers to: "sent:X:Y" → "lc:X:Y". Used by
+/// sent-label GC to find labels whose batch no longer exists. Returns the input
+/// unchanged if it is not a sent-label key (it then matches no batch).
+YUZU_EXPORT std::string journal_batch_key_from_sent_key(std::string_view sent_key);
 
 // ── Mint-time validation (design §2 loss table; rev-4.1 #2) ───────────────────
 

@@ -37,6 +37,13 @@ std::shared_ptr<const JournalRecord> ptr(const std::string& rid, const std::stri
     return std::make_shared<const JournalRecord>(rec(rid, kind));
 }
 
+// A one-record pending vector — std::span needs a named contiguous range, not a
+// braced-init-list, so persist() calls take this rather than {ptr(...)}.
+std::vector<std::shared_ptr<const JournalRecord>> one(const std::string& rid,
+                                                     const std::string& kind) {
+    return {ptr(rid, kind)};
+}
+
 // Read every batch back and flatten. Batch keys are lc:<nonce>:<seq12> with a fixed
 // per-process nonce + zero-padded seq, so list_entries' key order == persist order.
 std::vector<JournalRecord> read_all(KvStore& kv) {
@@ -131,4 +138,101 @@ TEST_CASE("journal persist: a write failure circuit-breaks; a retry of the same 
     REQUIRE(got.size() == 2);
     CHECK(got[0].rule_id == "r1");
     CHECK(got[1].rule_id == "r2");
+}
+
+// ── Retention + quarantine (item 7 PR-Ag C4) ─────────────────────────────────
+
+namespace {
+constexpr std::size_t kNoCap = std::size_t(-1);
+std::size_t count_keys(KvStore& kv, std::string_view prefix) {
+    auto rows = kv.list_entries(kJournalNamespace, prefix);
+    REQUIRE(rows.has_value());
+    return rows->size();
+}
+} // namespace
+
+TEST_CASE("journal prune: age cap evicts batches older than retention", "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.persist(one("r1", "armed"));
+    j.persist(one("r2", "armed"));
+    REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+
+    // A now_ms far in the future makes every real-now batch older than 7 days.
+    auto stats = j.prune(32503680000000LL); // ~year 3000 in ms
+    CHECK(stats.evicted == 2);
+    CHECK(j.batches_pruned() == 2);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 0);
+}
+
+TEST_CASE("journal prune: count cap evicts the oldest batches by (ts_ms,key)", "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/2, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    for (int i = 0; i < 4; ++i)
+        j.persist(one("r" + std::to_string(i), "armed"));
+    REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 4);
+
+    auto stats = j.prune(0); // now_ms=0 → nothing is "too old" under the 100000-day cap
+    CHECK(stats.evicted == 2);
+    auto remaining = read_all(*t.kv);
+    REQUIRE(remaining.size() == 2); // the two NEWEST survive
+    CHECK(remaining[0].rule_id == "r2");
+    CHECK(remaining[1].rule_id == "r3");
+}
+
+TEST_CASE("journal prune: byte cap evicts to satisfy the budget", "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(100000, kNoCap, /*max_bytes=*/1, 100); // 1 byte < any batch
+    for (int i = 0; i < 3; ++i)
+        j.persist(one("r" + std::to_string(i), "armed"));
+    REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 3);
+
+    auto stats = j.prune(0);
+    CHECK(stats.evicted == 3); // no batch fits a 1-byte budget → all evicted
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 0);
+}
+
+TEST_CASE("journal prune: an unparseable batch is quarantined; good batches survive",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(t.kv->set(kJournalNamespace, "lc:corrupt:000000000000", "not valid json"));
+    j.persist(one("good", "armed"));
+
+    auto stats = j.prune(0);
+    CHECK(stats.quarantined == 1);
+    CHECK(j.quarantined() == 1);
+
+    auto batches = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(batches.has_value());
+    REQUIRE(batches->size() == 1); // only the good batch remains under lc:
+    auto b = parse_journal_batch((*batches)[0].value);
+    REQUIRE(b.has_value());
+    CHECK(b->entries.at(0).rule_id == "good");
+    CHECK(count_keys(*t.kv, kQuarantineKeyPrefix) == 1); // the corrupt one moved aside
+}
+
+TEST_CASE("journal prune: an orphan sent-label is GC'd", "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.persist(one("r1", "armed")); // a surviving batch (its label, if any, is kept)
+    REQUIRE(t.kv->set(kJournalNamespace, "sent:ghost:000000000000", "")); // orphan: no such batch
+
+    auto stats = j.prune(0);
+    CHECK(stats.sent_labels_gc >= 1);
+    CHECK_FALSE(t.kv->exists(kJournalNamespace, "sent:ghost:000000000000"));
+}
+
+TEST_CASE("journal prune: the quarantine set is bounded", "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(100000, kNoCap, kNoCap, /*max_quarantine=*/1);
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(t.kv->set(kJournalNamespace, "lc:bad" + std::to_string(i) + ":000000000000", "garbage"));
+
+    j.prune(0); // quarantines 3, then bounds the quarantine set to 1
+    CHECK(count_keys(*t.kv, kQuarantineKeyPrefix) == 1);
 }

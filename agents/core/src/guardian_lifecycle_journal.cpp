@@ -2,9 +2,11 @@
 
 #include <yuzu/agent/kv_store.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <random>
+#include <set>
 #include <vector>
 
 namespace yuzu::agent {
@@ -94,6 +96,102 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
         }
     }
     return written;
+}
+
+JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
+    JournalPruneStats stats;
+    if (!kv_)
+        return stats;
+
+    auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    if (!rows) {
+        prune_failures_.fetch_add(1, std::memory_order_relaxed); // read error → fail-safe, retry next pass
+        return stats;
+    }
+
+    struct Live {
+        std::string key;
+        std::int64_t ts_ms;
+        std::size_t bytes;
+    };
+    std::vector<Live> live;
+    live.reserve(rows->size());
+    for (auto& row : *rows) {
+        auto parsed = parse_journal_batch(row.value);
+        if (!parsed) {
+            // Unparseable → move aside atomically so replay never re-parses it.
+            if (kv_->rename_key(kJournalNamespace, row.key, journal_quarantine_key(row.key)) ==
+                KvRename::Renamed) {
+                quarantined_.fetch_add(1, std::memory_order_relaxed);
+                ++stats.quarantined;
+            } else {
+                quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        live.push_back(Live{row.key, parsed->ts_ms, row.value.size()});
+    }
+
+    // Oldest-first by (ts_ms, key) — NOT lexical key (the boot-nonce is random).
+    std::sort(live.begin(), live.end(), [](const Live& a, const Live& b) {
+        return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
+    });
+
+    const std::int64_t min_ts =
+        now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
+    std::size_t total_bytes = 0;
+    for (const auto& l : live)
+        total_bytes += l.bytes;
+
+    std::vector<std::string> evict;
+    std::size_t surviving = live.size();
+    for (const auto& l : live) { // oldest first: age is absolute, count/bytes trim from this end
+        const bool too_old = l.ts_ms < min_ts;
+        const bool too_many = surviving > max_batches_;
+        const bool too_big = total_bytes > max_bytes_;
+        if (too_old || too_many || too_big) {
+            evict.push_back(l.key);
+            --surviving;
+            total_bytes -= l.bytes;
+        }
+    }
+    if (!evict.empty()) {
+        const int n = kv_->del_keys(kJournalNamespace, evict);
+        batches_pruned_.fetch_add(static_cast<std::uint64_t>(n), std::memory_order_relaxed);
+        stats.evicted = static_cast<std::size_t>(n);
+    }
+
+    // Surviving batch keys (parseable, not evicted) — the reference set for sent-label GC.
+    const std::set<std::string> evicted_set(evict.begin(), evict.end());
+    std::set<std::string> survivors;
+    for (const auto& l : live)
+        if (!evicted_set.count(l.key))
+            survivors.insert(l.key);
+
+    // Sent-label GC: drop any sent:<...> whose batch no longer survives — an evicted batch's
+    // label, or an orphan from a crash between the pop-after-send label write and eviction.
+    if (auto sent = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+        std::vector<std::string> stale;
+        for (const auto& s : *sent)
+            if (!survivors.count(journal_batch_key_from_sent_key(s.key)))
+                stale.push_back(s.key);
+        if (!stale.empty())
+            stats.sent_labels_gc =
+                static_cast<std::size_t>(kv_->del_keys(kJournalNamespace, stale));
+    }
+
+    // Bound the quarantine set (drop oldest-by-key; corrupt batches have no trusted ts_ms).
+    if (auto q = kv_->list_entries(kJournalNamespace, kQuarantineKeyPrefix)) {
+        if (q->size() > max_quarantine_) {
+            std::vector<std::string> drop;
+            const std::size_t excess = q->size() - max_quarantine_;
+            for (std::size_t i = 0; i < excess; ++i)
+                drop.push_back((*q)[i].key); // list_entries is key-sorted
+            kv_->del_keys(kJournalNamespace, drop);
+        }
+    }
+
+    return stats;
 }
 
 } // namespace yuzu::agent
