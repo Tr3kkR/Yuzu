@@ -667,3 +667,655 @@ TEST_CASE("ApiTokenStore: the post-commit generation bump prevents a validate th
     auto after = store.validate_token(*raw);
     CHECK_FALSE(after.has_value());
 }
+
+// ── New coverage (PR 4.3): overlap-pair credential rotation, design doc §7 ─
+
+namespace {
+
+int64_t test_now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+constexpr int64_t kDay = 24 * 3600;
+constexpr int64_t k90Days = 90 * kDay;
+constexpr int64_t kDefaultOverlapSecs = 7 * kDay;
+
+// Direct-SQL peek at a token row's raw `token_hash` column — used only to
+// prove the raw secret was never persisted anywhere, not exercised through
+// the store's own (hash-masking) public API.
+std::string raw_hash_column(PgPool& pool, const std::string& token_id) {
+    auto lease = pool.acquire();
+    if (!lease)
+        return {};
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT token_hash FROM api_token_store.api_tokens WHERE token_id = $1",
+                        std::vector<std::string>{token_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return {};
+    return PQgetvalue(res.get(), 0, 0);
+}
+
+} // namespace
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects an overlap window below the 24h "
+          "floor",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    auto now = test_now_epoch();
+    // No active credential exists at all — the floor check still fires
+    // first (pure math, no DB dependency), and its message is distinct from
+    // the "no active credential" rejection.
+    auto rotated =
+        store.rotate_engine_credential("engine:rotation-floor", kDay - 1, now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error().find("floor") != std::string::npos);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential with no active credential is rejected",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    auto now = test_now_epoch();
+    auto rotated = store.rotate_engine_credential("engine:rotation-empty", kDefaultOverlapSecs,
+                                                  now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects a window exceeding the "
+          "predecessor's own expiry rather than truncating it",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-tight-expiry";
+    auto now = test_now_epoch();
+    // Predecessor expires in 1h — a 24h (floor) overlap window cannot fit
+    // before it, so the mint must be rejected, not silently shrunk.
+    auto minted =
+        store.create_token("tight", principal, now + 3600, "", "readonly", "engine");
+    REQUIRE(minted.has_value());
+
+    auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error().find("expiry") != std::string::npos);
+
+    // Rejected mint must not have minted a successor.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 1);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential mints a successor, stamps the rotation "
+          "pair, and returns the raw secret exactly once — never persisted",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-mint";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto before = store.list_active_for_principal(principal);
+    REQUIRE(before.size() == 1);
+    const std::string predecessor_id = before[0].token_id;
+
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    CHECK(rotated->starts_with("yuzu_"));
+    CHECK(*rotated != *predecessor_raw);
+
+    auto after = store.list_active_for_principal(principal);
+    REQUIRE(after.size() == 2);
+
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : after) {
+        CHECK(t.token_hash.empty()); // masked, per list_active_for_principal's contract
+        if (t.token_id == predecessor_id)
+            predecessor = &t;
+        else
+            successor = &t;
+    }
+    REQUIRE(predecessor != nullptr);
+    REQUIRE(successor != nullptr);
+
+    CHECK_FALSE(predecessor->rotation_group.empty());
+    CHECK(predecessor->rotation_group == successor->rotation_group);
+    CHECK(predecessor->overlap_expires_at == now + kDefaultOverlapSecs);
+    CHECK(successor->supersedes_token_id == predecessor->token_id);
+    CHECK(predecessor->supersedes_token_id.empty());
+
+    // The raw secret is never stored — only its SHA-256 hash.
+    auto stored_hash = raw_hash_column(pool, successor->token_id);
+    CHECK_FALSE(stored_hash.empty());
+    CHECK(stored_hash != *rotated);
+    CHECK(stored_hash.size() == 64); // hex-encoded SHA-256
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential re-serves the same raw within the grace "
+          "window, and never mints a third credential",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-reserve";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto first = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(first.has_value());
+
+    // Retry "immediately" (a lost-response / dropped-connection scenario) —
+    // must re-serve the SAME successor raw, never mint a new one, PROVIDED
+    // the retry comes from the SAME operator who initiated the rotation
+    // (Hermes F4).
+    auto retry = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(retry.has_value());
+    CHECK(*retry == *first);
+
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2); // still exactly the predecessor + one successor
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects a grace-window re-serve to a "
+          "different operator than the one who initiated the rotation",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-reserve-wrong-user";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto first = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(first.has_value());
+
+    // A DIFFERENT operator retrying within the grace window must never
+    // receive admin's in-flight successor secret (Hermes F4).
+    auto stolen = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "mallory");
+    REQUIRE_FALSE(stolen.has_value());
+    CHECK(stolen.error().find("different operator") != std::string::npos);
+
+    // The rejection did not mint a third credential, and the SAME operator
+    // can still re-serve successfully afterward.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+
+    auto retry_same_user =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(retry_same_user.has_value());
+    CHECK(*retry_same_user == *first);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects a retry once the grace window has "
+          "elapsed — no third credential is ever minted",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-grace-lapsed";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto first = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(first.has_value());
+
+    // Simulate the grace window (kRotationGraceSecs, 120s) lapsing by
+    // advancing the caller-supplied `now` rather than sleeping — the epoch
+    // side of the idempotency check (now - successor.created_at) is what
+    // gates this, independent of wall-clock elapsed time.
+    auto lapsed_now = now + 300;
+    auto retry =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, lapsed_now, "admin");
+    REQUIRE_FALSE(retry.has_value());
+    CHECK(retry.error().find("grace") != std::string::npos);
+
+    // No third credential was minted by the rejected retry.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential defensively rejects when three active "
+          "credentials already exist for the principal (the ≤2 ceiling holds even against a "
+          "credential minted outside rotate)",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-over-ceiling";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("a", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("b", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("c", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 3);
+
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error().find("more than two") != std::string::npos);
+
+    // Never picks one to arbitrate — the count stays exactly 3, no fourth
+    // credential minted either.
+    CHECK(store.list_active_for_principal(principal).size() == 3);
+}
+
+// ── Hermes review (PR 4.3 round 2): F1-F5 hardening ───────────────────────
+
+TEST_CASE("ApiTokenStore: concurrent rotate_engine_credential calls for the same principal "
+          "never exceed the ≤2 active ceiling (Hermes F1)",
+          "[pg][token][rotation][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-concurrent";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Every thread races rotate_engine_credential for the SAME principal at
+    // the SAME `now`, with a distinct requesting_user each — before F1, the
+    // unlocked read-then-mint let multiple threads all observe 1-active and
+    // all mint, blowing the ≤2 ceiling. std::latch lines every thread up at
+    // the starting gun so they hit the advisory lock as concurrently as the
+    // test process can arrange.
+    constexpr int kThreads = 6;
+    std::latch start_latch{kThreads};
+    std::vector<std::thread> threads;
+    std::mutex results_mtx;
+    std::vector<std::expected<std::string, std::string>> results;
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i]() {
+            start_latch.arrive_and_wait();
+            auto r = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now,
+                                                     "operator-" + std::to_string(i));
+            std::lock_guard lock(results_mtx);
+            results.push_back(std::move(r));
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    // Exactly ONE thread's call is the 1-active mint winner — every other
+    // thread's call is serialized behind the advisory lock and, upon its
+    // own re-read, sees 2-active. Since every thread used a DIFFERENT
+    // requesting_user, none of the losers share the winner's identity, so
+    // F4's binding rejects every one of them (never a silent re-serve to
+    // the wrong caller, and never a THIRD mint).
+    int successes = 0;
+    for (const auto& r : results) {
+        if (r.has_value())
+            ++successes;
+        else
+            CHECK(r.error().find("different operator") != std::string::npos);
+    }
+    CHECK(successes == 1);
+
+    // The ≤2 ceiling holds under concurrency — never 3.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential never leaves an orphaned rotation pair — "
+          "mint and pair-stamp always commit together (Hermes F2)",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-no-orphan";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    // Every row with a non-empty rotation_group must have exactly one
+    // sibling sharing it (predecessor + successor) — never a lone stamped
+    // row, which would mean the INSERT committed without the pair-stamp (or
+    // vice versa).
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    CHECK_FALSE(active[0].rotation_group.empty());
+    CHECK(active[0].rotation_group == active[1].rotation_group);
+
+    const ApiToken* predecessor = active[0].supersedes_token_id.empty() ? &active[0] : &active[1];
+    const ApiToken* successor = active[0].supersedes_token_id.empty() ? &active[1] : &active[0];
+    CHECK(predecessor->overlap_expires_at > 0);
+    CHECK(successor->supersedes_token_id == predecessor->token_id);
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: rolls back the predecessor's revoke when "
+          "the successor's rotation-state clear fails — neither half applies (Hermes F3)",
+          "[pg][token][rotation][sweep]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-sweep-rollback";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : active) {
+        if (t.supersedes_token_id.empty())
+            predecessor = &t;
+        else
+            successor = &t;
+    }
+    REQUIRE(predecessor != nullptr);
+    REQUIRE(successor != nullptr);
+    const std::string predecessor_id = predecessor->token_id;
+    const std::string successor_id = successor->token_id;
+    const std::string rotation_group = predecessor->rotation_group;
+
+    // Force the successor's rotation-state clear to fail with a genuine SQL
+    // execution error (never merely a zero-row match) — a BEFORE UPDATE
+    // trigger that raises only when THIS successor's rotation_group is
+    // being cleared. Scoped to this test's own cloned database (PgTestTemplate),
+    // so it can't leak into any other test.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string fn_sql =
+            "CREATE OR REPLACE FUNCTION api_token_store.f3_force_clear_fail() "
+            "RETURNS trigger AS $$ BEGIN IF NEW.token_id = '" +
+            successor_id +
+            "' AND NEW.rotation_group = '' THEN "
+            "RAISE EXCEPTION 'F3 test: forced clear failure'; END IF; RETURN NEW; END; $$ "
+            "LANGUAGE plpgsql;";
+        PgResult fn_res{PQexec(conn.get(), fn_sql.c_str())};
+        REQUIRE(fn_res.ok());
+        PgResult trig_res{PQexec(
+            conn.get(),
+            "CREATE TRIGGER f3_force_clear_fail BEFORE UPDATE ON api_token_store.api_tokens "
+            "FOR EACH ROW EXECUTE FUNCTION api_token_store.f3_force_clear_fail();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    // AFTER the overlap window elapses, sweep attempts to revoke the
+    // predecessor + clear the successor together in one transaction — the
+    // clear fails, so NEITHER change may commit.
+    auto swept = store.sweep_expired_rotations(now + kDay + 1);
+    CHECK(swept.empty());
+
+    auto predecessor_after = store.get_token(predecessor_id).value();
+    REQUIRE(predecessor_after.has_value());
+    CHECK_FALSE(predecessor_after->revoked); // rolled back — NOT revoked
+
+    auto successor_after = store.get_token(successor_id).value();
+    REQUIRE(successor_after.has_value());
+    CHECK_FALSE(successor_after->rotation_group.empty()); // rolled back — still linked
+    CHECK(successor_after->rotation_group == rotation_group);
+
+    // Idempotent: re-running the (still-failing) sweep doesn't corrupt
+    // anything further — same clean rollback each time.
+    auto swept_again = store.sweep_expired_rotations(now + kDay + 2);
+    CHECK(swept_again.empty());
+    auto predecessor_still = store.get_token(predecessor_id).value();
+    REQUIRE(predecessor_still.has_value());
+    CHECK_FALSE(predecessor_still->revoked);
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation cuts over immediately — revokes the predecessor, "
+          "sets confirmed_at, and clears the successor's rotation state (Hermes F5)",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    auto before = store.list_active_for_principal(principal);
+    REQUIRE(before.size() == 2);
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : before) {
+        if (t.supersedes_token_id.empty())
+            predecessor = &t;
+        else
+            successor = &t;
+    }
+    REQUIRE(predecessor != nullptr);
+    REQUIRE(successor != nullptr);
+    const std::string predecessor_id = predecessor->token_id;
+    const std::string successor_id = successor->token_id;
+
+    auto confirmed = store.confirm_rotation(principal, "admin");
+    REQUIRE(confirmed.has_value());
+
+    auto predecessor_after = store.get_token(predecessor_id).value();
+    REQUIRE(predecessor_after.has_value());
+    CHECK(predecessor_after->revoked); // immediate cutover, not "wait for the window"
+
+    auto successor_after = store.get_token(successor_id).value();
+    REQUIRE(successor_after.has_value());
+    CHECK_FALSE(successor_after->revoked);
+    CHECK(successor_after->confirmed_at > 0); // the previously-dead column, now live
+    CHECK(successor_after->rotation_group.empty());
+    CHECK(successor_after->supersedes_token_id.empty());
+    CHECK(successor_after->overlap_expires_at == 0);
+
+    // Exactly one active credential remains — the confirmed successor.
+    auto active_after = store.list_active_for_principal(principal);
+    REQUIRE(active_after.size() == 1);
+    CHECK(active_after[0].token_id == successor_id);
+
+    // A fresh rotation may now begin (the pair fully resolved).
+    auto next_rotate =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    CHECK(next_rotate.has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initiate the "
+          "rotation (Hermes F4/F5 binding)",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-wrong-user";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    auto stolen_confirm = store.confirm_rotation(principal, "mallory");
+    REQUIRE_FALSE(stolen_confirm.has_value());
+    CHECK(stolen_confirm.error().find("different operator") != std::string::npos);
+
+    // Rejected — both credentials remain exactly as rotate left them.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+    for (const auto& t : active)
+        CHECK(t.confirmed_at == 0);
+
+    // The SAME operator who initiated it can still confirm afterward.
+    auto real_confirm = store.confirm_rotation(principal, "admin");
+    CHECK(real_confirm.has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation with no in-flight rotation is rejected",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-none";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Only one active credential — nothing to confirm.
+    auto confirmed = store.confirm_rotation(principal, "admin");
+    REQUIRE_FALSE(confirmed.has_value());
+}
+
+// ── Manual revoke resolves the rotation pair (design §7, PR #2284 review Major 3) ──
+
+TEST_CASE("ApiTokenStore: revoking a rotation PREDECESSOR resolves the pair — the successor "
+          "becomes a standalone active credential",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:revoke-predecessor";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    const std::string predecessor_id = store.list_active_for_principal(principal).at(0).token_id;
+    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin").has_value());
+
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (t.token_id != predecessor_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    auto revoked = store.revoke_token(predecessor_id);
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+
+    // The successor is now the sole active credential with its rotation state cleared.
+    auto after = store.list_active_for_principal(principal);
+    REQUIRE(after.size() == 1);
+    CHECK(after[0].token_id == successor_id);
+    CHECK(after[0].rotation_group.empty());
+    CHECK(after[0].supersedes_token_id.empty());
+    CHECK(after[0].overlap_expires_at == 0);
+}
+
+TEST_CASE("ApiTokenStore: revoking a rotation SUCCESSOR clears the predecessor's rotation state so "
+          "the sweep does NOT auto-revoke the principal's last credential",
+          "[pg][token][rotation][sweep]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:revoke-successor";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    const std::string predecessor_id = store.list_active_for_principal(principal).at(0).token_id;
+    // Short overlap so the sweep would fire after now+kDay.
+    REQUIRE(store.rotate_engine_credential(principal, kDay, now, "admin").has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (t.token_id != predecessor_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Revoke the SUCCESSOR — the predecessor is now the only credential.
+    auto revoked = store.revoke_token(successor_id);
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+
+    // Predecessor's rotation state is cleared (overlap_expires_at -> 0) so it is
+    // no longer a sweep target.
+    auto pred = store.get_token(predecessor_id);
+    REQUIRE(pred.has_value());
+    REQUIRE(pred->has_value());
+    CHECK_FALSE((*pred)->revoked);
+    CHECK((*pred)->overlap_expires_at == 0);
+    CHECK((*pred)->rotation_group.empty());
+
+    // Run the sweep AFTER the original overlap window would have elapsed. Without
+    // the §7 fix the sweep would auto-revoke the predecessor as
+    // "overlap_window_elapsed", leaving the principal with ZERO credentials.
+    bool tick_failed = false;
+    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
+    CHECK_FALSE(tick_failed);
+    CHECK(swept.empty()); // nothing to auto-revoke — the pair was already resolved
+
+    auto still = store.get_token(predecessor_id);
+    REQUIRE(still.has_value());
+    REQUIRE(still->has_value());
+    CHECK_FALSE((*still)->revoked); // predecessor survives — principal keeps a credential
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}

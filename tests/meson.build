@@ -366,6 +366,8 @@ if build_server
       'unit/server/test_engine_principal_integration.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
+      'unit/server/test_engine_principal_lifecycle.cpp',
+      'unit/server/test_engine_store_error_class.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
@@ -379,6 +381,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',
@@ -600,6 +603,16 @@ test('close automation logic',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
+# flake recoveries land in the persistent per-runner test-runs.db.
+test('ci telemetry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_ci_telemetry.py')],
   suite: 'docs',
   timeout: 30,
 )
