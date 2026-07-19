@@ -139,6 +139,29 @@ TEST_CASE("TAR schema: kUnsupported methods are excluded from the accept-list",
     }
 }
 
+TEST_CASE("TAR schema: dns macOS row is kUnsupported (roadmap 4.9 — no userspace "
+          "resolver-cache mechanism on modern macOS)",
+          "[tar][schema][dns][macos]") {
+    // Locks the 4.9 correction (dscacheutil is defunct on macOS 26; see
+    // ADR-0015 and docs/darwin-compat.md) against regressing back to a
+    // kPlanned row naming a dead mechanism.
+    bool found_macos_row = false;
+    for (const auto& src : capture_sources()) {
+        if (src.name != "dns")
+            continue;
+        for (const auto& os : src.os_support) {
+            if (os.os != "macos")
+                continue;
+            found_macos_row = true;
+            CHECK(os.status == OsSupportStatus::kUnsupported);
+        }
+    }
+    REQUIRE(found_macos_row);
+
+    auto methods = accepted_capture_methods("dns");
+    CHECK(std::find(methods.begin(), methods.end(), "dscacheutil") == methods.end());
+}
+
 // ── #540: per-OS capture-method accept-list ────────────────────────────────
 
 TEST_CASE("TAR schema: accepted_capture_methods_for_os is OS-specific (#540)",

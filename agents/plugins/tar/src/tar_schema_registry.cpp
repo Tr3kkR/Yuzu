@@ -745,7 +745,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // keyed on the (name, record_type, data) resolution; ttl_remaining_s is a
         // value field and is NOT part of the diff key (it decrements every tick
         // and must not churn). Opt-in (usage-class PII — reveals visited domains).
-        // Windows only here; Linux/macOS kPlanned.
+        // Windows kSupported; Linux kPlanned; macOS kUnsupported (no userspace
+        // resolver-cache enumeration — see the macos row / ADR-0015).
         {
             .name = "dns",
             .dollar_name = "DNS",
@@ -760,10 +761,13 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "present; falls back to /etc/hosts (source='hosts_file'). Hosts "
                  "without systemd-resolved yield hosts-file entries only "
                  "(constrained). Wired in the Linux follow-up."},
-                {"macos",   OsSupportStatus::kPlanned,             "dscacheutil",
-                 "dscacheutil -cachedump subprocess. TTL is unavailable "
-                 "(ttl_remaining_s reported -1, constrained). Wired in the macOS "
-                 "follow-up."},
+                {"macos",   OsSupportStatus::kUnsupported,         "",
+                 "No userspace mechanism enumerates the resolver cache on modern "
+                 "macOS. `dscacheutil -cachedump` is defunct (exits 0 printing "
+                 "\"Unable to get details from the cache node\", verified 26.5.2); "
+                 "`scutil --dns` returns resolver configuration, not cached records; "
+                 "the mDNSResponder cache is dumpable only as root to the redacted "
+                 "system log. See ADR-0015 and docs/darwin-compat.md."},
             },
             .granularities = {
                 {

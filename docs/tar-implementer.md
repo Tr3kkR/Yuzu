@@ -301,7 +301,9 @@ header):
 2. **`agents/plugins/tar/src/tar_<source>_collector.cpp`** (new) — `#include
    "tar_collectors.hpp"`; implement `enumerate_<source>()` per platform with
    `#ifdef _WIN32` / `#elif __APPLE__` / `#elif __linux__`, returning `{}` on
-   platforms whose collector is `kPlanned`. Enforce a per-cycle cap with a
+   platforms whose collector is `kPlanned` or `kUnsupported` (kUnsupported means
+   no mechanism exists at all — the stub still returns `{}`, it just never gains
+   a real implementation). Enforce a per-cycle cap with a
    `spdlog::warn` on truncation (there is no agent `/metrics` and no event bus, so
    a log line is the truncation signal — not a metric or audit event).
 3. **`tar_db.{hpp,cpp}`** — add the warehouse-row struct (e.g. `ArpEvent`, next to

@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-16._
+_Last hand-updated: 2026-07-19._
 
 ## Matrix
 
@@ -33,7 +33,7 @@ _Last hand-updated: 2026-07-16._
 | **Network quality** (`/network`: throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | ⛔ | `net_quality_sampler.cpp`; per-OS detail in `docs/user-manual/network.md` "Platform coverage" |
 | **TAR warehouse capture sources** (per source) | varies | varies | varies | **Authoritative & machine-readable:** `tar_schema_registry.cpp` `OsSupportStatus::{kSupported,kPlanned}` per source, with a notes string |
 | **TAR — ARP table** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `arp` def (Win `kSupported` via `iphlpapi`; Linux `kPlanned` `/proc/net/arp`; macOS `kPlanned` route sysctl, constrained — `entry_type 'unknown'`); collector `tar_arp_collector.cpp` (ADR-0015, opt-in) |
-| **TAR — DNS cache** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `dns` def (Win `kSupported` via `dnsapi`; Linux `kPlanned` systemd-resolved, hosts-file fallback where absent; macOS `kPlanned` `dscacheutil`, constrained — no TTL); collector `tar_dns_collector.cpp` (ADR-0015, opt-in; device-level usage-class PII, names-only) |
+| **TAR — DNS cache** (capture source) | ✅ | 🔜 | ⛔ | `tar_schema_registry.cpp` `dns` def (Win `kSupported` via `dnsapi`; Linux `kPlanned` systemd-resolved, hosts-file fallback where absent; macOS `kUnsupported` — no userspace resolver-cache enumeration: `dscacheutil -cachedump` defunct, `scutil --dns` is config-only, mDNSResponder dump is root+redacted-log only, ADR-0015); collector `tar_dns_collector.cpp` (ADR-0015, opt-in; device-level usage-class PII, names-only) |
 | **TAR — software install/uninstall events** (capture source) | ✅ | 🔜 | 🔜 | `tar_schema_registry.cpp` `software` def (Win `kSupported` via registry Uninstall keys; Linux `kPlanned` dpkg/rpm/pacman; macOS `kPlanned` pkgutil); collector `tar_software_collector.cpp`. **Machine scope only** (HKLM Uninstall — no per-user / profile-name data); **opt-in (off by default)**, enable per host via `software_enabled` (#1620). Distinct from the daily *inventory* sync row below (events vs point-in-time) |
 | **Process enumeration / live capture** | ✅ (ETW / Win32) | ✅ (`/proc`) | 🟡 | `process_enum.cpp`; ETW workstream is Windows-specific |
 | **Installed-software inventory** (daily sync → central Postgres) | ✅ | ✅ | ✅ | Agent sync framework `sync_scheduler.cpp` + `sync_source_installed_software.cpp` reuse the `installed_apps` plugin `list_inventory` (Win registry; Linux dpkg/rpm/pacman/**apk**; macOS `system_profiler`) via `LocalDispatcher`. Blob contract v2: kind/ecosystem/EVR/arch/packager + rpm stored-tag signature_status + distro_id/version (honest-empty where an ecosystem lacks a field; Windows/macOS rows are kind=app with name/version/publisher only). Machine-scope only. Server: `SoftwareInventoryStore` (ADR-0016) |

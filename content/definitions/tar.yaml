@@ -523,7 +523,9 @@ spec:
           Enable or disable the DNS resolver-cache capture source (ADR-0015).
           Opt-in: "false" by default — the DNS cache reveals visited domains
           (usage-class telemetry under the works-council posture; enabling is
-          audited). Windows-only collector today (Linux/macOS planned). Requires
+          audited). Windows-only collector today (Linux planned; macOS
+          unsupported — no userspace resolver-cache enumeration exists on
+          modern macOS). Requires
           agent v0.12.0+; older agents silently ignore. Valid: "true" | "false".
         validation:
           pattern: "^(true|false)$"

@@ -48,7 +48,12 @@ source".
   export) + `DnsQuery_W(..., DNS_QUERY_NO_WIRE_QUERY, ...)` to read each entry's
   data + TTL **from cache only** (the flag guarantees no wire query — no network
   amplification, no privacy leak from the collector).
-- Linux (systemd-resolved / `/etc/hosts`) and macOS (`dscacheutil`) are **kPlanned**.
+- Linux (systemd-resolved / `/etc/hosts`) is **kPlanned**.
+- macOS is **kUnsupported** (4.9 spike, 2026-07-19): no userspace mechanism enumerates
+  the resolver cache on modern macOS. `dscacheutil -cachedump` is defunct (exits 0
+  printing "Unable to get details from the cache node", verified 26.5.2); `scutil --dns`
+  returns resolver *configuration*, not cached records; the mDNSResponder cache is
+  dumpable only as root to the `<private>`-redacted unified log. See `docs/darwin-compat.md`.
 - **Device resolver-cache STATE — host-wide, no PID.** There is no per-process
   attribution. Snapshot-diff keyed on `(name, record_type, data)` → `appeared` /
   `removed`; `ttl_remaining_s` is a value field (decrements every tick, never
@@ -78,9 +83,10 @@ queryable empty until enabled.
    recent usage-class source (`module`/`procperf`/`netqual`) under the
    works-council posture. DNS cache is usage-class PII (reveals visited domains);
    enabling it is audited.
-2. **Windows-first.** This slice ships Windows collectors only; Linux/macOS rows
-   are `kPlanned` (the schema-invariant test requires a row per OS) and land as
-   follow-ups.
+2. **Windows-first.** This slice ships Windows collectors only; the schema-invariant
+   test requires a row per OS regardless of feasibility. `arp`'s Linux/macOS rows are
+   `kPlanned` follow-ups. `dns`'s Linux row is `kPlanned`; its macOS row is
+   `kUnsupported` (4.9 spike, 2026-07-19 — no feasible mechanism, not a follow-up).
 3. **No Prometheus metrics.** The proposal's "emit `yuzu_agent_*` metrics" is
    dropped — TAR has no agent `/metrics` endpoint; the observable surface is the
    `status` action's per-source row counts (auto-covered). Truncation is a
@@ -98,9 +104,11 @@ queryable empty until enabled.
 attribution directly from TAR; closes a gap vs. commercial EDR; aligns to MITRE
 ATT&CK DS0022/DS0029; no new operator concepts (existing actions extend).
 
-**Negative / deferred:** Linux/macOS collectors deferred; per-process DNS deferred
-(ETW); macOS DNS via `dscacheutil` will be a subprocess shell-out (flag for
-security review when it lands); the 2048/4096 caps are estimates to validate on
+**Negative / deferred:** Linux collectors deferred; per-process DNS deferred
+(ETW); **macOS DNS is kUnsupported, not deferred** — the 4.9 spike (2026-07-19)
+established that no userspace mechanism can enumerate the resolver cache on modern
+macOS (the original "`dscacheutil` subprocess shell-out" plan is void — the command
+is defunct); the 2048/4096 caps are estimates to validate on
 VLAN-heavy / large-resolver-cache hosts. `DnsGetCacheDataTable` is undocumented —
 resolved via `GetProcAddress` with graceful degradation if absent.
 

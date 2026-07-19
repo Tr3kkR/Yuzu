@@ -20,8 +20,10 @@
 //      query (no network amplification, no privacy leak from the collector
 //      itself); 0x8000 is required to surface cached records on many Win10/11
 //      builds (see the call site for the muhdnscache rationale).
-// Linux (systemd-resolved / /etc/hosts) and macOS (dscacheutil) are kPlanned and
-// return an empty vector.
+// Linux (systemd-resolved / /etc/hosts) is kPlanned; macOS is kUnsupported (no
+// userspace mechanism enumerates the resolver cache on modern macOS — dscacheutil
+// -cachedump is defunct; see ADR-0015 / docs/darwin-compat.md). Both return an
+// empty vector from the non-Windows stub below.
 
 #include "tar_collectors.hpp"
 
@@ -240,7 +242,7 @@ std::vector<DnsEntry> enumerate_dns() {
     return out;
 }
 
-#else // non-Windows: kPlanned (Linux systemd-resolved / hosts, macOS dscacheutil)
+#else // non-Windows: Linux kPlanned (systemd-resolved / hosts); macOS kUnsupported
 
 std::vector<DnsEntry> enumerate_dns() { return {}; }
 
