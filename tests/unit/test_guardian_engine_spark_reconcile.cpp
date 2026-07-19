@@ -510,3 +510,39 @@ TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left 
     REQUIRE(rows.has_value());
     CHECK_FALSE(rows->empty()); // durable after stop's final flush
 }
+
+TEST_CASE("prefer_spark=true: page_journal runs a paging pass", "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 0);
+    f.engine->page_journal();
+    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 1); // it paged (not gated out)
+}
+
+TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal untouched)",
+          "[spark][guardian][reconcile][journal]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    // Seed the journal namespace with a batch that must be left untouched.
+    REQUIRE(kv.set(yuzu::agent::kJournalNamespace, "lc:seed:000000000000",
+                   R"({"v":4,"ts_ms":1700000000000,"entries":[{"rule_id":"r","generation":1,)"
+                   R"("event_id":"e","enqueued_ns":1700000000000000000,"kind":"armed",)"
+                   R"("guard_type":"file","rule_name":"n"}]})"));
+
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+
+    engine.page_journal();
+    engine.journal_maintenance_tick();
+    CHECK(engine.lifecycle_journal_for_test()->pages() == 0);            // no paging pass ran
+    CHECK(kv.exists(yuzu::agent::kJournalNamespace, "lc:seed:000000000000")); // seed untouched
+
+    engine.stop();
+    spark_engine.stop();
+}

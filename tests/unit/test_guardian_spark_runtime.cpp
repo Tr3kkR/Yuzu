@@ -1198,3 +1198,67 @@ TEST_CASE("page_into_window prunes an expired batch before replaying (boot barri
     REQUIRE(lc.size() == 1);
     CHECK(lc[0].event_id == "e-new");
 }
+
+TEST_CASE("page_into_window stops enqueuing once request_stop is signalled (stop-race gate)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    for (int i = 0; i < 4; ++i)
+        rig.persist("r" + std::to_string(i));
+    rig.journal->request_stop();
+    // A page pass after stop began must not mutate the window.
+    CHECK(rig.journal->page_into_window(*rig.rt, 1'700'000'100'000).records_paged == 0);
+    CHECK(drain_lifecycle(*rig.rt).empty());
+}
+
+TEST_CASE("a paged batch's last entry, when sent, gets a sent-label (send-wrap logic)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    rig.persist("r1");
+    REQUIRE(rig.journal->page_into_window(*rig.rt, 1'700'000'100'000).records_paged == 1);
+
+    // Drain with the same wrap wire_spark_engine installs: on a Sent last-in-batch paged
+    // entry, write the sent-label.
+    rig.rt->drain([&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle && e.journal_last_in_batch &&
+            !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        return SendResult::Sent;
+    });
+    CHECK(rig.journal->sent_labels_written() == 1);
+    auto sent = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
+    REQUIRE(sent.has_value());
+    CHECK(sent->size() == 1);
+}
+
+TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
+          "[spark][runtime][journal][tsan]") {
+    PageRig rig;
+    for (int i = 0; i < 20; ++i)
+        rig.persist("r" + std::to_string(i));
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> pagers;
+    for (int p = 0; p < 3; ++p)
+        pagers.emplace_back([&, p] {
+            std::int64_t t = 1'700'000'000'000 + p * 1000;
+            while (!stop.load(std::memory_order_relaxed)) {
+                rig.journal->page_into_window(*rig.rt, t);
+                t += 10'000; // advance the clock so the bucket keeps refilling
+            }
+        });
+    std::thread drainer([&] {
+        while (!stop.load(std::memory_order_relaxed))
+            rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
+    });
+
+    // Interleave from the main thread too, then signal stop (also exercises the stop-race gate).
+    for (int i = 0; i < 200; ++i)
+        rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
+
+    rig.journal->request_stop();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : pagers)
+        t.join();
+    drainer.join();
+    SUCCEED("no data race / crash across concurrent pagers + drain");
+}

@@ -243,6 +243,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
 
     std::size_t considered = 0;
     for (auto& c : cands) {
+        if (stopping_.load(std::memory_order_acquire))
+            break; // shutdown began — stop mutating the window (stop-race gate, rev-4.1 #7)
         if (considered >= kJournalPageMaxBatchesPerPass)
             break; // bound per-pass work regardless of journal size
         ++considered;

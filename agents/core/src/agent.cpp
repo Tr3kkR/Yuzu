@@ -1717,6 +1717,10 @@ public:
                     }
                     guardian_->set_event_sink(
                         [this](const gpb::GuaranteedStateEvent& ev) { emit_guardian_event(ev); });
+                    // Replay the durable lifecycle journal into the send window now that the
+                    // sink is live on the new stream (item 7 PR-Ag). The drain worker sends the
+                    // paged backlog on its next pass. Inert unless prefer_spark.
+                    guardian_->page_journal();
                 }
 
                 // 4b. Spawn OTA update check thread

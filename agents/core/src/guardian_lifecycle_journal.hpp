@@ -123,6 +123,11 @@ public:
     /// no-send-evidence); it never gates re-paging or deletion.
     void mark_batch_sent(const std::string& batch_key);
 
+    /// Signal that shutdown has begun: a concurrent page_into_window pass observes this
+    /// between batches and stops enqueuing, so a late page never mutates the send window
+    /// after stop() joins the drain worker (rev-4.1 #7 stop-race gate). Idempotent, lock-free.
+    void request_stop() noexcept { stopping_.store(true, std::memory_order_release); }
+
     // Integrity counters (design §2 loss table). Lock-free.
     [[nodiscard]] std::uint64_t batches_written() const noexcept {
         return batches_written_.load(std::memory_order_relaxed);
@@ -200,6 +205,7 @@ private:
     std::mutex paging_mutex_;
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
     JournalPagingBucket page_bucket_{kJournalPageRefillPerSec, kJournalPageBurst};
+    std::atomic<bool> stopping_{false}; ///< set by request_stop(); page_into_window bails on it
     // Retention caps — default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};
     std::size_t max_batches_{kMaxJournalBatches};

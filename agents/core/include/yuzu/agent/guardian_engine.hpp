@@ -141,6 +141,12 @@ public:
     /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
     void journal_maintenance_tick();
 
+    /// Replay the durable lifecycle journal into the send window (item 7 PR-Ag). Captures the
+    /// runtime + journal under mtx_ (brief), then pages OFF mtx_ (KvStore + paging-mutex +
+    /// outbox_mu_, never mtx_). prefer_spark_-gated; a no-op after stop() and while stopping.
+    /// Called from the reconnect hook (after set_event_sink) and the maintenance tick.
+    void page_journal();
+
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     void stop();
