@@ -63,6 +63,7 @@ class GuardianSparkRuntime;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
+struct GuardianJournalStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 struct OutboxEntry;
@@ -146,6 +147,12 @@ public:
     /// outbox_mu_, never mtx_). prefer_spark_-gated; a no-op after stop() and while stopping.
     /// Called from the reconnect hook (after set_event_sink) and the maintenance tick.
     void page_journal();
+
+    /// A snapshot of the durable-journal integrity + activity counters (item 7 PR-Ag §8),
+    /// assembled from the runtime (staging) + the journal component. The agent heartbeat
+    /// emits these SPARSELY (only non-zero) via emit_guardian_journal_heartbeat_tags. All
+    /// zero when prefer_spark is off / the journal is quiescent.
+    [[nodiscard]] GuardianJournalStats journal_stats() const;
 
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.

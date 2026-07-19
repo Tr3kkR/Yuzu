@@ -31,6 +31,7 @@
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
 #include "guardian_outbox_drain_worker.hpp"
 #include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
@@ -370,6 +371,33 @@ void GuardianEngine::page_journal() {
     }
     if (rt && journal)
         journal->page_into_window(*rt, journal_now_ms());
+}
+
+GuardianJournalStats GuardianEngine::journal_stats() const {
+    GuardianJournalStats s;
+    std::lock_guard lock(mtx_);
+    if (spark_runtime_) {
+        s.stage_dropped = spark_runtime_->journal_stage_dropped();
+        s.stage_failures = spark_runtime_->journal_stage_failures();
+        s.field_rejected = spark_runtime_->journal_field_rejected();
+        s.clock_rejected = spark_runtime_->journal_clock_rejected();
+        s.pending_depth = spark_runtime_->pending_journal_depth();
+    }
+    if (lifecycle_journal_) {
+        s.batches_written = lifecycle_journal_->batches_written();
+        s.write_failures = lifecycle_journal_->write_failures();
+        s.key_collisions = lifecycle_journal_->key_collisions();
+        s.quarantined = lifecycle_journal_->quarantined();
+        s.quarantine_failures = lifecycle_journal_->quarantine_failures();
+        s.batches_pruned = lifecycle_journal_->batches_pruned();
+        s.prune_failures = lifecycle_journal_->prune_failures();
+        s.pages = lifecycle_journal_->pages();
+        s.records_paged = lifecycle_journal_->records_paged();
+        s.sent_labels_written = lifecycle_journal_->sent_labels_written();
+        s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
+        s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
+    }
+    return s;
 }
 
 std::expected<std::size_t, std::string>

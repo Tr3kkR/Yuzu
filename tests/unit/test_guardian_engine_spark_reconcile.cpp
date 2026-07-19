@@ -10,6 +10,7 @@
 
 #include "guaranteed_state.pb.h"
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "spark_engine.hpp"
@@ -21,6 +22,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -542,6 +544,38 @@ TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal u
     engine.journal_maintenance_tick();
     CHECK(engine.lifecycle_journal_for_test()->pages() == 0);            // no paging pass ran
     CHECK(kv.exists(yuzu::agent::kJournalNamespace, "lc:seed:000000000000")); // seed untouched
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertness)",
+          "[spark][guardian][reconcile][journal]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+
+    // Apply a rule + drive BOTH maintenance paths — none of it touches the journal.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    engine.journal_maintenance_tick();
+    engine.page_journal();
+
+    // Every journal counter is zero, so the sparse emitter ships NO tags (design §7/§8).
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_journal_heartbeat_tags(tags, engine.journal_stats());
+    CHECK(tags.empty());
 
     engine.stop();
     spark_engine.stop();

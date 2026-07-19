@@ -46,6 +46,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
@@ -1996,6 +1997,10 @@ public:
                                 // pending, so a failed write self-heals with no new push /
                                 // reconnect (item 7 PR-Ag; inert unless prefer_spark).
                                 guardian_->journal_maintenance_tick();
+                                // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
+                                // non-zero counters ship, so a quiescent / inert journal adds
+                                // no heartbeat tags.
+                                emit_guardian_journal_heartbeat_tags(tags, guardian_->journal_stats());
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
