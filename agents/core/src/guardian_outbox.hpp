@@ -89,10 +89,10 @@ struct OutboxEntry {
 
     // Journal-replay provenance (item 7 PR-Ag): set ONLY on Lifecycle entries PAGED back
     // from the durable journal, so the send path can write the batch's sent-label after its
-    // LAST entry sends. Empty/false on live + compliance/health entries. NOT wire fields —
+    // LAST entry sends. Empty/false on live + compliance/health entries. NOT wire fields -
     // guardian_outbox_entry_to_event ignores them, so they never change the server compare.
     std::string journal_batch_key;     ///< the durable batch this replayed entry came from ("" if live)
-    bool journal_last_in_batch{false}; ///< this is that batch's LAST entry — write sent:<key> on send
+    bool journal_last_in_batch{false}; ///< this is that batch's LAST entry - write sent:<key> on send
 
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
                                   std::string event_id, std::int64_t enqueued_ns, GuardDrift drift) {
@@ -386,10 +386,26 @@ public:
                 return true;
         return false;
     }
-    /// Free slots before the capacity cap — the loader pages a batch only when the window
+    /// Free slots before the capacity cap - the loader pages a batch only when the window
     /// has >= the batch's size of headroom (else it defers the batch to a later pass).
     [[nodiscard]] std::size_t headroom() const {
         return capacity_ > pending_.size() ? capacity_ - pending_.size() : 0;
+    }
+
+    /// Back-fill journal provenance onto still-buffered LIVE entries (item 7 PR-Ag M3): for each
+    /// entry whose event_id belongs to a just-persisted batch, stamp the batch key and mark ONLY
+    /// the batch's LAST record last-in-batch, so a live send writes the sent-label instead of the
+    /// batch later ageing out counted evicted_without_send_evidence. The window drains FIFO, so
+    /// the last-in-batch entry sends after the earlier ones and the label is never premature.
+    void stamp_provenance(const std::string& batch_key,
+                          const std::unordered_set<std::string>& event_ids,
+                          const std::string& last_event_id) {
+        for (auto& e : pending_) {
+            if (event_ids.count(e.event_id)) {
+                e.journal_batch_key = batch_key;
+                e.journal_last_in_batch = (e.event_id == last_event_id);
+            }
+        }
     }
 
 private:

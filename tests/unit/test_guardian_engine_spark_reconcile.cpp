@@ -482,9 +482,9 @@ TEST_CASE("prefer_spark=true: the maintenance tick retries a persist a write fai
 
     auto before = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
     REQUIRE(before.has_value());
-    CHECK(before->empty()); // nothing durable yet — the write failed
+    CHECK(before->empty()); // nothing durable yet - the write failed
 
-    f.engine->journal_maintenance_tick(); // NO new push/reconnect — the tick alone retries
+    f.engine->journal_maintenance_tick(); // NO new push/reconnect - the tick alone retries
 
     auto after = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
     REQUIRE(after.has_value());
@@ -563,7 +563,7 @@ TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertnes
     engine.wire_spark_engine(&spark_engine, false,
                              [](const OutboxEntry&) { return SendResult::Sent; });
 
-    // Apply a rule + drive BOTH maintenance paths — none of it touches the journal.
+    // Apply a rule + drive BOTH maintenance paths - none of it touches the journal.
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
     *p.add_rules() = make_service_rule("r1");

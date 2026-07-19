@@ -228,7 +228,7 @@ public:
     /// number SENT (not removed - a coalesced head counts as sent but is not popped).
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
 
-    // --- Durable lifecycle journal — staging seam (item 7 PR-Ag) ------------
+    // --- Durable lifecycle journal - staging seam (item 7 PR-Ag) ------------
     // Staging lives HERE (co-located with lifecycle_log_ under outbox_mu_) because
     // DISARM must stage inside detach_rule_locked. The KvStore-backed
     // persist/page/retention live in an engine-owned GuardianLifecycleJournal that
@@ -247,11 +247,19 @@ public:
 
     /// Page a REPLAYED batch into the send window: iff the window has >= batch-size
     /// headroom, enqueue each entry NOT already present (window-scan membership, no
-    /// allocating set). Returns the count newly enqueued — 0 if deferred for headroom or
+    /// allocating set). Returns the count newly enqueued - 0 if deferred for headroom or
     /// every entry was already present. Paged entries enter lifecycle_log_ ONLY (they are
-    /// already durable — never pending_journal_). Does NOT wake the drain; the caller (the
+    /// already durable - never pending_journal_). Does NOT wake the drain; the caller (the
     /// reconnect / low-water / tick hook, C6) drives sending.
     [[nodiscard]] std::size_t try_page_batch(std::vector<OutboxEntry> entries);
+
+    /// Back-fill provenance onto the LIVE window entries of a just-persisted batch (review M3),
+    /// so a live send writes its sent-label rather than the batch later ageing out counted
+    /// evicted_without_send_evidence. Called from the engine persist boundary; takes outbox_mu_.
+    /// `event_ids` are the batch's records in order; `last_event_id` is its last-in-batch record.
+    void backfill_batch_provenance(const std::string& batch_key,
+                                   const std::vector<std::string>& event_ids,
+                                   const std::string& last_event_id);
 
     /// Current staged-record depth (gauge). Takes outbox_mu_.
     [[nodiscard]] std::size_t pending_journal_depth() const;
@@ -413,7 +421,7 @@ private:
                                   const std::string& kind, const std::string& guard_type,
                                   const std::string& rule_name);
     /// Build + validate a durable JournalRecord (may throw bad_alloc on the string
-    /// copies — the caller decides whether that propagates). Returns nullptr if the
+    /// copies - the caller decides whether that propagates). Returns nullptr if the
     /// record is not journalable, counting the reason (field vs clock rejection).
     std::shared_ptr<JournalRecord> build_journal_record(
         const std::string& rule_id, std::uint64_t generation, const std::string& event_id,

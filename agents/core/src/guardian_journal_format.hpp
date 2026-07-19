@@ -7,7 +7,7 @@
  *
  * This TU is the SUBSTRATE ONLY: the record shape, the kv_store key/namespace
  * scheme, the caps, mint-time field validation, and batch (de)serialization.
- * It has NO wiring, NO KvStore access, NO threads — it is deterministic and
+ * It has NO wiring, NO KvStore access, NO threads - it is deterministic and
  * unit-testable in isolation. Staging, persistence, retention, and replay layer
  * on top of this in later commits.
  *
@@ -31,7 +31,7 @@ namespace yuzu::agent {
 
 // ── Namespace, format version, caps (design §3, §6; rev-4.1) ──────────────────
 
-/// Distinct kv_store "plugin" namespace — survives full_sync's clear("__guardian__").
+/// Distinct kv_store "plugin" namespace - survives full_sync's clear("__guardian__").
 inline constexpr std::string_view kJournalNamespace = "__guardian_journal__";
 
 /// Value envelope version. An unknown version on read → quarantine (never trust).
@@ -57,7 +57,7 @@ inline constexpr std::size_t kMaxJournalBytes = 32ull * 1024 * 1024; // 32 MiB
 inline constexpr std::size_t kMaxQuarantineBatches = 100;
 
 /// Replay paging rate limiter (rev-4.1 #8): a process-lifetime token bucket bounds the
-/// STEADY-STATE redelivery bandwidth — re-send-all re-pages a sent+popped entry on every
+/// STEADY-STATE redelivery bandwidth - re-send-all re-pages a sent+popped entry on every
 /// tick until retention, so the refill rate IS the per-agent redelivery rate. At this rate
 /// a fleet of N agents redelivers <= N * kJournalPageRefillPerSec batches/sec server-wide,
 /// each a cheap redelivered-quiet ingest; the DEFERRED server ack removes re-send-all
@@ -88,21 +88,21 @@ struct JournalRecord {
 };
 
 struct JournalBatch {
-    std::int64_t ts_ms{0}; // batch wall-clock ms — the ordering key across batches
+    std::int64_t ts_ms{0}; // batch wall-clock ms - the ordering key across batches
     std::vector<JournalRecord> entries;
 };
 
 // ── Key helpers ──────────────────────────────────────────────────────────────
 
-/// "lc:<boot_nonce>:<seq12>" — seq is a per-process counter from 0, zero-padded
+/// "lc:<boot_nonce>:<seq12>" - seq is a per-process counter from 0, zero-padded
 /// to 12 digits (side-steps list()'s fail-open max+1 overwrite). Ordering across
 /// batches is by (ts_ms, key), NOT lexical key: the boot-nonce is random.
 YUZU_EXPORT std::string journal_batch_key(std::string_view boot_nonce, std::uint64_t seq);
 
-/// "sent:<boot_nonce>:<seq12>" — the (best-effort) sent-label for a batch.
+/// "sent:<boot_nonce>:<seq12>" - the (best-effort) sent-label for a batch.
 YUZU_EXPORT std::string journal_sent_key(std::string_view boot_nonce, std::uint64_t seq);
 
-/// "quarantine:" + batch_key — where a corrupt/unparseable batch is moved.
+/// "quarantine:" + batch_key - where a corrupt/unparseable batch is moved.
 YUZU_EXPORT std::string journal_quarantine_key(std::string_view batch_key);
 
 /// Derive the batch key a sent-label refers to: "sent:X:Y" → "lc:X:Y". Used by
@@ -121,16 +121,16 @@ YUZU_EXPORT std::string journal_sent_key_from_batch_key(std::string_view batch_k
 /// journal_clock_rejected (rev-4.1 #2).
 enum class JournalReject {
     None,
-    EmbeddedNul,  // a string field contains a NUL — journal values are NUL-free
+    EmbeddedNul,  // a string field contains a NUL - journal values are NUL-free
     Oversized,    // a string field exceeds kMaxJournalFieldBytes
     InvalidUtf8,  // a string field is not valid UTF-8 (JSON cannot carry it byte-exact;
                   // silently replacing bytes would flip the server compare to a false Conflict)
-    SkewedClock,  // enqueued_ns floors to epoch seconds <= 0 — the server would stamp
+    SkewedClock,  // enqueued_ns floors to epoch seconds <= 0 - the server would stamp
                   // receipt-now instead, making every replay mismatch on timestamp
 };
 
 /// Validate a record at mint. Returns the FIRST reason it must be refused, or
-/// None if it is journalable. Pure — no I/O.
+/// None if it is journalable. Pure - no I/O.
 YUZU_EXPORT JournalReject validate_record(const JournalRecord& r);
 
 // ── Batch (de)serialization ──────────────────────────────────────────────────

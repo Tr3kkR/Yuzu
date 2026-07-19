@@ -137,7 +137,7 @@ public:
 
     /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7
     /// PR-Ag). Two-phase (rev-4.1 #6): PHASE 1 under mtx_ retries any persist a prior
-    /// write left pending — this is what makes a failed write self-heal with NO new
+    /// write left pending - this is what makes a failed write self-heal with NO new
     /// push/reconnect (Sol BLOCKER-4); PHASE 2 (off mtx_) will page + prune (C4/C5).
     /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
     void journal_maintenance_tick();
@@ -344,6 +344,9 @@ private:
     /// Journal maintenance/page/final-flush exceptions swallowed to keep the bare heartbeat
     /// thread + the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4).
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
+    /// Heartbeat-tick counter (mtx_-guarded): retention prune runs every Nth tick, not every
+    /// heartbeat, to bound the per-tick full-journal read on the heartbeat thread (review N1).
+    std::uint64_t journal_tick_count_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
@@ -355,9 +358,12 @@ private:
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
-    /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime —
-    /// the runtime must borrow no KvStore); borrows kv_. Constructed in
-    /// wire_spark_engine; persist calls are prefer_spark_-gated.
+    /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
+    /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
+    /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated. LIFETIME (review
+    /// N4): the drain-worker send-wrap captures this; declared after spark_drain_worker_ it is
+    /// destroyed FIRST, so its safety rests on stop() joining the drain worker before any member
+    /// destruction (~GuardianEngine calls stop()). That join is the load-bearing guarantee.
     std::unique_ptr<GuardianLifecycleJournal> lifecycle_journal_;
 };
 

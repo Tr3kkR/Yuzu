@@ -1043,7 +1043,7 @@ TEST_CASE("attach_rule stages a durable record; its event_id matches the wire ev
     CHECK_FALSE(staged[0]->event_id.empty());
 
     // Mint-once: the durable record and the live wire event carry ONE id (rev-4.1 #4)
-    // — a replay must reproduce it byte-for-byte or the server sees a false Conflict.
+    // - a replay must reproduce it byte-for-byte or the server sees a false Conflict.
     auto lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 1);
     CHECK(lc[0].event_id == staged[0]->event_id);
@@ -1157,7 +1157,7 @@ TEST_CASE("page_into_window does not re-page a windowed entry (re-send-all skips
     const std::int64_t now = 1'700'000'100'000;
     CHECK(rig.journal->page_into_window(*rig.rt, now).records_paged == 1);
     // The window still holds e-r1 (not drained): a second pass re-considers it but membership
-    // skips it — 0 net-new.
+    // skips it - 0 net-new.
     CHECK(rig.journal->page_into_window(*rig.rt, now + 60'000).records_paged == 0);
 }
 
@@ -1309,4 +1309,32 @@ TEST_CASE("page_into_window quarantines a corrupt batch instead of replaying it 
     auto sent = drain_lifecycle(*rig.rt);
     REQUIRE(sent.size() == 1);
     CHECK(sent[0].event_id == "e-good"); // the poison batches never reach the wire
+}
+
+TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    // A live entry enters BOTH the send window and staging; persist it, then back-fill.
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    auto pending = rig.rt->snapshot_pending();
+    REQUIRE(pending.size() == 1);
+
+    std::vector<PersistedBatch> batches;
+    CHECK(rig.journal->persist(pending, &batches) == 1);
+    REQUIRE(batches.size() == 1);
+    for (const auto& b : batches)
+        rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
+
+    // The live entry now carries the batch key + last-in-batch, so its LIVE send writes a
+    // sent-label (before this fix a live-sent entry had no key and later false-alerted).
+    rig.rt->drain([&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle && e.journal_last_in_batch &&
+            !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        return SendResult::Sent;
+    });
+    CHECK(rig.journal->sent_labels_written() == 1);
+    auto sent = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
+    REQUIRE(sent.has_value());
+    CHECK(sent->size() == 1);
 }

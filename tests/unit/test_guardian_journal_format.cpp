@@ -1,7 +1,7 @@
 /**
  * test_guardian_journal_format.cpp -- unit tests for the pure journal substrate
  * (item 7, PR-Ag, C1): key helpers, mint-time validation, and batch
- * (de)serialization. No KvStore, no threads — deterministic in isolation.
+ * (de)serialization. No KvStore, no threads - deterministic in isolation.
  */
 
 #include "guardian_journal_format.hpp"
@@ -15,7 +15,7 @@ using namespace yuzu::agent;
 
 namespace {
 
-// A record that passes every gate — tests mutate one field to isolate a fault.
+// A record that passes every gate - tests mutate one field to isolate a fault.
 JournalRecord good_record() {
     return JournalRecord{
         .rule_id = "rule-1",
@@ -37,7 +37,7 @@ TEST_CASE("journal key helpers: batch/sent 12-digit seq + prefixes", "[guardian]
     CHECK(journal_batch_key("deadbeef", 42) == "lc:deadbeef:000000000042");
     CHECK(journal_sent_key("deadbeef", 42) == "sent:deadbeef:000000000042");
 
-    // The three prefixes are disjoint — a scan of one never matches another.
+    // The three prefixes are disjoint - a scan of one never matches another.
     const auto bk = journal_batch_key("nonce", 3);
     CHECK(bk.starts_with(kBatchKeyPrefix));
     CHECK_FALSE(bk.starts_with(kSentKeyPrefix));
@@ -104,7 +104,7 @@ TEST_CASE("validate_record: skewed clock (secs<=0) rejected", "[guardian][journa
     r.enqueued_ns = -1; // floors to second -1 (pre-epoch)
     CHECK(validate_record(r) == JournalReject::SkewedClock);
 
-    r.enqueued_ns = 1'000'000'000; // exactly second 1 — the first valid ns
+    r.enqueued_ns = 1'000'000'000; // exactly second 1 - the first valid ns
     CHECK(validate_record(r) == JournalReject::None);
 }
 

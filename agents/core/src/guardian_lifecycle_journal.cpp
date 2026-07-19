@@ -4,6 +4,8 @@
 
 #include <yuzu/agent/kv_store.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <chrono>
 #include <format>
@@ -43,10 +45,21 @@ std::size_t est_entry_bytes(const JournalRecord& r) {
 } // namespace
 
 GuardianLifecycleJournal::GuardianLifecycleJournal(KvStore* kv)
-    : kv_(kv), boot_nonce_(make_journal_nonce()) {}
+    : kv_(kv), boot_nonce_(make_journal_nonce()) {
+    // rev-4.1 #9 / review M8: confirm the durability precondition on the BUILT binary. SOFT warn
+    // on != FULL (2); NEVER abort, since config drift must not kill an agent.
+    if (kv_) {
+        const int sync = kv_->pragma_synchronous();
+        if (sync != 2)
+            spdlog::warn("Guardian journal: kv_store PRAGMA synchronous = {} (expected 2/FULL); "
+                         "power-loss durability of the lifecycle journal is not guaranteed",
+                         sync);
+    }
+}
 
 std::size_t
-GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalRecord>> pending) {
+GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
+                                  std::vector<PersistedBatch>* out_batches) {
     if (!kv_ || pending.empty())
         return 0;
 
@@ -104,6 +117,13 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
             case KvInsert::Inserted:
                 ++batch_seq_;
                 batches_written_.fetch_add(1, std::memory_order_relaxed);
+                if (out_batches) { // provenance back-fill source (review M3)
+                    PersistedBatch pb{key, {}};
+                    pb.event_ids.reserve(entries.size());
+                    for (const auto& e : entries)
+                        pb.event_ids.push_back(e.event_id);
+                    out_batches->push_back(std::move(pb));
+                }
                 i += consumed;
                 written = i; // slots durably committed so far
                 break;
@@ -167,7 +187,7 @@ JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
         live.push_back(Live{row.key, parsed->ts_ms, row.value.size()});
     }
 
-    // Oldest-first by (ts_ms, key) — NOT lexical key (the boot-nonce is random).
+    // Oldest-first by (ts_ms, key) - NOT lexical key (the boot-nonce is random).
     std::sort(live.begin(), live.end(), [](const Live& a, const Live& b) {
         return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
     });
@@ -220,7 +240,7 @@ JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
         if (!evicted_set.count(l.key))
             survivors.insert(l.key);
 
-    // Sent-label GC: drop any sent:<...> whose batch no longer survives — an evicted batch's
+    // Sent-label GC: drop any sent:<...> whose batch no longer survives - an evicted batch's
     // label, or an orphan from a crash between the pop-after-send label write and eviction.
     if (auto sent = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
         std::vector<std::string> stale;
@@ -262,11 +282,17 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             boot_pruned_ = true;
     }
 
+    // N1 (fleet-cost): a pass with no token can do no net-new work, so skip the O(journal)
+    // read + parse of the whole namespace entirely. rev-4.1 #6 warned a slow KvStore delays
+    // heartbeats; nothing is skipped here, only delayed until a refilled pass.
+    if (!page_bucket_.ready(now_ms))
+        return stats;
+
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
     if (!rows)
-        return stats; // read error — fail-safe (prune counts it); page nothing this pass
+        return stats; // read error: fail-safe (prune counts it); page nothing this pass
 
-    // Order candidates by (ts_ms, key) — NOT lexical key (the boot-nonce is random). Skip
+    // Order candidates by (ts_ms, key) - NOT lexical key (the boot-nonce is random). Skip
     // expired batches (prune removes them; don't re-send an aged-out event).
     struct Cand {
         std::string key;

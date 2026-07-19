@@ -11,6 +11,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -48,7 +49,7 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
       boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
       lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {
-    // Reserve the staging vector ONCE — never from rule count. push_back then never
+    // Reserve the staging vector ONCE - never from rule count. push_back then never
     // reallocates, which is what makes stage_pending_locked's noexcept contract real.
     pending_journal_.reserve(kMaxPendingJournalRecords);
 }
@@ -509,7 +510,7 @@ std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
     case JournalReject::SkewedClock:
         journal_clock_rejected_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
-    default: // EmbeddedNul / Oversized / InvalidUtf8 — a field the journal cannot carry byte-exact
+    default: // EmbeddedNul / Oversized / InvalidUtf8 - a field the journal cannot carry byte-exact
         journal_field_rejected_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -517,13 +518,13 @@ std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
 
 void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> record) noexcept {
     if (!record)
-        return; // rejected at build — sent live, never journaled
+        return; // rejected at build - sent live, never journaled
     if (pending_journal_.size() >= kMaxPendingJournalRecords) {
         pending_journal_.erase(pending_journal_.begin()); // drop oldest; O(n) only under sustained failure
         journal_stage_dropped_.fetch_add(1, std::memory_order_relaxed);
     }
     // Reserve is fixed at construction, so this never reallocates and shared_ptr move is
-    // noexcept — the push cannot throw (the enclosing noexcept documents + enforces it).
+    // noexcept - the push cannot throw (the enclosing noexcept documents + enforces it).
     pending_journal_.push_back(std::move(record));
 }
 
@@ -554,11 +555,21 @@ std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entrie
         return 0;
     std::size_t added = 0;
     for (auto& e : entries) {
-        if (!lifecycle_log_.contains(e.event_id)) // window-scan membership — skip a re-page
+        if (!lifecycle_log_.contains(e.event_id)) // window-scan membership: skip a re-page
             if (lifecycle_log_.enqueue(std::move(e)))
                 ++added;
     }
     return added;
+}
+
+void GuardianSparkRuntime::backfill_batch_provenance(const std::string& batch_key,
+                                                     const std::vector<std::string>& event_ids,
+                                                     const std::string& last_event_id) {
+    if (event_ids.empty())
+        return;
+    const std::unordered_set<std::string> ids(event_ids.begin(), event_ids.end());
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    lifecycle_log_.stamp_provenance(batch_key, ids, last_event_id);
 }
 
 namespace {

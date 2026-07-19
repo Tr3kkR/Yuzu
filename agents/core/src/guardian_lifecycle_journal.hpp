@@ -8,7 +8,7 @@
  * detach-survival object (a late SparkEngine handler may run past the engine), so
  * it must own everything it touches and NEVER borrow a KvStore. The engine, by
  * contrast, already borrows the agent-owned KvStore (kv_) with a proven
- * member-destruction-order guarantee — this component makes the same borrow.
+ * member-destruction-order guarantee - this component makes the same borrow.
  *
  * C2 delivers persist() only; paging + retention (C4/C5) layer on later. NOT
  * thread-safe on its own: the engine calls into it only under its own mtx_, and
@@ -36,7 +36,7 @@ class GuardianSparkRuntime;
 
 /// A monotonic token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT
 /// reset on reconnect, so a flapping agent cannot replay its whole backlog on every
-/// reconnect. It DELAYS, never skips — a batch the bucket defers pages on a later pass, and
+/// reconnect. It DELAYS, never skips - a batch the bucket defers pages on a later pass, and
 /// retention (not the bucket) is the only deletion path, so nothing is lost. now_ms is
 /// passed in, so the pacing is deterministic + testable.
 class YUZU_EXPORT JournalPagingBucket {
@@ -49,7 +49,7 @@ public:
         refill(now_ms);
         return tokens_ >= 1.0;
     }
-    /// Spend one token — call only after ready() returned true.
+    /// Spend one token - call only after ready() returned true.
     void take() { tokens_ -= 1.0; }
     [[nodiscard]] double tokens() const { return tokens_; } // test introspection
 
@@ -77,6 +77,15 @@ struct JournalPageStats {
     std::size_t records_paged{0}; ///< records newly enqueued into the send window this pass
 };
 
+/// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the
+/// still-windowed LIVE entries get this batch key so their send writes the sent-label instead
+/// of the batch later aging out falsely counted evicted_without_send_evidence. event_ids are in
+/// batch order; back() is the batch's last-in-batch record.
+struct PersistedBatch {
+    std::string key;
+    std::vector<std::string> event_ids;
+};
+
 /// One prune pass's outcome (also mirrored on the lock-free counters).
 struct JournalPruneStats {
     bool read_ok{false};           ///< the initial journal scan succeeded (gates the boot barrier, M5)
@@ -88,18 +97,19 @@ struct JournalPruneStats {
 class YUZU_EXPORT GuardianLifecycleJournal {
 public:
     /// `kv` is BORROWED and must outlive this component (the agent owns it and
-    /// destroys it after the engine — agent.cpp member order). May be null (KV
+    /// destroys it after the engine - agent.cpp member order). May be null (KV
     /// unavailable): persist() then durably writes nothing.
     explicit GuardianLifecycleJournal(KvStore* kv);
 
     /// Serialise + durably write the FIFO-ordered `pending` records in batches
     /// (each ≤ kMaxJournalEntriesPerBatch entries and ≈ kMaxJournalBatchBytes).
-    /// Returns the count of RECORDS durably written — the caller passes it to
+    /// Returns the count of RECORDS durably written - the caller passes it to
     /// GuardianSparkRuntime::erase_persisted_prefix(). A per-push CIRCUIT BREAKER
     /// stops at the first write failure (remaining records stay pending for the
     /// maintenance-tick retry) so one failing write cannot stall a 500-rule
     /// apply_rules for 500 × the 5 s KvStore busy timeout under mtx_.
-    std::size_t persist(std::span<const std::shared_ptr<const JournalRecord>> pending);
+    std::size_t persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
+                        std::vector<PersistedBatch>* out_batches = nullptr);
 
     /// Enforce retention + quarantine (design §6, rev-4.1 #9). Evicts the oldest
     /// batches by (ts_ms, key) once they exceed the age (kJournalRetentionDays),
@@ -114,14 +124,14 @@ public:
     /// Replay the durable journal into `rt`'s send window (design §5; item 7 PR-Ag C5).
     /// Serialised by the paging mutex; the FIRST call runs a boot prune before returning
     /// any candidate (the prune-before-page barrier). Reads unexpired batches (fallible),
-    /// orders them by (ts_ms, key), and for each — rate-limited by a process-lifetime token
-    /// bucket charged ONLY for net-new work — reconstructs wire-identical entries (with
+    /// orders them by (ts_ms, key), and for each - rate-limited by a process-lifetime token
+    /// bucket charged ONLY for net-new work - reconstructs wire-identical entries (with
     /// replay provenance) and pages them via rt.try_page_batch. Re-send-all: nothing is
     /// permanently skipped (membership is a window scan; retention is the only deletion).
     /// Takes KvStore.mu_ then outbox_mu_ SEQUENTIALLY, never nested, never the engine mtx_.
     JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms);
 
-    /// Write the (best-effort) sent-label for a batch — called from the send path after the
+    /// Write the (best-effort) sent-label for a batch - called from the send path after the
     /// batch's LAST paged entry is delivered. Presence classifies eviction (sent-unacked vs
     /// no-send-evidence); it never gates re-paging or deletion.
     void mark_batch_sent(const std::string& batch_key);
@@ -179,7 +189,7 @@ public:
 
     /// TEST-ONLY: shrink the retention caps so count/byte/quarantine eviction is
     /// reachable at unit-test scale (production caps are 1000 batches / 32 MiB / 100
-    /// quarantined). Age eviction needs no shrink — pass a future now_ms to prune().
+    /// quarantined). Age eviction needs no shrink - pass a future now_ms to prune().
     void set_retention_limits_for_test(int days, std::size_t max_batches, std::size_t max_bytes,
                                        std::size_t max_quarantine) noexcept {
         retention_days_ = days;
@@ -190,7 +200,7 @@ public:
 
 private:
     KvStore* kv_;                ///< BORROWED; outlives this (agent owns it)
-    std::string boot_nonce_;     ///< random, fixed at construction — batch-key uniqueness across restarts
+    std::string boot_nonce_;     ///< random, fixed at construction - batch-key uniqueness across restarts
     std::uint64_t batch_seq_{0}; ///< per-process monotonic batch-key sequence (persist runs single-threaded under mtx_)
     std::atomic<std::uint64_t> batches_written_{0};
     std::atomic<std::uint64_t> write_failures_{0};
@@ -206,7 +216,7 @@ private:
     std::atomic<std::uint64_t> evicted_without_send_evidence_{0}; ///< aged out with NO sent-label (alert)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
-    // Paging state — all guarded by paging_mutex_ (paging is single-threaded per pass).
+    // Paging state - all guarded by paging_mutex_ (paging is single-threaded per pass).
     std::mutex paging_mutex_;
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
     JournalPagingBucket page_bucket_{kJournalPageRefillPerSec, kJournalPageBurst};
@@ -216,7 +226,7 @@ private:
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT
     /// persisted): a restart re-sends the whole unexpired journal, which is correct.
     std::optional<std::pair<std::int64_t, std::string>> page_cursor_;
-    // Retention caps — default to the production constants; a test may shrink them.
+    // Retention caps - default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};
     std::size_t max_batches_{kMaxJournalBatches};
     std::size_t max_bytes_{kMaxJournalBytes};

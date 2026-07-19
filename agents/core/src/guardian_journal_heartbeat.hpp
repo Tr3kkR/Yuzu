@@ -8,7 +8,7 @@
 ///
 /// SPARSE: every field is a counter (or a depth gauge) that is 0 on a healthy, quiescent,
 /// or inert (prefer_spark=false) agent, so a tag is emitted ONLY when non-zero. A journal
-/// that has never dropped/failed/quarantined/paged anything ships NO journal tags at all —
+/// that has never dropped/failed/quarantined/paged anything ships NO journal tags at all -
 /// fleet-kind, and it keeps the "absent == nothing to report" reading honest.
 
 #include <cstdint>
@@ -40,10 +40,11 @@ struct GuardianJournalStats {
     std::uint64_t sent_labels_written{0};
     std::uint64_t evicted_sent_unacked{0};          ///< aged out WITH a sent-label (monitor)
     std::uint64_t evicted_without_send_evidence{0}; ///< aged out with NO sent-label (integrity gap, alert)
+    std::uint64_t maint_exceptions{0};              ///< swallowed tick/page/flush throws (review B4)
 };
 
 /// Populate `tags` with the (sparse) journal telemetry. `TagMap` is any map with a string
-/// `operator[]` — the protobuf status_tags map in production, std::map in tests.
+/// `operator[]` - the protobuf status_tags map in production, std::map in tests.
 template <typename TagMap>
 void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalStats& s) {
     const auto put = [&](const char* key, std::uint64_t v) {
@@ -67,6 +68,7 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_sent_labels", s.sent_labels_written);
     put("yuzu.guardian_journal_evicted_sent_unacked", s.evicted_sent_unacked);
     put("yuzu.guardian_journal_evicted_no_send_evidence", s.evicted_without_send_evidence);
+    put("yuzu.guardian_journal_maint_exceptions", s.maint_exceptions);
 }
 
 } // namespace yuzu::agent

@@ -333,7 +333,7 @@ KvStore::list_entries(std::string_view plugin, std::string_view prefix) {
                                      : std::string{}});
     }
     // A mid-scan error must NOT be mistaken for end-of-rows (the raw list()
-    // while-loop cannot tell the difference — that is the bug this fixes).
+    // while-loop cannot tell the difference - that is the bug this fixes).
     if (rc != SQLITE_DONE)
         return std::unexpected(
             KvStoreError{std::format("list_entries step failed: {}", sqlite3_errmsg(db_))});

@@ -324,7 +324,7 @@ static std::int64_t journal_now_ms() {
 
 void GuardianEngine::persist_lifecycle_journal_locked() {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
-    // the path is wired (rev-4.1 §7 inertness — at prefer_spark_=false a pre-populated
+    // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
     // journal is neither written nor touched).
     if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
         return;
@@ -333,16 +333,24 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
         return;
     // snapshot released outbox_mu_; persist() does KV I/O holding NO runtime lock (so the
     // WRITE chain never nests outbox_mu_ under KvStore.mu_); erase re-takes outbox_mu_ for
-    // ONLY the prefix persist() durably wrote (circuit-broken on the first failure — the
+    // ONLY the prefix persist() durably wrote (circuit-broken on the first failure - the
     // rest stay pending for the maintenance-tick retry, C3).
-    const std::size_t written = lifecycle_journal_->persist(pending);
-    if (written > 0)
+    std::vector<PersistedBatch> batches;
+    const std::size_t written = lifecycle_journal_->persist(pending, &batches);
+    if (written > 0) {
+        // Back-fill provenance onto the still-windowed LIVE entries so their live send writes the
+        // sent-label (review M3), then erase the durably-written staging prefix.
+        for (const auto& b : batches)
+            if (!b.event_ids.empty())
+                spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
         spark_runtime_->erase_persisted_prefix(written);
+    }
 }
 
 void GuardianEngine::journal_maintenance_tick() {
     std::shared_ptr<GuardianSparkRuntime> rt;
     GuardianLifecycleJournal* journal = nullptr;
+    bool do_prune = false;
     {
         // PHASE 1 (under mtx_): retry any persist a prior write left pending, so a failed
         // write self-heals on the heartbeat with NO new push/reconnect (Sol BLOCKER-4), and
@@ -361,13 +369,18 @@ void GuardianEngine::journal_maintenance_tick() {
         }
         rt = spark_runtime_;
         journal = lifecycle_journal_.get();
+        // N1: prune (a full-journal read) every Nth tick, not every heartbeat. The page-side
+        // boot barrier still guarantees a prune-before-first-page; retention's day/1000/32 MiB
+        // caps tolerate the coarser cadence.
+        do_prune = (++journal_tick_count_ % 4) == 0;
     }
     // PHASE 2 (OFF mtx_): periodic retention + replay. Bounded by the token bucket + per-pass
     // cap; page_into_window observes the component stopping_ gate, so a late page never mutates
     // the window after stop() joined the drain worker (rev-4.1 #6/#7). Firewalled (B4a).
     if (rt && journal) {
         try {
-            journal->prune(journal_now_ms());
+            if (do_prune)
+                journal->prune(journal_now_ms());
             journal->page_into_window(*rt, journal_now_ms());
         } catch (...) {
             journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
@@ -385,8 +398,10 @@ void GuardianEngine::page_journal() {
         rt = spark_runtime_;
         journal = lifecycle_journal_.get();
     }
-    // Firewalled: page_journal is called from the reconnect hook on the run-loop thread and
-    // must not std::terminate on a bad_alloc (review B4a).
+    // Firewalled: page_journal is called from the reconnect hook on the run-loop thread and must
+    // not std::terminate on a bad_alloc (review B4a). The rt shared_ptr + the raw journal pointer
+    // captured under mtx_ stay valid off-lock because the run-loop + heartbeat threads are joined
+    // before ~GuardianEngine destroys these members (review M2/N4).
     if (rt && journal) {
         try {
             journal->page_into_window(*rt, journal_now_ms());
@@ -420,6 +435,7 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
         s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
     }
+    s.maint_exceptions = journal_maint_exceptions_.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -431,7 +447,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (!kv_)
         return std::unexpected("kv store unavailable");
 
-    // Flush staged lifecycle records to the durable journal on EVERY exit — the normal
+    // Flush staged lifecycle records to the durable journal on EVERY exit - the normal
     // return, the put_rule early return below, and any un-firewalled throw. GuardianRollback
     // is the codebase's terminate-safe scope guard; left un-committed it becomes an
     // always-fire flush whose dtor swallows a persist-during-unwind throw (records stay

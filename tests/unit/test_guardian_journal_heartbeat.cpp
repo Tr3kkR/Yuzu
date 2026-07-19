@@ -40,9 +40,9 @@ TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinne
 }
 
 TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journal][heartbeat]") {
-    // Set all 17 fields to distinct non-zero values → 17 distinct tags (no key collision).
+    // Set all 18 fields to distinct non-zero values -> 18 distinct tags (no key collision).
     std::map<std::string, std::string> tags;
-    GuardianJournalStats s{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17};
+    GuardianJournalStats s{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18};
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 17);
+    CHECK(tags.size() == 18);
 }

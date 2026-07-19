@@ -37,7 +37,7 @@ std::shared_ptr<const JournalRecord> ptr(const std::string& rid, const std::stri
     return std::make_shared<const JournalRecord>(rec(rid, kind));
 }
 
-// A one-record pending vector — std::span needs a named contiguous range, not a
+// A one-record pending vector - std::span needs a named contiguous range, not a
 // braced-init-list, so persist() calls take this rather than {ptr(...)}.
 std::vector<std::shared_ptr<const JournalRecord>> one(const std::string& rid,
                                                      const std::string& kind) {
@@ -128,11 +128,11 @@ TEST_CASE("journal persist: a write failure circuit-breaks; a retry of the same 
     std::vector<std::shared_ptr<const JournalRecord>> pending{ptr("r1", "armed"), ptr("r2", "armed")};
 
     j.inject_write_failures_for_test(1); // force the (single) batch write to fail
-    CHECK(j.persist(pending) == 0);      // circuit-broke — nothing durably written
+    CHECK(j.persist(pending) == 0);      // circuit-broke - nothing durably written
     CHECK(j.write_failures() == 1);
     CHECK(read_all(*t.kv).empty());
 
-    // Retry the SAME pending (as the maintenance tick would) — no injected fault now.
+    // Retry the SAME pending (as the maintenance tick would) - no injected fault now.
     CHECK(j.persist(pending) == 2);
     auto got = read_all(*t.kv);
     REQUIRE(got.size() == 2);
@@ -274,7 +274,7 @@ TEST_CASE("paging bucket delays then refills; caps at burst; never resets",
     b.take();
     CHECK_FALSE(b.ready(2000));
 
-    // A long gap refills but CAPS at burst — no unbounded accumulation.
+    // A long gap refills but CAPS at burst - no unbounded accumulation.
     CHECK(b.ready(1'000'000));
     CHECK(b.tokens() <= 2.0);
 }

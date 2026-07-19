@@ -28,8 +28,8 @@ struct KvStoreError {
     std::string message;
 };
 
-/// A key/value pair from list_entries(). The value is byte-exact — embedded NULs
-/// survive — unlike get()/list(), which read via sqlite3_column_text and truncate
+/// A key/value pair from list_entries(). The value is byte-exact - embedded NULs
+/// survive - unlike get()/list(), which read via sqlite3_column_text and truncate
 /// at the first NUL.
 struct KvRow {
     std::string key;
@@ -80,7 +80,7 @@ public:
     /**
      * Fallible, byte-exact, terminal-error-aware sibling of list(). Returns each
      * matching key WITH its value; distinguishes an empty result (empty vector)
-     * from a DB error (unexpected) — which list()'s fail-open cannot. Values are
+     * from a DB error (unexpected) - which list()'s fail-open cannot. Values are
      * read as blobs so embedded NULs survive.
      */
     std::expected<std::vector<KvRow>, KvStoreError> list_entries(std::string_view plugin,
@@ -89,7 +89,7 @@ public:
     /**
      * Insert only if (plugin, key) is absent. Uses INSERT ... ON CONFLICT DO
      * NOTHING RETURNING, so it reports Inserted vs Exists WITHOUT the
-     * sqlite3_changes()-after-step race (#1033) — letting a collision counter be
+     * sqlite3_changes()-after-step race (#1033) - letting a collision counter be
      * truthful.
      */
     KvInsert insert_if_absent(std::string_view plugin, std::string_view key,
@@ -98,7 +98,7 @@ public:
     /**
      * Atomically rename (plugin, from_key) → (plugin, to_key) via a single UPDATE
      * of the key column, preserving the value. Conflict if to_key already exists.
-     * Used for the quarantine move — never a non-atomic copy+delete.
+     * Used for the quarantine move - never a non-atomic copy+delete.
      */
     KvRename rename_key(std::string_view plugin, std::string_view from_key,
                         std::string_view to_key);
@@ -113,7 +113,7 @@ public:
     /**
      * The effective `PRAGMA synchronous` level (0=OFF, 1=NORMAL, 2=FULL,
      * 3=EXTRA), or -1 on error. The journal's power-loss-durability claim wants
-     * FULL; the caller SOFT-warns on anything less (never a hard abort — config
+     * FULL; the caller SOFT-warns on anything less (never a hard abort - config
      * drift must not kill an agent).
      */
     int pragma_synchronous();

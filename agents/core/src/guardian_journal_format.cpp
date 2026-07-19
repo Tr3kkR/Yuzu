@@ -12,7 +12,7 @@ constexpr std::int64_t kNsPerSec = 1'000'000'000;
 
 // Strict UTF-8 validation, matching (or exceeding) nlohmann's decoder: rejects
 // overlong encodings, surrogates, and code points > U+10FFFF. If a field passes
-// this, serialize's dump() cannot throw type_error 316 on it — so we never have
+// this, serialize's dump() cannot throw type_error 316 on it - so we never have
 // to fall back to byte-replacement (which would flip a replay to a false
 // Conflict against the server's byte-exact compare).
 bool is_valid_utf8(std::string_view s) {

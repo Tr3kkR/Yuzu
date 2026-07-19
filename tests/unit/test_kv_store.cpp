@@ -588,7 +588,7 @@ TEST_CASE("KvStore::rename_key moves atomically, reports Conflict/NotFound", "[k
     // Renaming a key that no longer exists.
     CHECK(t.store.rename_key("p1", "lc:n:0", "lc:n:9") == KvRename::NotFound);
 
-    // Conflict: to_key already exists — both rows survive untouched.
+    // Conflict: to_key already exists - both rows survive untouched.
     REQUIRE(t.store.set("p1", "lc:a", "A"));
     REQUIRE(t.store.set("p1", "lc:b", "B"));
     CHECK(t.store.rename_key("p1", "lc:a", "lc:b") == KvRename::Conflict);
