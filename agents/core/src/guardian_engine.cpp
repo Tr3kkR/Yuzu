@@ -225,7 +225,16 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // (normal return or an un-firewalled throw). Same terminate-safe always-fire guard as
     // apply_rules; fires with mtx_ still held (declared after the lock).
     GuardianRollback journal_flush;
-    journal_flush.fn = [this] { persist_lifecycle_journal_locked(); };
+    // Firewall + COUNT a persist-during-unwind throw (review UP-6): GuardianRollback's dtor is
+    // terminate-safe and swallows it, but a swallowed-yet-uncounted flush failure is an invisible
+    // audit-durability gap. Match the B4a maintenance-tick posture: catch here and count it.
+    journal_flush.fn = [this] {
+        try {
+            persist_lifecycle_journal_locked();
+        } catch (...) {
+            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
 
     std::size_t rearmed = 0;
     for (const auto& key : kv_->list(kKvNamespace, kRulePrefix)) {
@@ -338,12 +347,15 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
     std::vector<PersistedBatch> batches;
     const std::size_t written = lifecycle_journal_->persist(pending, &batches);
     if (written > 0) {
-        // Back-fill provenance onto the still-windowed LIVE entries so their live send writes the
-        // sent-label (review M3), then erase the durably-written staging prefix.
+        // Erase the durably-written staging prefix FIRST - it is the durability-completion step:
+        // once a batch is committed it must NEVER be re-persisted under a fresh key. Provenance
+        // back-fill (best-effort, allocates a set) runs AFTER, so a throw there loses only a
+        // sent-label back-fill (a later false evicted_without_send_evidence, monitoring noise),
+        // never leaves the records staged to re-persist as a DUPLICATE durable batch (review UP-6).
+        spark_runtime_->erase_persisted_prefix(written);
         for (const auto& b : batches)
             if (!b.event_ids.empty())
                 spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
-        spark_runtime_->erase_persisted_prefix(written);
     }
 }
 
@@ -427,8 +439,12 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.key_collisions = lifecycle_journal_->key_collisions();
         s.quarantined = lifecycle_journal_->quarantined();
         s.quarantine_failures = lifecycle_journal_->quarantine_failures();
+        s.quarantine_capacity_evicted = lifecycle_journal_->quarantine_capacity_evicted();
         s.batches_pruned = lifecycle_journal_->batches_pruned();
         s.prune_failures = lifecycle_journal_->prune_failures();
+        s.write_capacity_rejected = lifecycle_journal_->write_capacity_rejected();
+        s.journal_bytes = lifecycle_journal_->journal_bytes();
+        s.journal_batch_count = lifecycle_journal_->journal_batch_count();
         s.pages = lifecycle_journal_->pages();
         s.records_paged = lifecycle_journal_->records_paged();
         s.sent_labels_written = lifecycle_journal_->sent_labels_written();
@@ -454,7 +470,16 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // pending for the C3 maintenance-tick retry) rather than std::terminate. Declared after
     // the lock so it fires with mtx_ STILL held (reverse-order destruction).
     GuardianRollback journal_flush;
-    journal_flush.fn = [this] { persist_lifecycle_journal_locked(); };
+    // Firewall + COUNT a persist-during-unwind throw (review UP-6): GuardianRollback's dtor is
+    // terminate-safe and swallows it, but a swallowed-yet-uncounted flush failure is an invisible
+    // audit-durability gap. Match the B4a maintenance-tick posture: catch here and count it.
+    journal_flush.fn = [this] {
+        try {
+            persist_lifecycle_journal_locked();
+        } catch (...) {
+            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
 
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;

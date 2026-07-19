@@ -32,8 +32,12 @@ struct GuardianJournalStats {
     // Retention / quarantine (component).
     std::uint64_t quarantined{0};
     std::uint64_t quarantine_failures{0};
+    std::uint64_t quarantine_capacity_evicted{0}; ///< over-cap quarantined batches shed (UP-7)
     std::uint64_t batches_pruned{0};
     std::uint64_t prune_failures{0};
+    std::uint64_t write_capacity_rejected{0}; ///< new batch refused: journal at its byte/count cap (UP-1)
+    std::uint64_t journal_bytes{0};           ///< current live journal size estimate (gauge)
+    std::uint64_t journal_batch_count{0};     ///< current live batch count (gauge)
     // Replay (component).
     std::uint64_t pages{0};
     std::uint64_t records_paged{0};
@@ -61,8 +65,12 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_key_collisions", s.key_collisions);
     put("yuzu.guardian_journal_quarantined", s.quarantined);
     put("yuzu.guardian_journal_quarantine_failures", s.quarantine_failures);
+    put("yuzu.guardian_journal_quarantine_capacity_evicted", s.quarantine_capacity_evicted);
     put("yuzu.guardian_journal_pruned", s.batches_pruned);
     put("yuzu.guardian_journal_prune_failures", s.prune_failures);
+    put("yuzu.guardian_journal_write_capacity_rejected", s.write_capacity_rejected);
+    put("yuzu.guardian_journal_bytes", s.journal_bytes);
+    put("yuzu.guardian_journal_batch_count", s.journal_batch_count);
     put("yuzu.guardian_journal_pages", s.pages);
     put("yuzu.guardian_journal_records_paged", s.records_paged);
     put("yuzu.guardian_journal_sent_labels", s.sent_labels_written);

@@ -52,6 +52,53 @@ bool is_valid_utf8(std::string_view s) {
     return true;
 }
 
+// The maximum JSON nesting a legitimate v4 batch reaches is 3 (root object ->
+// entries array -> entry object); this cap is far above that but far below the
+// stack-recursion depth nlohmann's recursive-descent parser would blow.
+constexpr int kMaxJsonDepth = 100;
+
+// Reject pathologically-nested JSON BEFORE handing the value to nlohmann::parse.
+// A tampered kv_store.db value with thousands of nested '['/'{' would recurse the
+// parser until the stack overflows, which ABORTS the process - NOT a catchable
+// throw, so the try/catch firewalls on the replay/prune paths cannot contain it
+// (security review). This O(n) single pass tracks depth while skipping brackets
+// inside string literals (honouring '\\' escapes). Over-depth -> Malformed ->
+// the caller quarantines the batch.
+bool within_json_depth_limit(std::string_view json) {
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const char ch : json) {
+        if (in_string) {
+            if (escaped)
+                escaped = false;
+            else if (ch == '\\')
+                escaped = true;
+            else if (ch == '"')
+                in_string = false;
+            continue;
+        }
+        switch (ch) {
+        case '"':
+            in_string = true;
+            break;
+        case '[':
+        case '{':
+            if (++depth > kMaxJsonDepth)
+                return false;
+            break;
+        case ']':
+        case '}':
+            if (depth > 0)
+                --depth;
+            break;
+        default:
+            break;
+        }
+    }
+    return true;
+}
+
 // A field is journalable iff it is NUL-free, within the byte cap, and valid
 // UTF-8. Returns the specific fault (order: NUL, size, UTF-8) or None.
 JournalReject check_field(std::string_view f) {
@@ -125,6 +172,10 @@ std::string serialize_journal_batch(std::int64_t ts_ms, std::span<const JournalR
 }
 
 std::expected<JournalBatch, JournalParseError> parse_journal_batch(std::string_view json) {
+    // Guard the recursive-descent parser against a tampered, deeply-nested value that
+    // would stack-overflow (an uncatchable abort) before nlohmann even returns.
+    if (!within_json_depth_limit(json))
+        return std::unexpected(JournalParseError::Malformed);
     auto j = nlohmann::json::parse(json, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return std::unexpected(JournalParseError::Malformed);
 

@@ -429,13 +429,24 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
         return 0;
     }
 
+    // RAII: ROLLBACK on ANY early return between BEGIN and a successful COMMIT unless disarmed,
+    // so the hand-rolled transaction stays balanced against a future added early-return
+    // (cpp-safety review). Disarmed only after COMMIT succeeds.
+    struct TxnGuard {
+        sqlite3* db;
+        bool committed{false};
+        ~TxnGuard() {
+            if (!committed)
+                sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    } txn{db_};
+
     const char* sql = "DELETE FROM kv_store WHERE plugin = ? AND key = ? RETURNING 1";
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("KvStore::del_keys prepare failed: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return 0;
+        return 0; // TxnGuard rolls back
     }
     StmtPtr stmt(raw_stmt);
 
@@ -451,8 +462,7 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
         }
         if (rc != SQLITE_DONE) {
             spdlog::error("KvStore::del_keys step failed: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return 0;
+            return 0; // TxnGuard rolls back
         }
         sqlite3_reset(stmt.get());
         sqlite3_clear_bindings(stmt.get());
@@ -460,9 +470,9 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
 
     if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
         spdlog::error("KvStore::del_keys COMMIT failed: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return 0;
+        return 0; // TxnGuard rolls back
     }
+    txn.committed = true;
     return deleted;
 }
 

@@ -104,6 +104,22 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
             const std::string value = serialize_journal_batch(ts_ms, entries);
             const std::string key = journal_batch_key(boot_nonce_, batch_seq_);
 
+            // Write-side ceiling (review UP-1): retention (prune) is the only shrink path and it
+            // can fail indefinitely (chronic SQLITE_BUSY / a corrupt page). Without a write-side
+            // cap, a failing prune lets the journal grow without bound and exhaust the SHARED
+            // kv_store.db - taking down UNRELATED plugins' KV. This hard ceiling (default 2x the
+            // retention caps) sits ABOVE the soft retention caps prune trims to - so normal
+            // between-tick overshoot is never rejected - and is deliberately DECOUPLED from the
+            // retention caps (a test may shrink retention to force eviction without also blocking
+            // the writes that set that up). The cached size (set exactly by each prune scan,
+            // incremented below on a durable write) drives it: reject + count + circuit-break,
+            // leaving the records in the bounded RAM staging.
+            if (journal_batch_count_.load(std::memory_order_relaxed) + 1 > hard_max_batches_ ||
+                journal_bytes_.load(std::memory_order_relaxed) + value.size() > hard_max_bytes_) {
+                write_capacity_rejected_.fetch_add(1, std::memory_order_relaxed);
+                return written; // the rest stay pending; a later prune shrinks, then the tick retries
+            }
+
             KvInsert result;
             if (inject_skip_writes_.load(std::memory_order_relaxed) > 0) {
                 inject_skip_writes_.fetch_sub(1, std::memory_order_relaxed); // test-only: let this one write
@@ -118,6 +134,10 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
             case KvInsert::Inserted:
                 ++batch_seq_;
                 batches_written_.fetch_add(1, std::memory_order_relaxed);
+                // Track the live-size gauges so the write-side ceiling above and the operator
+                // size signal stay honest between prune scans (review UP-1 / sre).
+                journal_batch_count_.fetch_add(1, std::memory_order_relaxed);
+                journal_bytes_.fetch_add(value.size(), std::memory_order_relaxed);
                 i += consumed;
                 written = i; // count the durably-committed slots BEFORE building the best-effort
                              // provenance record, so a throw there loses only the sent-label
@@ -170,6 +190,11 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     if (!kv_)
         return stats;
 
+    if (inject_fail_reads_.load(std::memory_order_relaxed) > 0) { // test-only injected read fault
+        inject_fail_reads_.fetch_sub(1, std::memory_order_relaxed);
+        prune_failures_.fetch_add(1, std::memory_order_relaxed);
+        return stats; // read_ok stays false, same as a real list_entries failure
+    }
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
     if (!rows) {
         prune_failures_.fetch_add(1, std::memory_order_relaxed); // read error: fail-safe, retry next pass
@@ -210,6 +235,10 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     std::size_t total_bytes = 0;
     for (const auto& l : live)
         total_bytes += l.bytes;
+    // Snapshot the pre-eviction size: the write-side ceiling cache reflects on-disk reality even
+    // when the delete below fails (UP-1) - the scan succeeded, so this IS what is on disk now.
+    const std::size_t live_count = live.size();
+    const std::size_t live_bytes = total_bytes;
 
     std::vector<std::string> evict;
     std::size_t surviving = live.size();
@@ -229,9 +258,19 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         // a delete FAILURE (review M4). Only AFTER a successful delete do we count the eviction,
         // classify each by its (still-present) sent-label, and let the label-GC run against the
         // now-correct survivor set. On failure the batches + labels are left intact and retried.
-        const int n = kv_->del_keys(kJournalNamespace, evict);
+        int n;
+        if (inject_fail_deletes_.load(std::memory_order_relaxed) > 0) { // test-only injected del fault
+            inject_fail_deletes_.fetch_sub(1, std::memory_order_relaxed);
+            n = 0;
+        } else {
+            n = kv_->del_keys(kJournalNamespace, evict);
+        }
         if (n <= 0) {
             prune_failures_.fetch_add(1, std::memory_order_relaxed);
+            // Nothing was evicted, so the journal is still the full scanned set: keep the size
+            // cache honest under a chronic delete failure so the write-side ceiling still bounds it.
+            journal_batch_count_.store(live_count, std::memory_order_relaxed);
+            journal_bytes_.store(live_bytes, std::memory_order_relaxed);
             return stats; // do NOT touch survivors' sent-labels this pass
         }
         batches_pruned_.fetch_add(static_cast<std::uint64_t>(n), std::memory_order_relaxed);
@@ -246,12 +285,18 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         }
     }
 
-    // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC.
+    // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC, and the
+    // authoritative post-prune size for the write-side ceiling cache + operator size gauges.
     const std::set<std::string> evicted_set(evict.begin(), evict.end());
     std::set<std::string> survivors;
+    std::uint64_t surviving_bytes = 0;
     for (const auto& l : live)
-        if (!evicted_set.count(l.key))
+        if (!evicted_set.count(l.key)) {
             survivors.insert(l.key);
+            surviving_bytes += l.bytes;
+        }
+    journal_batch_count_.store(survivors.size(), std::memory_order_relaxed);
+    journal_bytes_.store(surviving_bytes, std::memory_order_relaxed);
 
     // Sent-label GC: drop any sent:<...> whose batch no longer survives - an evicted batch's
     // label, or an orphan from a crash between the pop-after-send label write and eviction.
@@ -272,7 +317,15 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
             const std::size_t excess = q->size() - max_quarantine_;
             for (std::size_t i = 0; i < excess; ++i)
                 drop.push_back((*q)[i].key); // list_entries is key-sorted
-            kv_->del_keys(kJournalNamespace, drop);
+            // Count + warn the shed (review UP-7 / sre): a fleet quietly discarding over-cap
+            // corrupt batches was previously invisible - an operator needs to see quarantine churn.
+            const int dropped = kv_->del_keys(kJournalNamespace, drop);
+            if (dropped > 0) {
+                quarantine_capacity_evicted_.fetch_add(static_cast<std::uint64_t>(dropped),
+                                                       std::memory_order_relaxed);
+                spdlog::warn("Guardian journal: shed {} over-cap quarantined batch(es) (cap {})",
+                             dropped, max_quarantine_);
+            }
         }
     }
 
@@ -286,6 +339,16 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         return stats;
     std::lock_guard<std::mutex> pg{paging_mutex_};
 
+    // N1 / UP-11 (fleet-cost + run-loop stall): a pass with no token can do no net-new work, so
+    // short-circuit BEFORE any O(journal) scan - including the boot-prune barrier below. Otherwise
+    // a flapping link re-runs the full boot scan on the run-loop thread every reconnect until it
+    // latches (up to the 5 s KvStore busy timeout each). The tick's periodic prune + the first
+    // token-bearing page both still bound an over-cap journal; nothing is skipped, only deferred.
+    // (The process's first page has the startup burst, so the boot prune still runs before the
+    // very first replay.) rev-4.1 #6 warned a slow KvStore delays heartbeats; this respects it.
+    if (!page_bucket_.ready(now_ms))
+        return stats;
+
     // Prune-before-page barrier (rev-4.1 #6): the FIRST paging attempt prunes before it can
     // return any replay candidate, so a stale over-cap journal is bounded before replay. Latch
     // the barrier only on a SUCCESSFUL prune scan (review M5) so a transient read error does not
@@ -295,12 +358,6 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         if (prune_locked_(now_ms).read_ok)
             boot_pruned_ = true;
     }
-
-    // N1 (fleet-cost): a pass with no token can do no net-new work, so skip the O(journal)
-    // read + parse of the whole namespace entirely. rev-4.1 #6 warned a slow KvStore delays
-    // heartbeats; nothing is skipped here, only delayed until a refilled pass.
-    if (!page_bucket_.ready(now_ms))
-        return stats;
 
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
     if (!rows)

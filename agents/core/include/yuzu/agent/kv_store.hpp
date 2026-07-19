@@ -83,8 +83,8 @@ public:
      * from a DB error (unexpected) - which list()'s fail-open cannot. Values are
      * read as blobs so embedded NULs survive.
      */
-    std::expected<std::vector<KvRow>, KvStoreError> list_entries(std::string_view plugin,
-                                                                 std::string_view prefix);
+    [[nodiscard]] std::expected<std::vector<KvRow>, KvStoreError>
+    list_entries(std::string_view plugin, std::string_view prefix);
 
     /**
      * Insert only if (plugin, key) is absent. Uses INSERT ... ON CONFLICT DO
@@ -92,23 +92,23 @@ public:
      * sqlite3_changes()-after-step race (#1033) - letting a collision counter be
      * truthful.
      */
-    KvInsert insert_if_absent(std::string_view plugin, std::string_view key,
-                              std::string_view value);
+    [[nodiscard]] KvInsert insert_if_absent(std::string_view plugin, std::string_view key,
+                                            std::string_view value);
 
     /**
      * Atomically rename (plugin, from_key) → (plugin, to_key) via a single UPDATE
      * of the key column, preserving the value. Conflict if to_key already exists.
      * Used for the quarantine move - never a non-atomic copy+delete.
      */
-    KvRename rename_key(std::string_view plugin, std::string_view from_key,
-                        std::string_view to_key);
+    [[nodiscard]] KvRename rename_key(std::string_view plugin, std::string_view from_key,
+                                      std::string_view to_key);
 
     /**
      * Delete a set of keys for a plugin in ONE transaction. Returns the number
      * actually removed (via RETURNING, not sqlite3_changes()). All-or-nothing: on
      * error the transaction rolls back and 0 is returned.
      */
-    int del_keys(std::string_view plugin, const std::vector<std::string>& keys);
+    [[nodiscard]] int del_keys(std::string_view plugin, const std::vector<std::string>& keys);
 
     /**
      * The effective `PRAGMA synchronous` level (0=OFF, 1=NORMAL, 2=FULL,
@@ -116,7 +116,7 @@ public:
      * FULL; the caller SOFT-warns on anything less (never a hard abort - config
      * drift must not kill an agent).
      */
-    int pragma_synchronous();
+    [[nodiscard]] int pragma_synchronous();
 
 private:
     explicit KvStore(sqlite3* db);

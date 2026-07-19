@@ -554,8 +554,13 @@ std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entrie
     if (lifecycle_log_.headroom() < entries.size())
         return 0;
     std::size_t added = 0;
+    // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
+    // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
+    // starve heartbeats under a large backlog (review UP-12 / perf P-2). The batch's records
+    // carry distinct event_ids, so a static pre-batch set is correct here.
+    const auto present = lifecycle_log_.event_id_set();
     for (auto& e : entries) {
-        if (!lifecycle_log_.contains(e.event_id)) // window-scan membership: skip a re-page
+        if (!present.count(e.event_id)) // O(1) membership: skip a re-page of an entry in the window
             if (lifecycle_log_.enqueue(std::move(e)))
                 ++added;
     }

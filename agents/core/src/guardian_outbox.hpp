@@ -386,6 +386,22 @@ public:
                 return true;
         return false;
     }
+    /// Journal-replay support (item 7 PR-Ag): build a membership set of the currently-buffered
+    /// event_ids in ONE O(size) pass, so the loader can test a whole batch's records in O(1)
+    /// each instead of re-scanning the window per record - which is O(records x window) and, on
+    /// the heartbeat/run-loop thread, can starve heartbeats under a large backlog (review
+    /// UP-12 / perf P-2). The returned views ALIAS this log's entries: valid only while the
+    /// caller holds the runtime's outbox_mu_ and does not erase from the log. enqueue()/push_back
+    /// keeps std::list nodes (and their string storage) stable, so pages appended after this
+    /// call do not invalidate the views - they simply are not in the (pre-batch) set, which is
+    /// correct because a batch's own records carry distinct event_ids.
+    [[nodiscard]] std::unordered_set<std::string_view> event_id_set() const {
+        std::unordered_set<std::string_view> ids;
+        ids.reserve(pending_.size());
+        for (const auto& e : pending_)
+            ids.insert(e.event_id);
+        return ids;
+    }
     /// Free slots before the capacity cap - the loader pages a batch only when the window
     /// has >= the batch's size of headroom (else it defers the batch to a later pass).
     [[nodiscard]] std::size_t headroom() const {

@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 namespace yuzu::agent {
@@ -108,8 +109,8 @@ public:
     /// stops at the first write failure (remaining records stay pending for the
     /// maintenance-tick retry) so one failing write cannot stall a 500-rule
     /// apply_rules for 500 × the 5 s KvStore busy timeout under mtx_.
-    std::size_t persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
-                        std::vector<PersistedBatch>* out_batches = nullptr);
+    [[nodiscard]] std::size_t persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
+                                      std::vector<PersistedBatch>* out_batches = nullptr);
 
     /// Enforce retention + quarantine (design §6, rev-4.1 #9). Evicts the oldest
     /// batches by (ts_ms, key) once they exceed the age (kJournalRetentionDays),
@@ -178,6 +179,22 @@ public:
     [[nodiscard]] std::uint64_t evicted_without_send_evidence() const noexcept {
         return evicted_without_send_evidence_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] std::uint64_t write_capacity_rejected() const noexcept {
+        return write_capacity_rejected_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t quarantine_capacity_evicted() const noexcept {
+        return quarantine_capacity_evicted_.load(std::memory_order_relaxed);
+    }
+    // Current-size GAUGES (not cumulative): set exactly by each prune scan, incremented by
+    // persist on a durable write. An operator watches these to see growth BEFORE a chronic
+    // prune failure exhausts the shared kv_store.db (sre review). Approximate before the first
+    // prune of a process (a restart re-establishes them from the boot-prune scan).
+    [[nodiscard]] std::uint64_t journal_bytes() const noexcept {
+        return journal_bytes_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t journal_batch_count() const noexcept {
+        return journal_batch_count_.load(std::memory_order_relaxed);
+    }
 
     /// TEST-ONLY: force the next `n` batch writes to fail (as if KvStore returned
     /// Error), exercising the per-push circuit breaker and the maintenance-tick
@@ -196,6 +213,30 @@ public:
         max_batches_ = max_batches;
         max_bytes_ = max_bytes;
         max_quarantine_ = max_quarantine;
+    }
+
+    /// TEST-ONLY: shrink the hard WRITE ceiling (the UP-1 anti-runaway bound, default 2x the
+    /// production retention caps) so a rejection is reachable at unit-test scale. Independent of
+    /// set_retention_limits_for_test - retention is the soft cap prune trims to; this is the hard
+    /// cap persist refuses to cross.
+    void set_write_ceiling_for_test(std::size_t max_batches, std::size_t max_bytes) noexcept {
+        hard_max_batches_ = max_batches;
+        hard_max_bytes_ = max_bytes;
+    }
+
+    /// TEST-ONLY: force the next `n` journal SCANS (the list_entries at the head of a prune
+    /// pass) to fail, exercising the read-error fail-safe: prune_failures increments, read_ok
+    /// stays false, and the boot-prune barrier does NOT latch (design §10 "injected list
+    /// failure distinguished from empty & retried"). No production caller.
+    void inject_read_failures_for_test(int n) noexcept {
+        inject_fail_reads_.store(n, std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: force the next `n` retention DELETES (del_keys of the evict set) to report a
+    /// 0/failure return, exercising the M4 delete-failure fail-safe (prune_failures increments,
+    /// survivors' sent-labels are left intact and retried). No production caller.
+    void inject_delete_failures_for_test(int n) noexcept {
+        inject_fail_deletes_.store(n, std::memory_order_relaxed);
     }
 
 private:
@@ -219,8 +260,14 @@ private:
     std::atomic<std::uint64_t> sent_labels_written_{0}; ///< sent-labels written (best-effort)
     std::atomic<std::uint64_t> evicted_sent_unacked_{0};          ///< aged out WITH a sent-label
     std::atomic<std::uint64_t> evicted_without_send_evidence_{0}; ///< aged out with NO sent-label (alert)
+    std::atomic<std::uint64_t> write_capacity_rejected_{0};       ///< new batch refused: journal at cap (UP-1)
+    std::atomic<std::uint64_t> quarantine_capacity_evicted_{0};   ///< over-cap quarantined batches shed (UP-7)
+    std::atomic<std::uint64_t> journal_bytes_{0};                 ///< current live journal size estimate (gauge)
+    std::atomic<std::uint64_t> journal_batch_count_{0};           ///< current live batch count (gauge)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
+    std::atomic<int> inject_fail_reads_{0};             ///< test-only: force the next N prune scans to fail
+    std::atomic<int> inject_fail_deletes_{0};           ///< test-only: force the next N retention deletes to fail
     // Paging state - all guarded by paging_mutex_ (paging is single-threaded per pass).
     std::mutex paging_mutex_;
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
@@ -231,11 +278,22 @@ private:
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT
     /// persisted): a restart re-sends the whole unexpired journal, which is correct.
     std::optional<std::pair<std::int64_t, std::string>> page_cursor_;
-    // Retention caps - default to the production constants; a test may shrink them.
+    // Retention (SOFT) caps - default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};
     std::size_t max_batches_{kMaxJournalBatches};
     std::size_t max_bytes_{kMaxJournalBytes};
     std::size_t max_quarantine_{kMaxQuarantineBatches};
+    // Hard WRITE ceiling (UP-1 anti-runaway bound) - 2x the retention caps, above normal
+    // between-prune overshoot; persist refuses to cross it so a chronically-failing prune cannot
+    // grow the shared kv_store.db without bound. Decoupled from the retention caps above.
+    std::size_t hard_max_batches_{kMaxJournalBatches * 2};
+    std::size_t hard_max_bytes_{kMaxJournalBytes * 2};
 };
+
+// Holds a std::mutex + atomics directly, so it is implicitly non-copyable AND non-movable; it
+// is only ever owned via a std::unique_ptr on GuardianEngine. Pin that so an accidental by-value
+// use (which would try to copy the borrowed kv_ and duplicate paging state) fails to compile.
+static_assert(!std::is_copy_constructible_v<GuardianLifecycleJournal> &&
+              !std::is_move_constructible_v<GuardianLifecycleJournal>);
 
 } // namespace yuzu::agent
