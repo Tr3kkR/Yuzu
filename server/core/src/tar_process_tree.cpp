@@ -1177,10 +1177,14 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     });
     // compatibility: row|<src>|<os>|<status>|<method>|<notes>
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> osmap;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> os_notes;
     each_line(compat_output, [&](const std::string& line) {
         const auto c = split_pipe(line);
-        if (c.size() >= 4 && c[0] == "row")
+        if (c.size() >= 4 && c[0] == "row") {
             osmap[c[1]][c[2]] = c[3];
+            if (c.size() >= 6)
+                os_notes[c[1]][c[2]] = c[5];
+        }
     });
 
     struct Meta {
@@ -1211,12 +1215,20 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     auto os_cell = [&](const std::string& src, const char* os) -> std::string {
         auto s = osmap.find(src);
         std::string st = (s != osmap.end() && s->second.count(os)) ? s->second.at(os) : "";
-        std::string cls = st == "supported" ? "os-ok" : (st == "constrained" ? "os-con" : "os-planned");
+        std::string cls = st == "supported" ? "os-ok"
+                         : st == "constrained" ? "os-con"
+                         : st == "unsupported" ? "os-unsupported"
+                         : "os-planned";
+        std::string notes;
+        auto n = os_notes.find(src);
+        if (n != os_notes.end() && n->second.count(os))
+            notes = n->second.at(os);
         if (st.empty()) {
             st = "\xE2\x80\x94";
             cls = "os-planned";
         }
-        return "<td class=\"os-cell " + cls + "\">" + html_escape(st) + "</td>";
+        std::string title = notes.empty() ? "" : " title=\"" + html_escape(notes) + "\"";
+        return "<td class=\"os-cell " + cls + "\"" + title + ">" + html_escape(st) + "</td>";
     };
 
     std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"

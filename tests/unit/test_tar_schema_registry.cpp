@@ -141,22 +141,32 @@ TEST_CASE("TAR schema: kUnsupported methods are excluded from the accept-list",
 
 TEST_CASE("TAR schema: dns macOS row is kUnsupported (roadmap 4.9 — no userspace "
           "resolver-cache mechanism on modern macOS)",
-          "[tar][schema][dns][macos]") {
+          "[tar][schema][dns][macos][issue2214]") {
     // Locks the 4.9 correction (dscacheutil is defunct on macOS 26; see
     // ADR-0015 and docs/darwin-compat.md) against regressing back to a
     // kPlanned row naming a dead mechanism.
     bool found_macos_row = false;
+    bool found_linux_row = false;
     for (const auto& src : capture_sources()) {
         if (src.name != "dns")
             continue;
         for (const auto& os : src.os_support) {
-            if (os.os != "macos")
-                continue;
-            found_macos_row = true;
-            CHECK(os.status == OsSupportStatus::kUnsupported);
+            INFO("source=" << src.name << " os=" << os.os);
+            if (os.os == "macos") {
+                found_macos_row = true;
+                CHECK(os.status == OsSupportStatus::kUnsupported);
+            } else if (os.os == "linux") {
+                // Pinned alongside the macOS row: the two are adjacent positional
+                // initializers in build_sources(), so a future edit near this array
+                // could clobber the wrong one without this catching it.
+                found_linux_row = true;
+                CHECK(os.status == OsSupportStatus::kPlanned);
+                CHECK(os.capture_method == "systemd-resolved");
+            }
         }
     }
     REQUIRE(found_macos_row);
+    REQUIRE(found_linux_row);
 
     auto methods = accepted_capture_methods("dns");
     CHECK(std::find(methods.begin(), methods.end(), "dscacheutil") == methods.end());

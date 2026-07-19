@@ -414,6 +414,7 @@ R"HTM(
     .os-ok { color: var(--green); }
     .os-con { color: var(--yellow); }
     .os-planned { color: var(--mds-color-theme-text-tertiary); opacity: 0.7; }
+    .os-unsupported { color: var(--red); opacity: 0.6; }
     .tgl { position: relative; display: inline-block; width: 38px; height: 20px; }
     .tgl input { opacity: 0; width: 0; height: 0; }
     .tgl .sl { position: absolute; cursor: pointer; inset: 0; background: var(--mds-color-theme-outline-secondary); border-radius: 20px; transition: .15s; }

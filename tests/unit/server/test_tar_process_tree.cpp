@@ -638,6 +638,28 @@ TEST_CASE("render_tar_capture_sources: rows, badges, staged toggles, device attr
     CHECK(html.find("capApplyBar") != std::string::npos);           // push bar present
 }
 
+TEST_CASE("render_tar_capture_sources: unsupported status gets its own class and a notes "
+          "tooltip, distinct from planned (roadmap 4.9 regression lock)",
+          "[tar][capture-sources]") {
+    // Before 4.9, no row in the schema registry ever carried kUnsupported, so this
+    // branch of os_cell() was dead code — flagged by governance Gate 4 unhappy-path
+    // as a first-exposure risk: an unsupported row falling into the same muted
+    // "os-planned" bucket as a merely-not-yet-implemented one would defeat the whole
+    // point of an honest status. Pin that "unsupported" gets a distinct CSS class and
+    // that its notes text (why it's unsupported) reaches the operator via a tooltip.
+    const std::string status = "config|dns_enabled|true\nconfig|dns_live_rows|0\n";
+    const std::string compat =
+        "header|source|os|status|capture_method|notes\n"
+        "row|dns|macos|unsupported||No userspace mechanism enumerates the DNS resolver "
+        "cache on modern macOS.\n"
+        "row|dns|linux|planned|systemd-resolved|Wired in the Linux follow-up.\n";
+    const std::string html = render_tar_capture_sources("agent-456", status, compat);
+    CHECK(html.find("os-unsupported") != std::string::npos);
+    CHECK(html.find("No userspace mechanism enumerates") != std::string::npos);
+    // The still-planned Linux row keeps the pre-existing muted class, not the new one.
+    CHECK(html.find("os-planned") != std::string::npos);
+}
+
 TEST_CASE("render_tar_dns_panel: newest-first input is a load-bearing invariant (ADR-0015)",
           "[tar][dns][panel]") {
     // The route feeds rows ORDER BY ts DESC; the reduction is newest-wins. Pin that

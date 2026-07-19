@@ -49,11 +49,18 @@ source".
   data + TTL **from cache only** (the flag guarantees no wire query — no network
   amplification, no privacy leak from the collector).
 - Linux (systemd-resolved / `/etc/hosts`) is **kPlanned**.
-- macOS is **kUnsupported** (4.9 spike, 2026-07-19): no userspace mechanism enumerates
-  the resolver cache on modern macOS. `dscacheutil -cachedump` is defunct (exits 0
-  printing "Unable to get details from the cache node", verified 26.5.2); `scutil --dns`
-  returns resolver *configuration*, not cached records; the mDNSResponder cache is
-  dumpable only as root to the `<private>`-redacted unified log. See `docs/darwin-compat.md`.
+- macOS is **kUnsupported** (mac-parity roadmap item 4.9 spike, 2026-07-19 — see
+  `~/.claude/plans/mac-parity-roadmap.md`, not `docs/roadmap.md`'s unrelated numbered
+  item 4.9): no userspace mechanism enumerates the resolver cache on modern macOS.
+  `dscacheutil -cachedump` is defunct (exits 0 printing "Unable to get details from
+  the cache node", verified 26.5.2); `scutil --dns` returns resolver *configuration*,
+  not cached records; the mDNSResponder cache is dumpable only as root to the
+  `<private>`-redacted unified log (confirmed for both `killall -INFO mDNSResponder`
+  and `dns-sd -O -stdout`). See `docs/darwin-compat.md`. **Re-check trigger:** revisit
+  this status only if Apple ships a public, non-root resolver-cache-enumeration API —
+  no such API exists as of macOS 26; `NetworkExtension`'s DNS-proxy providers observe
+  future queries, they don't expose existing cache state, so they are not a path back
+  to `kPlanned`.
 - **Device resolver-cache STATE — host-wide, no PID.** There is no per-process
   attribution. Snapshot-diff keyed on `(name, record_type, data)` → `appeared` /
   `removed`; `ttl_remaining_s` is a value field (decrements every tick, never
@@ -86,7 +93,8 @@ queryable empty until enabled.
 2. **Windows-first.** This slice ships Windows collectors only; the schema-invariant
    test requires a row per OS regardless of feasibility. `arp`'s Linux/macOS rows are
    `kPlanned` follow-ups. `dns`'s Linux row is `kPlanned`; its macOS row is
-   `kUnsupported` (4.9 spike, 2026-07-19 — no feasible mechanism, not a follow-up).
+   `kUnsupported` (mac-parity roadmap 4.9 spike, 2026-07-19 — no feasible mechanism,
+   not a follow-up).
 3. **No Prometheus metrics.** The proposal's "emit `yuzu_agent_*` metrics" is
    dropped — TAR has no agent `/metrics` endpoint; the observable surface is the
    `status` action's per-source row counts (auto-covered). Truncation is a
