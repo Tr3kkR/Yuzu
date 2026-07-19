@@ -56,6 +56,24 @@ enum class AssertionKind {
     ServiceStopped, ///< service-stopped: desired Stopped
 };
 
+/// The guard_type wire token ("file" | "registry" | "service") for an assertion kind.
+/// Health and Lifecycle events derive guard_type from the assertion this way; the
+/// Compliance path carries it inside GuardDrift instead. Matches the "registry" |
+/// "file" | "service" vocabulary GuardDrift::guard_type uses.
+[[nodiscard]] constexpr const char* guard_type_for(AssertionKind k) noexcept {
+    switch (k) {
+    case AssertionKind::FileExists:
+    case AssertionKind::FileHashEquals:
+        return "file";
+    case AssertionKind::RegistryEquals:
+        return "registry";
+    case AssertionKind::ServiceRunning:
+    case AssertionKind::ServiceStopped:
+        return "service";
+    }
+    return "unknown";
+}
+
 struct RuleAssertion {
     AssertionKind kind{AssertionKind::FileExists};
     std::string rule_id;

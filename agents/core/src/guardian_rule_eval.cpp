@@ -101,7 +101,10 @@ EvalOutcome eval_file(const RuleAssertion& a, const ReadResult<FileSnapshot>& re
         if (expected.empty()) // absent/unreadable/oversize drift: report the target hash
             expected = a.expected_hash.empty() ? state.baseline_hash : a.expected_hash;
     }
-    return pack(a, "file", compliant, std::move(detected), std::move(expected), state, now,
+    // guard_type via the shared guard_type_for(kind) so Compliance and Health/Lifecycle
+    // (which derive it the same way) can never report a different guard_type for one rule.
+    return pack(a, guard_type_for(a.kind), compliant, std::move(detected), std::move(expected),
+                state, now,
                 emit_compliant_edge, /*detection_latency_us=*/0);
 }
 
@@ -122,7 +125,8 @@ EvalOutcome eval_registry(const RuleAssertion& a, const ReadResult<RegistrySnaps
         compliant = (snap.value == a.expected_value);
         detected = snap.value;
     }
-    return pack(a, "registry", compliant, std::move(detected), a.expected_value, state, now,
+    return pack(a, guard_type_for(a.kind), compliant, std::move(detected), a.expected_value, state,
+                now,
                 emit_compliant_edge, detection_latency_us);
 }
 
@@ -156,7 +160,8 @@ EvalOutcome eval_service(const RuleAssertion& a, const ReadResult<ServiceRunStat
     // emit_compliant_edge default true UNIFIES the compliant-census signal across
     // platforms: legacy Windows-Service emitted it, legacy systemd did not. The caller
     // can pass false to preserve exact legacy-systemd silence (pinned in parity tests).
-    return pack(a, "service", compliant, std::move(detected), std::move(expected), state, now,
+    return pack(a, guard_type_for(a.kind), compliant, std::move(detected), std::move(expected),
+                state, now,
                 emit_compliant_edge, /*detection_latency_us=*/0);
 }
 

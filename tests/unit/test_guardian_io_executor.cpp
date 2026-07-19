@@ -129,7 +129,7 @@ TEST_CASE("run: a second read for the same (class,key) returns AlreadyRunning wi
 TEST_CASE("run: file-lane saturation does not block a service read (per-type bulkhead)",
           "[spark][ioexecutor]") {
     GuardianIoExecutor ex{GuardianIoExecutor::Config{
-        .file_quota = 2, .registry_quota = 2, .service_quota = 2, .total_quota = 6}};
+        .file_quota = 2, .registry_quota = 2, .service_quota = 2}};
     auto gate = std::make_shared<Gate>();
     std::vector<std::thread> callers;
     auto park = [&](IoClass c, std::string k) {
@@ -151,7 +151,8 @@ TEST_CASE("run: file-lane saturation does not block a service read (per-type bul
     });
     CHECK(rf.error() == IoFailure::CapacityExhausted);
 
-    // A service read is unaffected (total is 2 < 6, service quota free).
+    // A service read is unaffected: the file lane is full but the service quota is
+    // free, and the derived process bound (2+2+2=6) never binds before a class cap.
     auto rs = ex.run(IoClass::Service, "s1", 5s, [] { return 5; });
     REQUIRE(rs.has_value());
     CHECK(*rs == 5);
@@ -162,10 +163,46 @@ TEST_CASE("run: file-lane saturation does not block a service read (per-type bul
     CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
 }
 
-TEST_CASE("run: the total process bound rejects even when a per-type quota is free",
+TEST_CASE("Config: an oversubscribing injected quota is clamped to the process ceiling",
           "[spark][ioexecutor]") {
+    // A pathological injected Config (100/100/100) must NOT let the executor spawn 300
+    // workers - the derived process bound is clamped to kMaxProcessIoWorkers. (The
+    // DEFAULT config is static-asserted safe; this guards runtime-injected values.)
     GuardianIoExecutor ex{GuardianIoExecutor::Config{
-        .file_quota = 3, .registry_quota = 3, .service_quota = 3, .total_quota = 2}};
+        .file_quota = 100, .registry_quota = 100, .service_quota = 100}};
+    auto gate = std::make_shared<Gate>();
+    std::vector<std::thread> callers;
+    for (int i = 0; i < GuardianIoExecutor::kMaxProcessIoWorkers; ++i) {
+        callers.emplace_back([&ex, gate, i] {
+            ex.run(IoClass::File, "f" + std::to_string(i), 30s, [gate] {
+                gate->wait();
+                return 0;
+            });
+        });
+    }
+    REQUIRE(spin_until(
+        [&] { return ex.active_worker_count() == GuardianIoExecutor::kMaxProcessIoWorkers; }));
+    // The (ceiling+1)-th read is rejected: the process bound was clamped to the ceiling,
+    // not the injected sum of 300.
+    auto over = ex.run(IoClass::File, "f-over", 1s, [gate] {
+        gate->wait();
+        return 0;
+    });
+    CHECK(over.error() == IoFailure::CapacityExhausted);
+
+    gate->release();
+    for (auto& t : callers)
+        t.join();
+    CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+}
+
+TEST_CASE("run: a saturated file+registry lane never starves the service lane (R3 exact bulkheads)",
+          "[spark][ioexecutor]") {
+    // The default config is the shipped-bug shape: File 4 + Registry 3 = 7 workers.
+    // Under the old independent total_quota{8} that left Service just 1 of its 3
+    // slots. With the derived process bound (== sum of class quotas, so exact
+    // bulkheads) a saturated file+registry lane leaves Service its full 3 slots.
+    GuardianIoExecutor ex; // defaults: 4 / 3 / 3
     auto gate = std::make_shared<Gate>();
     std::vector<std::thread> callers;
     auto park = [&](IoClass c, std::string k) {
@@ -176,13 +213,30 @@ TEST_CASE("run: the total process bound rejects even when a per-type quota is fr
             });
         });
     };
+    // Saturate File (4) and Registry (3): 7 workers, the exact old-total-quota point.
     park(IoClass::File, "f1");
+    park(IoClass::File, "f2");
+    park(IoClass::File, "f3");
+    park(IoClass::File, "f4");
     park(IoClass::Registry, "r1");
-    REQUIRE(spin_until([&] { return ex.active_worker_count() == 2; }));
+    park(IoClass::Registry, "r2");
+    park(IoClass::Registry, "r3");
+    REQUIRE(spin_until([&] { return ex.active_worker_count() == 7; }));
 
-    // Service quota is free (0/3) but the total (2/2) is full.
-    auto rs = ex.run(IoClass::Service, "s1", 1s, [] { return 0; });
-    CHECK(rs.error() == IoFailure::CapacityExhausted);
+    // All THREE service reads are admitted - the service lane keeps its full quota,
+    // no cross-lane starvation. (Under the old total_quota{8} the 8th worker would
+    // admit and the 9th+ reject, capping service at 1.)
+    park(IoClass::Service, "s1");
+    park(IoClass::Service, "s2");
+    park(IoClass::Service, "s3");
+    REQUIRE(spin_until([&] { return ex.active_worker_count(IoClass::Service) == 3; }));
+
+    // A 4th service read hits the service class cap (3), not the process bound.
+    auto rs4 = ex.run(IoClass::Service, "s4", 1s, [gate] {
+        gate->wait();
+        return 0;
+    });
+    CHECK(rs4.error() == IoFailure::CapacityExhausted);
 
     gate->release();
     for (auto& t : callers)

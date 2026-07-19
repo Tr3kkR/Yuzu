@@ -99,8 +99,12 @@ public:
     ///                   legacy - a failure must be visible (errored via
     ///                   get_status()'s existing fail-closed behaviour), not
     ///                   silently absorbed (the mutual-exclusion invariant).
-    ///   Available     - spark_runtime_/spark_scheduler_/the drain worker are
-    ///                   live; the reconcile op classifies per-rule from here.
+    ///   Available     - the spark path is wired and could run: spark_runtime_ is
+    ///                   live and the reconcile op classifies per-rule from here.
+    ///                   The convergence scheduler + drain worker are CONSTRUCTED
+    ///                   but STARTED only when prefer_spark_ is set (rung 7.7b) -
+    ///                   at prefer_spark_=false nothing places on spark, so their
+    ///                   threads would be pure overhead; see wire_spark_engine().
     enum class SparkAvailability { Unwired, SparkDisabled, SparkFailed, Available };
 
     /// The KvStore pointer may be null at construction (e.g. KV open
@@ -182,16 +186,29 @@ public:
     /// every successful apply_rules call. Persisted across restarts.
     std::uint64_t policy_generation() const;
 
+    /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
+    /// apply_rules — a rule that persisted but did not arm. This counts attempts, NOT
+    /// distinct rules: one persistently-failing rule increments it once per push (so it
+    /// is a rate signal / "a gap is open", not "how many rules are gapped"). A nonzero
+    /// value means an enforcement gap is (or was) open on this endpoint; surfaced via the
+    /// heartbeat by item 9 so a persistent gap stays fleet-visible even after the
+    /// generation later advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
+    [[nodiscard]] std::uint64_t arm_failure_count() const noexcept {
+        return arm_failures_.load(std::memory_order_relaxed);
+    }
+
     /// KV namespace used for all Guardian persistent state. Exposed for
     /// tests — do not read from this namespace in production code.
     static std::string_view kv_namespace();
 
     /// Wire the spark detection path, once, before start_local() (agent.cpp,
     /// rung 7.7): builds the reader, the SparkEngine backend adapter, the
-    /// runtime, registers the SparkEngine consumer, starts the convergence
-    /// scheduler and the outbox drain worker - an all-or-nothing transaction
-    /// (ANY step failing after `engine` is confirmed non-null rolls every
-    /// partial construction back and reports SparkFailed; see the .cpp for
+    /// runtime, registers the SparkEngine consumer, and constructs the
+    /// convergence scheduler and the outbox drain worker - starting their
+    /// threads only when prefer_spark_ is set (rung 7.7b); at prefer_spark_=false
+    /// they are created but idle (nothing places on spark). An all-or-nothing
+    /// transaction (ANY step failing after `engine` is confirmed non-null rolls
+    /// every partial construction back and reports SparkFailed; see the .cpp for
     /// the exact rollback sequence). `engine` is a BORROWED pointer, safe
     /// only because of the agent.cpp member-declaration-order guarantee that
     /// spark_engine_ outlives this GuardianEngine's teardown (spark_engine_ is
@@ -223,6 +240,7 @@ private:
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
     std::size_t rule_count_{0};
+    std::atomic<std::uint64_t> arm_failures_{0}; ///< reconcile-throw count (item 3 / Sol B1)
 
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();

@@ -1484,7 +1484,7 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 19 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 

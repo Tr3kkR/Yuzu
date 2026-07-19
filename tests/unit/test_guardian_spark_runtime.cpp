@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <latch>
 #include <memory>
 #include <string>
@@ -68,7 +69,9 @@ struct FakeBackend : ISparkBackend {
     std::atomic<int> arms{0};
     std::atomic<int> disarms{0};
     std::atomic<bool> fail_arm{false};
+    std::atomic<bool> throw_arm{false}; ///< arm() throws (a backend that throws, not just fails)
     std::expected<std::uint64_t, std::string> arm(const SparkSpec&) override {
+        if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
         arms.fetch_add(1);
         return next.fetch_add(1);
@@ -233,6 +236,103 @@ TEST_CASE("a backend arm failure errors the rule, never a silent legacy fallback
     REQUIRE_FALSE(res.has_value()); // errored
     REQUIRE(rt->armed_key_count() == 0);
     REQUIRE(rt->rule_count() == 0); // not left half-attached
+}
+
+TEST_CASE("drain sends Lifecycle (armed) before Compliance (item 4 / Fable M6)",
+          "[spark][runtime]") {
+    // The "armed" audit entry must reach the server before the rule's first compliance
+    // event, or the trail shows detection preceding arm.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    rt->evaluate_key(key, EvalReason::Initial);                           // Compliance edge
+    REQUIRE(rt->outbox_size() == 1);
+
+    // Capture EVERY domain in send order (drain_all/drain_lifecycle filter by domain).
+    std::vector<OutboxEntry> got;
+    rt->drain([&](const OutboxEntry& e) {
+        got.push_back(e);
+        return SendResult::Sent;
+    });
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].domain == OutboxDomain::Lifecycle); // armed first
+    CHECK(got[0].lifecycle_kind == "armed");
+    CHECK(got[1].domain == OutboxDomain::Compliance); // then the edge
+}
+
+TEST_CASE("drain does NOT let a stuck lifecycle head block compliance (Gate 4 UP-3)",
+          "[spark][runtime]") {
+    // Regression for the M6-gate blackout: an earlier version gated compliance on the
+    // lifecycle log being empty, so a lifecycle head that could not send blocked ALL
+    // compliance/health indefinitely. Both logs must drain every pass (lifecycle first
+    // for best-effort ordering, but NO hard gate) so failure isolation holds.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    rt->evaluate_key(key, EvalReason::Initial);                           // Compliance edge
+    REQUIRE(rt->outbox_size() == 1);
+
+    // Retain the lifecycle head (as if its send keeps failing); compliance must STILL drain.
+    std::vector<OutboxDomain> got;
+    rt->drain([&](const OutboxEntry& e) {
+        got.push_back(e.domain);
+        return e.domain == OutboxDomain::Lifecycle ? SendResult::Retain : SendResult::Sent;
+    });
+    CHECK(rt->outbox_size() == 0); // compliance drained despite the stuck lifecycle head
+    REQUIRE(got.size() == 2);
+    CHECK(got[0] == OutboxDomain::Lifecycle);  // attempted first (best-effort ordering)
+    CHECK(got[1] == OutboxDomain::Compliance); // then compliance, NOT blocked
+}
+
+TEST_CASE("drain counts a send that throws and retains the head (item 4 hardening)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // Lifecycle "armed"
+    REQUIRE(rt->send_exception_count() == 0);
+
+    // A throwing send must not escape drain (that would eventually reach the worker's
+    // firewall), must be counted (not silent), and must retain the head.
+    rt->drain([](const OutboxEntry&) -> SendResult { throw std::runtime_error("send boom"); });
+    CHECK(rt->send_exception_count() == 1);
+
+    const auto lc = drain_lifecycle(*rt); // clean drain: the retained head still sends
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].lifecycle_kind == "armed");
+}
+
+TEST_CASE("drain releases outbox_mu_ during send - no head-of-line block (item 4)",
+          "[spark][runtime]") {
+    // Proof the send (a gRPC Write in production) no longer runs UNDER outbox_mu_: the
+    // callback itself takes outbox_mu_ via outbox_size(). Under the old lock-across-send
+    // drain this self-deadlocks the drain thread; with item 4 it completes.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // enqueues an "armed"
+
+    // Run the drain on a separate thread with a timeout so a REGRESSION (self-deadlock
+    // when the send runs under outbox_mu_) fails FAST here instead of burning the 240s
+    // binary-level CI timeout and killing every other test in the run (quality Gate 3).
+    // The blocked thread would hold only locks local to this test's rt - safe to abandon.
+    std::atomic<bool> callback_ran{false};
+    std::atomic<std::size_t> sent{0};
+    auto fut = std::async(std::launch::async, [&] {
+        sent = rt->drain([&](const OutboxEntry&) {
+            (void)rt->outbox_size(); // takes outbox_mu_ - would DEADLOCK if held across send
+            callback_ran = true;
+            return SendResult::Sent;
+        });
+    });
+    REQUIRE(fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready); // no deadlock
+    fut.get();
+    CHECK(callback_ran.load());
+    CHECK(sent.load() == 1);
 }
 
 TEST_CASE("detach purges a rule's buffered (undrained) outbox entries", "[spark][runtime]") {
@@ -650,18 +750,91 @@ TEST_CASE("attach_rule enqueues a Lifecycle 'armed' entry; detach_rule enqueues 
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
-    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    auto rule = file_exists_rule("r1");
+    rule.rule_name = "Hosts integrity";
+    rt->attach_rule("r1", file_spec("/a"), rule, true);
 
     auto lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 1);
     CHECK(lc[0].rule_id == "r1");
     CHECK(lc[0].lifecycle_kind == "armed");
+    // The entry carries the guard identity so the wire event is not blank (#2237 item 4).
+    CHECK(lc[0].guard_type == "file");
+    CHECK(lc[0].rule_name == "Hosts integrity");
 
     rt->detach_rule("r1");
     lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 1);
     CHECK(lc[0].rule_id == "r1");
     CHECK(lc[0].lifecycle_kind == "disarmed");
+    CHECK(lc[0].guard_type == "file"); // disarmed carries the identity too (captured pre-erase)
+    CHECK(lc[0].rule_name == "Hosts integrity");
+}
+
+TEST_CASE("attach_rule: a THROWING backend arm() rolls back with no ghost index entry / no leak",
+          "[spark][runtime]") {
+    // Fable rung-7.7b M3: the pre-fix code installed attach_rule's rollback only AFTER
+    // arm(), so a THROWING arm() left the rule in the index with no subscription. That
+    // ghost then corrupted a LATER successful attach of a sibling rule on the same key
+    // (a false 0->1 edge -> double-arm / untracked subscription).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    b->throw_arm = true;
+    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true),
+                    std::runtime_error);
+    b->throw_arm = false;
+
+    // Rolled back clean: no armed watcher, the throwing arm did not count, nothing to
+    // disarm (arm threw before returning a subscription).
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 0);
+    CHECK(b->disarms.load() == 0);
+
+    // The decisive check: a fresh attach of a SIBLING on the SAME key sees a real 0->1
+    // edge and arms EXACTLY once. A lingering ghost from r1 would make this take the
+    // existing-key branch and never arm (armed_key_count would stay 0, or double-count).
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1);
+}
+
+TEST_CASE("attach_rule: a throw AFTER arm() (waker copy) disarms and leaves no phantom audit",
+          "[spark][runtime]") {
+    // The throwing-arm test above only covers a throw BEFORE arm has any side effect.
+    // This exercises the armed_here=true rollback path: arm() genuinely succeeds, then a
+    // later step throws. A callable whose COPY throws, installed as the pending-initial
+    // waker, makes the std::function copy inside attach_rule (after arm() returned a
+    // subscription) throw. (Fable rung-7.7b: the seam the shipped test lacked.)
+    struct ThrowOnCopy {
+        ThrowOnCopy() = default;
+        ThrowOnCopy(const ThrowOnCopy&) { throw std::runtime_error("waker copy boom"); }
+        ThrowOnCopy(ThrowOnCopy&&) noexcept = default;
+        ThrowOnCopy& operator=(ThrowOnCopy&&) noexcept = default;
+        void operator()() const {}
+    };
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    rt->set_pending_initial_waker(ThrowOnCopy{}); // moved in (noexcept); the COPY inside attach throws
+    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true),
+                    std::runtime_error);
+    rt->set_pending_initial_waker({}); // clear so the sibling attach below is clean
+
+    // arm() succeeded, then the waker copy threw: the rollback disarmed the just-armed
+    // subscription and removed the rule, and (the waker copy now precedes the lifecycle
+    // enqueue) NO "armed" audit entry was written for the rolled-back attach.
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 1);    // the arm did happen
+    CHECK(b->disarms.load() == 1); // ...and the rollback disarmed it (the armed_here path)
+    CHECK(drain_lifecycle(*rt).empty()); // no phantom "armed"
+
+    // Key is clean afterward: a fresh attach arms exactly once.
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 2);
 }
 
 TEST_CASE("Lifecycle audit entries are NOT coalesced or purged like compliance/health",

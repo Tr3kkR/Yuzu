@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <string_view>
@@ -661,17 +662,98 @@ std::vector<GuaranteedStateRuleRow> GuaranteedStateStore::list_rules() const {
     return rows;
 }
 
-std::expected<void, std::string>
-GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
+std::expected<bool, std::string>
+GuaranteedStateStore::stored_event_matches_locked(const GuaranteedStateEventRow& in) const {
+    // Compare the persisted row against `in` across every immutable agent-supplied
+    // field. EXCLUDED: severity (server-enriched at ingest — it can legitimately
+    // differ across a redelivery if the rule's severity changed) and ttl_expires_at
+    // (receipt-derived). event_id is the PK (equal by definition). Caller holds mtx_.
+    //
+    // Returns: true = idempotent redelivery, false = genuine field mismatch,
+    // unexpected = the compare itself could NOT be performed (an OPERATIONAL error —
+    // NOMEM/IOERR/raced-reap). The caller maps unexpected to `Error`, so a transient
+    // DB fault is never mislabelled as a forged-id collision (Sol code review #2).
+    const char* sql = R"(
+        SELECT rule_id, agent_id, event_type, guard_type, guard_category,
+               detected_value, expected_value, remediation_action, remediation_success,
+               detection_latency_us, remediation_latency_us, timestamp, detail_json
+        FROM guaranteed_state_events WHERE event_id = ?
+    )";
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("compare prepare: ") + sqlite3_errmsg(db_));
+    // event_id is NUL-free (validated at insert_event_classified entry), so a -1
+    // (strlen) length binds it exactly.
+    if (sqlite3_bind_text(stmt.get(), 1, in.event_id.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK)
+        return std::unexpected(std::string("compare bind: ") + sqlite3_errmsg(db_));
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE)
+        return std::unexpected("conflicting row not found for compare (raced reaper?)");
+    if (rc != SQLITE_ROW)
+        return std::unexpected(std::string("compare step: ") + sqlite3_errmsg(db_));
+
+    // Byte-exact via column_bytes+memcmp (not strlen), and type-checked: a row this
+    // store wrote has non-NULL TEXT/INTEGER in every compared column, so any NULL or
+    // unexpected storage class (a legacy/externally-repaired row) is NOT a match — it
+    // must not coerce to ""/0 and quietly pass (Sol code review #1/#3).
+    const auto text_eq = [&](int i, const std::string& want) {
+        if (sqlite3_column_type(stmt.get(), i) != SQLITE_TEXT)
+            return false;
+        const auto* p = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), i));
+        const int n = sqlite3_column_bytes(stmt.get(), i);
+        return static_cast<std::size_t>(n) == want.size() &&
+               (n == 0 || std::memcmp(p, want.data(), static_cast<std::size_t>(n)) == 0);
+    };
+    const auto int_eq = [&](int i, int64_t want) {
+        return sqlite3_column_type(stmt.get(), i) == SQLITE_INTEGER &&
+               sqlite3_column_int64(stmt.get(), i) == want;
+    };
+    const bool match =
+        text_eq(0, in.rule_id) && text_eq(1, in.agent_id) && text_eq(2, in.event_type) &&
+        text_eq(3, in.guard_type) && text_eq(4, in.guard_category) &&
+        text_eq(5, in.detected_value) && text_eq(6, in.expected_value) &&
+        text_eq(7, in.remediation_action) && int_eq(8, in.remediation_success ? 1 : 0) &&
+        int_eq(9, in.detection_latency_us) && int_eq(10, in.remediation_latency_us) &&
+        text_eq(11, in.timestamp) && text_eq(12, in.detail_json);
+    return match;
+}
+
+EventInsertResult
+GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row) {
     std::unique_lock lock(mtx_);
     if (!db_)
-        return std::unexpected("database not open");
+        return {EventInsertOutcome::Error, "database not open"};
+
+    // Reject malformed input up front (untrusted agent boundary): an embedded NUL in
+    // event_id or any compared field would be silently truncated by SQLite's -1 text
+    // binds — corrupting the event_id PK dedup and the redelivery compare (a truncated
+    // store vs a full replay flips redelivery into a false Conflict; two different wire
+    // payloads sharing a pre-NUL prefix collapse to a false Redelivered). Guardian
+    // fields are structured text / JSON and never legitimately carry a NUL (Sol #1).
+    for (const std::string* f :
+         {&row.event_id, &row.rule_id, &row.agent_id, &row.event_type, &row.severity,
+          &row.guard_type, &row.guard_category, &row.detected_value, &row.expected_value,
+          &row.remediation_action, &row.timestamp, &row.detail_json})
+        if (f->find('\0') != std::string::npos)
+            return {EventInsertOutcome::Error, "event field contains an embedded NUL byte"};
+
+    // An OPERATIONAL ingest fault (BEGIN/prepare/insert/commit/compare failure) is
+    // counted so a persistent fault — which would suppress BOTH the drop and redelivered
+    // signals and let genuine collisions escape the CC7.3 alert (sec-M2) — is itself
+    // alertable via yuzu_server_guardian_events_ingest_errors_total, not grep-only. The
+    // malformed-input NUL reject above is deliberately NOT counted here: it is
+    // attacker-drivable, so it must never be able to inflate an operational-fault signal
+    // (and a rejected malformed event cannot hide a collision).
+    const auto op_error = [this](std::string msg) {
+        events_ingest_errors_.fetch_add(1, std::memory_order_relaxed);
+        return EventInsertResult{EventInsertOutcome::Error, std::move(msg)};
+    };
 
     // Wrap the event INSERT and the DEX projection in ONE transaction so they are
     // atomic: a redelivered event_id fails the event PK below and rolls back BOTH,
     // so the projection inherits the at-least-once dedup and never double-counts.
     if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("BEGIN failed: ") + sqlite3_errmsg(db_));
+        return op_error(std::string("BEGIN failed: ") + sqlite3_errmsg(db_));
     SqliteTxn txn(db_);
     const int64_t ttl = compute_ttl_epoch();
 
@@ -686,7 +768,7 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     )";
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        return op_error(std::string("prepare failed: ") + sqlite3_errmsg(db_));
 
     sqlite3_bind_text(stmt.get(), 1, row.event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -710,15 +792,34 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
         const int ext = sqlite3_extended_errcode(db_);
         const std::string err = sqlite3_errmsg(db_);
         if (is_sqlite_uniqueness_violation(ext)) {
-            // Silent-drop visibility (#1414, CC7.3): the conflicting event is
-            // discarded here and guardian_ingest only warns. Count it so the loss
-            // is alertable in Prometheus rather than grep-only. Surfaced as
-            // yuzu_server_guardian_events_dropped_total.
+            // event_id already present. Classify (item-7 PR-Sv): a redelivery of the
+            // SAME event (matching immutable fields) is the durable agent journal's
+            // expected at-least-once retry — quiet + counted apart; a MISMATCH is a
+            // genuine collision (forged-id pre-claim #1360 / seq-reset with a different
+            // payload) — kept on the loud CC7.3 drop path. The compare SELECT runs in
+            // the open txn (rolled back on return — nothing here is committed).
+            //
+            // LOAD-BEARING INVARIANT (UP-9): the failed INSERT and the compare SELECT run
+            // on the SAME single connection under a held unique_lock on mtx_, and the
+            // reaper takes the same lock — so the conflicting row cannot be deleted
+            // between the two, and the "row not found" branch below is defensive-only. If
+            // the compare is ever moved to a separate reader connection (perf follow-up),
+            // that move MUST re-establish this ordering (or it reintroduces a TOCTOU where
+            // the compare reads a mid-delete / uncommitted row → a spurious Error).
+            stmt.reset(); // finalize the failed INSERT before the compare SELECT
+            auto matched = stored_event_matches_locked(row);
+            if (!matched) // compare could not run (operational fault) -> Error, counted
+                return op_error("redelivery compare failed: " + matched.error());
+            if (*matched) {
+                events_redelivered_.fetch_add(1, std::memory_order_relaxed);
+                return {EventInsertOutcome::Redelivered, {}};
+            }
             events_dropped_.fetch_add(1, std::memory_order_relaxed);
-            return std::unexpected(
-                format_conflict("event_id '" + row.event_id + "' already exists"));
+            return {EventInsertOutcome::Conflict,
+                    format_conflict("event_id '" + row.event_id +
+                                    "' already exists with different fields")};
         }
-        return std::unexpected("insert failed: " + err);
+        return op_error("insert failed: " + err);
     }
     stmt.reset(); // finalize the event INSERT before the projection + COMMIT
 
@@ -741,7 +842,7 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
         }
     }
     if (txn.commit() != SQLITE_OK)
-        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
+        return op_error(std::string("commit failed: ") + sqlite3_errmsg(db_));
 
     events_written_.fetch_add(1, std::memory_order_relaxed);
     // Maintain the per-(agent, rule) compliance census in lock-step with the event
@@ -752,9 +853,36 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     if (!is_reserved_rule_id(row.rule_id))
         if (const char* state = event_state_from_type(row.event_type))
             upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
-    return {};
+    return {EventInsertOutcome::Inserted, {}};
 }
 
+std::expected<void, std::string>
+GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
+    // Back-compat wrapper: an idempotent redelivery is a benign success for callers
+    // that don't distinguish it (tests, batch seed); a mismatched Conflict + a hard
+    // Error stay failures. The redelivery/collision split lives in _classified.
+    EventInsertResult r = insert_event_classified(row);
+    switch (r.outcome) {
+    case EventInsertOutcome::Inserted:
+    case EventInsertOutcome::Redelivered:
+        return {};
+    case EventInsertOutcome::Conflict:
+    case EventInsertOutcome::Error:
+        return std::unexpected(std::move(r.error));
+    }
+    return std::unexpected("insert_event: unreachable outcome");
+}
+
+// HARD CONSTRAINT (item-7 PR-Sv, arch-S1 / UP-11): this batch path does NOT classify
+// redelivery vs collision, has NO embedded-NUL guard, and does NOT drive the DEX
+// observers — on ANY event_id conflict it aborts and rolls back the WHOLE batch. That is
+// safe ONLY because it has no live caller today. The durable agent lifecycle journal
+// (item-7 PR-Ag) makes redelivery the common case, so its replays MUST ingest one-at-a-
+// time via ingest_guardian_response -> insert_event_classified, NEVER through this batch
+// path (one benign redelivery here would discard up to a full batch of genuine new
+// events). If a batch ingress (the "preferred GuaranteedStatePush handler") is ever
+// wired, it MUST extend insert_event_classified's classify + NUL guard + observer-gating
+// per row — never re-introduce a parallel unclassified event-ingest path.
 std::expected<std::size_t, std::string>
 GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& rows) {
     if (rows.empty())
