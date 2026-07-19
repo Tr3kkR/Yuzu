@@ -292,4 +292,175 @@ int KvStore::clear(std::string_view plugin) {
     return sqlite3_changes(db_);
 }
 
+std::expected<std::vector<KvRow>, KvStoreError>
+KvStore::list_entries(std::string_view plugin, std::string_view prefix) {
+    std::lock_guard lock(mu_);
+    std::vector<KvRow> result;
+    if (!db_)
+        return std::unexpected(KvStoreError{"kv_store is closed"});
+
+    std::string escaped_prefix;
+    escaped_prefix.reserve(prefix.size());
+    for (char c : prefix) {
+        if (c == '%' || c == '_' || c == '\\')
+            escaped_prefix += '\\';
+        escaped_prefix += c;
+    }
+    escaped_prefix += '%';
+
+    const char* sql =
+        "SELECT key, value FROM kv_store WHERE plugin = ? AND key LIKE ? ESCAPE '\\' ORDER BY key";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK)
+        return std::unexpected(
+            KvStoreError{std::format("list_entries prepare failed: {}", sqlite3_errmsg(db_))});
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, escaped_prefix.c_str(),
+                      static_cast<int>(escaped_prefix.size()), SQLITE_STATIC);
+
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        const auto* ktext = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        // Read the value as a BLOB so an embedded NUL is preserved (a corrupt
+        // value must reach the parser intact to be quarantined, not silently
+        // truncated by column_text).
+        const auto* vblob = static_cast<const char*>(sqlite3_column_blob(stmt.get(), 1));
+        const int vbytes = sqlite3_column_bytes(stmt.get(), 1);
+        result.push_back(KvRow{ktext ? std::string(ktext) : std::string{},
+                               vblob ? std::string(vblob, static_cast<std::size_t>(vbytes))
+                                     : std::string{}});
+    }
+    // A mid-scan error must NOT be mistaken for end-of-rows (the raw list()
+    // while-loop cannot tell the difference — that is the bug this fixes).
+    if (rc != SQLITE_DONE)
+        return std::unexpected(
+            KvStoreError{std::format("list_entries step failed: {}", sqlite3_errmsg(db_))});
+    return result;
+}
+
+KvInsert KvStore::insert_if_absent(std::string_view plugin, std::string_view key,
+                                   std::string_view value) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return KvInsert::Error;
+
+    const char* sql = R"(
+        INSERT INTO kv_store (plugin, key, value, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(plugin, key) DO NOTHING
+        RETURNING 1
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("KvStore::insert_if_absent prepare failed: {}", sqlite3_errmsg(db_));
+        return KvInsert::Error;
+    }
+    StmtPtr stmt(raw_stmt);
+    sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, key.data(), static_cast<int>(key.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 3, value.data(), static_cast<int>(value.size()), SQLITE_STATIC);
+    sqlite3_bind_int64(stmt.get(), 4, now_epoch_seconds());
+
+    rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW)
+        return KvInsert::Inserted; // RETURNING produced a row → a fresh insert
+    if (rc == SQLITE_DONE)
+        return KvInsert::Exists; // conflict → nothing inserted, no row returned
+    spdlog::error("KvStore::insert_if_absent step failed: {}", sqlite3_errmsg(db_));
+    return KvInsert::Error;
+}
+
+KvRename KvStore::rename_key(std::string_view plugin, std::string_view from_key,
+                             std::string_view to_key) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return KvRename::Error;
+
+    const char* sql = "UPDATE kv_store SET key = ? WHERE plugin = ? AND key = ? RETURNING 1";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("KvStore::rename_key prepare failed: {}", sqlite3_errmsg(db_));
+        return KvRename::Error;
+    }
+    StmtPtr stmt(raw_stmt);
+    sqlite3_bind_text(stmt.get(), 1, to_key.data(), static_cast<int>(to_key.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 3, from_key.data(), static_cast<int>(from_key.size()),
+                      SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW)
+        return KvRename::Renamed;
+    if (rc == SQLITE_DONE)
+        return KvRename::NotFound; // from_key matched no row
+    if (rc == SQLITE_CONSTRAINT)
+        return KvRename::Conflict; // to_key already exists (PK) — ABORT default
+    spdlog::error("KvStore::rename_key step failed: {}", sqlite3_errmsg(db_));
+    return KvRename::Error;
+}
+
+int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& keys) {
+    std::lock_guard lock(mu_);
+    if (!db_ || keys.empty())
+        return 0;
+
+    if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("KvStore::del_keys BEGIN failed: {}", sqlite3_errmsg(db_));
+        return 0;
+    }
+
+    const char* sql = "DELETE FROM kv_store WHERE plugin = ? AND key = ? RETURNING 1";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("KvStore::del_keys prepare failed: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return 0;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    int deleted = 0;
+    for (const auto& k : keys) {
+        sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()),
+                          SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 2, k.data(), static_cast<int>(k.size()), SQLITE_STATIC);
+        rc = sqlite3_step(stmt.get());
+        while (rc == SQLITE_ROW) { // 0 or 1 rows per key (PK), but drain defensively
+            ++deleted;
+            rc = sqlite3_step(stmt.get());
+        }
+        if (rc != SQLITE_DONE) {
+            spdlog::error("KvStore::del_keys step failed: {}", sqlite3_errmsg(db_));
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return 0;
+        }
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("KvStore::del_keys COMMIT failed: {}", sqlite3_errmsg(db_));
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return 0;
+    }
+    return deleted;
+}
+
+int KvStore::pragma_synchronous() {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return -1;
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "PRAGMA synchronous", -1, &raw_stmt, nullptr) != SQLITE_OK)
+        return -1;
+    StmtPtr stmt(raw_stmt);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW)
+        return sqlite3_column_int(stmt.get(), 0);
+    return -1;
+}
+
 } // namespace yuzu::agent
