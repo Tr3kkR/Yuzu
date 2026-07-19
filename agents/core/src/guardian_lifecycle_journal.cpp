@@ -1,5 +1,7 @@
 #include "guardian_lifecycle_journal.hpp"
 
+#include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::try_page_batch + OutboxEntry
+
 #include <yuzu/agent/kv_store.hpp>
 
 #include <algorithm>
@@ -151,6 +153,12 @@ JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
         const bool too_big = total_bytes > max_bytes_;
         if (too_old || too_many || too_big) {
             evict.push_back(l.key);
+            // Classify the eviction by whether its data was ever sent (best-effort: a live
+            // entry may age out before its batch key exists, so absence != "never sent").
+            if (kv_->exists(kJournalNamespace, journal_sent_key_from_batch_key(l.key)))
+                evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
+            else
+                evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
             --surviving;
             total_bytes -= l.bytes;
         }
@@ -192,6 +200,86 @@ JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
     }
 
     return stats;
+}
+
+JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime& rt,
+                                                           std::int64_t now_ms) {
+    JournalPageStats stats;
+    if (!kv_)
+        return stats;
+    std::lock_guard<std::mutex> pg{paging_mutex_};
+
+    // Prune-before-page barrier (rev-4.1 #6): the FIRST paging attempt prunes before it can
+    // return any replay candidate, so a stale over-cap journal is bounded before replay.
+    if (!boot_pruned_) {
+        prune(now_ms); // does NOT take paging_mutex_ — safe to call while we hold it
+        boot_pruned_ = true;
+    }
+
+    auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    if (!rows)
+        return stats; // read error — fail-safe (prune counts it); page nothing this pass
+
+    // Order candidates by (ts_ms, key) — NOT lexical key (the boot-nonce is random). Skip
+    // expired batches (prune removes them; don't re-send an aged-out event).
+    struct Cand {
+        std::string key;
+        std::int64_t ts_ms;
+        JournalBatch batch;
+    };
+    std::vector<Cand> cands;
+    cands.reserve(rows->size());
+    const std::int64_t min_ts =
+        now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
+    for (auto& row : *rows) {
+        auto b = parse_journal_batch(row.value);
+        if (!b || b->ts_ms < min_ts)
+            continue; // a corrupt batch is prune's job; an expired one is not re-sent
+        cands.push_back(Cand{row.key, b->ts_ms, std::move(*b)});
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
+    });
+
+    std::size_t considered = 0;
+    for (auto& c : cands) {
+        if (considered >= kJournalPageMaxBatchesPerPass)
+            break; // bound per-pass work regardless of journal size
+        ++considered;
+        if (!page_bucket_.ready(now_ms))
+            break; // rate-limited: DELAY the rest to a later pass (never skipped)
+
+        std::vector<OutboxEntry> entries;
+        entries.reserve(c.batch.entries.size());
+        for (std::size_t i = 0; i < c.batch.entries.size(); ++i) {
+            const auto& r = c.batch.entries[i];
+            OutboxEntry e = OutboxEntry::lifecycle(r.rule_id, r.generation, r.event_id,
+                                                   r.enqueued_ns, r.kind, r.guard_type, r.rule_name);
+            e.journal_batch_key = c.key; // replay provenance for the sent-label (wire-ignored)
+            e.journal_last_in_batch = (i + 1 == c.batch.entries.size());
+            entries.push_back(std::move(e));
+        }
+        const std::size_t added = rt.try_page_batch(std::move(entries));
+        if (added > 0) {
+            page_bucket_.take(); // charge a token ONLY for a batch that did net-new work
+            ++stats.batches_paged;
+            stats.records_paged += added;
+        }
+        // added == 0: all already windowed, or headroom-deferred — no charge, keep scanning.
+    }
+
+    pages_.fetch_add(1, std::memory_order_relaxed);
+    records_paged_.fetch_add(stats.records_paged, std::memory_order_relaxed);
+    return stats;
+}
+
+void GuardianLifecycleJournal::mark_batch_sent(const std::string& batch_key) {
+    if (!kv_ || batch_key.empty())
+        return;
+    // Best-effort presence marker; the value is unused. set() is an upsert, so a repeated
+    // send is idempotent. Never gates re-paging or deletion (design §2/§8).
+    if (kv_->set(kJournalNamespace, journal_sent_key_from_batch_key(batch_key), ""))
+        sent_labels_written_.fetch_add(1, std::memory_order_relaxed);
 }
 
 } // namespace yuzu::agent

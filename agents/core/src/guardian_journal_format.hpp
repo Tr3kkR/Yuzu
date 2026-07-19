@@ -56,6 +56,17 @@ inline constexpr std::size_t kMaxJournalBytes = 32ull * 1024 * 1024; // 32 MiB
 /// accumulate outside the caps above.
 inline constexpr std::size_t kMaxQuarantineBatches = 100;
 
+/// Replay paging rate limiter (rev-4.1 #8): a process-lifetime token bucket bounds the
+/// STEADY-STATE redelivery bandwidth — re-send-all re-pages a sent+popped entry on every
+/// tick until retention, so the refill rate IS the per-agent redelivery rate. At this rate
+/// a fleet of N agents redelivers <= N * kJournalPageRefillPerSec batches/sec server-wide,
+/// each a cheap redelivered-quiet ingest; the DEFERRED server ack removes re-send-all
+/// entirely. Tunable.
+inline constexpr double kJournalPageRefillPerSec = 0.1; // 1 batch / 10 s / agent
+inline constexpr double kJournalPageBurst = 5.0;        // small startup burst
+/// Bound per-pass paging work (reconstruct + membership scan) regardless of journal size.
+inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
+
 /// Key prefixes within kJournalNamespace. A batch key is "lc:<nonce>:<seq12>";
 /// its sent-label is "sent:<nonce>:<seq12>"; a quarantined batch is
 /// "quarantine:" + the original batch key. The three prefixes are disjoint so a
@@ -98,6 +109,10 @@ YUZU_EXPORT std::string journal_quarantine_key(std::string_view batch_key);
 /// sent-label GC to find labels whose batch no longer exists. Returns the input
 /// unchanged if it is not a sent-label key (it then matches no batch).
 YUZU_EXPORT std::string journal_batch_key_from_sent_key(std::string_view sent_key);
+
+/// Derive a batch's sent-label key: "lc:X:Y" → "sent:X:Y". Used when a paged batch's last
+/// entry sends, and to classify an eviction. Returns the input unchanged if not a batch key.
+YUZU_EXPORT std::string journal_sent_key_from_batch_key(std::string_view batch_key);
 
 // ── Mint-time validation (design §2 loss table; rev-4.1 #2) ───────────────────
 

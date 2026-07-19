@@ -19,15 +19,61 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 
 namespace yuzu::agent {
 
 class KvStore;
+class GuardianSparkRuntime;
+
+/// A monotonic token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT
+/// reset on reconnect, so a flapping agent cannot replay its whole backlog on every
+/// reconnect. It DELAYS, never skips — a batch the bucket defers pages on a later pass, and
+/// retention (not the bucket) is the only deletion path, so nothing is lost. now_ms is
+/// passed in, so the pacing is deterministic + testable.
+class YUZU_EXPORT JournalPagingBucket {
+public:
+    JournalPagingBucket(double refill_per_sec, double burst)
+        : refill_per_sec_(refill_per_sec), burst_(burst), tokens_(burst) {}
+
+    /// Refill for the elapsed time, then report whether at least one token is available.
+    bool ready(std::int64_t now_ms) {
+        refill(now_ms);
+        return tokens_ >= 1.0;
+    }
+    /// Spend one token — call only after ready() returned true.
+    void take() { tokens_ -= 1.0; }
+    [[nodiscard]] double tokens() const { return tokens_; } // test introspection
+
+private:
+    void refill(std::int64_t now_ms) {
+        if (last_ms_ == 0) {
+            last_ms_ = now_ms;
+            return;
+        }
+        if (now_ms > last_ms_) {
+            tokens_ = std::min(burst_, tokens_ + refill_per_sec_ *
+                                                     static_cast<double>(now_ms - last_ms_) / 1000.0);
+            last_ms_ = now_ms;
+        }
+    }
+    double refill_per_sec_;
+    double burst_;
+    double tokens_;
+    std::int64_t last_ms_{0};
+};
+
+/// One page-into-window pass's outcome.
+struct JournalPageStats {
+    std::size_t batches_paged{0}; ///< batches that contributed >=1 net-new record this pass
+    std::size_t records_paged{0}; ///< records newly enqueued into the send window this pass
+};
 
 /// One prune pass's outcome (also mirrored on the lock-free counters).
 struct JournalPruneStats {
@@ -62,6 +108,21 @@ public:
     /// serialises itself); wired into the tick phase-2 + a boot barrier in C5.
     JournalPruneStats prune(std::int64_t now_ms);
 
+    /// Replay the durable journal into `rt`'s send window (design §5; item 7 PR-Ag C5).
+    /// Serialised by the paging mutex; the FIRST call runs a boot prune before returning
+    /// any candidate (the prune-before-page barrier). Reads unexpired batches (fallible),
+    /// orders them by (ts_ms, key), and for each — rate-limited by a process-lifetime token
+    /// bucket charged ONLY for net-new work — reconstructs wire-identical entries (with
+    /// replay provenance) and pages them via rt.try_page_batch. Re-send-all: nothing is
+    /// permanently skipped (membership is a window scan; retention is the only deletion).
+    /// Takes KvStore.mu_ then outbox_mu_ SEQUENTIALLY, never nested, never the engine mtx_.
+    JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms);
+
+    /// Write the (best-effort) sent-label for a batch — called from the send path after the
+    /// batch's LAST paged entry is delivered. Presence classifies eviction (sent-unacked vs
+    /// no-send-evidence); it never gates re-paging or deletion.
+    void mark_batch_sent(const std::string& batch_key);
+
     // Integrity counters (design §2 loss table). Lock-free.
     [[nodiscard]] std::uint64_t batches_written() const noexcept {
         return batches_written_.load(std::memory_order_relaxed);
@@ -83,6 +144,21 @@ public:
     }
     [[nodiscard]] std::uint64_t prune_failures() const noexcept {
         return prune_failures_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t pages() const noexcept {
+        return pages_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t records_paged() const noexcept {
+        return records_paged_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t sent_labels_written() const noexcept {
+        return sent_labels_written_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t evicted_sent_unacked() const noexcept {
+        return evicted_sent_unacked_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t evicted_without_send_evidence() const noexcept {
+        return evicted_without_send_evidence_.load(std::memory_order_relaxed);
     }
 
     /// TEST-ONLY: force the next `n` batch writes to fail (as if KvStore returned
@@ -114,7 +190,16 @@ private:
     std::atomic<std::uint64_t> quarantine_failures_{0}; ///< could not even quarantine a corrupt batch
     std::atomic<std::uint64_t> batches_pruned_{0};      ///< batches evicted by retention
     std::atomic<std::uint64_t> prune_failures_{0};      ///< a prune pass could not read the journal
+    std::atomic<std::uint64_t> pages_{0};               ///< page_into_window passes
+    std::atomic<std::uint64_t> records_paged_{0};       ///< records newly enqueued into the window
+    std::atomic<std::uint64_t> sent_labels_written_{0}; ///< sent-labels written (best-effort)
+    std::atomic<std::uint64_t> evicted_sent_unacked_{0};          ///< aged out WITH a sent-label
+    std::atomic<std::uint64_t> evicted_without_send_evidence_{0}; ///< aged out with NO sent-label (alert)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
+    // Paging state — all guarded by paging_mutex_ (paging is single-threaded per pass).
+    std::mutex paging_mutex_;
+    bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
+    JournalPagingBucket page_bucket_{kJournalPageRefillPerSec, kJournalPageBurst};
     // Retention caps — default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};
     std::size_t max_batches_{kMaxJournalBatches};

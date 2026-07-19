@@ -81,6 +81,12 @@ std::string journal_batch_key_from_sent_key(std::string_view sent_key) {
     return std::string(sent_key);
 }
 
+std::string journal_sent_key_from_batch_key(std::string_view batch_key) {
+    if (batch_key.starts_with(kBatchKeyPrefix))
+        return std::string(kSentKeyPrefix) + std::string(batch_key.substr(kBatchKeyPrefix.size()));
+    return std::string(batch_key);
+}
+
 JournalReject validate_record(const JournalRecord& r) {
     // Clock first: a skewed-clock record would replay as server-receipt-now and
     // mismatch on timestamp forever (rev-4.1 #2). Mirror set_common's floored

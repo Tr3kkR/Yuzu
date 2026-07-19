@@ -236,3 +236,43 @@ TEST_CASE("journal prune: the quarantine set is bounded", "[guardian][journal][p
     j.prune(0); // quarantines 3, then bounds the quarantine set to 1
     CHECK(count_keys(*t.kv, kQuarantineKeyPrefix) == 1);
 }
+
+// ── Paging token bucket + sent-label classification (item 7 PR-Ag C5) ─────────
+
+TEST_CASE("paging bucket delays then refills; caps at burst; never resets",
+          "[guardian][journal][bucket]") {
+    JournalPagingBucket b(/*refill_per_sec=*/1.0, /*burst=*/2.0);
+    CHECK(b.ready(1000));
+    b.take();
+    CHECK(b.ready(1000));
+    b.take();
+    CHECK_FALSE(b.ready(1000)); // burst exhausted at the same instant
+
+    CHECK(b.ready(2000)); // +1 token after 1 s
+    b.take();
+    CHECK_FALSE(b.ready(2000));
+
+    // A long gap refills but CAPS at burst — no unbounded accumulation.
+    CHECK(b.ready(1'000'000));
+    CHECK(b.tokens() <= 2.0);
+}
+
+TEST_CASE("mark_batch_sent writes a sent-label; eviction classifies by its presence",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100); // count cap 0 → prune evicts all
+    j.persist(one("r1", "armed"));
+    auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    j.mark_batch_sent((*rows)[0].key);
+    CHECK(j.sent_labels_written() == 1);
+
+    j.persist(one("r2", "armed")); // a second, UNMARKED batch
+
+    j.prune(0); // both evicted
+    CHECK(j.evicted_sent_unacked() == 1);          // r1 had a sent-label
+    CHECK(j.evicted_without_send_evidence() == 1);  // r2 had none
+}

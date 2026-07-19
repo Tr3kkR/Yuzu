@@ -538,6 +538,23 @@ std::size_t GuardianSparkRuntime::pending_journal_depth() const {
     return pending_journal_.size();
 }
 
+std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+    if (entries.empty())
+        return 0;
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    // Headroom gate (design §5): page the batch only if it fits whole; else leave it for a
+    // later pass once the window drains (never a partial page that splits a batch).
+    if (lifecycle_log_.headroom() < entries.size())
+        return 0;
+    std::size_t added = 0;
+    for (auto& e : entries) {
+        if (!lifecycle_log_.contains(e.event_id)) // window-scan membership — skip a re-page
+            if (lifecycle_log_.enqueue(std::move(e)))
+                ++added;
+    }
+    return added;
+}
+
 namespace {
 // Drain one log with outbox_mu_ RELEASED across each send: copy the head under the
 // lock, unlock, send (the gRPC Write - previously run UNDER outbox_mu_, so a stalled

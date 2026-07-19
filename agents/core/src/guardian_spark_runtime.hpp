@@ -245,6 +245,14 @@ public:
     /// Clamped to the current size.
     void erase_persisted_prefix(std::size_t n);
 
+    /// Page a REPLAYED batch into the send window: iff the window has >= batch-size
+    /// headroom, enqueue each entry NOT already present (window-scan membership, no
+    /// allocating set). Returns the count newly enqueued — 0 if deferred for headroom or
+    /// every entry was already present. Paged entries enter lifecycle_log_ ONLY (they are
+    /// already durable — never pending_journal_). Does NOT wake the drain; the caller (the
+    /// reconnect / low-water / tick hook, C6) drives sending.
+    [[nodiscard]] std::size_t try_page_batch(std::vector<OutboxEntry> entries);
+
     /// Current staged-record depth (gauge). Takes outbox_mu_.
     [[nodiscard]] std::size_t pending_journal_depth() const;
 

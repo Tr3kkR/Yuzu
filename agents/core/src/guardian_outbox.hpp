@@ -87,6 +87,13 @@ struct OutboxEntry {
     std::string guard_type;      ///< Health/Lifecycle: "file" | "registry" | "service"
     std::string rule_name;       ///< Health/Lifecycle: human-readable rule name
 
+    // Journal-replay provenance (item 7 PR-Ag): set ONLY on Lifecycle entries PAGED back
+    // from the durable journal, so the send path can write the batch's sent-label after its
+    // LAST entry sends. Empty/false on live + compliance/health entries. NOT wire fields —
+    // guardian_outbox_entry_to_event ignores them, so they never change the server compare.
+    std::string journal_batch_key;     ///< the durable batch this replayed entry came from ("" if live)
+    bool journal_last_in_batch{false}; ///< this is that batch's LAST entry — write sent:<key> on send
+
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
                                   std::string event_id, std::int64_t enqueued_ns, GuardDrift drift) {
         OutboxEntry e;
@@ -369,6 +376,21 @@ public:
     [[nodiscard]] std::size_t size() const { return pending_.size(); }
     [[nodiscard]] bool empty() const { return pending_.empty(); }
     [[nodiscard]] std::uint64_t backpressure_drops() const { return backpressure_drops_; }
+
+    /// Journal-replay support (item 7 PR-Ag): is `event_id` already buffered? The loader
+    /// scans the window to skip re-paging an entry already present (membership = window
+    /// scan, no allocating set). O(size); the window is bounded.
+    [[nodiscard]] bool contains(std::string_view event_id) const {
+        for (const auto& e : pending_)
+            if (e.event_id == event_id)
+                return true;
+        return false;
+    }
+    /// Free slots before the capacity cap — the loader pages a batch only when the window
+    /// has >= the batch's size of headroom (else it defers the batch to a later pass).
+    [[nodiscard]] std::size_t headroom() const {
+        return capacity_ > pending_.size() ? capacity_ - pending_.size() : 0;
+    }
 
 private:
     std::size_t capacity_;

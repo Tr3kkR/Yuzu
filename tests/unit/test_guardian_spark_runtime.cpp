@@ -8,7 +8,12 @@
 
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_lifecycle_journal.hpp"
+
+#include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/spark.hpp>
+
+#include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -142,6 +147,35 @@ std::shared_ptr<GuardianSparkRuntime> make_rt(std::shared_ptr<FakeReader> r,
         std::move(r), std::move(b), cfg,
         [] { return clk::time_point{} + std::chrono::milliseconds(tick.fetch_add(1000)); });
 }
+
+// A replayable lifecycle entry for try_page_batch tests.
+OutboxEntry lc_entry(const std::string& rule, const std::string& eid, const std::string& kind = "armed") {
+    return OutboxEntry::lifecycle(rule, 1, eid, 1'700'000'000'000'000'000, kind, "file", "n");
+}
+
+// A component + runtime + KvStore rig for page_into_window integration (item 7 PR-Ag C5).
+struct PageRig {
+    yuzu::test::TempDbFile db{"yuzu_test_page-"};
+    std::unique_ptr<KvStore> kv;
+    std::shared_ptr<GuardianSparkRuntime> rt;
+    std::unique_ptr<GuardianLifecycleJournal> journal;
+    PageRig() {
+        auto r = KvStore::open(db.path);
+        REQUIRE(r.has_value());
+        kv = std::make_unique<KvStore>(std::move(*r));
+        rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+        journal = std::make_unique<GuardianLifecycleJournal>(kv.get());
+    }
+    // Persist one record as its own batch (a distinct persist call → a distinct batch key).
+    void persist(const std::string& rule, const std::string& kind = "armed") {
+        std::vector<std::shared_ptr<const JournalRecord>> pending{
+            std::make_shared<const JournalRecord>(
+                JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
+                              .enqueued_ns = 1'700'000'000'000'000'000, .kind = kind,
+                              .guard_type = "file", .rule_name = "n"})};
+        journal->persist(pending);
+    }
+};
 } // namespace
 
 TEST_CASE("attach arms the watcher on the 0->1 edge; a sibling rule shares it", "[spark][runtime]") {
@@ -1071,4 +1105,96 @@ TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
 
     rt->erase_persisted_prefix(99); // clamps to size
     CHECK(rt->pending_journal_depth() == 0);
+}
+
+// ── Replay: try_page_batch + page_into_window (item 7 PR-Ag C5) ───────────────
+
+TEST_CASE("try_page_batch pages new entries into the send window", "[spark][runtime][journal]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 2);
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 2);
+    CHECK(lc[0].event_id == "e1");
+    CHECK(lc[1].event_id == "e2");
+}
+
+TEST_CASE("try_page_batch skips entries already in the window (membership scan)",
+          "[spark][runtime][journal]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1);
+    // e1 already present; only e2 is net-new.
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 1);
+}
+
+TEST_CASE("try_page_batch defers a batch that does not fit the headroom", "[spark][runtime][journal]") {
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1); // headroom 2 → ok
+    // headroom now 1; a 2-entry batch is deferred WHOLE (never split).
+    CHECK(rt->try_page_batch({lc_entry("r2", "e2"), lc_entry("r3", "e3")}) == 0);
+    CHECK(rt->try_page_batch({lc_entry("r2", "e2")}) == 1); // a 1-entry batch fits
+}
+
+TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark][runtime][journal]") {
+    PageRig rig;
+    rig.persist("r1");
+    auto stats = rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000);
+    CHECK(stats.records_paged == 1);
+
+    auto lc = drain_lifecycle(*rig.rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].event_id == "e-r1");
+    CHECK(lc[0].journal_last_in_batch);         // provenance attached for the sent-label
+    CHECK_FALSE(lc[0].journal_batch_key.empty());
+}
+
+TEST_CASE("page_into_window does not re-page a windowed entry (re-send-all skips members)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    rig.persist("r1");
+    const std::int64_t now = 1'700'000'100'000;
+    CHECK(rig.journal->page_into_window(*rig.rt, now).records_paged == 1);
+    // The window still holds e-r1 (not drained): a second pass re-considers it but membership
+    // skips it — 0 net-new.
+    CHECK(rig.journal->page_into_window(*rig.rt, now + 60'000).records_paged == 0);
+}
+
+TEST_CASE("page_into_window rate-limits: delays batches, never skips", "[spark][runtime][journal]") {
+    PageRig rig;
+    for (int i = 0; i < 8; ++i)
+        rig.persist("r" + std::to_string(i)); // 8 single-record batches
+    const std::int64_t t0 = 1'700'000'000'000;
+
+    // Burst = 5 tokens → at most 5 batches this pass; the rest are DELAYED, not dropped.
+    CHECK(rig.journal->page_into_window(*rig.rt, t0).batches_paged == 5);
+    // Same instant, bucket empty → 0 paged.
+    CHECK(rig.journal->page_into_window(*rig.rt, t0).batches_paged == 0);
+    // 60 s later refills the bucket; the remaining 3 batches page (members cost no tokens).
+    CHECK(rig.journal->page_into_window(*rig.rt, t0 + 60'000).batches_paged == 3);
+    // Everything eventually reached the window: nothing was skipped.
+    CHECK(drain_lifecycle(*rig.rt).size() == 8);
+}
+
+TEST_CASE("page_into_window prunes an expired batch before replaying (boot barrier)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    // Both batches written directly with CONTROLLED ts_ms (persist would stamp real-now).
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    write_batch("lc:old:000000000000", 1000, "e-old");             // ancient → older than 7 days
+    write_batch("lc:new:000000000000", 1'700'000'000'000, "e-new"); // recent
+
+    // The barrier prunes before paging: the ts_ms=1000 batch ages out and is never replayed.
+    auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'050'000LL);
+    CHECK(stats.records_paged == 1);
+    CHECK(rig.journal->batches_pruned() == 1); // the expired batch pruned by the barrier
+    auto lc = drain_lifecycle(*rig.rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].event_id == "e-new");
 }
