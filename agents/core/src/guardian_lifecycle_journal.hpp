@@ -24,8 +24,10 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace yuzu::agent {
 
@@ -208,6 +210,11 @@ private:
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
     JournalPagingBucket page_bucket_{kJournalPageRefillPerSec, kJournalPageBurst};
     std::atomic<bool> stopping_{false}; ///< set by request_stop(); page_into_window bails on it
+    /// Fair-rotation cursor (review B2): the last-CONSIDERED (ts_ms, key). Each pass resumes at
+    /// the first candidate strictly greater and wraps, so the never-sent tail is reached instead
+    /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT
+    /// persisted): a restart re-sends the whole unexpired journal, which is correct.
+    std::optional<std::pair<std::int64_t, std::string>> page_cursor_;
     // Retention caps — default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};
     std::size_t max_batches_{kMaxJournalBatches};

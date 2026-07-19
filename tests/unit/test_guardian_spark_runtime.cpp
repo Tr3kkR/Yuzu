@@ -23,6 +23,7 @@
 #include <future>
 #include <latch>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1160,20 +1161,40 @@ TEST_CASE("page_into_window does not re-page a windowed entry (re-send-all skips
     CHECK(rig.journal->page_into_window(*rig.rt, now + 60'000).records_paged == 0);
 }
 
-TEST_CASE("page_into_window rate-limits: delays batches, never skips", "[spark][runtime][journal]") {
+TEST_CASE("page_into_window reaches the never-sent tail on a stable connection (fair rotation)",
+          "[spark][runtime][journal]") {
     PageRig rig;
-    for (int i = 0; i < 8; ++i)
-        rig.persist("r" + std::to_string(i)); // 8 single-record batches
-    const std::int64_t t0 = 1'700'000'000'000;
+    const int N = 12; // > burst; the head keeps re-arriving as it is sent + popped
+    for (int i = 0; i < N; ++i)
+        rig.persist("r" + std::to_string(i));
 
-    // Burst = 5 tokens → at most 5 batches this pass; the rest are DELAYED, not dropped.
-    CHECK(rig.journal->page_into_window(*rig.rt, t0).batches_paged == 5);
-    // Same instant, bucket empty → 0 paged.
-    CHECK(rig.journal->page_into_window(*rig.rt, t0).batches_paged == 0);
-    // 60 s later refills the bucket; the remaining 3 batches page (members cost no tokens).
-    CHECK(rig.journal->page_into_window(*rig.rt, t0 + 60'000).batches_paged == 3);
-    // Everything eventually reached the window: nothing was skipped.
-    CHECK(drain_lifecycle(*rig.rt).size() == 8);
+    // Model a healthy connected agent: page, then drain (send + pop), each tick; the bucket
+    // refills as the clock advances. Oldest-first (the old code) would re-send the head forever
+    // and starve the tail; fair rotation must reach EVERY batch. (Design §10 mandated test.)
+    std::set<std::string> ever_sent;
+    std::int64_t t = 1'700'000'000'000;
+    for (int tick = 0; tick < 80 && ever_sent.size() < static_cast<std::size_t>(N); ++tick) {
+        rig.journal->page_into_window(*rig.rt, t);
+        rig.rt->drain([&](const OutboxEntry& e) {
+            if (e.domain == OutboxDomain::Lifecycle)
+                ever_sent.insert(e.event_id);
+            return SendResult::Sent;
+        });
+        t += 30'000; // 30 s / tick
+    }
+    CHECK(ever_sent.size() == static_cast<std::size_t>(N)); // no tail starvation
+}
+
+TEST_CASE("page_into_window bounds net-new work per pass (rate limit)", "[spark][runtime][journal]") {
+    PageRig rig;
+    for (int i = 0; i < 20; ++i)
+        rig.persist("r" + std::to_string(i));
+    // One pass with a fresh bucket pages at most burst + the single-batch overshoot; the rest
+    // are DELAYED (still journaled), never dropped.
+    const auto s = rig.journal->page_into_window(*rig.rt, 1'700'000'000'000);
+    CHECK(s.batches_paged >= 1);
+    CHECK(s.batches_paged <= 6); // burst (5) + 1 overshoot
+    CHECK(drain_lifecycle(*rig.rt).size() == s.batches_paged);
 }
 
 TEST_CASE("page_into_window prunes an expired batch before replaying (boot barrier)",

@@ -262,15 +262,28 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
     });
 
-    std::size_t considered = 0;
-    for (auto& c : cands) {
+    // Fair rotation (review B2): resume at the first candidate strictly greater than the
+    // last-considered (ts_ms, key) and WRAP, so the never-sent tail is reached instead of the
+    // oldest sent-and-popped batches re-charging the bucket every pass and starving it. Bound
+    // the pass to min(cands, cap) so a wrap cannot re-page a batch twice in one pass.
+    const auto after_cursor = [&](const Cand& c) -> bool {
+        if (!page_cursor_)
+            return true;
+        return c.ts_ms != page_cursor_->first ? c.ts_ms > page_cursor_->first
+                                              : c.key > page_cursor_->second;
+    };
+    std::size_t start = 0;
+    while (start < cands.size() && !after_cursor(cands[start]))
+        ++start;
+    if (start == cands.size())
+        start = 0; // cursor at/after the end: wrap to the oldest
+
+    const std::size_t limit = std::min<std::size_t>(cands.size(), kJournalPageMaxBatchesPerPass);
+    for (std::size_t n = 0; n < limit; ++n) {
         if (stopping_.load(std::memory_order_acquire))
-            break; // shutdown began — stop mutating the window (stop-race gate, rev-4.1 #7)
-        if (considered >= kJournalPageMaxBatchesPerPass)
-            break; // bound per-pass work regardless of journal size
-        ++considered;
-        if (!page_bucket_.ready(now_ms))
-            break; // rate-limited: DELAY the rest to a later pass (never skipped)
+            break; // shutdown began: stop mutating the window (stop-race gate, rev-4.1 #7)
+        Cand& c = cands[(start + n) % cands.size()];
+        const bool have_token = page_bucket_.ready(now_ms); // refills for elapsed time
 
         std::vector<OutboxEntry> entries;
         entries.reserve(c.batch.entries.size());
@@ -283,12 +296,17 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             entries.push_back(std::move(e));
         }
         const std::size_t added = rt.try_page_batch(std::move(entries));
+        // Advance the cursor for EVERY considered batch (paged or a free member / headroom-defer
+        // skip), so an already-windowed head cannot pin the rotation.
+        page_cursor_ = std::pair{c.ts_ms, c.key};
         if (added > 0) {
-            page_bucket_.take(); // charge a token ONLY for a batch that did net-new work
+            page_bucket_.take(); // charge a token ONLY for net-new work
             ++stats.batches_paged;
             stats.records_paged += added;
+            if (!have_token)
+                break; // paged one net-new over an empty bucket; the rest wait for a refill
         }
-        // added == 0: all already windowed, or headroom-deferred — no charge, keep scanning.
+        // added == 0: member or headroom-deferred, no token, keep rotating.
     }
 
     pages_.fetch_add(1, std::memory_order_relaxed);
