@@ -448,37 +448,43 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     // Called from attach_rule/detach_rule_locked - never on the detached-post-
     // read path - so calling agent_id_fn_() directly (not pre-snapshotted) is
     // safe here, unlike evaluate_key's read path.
-    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const auto wall = std::chrono::system_clock::now().time_since_epoch(); // noexcept arithmetic
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
-    const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
-    // Mint the event_id ONCE and share it between the live window entry and the durable
-    // journal record — a replay must reproduce THIS id byte-for-byte (rev-4.1 #4).
-    const std::string event_id = make_event_id(rule_id, ms, agent_id);
-    auto entry = OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
 
     if (kind == "armed") {
-        // ARM: build the durable record first (a bad_alloc here PROPAGATES → attach_rule's
-        // GuardianRollback undoes the arm, and nothing is staged: no phantom). Then, under
-        // outbox_mu_, the window enqueue is the LAST throwing op before the caller's noexcept
-        // commit; the journal push after it is noexcept.
+        // ARM: every throwing op here PROPAGATES, so attach_rule's GuardianRollback undoes the
+        // arm and nothing is staged (no phantom). The event_id is minted ONCE and shared by the
+        // window entry + the durable record (rev-4.1 #4). The window enqueue is the LAST throwing
+        // op before the caller's noexcept commit; the journal push after it is noexcept.
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        const std::string event_id = make_event_id(rule_id, ms, agent_id);
+        auto entry =
+            OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
         std::shared_ptr<JournalRecord> record =
             build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
         std::lock_guard<std::mutex> ob{outbox_mu_};
-        const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing → rolls back arm
+        const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing, rolls back arm
         stage_pending_locked(std::move(record));                        // noexcept
         return accepted;
     }
 
-    // DISARM: the teardown already happened, so a throw must NOT propagate (it would break the
-    // caller mid-teardown). Firewall the record build — a post-teardown bad_alloc is the
-    // reachable journal_stage_failures — and stage FIRST so a best-effort window-enqueue throw
-    // cannot lose a real disarm.
+    // DISARM: the teardown already happened, so NO throw may propagate (it would break the
+    // caller mid-teardown). Firewall the WHOLE construction: agent_id, the event_id mint, the
+    // OutboxEntry, and the record all allocate, and a bad_alloc in ANY of them post-teardown is
+    // the reachable journal_stage_failures loss channel (rev-4.1 #5 / review B3). Then stage the
+    // durable record FIRST so a best-effort window-enqueue throw cannot lose a real disarm.
+    OutboxEntry entry;
     std::shared_ptr<JournalRecord> record;
     try {
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        const std::string event_id = make_event_id(rule_id, ms, agent_id);
+        entry =
+            OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
         record = build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
     } catch (...) {
         journal_stage_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false; // nothing built, nothing to stage or enqueue
     }
     std::lock_guard<std::mutex> ob{outbox_mu_};
     stage_pending_locked(std::move(record)); // durable disarm staged first (noexcept)

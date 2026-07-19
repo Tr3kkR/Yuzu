@@ -341,6 +341,9 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
+    /// Journal maintenance/page/final-flush exceptions swallowed to keep the bare heartbeat
+    /// thread + the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4).
+    std::atomic<std::uint64_t> journal_maint_exceptions_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---

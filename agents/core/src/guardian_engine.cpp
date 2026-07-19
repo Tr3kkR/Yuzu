@@ -303,11 +303,15 @@ void GuardianEngine::stop() {
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
     stop_all_guards_locked();
-    // Final flush: persist any records a prior failed write left pending, before shutdown —
+    // Final flush: persist any records a prior failed write left pending, before shutdown;
     // there is no maintenance tick after stop(). Bounded + circuit-broken (worst case one
-    // KvStore 5 s busy-timeout). persist_lifecycle_journal_locked does not gate on stopped_,
-    // so ordering it here (before stopped_) is for clarity, not correctness.
-    persist_lifecycle_journal_locked();
+    // KvStore 5 s busy-timeout). FIREWALLED: stop() is reached from the (implicitly noexcept)
+    // ~GuardianEngine destructor, so a throw here would std::terminate (review B4a).
+    try {
+        persist_lifecycle_journal_locked();
+    } catch (...) {
+        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    }
     stopped_ = true;
     started_ = false;
 }
@@ -346,16 +350,28 @@ void GuardianEngine::journal_maintenance_tick() {
         std::lock_guard lock(mtx_);
         if (stopped_ || !prefer_spark_)
             return;
-        persist_lifecycle_journal_locked();
+        // FIREWALLED: this runs on the BARE heartbeat thread (no top-level handler), so a
+        // bad_alloc from the persist path must be swallowed + counted, never std::terminate
+        // (review B4a). Phase 1 is firewalled separately from phase 2 so a phase-1 throw does
+        // not skip prune/page.
+        try {
+            persist_lifecycle_journal_locked();
+        } catch (...) {
+            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        }
         rt = spark_runtime_;
         journal = lifecycle_journal_.get();
     }
     // PHASE 2 (OFF mtx_): periodic retention + replay. Bounded by the token bucket + per-pass
-    // cap; page_into_window observes the component stopping_ gate, so a late page never
-    // mutates the window after stop() joined the drain worker (rev-4.1 #6/#7).
+    // cap; page_into_window observes the component stopping_ gate, so a late page never mutates
+    // the window after stop() joined the drain worker (rev-4.1 #6/#7). Firewalled (B4a).
     if (rt && journal) {
-        journal->prune(journal_now_ms());
-        journal->page_into_window(*rt, journal_now_ms());
+        try {
+            journal->prune(journal_now_ms());
+            journal->page_into_window(*rt, journal_now_ms());
+        } catch (...) {
+            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -369,8 +385,15 @@ void GuardianEngine::page_journal() {
         rt = spark_runtime_;
         journal = lifecycle_journal_.get();
     }
-    if (rt && journal)
-        journal->page_into_window(*rt, journal_now_ms());
+    // Firewalled: page_journal is called from the reconnect hook on the run-loop thread and
+    // must not std::terminate on a bad_alloc (review B4a).
+    if (rt && journal) {
+        try {
+            journal->page_into_window(*rt, journal_now_ms());
+        } catch (...) {
+            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 }
 
 GuardianJournalStats GuardianEngine::journal_stats() const {

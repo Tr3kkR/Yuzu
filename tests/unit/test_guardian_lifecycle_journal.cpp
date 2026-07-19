@@ -140,6 +140,28 @@ TEST_CASE("journal persist: a write failure circuit-breaks; a retry of the same 
     CHECK(got[1].rule_id == "r2");
 }
 
+TEST_CASE("journal persist: a mid-persist failure returns the committed-prefix count (no loss/dup)",
+          "[guardian][journal][persist]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    std::vector<std::shared_ptr<const JournalRecord>> pending;
+    for (int i = 0; i < 300; ++i) // 300 records -> 2 batches (256 + 44)
+        pending.push_back(ptr("r" + std::to_string(i), "armed"));
+
+    // Batch 1 writes; batch 2's write fails. written must be batch 1's 256 records so the
+    // caller erases exactly that prefix and the rest stay pending (review B4b).
+    j.inject_write_failures_for_test(/*n=*/1, /*skip_first=*/1);
+    CHECK(j.persist(pending) == 256);
+    auto after1 = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(after1.has_value());
+    CHECK(after1->size() == 1); // only batch 1 durable
+
+    // Retry the remaining records (as the engine does after erasing the 256 prefix).
+    std::vector<std::shared_ptr<const JournalRecord>> rest(pending.begin() + 256, pending.end());
+    CHECK(j.persist(rest) == 44);
+    CHECK(read_all(*t.kv).size() == 300); // every record durable exactly once
+}
+
 // ── Retention + quarantine (item 7 PR-Ag C4) ─────────────────────────────────
 
 namespace {

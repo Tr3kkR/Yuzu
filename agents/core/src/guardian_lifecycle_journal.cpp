@@ -39,60 +39,81 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
     if (!kv_ || pending.empty())
         return 0;
 
+    // `written` is the count of leading pending SLOTS durably committed. The caller passes it
+    // to erase_persisted_prefix, so it must map 1:1 to the front of `pending`; snapshot never
+    // stages a nullptr, so a slot count equals a record count (N5). It advances ONLY after a
+    // batch is confirmed Inserted (its terminal COMMIT surfaced by insert_if_absent, B1).
     std::size_t written = 0;
     std::size_t i = 0;
     while (i < pending.size()) {
-        // Assemble one batch up to the entry-count and byte caps. A single record
-        // larger than the byte cap still forms its own 1-entry batch (never dropped
-        // here — validate_record already bounded each field).
-        std::vector<JournalRecord> entries;
-        std::size_t batch_bytes = 64; // envelope overhead ({"v":4,"ts_ms":...,"entries":[]})
-        while (i < pending.size() && entries.size() < kMaxJournalEntriesPerBatch) {
-            const auto& rec = pending[i];
-            if (!rec) { // defensive: snapshot never stages nullptr, but don't trust it
-                ++i;
+        // Build + write ONE batch. Every step below allocates (vector copies, JSON dump, key
+        // format); a throw must NOT lose the `written` count for batches already committed, so
+        // the whole batch is firewalled and treated as a write failure (review B4). The rest
+        // stay pending for the maintenance-tick retry.
+        try {
+            std::vector<JournalRecord> entries;
+            std::size_t batch_bytes = 64; // envelope overhead
+            std::size_t consumed = 0;     // pending slots this batch spans (incl. any skipped)
+            while (i + consumed < pending.size() && entries.size() < kMaxJournalEntriesPerBatch) {
+                const auto& rec = pending[i + consumed];
+                if (!rec) { // invariant: never nullptr; belt-and-suspenders so a stray slot is
+                    ++consumed; // still consumed (erased), never dereferenced
+                    continue;
+                }
+                const std::size_t rb = est_entry_bytes(*rec);
+                if (!entries.empty() && batch_bytes + rb > kMaxJournalBatchBytes)
+                    break; // this record starts the next batch
+                entries.push_back(*rec);
+                batch_bytes += rb;
+                ++consumed;
+            }
+            if (entries.empty()) { // only nullptr slots in this span (should never happen)
+                i += consumed;
+                written = i;
                 continue;
             }
-            const std::size_t rb = est_entry_bytes(*rec);
-            if (!entries.empty() && batch_bytes + rb > kMaxJournalBatchBytes)
-                break; // this record starts the next batch
-            entries.push_back(*rec);
-            batch_bytes += rb;
-            ++i;
-        }
-        if (entries.empty())
-            continue;
 
-        const std::int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       std::chrono::system_clock::now().time_since_epoch())
-                                       .count();
-        const std::string value = serialize_journal_batch(ts_ms, entries);
-        const std::string key = journal_batch_key(boot_nonce_, batch_seq_);
+            const std::int64_t ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::system_clock::now().time_since_epoch())
+                                           .count();
+            const std::string value = serialize_journal_batch(ts_ms, entries);
+            const std::string key = journal_batch_key(boot_nonce_, batch_seq_);
 
-        KvInsert result;
-        if (inject_fail_writes_.load(std::memory_order_relaxed) > 0) {
-            inject_fail_writes_.fetch_sub(1, std::memory_order_relaxed); // test-only fault
-            result = KvInsert::Error;
-        } else {
-            result = kv_->insert_if_absent(kJournalNamespace, key, value);
-        }
-        switch (result) {
-        case KvInsert::Inserted:
-            ++batch_seq_;
-            batches_written_.fetch_add(1, std::memory_order_relaxed);
-            written += entries.size();
-            break;
-        case KvInsert::Exists:
-            // ~2^-64 boot-nonce+seq collision: DON'T overwrite. Count it, advance the
-            // seq past the occupied key, and circuit-break (the tick retries the rest).
-            key_collisions_.fetch_add(1, std::memory_order_relaxed);
-            ++batch_seq_;
-            write_failures_.fetch_add(1, std::memory_order_relaxed);
-            return written;
-        case KvInsert::Error:
-            // Per-push circuit breaker: stop at the first write failure so one bad
-            // write can't stall apply_rules for 500 × the 5 s busy timeout. Keep the
-            // seq (nothing was written to this key), leave the rest pending.
+            KvInsert result;
+            if (inject_skip_writes_.load(std::memory_order_relaxed) > 0) {
+                inject_skip_writes_.fetch_sub(1, std::memory_order_relaxed); // test-only: let this one write
+                result = kv_->insert_if_absent(kJournalNamespace, key, value);
+            } else if (inject_fail_writes_.load(std::memory_order_relaxed) > 0) {
+                inject_fail_writes_.fetch_sub(1, std::memory_order_relaxed); // test-only fault
+                result = KvInsert::Error;
+            } else {
+                result = kv_->insert_if_absent(kJournalNamespace, key, value);
+            }
+            switch (result) {
+            case KvInsert::Inserted:
+                ++batch_seq_;
+                batches_written_.fetch_add(1, std::memory_order_relaxed);
+                i += consumed;
+                written = i; // slots durably committed so far
+                break;
+            case KvInsert::Exists:
+                // ~2^-64 boot-nonce+seq collision: DON'T overwrite. Count it, advance the seq
+                // past the occupied key, and circuit-break (the tick retries the rest).
+                key_collisions_.fetch_add(1, std::memory_order_relaxed);
+                ++batch_seq_;
+                write_failures_.fetch_add(1, std::memory_order_relaxed);
+                return written;
+            case KvInsert::Error:
+                // Per-push circuit breaker: stop at the first write failure so one bad write
+                // can't stall apply_rules for 500 x the 5 s busy timeout. Keep the seq (nothing
+                // was written to this key), leave the rest pending.
+                write_failures_.fetch_add(1, std::memory_order_relaxed);
+                return written;
+            }
+        } catch (...) {
+            // A build/serialize allocation threw: batches before this one are durably written,
+            // so count a write failure and return `written`; the caller erases exactly that
+            // prefix and the rest (incl. this batch) stay pending for the tick retry (B4).
             write_failures_.fetch_add(1, std::memory_order_relaxed);
             return written;
         }

@@ -365,10 +365,19 @@ KvInsert KvStore::insert_if_absent(std::string_view plugin, std::string_view key
     sqlite3_bind_int64(stmt.get(), 4, now_epoch_seconds());
 
     rc = sqlite3_step(stmt.get());
-    if (rc == SQLITE_ROW)
-        return KvInsert::Inserted; // RETURNING produced a row → a fresh insert
+    if (rc == SQLITE_ROW) {
+        // A RETURNING row means the row was inserted, but the autocommit COMMIT (WAL fsync)
+        // only completes at the TERMINAL step. Drain to SQLITE_DONE so a commit failure
+        // (SQLITE_FULL / SQLITE_IOERR) after the returned row surfaces here as Error instead
+        // of a false Inserted that would let the caller drop a not-yet-durable record.
+        rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_DONE)
+            return KvInsert::Inserted;
+        spdlog::error("KvStore::insert_if_absent commit failed: {}", sqlite3_errmsg(db_));
+        return KvInsert::Error;
+    }
     if (rc == SQLITE_DONE)
-        return KvInsert::Exists; // conflict → nothing inserted, no row returned
+        return KvInsert::Exists; // conflict: nothing inserted (no row), no durable change
     spdlog::error("KvStore::insert_if_absent step failed: {}", sqlite3_errmsg(db_));
     return KvInsert::Error;
 }
@@ -393,12 +402,19 @@ KvRename KvStore::rename_key(std::string_view plugin, std::string_view from_key,
                       SQLITE_STATIC);
 
     rc = sqlite3_step(stmt.get());
-    if (rc == SQLITE_ROW)
-        return KvRename::Renamed;
+    if (rc == SQLITE_ROW) {
+        // Drain to the terminal step so a commit failure after the RETURNING row surfaces as
+        // Error, not a false Renamed (same durability reason as insert_if_absent).
+        rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_DONE)
+            return KvRename::Renamed;
+        spdlog::error("KvStore::rename_key commit failed: {}", sqlite3_errmsg(db_));
+        return KvRename::Error;
+    }
     if (rc == SQLITE_DONE)
         return KvRename::NotFound; // from_key matched no row
     if (rc == SQLITE_CONSTRAINT)
-        return KvRename::Conflict; // to_key already exists (PK) — ABORT default
+        return KvRename::Conflict; // to_key already exists (PK), ABORT default
     spdlog::error("KvStore::rename_key step failed: {}", sqlite3_errmsg(db_));
     return KvRename::Error;
 }

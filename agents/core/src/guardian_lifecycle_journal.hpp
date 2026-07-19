@@ -169,7 +169,8 @@ public:
     /// TEST-ONLY: force the next `n` batch writes to fail (as if KvStore returned
     /// Error), exercising the per-push circuit breaker and the maintenance-tick
     /// retry (Sol BLOCKER-4) without a real disk fault. No production caller.
-    void inject_write_failures_for_test(int n) noexcept {
+    void inject_write_failures_for_test(int n, int skip_first = 0) noexcept {
+        inject_skip_writes_.store(skip_first, std::memory_order_relaxed);
         inject_fail_writes_.store(n, std::memory_order_relaxed);
     }
 
@@ -201,6 +202,7 @@ private:
     std::atomic<std::uint64_t> evicted_sent_unacked_{0};          ///< aged out WITH a sent-label
     std::atomic<std::uint64_t> evicted_without_send_evidence_{0}; ///< aged out with NO sent-label (alert)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
+    std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
     // Paging state — all guarded by paging_mutex_ (paging is single-threaded per pass).
     std::mutex paging_mutex_;
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
