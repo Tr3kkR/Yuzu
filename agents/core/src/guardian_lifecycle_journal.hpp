@@ -56,6 +56,13 @@ public:
         return key_collisions_.load(std::memory_order_relaxed);
     }
 
+    /// TEST-ONLY: force the next `n` batch writes to fail (as if KvStore returned
+    /// Error), exercising the per-push circuit breaker and the maintenance-tick
+    /// retry (Sol BLOCKER-4) without a real disk fault. No production caller.
+    void inject_write_failures_for_test(int n) noexcept {
+        inject_fail_writes_.store(n, std::memory_order_relaxed);
+    }
+
 private:
     KvStore* kv_;                ///< BORROWED; outlives this (agent owns it)
     std::string boot_nonce_;     ///< random, fixed at construction — batch-key uniqueness across restarts
@@ -63,6 +70,7 @@ private:
     std::atomic<std::uint64_t> batches_written_{0};
     std::atomic<std::uint64_t> write_failures_{0};
     std::atomic<std::uint64_t> key_collisions_{0};
+    std::atomic<int> inject_fail_writes_{0}; ///< test-only forced-failure countdown
 };
 
 } // namespace yuzu::agent

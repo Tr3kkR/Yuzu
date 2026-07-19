@@ -65,7 +65,14 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
         const std::string value = serialize_journal_batch(ts_ms, entries);
         const std::string key = journal_batch_key(boot_nonce_, batch_seq_);
 
-        switch (kv_->insert_if_absent(kJournalNamespace, key, value)) {
+        KvInsert result;
+        if (inject_fail_writes_.load(std::memory_order_relaxed) > 0) {
+            inject_fail_writes_.fetch_sub(1, std::memory_order_relaxed); // test-only fault
+            result = KvInsert::Error;
+        } else {
+            result = kv_->insert_if_absent(kJournalNamespace, key, value);
+        }
+        switch (result) {
         case KvInsert::Inserted:
             ++batch_seq_;
             batches_written_.fetch_add(1, std::memory_order_relaxed);

@@ -1984,9 +1984,15 @@ public:
                             // manual operator action. Always emitted — including
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
-                            if (guardian_)
+                            if (guardian_) {
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
+                                // Drive durable lifecycle-journal maintenance on the
+                                // heartbeat cadence: retry any persist a prior write left
+                                // pending, so a failed write self-heals with no new push /
+                                // reconnect (item 7 PR-Ag; inert unless prefer_spark).
+                                guardian_->journal_maintenance_tick();
+                            }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
                             // Windows / Linux / macOS; no-op platforms have none). Both tags are

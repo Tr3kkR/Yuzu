@@ -10,6 +10,7 @@
 
 #include "guaranteed_state.pb.h"
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
@@ -461,11 +462,51 @@ TEST_CASE("prefer_spark=false: no lifecycle record is journaled (inert)",
     REQUIRE(dr.exit_code == 0);
 
     // Inert: persist_lifecycle_journal_locked is prefer_spark_-gated AND no spark staging
-    // happened (the rule armed on the legacy backend), so the journal namespace is empty.
+    // happened (the rule armed on the legacy backend). The maintenance tick is inert too.
+    engine.journal_maintenance_tick();
     auto rows = kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
     REQUIRE(rows.has_value());
     CHECK(rows->empty());
 
     engine.stop();
     spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=true: the maintenance tick retries a persist a write failure left pending",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    f.apply(make_service_rule("r1")); // the apply_rules flush persist FAILS → record stays pending
+
+    auto before = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(before.has_value());
+    CHECK(before->empty()); // nothing durable yet — the write failed
+
+    f.engine->journal_maintenance_tick(); // NO new push/reconnect — the tick alone retries
+
+    auto after = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(after.has_value());
+    bool found = false;
+    for (const auto& row : *after) {
+        auto b = yuzu::agent::parse_journal_batch(row.value);
+        REQUIRE(b.has_value());
+        for (const auto& e : b->entries)
+            if (e.rule_id == "r1" && e.kind == "armed")
+                found = true;
+    }
+    CHECK(found); // BLOCKER-4: the failed write self-healed via the heartbeat tick
+}
+
+TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left pending",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    f.apply(make_service_rule("r1")); // persist fails → pending
+    CHECK(f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
+
+    f.engine->stop(); // the final flush persists the leftover pending record
+
+    auto rows = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    CHECK_FALSE(rows->empty()); // durable after stop's final flush
 }

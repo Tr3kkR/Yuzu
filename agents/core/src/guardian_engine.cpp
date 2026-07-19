@@ -297,6 +297,11 @@ void GuardianEngine::stop() {
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
     stop_all_guards_locked();
+    // Final flush: persist any records a prior failed write left pending, before shutdown —
+    // there is no maintenance tick after stop(). Bounded + circuit-broken (worst case one
+    // KvStore 5 s busy-timeout). persist_lifecycle_journal_locked does not gate on stopped_,
+    // so ordering it here (before stopped_) is for clarity, not correctness.
+    persist_lifecycle_journal_locked();
     stopped_ = true;
     started_ = false;
 }
@@ -317,6 +322,22 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
     const std::size_t written = lifecycle_journal_->persist(pending);
     if (written > 0)
         spark_runtime_->erase_persisted_prefix(written);
+}
+
+void GuardianEngine::journal_maintenance_tick() {
+    // PHASE 1 (under mtx_): retry any persist a prior write left pending, so a failed write
+    // self-heals on the heartbeat with NO new push/reconnect (Sol BLOCKER-4). A no-op after
+    // stop() and when nothing is pending; persist_lifecycle_journal_locked is itself
+    // prefer_spark_-gated and circuit-broken, so the common case is a cheap empty snapshot.
+    {
+        std::lock_guard lock(mtx_);
+        if (stopped_)
+            return;
+        persist_lifecycle_journal_locked();
+    }
+    // PHASE 2 (OFF mtx_): page_journal_into_window() + prune land here in C5/C4. When filled
+    // it MUST observe an engine-side stopping_ gate (added with the paging path in C5) so it
+    // never mutates the send window after stop() joined the drain worker (rev-4.1 #7).
 }
 
 std::expected<std::size_t, std::string>

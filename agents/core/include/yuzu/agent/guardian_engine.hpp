@@ -134,6 +134,13 @@ public:
     /// to drain a buffered-events queue over the command stream.
     void sync_with_server();
 
+    /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7
+    /// PR-Ag). Two-phase (rev-4.1 #6): PHASE 1 under mtx_ retries any persist a prior
+    /// write left pending — this is what makes a failed write self-heal with NO new
+    /// push/reconnect (Sol BLOCKER-4); PHASE 2 (off mtx_) will page + prune (C4/C5).
+    /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
+    void journal_maintenance_tick();
+
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     void stop();
@@ -227,6 +234,13 @@ public:
 
     /// The current, immutable-after-set outcome of wire_spark_engine().
     [[nodiscard]] SparkAvailability spark_availability() const;
+
+    /// TEST-ONLY: the durable-journal component, for fault injection (see
+    /// GuardianLifecycleJournal::inject_write_failures_for_test). Null until
+    /// wire_spark_engine runs. No production caller.
+    [[nodiscard]] GuardianLifecycleJournal* lifecycle_journal_for_test() {
+        return lifecycle_journal_.get();
+    }
 
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).

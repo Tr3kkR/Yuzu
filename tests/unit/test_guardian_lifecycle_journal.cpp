@@ -113,3 +113,22 @@ TEST_CASE("journal persist: null KvStore is a no-op", "[guardian][journal][persi
     CHECK(j.persist(pending) == 0);
     CHECK(j.batches_written() == 0);
 }
+
+TEST_CASE("journal persist: a write failure circuit-breaks; a retry of the same pending persists",
+          "[guardian][journal][persist]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    std::vector<std::shared_ptr<const JournalRecord>> pending{ptr("r1", "armed"), ptr("r2", "armed")};
+
+    j.inject_write_failures_for_test(1); // force the (single) batch write to fail
+    CHECK(j.persist(pending) == 0);      // circuit-broke — nothing durably written
+    CHECK(j.write_failures() == 1);
+    CHECK(read_all(*t.kv).empty());
+
+    // Retry the SAME pending (as the maintenance tick would) — no injected fault now.
+    CHECK(j.persist(pending) == 2);
+    auto got = read_all(*t.kv);
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].rule_id == "r1");
+    CHECK(got[1].rule_id == "r2");
+}
