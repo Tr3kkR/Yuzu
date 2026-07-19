@@ -62,6 +62,7 @@ class SparkEngine;
 class GuardianSparkRuntime;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
+class GuardianLifecycleJournal;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 struct OutboxEntry;
@@ -245,6 +246,12 @@ private:
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     void persist_generation_locked();
+    /// Flush the runtime's staged lifecycle records to the durable journal (item 7
+    /// PR-Ag). mtx_ held; snapshot → persist → erase-persisted-prefix, circuit-broken
+    /// on the first write failure. prefer_spark_-gated (inert when spark is not the
+    /// active backend). Fired via a terminate-safe guard on every apply_rules /
+    /// start_local exit.
+    void persist_lifecycle_journal_locked();
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,
@@ -318,6 +325,10 @@ private:
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
+    /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime —
+    /// the runtime must borrow no KvStore); borrows kv_. Constructed in
+    /// wire_spark_engine; persist calls are prefer_spark_-gated.
+    std::unique_ptr<GuardianLifecycleJournal> lifecycle_journal_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the

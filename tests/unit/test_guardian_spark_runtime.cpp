@@ -990,3 +990,85 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
     CHECK(rt->rule_count() == 1);
     CHECK(b->arms.load() >= 1);
 }
+
+// ── Durable-journal staging (item 7 PR-Ag C2) ────────────────────────────────
+
+TEST_CASE("attach_rule stages a durable record; its event_id matches the wire event",
+          "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    auto staged = rt->snapshot_pending();
+    REQUIRE(staged.size() == 1);
+    CHECK(staged[0]->rule_id == "r1");
+    CHECK(staged[0]->kind == "armed");
+    CHECK(staged[0]->enqueued_ns > 0);
+    CHECK_FALSE(staged[0]->event_id.empty());
+
+    // Mint-once: the durable record and the live wire event carry ONE id (rev-4.1 #4)
+    // — a replay must reproduce it byte-for-byte or the server sees a false Conflict.
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].event_id == staged[0]->event_id);
+    CHECK(lc[0].lifecycle_kind == staged[0]->kind);
+    CHECK(lc[0].guard_type == staged[0]->guard_type);
+    // The drain pops the send window, NOT the staging vector.
+    CHECK(rt->pending_journal_depth() == 1);
+}
+
+TEST_CASE("detach_rule stages a disarmed record after the armed one", "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true)); // stages "armed"
+    rt->detach_rule("r1");                                                         // ->0 edge, stages "disarmed"
+
+    auto staged = rt->snapshot_pending();
+    REQUIRE(staged.size() == 2);
+    CHECK(staged[0]->kind == "armed");
+    CHECK(staged[1]->kind == "disarmed");
+    CHECK(staged[1]->rule_id == "r1");
+}
+
+TEST_CASE("a refused arm stages no durable record (no phantom)", "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->fail_arm.store(true);
+    auto rt = make_rt(r, b);
+    CHECK_FALSE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    CHECK(rt->snapshot_pending().empty()); // arm refused before enqueue → nothing staged
+}
+
+TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->throw_arm.store(true);
+    auto rt = make_rt(r, b);
+    CHECK_THROWS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(rt->snapshot_pending().empty()); // rollback undid the arm; nothing staged
+}
+
+TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
+          "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true));
+    REQUIRE(rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3"), true));
+    REQUIRE(rt->pending_journal_depth() == 3);
+
+    auto staged = rt->snapshot_pending();
+    REQUIRE(staged.size() == 3);
+    CHECK(staged[0]->rule_id == "r1");
+    CHECK(staged[2]->rule_id == "r3");
+
+    rt->erase_persisted_prefix(2); // drop the two oldest (r1, r2)
+    REQUIRE(rt->pending_journal_depth() == 1);
+    CHECK(rt->snapshot_pending()[0]->rule_id == "r3");
+
+    rt->erase_persisted_prefix(99); // clamps to size
+    CHECK(rt->pending_journal_depth() == 0);
+}

@@ -9,6 +9,7 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
@@ -409,6 +410,61 @@ TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spa
     // Legacy DID attempt to arm (whether it succeeds depends on the platform's
     // real ServiceGuard/SystemdServiceGuard - not this test's concern; only
     // that spark was never touched).
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+// ── Durable-journal persist boundary + inertness (item 7 PR-Ag C2) ───────────
+
+TEST_CASE("prefer_spark=true: an armed rule's record is persisted to the durable journal",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    f.apply(make_service_rule("r1")); // arms via spark → stages "armed" → apply_rules flush persists
+
+    // The journal namespace is distinct from the rule namespace and survives full_sync.
+    auto rows = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty()); // a batch was durably written by the flush guard
+
+    bool found_armed_r1 = false;
+    for (const auto& row : *rows) {
+        auto b = yuzu::agent::parse_journal_batch(row.value);
+        REQUIRE(b.has_value());
+        for (const auto& e : b->entries)
+            if (e.rule_id == "r1" && e.kind == "armed")
+                found_armed_r1 = true;
+    }
+    CHECK(found_armed_r1);
+}
+
+TEST_CASE("prefer_spark=false: no lifecycle record is journaled (inert)",
+          "[spark][guardian][reconcile][journal]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false}; // production default
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    // Inert: persist_lifecycle_journal_locked is prefer_spark_-gated AND no spark staging
+    // happened (the rule armed on the legacy backend), so the journal namespace is empty.
+    auto rows = kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
 
     engine.stop();
     spark_engine.stop();

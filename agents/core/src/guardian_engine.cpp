@@ -31,6 +31,7 @@
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
 #include "guardian_outbox_drain_worker.hpp"
 #include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
 #include "guardian_spark_backend.hpp"
@@ -219,6 +220,12 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // detected before set_event_sink() is wired are dropped (durable buffering
     // is A3). Guards re-armed by a later push replace these. Before this, a
     // restarted agent reported rules present while enforcing nothing.
+    // Flush the boot re-arm's staged "armed" records to the durable journal on exit
+    // (normal return or an un-firewalled throw). Same terminate-safe always-fire guard as
+    // apply_rules; fires with mtx_ still held (declared after the lock).
+    GuardianRollback journal_flush;
+    journal_flush.fn = [this] { persist_lifecycle_journal_locked(); };
+
     std::size_t rearmed = 0;
     for (const auto& key : kv_->list(kKvNamespace, kRulePrefix)) {
         auto raw = kv_->get(kKvNamespace, key);
@@ -294,6 +301,24 @@ void GuardianEngine::stop() {
     started_ = false;
 }
 
+void GuardianEngine::persist_lifecycle_journal_locked() {
+    // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
+    // the path is wired (rev-4.1 §7 inertness — at prefer_spark_=false a pre-populated
+    // journal is neither written nor touched).
+    if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
+        return;
+    const auto pending = spark_runtime_->snapshot_pending();
+    if (pending.empty())
+        return;
+    // snapshot released outbox_mu_; persist() does KV I/O holding NO runtime lock (so the
+    // WRITE chain never nests outbox_mu_ under KvStore.mu_); erase re-takes outbox_mu_ for
+    // ONLY the prefix persist() durably wrote (circuit-broken on the first failure — the
+    // rest stay pending for the maintenance-tick retry, C3).
+    const std::size_t written = lifecycle_journal_->persist(pending);
+    if (written > 0)
+        spark_runtime_->erase_persisted_prefix(written);
+}
+
 std::expected<std::size_t, std::string>
 GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     std::lock_guard lock(mtx_);
@@ -301,6 +326,15 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         return std::unexpected("guardian engine stopped");
     if (!kv_)
         return std::unexpected("kv store unavailable");
+
+    // Flush staged lifecycle records to the durable journal on EVERY exit — the normal
+    // return, the put_rule early return below, and any un-firewalled throw. GuardianRollback
+    // is the codebase's terminate-safe scope guard; left un-committed it becomes an
+    // always-fire flush whose dtor swallows a persist-during-unwind throw (records stay
+    // pending for the C3 maintenance-tick retry) rather than std::terminate. Declared after
+    // the lock so it fires with mtx_ STILL held (reverse-order destruction).
+    GuardianRollback journal_flush;
+    journal_flush.fn = [this] { persist_lifecycle_journal_locked(); };
 
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;
@@ -955,6 +989,10 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         spark_reader_ = std::make_shared<GuardianStateReader>();
         spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);
         spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_);
+        // The durable journal is engine-owned and borrows kv_ (may be null → it durably
+        // writes nothing). Constructed whenever spark is wired; persist stays gated on
+        // prefer_spark_ in persist_lifecycle_journal_locked, so it is inert at 7.7a.
+        lifecycle_journal_ = std::make_unique<GuardianLifecycleJournal>(kv_);
 
         auto id = engine->register_consumer("guardian-spark",
                                             GuardianSparkRuntime::make_handler(spark_runtime_));
