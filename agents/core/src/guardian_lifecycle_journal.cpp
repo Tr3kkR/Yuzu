@@ -21,12 +21,23 @@ std::string make_journal_nonce() {
     return std::format("{:016x}", v);
 }
 
-// A cheap byte estimate for one record's JSON entry — used only to decide when to
-// start a new batch, so it can be approximate as long as it never UNDER-counts the
-// wire fields by enough to blow past kMaxJournalBatchBytes on a realistic record.
+// Worst-case serialized byte count of a string field once JSON-escaped: a control char
+// (< 0x20) can expand to \u00XX (6 bytes), '"' and '\\' to 2 (review M7). Fields are validated
+// UTF-8, so multibyte code points pass through 1:1.
+std::size_t json_escaped_bytes(std::string_view s) {
+    std::size_t n = 0;
+    for (unsigned char c : s)
+        n += (c < 0x20) ? 6 : ((c == '"' || c == '\\') ? 2 : 1);
+    return n;
+}
+
+// A byte estimate for one record's JSON entry, used to decide when to start a new batch. It
+// must never UNDER-count (a batch estimated below kMaxJournalBatchBytes must actually serialize
+// below it), so each field is counted at its worst-case escaped size.
 std::size_t est_entry_bytes(const JournalRecord& r) {
-    return r.rule_id.size() + r.event_id.size() + r.kind.size() + r.guard_type.size() +
-           r.rule_name.size() + 128; // 128 = JSON keys/punctuation/number fields
+    return json_escaped_bytes(r.rule_id) + json_escaped_bytes(r.event_id) +
+           json_escaped_bytes(r.kind) + json_escaped_bytes(r.guard_type) +
+           json_escaped_bytes(r.rule_name) + 128; // 128 = JSON keys/punctuation/number fields
 }
 
 } // namespace
@@ -128,9 +139,10 @@ JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
 
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
     if (!rows) {
-        prune_failures_.fetch_add(1, std::memory_order_relaxed); // read error → fail-safe, retry next pass
-        return stats;
+        prune_failures_.fetch_add(1, std::memory_order_relaxed); // read error: fail-safe, retry next pass
+        return stats; // read_ok stays false: the boot barrier will NOT latch on a failed scan (M5)
     }
+    stats.read_ok = true;
 
     struct Live {
         std::string key;
@@ -174,23 +186,34 @@ JournalPruneStats GuardianLifecycleJournal::prune(std::int64_t now_ms) {
         const bool too_big = total_bytes > max_bytes_;
         if (too_old || too_many || too_big) {
             evict.push_back(l.key);
-            // Classify the eviction by whether its data was ever sent (best-effort: a live
-            // entry may age out before its batch key exists, so absence != "never sent").
-            if (kv_->exists(kJournalNamespace, journal_sent_key_from_batch_key(l.key)))
-                evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
-            else
-                evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
             --surviving;
             total_bytes -= l.bytes;
         }
     }
+
     if (!evict.empty()) {
+        // del_keys is one all-or-nothing transaction: a 0 return with a non-empty evict list is
+        // a delete FAILURE (review M4). Only AFTER a successful delete do we count the eviction,
+        // classify each by its (still-present) sent-label, and let the label-GC run against the
+        // now-correct survivor set. On failure the batches + labels are left intact and retried.
         const int n = kv_->del_keys(kJournalNamespace, evict);
+        if (n <= 0) {
+            prune_failures_.fetch_add(1, std::memory_order_relaxed);
+            return stats; // do NOT touch survivors' sent-labels this pass
+        }
         batches_pruned_.fetch_add(static_cast<std::uint64_t>(n), std::memory_order_relaxed);
         stats.evicted = static_cast<std::size_t>(n);
+        for (const auto& key : evict) {
+            // Best-effort classification: a live entry may age out before its batch key exists,
+            // so absence of a sent-label != "never sent".
+            if (kv_->exists(kJournalNamespace, journal_sent_key_from_batch_key(key)))
+                evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
+            else
+                evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
-    // Surviving batch keys (parseable, not evicted) — the reference set for sent-label GC.
+    // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC.
     const std::set<std::string> evicted_set(evict.begin(), evict.end());
     std::set<std::string> survivors;
     for (const auto& l : live)
@@ -231,10 +254,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     std::lock_guard<std::mutex> pg{paging_mutex_};
 
     // Prune-before-page barrier (rev-4.1 #6): the FIRST paging attempt prunes before it can
-    // return any replay candidate, so a stale over-cap journal is bounded before replay.
+    // return any replay candidate, so a stale over-cap journal is bounded before replay. Latch
+    // the barrier only on a SUCCESSFUL prune scan (review M5) so a transient read error does not
+    // permanently mark the boot prune done and let over-cap data page unpruned.
     if (!boot_pruned_) {
-        prune(now_ms); // does NOT take paging_mutex_ — safe to call while we hold it
-        boot_pruned_ = true;
+        if (prune(now_ms).read_ok) // prune does NOT take paging_mutex_: safe to call while held
+            boot_pruned_ = true;
     }
 
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
@@ -254,8 +279,31 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
     for (auto& row : *rows) {
         auto b = parse_journal_batch(row.value);
-        if (!b || b->ts_ms < min_ts)
-            continue; // a corrupt batch is prune's job; an expired one is not re-sent
+        if (!b)
+            continue; // unparseable: prune quarantines it (runs before page via the barrier + tick)
+        if (b->ts_ms < min_ts)
+            continue; // valid but expired: prune evicts it; do not re-send, do not quarantine
+        // Re-validate every record before replay (review M6): a corrupt/tampered v4 row on disk
+        // (enqueued_ns<=0, an oversized/non-UTF-8 field, or a kind other than armed/disarmed)
+        // would poison the server compare into a false Conflict every reconnect -- the exact
+        // failure the M6 MINT gate prevents. QUARANTINE the whole batch (the quarantine unit per
+        // section 2/9) so it is never replayed and the removal is COUNTED, not silently skipped.
+        bool replayable = true;
+        for (const auto& r : b->entries) {
+            if (validate_record(r) != JournalReject::None ||
+                (r.kind != "armed" && r.kind != "disarmed")) {
+                replayable = false;
+                break;
+            }
+        }
+        if (!replayable) {
+            if (kv_->rename_key(kJournalNamespace, row.key, journal_quarantine_key(row.key)) ==
+                KvRename::Renamed)
+                quarantined_.fetch_add(1, std::memory_order_relaxed);
+            else
+                quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         cands.push_back(Cand{row.key, b->ts_ms, std::move(*b)});
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {

@@ -79,6 +79,7 @@ struct JournalPageStats {
 
 /// One prune pass's outcome (also mirrored on the lock-free counters).
 struct JournalPruneStats {
+    bool read_ok{false};           ///< the initial journal scan succeeded (gates the boot barrier, M5)
     std::size_t evicted{0};        ///< batches removed by retention (age/count/bytes)
     std::size_t quarantined{0};    ///< unparseable batches moved aside this pass
     std::size_t sent_labels_gc{0}; ///< orphaned/evicted sent-labels removed this pass

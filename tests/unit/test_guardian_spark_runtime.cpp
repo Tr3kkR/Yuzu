@@ -1283,3 +1283,30 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     drainer.join();
     SUCCEED("no data race / crash across concurrent pagers + drain");
 }
+
+TEST_CASE("page_into_window quarantines a corrupt batch instead of replaying it (M6)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    auto write = [&](const std::string& key, std::int64_t ts, const std::string& eid,
+                     std::int64_t ns, const std::string& kind) {
+        REQUIRE(rig.kv->set(kJournalNamespace, key,
+                            R"({"v":4,"ts_ms":)" + std::to_string(ts) +
+                                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                                R"(","enqueued_ns":)" + std::to_string(ns) + R"(,"kind":")" + kind +
+                                R"(","guard_type":"file","rule_name":"n"}]})"));
+    };
+    // enqueued_ns=0 floors to epoch second 0, so the server would stamp receipt-now -> a false
+    // Conflict every replay. A kind outside {armed,disarmed} is likewise corrupt/tampered.
+    write("lc:bad:000000000000", 1'700'000'000'000, "e-bad", 0, "armed");
+    write("lc:badkind:000000000000", 1'700'000'000'000, "e-bk", 1'700'000'000'000'000'000, "banana");
+    write("lc:good:000000000000", 1'700'000'000'000, "e-good", 1'700'000'000'000'000'000, "armed");
+
+    auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'050'000);
+    CHECK(stats.records_paged == 1);        // only the good batch replayed
+    CHECK(rig.journal->quarantined() >= 2); // both corrupt batches moved aside
+    CHECK(rig.kv->list_entries(kJournalNamespace, kQuarantineKeyPrefix)->size() >= 2);
+
+    auto sent = drain_lifecycle(*rig.rt);
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].event_id == "e-good"); // the poison batches never reach the wire
+}
