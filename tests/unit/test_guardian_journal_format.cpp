@@ -187,3 +187,25 @@ TEST_CASE("parse_journal_batch: missing/typewrong fields → Malformed", "[guard
               R"({"v":4,"ts_ms":1,"entries":[{"rule_id":"r","generation":1,"event_id":"e","enqueued_ns":"nope","kind":"armed","guard_type":"file","rule_name":"n"}]})")
               .error() == JournalParseError::Malformed);
 }
+
+TEST_CASE("parse_journal_batch: pathologically-nested JSON is rejected, never stack-overflows",
+          "[guardian][journal][format]") {
+    // A tampered kv_store.db value could nest '[' thousands deep; nlohmann's recursive-descent
+    // parser would stack-overflow (an uncatchable ABORT) before returning. The depth pre-scan
+    // must reject it as Malformed - the caller then quarantines it - without recursing (security
+    // review). 50k deep is far past any legitimate v4 batch (which nests 3) and would blow the
+    // stack if the guard were absent; reaching the CHECK at all proves the guard fired first.
+    const std::string deep(50000, '[');
+    auto p = parse_journal_batch(deep);
+    REQUIRE_FALSE(p.has_value());
+    CHECK(p.error() == JournalParseError::Malformed);
+
+    // Brackets INSIDE a string literal are not real nesting and must not trip the guard: a v4
+    // batch whose rule_name is full of '[' still parses fine.
+    const std::string brackety(200, '[');
+    auto ok = parse_journal_batch(
+        R"({"v":4,"ts_ms":1,"entries":[{"rule_id":"r","generation":1,"event_id":"e","enqueued_ns":2000000000,"kind":"armed","guard_type":"file","rule_name":")" +
+        brackety + R"("}]})");
+    REQUIRE(ok.has_value());
+    CHECK(ok->entries.at(0).rule_name == brackety);
+}

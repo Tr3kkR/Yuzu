@@ -174,7 +174,7 @@ struct PageRig {
                 JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
                               .enqueued_ns = 1'700'000'000'000'000'000, .kind = kind,
                               .guard_type = "file", .rule_name = "n"})};
-        journal->persist(pending);
+        REQUIRE(journal->persist(pending) == 1);
     }
 };
 } // namespace
@@ -1334,7 +1334,94 @@ TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
         return SendResult::Sent;
     });
     CHECK(rig.journal->sent_labels_written() == 1);
-    auto sent = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
-    REQUIRE(sent.has_value());
-    CHECK(sent->size() == 1);
+    auto sent_m3 = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
+    REQUIRE(sent_m3.has_value());
+    CHECK(sent_m3->size() == 1);
+}
+
+TEST_CASE("a hostile rule_name is rejected from the journal but never crashes the arm (QE-2)",
+          "[spark][runtime][journal]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+
+    // Feed embedded-NUL / invalid-UTF-8 / oversized rule_names through the REAL wired staging
+    // path (attach_rule -> enqueue_lifecycle_locked -> build_journal_record -> validate_record),
+    // not validate_record in isolation. This is the governance blind-spot #1593 lesson: a
+    // "rejected, not thrown" claim for the wired path needs a reproduction. Each must be kept out
+    // of the durable journal (journal_field_rejected++) while the arm itself still succeeds.
+    const auto arm_with_name = [&](const std::string& rid, const std::string& name) {
+        auto rule = file_exists_rule(rid);
+        rule.rule_name = name;
+        return rt->attach_rule(rid, file_spec("/" + rid), rule, true);
+    };
+
+    std::string nul = "bad";
+    nul.push_back('\0');
+    nul += "name";
+    REQUIRE(arm_with_name("r1", nul).has_value());                           // embedded NUL
+    REQUIRE(arm_with_name("r2", std::string("bad\xff\xfetail")).has_value()); // invalid UTF-8
+    REQUIRE(arm_with_name("r3", std::string(5000, 'x')).has_value());        // > kMaxJournalFieldBytes
+
+    CHECK(rt->journal_field_rejected() == 3); // all three kept OUT of the durable journal
+    CHECK(rt->journal_clock_rejected() == 0);
+    CHECK(rt->pending_journal_depth() == 0);  // nothing staged (the live audit entry still sent)
+}
+
+TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)",
+          "[spark][runtime][journal][tsan]") {
+    PageRig rig;
+    // A small retention cap keeps the pruner trimming the journal so page-passes stay O(small):
+    // TSan finds a race from the INTERLEAVING, not from volume, so a short bounded run suffices.
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/16,
+                                               /*max_bytes=*/static_cast<std::size_t>(-1),
+                                               /*max_quarantine=*/100);
+    for (int i = 0; i < 16; ++i)
+        rig.persist("seed" + std::to_string(i));
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> workers;
+    // Pagers: page_into_window (paging_mutex_ -> KvStore.mu_).
+    for (int p = 0; p < 2; ++p)
+        workers.emplace_back([&, p] {
+            std::int64_t t = 1'700'000'000'000 + p * 1000;
+            while (!stop.load(std::memory_order_relaxed)) {
+                rig.journal->page_into_window(*rig.rt, t);
+                t += 10'000;
+            }
+        });
+    // Pruner: prune() (paging_mutex_ -> KvStore.mu_) - the FR5 prune-vs-paging serialization this
+    // test exists to exercise under TSan (previously only single-threaded).
+    workers.emplace_back([&] {
+        std::int64_t t = 1'700'000'000'000;
+        while (!stop.load(std::memory_order_relaxed)) {
+            rig.journal->prune(t);
+            t += 5'000;
+        }
+    });
+    // Persister: persist() (KvStore.mu_, no paging_mutex_) - a single writer, as in production
+    // (always under the engine mtx_); it races page/prune only on the shared KvStore + atomics.
+    // Bounded to keep the run short; the pruner recycles the batch budget as it writes.
+    workers.emplace_back([&] {
+        for (int n = 0; n < 40 && !stop.load(std::memory_order_relaxed); ++n) {
+            std::vector<std::shared_ptr<const JournalRecord>> pending{
+                std::make_shared<const JournalRecord>(JournalRecord{
+                    .rule_id = "w" + std::to_string(n), .generation = 1,
+                    .event_id = "we-" + std::to_string(n), .enqueued_ns = 1'700'000'000'000'000'000,
+                    .kind = "armed", .guard_type = "file", .rule_name = "n"})};
+            (void)rig.journal->persist(pending);
+        }
+    });
+    // Drainer.
+    workers.emplace_back([&] {
+        while (!stop.load(std::memory_order_relaxed))
+            rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
+    });
+
+    for (int i = 0; i < 60; ++i)
+        rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
+
+    rig.journal->request_stop();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& w : workers)
+        w.join();
+    SUCCEED("no data race across concurrent persist/page/prune/drain");
 }

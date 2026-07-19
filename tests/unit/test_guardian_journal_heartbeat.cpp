@@ -40,9 +40,27 @@ TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinne
 }
 
 TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journal][heartbeat]") {
-    // Set all 18 fields to distinct non-zero values -> 18 distinct tags (no key collision).
+    // Set all 22 fields to distinct non-zero values -> 22 distinct tags (no key collision). If a
+    // field is added without a matching put() key (or two keys collide), this size check fails.
     std::map<std::string, std::string> tags;
-    GuardianJournalStats s{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18};
+    GuardianJournalStats s{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
+                           12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22};
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 18);
+    CHECK(tags.size() == 22);
+}
+
+TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",
+          "[guardian][journal][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    GuardianJournalStats s;
+    s.write_capacity_rejected = 4;
+    s.quarantine_capacity_evicted = 5;
+    s.journal_bytes = 4096;
+    s.journal_batch_count = 7;
+    emit_guardian_journal_heartbeat_tags(tags, s);
+    CHECK(tags.size() == 4);
+    CHECK(tags.at("yuzu.guardian_journal_write_capacity_rejected") == "4");
+    CHECK(tags.at("yuzu.guardian_journal_quarantine_capacity_evicted") == "5");
+    CHECK(tags.at("yuzu.guardian_journal_bytes") == "4096");
+    CHECK(tags.at("yuzu.guardian_journal_batch_count") == "7");
 }
