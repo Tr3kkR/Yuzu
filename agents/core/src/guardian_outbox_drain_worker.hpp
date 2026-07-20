@@ -38,6 +38,7 @@
 #include "guardian_outbox.hpp"        // OutboxEntry, SendResult
 #include "guardian_spark_runtime.hpp" // GuardianSparkRuntime
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -70,8 +71,17 @@ public:
     void stop();
 
     /// Deterministic test seam (also the worker thread's own loop body): run
-    /// ONE drain pass synchronously on the caller's thread.
+    /// ONE drain pass synchronously on the caller's thread. Does NOT firewall
+    /// exceptions - the worker thread's loop() does (so a test can still observe a
+    /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
+
+    /// Cumulative count of drain passes that threw and were firewalled by loop().
+    /// A nonzero value means the drain path hit an exception (bad_alloc under memory
+    /// pressure); surfaced via the heartbeat by item 9. Lock-free.
+    [[nodiscard]] std::uint64_t drain_exception_count() const noexcept {
+        return drain_exceptions_.load(std::memory_order_relaxed);
+    }
 
 private:
     void loop();
@@ -92,6 +102,7 @@ private:
     std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::thread thread_;
+    std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
 };
 
 } // namespace yuzu::agent

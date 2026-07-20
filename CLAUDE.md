@@ -61,6 +61,8 @@ Standing up or debugging the stack? **Read `docs/uat-environment.md` first** —
 
 The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate — compiles HEAD, upgrades from the previous release image, runs the standard test surface, persists every gate result + timing to a SQLite DB at `~/.local/share/yuzu/test-runs.db` (survives `git clean`; override `YUZU_TEST_DB=path`). Modes: `--quick` (~10 min), default (~30–45 min), `--full` (~60–120 min — adds OTA, sanitizers, coverage enforcement, perf measure-only). History: `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend|--flaky`.
 
+CI history is separate and per runner: Big Tam stores `/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`; Wee Tam stores `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. The files persist outside checkouts and are never shared by runner agents. `ci.yml` records job and Meson test-entry outcomes/timings plus recovered known flakes; query via `test-db-query.sh ci-stats|ci-suite-stats|ci-flakes`. See `docs/ci-architecture.md` for provisioning and schema details.
+
 ## Instruction Engine
 
 The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via `CommandRequest`; `yaml_source` authoritative, denormalized columns for queries. Architecture: `docs/Instruction-Engine.md`; DSL: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
