@@ -580,3 +580,57 @@ TEST_CASE("journal prune: a persist in the PRE-scan window over-counts safely, h
     CHECK(j.journal_batch_count() == 3);
     CHECK(j.gauge_underflow() == 0); // an over-count never trips the negative tripwire
 }
+
+TEST_CASE("journal persist: a negative gauge fails CLOSED and recovers after a prune rebase "
+          "(#2303 UP-2 / Sol)",
+          "[guardian][journal][persist]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+
+    // Force a negative gauge. This cannot happen in correct operation (every lc: row is
+    // counted), so the seam stages the state a future over-subtraction bug would produce.
+    j.set_size_gauges_for_test(/*count=*/-5, /*bytes=*/-5);
+
+    // FAIL-CLOSED: the write is REFUSED (not admitted on a clamp-to-0 read, which would be
+    // fail-OPEN and grow the shared kv_store.db on an untrusted size), and the tripwire counts.
+    CHECK(j.persist(one("neg", "armed")) == 0);
+    CHECK(j.gauge_underflow() >= 1);
+    CHECK(j.write_failures() == 0);                 // refused BEFORE the write, not attempted and failed
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1); // the refused row never reached the shared DB
+
+    // A successful prune rebases the gauge back to on-disk reality (the unclamped pre_count
+    // walks the negative up); writes then resume.
+    auto s = j.prune(0);
+    CHECK(s.read_ok);
+    CHECK(j.journal_batch_count() == 1); // rebased to the one row (r1) actually on disk
+    CHECK(j.persist(one("r2", "armed")) == 1); // no longer refused
+    CHECK(j.journal_batch_count() == 2);
+}
+
+TEST_CASE("journal persist: a negative gauge stays bricked while prune scans keep failing "
+          "(#2303 UP-1 / chaos)",
+          "[guardian][journal][persist]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    j.set_size_gauges_for_test(/*count=*/-3, /*bytes=*/-3); // simulate an over-subtraction bug
+
+    // Recovery is ONLY via a successful prune rebase (UP-1). While the scan chronically fails,
+    // the negative gauge is never walked back and writes stay refused - bricked, but BOUNDED
+    // (records defer to RAM staging, drops counted) rather than the old unbounded fail-open.
+    j.inject_read_failures_for_test(2);
+    CHECK(j.persist(one("x1", "armed")) == 0); // still refused
+    auto f1 = j.prune(0);
+    CHECK_FALSE(f1.read_ok); // scan failed -> no rebase
+    CHECK(j.persist(one("x2", "armed")) == 0); // still bricked
+    auto f2 = j.prune(0);
+    CHECK_FALSE(f2.read_ok);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1); // nothing written while bricked (only r1)
+
+    // The FIRST successful scan rebases and unbricks - no latched-bad state.
+    auto ok = j.prune(0);
+    CHECK(ok.read_ok);
+    CHECK(j.journal_batch_count() == 1);
+    CHECK(j.persist(one("r2", "armed")) == 1); // recovered
+}

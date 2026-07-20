@@ -345,7 +345,10 @@ static std::int64_t journal_now_ms() {
 void GuardianEngine::persist_lifecycle_journal_locked() {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
     // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
-    // journal is neither written nor touched).
+    // journal is neither written, pruned, nor paged. Precise exception (#2303 Sol): the
+    // journal's CONSTRUCTOR still runs once regardless of prefer_spark_ - a read-only
+    // PRAGMA synchronous check + a namespace_size() size probe to seed the gauges. Those
+    // two boot-time reads are the only thing that touches the store while inert.
     if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
         return;
     const auto pending = spark_runtime_->snapshot_pending();

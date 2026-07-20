@@ -10,9 +10,18 @@
  * contrast, already borrows the agent-owned KvStore (kv_) with a proven
  * member-destruction-order guarantee - this component makes the same borrow.
  *
- * C2 delivers persist() only; paging + retention (C4/C5) layer on later. NOT
- * thread-safe on its own: the engine calls into it only under its own mtx_, and
- * KvStore serialises its single connection.
+ * C2 delivers persist() only; paging + retention (C4/C5) layer on later.
+ *
+ * CONCURRENCY (updated #2303): NOT a general thread-safe object, but it does run
+ * under a specific, bounded concurrency in production - persist() executes on the
+ * engine mtx_ (heartbeat retry / apply_rules flush / stop-flush) while prune() and
+ * page_into_window() run OFF mtx_, serialised against each other by paging_mutex_.
+ * That safe overlap rests on: the size gauges being atomic RMW running counters
+ * (no lost update across persist-vs-prune), KvStore serialising its single
+ * connection, batch_seq_ being written only by the single persist caller
+ * (boot_nonce_ is fixed in the ctor, immutable thereafter), and the seed's
+ * absolute store running once in the ctor before publication. Do NOT add a
+ * second persist caller or a non-RMW gauge write.
  */
 
 #include "guardian_journal_format.hpp"
@@ -183,10 +192,19 @@ public:
     [[nodiscard]] std::uint64_t write_capacity_rejected() const noexcept {
         return write_capacity_rejected_.load(std::memory_order_relaxed);
     }
-    // A gauge observed NEGATIVE at the write-ceiling check (#2303 UP-2). clamp_nonneg floors it
-    // to 0 for the decision, which is fail-OPEN (an under-count reads as "empty" and admits a
-    // write). Correct operation never goes negative, so any non-zero here is a real accounting
-    // bug surfacing - counted, not silently clamped away.
+    // A gauge observed NEGATIVE at the write-ceiling check (#2303 UP-2 / Sol). The size is then
+    // untrusted, so persist() fails CLOSED (refuses the write, defers to RAM staging) until a
+    // prune rebase restores it - and increments this. Correct operation never goes negative, so
+    // any non-zero here is a real accounting bug surfacing, not silently admitted on a clamp.
+    //
+    // OBSERVABILITY GAP (untracked prerequisite, CUTOVER-GATED): unlike its sibling
+    // write_capacity_rejected, this counter is NOT in GuardianJournalStats / the heartbeat emit
+    // AT ALL yet - so a negative-gauge brick is currently only locally counted. Worse, the
+    // journal_batch_count gauge CLAMPS a negative to 0, i.e. reads as a healthy EMPTY journal,
+    // so the brick is camouflaged on the primary gauge (governance UP-4). Adding this field to
+    // the heartbeat (mirror write_capacity_rejected: struct field + journal_stats() + emit) must
+    // land WITH the prefer_spark cutover, not after; only THEN does its server-side fleet rollup
+    // ride #2298 gate 3. Harmless while inert (prefer_spark=false).
     [[nodiscard]] std::uint64_t gauge_underflow() const noexcept {
         return gauge_underflow_.load(std::memory_order_relaxed);
     }

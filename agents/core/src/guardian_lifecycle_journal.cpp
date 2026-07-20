@@ -185,13 +185,17 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
             // leaving the records in the bounded RAM staging.
             const std::int64_t raw_count = journal_batch_count_.load(std::memory_order_relaxed);
             const std::int64_t raw_bytes = journal_bytes_.load(std::memory_order_relaxed);
-            // UP-2: a NEGATIVE gauge here means an over-subtraction bug - clamp_nonneg would floor
-            // it to 0 and admit a write (fail-OPEN on the shared kv_store.db). Correct operation
-            // never goes negative at a ceiling read, so surface it as a counter rather than let
-            // the clamp hide it. (The write still proceeds under the clamped-0 read; the counter
-            // is the tripwire, and a later prune rebase self-heals the value.)
-            if (raw_count < 0 || raw_bytes < 0)
+            // #2303 UP-2 (Sol review): a NEGATIVE gauge means the cached size is UNTRUSTED (an
+            // over-subtraction bug). clamp_nonneg would floor it to 0 and ADMIT the write -
+            // fail-OPEN, growing the shared kv_store.db on the strength of a wrong size. Fail
+            // CLOSED instead: refuse + count, and let a later prune rebase restore a trusted size
+            // (writes then resume). This cannot occur in correct operation - every lc: row is
+            // counted - so it never blocks a healthy agent; it is a defense-in-depth tripwire
+            // against a future accounting regression, not a live code path.
+            if (raw_count < 0 || raw_bytes < 0) {
                 gauge_underflow_.fetch_add(1, std::memory_order_relaxed);
+                return written; // untrusted size: defer to RAM staging until a prune rebases
+            }
             if (clamp_nonneg(raw_count) + 1 > hard_max_batches_ ||
                 clamp_nonneg(raw_bytes) + value.size() > hard_max_bytes_) {
                 write_capacity_rejected_.fetch_add(1, std::memory_order_relaxed);
@@ -480,6 +484,14 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // return any replay candidate, so a stale over-cap journal is bounded before replay. Latch
     // the barrier only on a SUCCESSFUL prune scan (review M5) so a transient read error does not
     // permanently mark the boot prune done and let over-cap data page unpruned.
+    //
+    // KNOWN LIMIT (#2303 Sol, pre-existing, inert): "bounded before replay" holds for the SCAN
+    // (C4 pages nothing on a failed scan). It does NOT hold if the scan succeeds but the
+    // retention DELETE fails - prune returns read_ok=true, the barrier latches, and readable
+    // over-cap rows page anyway. That is bounded (the page rate-limiter caps the fleet cost) and
+    // the rows are valid audit records, just not retention-trimmed first. Gating the barrier on
+    // complete retention success (or documenting the intentional replay) is deferred to the
+    // cutover resilience work (#2300); it does not gate this inert path.
     if (!boot_pruned_) {
         // Call prune_locked_ directly: we already hold paging_mutex_ (prune() would re-lock it).
         if (!prune_locked_(now_ms).read_ok)
