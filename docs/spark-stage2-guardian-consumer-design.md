@@ -1,11 +1,20 @@
 ---
 status: draft
-date: 2026-07-11
+date: 2026-07-17
 owner: Dave Rae
 scope: agent — Guardian detection cutover onto SparkEngine; server — spark/guard health surface
 adr: 0021 (Sparks as sole detection layer); amends Decisions 3 & 11
 tracks: #1939 (Stage-2 readiness checklist), #2011, #2014, #1938, #1929, #1933, #1936, #2015
-governance: 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folds all findings below
+governance:
+  - original design - 9-agent /governance pipeline, 2026-07-11 (report local, not committed to git); hardening round folded all findings into the sections below.
+  - rung 9a addition (the §Rung-2 decision record + inner ladder) - 4-agent pipeline (security-guardian, docs-writer, architect, consistency-auditor), 2026-07-17; every embedded code-claim verified against origin/dev; security MEDIUMs on the F3 blast radius and intra-class lane exhaustion folded in.
+history:
+  - 2026-07-11 - initial design; 2 governance rounds; landed as PR #2051.
+  - 2026-07-17 - rung 9a - §Rung-2 decision record (R1-R4) + the inner-ladder
+    decomposition of rung 2 into the §Implementation PR ladder (rungs 1-7 merged as
+    PR #2224; the 7.7a/7.7b/8/10/11/12 remainder). Records what was previously held
+    only in commit messages and a local plan; the full as-built rewrite is rung 9b,
+    after 7.7b.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -49,6 +58,311 @@ surfaced on heartbeat metrics **and** the per-rule REST + MCP status surface.
   cutovers, separate stages.
 - `PolicyEvaluator` (server-polled instruction compliance) — untouched,
   ADR-0021 Decision 12.
+
+## Rung-2 decision record (rung 9a)
+
+Four questions that rung 2's inner ladder depends on, settled 2026-07-17. They are
+recorded here because they were previously settled only in conversation, and rung 7.7's
+shape is undefined without them. Each states the ruling, the reason that decided it, and
+what it costs.
+
+### R1 - Backend selection: `--spark-disable` is the only switch
+
+`prefer_spark` is set from the existing kill-switch, at the single production
+construction site:
+
+```cpp
+guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id,
+                                             /*prefer_spark=*/!cfg_.spark_disable);
+```
+
+This lands in rung 7.7b, and **7.7b is therefore the cutover**. No second flag is added.
+
+The problem it solves: `GuardianEngine`'s ctor takes `bool prefer_spark = false` and
+production passed only two arguments, so the only `prefer_spark=true` in the tree was a
+unit test. Spark was unreachable in any production configuration, which would have made
+every pre-cutover gate measure the legacy path or a test constructor.
+
+A temporary opt-in selector (`--guardian-spark`, staged cohort, removed later) was
+considered and **rejected**: Yuzu is installed only in small labs, so a staged rollout has
+no value, and a hard cutover is acceptable (owner decision, 2026-07-17). This matches the
+rung-2 posture this document already specifies (detect-only by default; `--spark-disable`
+keeps the enforcing legacy path), so **no ADR amendment is required**.
+
+Behaviour, traced through `reconcile_rule_locked`:
+
+| `--spark-disable` | `prefer_spark_` | `SparkAvailability` | Guardian backend |
+|---|---|---|---|
+| set | `false` | `SparkDisabled` | legacy - **enforcement intact** (escape hatch) |
+| unset | `true` | `Available` | spark |
+| unset, spark boot threw | `true` | `SparkFailed` | **errored - never a silent legacy fallback** |
+
+`--spark-disable` carries three jobs from 7.7b on: the kill-switch, the resource gate's
+legacy comparison arm, and the enforcement escape hatch.
+
+**Fail-visible is fail-closed-for-protection, and that has a correlated-outage tail.** The
+`SparkFailed` → errored path is the right posture (a boot failure must be loud, never a
+silent restore of legacy enforcement), but note the residual risk it commits to: a
+*correlated* spark boot failure - a bad release that throws on every agent - withdraws
+every Guardian rule fleet-wide until an operator sets `--spark-disable`. The rung-11 alert
+group must therefore alert on `SparkFailed` *prevalence* (a fleet-wide spike), not only
+per-agent, so this failure mode is caught in minutes rather than discovered as silent
+non-enforcement.
+
+**Accepted cost:** Guardian enforcement is absent from 7.7b until rung 3, because rung-2
+posture is detect-but-do-not-enforce. The enforce gap was already accepted (rung 3 follows
+immediately, no extended burn-in); the hard cutover makes it start at 7.7b rather than at
+a later flip. `--spark-disable` restores enforcement if that is not tolerable on a given
+box.
+
+**Consequences for the ladder:** the separate "default flip" rung dissolves into 7.7b; its
+residue is the boot WARN, the `yuzu_fleet_spark_enforce_active` gauge, the `changelog.d`
+fragment and the `guaranteed-state.md` upgrade note. Rung 4 no longer gates the cutover,
+because R4 brings the `unsupported` telemetry forward into 7.7b (only `guard_healthy`
+waits for rung 4).
+
+**Note for any future flag:** unknown CLI flags are **fatal** (`main.cpp`'s `CLI11_PARSE`
+does not set `allow_extras`). Adding a flag to a fleet agent and later removing it would
+refuse to start every device whose service definition still carries it. Any flag
+retirement must be staged: accepted-and-ignored with a warning for at least one release.
+This applies to `--spark-disable`'s semantic change at rung 5.
+
+### R2 - Mutual exclusion is per-agent, not per-rule
+
+On a spark-preferred agent, `RulePlacement::Unsupported` routes to the distinct
+`unsupported` state (§Platform-rejection). It **never** falls through to legacy. ADR-0021
+Decision 11's "the flag selects one path" stands unamended.
+
+What decided it: **rung 5 forces this regardless.** When the legacy backend is deleted
+there is nothing to fall through to, so `Unsupported` must become a distinct terminal
+state then. Keeping the fallthrough means implementing the same outcome twice, and
+teaching the parity suite, the telemetry, and the operator model two behaviours.
+
+Verified safe to change now:
+- **Enforcement behaviour is identical.** The legacy File/Registry guards already return
+  false from `start()` off-Windows: a silent no-op, no `guards_` entry. Nothing enforces
+  either way. What changes is reporting, from silence to an explicit state.
+- **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
+  (§Health/status surface), so no server code validates status tokens yet. This is the
+  cheapest moment to introduce one; rung 4 owns its wiring.
+
+**Consequences to book:**
+1. **The existing reconcile tests assert the old semantics.** `test_guardian_engine_spark_reconcile.cpp`
+   contains `TEST_CASE("an unsupported type falls through to legacy, never attempted on spark")`
+   and a same-id replace case that assumes legacy is reachable on a spark agent. They are
+   rewritten in the same PR as the code change, or the suite goes red on a deliberate
+   change and the next person "fixes" it back.
+2. **Parity needs an intentional-delta registry.** Legacy silently no-ops where spark
+   reports `unsupported`. Zero-tolerance parity cannot be literal across that dimension;
+   rung 10's gate artifact must carry the documented delta list, or the gate fails
+   spuriously and gets quietly weakened until it means nothing.
+3. **macOS under spark preference is all-unsupported.** Both mechanism factories return
+   nullptr off their platforms, so every rule on a spark-preferred macOS agent classifies
+   `Unsupported`. That matches today's macOS enforcement reality, but the macOS CI leg
+   must assert exactly that posture or it passes by testing nothing.
+
+### R3 - I/O executor quota semantics
+
+**Ruled:** the per-class bulkheads must be exact. `GuardianIoExecutor`'s class quotas
+(File 4, Registry 3, Service 3) sum to 10 against `total_quota{8}`, and admission is
+first-come-first-served against the two caps with no per-class floor - so File and
+Registry at their own limits starve Service to 1 of its 3 slots with nothing wedged,
+contradicting the header's own guarantee that "a dead mount saturating the file lane never
+starves a healthy service reconcile".
+
+The governing algebra: **if `sum(class_quota) <= total_quota`, the total can never be the
+binding constraint.** Admitting class `c` requires `class_inflight[c] <= quota[c]-1`, and
+every other class is bounded by its own cap, so `total_inflight <= sum(quota) - 1 < sum <=
+total_quota`. The total check cannot fire while any class has room; when every class is at
+cap the class caps reject anyway. So the choice is binary: exact bulkheads with a
+structurally inert total, or oversubscription plus reserved floors.
+
+Oversubscription-plus-floors is **rejected**: it buys 8 versus 10 concurrent
+spawn-per-read *detached* workers (not resident threads), which does not justify new
+admission logic on a safety-critical path.
+
+**Open at time of writing:** whether to satisfy the invariant by setting `total_quota = 10`
+with a constructor-time check, or to remove `total_quota` from `Config` and derive the
+bound from the class quotas. Deriving cannot desynchronise; an explicit total plus an
+invariant check is a tripwire that forces a conscious decision when a fourth `IoClass` is
+added. A synthesis - derive the bound, and `static_assert` the default quotas against an
+explicit `kMaxProcessIoWorkers` - gets both, and is the current preference. Note the check
+cannot be `static_assert` alone: `Config` is runtime-injectable, so the defaults are
+statically asserted and injected values runtime-checked. **Resolve when implementing;
+the semantics above are settled either way.** Whichever is chosen, the `total_quota{8}`
+field comment ("< sum(class quotas) so it actually binds") states the intent this ruling
+*reverses* and must be corrected in the same rung, or a future reader trusts a stale intent.
+
+**Intra-class exhaustion is a separate, unsettled axis (settle it in 7.7a).** The bulkhead
+ruling above is about *cross*-class starvation only. Within a class, keyed single-flight
+plus `class_quota{File:4}` means four distinct wedged file targets saturate the file lane
+and silently kill detection for every file rule - at runtime, with no F3 trip and no crash.
+The load-bearing question the record must pin, not leave to implementer judgement: **when a
+per-class deadline elapses, the admission slot is freed immediately** (the wedged read's
+orphan thread lives on under the F3 count, but the lane recovers), so a wedged target
+degrades to skip-and-continue rather than holding its slot until the orphan returns. Lane
+availability must be decoupled from orphan-thread liveness.
+
+### R4 - Observability contract
+
+**Constraint:** the agent has no `/metrics` endpoint. `spark_heartbeat.hpp` → status_tags
+→ the server-side rollup is the only metric path, and rung 1 already shipped that rail, so
+this is an increment on working rails. `GuardianIoExecutor` already computes per-class
+`Counters{timed_out, rejected_capacity, rejected_key}`, but `stats()` has no production
+caller - they are write-only today, so routing them is new wiring rather than a relabel.
+
+**Standing rule: log state transitions and sampled failures only.** Never per-event or
+per-convergence-read. A chatty file watcher at fleet scale is a self-inflicted denial of
+service on the log pipeline. This rule governs the initial logging pass itself: write this
+set once, rather than a "stopgap" that a later rung has to rip out.
+
+**7.7a (threads live, no rules placed) - logs:** wiring outcome and selected backend;
+scheduler and drain-worker thread start/stop; active I/O workers at shutdown, including
+whether the F3 hard-exit path fired.
+
+**7.7b (rules flow) - logs:** arm/disarm failure transitions, unsupported classification,
+mechanism liveness transitions. **Heartbeat tags:** the executor's per-class counters;
+outbox occupancy, oldest-entry age and drops; scheduler lag; and `yuzu.guardian_backend`,
+without which the server cannot tell which backend a device is running or distinguish
+`SparkFailed` from `Unsupported`.
+
+**The F3 hard-exit signal cannot be a live heartbeat.** `hard_exit()` skips teardown by
+design; the process is gone before anything could be sent. It is a best-effort marker
+persisted before the exit, then read, reported and cleared on the next boot.
+
+## 7.7b split — pre-cutover hardening (settled 2026-07-18)
+
+7.7b was first planned as one PR folding the #2237 send-path items and #2238 test
+seams into the flip. Three independent reviews — Sol/Codex (opine), Claude
+(adjudication, every claim verified against code), and Fable (advisor) — converged on:
+**the flip is unsafe in one PR; split into an inert-hardening PR-1 and a thin-cutover
+PR-2, with the `prefer_spark` flip as the last commit either way.** Every finding below
+was verified against the worktree at `origin/dev` (b09cdd19).
+
+**"Inert" is placement-inert, not behaviour-inert.** PR-1 changes *no* detection or
+enforcement *placement* (`prefer_spark` stays false), but it is not a no-op: the shared
+builder refactors the live legacy emit path (`guardian_engine.cpp:500`), the
+`apply_rules` firewall changes live per-push failure semantics (`guardian_engine.cpp:326`),
+and the telemetry ships new heartbeat tags every beat. State this in the PR so a gate
+reviews it as a live-path change, not a rubber-stamp of a false "inert" premise.
+
+### The cutover-blocking finding (Fable M1): `guard.unhealthy` re-emission flood
+
+The read-failure path calls `unhealthy()` **unconditionally** on every `!read.known`
+(`guardian_rule_eval.cpp:63/111/132`) — there is **no into-unknown edge guard**; only
+*recovery* is edge-forced (`pack()`'s `recovered` bit). `build_entries` then pushes a
+**fresh-`event_id`** health entry on every `Unhealthy` (`guardian_spark_runtime.cpp:405-413`).
+An unhealthy rule stays in `pending_initial` (`:357`), which the priority lane re-sweeps
+every ~5 s (`guardian_convergence_scheduler.hpp:60` `priority_poll_ms{5000}`). Net: one
+mundane unreadable target (ACL-denied file, missing hive path) emits **~17 k
+`guard.unhealthy`/day/rule/agent**, each its own server-side insert transaction. Legacy
+has no health stream, so this traffic class switches on **at the flip** — a self-inflicted
+fleet ingest DoS. **The `guardian_rule_eval.cpp:15` comment "edge-triggered
+guard.unhealthy" is false.** Fix (send-path, flag-gated inert → PR-1, flip unsafe
+without it): transition-edge health emission (emit on the false→true unknown edge + a
+slow periodic refresh only) + evict never-Known rules from the 5 s priority lane to
+their normal lane cadence.
+
+### PR-1 hardening items (commit order 1→2→3→4→7→5→6→9→8)
+
+1. **Shared drift-event builder.** Extract `apply_drift_to_event`; legacy build at
+   `guardian_engine.cpp:500`, spark at `guardian_spark_send.cpp:43` — extract, not just
+   a cross-check test (a cross-check leaves two drifting impls).
+2. **OutboxEntry guard_type/rule_name for Health/Lifecycle** (empty today,
+   `guardian_spark_send.cpp:76`).
+3. **attach_rule + live `apply_rules` exception firewall (Fable M3 — harder than #2237
+   item 2).** `index_->add()` runs *before* `rollback.fn` is assigned
+   (`guardian_spark_runtime.cpp:108` vs `:129`); a **throwing** `arm()` leaves a ghost
+   `by_rule_` entry → the next sibling attach's `keys_.at(key)` throws `out_of_range`
+   (`:143`) through the un-firewalled `apply_rules`. And `SparkKeyRuleIndex::add`'s
+   emplace-throw (`spark_key_rule_index.hpp:92`) leaves an *empty set* → a false 0→1
+   edge on the next add → double-arm → **untracked live subscription leak on a success
+   path**. Requires a strong-guarantee/noexcept `SparkKeyRuleIndex::add` + fault
+   injection of a throwing `arm()`; wrapping callers is not enough.
+4. **Drain-without-lock.** `GuardianSparkRuntime::drain()` holds `outbox_mu_`
+   (`:441`) across `send_guardian_outbox_entry`'s synchronous gRPC `Write()`
+   (`agent.cpp:2700`); the stall cascade is `Write` → `outbox_mu_` → `evaluate_key`
+   commit under `registry_mu_` → `apply_rules` under engine `mtx_` → heartbeat/status.
+   Restructure to peek/copy → unlock → send → conditional-remove by `event_id` alone
+   (globally unique per enqueue — `agent_id`+boot-nonce+`rule_id`+ms+seq — so it pins the
+   exact sent node with no separate generation check; as implemented, `pop_front_if`).
+   Sub-contracts: `drain_once()` is public/off-thread-callable → keep a drain-in-progress
+   guard; the lifecycle log has no index (`guardian_outbox.hpp:294`) → conditional-remove
+   needs a front-`event_id` check; a coalesce during the unlocked send replaces the node
+   with a new `event_id` (`:151`) → remove-by-`event_id` handles it, write the test.
+   **Drain order fix (M6):** send lifecycle *before* compliance (currently `:443-444`
+   sends compliance first) so a rule's "armed" audit entry never arrives after its first
+   drift event.
+5. **Two-count executor + physical-orphan ceiling (Fable M4).** Today inflight counters
+   free at OS-thread-exit (`guardian_io_executor.hpp:338`), so `kMaxProcessIoWorkers=10`
+   is a real physical bound. Freeing the *logical* admission slot on the run() deadline
+   requires a **separate physical-orphan ceiling strictly > sum(quotas)** (else 10 wedged
+   orphans re-create the exact cross-class starvation R3 eliminated) + same-key
+   single-flight retained until orphan exit + an exactly-once logical-vs-physical
+   decrement handshake (a double-decrement inflates quota). Pin the ceiling **value** in
+   the PR description (R3's own lesson).
+6. **F3 KV marker** (R4): best-effort marker persisted before `hard_exit()`, read/reported/
+   cleared next boot.
+7. **Lifecycle-audit durability.** `GuardianLifecycleLog` is in-memory, reject-new+count-
+   on-full, never-evict (`guardian_outbox.hpp:263`), and the send drops on `Write()==true`
+   (queued ≠ acked) → at-most-once + capacity-lossy + crash-lossy = **not audit-grade**.
+   Compliance drift stays documented best-effort telemetry; **lifecycle
+   (`guard.armed/disarmed/errored`) becomes durable**: a retention-bounded journal +
+   replay on boot **and every reconnect**, leaning on the server's existing `event_id`
+   idempotency (PK rollback at `guaranteed_state_store.cpp:670` absorbs replay dups;
+   boot-nonce'd `event_id`s). Delete-on-`Write()==true` alone re-inherits the hole — the
+   entry leaves the journal only after replay-safe confirmation. **Substrate: reuse
+   `KvStore`/`kv_store.db`** (already open, WAL, Guardian writes rules there) — not a new
+   file. Constraints: `get()` truncates at NUL (`kv_store.cpp:178`) → payload is JSON not
+   raw proto; no txn API, each `set()` is a commit+fsync → a 500-rule `full_sync` = ~1000
+   fsyncs → **batch/persist-per-push, not per-entry**; do **not** journal inside
+   `enqueue_lifecycle_locked` (under `registry_mu_`+`outbox_mu_`) or it recreates the
+   coupling item 4 removes — journal at the engine layer under `mtx_`.
+8. **Test seams + TSan** (#2238): the re-arm-throw degrade fault hook, the prefer_spark
+   thread-start introspection, and a concurrent start-drain-then-stop TSan test with the
+   real `this`-capturing send callback.
+9. **R4 telemetry as a producer+consumer contract**, not just agent tags: each field
+   needs an agent writer + `agent_registry.cpp:1323` server parser + family-clear +
+   reset-handling + bounded labels + current-vs-cumulative semantics + a writer/reader
+   cross-pin test; both outbox domains reported separately; the F3 marker included. The
+   `SparkFailed`-prevalence alert ships here reporting the inactive posture, and needs a
+   **paired `reporting`-drop condition** (a correlated crash-loop manifests as
+   `yuzu_fleet_spark_reporting` dropping, not `failed` rising, because a fast loop dies
+   before heartbeating).
+
+Also folded into PR-1: the **R2 `unsupported` terminal state + rung-8 telemetry +
+reconcile-test rewrites**. Verified flag-gated inert — the whole Arm/Unsupported branch
+is under `if (prefer_spark_ && Available)` (`guardian_engine.cpp:845`; the legacy
+fallthrough it replaces is `:882-885`) and the reconcile tests already construct
+`prefer_spark=true` (`test_guardian_engine_spark_reconcile.cpp:160`). Moving it here
+pulls the largest piece of unspecified new semantics off the flip PR.
+
+### PR-2 (thin cutover)
+
+`prefer_spark = !cfg_.spark_disable` (`agent.cpp:~579`, R1) as the **final commit**; the
+**intentional-delta registry** (R2 consequence 2 — pulled forward from rung 10 because
+7.7b changes the behaviour parity classifies); **production-order cached-KV
+restart/upgrade tests** (the current fixture runs `start_local()` before
+`wire_spark_engine()`, the reverse of production `agent.cpp:962` vs `990`, with an empty
+KV — it masks the rehydration path); parity + resource + **3-OS/gateway** evidence
+(Linux File/Service/inert-systemd; Windows File/Registry/Service + shared-watcher
+refcount; macOS all-unsupported + `--spark-disable` legacy-restore; slow/stalled-`Write`;
+long pre-connect/outage; reconnect-during-drain; a server-side reconnect-storm
+events/sec ingest figure); and the **grep-enumerated stale-prose sweep** (`"legacy
+IGuard"`/`"unaffected"`/`"remediated"` — false after the flip at `guardian_engine.cpp:264`,
+`agent.cpp:934-984`, `guaranteed-state.md:344`).
+
+### Two decisions settled 2026-07-18
+
+- **M2 — one-legged recovery.** `event_state_from_type` maps `guard.unhealthy`→errored
+  but `guard.healthy`→`nullptr` (`guaranteed_state_store.cpp:64-67`); recovery clears
+  `errored` only via a paired *compliance* event, which works solely because the prod
+  attach hardcodes `emit_compliant_edge=true` (`guardian_engine.cpp:861`). **Ruled:** add
+  a **cross-pin test** in PR-1 that fails if any attach uses `edge=false`; the real
+  server-side `guard.healthy` census mapping lands with the health surface at **rung 4**.
+- **Flap detector** (design-mandated, §Kill-switch / F3 notes): **deferred to rung 11**
+  alongside the `SparkFailed`-prevalence alert (both server-side fleet-signal work),
+  recorded here so the deferral is explicit rather than silent.
 
 ## Consumer architecture
 
@@ -271,10 +585,36 @@ dashboard fragment. This section ticks every #1939 item.
   exports flat key→value heartbeat tags (`kNetTag*`-style scalars), and every sibling
   `SparkEngineStats` counter is a flat scalar summed across mechanisms — so the
   `{os,mechanism}` breakdown is realized as **separate per-type scalar counters**
-  (file / registry / service), each **pre-seeded to 0** per the bounded-label
-  convention (`docs/observability-conventions.md`), not a single labelled series.
+  (file / registry / service), not a single labelled series. **Corrected as built
+  (rung 1):** these are emitted **SPARSELY — omitted when 0, never pre-seeded** (an
+  earlier draft of this bullet said "pre-seeded to 0", which contradicted this same
+  doc's §Server and the `yuzu_fleet_net_*` precedent). The server clears each gauge
+  family per sweep, so an absent series means "no agent reported it", never a
+  fabricated 0 — the absent-not-zero rule in `docs/observability-conventions.md`.
+  Sparse emit also keeps a quiescent agent's heartbeat at two tags rather than ~15.
   Also emit `yuzu.spark_enforce_active` (rung 2, the detect-only-vs-enforcing signal,
-  §Kill-switch). **Rung-1 task:** introduce `kSparkTag*` tag-key constants
+  §Kill-switch).
+
+  > **RUNG-2 TELEMETRY CONTRACT — read this before touching the counters (#2083).**
+  > The obvious rung-2 move — "counter-type the `yuzu_fleet_spark_*` sums so `increase()`
+  > works" — is **UNIMPLEMENTABLE**, and an earlier draft of this doc and of
+  > `docs/prometheus/yuzu-alerts.yml` both said to do it. A fleet **SUM over a churning
+  > agent population is not a valid counter**: it DECREASES whenever an agent ages out of
+  > the staleness window or restarts (its cumulative counters reset to 0), Prometheus reads
+  > any decrease in a counter as a RESET, and `increase()` then manufactures a false spike
+  > out of an agent merely going away. `clear_gauge_family()` makes it worse — series go
+  > absent and reappear.
+  >
+  > The correct design: the **agent keeps shipping the cumulative absolute value**
+  > (idempotent under a duplicated or lost heartbeat — an agent-side delta is NOT: a
+  > duplicate double-counts and a loss is gone forever), and the **server** holds
+  > last-seen-per-agent and does `counter.inc(max(0, new − old))` with reset detection
+  > (`new < old → inc(new)`). Server state is ~10k × 11 × 8B ≈ 1 MB. That single change
+  > also fixes the **`absent == 0` reader contract**, which today forecloses change-gated
+  > emit and forces every agent to re-ship unchanged counters on every heartbeat
+  > (~68 B → ~556 B at rung 2; ~16 GB/day fleet-wide at 10k agents). Same root, both ends.
+
+  **Rung-1 task:** introduce `kSparkTag*` tag-key constants
   (none exist yet) and pin them with a `static_assert` in a new `test_spark_*`
   test, mirroring the `kNetTag*` pin precedent (`test_network_perf_model.cpp`) —
   this doc does not reuse the net pin's own location. Omit the
@@ -408,6 +748,40 @@ container without a system bus) is today indistinguishable from "no Service spar
 configured." A mechanism-up gauge (or an `inert` reason on the fault channel)
 distinguishes them; **owned by rung 1** (observe-only), not left open. (sre F3.)
 
+> **SHIPPED IN RUNG 1 — the 2026-07-12 deferral below was WRONG and is withdrawn.**
+> The rung-1 governance re-run (2026-07-13) had three agents independently reach the
+> same conclusion — cross-platform, sre (which explicitly *rebutted* the deferral), and
+> Gate-4 consistency. The deferral rested on "inert liveness needs arming to carry
+> signal." It does not: **inertness is known at `start()`**, no arming required, and all
+> three mechanisms already log it there. Worse, deferring it shipped a live
+> misreport — `Dockerfile.agent` installs `libsystemd0` but a container has **no system
+> bus**, so *every containerised Linux agent* advertised a `service` capability whose
+> every `watch()` would be refused: "looks healthy, can detect nothing".
+>
+> Rung 1 therefore ships an `inert` bit on `SparkMechanismStats`, set at `start()` by
+> each mechanism, and **excludes inert mechanisms from the `yuzu.spark_mechs` capability
+> CSV** — so `yuzu_fleet_spark_mechanisms{os,mechanism}` now counts only mechanisms that
+> are registered **and functional**. Inert mechanisms still report their counters;
+> inertness suppresses the capability *claim*, not the telemetry.
+>
+> Still genuinely deferred to rung 2 (#2084): the **armed-but-deaf** liveness signal (a
+> watcher that died after arming) and `mech_unsupported_total` (an arm-rejection counter
+> — nothing arms at rung 1, so it is structurally 0). Those really do need arming.
+
+### Not-running distinguishability (rung 1)
+A spark-capable agent reports exactly one of four postures, and each is distinguishable
+on the wire: **RUNNING** (`spark_running=1` + capability CSV), **FAILED** (`=0`, no
+`spark_disabled` key — enabled, but boot-time instantiation threw), **DISABLED** (`=0`
+plus `spark_disabled=1`), and **ABSENT** (no `yuzu.spark_*` key at all — a pre-rung-1
+agent, or a dead one). Rolled up as `yuzu_fleet_spark_{reporting,failed,disabled}{os}`.
+
+As first built, the FAILED path emitted *nothing*, making it byte-identical to DISABLED
+and to ABSENT — so a fleet where spark failed to boot on 30% of endpoints was
+**unobservable**, which defeats rung 1's entire stated purpose ("prove the engine runs
+and reports at rest"). The DEX sibling already had this right, emitting
+`dex_observer_armed=0` when enabled-but-deaf rather than going quiet. Alert on `failed`;
+never on `disabled`, which is an operator decision. (Gate-4 consistency + UP-10.)
+
 ### Audit-on-arm
 The arming path (Guardian's `apply_rules` / `start_local` calling
 `arm(Service, …)`) emits an audit event at the Guardian layer, matching the
@@ -506,6 +880,25 @@ posting it as a **GitHub PR review (`gh pr review`) on that rung's PR** — a du
 artifact mapping onto Workstream F's "PR review records" category, never a bare git
 commit hash (which can orphan, as this doc's own prior `bbe55cc9` did).
 
+**A PR can orphan too — the rule above is necessary but not sufficient.** Rung 1 proved
+it. PR #2082 carried a complete governance review and GitHub reported it **MERGED** — but
+its base was `fix/2011-spark-mech-ops-per-type`, a sibling branch that had *itself* merged
+to `dev` the day before. GitHub did not retarget it, so the merge (and the code, and the
+review) landed on a dangling ref and **never reached `dev`**. The rule was satisfied and
+the evidence orphaned anyway, because it never checked where the PR's *base* pointed. An
+auditor tracing "what review authorised the code running in production" would have found
+nothing that resolves to `dev`.
+
+Two corrections, both binding from rung 2 on:
+
+1. **Every rung PR bases directly on `dev`.** Never on a sibling feature/fix branch, even
+   one still open — that branch may merge to `dev` first and silently strand the second
+   merge off-trunk. If a rung genuinely must stack, it is rebased onto `dev` and
+   re-targeted *before* merge, not after.
+2. **A PR is valid Workstream-F evidence only once its merge commit is reachable from
+   `dev`** — verified with `git merge-base --is-ancestor <merge-sha> origin/dev`, **not**
+   by trusting the GitHub "Merged" badge, which was true for #2082 the entire time.
+
 Gates, applied at the marked rungs:
 - **Parity:** Guardian §24 invariants verbatim — `Push` seed stays Guardian-only,
   the `__guard__` load-time + dispatch-time dual intercept both remain,
@@ -540,12 +933,32 @@ Each rung is an independently-governed PR on `dev`, run through the full
    and a blocking `watch()` DOES still serialise a second arm of the same type
    (per-type control). Observability half (per-type stats + alerts) deferred to
    rung 1.
-1. **Instantiate + observe** — SparkEngine constructed in `agent.cpp` behind
-   `--spark-disable`; `yuzu.spark_*` heartbeat tags (incl. queue-drop/consumer-error
-   + inert-mechanism signal) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
-   denominator + alerts, `mech_unsupported_total{os,mechanism}`, and the boot log
-   naming the active detection path (legacy `IGuard` still enforcing at rung 1). No
-   consumer yet; proves the engine runs and reports at rest.
+1. **Instantiate + observe — LANDED.** SparkEngine constructed in `agent.cpp` behind
+   `--spark-disable`; `yuzu.spark_*` heartbeat tags (queue-drop/consumer-error +
+   per-type mech counters) + `yuzu_fleet_spark_*` os-labelled gauges + reporting
+   denominator + the capability signal `yuzu_fleet_spark_mechanisms{os,mechanism}` +
+   a reviewed alert group shipped **commented out**, and the boot log naming the active
+   detection path (legacy `IGuard` still enforcing at rung 1). No consumer yet;
+   proves the engine runs and reports at rest. Guards against a boot exception (thread
+   exhaustion) by degrading to no-spark.
+
+   **Shipped beyond the original rung-1 scope**, both added by the rung-1 governance
+   rounds — the ladder must not be read as still deferring them:
+   - **The `inert` bit** (§Inert-mechanism distinguishability). A mechanism that started
+     but could not bind its OS facility is excluded from the capability CSV. The earlier
+     deferral to rung 2 was WITHDRAWN: inertness is known at `start()`, needs no arming,
+     and deferring it shipped a live misreport on every containerised Linux agent
+     (`libsystemd0` is installed, but a container has no system bus).
+   - **The four-posture wire contract** (§Not-running distinguishability): RUNNING /
+     FAILED / DISABLED / ABSENT, rolled up as
+     `yuzu_fleet_spark_{reporting,failed,disabled}{os}`. Without it a fleet-wide spark
+     boot failure was invisible — a failed agent emitted nothing, identical to a
+     deliberate opt-out.
+
+   **Genuinely still deferred to rung 2** (#2084): the ARMED-BUT-DEAF liveness signal (a
+   watcher that dies after arming) and `mech_unsupported_total{os,mechanism}` — both need
+   arming to carry signal. The alert group is enabled at rung 2 (#2083), and NOT by
+   "counter-typing the fleet sums" — see §Fleet metrics for why that does not work.
 2. **Guardian detection consumer** — the queued consumer + arm-per-rule (with the
    `spark_key→rule` index, refcounted shared watchers, and the re-arm/initial-eval
    contract), detection only (observe mode), behind the switch, both paths compiled
@@ -554,6 +967,138 @@ Each rung is an independently-governed PR on `dev`, run through the full
    `changelog.d` fragment + `guaranteed-state.md` upgrade note for the rung-2
    enforcement-posture default change** (detect-only by default; `--spark-disable`
    keeps the enforcing legacy path). Gates: event-stream equivalence parity + the resource gate.
+
+   **Rung 2 is delivered as an inner ladder of its own** - the surface is too large
+   for one governed PR, and ADR-0021 Decision 11 (as amended) requires the parity,
+   resource, and evidence-continuity gates **per rung**, not once at the end. This
+   inner ladder was previously recorded only in commit messages and a local plan
+   file, which is what caused PR #2224's Gate-1 scoping error (the range was written
+   against a memory-recalled merge-base and inner rungs 2-6 went in ungoverned).
+   It is written down here so a gate can be scoped against it.
+
+   Inner rungs 1-7 **merged as PR #2224** (~45 files), all pure/against-fakes
+   agent-internal code with no production call site - the subsystem is compiled but
+   unreachable (`wire_spark_engine()` has zero callers):
+   - **1.** Tri-state + snapshot reshape of `guardian_rule_eval` (`ReadResult<Snapshot>`
+     → `EvalOutcome{Silent|Emit|Unhealthy}`; Unknown never mutates the emit-decider).
+   - **2.** `guardian_outbox` (header-only, pure): FIFO drain, retain-on-failure,
+     coalescing domains, generation purge, cap ⇒ reject-new-key backpressure.
+   - **3.** `GuardianSparkRuntime` core against fakes: registry mutex, per-rule
+     generations, per-key eval mutex, one `evaluate_key` for all paths, detach-safe
+     `shared_ptr` capture. TSan + ASan detached-handler checkpoint.
+   - **4.** Convergence scheduler: per-type lanes, jitter, size+mtime precheck before
+     re-hash, byte budget, non-droppable pending-initial priority.
+   - **5.** Platform `StateReaders` (file handle-scoped #807 hashers, registry
+     `RegOpenKeyExW`, service SCM/sd-bus, absent→Stopped), **plus F3** - the
+     bounded/cancellable I/O executor (spawn-per-read detached workers, per-class
+     deadlines, keyed single-flight, the executor's `active_worker_count()` - surfaced to
+     the engine as `active_io_workers()` - for the orphan-exit count).
+   - **6.** `enabled()` fix (own commit, a legacy behaviour change): a disabled rule
+     in `apply_rules` no longer arms, and an already-armed rule pushed disabled is
+     stopped.
+   - **7.** `GuardianEngine` integration: `reconcile_rule_locked()` as the sole
+     arm/disarm chokepoint, `wire_spark_engine()` as a rollback-on-failure transaction,
+     the `SparkAvailability` state, decl-order/stop-order prep, and the F3 orphan-exit
+     enforcement (`hard_exit()` when an I/O worker outlives the grace).
+
+   Remaining inner rungs (this program):
+   - **9a.** This decision record + the inner ladder + the gates-per-rung note.
+     Docs-only; precedes 7.7 because 7.7's shape depends on R1-R4. **(this change.)**
+   - **7.7a.** Lifecycle-only wiring. Reorder boot to **construct → register
+     mechanisms → `SparkEngine::start()` → `wire_spark_engine()` → `start_local()`**
+     (the header requires wiring before `start_local()`, and the capability set
+     `reconcile` reads is only correct after `start()`; whether `arm()` before
+     `start()` is safe per mechanism must be **pinned, not discovered**). Extend the
+     boot latch across object publication and wiring; prove every early-return and
+     concurrent-`stop()` path; exercise wiring rollback. `prefer_spark` hardcoded
+     `false` - **zero placement behaviour change.** Ships R4's 7.7a log set.
+     Qualifies shutdown and the F3 hard-exit path, **including its interaction with
+     `Restart=always`** (see below).
+   - **7.7b — SPLIT into two governed PRs (settled 2026-07-18, §7.7b split below).**
+     Three reviewers (Sol/Codex, Claude, Fable) found the send/placement path is not
+     yet safe to make live in one PR. The flip is the **last commit** either way.
+
+     **PR-1 is itself landed as two governed PRs (decided 2026-07-18) so each is
+     reviewable as one unit and item 9's counters land before their consumers:**
+     - **PR-1a** = the send/exception/drain cluster: items 1 (shared drift builder),
+       2 (guard_type/rule_name), 3 (exception firewall), 4 (drain-without-lock), plus
+       their two Sol/Fable hardening folds and this governance round. Behaviourally
+       inert (`prefer_spark` false), but item 3's `apply_rules` firewall is a **live
+       legacy-path** crash-prevention fix (see the changelog fragment).
+     - **PR-1b** = items 5 (two-count executor + orphan ceiling), 6 (F3 marker),
+       7 (KV lifecycle journal), 9 (R4 telemetry + the heartbeat wiring for the
+       PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
+       fix)**, and the R2 `unsupported` terminal state.
+     - **FLIP GATE:** M1, item 9's heartbeat wiring, #2270, and the lifecycle-audit
+       journal ALL land in PR-1b and **gate PR-2** — the `prefer_spark` flip must not
+       ship while any is open. M1 in particular is a fleet ingest-DoS if the flip
+       precedes it, so it is not enough that it is "in PR-1" — it is specifically in
+       PR-1b, after PR-1a.
+
+     - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
+       detection/enforcement *placement*).** The shared drift-event builder;
+       OutboxEntry guard_type/rule_name for Health/Lifecycle; attach_rule + live
+       `apply_rules` exception firewall (strong-guarantee `SparkKeyRuleIndex::add`);
+       **drain-without-lock** (transport outside `outbox_mu_`); the two-count executor
+       + a **physical-orphan ceiling strictly > sum(quotas)**; the F3 KV marker;
+       **lifecycle-audit durability** (KV-backed journal, replay on boot+reconnect);
+       the **transition-edge health-emission fix** (see §7.7b split M1 — the flip is a
+       fleet ingest-DoS without it); the `unsupported` terminal state (R2) + rung-8
+       telemetry + reconcile-test rewrites (flag-gated inert, so they land here not on
+       the flip); R4 telemetry producers+consumers + the `SparkFailed`-prevalence
+       alert, all reporting the *inactive* posture; the #2238 test seams + TSan.
+     - **PR-2 (thin cutover).** `prefer_spark = !cfg_.spark_disable`; the
+       intentional-delta registry (R2 consequence 2, pulled forward from rung 10 since
+       7.7b changes the behaviour it classifies); production-order cached-KV
+       restart/upgrade tests; parity + resource + **3-OS/gateway** evidence; the
+       grep-enumerated stale-prose sweep; the flip as the **final commit**. **This is
+       where detection moves to spark and legacy enforcement stops** (until rung 3).
+   - **8.** `mech_unsupported_total` + `yuzu_fleet_spark_unsupported` - **folded into
+     7.7b PR-1** per R2 (unsupported must be loud the moment a rule can land on spark);
+     current-gauge vs cumulative-counter split per §7.7b split.
+   - **10.** Parity + durability + integration matrix. Semantic ports land **before**
+     7.7b where possible; live/equivalence after. Carries the **intentional-delta
+     registry** (R2 consequence 2) so zero-tolerance parity survives the legacy-no-op
+     vs `unsupported` difference.
+   - **11.** The `yuzu-fleet-spark` alert group (#2083) enabled + promtool CI lint,
+     including the `SparkFailed`-prevalence alert (R1 correlated-outage note).
+   - **12.** Dissolved into 7.7b per R1. Residue only: boot WARN, `enforce_active`
+     gauge, `changelog.d` fragment, `guaranteed-state.md` upgrade note.
+   - **9b.** The full as-built rewrite of this §Rung-2 decision record and the ladder
+     against the shipped 7.7a/7.7b/10 code, folding R3's resolved mechanism and R2's
+     `unsupported`-vocab reconciliation. Docs-only; lands after 7.7b.
+
+   **F3 × `Restart=always` (must be answered in 7.7a).** `deploy/systemd/yuzu-agent.service`
+   sets `Restart=always` + `RestartSec=10` and **no `StartLimitIntervalSec`/`StartLimitBurst`**,
+   so systemd's default burst limit (5 restarts / 10s) can never trip when restarts are
+   spaced ≥10s apart. The F3 `hard_exit()` fires when an I/O worker is wedged past the
+   grace. Against a *permanently* wedged target (dead NFS mount, hung SCM call) this is a
+   10-second crash loop: exit → restart → arm the same rule → wedge → exit. Windows SCM
+   recovery policy is the equivalent.
+
+   **This is a security finding, not only an ops one.** Anyone who can wedge a read on a
+   watched target inside a Baseline's scope (a black-holed NFS/SMB mount, a hung SCM or
+   registry call) gets a **whole-agent** denial-of-service primitive: the crash loop downs
+   every plugin, the heartbeat, and every other rule, not just the offending one.
+
+   So the two candidate answers are **not** equivalent, and 7.7a must not treat them as an
+   implementer coin-flip:
+   - **Primary: degrade-and-skip-that-rule.** A wedged read isolates to its own rule and
+     the agent keeps running everything else. This bounds the blast radius to one rule and
+     is the required default. (It is the same "free the admission slot on deadline"
+     property R3's intra-class note pins - the two findings share one mechanism.)
+   - **`hard_exit()` is reserved for a genuinely uncancellable orphan** (a worker that
+     cannot be cancelled and would otherwise run through static teardown - F3's original
+     purpose), never as the routine answer to a wedged target. Bound it with a per-boot
+     F3-trip cap.
+   - **Belt-and-braces backstop:** add `StartLimitIntervalSec`/`StartLimitBurst` to the
+     unit so any regression that still loops enters `failed` (paged) instead of restarting
+     forever, and pair it with a **server-side flap detector** (repeated short-lived
+     sessions from one agent) - a fast crash loop may exit before the heartbeat rail is
+     even wired, so the agent cannot always self-report, and the F3 KV marker (R4) can go
+     unreported.
+
+   The F3 trip should page - a wedged read in the kernel is not routine.
 3. **Enforce cutover** — Service/Registry remediation on the consumer thread;
    never-drop enforce lane; dequeue-time re-gate; the withdrawal disarm-push trigger
    contract (reconcile the armed set — `full_sync` today, or a new per-rule

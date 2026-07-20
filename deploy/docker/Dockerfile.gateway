@@ -17,7 +17,7 @@
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:28-alpine@sha256:f36705c51f7c6d92d102234dfa6d85f8d2828e10f9adcfc98ff1931f87850787 AS deps
+FROM erlang:28-alpine@sha256:7ac041688101d99b99d2bd53711f676d2773798d3d9488c6560e75ab88d2e631 AS deps
 
 RUN apk add --no-cache git
 
@@ -67,6 +67,12 @@ RUN rebar3 as prod release
 # image to a wget-less variant or strip busybox without first updating every
 # compose file's healthcheck block to use a tool the new base provides.
 # Governance Gate 7, architect SHOULD-2.
+#
+# ENFORCED (#751): scripts/ci/verify-healthcheck-invariants.sh runs
+# `wget --spider` against a live listener inside this image before release.yml
+# pushes it, and on every PR that touches this file. NOTE: Alpine's busybox is
+# built WITHOUT the httpd applet, so it cannot serve the probe's listener — the
+# script uses the official busybox image for that.
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \

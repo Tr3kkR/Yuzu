@@ -16,6 +16,7 @@
 #include "agent_registry.hpp"
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
@@ -43,6 +44,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
@@ -282,18 +284,13 @@ TEST_CASE("MCP Policy: is_valid_tier", "[mcp][policy]") {
 }
 
 // ── MCP token integration with ApiTokenStore ──────────────────────────────
+//
+// ApiTokenStore ported to Postgres (PR 4.1) — these tests now clone an
+// ephemeral database per case via the shared ApiTokenStorePg helper
+// (test_api_token_pg_helper.hpp), which SKIPs when YUZU_TEST_POSTGRES_DSN is
+// unset and FAILs when it is set but broken, same as every other [pg] test.
 
 namespace {
-
-struct TempDb {
-    std::filesystem::path path;
-    // #473: per-instance unique path (was a shared `test_mcp_tokens.db` in the system
-    // temp dir, which collided across concurrent CI shards / a crash-without-cleanup).
-    TempDb() : path(yuzu::test::unique_temp_path("mcp-tokens-")) {
-        std::filesystem::remove(path);
-    }
-    ~TempDb() { std::filesystem::remove(path); }
-};
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -303,55 +300,47 @@ int64_t now_epoch() {
 
 } // namespace
 
-TEST_CASE("MCP Token: create MCP token with tier", "[mcp][token]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
-    REQUIRE(store.is_open());
+TEST_CASE("MCP Token: create MCP token with tier", "[pg][mcp][token]") {
+    yuzu::test::ApiTokenStorePg store;
 
     auto expires = now_epoch() + 86400; // 24 hours
-    auto raw = store.create_token("MCP Readonly", "admin", expires, "", "readonly");
+    auto raw = store->create_token("MCP Readonly", "admin", expires, "", "readonly");
     REQUIRE(raw.has_value());
 
-    auto validated = store.validate_token(*raw);
+    auto validated = store->validate_token(*raw);
     REQUIRE(validated.has_value());
     CHECK(validated->name == "MCP Readonly");
     CHECK(validated->mcp_tier == "readonly");
 }
 
-TEST_CASE("MCP Token: MCP token requires expiration", "[mcp][token]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
-    REQUIRE(store.is_open());
+TEST_CASE("MCP Token: MCP token requires expiration", "[pg][mcp][token]") {
+    yuzu::test::ApiTokenStorePg store;
 
     // MCP token with no expiration should be rejected
-    auto raw = store.create_token("No Expiry MCP", "admin", 0, "", "operator");
+    auto raw = store->create_token("No Expiry MCP", "admin", 0, "", "operator");
     CHECK(!raw.has_value());
 }
 
-TEST_CASE("MCP Token: regular token has empty mcp_tier", "[mcp][token]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
-    REQUIRE(store.is_open());
+TEST_CASE("MCP Token: regular token has empty mcp_tier", "[pg][mcp][token]") {
+    yuzu::test::ApiTokenStorePg store;
 
-    auto raw = store.create_token("Regular Token", "admin");
+    auto raw = store->create_token("Regular Token", "admin");
     REQUIRE(raw.has_value());
 
-    auto validated = store.validate_token(*raw);
+    auto validated = store->validate_token(*raw);
     REQUIRE(validated.has_value());
     CHECK(validated->mcp_tier.empty());
 }
 
-TEST_CASE("MCP Token: list includes mcp_tier", "[mcp][token]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
-    REQUIRE(store.is_open());
+TEST_CASE("MCP Token: list includes mcp_tier", "[pg][mcp][token]") {
+    yuzu::test::ApiTokenStorePg store;
 
     auto expires = now_epoch() + 86400;
-    store.create_token("Regular", "admin");
-    store.create_token("MCP Read", "admin", expires, "", "readonly");
-    store.create_token("MCP Supervised", "admin", expires, "", "supervised");
+    store->create_token("Regular", "admin");
+    store->create_token("MCP Read", "admin", expires, "", "readonly");
+    store->create_token("MCP Supervised", "admin", expires, "", "supervised");
 
-    auto tokens = store.list_tokens();
+    auto tokens = store->list_tokens().value();
     REQUIRE(tokens.size() == 3);
 
     int mcp_count = 0;
@@ -362,20 +351,18 @@ TEST_CASE("MCP Token: list includes mcp_tier", "[mcp][token]") {
     CHECK(mcp_count == 2);
 }
 
-TEST_CASE("MCP Token: 90-day max TTL enforced", "[mcp][token]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
-    REQUIRE(store.is_open());
+TEST_CASE("MCP Token: 90-day max TTL enforced", "[pg][mcp][token]") {
+    yuzu::test::ApiTokenStorePg store;
 
     // 91 days from now should be rejected
     auto expires_91d = now_epoch() + 91 * 24 * 3600;
-    auto raw = store.create_token("Too Long MCP", "admin", expires_91d, "", "readonly");
+    auto raw = store->create_token("Too Long MCP", "admin", expires_91d, "", "readonly");
     CHECK(!raw.has_value());
     CHECK(raw.error().find("90 days") != std::string::npos);
 
     // 89 days from now should be accepted
     auto expires_89d = now_epoch() + 89 * 24 * 3600;
-    auto raw_ok = store.create_token("OK MCP", "admin", expires_89d, "", "readonly");
+    auto raw_ok = store->create_token("OK MCP", "admin", expires_89d, "", "readonly");
     CHECK(raw_ok.has_value());
 }
 
@@ -730,6 +717,14 @@ struct McpTestServer {
     std::string mock_username{"test-user"};
     yuzu::server::auth::Role mock_role{yuzu::server::auth::Role::admin};
 
+    /// Engine-principal deny-belt (PR 4.3 §9): defaults MATCH
+    /// yuzu::server::auth::Session's own field defaults ("human"/"local"), so
+    /// leaving these untouched is a no-op for every pre-existing test. A test
+    /// exercising the belt sets one (or both) to the engine-classed value —
+    /// `deny_if_engine_session()` in mcp_server.cpp trips on EITHER key alone.
+    std::string mock_principal_kind{"human"};
+    std::string mock_auth_source{"local"};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
     yuzu::server::mcp::McpServer::HandlerFn get_handler;    // 2f: GET /mcp/v1/
@@ -812,6 +807,8 @@ private:
             s.username = mock_username;
             s.role = mock_role;
             s.mcp_tier = mock_tier;
+            s.principal_kind = mock_principal_kind;
+            s.auth_source = mock_auth_source;
             return s;
         };
 
@@ -1611,6 +1608,118 @@ TEST_CASE("MCP A4: shared tier-denied error carries a correlation id (#1470)",
     // parity with the REST sibling (Gate-4 consistency N2).
     REQUIRE(denied["error"]["data"].contains("retry_after_ms"));
     CHECK(denied["error"]["data"]["retry_after_ms"].is_null());
+}
+
+// ── Engine-principal MCP deny-belt (PR 4.3 §9, sec-HIGH regression guard) ──
+//
+// This round hardened ALL 9 engine-principal MCP tools to call
+// `deny_if_engine_session()` — including the 3 read tools
+// (list_engine_principals / get_engine_principal / audit_engine_no_admin)
+// which previously did NOT belt-check and were the actual regression. An
+// engine-classed session (principal_kind=="engine" OR auth_source==
+// "engine_token" — either key alone is sufficient, mirrored from the REST
+// §9 deny-belt tests in test_engine_principal_lifecycle.cpp) must be denied
+// on every one of the 9 tools, not just the mutating ones.
+//
+// No engine_principal_store/engine_credential_store is wired here: every
+// handler runs deny_if_engine_session() BEFORE its own store-availability
+// check (verified by reading mcp_server.cpp), so the JSON-RPC denial is
+// reached — and asserted — with none of the store plumbing this file would
+// otherwise need. tier defaults to "" (start() with no arg), which
+// tier_allows() treats as "not an MCP token -> allow everything, defer to
+// RBAC" — i.e. this reproduces a human-login-shaped session that happens to
+// carry an engine-classed principal_kind/auth_source, exactly the shape the
+// belt exists to catch.
+namespace {
+/// The 9 engine-principal lifecycle tool names (kToolSecurity entries in
+/// mcp_server.cpp), each dispatched with an empty `arguments` object — every
+/// handler's deny_if_engine_session() call runs before any argument parsing,
+/// so the shape of `arguments` cannot matter to this assertion.
+const std::vector<std::string> kEngineLifecycleTools = {
+    "create_engine_principal",  "list_engine_principals",
+    "get_engine_principal",     "revoke_engine_principal",
+    "mint_engine_credential",   "rotate_engine_credential",
+    "confirm_engine_rotation",  "transfer_engine_principal_owner",
+    "audit_engine_no_admin",
+};
+
+/// Dispatches `tool_name` with an empty arguments object and asserts the
+/// JSON-RPC response is the §9 deny-belt's own error — a kTierDenied A4
+/// error carrying the exact denial message, not a store result (which would
+/// prove nothing: a nullptr store also 503s, but that's the WRONG reason to
+/// pass).
+void assert_engine_deny_belt_denies(McpTestServer& ts, const std::string& tool_name, int id) {
+    INFO("tool_name = " << tool_name);
+    nlohmann::json req{{"jsonrpc", "2.0"},
+                       {"method", "tools/call"},
+                       {"id", id},
+                       {"params", {{"name", tool_name}, {"arguments", nlohmann::json::object()}}}};
+    auto res = ts.call(req.dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(body["error"]["message"] ==
+         "engine-classed sessions may not call engine-principal lifecycle tools");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["remediation"] == "use a human admin credential");
+
+    // The belt's own audit row, distinct from the tool's normal success/failure
+    // audit action: "mcp.<tool_name>|denied", detail "engine-classed session on
+    // lifecycle surface" (mcp_server.cpp's deny_if_engine_session()).
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp." + tool_name + "|denied");
+    CHECK(ts.audit_details.back() == "engine-classed session on lifecycle surface");
+}
+} // namespace
+
+TEST_CASE("MCP engine-principal deny-belt: principal_kind==\"engine\" is denied on "
+          "all 9 lifecycle tools",
+          "[mcp][integration][engine_principal][deny_belt]") {
+    McpTestServer ts;
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "local"; // deliberately NOT engine_token — principal_kind alone
+                                   // must be enough to trip the belt (mirrors the REST
+                                   // §9 "principal_kind key" test)
+    ts.start();                   // empty tier -> tier_allows() defers to RBAC (mock always-allow)
+
+    int id = 1;
+    for (const auto& tool : kEngineLifecycleTools) {
+        assert_engine_deny_belt_denies(ts, tool, id++);
+    }
+}
+
+TEST_CASE("MCP engine-principal deny-belt: auth_source==\"engine_token\" is denied "
+          "on all 9 lifecycle tools",
+          "[mcp][integration][engine_principal][deny_belt]") {
+    McpTestServer ts;
+    ts.mock_principal_kind = "human"; // deliberately human-shaped principal_kind —
+                                      // auth_source alone must ALSO trip the belt
+                                      // (mirrors the REST §9 "auth_source key" test)
+    ts.mock_auth_source = "engine_token";
+    ts.start();
+
+    int id = 1;
+    for (const auto& tool : kEngineLifecycleTools) {
+        assert_engine_deny_belt_denies(ts, tool, id++);
+    }
+}
+
+TEST_CASE("MCP engine-principal deny-belt: the 3 read tools regressed this round "
+          "are individually covered (list/get/audit_no_admin)",
+          "[mcp][integration][engine_principal][deny_belt]") {
+    // Narrower, explicit companion to the two loop-based tests above — calls
+    // out by name the three read tools the governance review flagged as
+    // having NOT belt-checked before this round, so a future revert of just
+    // those three handlers still fails a test that names them directly
+    // rather than only failing inside a loop.
+    McpTestServer ts;
+    ts.mock_principal_kind = "engine";
+    ts.start();
+
+    assert_engine_deny_belt_denies(ts, "list_engine_principals", 1);
+    assert_engine_deny_belt_denies(ts, "get_engine_principal", 2);
+    assert_engine_deny_belt_denies(ts, "audit_engine_no_admin", 3);
 }
 
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",
@@ -4240,6 +4349,46 @@ TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → 
     CHECK(saw_failure);
 }
 
+TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #1717 fail closed",
+          "[mcp][sle]") {
+    // The OTHER arm of the #1717 guard (`rbac_store && rbac_store->is_open()`):
+    // the sibling test above leaves the store null; this one hands the twin a
+    // NON-NULL store whose backing file is garbage bytes, so sqlite3_open_v2
+    // succeeds but the schema migration hits SQLITE_NOTADB and RbacStore
+    // closes db_ — the literal #1717 corrupt-but-openable scenario. Both arms
+    // collapse into one boolean today, so only this case would catch a future
+    // null-prefix refactor (`if (rbac_store && ...)`) breaking the corrupt
+    // arm (#2104).
+    yuzu::test::TempDbFile db{"yuzu_test_mcp_rbac_corrupt-"};
+    {
+        // NON-empty garbage: SQLite treats a zero-byte file as a valid fresh
+        // database, which would open cleanly and defeat the test.
+        std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "not a valid sqlite database";
+    }
+    yuzu::server::RbacStore broken(db.path);
+    REQUIRE_FALSE(broken.is_open());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &broken; // non-null but unusable
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":94,)"
+                       R"("params":{"name":"query_software_licenses","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("authorization subsystem unavailable") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not a served read
+    // Same CC7.2 audit trail as the null arm.
+    bool saw_failure = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "mcp.query_software_licenses|failure")
+            saw_failure = true;
+    CHECK(saw_failure);
+}
+
 TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle]") {
     yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
@@ -5222,7 +5371,7 @@ TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
 // replay is rejected. Locks the a28deae0 fix at the integration level.
 
 TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_permission",
-          "[mcp][integration][approval][auth_routes]") {
+          "[pg][mcp][integration][approval][auth_routes]") {
     namespace fs = std::filesystem;
     // Per-test unique dir for the AuthRoutes stores (mirrors AuthRoutesFixture
     // in test_auth_routes.cpp).
@@ -5233,19 +5382,21 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
     auth::AuthManager auth_mgr{};
     REQUIRE(auth_mgr.upsert_user("real_mcp_user", "test_password", auth::Role::admin));
 
-    ApiTokenStore api_tokens(tmp_dir / "api_tokens.db");
+    // ApiTokenStore ported to Postgres (PR 4.1) — clones an ephemeral database
+    // via the shared ApiTokenStorePg helper (SKIPs when YUZU_TEST_POSTGRES_DSN
+    // is unset, FAILs when set but broken).
+    yuzu::test::ApiTokenStorePg api_tokens;
     AnalyticsEventStore analytics(tmp_dir / "analytics.db");
-    REQUIRE(api_tokens.is_open());
     REQUIRE(analytics.is_open());
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
-    AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, &api_tokens,
+    AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, api_tokens.get(),
                   /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
                   /*tag_store=*/nullptr, &analytics, oidc_mu, oidc_provider);
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
-    auto raw_token = api_tokens.create_token("c1-integration", "real_mcp_user",
+    auto raw_token = api_tokens->create_token("c1-integration", "real_mcp_user",
                                              now + 3600, "", "supervised");
     REQUIRE(raw_token.has_value());
 

@@ -285,30 +285,55 @@ groups:
     rules:
       # yuzu_server_guardian_events_dropped_total is a cumulative-but-published-
       # as-gauge counter that RESETS on server restart, so alert on increase()
-      # over a window, never an absolute value or `> 0`. The metric conflates
-      # benign redelivery (agent reconnect / event_seq_ reset after a crash-loop)
-      # with real loss and the forged-id pre-claim path (#1360), so the threshold
-      # needs a real-fleet redelivery baseline — the value below is a placeholder
-      # starting point, tune it against your own reconnect churn. Closing this
-      # alert is what turns the #1414 CC7.3 visibility gauge into an operating
-      # control: a sustained climb means drift was observed but silently discarded.
+      # over a window, never an absolute value. Since item-7 PR-Sv it counts ONLY
+      # MISMATCHED-payload event_id collisions — a forged-id pre-claim (#1360) or an
+      # agent event_seq_ reset / clock skew carrying a DIFFERENT event. Benign
+      # redelivery (the durable agent journal re-sending on reconnect) is now on the
+      # separate quiet yuzu_server_guardian_events_redelivered_total and does NOT
+      # land here — so this is a security-relevant anomaly signal, not reconnect
+      # churn, and the threshold is low. A sustained climb means either drift is
+      # being silently discarded (#1414 CC7.3) or an agent is pre-claiming/forging
+      # event_ids — investigate, don't just widen the threshold.
       - alert: YuzuGuardianEventsDropped
         expr: |
-          increase(yuzu_server_guardian_events_dropped_total[1h]) > 50
+          increase(yuzu_server_guardian_events_dropped_total[1h]) > 5
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Guardian events dropped at ingest (event_id PK conflict)"
+          summary: "Guardian events dropped at ingest (mismatched event_id collision)"
           description: >-
-            More than 50 Guardian events were dropped at ingest on an event_id
-            PK/UNIQUE conflict in the last hour. Some redelivery is benign
-            (agent reconnects, event_seq_ resets); a sustained climb means real
-            drift is being silently discarded — check the server `warn` logs for
-            the rejected event_id, and rule out a clock-skewed fleet or a
-            forged-id pre-claim. Tune the threshold to your fleet's reconnect
-            churn.
+            More than 5 Guardian events were dropped at ingest in the last hour on
+            a MISMATCHED-payload event_id collision. These are not benign
+            redeliveries (those are counted on
+            yuzu_server_guardian_events_redelivered_total) — each is a forged-id
+            pre-claim (#1360), an agent event_seq_ reset / clock skew carrying a
+            different event, or drift being silently discarded (#1414 CC7.3).
+            Check the server `warn` logs for the conflicting event_id + agent, and
+            investigate a forged-id campaign or a misbehaving agent before tuning.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-events-dropped"
+
+      # A sustained OPERATIONAL ingest-fault rate means the classify/insert machinery is
+      # broken and event_id conflicts are going UNCLASSIFIED — a genuine collision can then
+      # escape yuzu_server_guardian_events_dropped_total entirely (item-7 sec-M2). The
+      # metric resets on restart, so alert on increase() over a window. A metric with no
+      # alert would be the same blind spot #1414 exists to close, one layer down.
+      - alert: YuzuGuardianIngestErrors
+        expr: |
+          increase(yuzu_server_guardian_events_ingest_errors_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian event ingest is failing (conflicts going unclassified)"
+          description: >-
+            The Guardian event ingest path reported operational faults (a failed
+            BEGIN/prepare/insert/commit, or a redelivery compare that could not run) over
+            the last 15 minutes. While this persists, an event_id conflict cannot be
+            classified redelivery-vs-collision, so a genuine forged-id collision can
+            escape yuzu_server_guardian_events_dropped_total. Check the server logs and
+            the guaranteed-state DB health (disk pressure, corruption, lock contention).
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-ingest-errors"
 
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
@@ -638,3 +663,155 @@ groups:
       #       inventory source in over two daily cycles. Check for a fleet-wide agent
       #       outage, a broken/disabled sync source, or a network partition.
       #     runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+
+  # ── yuzu-fleet-spark — DISABLED at rung 1 (reviewed template; enable at rung 2) ──
+  # SparkEngine (ADR-0021 Stage-2) is instantiated OBSERVE-ONLY at rung 1: no consumer
+  # arms rules, so every yuzu_fleet_spark_* counter is provably 0 in production. These
+  # rules are DELIBERATELY COMMENTED OUT until rung 2, for two reasons governance surfaced:
+  #   1. They can only fire on a FORGED heartbeat until rung 2 (an enrolled agent
+  #      spoofing e.g. yuzu.spark_quarantined=1) — an enabled critical would let ONE
+  #      agent page on-call with zero real signal (gov UP-2).
+  #   2. The counters are fleet SUMs of monotonic per-agent counters surfaced as gauges,
+  #      so a bare `> 0` LATCHES: once any agent reports non-zero it never returns to 0
+  #      for that process's lifetime — a transient watch-cap/slow-op blip pages forever
+  #      (gov arch-S2 / sre-F1). The correct form is increase()/rate() over a
+  #      counter-TYPED metric, a rung-2 change (see the exprs below).
+  #
+  # ⚠ THE RUNG-2 FIX IS *NOT* "counter-type the fleet sum" — that does not work, and an
+  # earlier draft of this comment said it did (governance Gate-4 consistency). A fleet SUM
+  # over a CHURNING agent population is not a valid counter: it DECREASES whenever an agent
+  # ages out of the staleness window or restarts (its cumulative counters reset to 0), and
+  # Prometheus reads any decrease in a counter as a RESET — so increase() would manufacture
+  # a false spike out of an agent simply going away. clear_gauge_family() makes it worse:
+  # series go absent and reappear.
+  #
+  # The real fix is a PER-AGENT DELTA: the agent ships the interval delta and the server
+  # .inc()s a true monotonic counter it owns. That is the same change that fixes the
+  # `absent == 0` reader contract (Gate-3 performance) — today an absent counter is read as
+  # 0 rather than "unchanged", which is what forecloses change-gated emit and forces every
+  # agent to re-ship unchanged counters on every heartbeat (~68B → ~556B at rung 2, an 8×
+  # step, ~16GB/day fleet-wide at 10k agents). Both ends, one change. Tracked by #2083.
+  #
+  # ENABLE at rung 2 with: (a) the per-agent delta-emit + server-side counter above,
+  # (b) uncomment this group, (c) confirm each runbook notes "restart the agent to clear
+  # a latched signal". armed_faulted is a live/self-healing gauge and is `> 0`-safe; the
+  # cumulative counters use increase(...[15m]) > 0 below. PRESERVE the {os[,mechanism]}
+  # labels — File/Registry are Windows-only, Service is Windows+Linux, so NEVER
+  # sum without(os) these (a cross-OS aggregate is meaningless).
+  #
+  # - name: yuzu-fleet-spark
+  #   rules:
+  #     - alert: YuzuSparkMechanismQuarantined
+  #       expr: |
+  #         increase(yuzu_fleet_spark_quarantined[15m]) > 0
+  #       labels:
+  #         severity: critical
+  #       annotations:
+  #         summary: "Spark {{ $labels.mechanism }} mechanism quarantined on {{ $labels.os }}"
+  #         description: >-
+  #           A SparkEngine mechanism reported a quarantine — a structural leak that should
+  #           stay 0. Detection for that mechanism type is compromised on the affected OS.
+  #           Inspect the agent `warn` logs; restart the agent to clear a latched signal.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-mechanism-quarantined"
+  #     - alert: YuzuSparkWatchRejected
+  #       expr: |
+  #         increase(yuzu_fleet_spark_watch_rejected[15m]) > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark {{ $labels.mechanism }} watch rejections on {{ $labels.os }}"
+  #         description: >-
+  #           A SparkEngine mechanism is rejecting watch arms (watch-cap reached) — a
+  #           denial-of-detection: rules that should be enforced could not arm. Check the
+  #           per-type watch cap and the volume of rules of that mechanism type on the OS.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-watch-rejected"
+  #     - alert: YuzuSparkArmedFaulted
+  #       expr: |
+  #         yuzu_fleet_spark_armed_faulted > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark armed watches went deaf on {{ $labels.os }}"
+  #         description: >-
+  #           One or more armed spark watches reported FAULTED (armed but no longer
+  #           watching) — detection is silently down for those watches. This is a live
+  #           gauge (self-heals when the watch recovers) — no latch. Correlate with agent
+  #           restarts / OS event-source ACL changes.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-armed-faulted"
+  #     - alert: YuzuSparkSlowOp
+  #       expr: |
+  #         increase(yuzu_fleet_spark_slow_op[15m]) > 0
+  #       for: 10m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark {{ $labels.mechanism }} slow watch/unwatch ops on {{ $labels.os }}"
+  #         description: >-
+  #           A SparkEngine mechanism is recording slow watch/unwatch operations — a stalled
+  #           or contended watcher. Sustained slow ops can delay detection. Inspect the
+  #           mechanism's OS facility (IOCP / TP_WAIT pool / sd-bus / SCM) on the OS.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-slow-op"
+  #     - alert: YuzuSparkQueuedDropped
+  #       expr: |
+  #         increase(yuzu_fleet_spark_queued_dropped[15m]) > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Spark queued events dropped on {{ $labels.os }}"
+  #         description: >-
+  #           The SparkEngine bounded consumer queue dropped events (overflow or shutdown).
+  #           On the observe lane this loses detections; once the enforce lane lands (rung 3)
+  #           a drop is a silent compliance failure. Check consumer throughput + queue cap.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/spark-queued-dropped"
+
+  # ── yuzu-fleet-spark-rung1 — ACTIVE (the one live-actionable spark signal today) ──
+  # yuzu_fleet_spark_failed is NOT one of the latching counter-sums above: it is a STATE
+  # gauge recomputed and cleared on every 15s sweep (an agent that recovers or restarts
+  # leaves it within one sweep), and it carries real signal at rung 1 — boot-time
+  # instantiation failure, e.g. thread/pid exhaustion, which is exactly the degraded
+  # posture rung 1 exists to make visible (gov UP-11 / sre Gate-6). severity=warning,
+  # deliberately NOT critical: the value is agent-self-reported inside the heartbeat
+  # trust boundary, so ONE forged or buggy agent can set it to 1 — a warning routes to a
+  # ticket, not a page (gov Gate-2 security). Escalate per-fleet policy if failed
+  # exceeds a meaningful fraction of yuzu_fleet_spark_reporting + yuzu_fleet_spark_failed.
+  - name: yuzu-fleet-spark-rung1
+    rules:
+      - alert: YuzuSparkBootFailed
+        expr: |
+          yuzu_fleet_spark_failed > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} agent(s) on {{ $labels.os }} report SparkEngine FAILED"
+          description: >-
+            Agents reported spark_running=0 without spark_disabled=1 for 30+ minutes:
+            SparkEngine failed to instantiate at boot (commonly thread/handle exhaustion —
+            the agent deliberately degrades to no-spark instead of crash-looping) or the
+            posture was forged. Legacy Guardian detection is unaffected. Check the
+            affected agents' warn logs for "SparkEngine: instantiation failed"; a restart
+            after resolving host pressure clears the posture within one sweep.
+          runbook_url: "https://docs.yuzu.io/runbooks/spark-boot-failed"
+  # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
+  # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
+  # dark at once" (fleet-wide agent outage / gateway partition) — real alert blindness,
+  # because every `> 0` rule above no-matches on absent series. But during a STAGED
+  # ROLLOUT (or a fleet with zero rung-1 agents) the series is legitimately absent, so
+  # enabling this before the fleet floor is upgraded guarantees a false page. Enable
+  # once yuzu_fleet_spark_reporting has a stable baseline:
+  #     - alert: YuzuSparkFleetSignalGone
+  #       expr: |
+  #         absent(yuzu_fleet_spark_reporting)
+  #       for: 15m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "All spark fleet telemetry vanished"
+  #         description: >-
+  #           No agent reported any spark posture for 15m. Either the upgraded-agent
+  #           population is gone (mass agent outage, gateway partition) or the server
+  #           sweep stopped. Correlate with yuzu_fleet_net_*/agent-online gauges before
+  #           reading this as a spark problem.

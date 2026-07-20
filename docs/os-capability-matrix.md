@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-13._
+_Last hand-updated: 2026-07-16._
 
 ## Matrix
 
@@ -25,6 +25,7 @@ _Last hand-updated: 2026-07-13._
 | **Guardian — registry guard** | ✅ | ⛔ | ⛔ | `guard_registry.cpp` (no-op off-Windows); `registry_support::kHives` |
 | **Guardian — file guard** | ✅ | ⛔ | ⛔ | `guard_file.cpp` (no-op off-Windows) |
 | **Guardian — service run-state guard** | ✅ enforce | 🟡 observe-only | ⛔ | `make_service_guard()` in `guard_systemd.hpp`; Win `ServiceGuard` (SCM), Linux `SystemdServiceGuard` (sd-bus, enforce deferred) |
+| **SparkEngine detection mechanisms** (ADR-0021 Stage-2; observe-only at rung 1) | ✅ file + registry + service | 🟡 service only — **and NONE in a container** (see note) | ⛔ none | `make_{file,registry,service}_mechanism()` in `spark_mechanism.hpp` (returns `nullptr` off-platform → type left unregistered): File/Registry Windows-only, Service Win-SCM + Linux-sd-bus, macOS none. **Registered ≠ functional:** a mechanism that starts but cannot bind its OS facility is marked INERT and EXCLUDED from the capability CSV — `sd_bus_open_system()` failing (`spark_service.cpp`, the inert branch in `start()`), `OpenSCManager` denied, `CreateThreadpool`/`CreateIoCompletionPort` failing. **The container case is the common one:** `deploy/docker/Dockerfile.agent` installs `libsystemd0`, but a container has **no system bus**, so a containerised Linux agent registers the Service mechanism INERT and ends up with **zero** spark capability — it reports `spark_running=1` with an EMPTY `spark_mechs` CSV and no `{os=linux,mechanism=*}` series. Surfaced fleet-wide via `yuzu_fleet_spark_mechanisms{os,mechanism}`; an inert agent shows up as a capability GAP (`yuzu_fleet_spark_reporting{os}` exceeding the sum of `yuzu_fleet_spark_mechanisms{os,mechanism}`). Not yet wired to drive detection/enforcement (that is rung 2/3) |
 | **DEX — reliability signals** (crashes, hangs, service/boot, storage, kernel faults, perf/thermal, …) | ✅ | 🟡 growing (17 signals: perf cpu/mem/disk + storage/uptime + journald unit-crash/hung + coredump-crash + OOM + time-unsynced + kernel panic/disk/fs/dirty-shutdown/MCE/hung-task + thermal-throttle) | 🟡 | Win: `dex_observer.cpp`/`dex_win_poll.cpp`; Linux: `dex_linux_collector.cpp`/`dex_linux_proc.cpp`/`dex_linux_storage.cpp`/`dex_linux_journal.cpp`/`dex_linux_kmsg.cpp`/`dex_linux_sysfs.cpp`; macOS: `dex_macos_collector.cpp` (DiagnosticReports/OSLog/IOKit). Catalogue: `docs/dex-signal-catalog.md` |
 | **DEX — performance telemetry** (CPU/mem/disk levels) | ✅ | ✅ | ⛔ | Two paths, both live on Win+Linux: DEX breach sampling (`dex_win_poll.cpp` / `dex_linux_proc.cpp`) and the TAR `$Perf_*` sampler (`tar_perf.cpp` — Win kernel counters; Linux `/proc` via `parse_linux_perf_counters`). macOS absent from the rollup |
 | **DEX — per-app file version** (on procperf + on crash/hang signals; the `(name, version)` identity) | ✅ | ⛔ (emits `""`) | ⛔ (emits `""`) | Win: procperf reads `VS_FIXEDFILEINFO` via `GetFileVersionInfo` (`tar_proc_perf.cpp`, schema v4); crash/hang read WER `AppVersion` (`dex_signal_catalog.cpp`, migration {8}); both canonicalized by `yuzu::util::canon_version`. Linux/macOS emit `""` (unknown bucket) — version capture is a follow-up (`COREDUMP_PACKAGE_VERSION` / ELF `.note.package`; `.ips` bundle) |
@@ -42,6 +43,7 @@ _Last hand-updated: 2026-07-13._
 | **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`); no-op note elsewhere |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ | `network_config/dns_cache` (`DnsGetCacheDataTable`) |
 | **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
+| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `netsh advfirewall` | ✅ backend autodetect (firewalld / ufw / iptables) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate

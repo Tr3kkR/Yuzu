@@ -28,6 +28,17 @@
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
 
+// rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
+#include "guardian_convergence_scheduler.hpp"
+#include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_outbox_drain_worker.hpp"
+#include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
+#include "guardian_spark_backend.hpp"
+#include "guardian_spark_bridge.hpp" // spark_spec_from_rule, rule_assertion_from_rule, classify
+#include "guardian_spark_runtime.hpp"
+#include "guardian_state_reader.hpp"
+#include "spark_engine.hpp"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -35,6 +46,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,6 +64,12 @@ constexpr std::string_view kKeyGen      = "meta:policy_generation";
 
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";
+
+// The rollback guard used by wire_spark_engine() (rollback runs on EVERY exit path,
+// including a catch handler's own logging throwing - Sol rung-7.5 finding 2) is now
+// the shared, terminate-safe GuardianRollback (guardian_scope_guard.hpp): its cleanup
+// joins threads / resets shared_ptrs and could throw during unwinding, which a plain
+// noexcept ~ScopeExit would turn into std::terminate (rung 7.7b PR-1 item 3 / Sol B3).
 
 std::string hex_encode(const std::string& bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
@@ -148,8 +166,8 @@ std::string make_rule_key(std::string_view rule_id) {
 
 } // namespace
 
-GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id)
-    : kv_{kv}, agent_id_{std::move(agent_id)} {}
+GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
+    : kv_{kv}, agent_id_{std::move(agent_id)}, prefer_spark_{prefer_spark} {}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
@@ -170,8 +188,13 @@ std::string_view GuardianEngine::kv_namespace() {
 std::expected<void, std::string> GuardianEngine::start_local() {
     std::lock_guard lock(mtx_);
     if (started_) return {};
+    // stop() is STICKY: if it already ran (e.g. a SIGTERM / service-stop arrived
+    // during boot, before the reordered start_local() at rung 7.7a), do NOT
+    // resurrect. Without this, stop() -> start_local() would set started_=true and
+    // re-arm cached guards AFTER stop() returned, so stop() would not be truthful
+    // (and at rung 7.7b, detection + buffered sends could resume post-stop).
+    if (stopped_) return {};
     started_ = true;
-    stopped_ = false;
 
     if (!kv_) {
         spdlog::warn("Guardian: KV store unavailable — rule cache will be in-memory only "
@@ -211,8 +234,22 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         }
         if (!rule.enabled())
             continue;
-        if (start_guard_for_rule_locked(rule)) // count only guards that actually armed
-            ++rearmed;
+        // Arming a legacy guard spawns a std::thread (guard_{file,registry,systemd}.cpp);
+        // under thread-or-handle exhaustion that ctor throws std::system_error. This
+        // loop runs OUTSIDE the json try above, and start_local()'s caller does not
+        // catch, so an uncaught throw here escapes run() and terminates the agent. Since
+        // rung 7.7a re-armed cached guards AFTER the SparkEngine's own boot threads, an
+        // exhausted host could now hit this on the still-authoritative legacy backend.
+        // Degrade per-rule (LOUD error, this rule does not enforce) so the agent survives
+        // to arm the rest, rather than terminating the whole process.
+        try {
+            if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
+                ++rearmed;
+        } catch (const std::exception& e) {
+            spdlog::error("Guardian: rule '{}' failed to re-arm ({}) - NOT enforcing this rule; "
+                          "agent continues with the remaining rules",
+                          rule.rule_id(), e.what());
+        }
     }
 
     spdlog::info("Guardian engine started (cached_rules={}, re-armed={}, policy_generation={})",
@@ -237,6 +274,21 @@ void GuardianEngine::sync_with_server() {
 
 void GuardianEngine::stop() {
     std::lock_guard lock(mtx_);
+    // Spark teardown FIRST, in this order (rung 7): (1) runtime phase 1 - fast,
+    // wakes any bounded reader waiter, makes a concurrent spark event a no-op;
+    // (2) the convergence scheduler - joins its lane threads, CV-interruptible
+    // so this is prompt, not a multi-minute wait; (3) the drain worker - joins
+    // its thread. By the time all three return, spark_runtime_ is refusing new
+    // commits, so the external spark_engine_->stop() (owned by agent.cpp,
+    // called separately - GuardianEngine never owns spark_engine_ itself) can
+    // safely tear down the consumer afterward without racing a live commit.
+    // (4) legacy guards, unchanged.
+    if (spark_runtime_)
+        spark_runtime_->begin_stop();
+    if (spark_scheduler_)
+        spark_scheduler_->stop();
+    if (spark_drain_worker_)
+        spark_drain_worker_->stop();
     stop_all_guards_locked();
     stopped_ = true;
     started_ = false;
@@ -250,17 +302,38 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (!kv_)
         return std::unexpected("kv store unavailable");
 
+    std::size_t applied = 0;
+    std::size_t reconcile_failures = 0;
     if (push.full_sync()) {
         const int cleared = kv_->clear(kKvNamespace);
         if (cleared > 0)
             spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
         // Re-persist the policy generation marker after clear() wiped everything.
         persist_generation_locked();
-        // Full sync replaces the active set — tear down guards before re-arming.
-        stop_all_guards_locked();
+        // Full sync replaces the active set - tear down BOTH backends before
+        // re-arming (rung 7: a spark-attached rule the new push omits must be
+        // withdrawn too, not left dangling - Sol's rev-2 review). FIREWALLED like the
+        // per-rule reconcile below: stop_all_guards_locked/detach_all allocate (lifecycle
+        // enqueue, disarm, Key strings), and a bad_alloc here would otherwise escape
+        // apply_rules onto the un-firewalled dispatch/run() thread and abort the whole
+        // agent - the same #2037 class the per-rule firewall closes, on the full_sync
+        // path (Gate 4 UP-1/UP-14). Count + hold the generation so the server retries,
+        // then proceed to re-arm what we can.
+        try {
+            stop_all_guards_locked();
+            if (spark_runtime_)
+                spark_runtime_->detach_all();
+        } catch (...) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("Guardian: full_sync teardown threw - partial teardown, "
+                              "holding generation for retry");
+            } catch (...) {
+            }
+        }
     }
 
-    std::size_t applied = 0;
     for (const auto& rule : push.rules()) {
         if (rule.rule_id().empty()) {
             spdlog::warn("Guardian: skipping rule with empty rule_id (name={})", rule.name());
@@ -269,18 +342,45 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         if (!put_rule_locked(rule)) {
             return std::unexpected("failed to persist rule '" + rule.rule_id() + "'");
         }
-        start_guard_for_rule_locked(rule); // step 4: arm the on-box guard
+        // Per-rule exception firewall: reconcile can throw (a spark attach OOM, a
+        // backend arm that throws) and must NOT abort the whole push and escape to the
+        // dispatch caller - an escaped exception on the unguarded ThreadPool task aborts
+        // the whole agent (#2037). Degrade loud and continue - the posture start_local()
+        // takes for a thread-exhaustion throw. catch(...) not just std::exception, and
+        // the log is guarded (spdlog allocates and could itself throw under the bad_alloc
+        // that triggered this). (rung 7.7b PR-1 item 3 / Sol B1 + Fable.)
+        try {
+            reconcile_rule_locked(rule); // step 4: arm/withdraw via the reconcile op (rung 7)
+        } catch (...) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted but not armed",
+                              rule.rule_id());
+            } catch (...) {
+            }
+            continue; // not counted as applied
+        }
         ++applied;
     }
 
-    if (push.policy_generation() > policy_generation_) {
+    // Do NOT advance the policy generation when any rule failed to arm. The server's
+    // heartbeat reconcile fn re-pushes only while the agent reports a generation BEHIND
+    // current (server.cpp), so advancing here would tell the server "caught up" and
+    // strand the unarmed rule until restart - a silent enforcement hole on a
+    // Guaranteed-State product. Holding the generation keeps the 25s heartbeat retry
+    // live so a transient OOM/thread-exhaustion self-heals. (Sol B1 / Fable.) A later
+    // successful push can still advance past a persistently-failing rule; arm_failures_
+    // (surfaced via the heartbeat, item 9) is the durable fleet-visible signal for that.
+    if (reconcile_failures == 0 && push.policy_generation() > policy_generation_) {
         policy_generation_ = push.policy_generation();
         persist_generation_locked();
     }
 
     refresh_count_locked();
-    spdlog::info("Guardian: apply_rules ok (applied={}, full_sync={}, generation={}, total={})",
-                 applied, push.full_sync(), policy_generation_, rule_count_);
+    spdlog::info(
+        "Guardian: apply_rules ok (applied={}, failed={}, full_sync={}, generation={}, total={})",
+        applied, reconcile_failures, push.full_sync(), policy_generation_, rule_count_);
     return applied;
 }
 
@@ -395,6 +495,16 @@ std::size_t GuardianEngine::rule_count() const {
     return rule_count_;
 }
 
+std::size_t GuardianEngine::armed_guard_count() const {
+    std::lock_guard lock(mtx_);
+    return guards_.size();
+}
+
+std::size_t GuardianEngine::spark_armed_rule_count() const {
+    std::lock_guard lock(mtx_);
+    return spark_runtime_ ? spark_runtime_->rule_count() : 0;
+}
+
 std::uint64_t GuardianEngine::policy_generation() const {
     std::lock_guard lock(mtx_);
     return policy_generation_;
@@ -457,38 +567,14 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     ev.set_event_id(d.rule_id + "-" + agent_id_ + "-" + std::to_string(now_ms) + "-" +
                     std::to_string(seq));
     ev.set_rule_id(d.rule_id);
-    ev.set_rule_name(d.rule_name);
-    ev.set_guard_type(d.guard_type); // "registry" | "file" | "service" — set by the producing guard
     ev.set_guard_category("event");
-    ev.set_detected_value(d.detected_value);
-    ev.set_expected_value(d.expected_value);
-    ev.set_detection_latency_us(d.detection_latency_us);
-    if (d.compliant) {
-        // Compliant transition (Slice B): the watched state is at / returned to
-        // expected. No remediation fields — a compliant edge is never a write-back.
-        // The server buckets guard.compliant + drift.remediated → compliant; the
-        // guard only emits this on the edge, so steady state adds zero traffic.
-        ev.set_event_type("guard.compliant");
-    } else if (d.remediation_attempted) {
-        ev.set_remediation_action(d.remediation_action);
-        ev.set_remediation_success(d.remediation_success);
-        ev.set_remediation_latency_us(d.remediation_latency_us);
-        // drift.remediated = write-back restored the value; remediation.failed =
-        // enforce attempted but the write did not succeed (e.g. read-only-fallback
-        // key, denied ACL). Both are in the frozen taxonomy and the dashboard
-        // renderer styles them; remediation.failed keeps a failed enforce visibly
-        // distinct from a passive detection so the operator sees enforcement is
-        // not working, not just that drift exists.
-        ev.set_event_type(d.remediation_success ? "drift.remediated" : "remediation.failed");
-    } else {
-        ev.set_event_type("drift.detected");
-    }
-    // drift_rate carries the count of ADDITIONAL drift detections the agent-side
-    // sink debounce collapsed into this single event over its window (H3 / #1209):
-    // 0 = sole detection in its window; a high value means a competing writer was
-    // churning the value and the burst was folded to keep the event store bounded.
-    if (d.collapsed_count > 0)
-        ev.set_drift_rate(static_cast<double>(d.collapsed_count));
+    // rule_name / guard_type / detected_value / expected_value / detection_latency_us,
+    // the 4-way event_type cascade (+ remediation fields) and drift_rate are shared
+    // byte-for-byte with the spark consumer's Compliance branch — set them from the
+    // single apply_drift_to_event source of truth so the two producers cannot drift
+    // apart (#2237 item 1). event_id, rule_id, guard_category, timestamp and platform
+    // stay stamped here (idempotency- and host-specific).
+    apply_drift_to_event(d, ev);
     ev.mutable_timestamp()->set_seconds(now_ms / 1000);
     // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
     // "windows", which would mislabel every drift event once Linux/macOS guards land.
@@ -508,10 +594,29 @@ void GuardianEngine::stop_all_guards_locked() {
     guards_.clear();
 }
 
+void GuardianEngine::withdraw_legacy_guard_locked(const std::string& rule_id) {
+    if (auto it = guards_.find(rule_id); it != guards_.end()) {
+        if (it->second)
+            it->second->stop();
+        guards_.erase(it);
+    }
+}
+
 bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule& rule) {
     // Spark dispatch. Each Spark type maps to a guard implementation, all no-op off
     // Windows for the MVP. Returns true iff a guard was actually armed (so callers
     // can count accurately).
+
+    // Retire any guard already armed for this rule_id BEFORE validating/arming the
+    // new definition below. Each branch used to do this find-stop-erase only on its
+    // happy path, AFTER the type/assertion checks - so a same-id re-push whose new
+    // assertion failed validation (an unsupported type, an unrecognized spark type)
+    // returned false early and left the PRIOR guard running, silently enforcing a
+    // stale definition the caller believes was replaced (apply_rules persists the
+    // new rule to KV regardless of whether it arms). Hoisting this here means every
+    // return path - early-invalid, late-failed-start, or success - starts from a
+    // clean slate, so an unarmed/errored outcome is genuinely unarmed.
+    withdraw_legacy_guard_locked(rule.rule_id());
 
     // ── file-change Spark (Change B) — realtime file watch via FileGuard ──────
     if (rule.spark().type() == "file-change") {
@@ -578,11 +683,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 : std::string(fcfg.expect_present ? "expect present" : "expect absent");
 
         auto file_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
-        if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
-            if (it->second)
-                it->second->stop();
-            guards_.erase(it);
-        }
+        // (prior guard for this rule_id already retired at function entry)
         auto fguard = std::make_unique<FileGuard>(std::move(fcfg), std::move(file_sink));
         if (fguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(fguard));
@@ -628,11 +729,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         const std::string log_service = cfg.service_name; // captured before the move below
 
         auto service_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
-        if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
-            if (it->second)
-                it->second->stop();
-            guards_.erase(it);
-        }
+        // (prior guard for this rule_id already retired at function entry)
         // Platform factory: Windows SCM ServiceGuard or Linux systemd
         // SystemdServiceGuard, both IGuard. Keeps this dispatch platform-clean.
         auto sguard = make_service_guard(std::move(cfg), std::move(service_sink));
@@ -697,11 +794,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     // delivers once set_event_sink runs. emit_guard_event takes sink_mtx_ only.
     auto guard_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
 
-    if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
-        if (it->second)
-            it->second->stop();
-        guards_.erase(it);
-    }
+    // (prior guard for this rule_id already retired at function entry)
     auto guard = std::make_unique<RegistryGuard>(std::move(cfg), std::move(guard_sink));
     if (guard->start()) {
         guards_.emplace(rule.rule_id(), std::move(guard));
@@ -713,6 +806,230 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                  "(non-Windows or invalid hive)",
                  rule.rule_id());
     return false;
+}
+
+bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
+    if (!rule.enabled()) {
+        if (spark_runtime_)
+            spark_runtime_->detach_rule(rule.rule_id());
+        withdraw_legacy_guard_locked(rule.rule_id());
+        return false;
+    }
+
+    // VALIDATION FIRST, before any capability/preference question: an
+    // authoring fault (an unrecognized spark type, a spark-type/assertion-
+    // type mismatch, a missing required target param) must never be
+    // mislabeled as a routine platform gap (Sol's rev-2 review flagged the
+    // original ordering as backwards). A rule that fails validation is
+    // withdrawn from both backends; get_status()'s existing universal
+    // "errored" fail-closed behaviour already represents this correctly - no
+    // separate error-reason tracking exists yet (deferred to a later rung
+    // that wires status_for_rule() into a more granular get_status()).
+    auto assertion = rule_assertion_from_rule(rule);
+    auto spec = spark_spec_from_rule(rule);
+    if (!assertion || !spec) {
+        // A validation-rejected rule is withdrawn from BOTH backends with no
+        // diagnostic at all otherwise - unlike every legacy arm-failure path,
+        // which always spdlog::warns with the rule_id and a reason. Silent
+        // withdrawal here means an operator sees a rule stop being enforced
+        // (e.g. on the next restart re-arm pass) with nothing in the log to
+        // explain why (sre Gate 6 finding, this PR).
+        spdlog::warn("Guardian: rule '{}' failed spark validation ({}) - withdrawing from "
+                     "both detection paths",
+                     rule.rule_id(),
+                     !assertion ? assertion.error() : "spec derivation failed for spark type '" +
+                                                           rule.spark().type() + "'");
+        if (spark_runtime_)
+            spark_runtime_->detach_rule(rule.rule_id());
+        withdraw_legacy_guard_locked(rule.rule_id());
+        return false;
+    }
+
+    // spark_availability_ is set exactly once by wire_spark_engine() and never
+    // changes afterward. prefer_spark_ is immutable for this object's
+    // lifetime. SparkFailed and Unwired NEVER fall back to legacy - a failure
+    // must be visible (errored), never silently absorbed (mutual exclusion).
+    if (prefer_spark_ && (spark_availability_ == SparkAvailability::SparkFailed ||
+                          spark_availability_ == SparkAvailability::Unwired)) {
+        withdraw_legacy_guard_locked(rule.rule_id());
+        return false;
+    }
+
+    const bool try_spark = prefer_spark_ && spark_availability_ == SparkAvailability::Available;
+    if (try_spark) {
+        // Capability set: registered AND functional (non-inert) mechanisms
+        // only - mirrors spark_heartbeat.hpp's own inert-filtering exactly,
+        // so a mechanism that started but could not bind its OS facility is
+        // never misclassified as armable (Sol's rev-2 review).
+        std::set<SparkType> supported;
+        if (spark_engine_)
+            for (const auto& [type, ms] : spark_engine_->stats_by_type())
+                if (!ms.inert)
+                    supported.insert(type);
+        const RulePlacement placement = classify(rule.spark().type(), supported);
+        if (placement == RulePlacement::Arm) {
+            withdraw_legacy_guard_locked(rule.rule_id());
+            auto gen = spark_runtime_->attach_rule(rule.rule_id(), std::move(*spec),
+                                                   std::move(*assertion),
+                                                   /*emit_compliant_edge=*/true);
+            if (gen)
+                return true; // armed; attach_rule already enqueued its own "armed" audit entry
+            // Arm failure: errored, NEVER a fallback to legacy (mutual exclusion).
+            spdlog::warn("Guardian: spark arm failed for rule '{}': {}", rule.rule_id(),
+                         gen.error());
+            spark_runtime_->detach_rule(rule.rule_id()); // defensive; attach_rule leaves nothing on failure
+            return false;
+        }
+        if (placement == RulePlacement::Unrecognized) {
+            // Structurally unreachable here: spec/assertion validation above
+            // already rejected an unrecognized spark type before this point
+            // is ever reached. Kept as an explicit branch (not folded into
+            // the Unsupported fallthrough below) so a future reordering of
+            // the validation step cannot silently start treating an
+            // authoring fault as a routine legacy fallback.
+            if (spark_runtime_)
+                spark_runtime_->detach_rule(rule.rule_id());
+            withdraw_legacy_guard_locked(rule.rule_id());
+            return false;
+        }
+        // placement == Unsupported: a ROUTINE cross-platform gap (a known
+        // type, no mechanism on THIS host) - legacy is the correct, expected
+        // outcome here, not a failure. Falls through to the legacy arm below.
+    }
+
+    if (spark_runtime_)
+        spark_runtime_->detach_rule(rule.rule_id()); // harmless no-op if never attached
+    return start_guard_for_rule_locked(rule); // existing legacy path, UNCHANGED
+}
+
+void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_by_config,
+                                       std::function<SendResult(const OutboxEntry&)> send) {
+    std::lock_guard lock(mtx_);
+    // stop() is STICKY (see start_local): if a stop already ran during boot, do NOT
+    // start any spark machinery. Leaving spark_availability_ Unwired is correct - the
+    // agent is shutting down and there is nothing to detect with.
+    if (stopped_) {
+        spdlog::info("Guardian: wire_spark_engine() after stop() - not wiring (shutdown in "
+                     "progress); spark stays Unwired");
+        return;
+    }
+    if (spark_availability_ != SparkAvailability::Unwired) {
+        spdlog::warn("Guardian: wire_spark_engine() called more than once - ignoring (already {})",
+                     spark_availability_ == SparkAvailability::Available ? "Available"
+                     : spark_availability_ == SparkAvailability::SparkFailed ? "SparkFailed"
+                                                                             : "SparkDisabled");
+        return;
+    }
+    if (spark_disabled_by_config) {
+        spark_availability_ = SparkAvailability::SparkDisabled;
+        spdlog::info("Guardian: spark path disabled by --spark-disable - legacy IGuard is the "
+                     "sole detection path");
+        return;
+    }
+    if (!engine) {
+        spark_availability_ = SparkAvailability::SparkFailed;
+        spdlog::warn("Guardian: spark_engine_ failed to boot - spark path unavailable; legacy "
+                     "IGuard is the sole detection path (never silently substituted)");
+        return;
+    }
+
+    // All-or-nothing wiring transaction. `registered` tracks whether
+    // register_consumer() succeeded, so the guard below knows whether it must
+    // unregister on a LATER step's failure (scheduler/drain-worker
+    // construction, which can throw - both spawn threads).
+    bool registered = false;
+    SparkEngine::ConsumerId consumer_id = 0;
+    // Runs rollback_spark_wiring_locked() on ANY exit from this point on -
+    // an early return, an exception unwinding out of the try below, or a
+    // catch handler's own spdlog::warn call itself throwing - unless
+    // `committed` is set at the very end of the success path. Declaring this
+    // OUTSIDE the try/catch, before either branch runs, is what guarantees
+    // the destructor always fires (Sol rung-7.5 review finding 2: the prior
+    // explicit rollback_spark_wiring_locked() call inside each catch block
+    // could be skipped if the logging call ahead of it threw).
+    GuardianRollback rollback;
+    rollback.fn = [this, engine, &registered, &consumer_id] {
+        rollback_spark_wiring_locked(engine, registered, consumer_id);
+    };
+    try {
+        spark_reader_ = std::make_shared<GuardianStateReader>();
+        spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);
+        spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_);
+
+        auto id = engine->register_consumer("guardian-spark",
+                                            GuardianSparkRuntime::make_handler(spark_runtime_));
+        if (!id) {
+            spdlog::warn("Guardian: spark consumer registration failed ({}) - spark path "
+                         "unavailable",
+                         id.error());
+            return; // rollback's destructor cleans up (registered is still false)
+        }
+        consumer_id = *id;
+        registered = true;
+        spark_backend_->bind_consumer(consumer_id);
+
+        spark_scheduler_ = std::make_unique<ConvergenceScheduler>(*spark_runtime_);
+        spark_drain_worker_ = std::make_unique<GuardianOutboxDrainWorker>(*spark_runtime_,
+                                                                          std::move(send));
+        // Start the convergence + drain machinery ONLY when spark is the ACTIVE
+        // detection backend (prefer_spark_). At prefer_spark_=false (rung 7.7a: spark
+        // wired but legacy authoritative) no rule ever places on spark, so the outbox
+        // never fills and the convergence lanes are empty - their 5 threads would be
+        // pure overhead AND would claim thread budget ahead of the still-authoritative
+        // legacy backend, whose re-arm (start_local) follows wiring at boot. rung 7.7b
+        // (prefer_spark_=true) starts them here. stop() calls their stop()
+        // unconditionally, a no-op on an unstarted scheduler/drain. (start() may throw:
+        // it spawns threads - hence the ScopeExit rollback above.)
+        if (prefer_spark_) {
+            spark_scheduler_->start();
+            spark_drain_worker_->start();
+        }
+
+        spark_engine_ = engine;
+        spark_availability_ = SparkAvailability::Available;
+        rollback.committed = true;
+        spdlog::info("Guardian: spark path wired and available (consumer_id={})", consumer_id);
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian: spark wiring failed ({}) - rolling back, spark path unavailable",
+                     e.what());
+    } catch (...) {
+        // Belt-and-braces: nothing may terminate the agent for this
+        // best-effort subsystem, even a non-std throw.
+        spdlog::warn("Guardian: spark wiring failed (unknown exception) - rolling back, spark "
+                     "path unavailable");
+    }
+}
+
+void GuardianEngine::rollback_spark_wiring_locked(SparkEngine* engine, bool registered,
+                                                  std::uint64_t consumer_id) {
+    // Unwind in the reverse order construction attempted them. Each step is
+    // independently null-safe, so this is correct regardless of exactly how
+    // far the wiring sequence got before it threw.
+    if (spark_drain_worker_)
+        spark_drain_worker_->stop();
+    spark_drain_worker_.reset();
+    if (spark_scheduler_)
+        spark_scheduler_->stop();
+    spark_scheduler_.reset();
+    if (spark_runtime_)
+        spark_runtime_->begin_stop();
+    spark_runtime_.reset();
+    spark_backend_.reset();
+    spark_reader_.reset();
+    if (registered)
+        engine->unregister_consumer(consumer_id);
+    spark_engine_ = nullptr;
+    spark_availability_ = SparkAvailability::SparkFailed;
+}
+
+GuardianEngine::SparkAvailability GuardianEngine::spark_availability() const {
+    std::lock_guard lock(mtx_);
+    return spark_availability_;
+}
+
+std::size_t GuardianEngine::active_io_workers() const {
+    std::lock_guard lock(mtx_);
+    return spark_reader_ ? spark_reader_->active_io_workers() : 0;
 }
 
 // #501: Test-support helper — see guardian_engine.hpp for the full rationale.

@@ -126,7 +126,11 @@ RUN set -eux; \
 #   libsqlite3-0_libs       agent KV / identity store.
 #   libsystemd0_libs        sd-bus, for the Linux Guardian systemd service guard
 #                           (libyuzu_agent_core.so DT_NEEDED libsystemd.so.0).
-#   busybox-static_bins     single static binary for the compose healthcheck
+#   busybox-static_bins     single static binary; PRE-EMPTIVE for a compose
+#                           healthcheck (no compose healthchecks an agent image
+#                           today — the agent has no HTTP endpoint). Gated anyway
+#                           by scripts/ci/verify-healthcheck-invariants.sh (#751)
+#                           so the demo stack can gain one without a silent break.
 #                           (no shell otherwise exists in the image).
 #   base-passwd_data        /etc/passwd + /etc/group base (NSS "files").
 #   netbase_config          /etc/protocols + /etc/services (getaddrinfo).

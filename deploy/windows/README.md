@@ -13,7 +13,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 |---|---|
 | `Provision-Windows-Runner.ps1` | Installs the pinned toolchain, sets machine env (incl. the gateway + shared-cache contracts), emits `toolchain-manifest.json`. |
 | `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest (every required tool present, every contract env set). Run at provision time **and** as a registration/preflight gate. |
-| `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache via `RUNNER_TOOL_CACHE`. |
+| `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache and selects that runner's persistent telemetry DB. |
 
 ## Standing up a new box
 
@@ -57,6 +57,19 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   then PATH/glob — it no longer assumes Shulgi's `C:\Erlang` junction or the
   Chocolatey rebar3 path. A box that sets those env vars builds the gateway with
   no filesystem fakery.
+- **Per-agent PostgreSQL (#2094).** Provisioning creates **one cluster per
+  runner agent**: agent 0's winget-installed service on `:5433`, plus an
+  initdb'd cluster + service `postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`
+  (data under `D:\ci\pg\agent-<n>`, run as NETWORK SERVICE like agent 0) for
+  each further agent. The machine-level `YUZU_TEST_POSTGRES_DSN` stays the
+  **agent-0** DSN; `scripts/ci/ensure-postgres.sh` derives "base port + agent
+  index" from the runner's `-<n>` name suffix at job time and probes before
+  switching, falling back to the shared agent-0 cluster with a `::warning` if
+  a per-agent cluster is missing. Rationale: 4 concurrent jobs sharing one
+  cluster mutually DoS their `[pg]` server suites through the shared
+  WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
+  wrapper change is involved — re-running the provisioning script is the whole
+  cutover.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg
@@ -64,6 +77,22 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   `CCACHE_DIR=D:\ci\ccache`. Set in each runner's `.env` (durable) and exported
   by the wrapper. The vcpkg binary cache is content-addressed → concurrent writes
   across runners are safe.
+- **Persistent CI telemetry.** Each runner owns
+  `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. Provisioning initializes
+  all four databases; the pin wrapper exports the matching path as
+  `YUZU_TEST_DB`, and `ci.yml` records every Windows MSVC job, Meson suite
+  duration/timeout and recovered known flake. The files sit outside the checkout
+  and are never shared between agents, so history survives branch/build cleanup
+  without adding SQLite writer contention between CCDs.
+- **Defender CI exclusions.** Provisioning preserves Wee Tam's four exact runner
+  work-root exclusions (`D:\ci\work-0` … `work-3`), which cover each runner's
+  `_temp` directory and checkout/build outputs. PostgreSQL's executable and
+  disposable data paths are also excluded. Provisioning verifies every `_temp`
+  path with Defender's own `MpCmdRun.exe -CheckExclusion`. It deliberately does
+  not exempt user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper
+  routes native `TEMP`/`TMP` and MSYS2 `TMPDIR` into that runner's own `_temp`;
+  the CI telemetry start step repeats those exports so the fix applies before
+  the next planned runner restart too.
 
 ## `toolchain-manifest.json`
 
@@ -81,6 +110,10 @@ verified by `Assert-Toolchain.ps1`:
              "YUZU_ESCRIPT": "...erts-*\\bin\\escript.exe",
              "YUZU_REBAR3": "C:\\tools\\rebar3\\rebar3",
              "YUZU_TEST_POSTGRES_DSN": "postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test" },
+  "telemetry": {
+    "root": "D:\\ci\\test-runs",
+    "databases": ["D:\\ci\\test-runs\\yuzu-weetam-windows-0\\test-runs.db", "..."]
+  },
   "tools": [ { "name": "vcpkg", "path": "C:\\vcpkg\\vcpkg.exe", "version": "...", "required": true }, ... ]
 }
 ```

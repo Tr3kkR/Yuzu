@@ -151,11 +151,29 @@ agent_test_exe = executable(
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
+    'unit/test_shutdown_pipe.cpp',
+    'unit/test_hard_exit.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
+    'unit/test_spark_key_rule_index.cpp',
     'unit/test_spark_mechanism.cpp',
+    'unit/test_guardian_spark_bridge.cpp',
+    'unit/test_guardian_spark_backend.cpp',
+    'unit/test_guardian_emit_decider.cpp',
+    'unit/test_guardian_rule_eval.cpp',
+    'unit/test_guardian_drift_event.cpp',
+    'unit/test_guardian_scope_guard.cpp',
+    'unit/test_guardian_outbox.cpp',
+    'unit/test_guardian_spark_send.cpp',
+    'unit/test_guardian_spark_runtime.cpp',
+    'unit/test_guardian_state_reader.cpp',
+    'unit/test_guardian_convergence_scheduler.cpp',
+    'unit/test_guardian_io_executor.cpp',
+    'unit/test_guardian_outbox_drain_worker.cpp',
+    'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
+    'unit/test_firewall_parsers.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -168,14 +186,17 @@ agent_test_exe = executable(
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
+    'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -320,6 +341,7 @@ if build_server
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_instruction_store_signing.cpp',
+      'unit/server/test_instruction_yaml.cpp',
       'unit/server/test_execution_tracker.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
@@ -340,6 +362,12 @@ if build_server
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_engine_principal_store.cpp',
+      'unit/server/test_engine_principal_integration.cpp',
+      'unit/server/test_rest_engine_principal_roles.cpp',
+      'unit/server/test_mcp_engine_principal_roles.cpp',
+      'unit/server/test_engine_principal_lifecycle.cpp',
+      'unit/server/test_engine_store_error_class.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
@@ -353,6 +381,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',
@@ -371,6 +400,7 @@ if build_server
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
+      'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -450,6 +480,7 @@ if build_server
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
       'unit/server/test_scim_store.cpp',
+      'unit/server/test_scim_group_store.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
     ),
@@ -460,6 +491,25 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
+      # Spark tag-key pin: test_spark_fleet_tags.cpp includes the agent's
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags) to assert the agent's actual
+      # emitted keys equal the server-side spark_fleet_tags.hpp constants — a full
+      # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
+      # template — no link to yuzu_agent_core, just the include path.
+      #
+      # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
+      # the include path of every server test TU. It is safe TODAY only because there is
+      # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
+      # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
+      # and server/core/src/*.hpp,
+      # and because server/core/src is listed FIRST so it would win a future clash. A
+      # same-named header added on both sides later SILENTLY SHADOWS — there is no
+      # diagnostic. Do NOT add a private-agent-src include for any other target, and do
+      # NOT solve a future collision by having server PRODUCTION code include an agent
+      # header: that would be an upward dependency edge (server → agent), which the build
+      # graph does not have and must not gain. The durable fix is to hoist the shared tag
+      # keys into one source of truth at rung 2, when the wire contract changes anyway.
+      include_directories('../agents/core/src'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
@@ -483,18 +533,39 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  # 900s: recalibrated 2026-07-12 (Wee Tam server-suite timeouts) — the suite
-  # has grown to ~3500 cases (incl. the [pg] Postgres-substrate tests; per-OS
-  # counts differ slightly) and reached 512s on an otherwise-idle Windows MSVC
-  # debug leg, blowing the previous 600s cap whenever the box ran concurrent
-  # jobs (4 runner agents + one shared native Postgres on one host roughly
-  # double the wall time under contention). Sanitizer-instrumented nightly
-  # passes run slower still. A real hang is still bounded by the job-level
-  # timeouts (90-120 min in ci.yml, 60 min in nightly.yml for every job that
-  # runs this suite). If a quiet Windows debug leg crosses ~700s again, split
-  # the suite (e.g. '[pg]' / '~[pg]' shards, each with its own budget)
-  # instead of raising this number.
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 900)
+  # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
+  # promised): two test() entries over the SAME binary, partitioned by Catch2
+  # tag filter. '~[pg]' is everything not Postgres-backed; '[pg]' is the
+  # Postgres-substrate cases (~72 cases across 28 files). The complement is
+  # exact: every Postgres-touching test carries [pg] and no [pg] test is
+  # hidden ([.]), so the shards partition the visible case set with nothing
+  # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
+  # meson runs the entries in parallel, so suite wall time is max(shards),
+  # and each shard gets its own budget. ~[pg] keeps 600s (its Windows worst
+  # case is ~231s). [pg] gets 900s: the 600 assumed per-agent Postgres
+  # (#2094) had removed cross-job contention, but it is NOT yet provisioned on
+  # Wee Tam, and at full durability every [pg] case's CREATE DATABASE ...
+  # TEMPLATE + DROP DATABASE WITH (FORCE) is fsync-bound — ~20x costlier on
+  # Windows — so the [pg] shard hit exactly-600s TIMEOUTs on 2026-07-14
+  # (Fail:0, killed at the cap). The durable fix is durability-off on the
+  # disposable CI clusters (fsync/synchronous_commit/full_page_writes;
+  # scripts/ci/ensure-postgres.sh + deploy/windows/Provision-Windows-Runner.ps1)
+  # + finishing the #2094 per-agent provisioning; once both land on Wee Tam
+  # this returns to 600. A real hang is still bounded by the job-level timeouts
+  # (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
+  # (test_pg_template_cleanup.cpp) fires in both shards — idempotent,
+  # harmless without a DSN. Constraints the shards must keep:
+  #   - only tag-filter specs may appear in args (flake-retry.py strips
+  #     positional tag specs before an isolated case retry — Catch2 ORs
+  #     positional specs);
+  #   - neither entry name may be a substring of the other (flake-retry maps
+  #     meson-junit names by longest substring match).
+  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the
+  # first move is the durability/per-agent fix above (attack the cost), then
+  # split or rebalance — raising the number is only the transitional net it is
+  # here for [pg] until durability-off + per-agent Postgres land on Wee Tam.
+  test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
+  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -512,4 +583,51 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
+# parser fixtures (incl. PR #1711, the canonical negated close) + the decision
+# ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes
+# always run the heavy platform jobs, so meson coverage alone is sufficient.
+test('close automation logic',
+  _python3_test,
+  args: [files('test_close_automation.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit
+# parsing, budget rows). Wired here (#2092) so the shard-retry contract the
+# server entries above rely on is enforced on every platform, not just when
+# someone remembers to run it by hand.
+test('flake-retry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
+# flake recoveries land in the persistent per-runner test-runs.db.
+test('ci telemetry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_ci_telemetry.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing
+# entries, testlog.txt -> per-entry Catch2 seed, introspect -> binary + args, and
+# the cancelled-path "which entry never finished" inference. It reuses
+# flake-retry.py's junit-name -> introspected-entry mapping rather than keeping a
+# second copy, so the shard-naming contract documented above now has two
+# consumers — and this selftest is what makes a break in it loud. Wired here for
+# the same reason flake-retry's is: the alternative to failing in `meson test` is
+# failing silently at 06:00 UTC, in the one nightly that needed a stack trace.
+test('tsan-gdb-capture selftest',
+  _python3_test,
+  args: [files('../scripts/ci/tsan-gdb-capture.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
 )

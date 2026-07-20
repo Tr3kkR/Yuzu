@@ -26,27 +26,105 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
-  The TSan leg preloads `/tmp/libgai_sync_shim.so` (built inline from a
-  ~30-line C file at job start) to replace glibc's `getaddrinfo_a()` async
-  DNS path with synchronous `getaddrinfo()` on the calling thread. Required
-  because cpp-httplib enables `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON`
-  by default (vcpkg port), which makes glibc spawn an async-DNS helper
-  thread via `clone3` directly — bypassing TSan's `pthread_create`
-  interceptor — so the helper's per-thread allocator state is never
-  initialised and the first `malloc()` from it segfaults inside
-  `__tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8)` (#438).
-  Scoped to the TSan job via step-level `env: LD_PRELOAD`; production
-  keeps the non-blocking-DNS behaviour. The same shim is mirrored into
-  `sanitizer-tests.yml` so `/test --full` benefits identically.
+  The TSan leg preloads `$RUNNER_TEMP/libgai_sync_shim.so` to replace glibc's
+  `getaddrinfo_a()` async DNS path with synchronous `getaddrinfo()` on the
+  calling thread. Required because cpp-httplib enables
+  `CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO=ON` by default (vcpkg port), which
+  makes glibc spawn an async-DNS helper thread via `clone3` directly —
+  bypassing TSan's `pthread_create` interceptor — so the helper's per-thread
+  allocator state is never initialised and the first `malloc()` from it
+  segfaults inside `__tsan::SizeClassAllocator64LocalCache::Allocate
+  (this=0x8)` (#438). Scoped to the TSan job via step-level `env: LD_PRELOAD`;
+  production keeps the non-blocking-DNS behaviour. The shim is built by
+  `scripts/ci/build-gai-sync-shim.sh` — a **single** script shared by both this
+  workflow and `sanitizer-tests.yml` so the two can't drift (#1038 CS-03); it
+  compiles with `gcc-15 -Werror` and `_Static_assert`s glibc's private
+  `struct gaicb` layout (`ar_result`=24, `__return`=32, `sizeof`=56), so an ABI
+  reshuffle fails the build loudly instead of silently corrupting adjacent
+  memory. Built into `$RUNNER_TEMP`, not a fixed `/tmp` path, because Big Tam
+  runs 4 runner agents under one OS identity and a fixed path is a cross-job
+  collision class (#1038 R-15).
 
-  On Test failure, the TSan job's `Capture stack trace under gdb`
-  diagnostic re-runs `yuzu_server_tests` under `gdb -batch` with the
-  Catch2 seed replayed, dumps `thread apply all bt full` + `info
-  registers`, and rides the existing `meson-testlog-tsan` artifact.
+  On Test **failure or job cancellation**, the TSan job's `Capture stack trace
+  under gdb` diagnostic (`scripts/ci/tsan-gdb-capture.py`) derives **every**
+  failing test binary from the meson junit, maps each to its binary+args via
+  `meson introspect`, and replays each under `gdb -batch` with its own Catch2
+  seed and shard filter, dumping `thread apply all bt full` + `info registers`
+  into `build-linux-tsan/stack-capture.log`, which rides the `meson-testlog-tsan`
+  artifact (uploaded on `failure() || cancelled()`). The cancelled path is the
+  60-min-timeout **hang** case: it infers the unfinished entries and
+  SIGINT-interrupts gdb for a live backtrace. Best-effort — it always exits 0
+  and never changes pass/fail. **Guard note (#1038):** the step's `if:` must keep
+  an explicit `failure() || cancelled()`; a bare `steps.test.outcome ==
+  'failure'` gets an implicit `success()` ANDed on and is unreachable — that
+  defect silently skipped this step on every red nightly from 2026-05-15 to
+  2026-07-14.
 
 `workflow_dispatch` only works once a workflow file exists on the **default
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
 dormant until merged.
+
+## Gates outside the tier ladder
+
+### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
+
+The five Yuzu **application** images' compose healthchecks depend on a tool baked
+into the image, not on the application: **bash + `/dev/tcp` + `grep`** for
+`yuzu-server`, **busybox `wget --spider`** for `yuzu-gateway`, and
+**`/bin/busybox`** (by absolute path) for the three FROM-scratch chisel images.
+Nothing else exercises those tools. A base-image swap, a dropped apt package, or a
+chisel slice change that stops shipping the busybox symlink breaks nothing at
+build time and nothing at boot — it breaks only the healthcheck, so Compose parks
+every container `unhealthy` forever and anything with `depends_on: condition:
+service_healthy` never starts, with no application failure to point at.
+
+`yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
+is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
+role in the gate and `docker-publish-postgres` has no pre-push check. `agent-chisel`
+is gated **pre-emptively**: no compose healthchecks an agent image today.
+
+The probes are a hard-coded copy of the healthcheck commands, so both the script
+and the workflow's change-filter carry a **KEEP IN SYNC** list of every file that
+defines one — including the two easy-to-miss ones,
+`scripts/test/docker-compose.upgrade-test.yml` and the compose heredocs inlined in
+`pre-release.yml`.
+
+`scripts/ci/verify-healthcheck-invariants.sh` is the gate. It runs each image's
+real healthcheck probe **against a live HTTP listener** in a shared network
+namespace, so exit 0 is the only passing outcome. Probing a *closed* port cannot
+distinguish a working bash from a bash built without net redirections — both
+return 1 — which is why the naive "accept 0 or 1" check that #751 originally
+proposed passes a broken image (verified against a bash compiled
+`--disable-net-redirections`).
+
+**Placement — it runs in two places, sharing one script:**
+
+| Where | When | Why |
+|---|---|---|
+| `docker-healthcheck-invariants.yml` | PRs + pushes to `dev`/`main` | Catches a base-image swap in the PR that introduces it, not weeks later at release. |
+| `release.yml` (`docker-publish`, `docker-publish-chisel`) | Between image build and registry push | A broken image is never published. Verifying after the push would leave a broken tag in GHCR. |
+
+It is deliberately **not** in `ci.yml`: the Tier-1 fast path must stay under 10
+min and these builds are far too heavy. It is equally deliberately **not**
+`paths:`-filtered — per #1978, a path-filtered workflow that later becomes a
+*required* check never reports on PRs it filters out, so the check sits at
+"Expected — waiting for status" forever and a non-admin can never merge. Instead
+the workflow always runs and a cheap `changes` job skips the build matrix.
+
+That is necessary but **not sufficient for a matrix job**. Per `actions/runner#952`
+a matrix job skipped at the job level is skipped *before* the matrix expands, so it
+emits none of its inner check-run names — "skipped" never appears and the required
+context hangs anyway. A `required-check-stubs` job (mirroring `ci.yml`'s
+`docs-required-checks`) emits the five `Verify <role> healthcheck invariant` names
+when the matrix is skipped, and fails red rather than hanging if the classifier
+itself dies. **Only with that stub are the five contexts safe to add to branch
+protection.**
+
+The PR matrix reuses release.yml's local buildcache **read-only** (`cache-from`
+with no `cache-to`), so it never evicts release layers and adds no cache directory
+`cache-prune.yml` doesn't know about. Inside `release.yml` the verification build
+likewise has no `cache-to`: it shares one buildkitd instance with the push build,
+so the push hits BuildKit's own solver cache and rebuilds nothing.
 
 ## Self-hosted runner topology
 
@@ -111,7 +189,45 @@ The Windows toolchain is codified in [`deploy/windows/`](../deploy/windows/READM
 (the native-Windows analog of `deploy/docker/Dockerfile.ci-linux`): a versioned
 provisioning spec, a manifest, and a runner self-test. All four runners share one
 vcpkg binary cache via `RUNNER_TOOL_CACHE=D:\ci\tool_cache` (mirroring
-`CCACHE_DIR`), so the CCD split doesn't fragment the cache 4×.
+`CCACHE_DIR`), so the CCD split doesn't fragment the cache 4×. The provisioner
+also enforces the four exact Defender work-root exclusions (`D:\ci\work-0` …
+`work-3`), covering each runner's `_temp` and build outputs without excluding
+user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper routes native
+`TEMP`/`TMP` and MSYS2 `TMPDIR` into the matching per-runner `_temp`; the CI
+telemetry start step exports the same values for already-running listeners.
+
+### Persistent runner-local test history
+
+Every self-hosted runner agent owns a separate `test-runs.db` outside its
+checkout. Big Tam stores it below that agent's registered tool cache at
+`/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`;
+Wee Tam stores it at
+`D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. The files survive
+`actions/checkout`, branch-switch build wipes and runner restarts. They are
+deliberately per-agent rather than per-host: telemetry must not introduce a
+shared SQLite writer lock between the four jobs whose contention it measures.
+
+The Linux and Windows jobs in `ci.yml` call `scripts/ci/ci-telemetry.py` near
+job start and from an `always()` finalizer. Schema v3 records GitHub run attempt,
+job/platform/runner, commit/branch/event, conclusion and wall time, ccache ratio,
+each Meson test entry's result/duration/timeout, and any listed flake recovered
+by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
+that prevents post-steps intentionally leaves an `in_progress` row, which is
+itself evidence of runner/job termination rather than a fabricated result.
+
+Provisioning is versioned in
+[`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)
+and [`deploy/windows/Provision-Windows-Runner.ps1`](../deploy/windows/Provision-Windows-Runner.ps1).
+Query a runner in place by setting `YUZU_TEST_DB` and using:
+
+```bash
+bash scripts/test/test-db-query.sh ci-stats --since 30d
+bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
+bash scripts/test/test-db-query.sh ci-flakes --since 30d
+```
+
+GitHub-hosted macOS agents are ephemeral and cannot meet this runner-local
+persistence contract; their test logs remain retained Actions artifacts.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
@@ -148,16 +264,33 @@ tests)` step between Build and Test in ci.yml (linux / windows / macos) and
 nightly.yml (asan / tsan / coverage).
 Resolution order inside the script:
 
-1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — trusted
-   as-is. The escape hatch for any bespoke runner setup.
-2. **Docker** (self-hosted Linux: the `yuzu-bigtam-linux` pool) —
-   idempotent persistent container `yuzu-ci-postgres` on
-   `127.0.0.1:15432` (`docker start` || `docker run --restart
-   unless-stopped`, image pinned to the same digest as
-   `deploy/docker/Dockerfile.postgres`'s base). One-time cost per runner;
-   port 15432 avoids colliding with native clusters or UAT rigs on 5432.
-   Big Tam runs 4 runners on one host, so the create path is
-   `flock`-serialized (one shared container, not four).
+1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
+   hatch for any bespoke runner setup. On a **multi-agent box** (runner
+   name ending `-<n>`, i.e. the 4-runner pools) the pre-set DSN names the
+   *agent-0* cluster and agent `<n>` uses **port + `<n>`** when that
+   per-agent cluster answers a probe — one instance per agent, so
+   concurrent jobs never share a WAL/buffer pool (#2094, the 2026-07-12
+   Wee Tam server-suite timeouts). Until a box is provisioned with the
+   extra clusters the script falls back to the shared pre-set DSN with a
+   `::warning` — no flag day. Runners without a `-<n>` suffix use the DSN
+   as-is. **The DSN must not set `options=`, and `PGOPTIONS` must be unset
+   in the job environment** (checked unconditionally, before path
+   selection) — either silently disables PgPool's `statement_timeout`/
+   `lock_timeout` safety-bound GUCs (`pg_pool.cpp`'s `conninfo_has_options_`
+   gate), caught by the `[pg][hardening]` test "PgPool injects
+   statement_timeout and lock_timeout GUCs". Put durability tuning in
+   `postgresql.conf` via `ALTER SYSTEM` instead (#2167).
+2. **Docker** (self-hosted Linux) — idempotent persistent container
+   (`docker start` || `docker run --restart unless-stopped`, image pinned
+   to the same digest as `deploy/docker/Dockerfile.postgres`'s base;
+   one-time cost per runner). On the multi-agent `yuzu-bigtam-linux` pool
+   each agent gets **its own container** — `yuzu-ci-postgres-<n>` on
+   `127.0.0.1:15440+<n>`, `max_connections=400` (#2094/#2096),
+   self-created on the agent's first job. Single-agent boxes keep the
+   shared `yuzu-ci-postgres` on `127.0.0.1:15432`. The 15440+ base and
+   15432 avoid colliding with native clusters (5432), the dev pg-canary
+   (5433), and the UAT sidecar (15433). Lifecycle is `flock`-serialized
+   per container name.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -174,10 +307,13 @@ Resolution order inside the script:
    Postgres with different credentials.
 
    **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4:** each runner
-   provides a native PostgreSQL **18** service (`postgresql-x64-18-yuzu-ci`)
-   and a machine-level `YUZU_TEST_POSTGRES_DSN` that wins before the docker
-   probe, so the leg stays deterministic regardless of any Docker engine
-   state. Provisioning specifics live in
+   provides native PostgreSQL **18** services — agent 0's winget-installed
+   `postgresql-x64-18-yuzu-ci` on `:5433` plus one initdb'd cluster per
+   further agent (`postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`, #2094) —
+   and a machine-level `YUZU_TEST_POSTGRES_DSN` (the agent-0 DSN; path 1
+   derives the per-agent port) that wins before the docker probe, so the
+   leg stays deterministic regardless of any Docker engine state.
+   Provisioning specifics live in
    [`deploy/windows/`](../deploy/windows/README.md). (The retired
    `yuzu-local-windows` box ran a PG 16 binaries-zip service on 5433 — see
    git history if that bootstrap pattern is ever needed again.)
@@ -206,12 +342,17 @@ unset — the `[pg]` cases skip cleanly. The `/test` skill and CI
 deliberately hard-fail at the ensure-postgres step instead (that is the
 gate working, not a skill bug).
 
-Operational notes for shared instances: the `yuzu-ci-postgres`
-container is shared across concurrent jobs on a runner — the migration
-runner's advisory locks are **cluster-wide**, so same-named stores in
-different ephemeral test databases briefly serialize on each other
-(transaction-scoped locks: never deadlock, never cross-database
-corruption).
+Operational notes for shared instances: on a box where a Postgres
+instance IS still shared across concurrent jobs (single-agent boxes, or
+a multi-agent box before its per-agent instances are provisioned —
+the fallback `::warning`), the migration runner's advisory locks are
+**cluster-wide**, so same-named stores in different ephemeral test
+databases briefly serialize on each other (transaction-scoped locks:
+never deadlock, never cross-database corruption). The 4-agent pools run
+**one instance per agent** (#2094) precisely so no job shares WAL/fsync
+bandwidth — or advisory-lock space — with a concurrent job. After the
+Big Tam cutover the legacy shared `yuzu-ci-postgres` container on
+`:15432` is unused there and can be `docker rm -f`'d.
 
 **Test-database lifecycle (PR #2091).** Ephemeral per-case databases
 (`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`)
@@ -222,15 +363,30 @@ legitimately holds up to ~a dozen template databases. A pile-up is NOT
 automatically "teardown is failing": names embed their creation epoch, and
 every suite start sweeps names older than 6 h (`kTestDbStaleAfterSeconds`),
 so leaks from killed runs self-heal within that window; the sweep prints a
-`sweep saw N ... dropped M` summary in the job log. Hand-cleaning a wedged
-instance: only ever touch `yuzu_test_*`/`yuzu_test_tpl_*` names; prefer
-"name-epoch older than 6 h" over "no current connections" (a live fixture
-is momentarily connection-free between drop and re-create); pre-epoch-format
-names (`yuzu_test_<salt>_<n>`, first number < 1e9) predate the sweeper and
-need manual judgment. The server suite's meson timeout was recalibrated
-600 s → 900 s in the same PR (gate-parameter change; see the comment at the
-`test('server unit tests', ...)` entry in `tests/meson.build` — if a quiet
-Windows debug leg crosses ~700 s, split the suite instead of raising it).
+`sweep saw N ... dropped M` summary in the job log. A weekly out-of-band
+janitor complements it (#1367): `cache-prune.yml` (Sundays 04:00 UTC +
+`workflow_dispatch`) runs `scripts/ci/sweep-test-databases.sh` on both
+self-hosted boxes, so leaks reclaim even on a box that stops running `[pg]`
+legs. The janitor self-discovers the per-agent topology from #2094/#2114 —
+every running `yuzu-ci-postgres(-<n>)` container on the docker boxes, and in
+DSN mode the machine DSN's base port plus the next three per-agent ports
+(dark higher ports are the normal pre-cutover state and skip silently); a
+degraded sweep (psql missing, cluster dark, a pass query failing) exits
+nonzero so the weekly run goes red rather than rotting silently.
+Epoch-named databases age by the same >6 h/server-clock rule; names
+the epoch sweeper can never parse (pre-epoch format `yuzu_test_<salt>_<n>`,
+implausible clock stamps) are dropped only when the datdir's `PG_VERSION`
+mtime exceeds 7 days AND the database has zero active backends
+(superuser-only via `pg_stat_file`; dropped without FORCE so a racing
+connection vetoes). Hand-cleaning a wedged instance: only ever touch
+`yuzu_test_*`/`yuzu_test_tpl_*` names; prefer "name-epoch older than 6 h"
+over "no current connections" (a live fixture is momentarily
+connection-free between drop and re-create); pre-epoch-format names are
+reclaimed by the weekly cron after 7 days — hand-clean only if one must go
+sooner. The server suite's meson timeout was recalibrated 600 s → 900 s in
+the same PR, then split into `[pg]`/`~[pg]` shards at 600 s each (#2092;
+see the comment above the two `test('server ...', ...)` entries in
+`tests/meson.build`).
 
 ## Universal vcpkg cache-key contract
 
@@ -280,8 +436,12 @@ is shared. Closes #406.
 
 `scripts/ci/flake-retry.py` wraps the `meson test` step on `ci.yml`'s three
 test legs (PR fast-path + push matrix; **not** nightly/sanitizer, which stay
-fail-loud so a real ASan/TSan race is never masked). On a clean run it does
-nothing. On failure it isolates the failed **Catch2 case(s)** — it re-runs the
+fail-loud so a real ASan/TSan race is never masked). Every run — green
+included — first gets the #2093 duration watchdog: a per-suite
+duration/budget table in the step summary, plus a `::warning` for any suite
+past 80% of its meson timeout (reporting only; pass/fail semantics never
+change). On a clean run it does nothing further. On failure it isolates the
+failed **Catch2 case(s)** — it re-runs the
 failed suite binary (located via `meson introspect --tests`) with Catch2's own
 junit reporter, since meson's junit is only suite-level — then:
 
@@ -302,10 +462,12 @@ quirk); OS-scoped ones a `::notice`. Entries older than 90 days get a soft
 `::warning` nag (never a hard fail). The wrapper validates the list up front and
 fails fast on a malformed one.
 
-No DB: visibility is the job summary + annotations; a per-case trend store is
-deferred to a future `ci-ingest`-style step (the junit artifacts are the raw
-data source). This is reversible test tooling — no ADR (rationale in the wrapper
-header).
+The job summary + annotations remain the immediate signal. In addition,
+`flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
+recovered listed cases into the runner's `ci_flake_events` table alongside the
+suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
+the database is observation history, never an implicit allowlist. This is
+reversible test tooling — no ADR (rationale in the wrapper header).
 
 ## Workflow-PR canary
 
@@ -314,7 +476,7 @@ header).
 the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
 `actions/cache` for vcpkg — catches workflow regressions before main.
 
-## Cache pruning
+## Cache pruning + weekly maintenance
 
 `cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
@@ -322,6 +484,9 @@ old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 Also sweeps the buildx local cache the chisel images write
 (`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
 built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+Since #1367 the same run also executes `scripts/ci/sweep-test-databases.sh`
+on both boxes — the weekly out-of-band janitor for leaked `yuzu_test_*`
+databases (thresholds and semantics: "Test-database lifecycle" above).
 
 ## Chiselled demo images + agent bundle (release-time)
 

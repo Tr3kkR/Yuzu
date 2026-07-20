@@ -6,9 +6,10 @@ fake Catch2 stubs on PATH, exercising the orchestration the unit `--selftest`
 can't reach: `meson test` -> meson suite-level junit -> `meson introspect` ->
 re-run the suite binary with Catch2's junit reporter -> isolated case retries.
 
-Scenarios: green pass, a listed flake that recovers on retry, a listed flake
-that fails all retries (blocks), an unlisted failure (blocks), and a
-non-classifiable (non-Catch2) suite (blocks).
+Scenarios: green pass (including an unavailable telemetry-report path), a
+listed flake that recovers on retry, a listed flake that fails all retries
+(blocks), an unlisted failure (blocks), and a non-classifiable (non-Catch2)
+suite (blocks).
 
 POSIX-only (the fakes are chmod +x shebang scripts); skipped on Windows, where
 the real CI exercises the binary-execution mechanics anyway.
@@ -42,6 +43,8 @@ if a and a[0] == "introspect":
         cmd = ["/bin/echo"]                 # basename not yuzu_*_tests -> unclassifiable
     else:
         cmd = [os.environ["FAKE_CATCH2_BIN"]]
+        if os.environ.get("FAKE_SHARD_SPEC"):   # sharded entry (#2092): tag filter in cmd
+            cmd.append(os.environ["FAKE_SHARD_SPEC"])
     print(json.dumps([{"name": "fake unit tests", "cmd": cmd, "env": {}, "workdir": None,
                        "suite": ["yuzu:fake"]}]))
     sys.exit(0)
@@ -50,26 +53,42 @@ if a and a[0] == "test":
     logs = os.path.join(builddir, "meson-logs"); os.makedirs(logs, exist_ok=True)
     j = os.path.join(logs, "testlog.junit.xml")
     if os.environ.get("FAKE_MESON_TEST_PASS") == "1":
-        open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests"/></testsuite></testsuites>')
+        open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0"/></testsuite></testsuites>')
+        if os.environ.get("FAKE_REPORT_PATH_IS_FILE") == "1":
+            os.remove(j)
+            os.rmdir(logs)
+            open(logs, "w").write("not a directory")
         sys.exit(0)
-    open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests">'
+    open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0">'
                        '<failure>boom</failure></testcase></testsuite></testsuites>')
     sys.exit(1)
 sys.exit(0)
 """
 
 FAKE_CATCH2 = r"""#!/usr/bin/env python3
-import os, sys
+import os, re, sys
 a = sys.argv[1:]
 fail = [c for c in os.environ.get("FAKE_FAIL_CASES", "").split(";") if c]
 always = [c for c in os.environ.get("FAKE_ALWAYS_FAIL", "").split(";") if c]
+TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
 if "--reporter" in a:                       # enumeration run -> emit Catch2 junit
+    # A sharded entry's tag filter must SURVIVE into the enumeration run
+    # (#2092: only the isolated retry strips it) — a missing spec means the
+    # wrapper stripped too much, so emit nothing (-> unclassifiable -> block).
+    spec = os.environ.get("FAKE_SHARD_SPEC")
+    if spec and spec not in a:
+        sys.exit(1)
     out = a[a.index("--out") + 1]
     tcs = "".join('<testcase classname="c" name="%s"><failure>boom</failure></testcase>' % c
                   for c in fail)
     open(out, "w").write('<testsuites><testsuite name="fake">%s</testsuite></testsuites>' % tcs)
     sys.exit(1 if fail else 0)
-case = a[0] if a else ""                     # isolated retry of one case by name
+# Isolated retry of one case by name. A leftover tag spec means the wrapper
+# failed to strip the shard filter (real Catch2 would OR it with the case and
+# re-run the whole shard) -> hard fail so the recovery scenario can't pass.
+if any(TAG_SPEC.match(x) for x in a):
+    sys.exit(1)
+case = a[0] if a else ""
 sys.exit(1 if case in always else 0)
 """
 
@@ -92,6 +111,9 @@ def run_scenario(label, env_extra, known_flaky, expect_zero):
         with open(kf, "w") as f:
             json.dump(known_flaky, f)
         env = dict(os.environ)
+        # The wrapper's summary() writes bypass capture_output — never let a
+        # fake scenario append to a real Actions job summary.
+        env.pop("GITHUB_STEP_SUMMARY", None)
         env["PATH"] = binroot + os.pathsep + env["PATH"]
         env["FAKE_CATCH2_BIN"] = catch2
         env.update(env_extra)
@@ -116,12 +138,24 @@ def main():
     listed = [{"case": "FlakeA", "platforms": [THIS_OS], "reason": "test flake", "added": "2026-06-23"}]
     results = [
         run_scenario("green pass", {"FAKE_MESON_TEST_PASS": "1"}, listed, True),
+        run_scenario("green pass survives unavailable retry-report path",
+                     {"FAKE_MESON_TEST_PASS": "1", "FAKE_REPORT_PATH_IS_FILE": "1"},
+                     listed, True),
         run_scenario("listed flake recovers on retry", {"FAKE_FAIL_CASES": "FlakeA"}, listed, True),
         run_scenario("listed flake fails all retries -> block",
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_ALWAYS_FAIL": "FlakeA"}, listed, False),
         run_scenario("unlisted failure -> block", {"FAKE_FAIL_CASES": "RealBug"}, listed, False),
         run_scenario("non-Catch2 suite -> block",
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_NONCATCH2": "1"}, listed, False),
+        run_scenario("sharded suite (#2092): retry replaces tag filter",
+                     {"FAKE_FAIL_CASES": "FlakeA", "FAKE_SHARD_SPEC": "~[pg]"}, listed, True),
+        # Suite red under meson, but the solo enumeration re-run reproduces
+        # ZERO failing cases (order/contention-dependent failure, or a stale
+        # junit from a crashed run). Nothing is attributable to a listed
+        # flake, so the wrapper must block — returning 0 here is the
+        # masked-green hole governance UP-1 closed.
+        run_scenario("suite fails, enumeration reproduces nothing -> block",
+                     {"FAKE_FAIL_CASES": ""}, listed, False),
     ]
     if all(results):
         print(f"\nflake-retry integration test: OK ({len(results)} scenarios)")

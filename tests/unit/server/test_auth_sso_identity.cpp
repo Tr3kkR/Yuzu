@@ -20,6 +20,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "migration_runner.hpp"
 #include "test_route_sink.hpp"
@@ -111,6 +112,34 @@ TEST_CASE("AuthDB::upsert_sso_identity rejects a non-principal, non-username str
     // No reserved prefix and fails the strict local charset (':').
     CHECK_FALSE(db.upsert_sso_identity("not:reserved", "https://idp/", "sub", "x", "oidc")
                     .has_value());
+}
+
+TEST_CASE("AuthDB::upsert_sso_identity rejects an 'engine:'-prefixed principal",
+          "[sso][authdb][engine_principal]") {
+    // Security review finding on PR #2202 (engine principals 4.2): the write
+    // surface itself must reject a reserved `engine:` principal (design
+    // §3.3), not merely rely on the OIDC/SAML/AD caller's own construction
+    // convention (`source` is always a literal in {"oidc","saml","ad"}, never
+    // "engine") to keep it from happening. `is_valid_principal`'s format
+    // check alone is NOT sufficient here — it structurally accepts an
+    // `engine:`-shaped string (see `is_reserved_identity_prefix`), so this
+    // proves the dedicated guard added directly in `upsert_sso_identity`.
+    auto dir = yuzu::test::TempDir{};
+    fs::create_directories(dir.path);
+    AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
+    REQUIRE(db.initialize().has_value());
+
+    CHECK_FALSE(db.upsert_sso_identity("engine:vuln-scanner", "https://issuer.example", "sub-1",
+                                       "Impersonating Row", "oidc")
+                    .has_value());
+    CHECK_FALSE(db.get_user("engine:vuln-scanner").has_value());
+
+    // A normal SSO principal (no reserved prefix collision) is unaffected.
+    const std::string principal = "oidc:https://idp.example.com/#sub-engine-guard";
+    REQUIRE(db.upsert_sso_identity(principal, "https://idp.example.com/", "sub-engine-guard",
+                                   "Dave", "oidc")
+                .has_value());
+    CHECK(db.get_user(principal).has_value());
 }
 
 TEST_CASE("AuthDB::mfa_status stays strict — rejects an SSO principal", "[sso][authdb]") {
@@ -339,7 +368,11 @@ struct SsoJitHarness {
     Config cfg{};
     auth::AuthManager auth_mgr{};
     AuthDB auth_db;
-    std::unique_ptr<ApiTokenStore> api_tokens;
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
+    // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+    // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
+    // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
+    // below — embedding the PG fixture only made every case skip without a DSN.
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -355,12 +388,10 @@ struct SsoJitHarness {
         auth_mgr.load_config(cfg.auth_config_path);
         auth_mgr.set_auth_db(&auth_db);
 
-        api_tokens = std::make_unique<ApiTokenStore>(tmp.path / "api_tokens.db");
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
-        REQUIRE(api_tokens->is_open());
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
-                                                   api_tokens.get(), audit_store.get(), nullptr,
+                                                   /*api_token_store=*/nullptr, audit_store.get(), nullptr,
                                                    nullptr, analytics_store.get(), oidc_mu,
                                                    oidc_provider);
         auth_routes->register_routes(sink);
