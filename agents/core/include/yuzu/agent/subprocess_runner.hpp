@@ -50,6 +50,16 @@ struct SubprocessOptions {
                                 // stderr merged into the same captured
                                 // stream as stdout (codesign/plutil write
                                 // their diagnostics to stderr).
+    // When true AND max_lines > 0: stop reading as soon as max_lines lines
+    // have been stored, kill+reap the child's process group, and report a
+    // NORMAL success (timed_out=false, output_truncated=false) rather than
+    // running the child to opts.deadline. For a caller that only ever wants
+    // the first N lines (e.g. `log show`), this turns "N lines available in
+    // a huge stream" into a clean bounded success instead of a partial
+    // result that looks like a timeout/truncation. False (default) keeps
+    // the previous behaviour: max_lines only caps what's stored, the runner
+    // keeps draining/discarding until the child exits or the deadline hits.
+    bool stop_after_max_lines = false;
 };
 
 struct SubprocessResult {

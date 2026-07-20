@@ -86,8 +86,19 @@ inline std::string escape_pipes(std::string_view s) {
 
 /// Escape a value for a pipe-delimited output field: escape '|' and fold
 /// CR/LF to spaces so untrusted endpoint data cannot inject columns/rows.
+///
+/// A literal backslash in the INPUT is folded to '/' before escape_pipes
+/// runs. The server's parser treats any '|' preceded by a backslash as
+/// escaped (single-backslash lookback), so a value legitimately ending in
+/// '\' would otherwise leave a dangling backslash that consumes the real
+/// field separator right after it, shifting every later column. Folding
+/// first guarantees the only backslashes ever present in the output are
+/// the ones escape_pipes itself just introduced immediately before a '|',
+/// so the server's escape detection stays unambiguous.
 inline std::string safe_output_field(std::string_view value) {
-    std::string out = escape_pipes(value);
+    std::string folded(value);
+    for (char& ch : folded) { if (ch == '\\') ch = '/'; }
+    std::string out = escape_pipes(folded);
     for (char& ch : out) { if (ch == '\r' || ch == '\n') ch = ' '; }
     return out;
 }

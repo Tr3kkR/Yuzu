@@ -262,25 +262,29 @@ std::string select_info_plist(const std::string& validated, std::string_view bas
     return validate_path(candidate, base_dir);
 }
 
-// ── Replicated: do_get_signature / do_get_version_info PLAN-02 short-circuit
-// A timed-out subprocess run is reported honestly (unknown / absent) BEFORE
-// the run's exit_code/output is ever handed to the classifier -- a codesign
-// killed at the deadline can still have tool_ran=true and partial stderr
-// diagnostics, which classify_codesign_result would otherwise read as a
-// genuine `invalid` verdict.
+// ── Replicated: do_get_signature / do_get_version_info PLAN-02/BR-008
+// short-circuit. A timed-out OR output_truncated subprocess run is reported
+// honestly (unknown / absent) BEFORE the run's exit_code/output is ever
+// handed to the classifier -- a codesign killed at the deadline can still
+// have tool_ran=true and partial stderr diagnostics, and a 1MB-truncated
+// capture is only a PREFIX of what the tool actually said; either way
+// classify_codesign_result/classify_plutil_extract would otherwise read the
+// partial data as a genuine verdict.
 
-yuzu::filesystem_macos::SignatureStatus signature_status_for(bool timed_out, bool tool_ran,
-                                                              int exit_code,
+yuzu::filesystem_macos::SignatureStatus signature_status_for(bool timed_out,
+                                                              bool output_truncated,
+                                                              bool tool_ran, int exit_code,
                                                               std::string_view output) {
-    if (timed_out)
+    if (timed_out || output_truncated)
         return yuzu::filesystem_macos::SignatureStatus::unknown;
     return yuzu::filesystem_macos::classify_codesign_result(tool_ran, exit_code, output);
 }
 
-yuzu::filesystem_macos::PlutilExtractResult version_field_for(bool timed_out, bool tool_ran,
-                                                               int exit_code,
+yuzu::filesystem_macos::PlutilExtractResult version_field_for(bool timed_out,
+                                                               bool output_truncated,
+                                                               bool tool_ran, int exit_code,
                                                                std::string_view output) {
-    if (timed_out)
+    if (timed_out || output_truncated)
         return {};
     return yuzu::filesystem_macos::classify_plutil_extract(tool_ran, exit_code, output);
 }
@@ -1142,31 +1146,56 @@ TEST_CASE("PLAN-02: a timed-out codesign run is unknown despite a nonzero exit a
     // Mirrors a real codesign killed mid-diagnostic: tool_ran=true, a
     // nonzero exit_code, and partial stderr text that would otherwise
     // classify as `invalid`.
-    auto status = signature_status_for(/*timed_out=*/true, /*tool_ran=*/true, /*exit_code=*/1,
+    auto status = signature_status_for(/*timed_out=*/true, /*output_truncated=*/false,
+                                        /*tool_ran=*/true, /*exit_code=*/1,
                                         "a sealed resource is missing or invalid");
     CHECK(status == yuzu::filesystem_macos::SignatureStatus::unknown);
 }
 
 TEST_CASE("PLAN-02: a codesign run that finishes before the deadline still classifies normally",
           "[filesystem][macos_sig][plan02]") {
-    auto status =
-        signature_status_for(/*timed_out=*/false, /*tool_ran=*/true, /*exit_code=*/0, "");
+    auto status = signature_status_for(/*timed_out=*/false, /*output_truncated=*/false,
+                                        /*tool_ran=*/true, /*exit_code=*/0, "");
     CHECK(status == yuzu::filesystem_macos::SignatureStatus::valid);
 }
 
 TEST_CASE("PLAN-02: a timed-out plutil run is honest-absent despite captured stdout",
           "[filesystem][macos_sig][plan02]") {
-    auto result =
-        version_field_for(/*timed_out=*/true, /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    auto result = version_field_for(/*timed_out=*/true, /*output_truncated=*/false,
+                                     /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
     CHECK(result.available == false);
 }
 
 TEST_CASE("PLAN-02: a plutil run that finishes before the deadline still classifies normally",
           "[filesystem][macos_sig][plan02]") {
-    auto result =
-        version_field_for(/*timed_out=*/false, /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    auto result = version_field_for(/*timed_out=*/false, /*output_truncated=*/false,
+                                     /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
     CHECK(result.available == true);
     CHECK(result.value == "1.2.3");
+}
+
+// ── BR-008: output_truncated short-circuit (get_signature / get_version_info)
+//
+// A 1MB-truncated capture is only a PREFIX of what codesign/plutil actually
+// said -- classifying that prefix (e.g. a truncated "satisfies its
+// Designated Requirement" string that happens to look like a clean pass)
+// would report a complete verdict from incomplete data. Verified separately
+// from timed_out since a truncated capture can complete (tool_ran=true,
+// exit_code==0) despite the cap having discarded real output.
+
+TEST_CASE("BR-008: a truncated codesign capture is unknown despite a clean exit",
+          "[filesystem][macos_sig][br008]") {
+    auto status = signature_status_for(/*timed_out=*/false, /*output_truncated=*/true,
+                                        /*tool_ran=*/true, /*exit_code=*/0,
+                                        "valid on disk\nsatisfies its Designated Requirement");
+    CHECK(status == yuzu::filesystem_macos::SignatureStatus::unknown);
+}
+
+TEST_CASE("BR-008: a truncated plutil capture is honest-absent despite a clean exit",
+          "[filesystem][macos_sig][br008]") {
+    auto result = version_field_for(/*timed_out=*/false, /*output_truncated=*/true,
+                                     /*tool_ran=*/true, /*exit_code=*/0, "1.2.3\n");
+    CHECK(result.available == false);
 }
 
 // ── safe_output_field (do_get_version_info macOS output framing) ───────────

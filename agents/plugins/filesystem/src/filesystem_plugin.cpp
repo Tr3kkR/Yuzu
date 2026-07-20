@@ -1076,7 +1076,7 @@ private:
         // strings here would misrepresent a codesign verdict as a
         // WinVerifyTrust one.
         auto run = yuzu::agent::run_bounded_subprocess(
-            {"codesign", "--verify", "--deep", "--strict", validated},
+            {"/usr/bin/codesign", "--verify", "--deep", "--strict", validated},
             yuzu::agent::SubprocessOptions{.merge_stderr = true});
 
         // PLAN-02: a codesign killed at the deadline can still have
@@ -1084,8 +1084,10 @@ private:
         // captured before the SIGKILL -- classify_codesign_result would read
         // that as a genuine "invalid" verdict. Short-circuit to unknown
         // BEFORE classify so a timed-out run is never reported as a broken
-        // signature.
-        auto status = run.timed_out
+        // signature. Same reasoning for output_truncated: a 1MB-truncated
+        // capture is only a PREFIX of whatever codesign actually said, so
+        // classify_codesign_result must never see it either.
+        auto status = (run.timed_out || run.output_truncated)
             ? yuzu::filesystem_macos::SignatureStatus::unknown
             : yuzu::filesystem_macos::classify_codesign_result(run.tool_ran, run.exit_code,
                                                                 run.output);
@@ -1302,25 +1304,27 @@ private:
         // CFBundleShortVersionString is the user-visible "marketing"
         // version (n.n.n) -- the closest analogue of Windows ProductVersion.
         auto short_ver_run = yuzu::agent::run_bounded_subprocess(
-            {"plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-", info_plist},
+            {"/usr/bin/plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-",
+             info_plist},
             yuzu::agent::SubprocessOptions{});
 
         // CFBundleVersion is the machine-readable, monotonically increasing
         // build number -- the closest analogue of Windows FileVersion.
         auto build_ver_run = yuzu::agent::run_bounded_subprocess(
-            {"plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist},
+            {"/usr/bin/plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist},
             yuzu::agent::SubprocessOptions{});
 
-        // PLAN-02: a plutil run killed at the deadline is honest-absent,
-        // never handed to classify_plutil_extract (which would otherwise
-        // trust its exit_code/output as if the run had actually finished).
+        // PLAN-02: a plutil run killed at the deadline, or one whose capture
+        // hit the 1MB output_truncated cap, is honest-absent, never handed
+        // to classify_plutil_extract (which would otherwise trust a partial
+        // exit_code/output as if the run had actually finished cleanly).
         yuzu::filesystem_macos::PlutilExtractResult short_ver;
-        if (!short_ver_run.timed_out) {
+        if (!short_ver_run.timed_out && !short_ver_run.output_truncated) {
             short_ver = yuzu::filesystem_macos::classify_plutil_extract(
                 short_ver_run.tool_ran, short_ver_run.exit_code, short_ver_run.output);
         }
         yuzu::filesystem_macos::PlutilExtractResult build_ver;
-        if (!build_ver_run.timed_out) {
+        if (!build_ver_run.timed_out && !build_ver_run.output_truncated) {
             build_ver = yuzu::filesystem_macos::classify_plutil_extract(
                 build_ver_run.tool_ran, build_ver_run.exit_code, build_ver_run.output);
         }

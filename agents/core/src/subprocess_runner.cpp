@@ -455,14 +455,23 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     std::string line_buf;
     std::array<char, 512> buf{};
     constexpr std::size_t kOutputSanityCapBytes = 1'000'000; // real output is tiny
+    // Set once opts.stop_after_max_lines is armed and result.lines has just
+    // reached opts.max_lines -- triggers a clean early kill+reap below,
+    // distinct from a deadline/cancel kill (see the exit_code fixup after
+    // the loop).
+    bool line_cap_stop = false;
 
     auto store_line = [&](std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
         if (line.empty())
             return;
-        if (opts.max_lines == 0 || result.lines.size() < opts.max_lines)
+        if (opts.max_lines == 0 || result.lines.size() < opts.max_lines) {
             result.lines.push_back(std::move(line));
+            if (opts.stop_after_max_lines && opts.max_lines != 0 &&
+                result.lines.size() >= opts.max_lines)
+                line_cap_stop = true;
+        }
     };
 
     auto try_reap = [&]() {
@@ -537,6 +546,19 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 // the still-unreaped direct child if the group kill fails.
                 kill_child_or_group(pid);
             }
+        } else if (!killed && line_cap_stop) {
+            // Caller only wants the first opts.max_lines lines and asked
+            // for a clean bounded stop rather than draining to the
+            // deadline -- kill+reap exactly like a deadline, but this is
+            // NOT a timeout: result.timed_out stays false, and exit_code is
+            // fixed up to a success sentinel after the loop below.
+            killed = true;
+            kill_time = now;
+            if (child_reaped) {
+                (void)kill(-pid, SIGKILL);
+            } else {
+                kill_child_or_group(pid);
+            }
         }
 
         if (child_reaped && pipe_eof && !err_pipe_open)
@@ -578,7 +600,12 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             if (take < static_cast<std::size_t>(n))
                 result.output_truncated = true;
 
-            for (ssize_t i = 0; i < n; ++i) {
+            // Line materialization only ever sees the `take` prefix admitted
+            // above -- once the blob cap is hit (take == 0), no further
+            // bytes reach store_line/line_buf even though the read loop
+            // keeps draining (and discarding) the rest of the pipe, so
+            // result.lines stays bounded by the same cap as result.output.
+            for (ssize_t i = 0; i < static_cast<ssize_t>(take); ++i) {
                 char ch = buf[static_cast<std::size_t>(i)];
                 if (ch == '\n') {
                     store_line(std::move(line_buf));
@@ -626,6 +653,14 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // reached execvp(): either way, tool_ran stays false, an honest
     // "unknown" rather than a guess.
     result.tool_ran = exec_confirmed_ok && !exec_failed;
+
+    // A clean stop_after_max_lines stop kills the child by our own request
+    // once it had already produced everything the caller asked for -- that
+    // is a success, not a failure, so it gets a real exit_code rather than
+    // the signal-death -1 sentinel (which callers would otherwise read as
+    // "log show exited with an error").
+    if (line_cap_stop && !result.timed_out)
+        result.exit_code = 0;
 
     return result;
 }

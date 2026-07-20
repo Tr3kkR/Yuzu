@@ -171,13 +171,15 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
 
 #elif defined(__APPLE__)
     constexpr std::size_t kMaxLines = 100;
-    std::vector<std::string> argv{"log",         "show",
-                                   "--predicate", "messageType == error",
-                                   "--last",      std::format("{}h", hours),
-                                   "--style",     "compact"};
+    std::vector<std::string> argv{"/usr/bin/log", "show",
+                                   "--predicate",  "messageType == error",
+                                   "--last",       std::format("{}h", hours),
+                                   "--style",      "compact"};
     auto result = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{
-                  .deadline = kLogShowDeadline, .max_lines = kMaxLines, .merge_stderr = false});
+        argv, yuzu::agent::SubprocessOptions{.deadline = kLogShowDeadline,
+                                              .max_lines = kMaxLines,
+                                              .merge_stderr = false,
+                                              .stop_after_max_lines = true});
 
     // decide_log_show_output is the single source of truth for the
     // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
@@ -276,7 +278,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    std::vector<std::string> argv{"log",
+    std::vector<std::string> argv{"/usr/bin/log",
                                    "show",
                                    "--predicate",
                                    std::format("eventMessage contains \"{}\"", filter),
@@ -287,7 +289,8 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto result = yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = kLogShowDeadline,
                                               .max_lines = static_cast<std::size_t>(count),
-                                              .merge_stderr = false});
+                                              .merge_stderr = false,
+                                              .stop_after_max_lines = true});
 
     // decide_log_show_output is the single source of truth for the
     // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only

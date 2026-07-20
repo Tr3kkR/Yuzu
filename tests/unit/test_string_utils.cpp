@@ -133,6 +133,68 @@ TEST_CASE("escape_pipes: only pipes", "[string_utils][pipes]") {
     REQUIRE(escape_pipes("|||") == "\\|\\|\\|");
 }
 
+// ── safe_output_field ───────────────────────────────────────────────────────
+
+namespace {
+// Mirrors server/core/src/result_parsing.hpp's find_unescaped_pipe exactly
+// (kept local to this test -- the server file is out of scope for this
+// change) so the round-trip tests below assert against the real
+// consumer-side parsing semantics, not just this header's own escaping.
+size_t test_find_unescaped_pipe(const std::string& s, size_t pos) {
+    while (pos < s.size()) {
+        auto p = s.find('|', pos);
+        if (p == std::string::npos)
+            return std::string::npos;
+        if (p > 0 && s[p - 1] == '\\') {
+            pos = p + 1;
+            continue;
+        }
+        return p;
+    }
+    return std::string::npos;
+}
+
+std::vector<std::string> test_split_fields(const std::string& line) {
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        auto p = test_find_unescaped_pipe(line, pos);
+        if (p == std::string::npos) {
+            parts.push_back(line.substr(pos));
+            break;
+        }
+        parts.push_back(line.substr(pos, p - pos));
+        pos = p + 1;
+    }
+    return parts;
+}
+} // namespace
+
+TEST_CASE("safe_output_field: trailing backslash does not swallow the following separator",
+          "[string_utils][safe_output_field]") {
+    // A value ending in a literal backslash used to leave that backslash in
+    // the output, which the server's find_unescaped_pipe reads as escaping
+    // the very next '|' -- collapsing two real fields into one.
+    std::string field1 = safe_output_field("value ending in\\");
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == field1);
+    CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: literal backslash-pipe stays inside one field",
+          "[string_utils][safe_output_field]") {
+    std::string field1 = safe_output_field("contains \\| inside");
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == field1);
+    CHECK(parts[1] == "next");
+}
+
 // ── sanitize_input ──────────────────────────────────────────────────────────
 
 TEST_CASE("sanitize_input: alphanumeric passes through", "[string_utils][sanitize]") {

@@ -389,4 +389,49 @@ TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a con
     CHECK(unexpected_no_run.load() == 0);
 }
 
+TEST_CASE("run_bounded_subprocess bounds result.lines by the same cap as result.output for a "
+          "newline-rich child (BR-001)",
+          "[subprocess][deadline][macos][linux]") {
+    // A child that emits nothing but short lines used to blow past the 1MB
+    // output blob cap on result.lines too: line materialization iterated
+    // over the WHOLE read rather than just the `take` prefix admitted into
+    // result.output, so lines could accumulate far past what 1MB of source
+    // text implies (observed against /usr/bin/yes x: lines=928256 while
+    // output=1000000). This drives a real child past the cap and asserts
+    // both are bounded together.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/usr/bin/awk", "BEGIN{for(i=0;i<600000;++i)print \"x\"}"},
+        SubprocessOptions{.deadline = 10000ms});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    CHECK(result.output.size() == 1'000'000);
+    CHECK(result.output_truncated);
+    // Each stored line is "x\n" (2 bytes admitted per line), so the 1MB cap
+    // bounds lines to at most 500'000 -- nowhere near the pre-fix 928256.
+    CHECK(result.lines.size() <= 500'000);
+}
+
+TEST_CASE("run_bounded_subprocess with stop_after_max_lines cleanly stops at exactly N lines "
+          "instead of draining to the deadline (BR-004)",
+          "[subprocess][deadline][macos][linux]") {
+    // /usr/bin/yes never stops on its own. Without stop_after_max_lines,
+    // max_lines only caps what gets STORED while the runner keeps draining
+    // the pipe until the deadline -- reported as a partial, timed_out
+    // result. With stop_after_max_lines set, reaching max_lines is itself a
+    // clean, bounded success: the runner kills+reaps the child immediately
+    // and reports it as a normal completion, not a timeout or truncation.
+    constexpr std::size_t kLines = 500;
+    SubprocessResult result = run_bounded_subprocess(
+        {"/usr/bin/yes", "x"}, SubprocessOptions{.deadline = 10000ms,
+                                                  .max_lines = kLines,
+                                                  .stop_after_max_lines = true});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK_FALSE(result.output_truncated);
+    REQUIRE(result.lines.size() == kLines);
+    CHECK(result.lines[0] == "x");
+    CHECK(result.exit_code == 0);
+}
+
 #endif // !_WIN32
