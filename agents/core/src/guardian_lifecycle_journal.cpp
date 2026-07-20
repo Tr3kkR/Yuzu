@@ -3,6 +3,7 @@
 #include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::try_page_batch + OutboxEntry
 
 #include <yuzu/agent/kv_store.hpp>
+#include <yuzu/agent/plugin_loader.hpp> // kReservedPluginNames - for the pin below
 
 #include <spdlog/spdlog.h>
 
@@ -14,6 +15,18 @@
 #include <vector>
 
 namespace yuzu::agent {
+
+// #2303 C2. The journal namespace MUST be a reserved plugin name: yuzu_ctx_storage_* keys
+// KvStore by the plugin's own declared name on the SAME connection this journal borrows, so a
+// plugin able to claim it could read, delete, or forge the audit records replayed over the
+// authenticated stream. plugin_loader.hpp (include/) cannot include guardian_journal_format.hpp
+// (src/) without inverting the layering, so the literal is duplicated there and pinned here -
+// this file is the only translation unit that sees both. Same bind-or-drift pattern as the
+// kNetTag* heartbeat-key asserts.
+static_assert(std::ranges::find(kReservedPluginNames, kJournalNamespace) !=
+                  kReservedPluginNames.end(),
+              "kJournalNamespace must appear in kReservedPluginNames (plugin_loader.hpp) - "
+              "otherwise a native plugin can claim the journal's kv_store namespace");
 
 namespace {
 

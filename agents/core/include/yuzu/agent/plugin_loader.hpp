@@ -26,10 +26,21 @@ struct LoadError {
 /// that declare one of these names are rejected so a compromised or
 /// misconfigured plugin author cannot shadow the reserved dispatch paths.
 /// See docs/yuzu-guardian-design-v1.1.md §7.2 for `__guard__`.
-inline constexpr std::array<std::string_view, 3> kReservedPluginNames{
-    "__guard__",   // Guardian engine (design v1.1 §7.2)
-    "__system__",  // reserved for future system-scope commands
-    "__update__",  // reserved for OTA update commands
+///
+/// `__guardian_journal__` is the Guardian lifecycle journal's kv_store
+/// namespace. It MUST stay reserved: yuzu_ctx_storage_* keys KvStore by the
+/// plugin's own declared name on the SAME connection the journal borrows, so a
+/// plugin allowed to claim that name could read, delete (silent audit-evidence
+/// loss), or forge the arm/disarm records the journal later replays over the
+/// authenticated stream. The literal is duplicated from kJournalNamespace
+/// (guardian_journal_format.hpp) because that header lives under src/ and this
+/// one under include/ - a static_assert in guardian_lifecycle_journal.cpp pins
+/// the two together so they cannot drift.
+inline constexpr std::array<std::string_view, 4> kReservedPluginNames{
+    "__guard__",            // Guardian engine (design v1.1 §7.2)
+    "__system__",           // reserved for future system-scope commands
+    "__update__",           // reserved for OTA update commands
+    "__guardian_journal__", // Guardian lifecycle journal namespace (#2303 C2)
 };
 
 /// Stable reason prefix recorded in LoadError::reason when a plugin is

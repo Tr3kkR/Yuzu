@@ -296,15 +296,34 @@ TEST_CASE("is_reserved_plugin_name matches the reserved set", "[plugin_loader][r
     REQUIRE_FALSE(is_reserved_plugin_name("__guard__ "));
 }
 
-TEST_CASE("kReservedPluginNames covers guardian, system, update",
+TEST_CASE("kReservedPluginNames covers guardian, system, update, journal",
           "[plugin_loader][reserved_name]") {
     // Sanity-check the exact namespace. If a new reserved name is added,
     // this test is the deliberate trip-wire reminding authors to update
     // docs/cpp-conventions.md and the plugin ABI reference.
-    REQUIRE(yuzu::agent::kReservedPluginNames.size() == 3);
+    REQUIRE(yuzu::agent::kReservedPluginNames.size() == 4);
     REQUIRE(yuzu::agent::kReservedPluginNames[0] == "__guard__");
     REQUIRE(yuzu::agent::kReservedPluginNames[1] == "__system__");
     REQUIRE(yuzu::agent::kReservedPluginNames[2] == "__update__");
+    REQUIRE(yuzu::agent::kReservedPluginNames[3] == "__guardian_journal__");
+}
+
+TEST_CASE("the Guardian lifecycle-journal namespace is a reserved plugin name",
+          "[plugin_loader][reserved_name]") {
+    // #2303 C2. yuzu_ctx_storage_* keys KvStore by the plugin's own declared
+    // name, on the SAME kv_store connection GuardianLifecycleJournal borrows.
+    // A native plugin able to claim this name could read, delete (silent
+    // evidence loss), or FORGE the arm/disarm records the journal later
+    // replays over the authenticated stream. The name is otherwise
+    // well-formed, so is_valid_plugin_name alone does NOT stop it - only the
+    // reserved-name check does. Both halves are asserted here.
+    REQUIRE(yuzu::agent::is_valid_plugin_name("__guardian_journal__"));
+    REQUIRE(yuzu::agent::is_reserved_plugin_name("__guardian_journal__"));
+
+    // Same near-miss discipline as __guard__: exact, case-sensitive match only.
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__GUARDIAN_JOURNAL__"));
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__guardian_journal"));
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("x__guardian_journal__"));
 }
 
 // ── #822 plugin-name validation ──────────────────────────────────────────────
