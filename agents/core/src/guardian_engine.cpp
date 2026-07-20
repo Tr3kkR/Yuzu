@@ -24,6 +24,7 @@
 #include <yuzu/agent/guard_service.hpp>
 #include <yuzu/agent/guard_systemd.hpp> // make_service_guard (platform factory)
 #include <yuzu/agent/kv_store.hpp>
+#include <yuzu/agent/plugin_loader.hpp> // kReservedPluginNames - for the kKvNamespace pin
 
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
@@ -63,6 +64,16 @@ namespace apb = ::yuzu::agent::v1;
 constexpr std::string_view kKvNamespace = "__guardian__";
 constexpr std::string_view kRulePrefix  = "rule:";
 constexpr std::string_view kKeyGen      = "meta:policy_generation";
+
+// #2303 sec-M. GuardianEngine persists rule state under kKvNamespace on the shared kv_store.db,
+// keyed the same way plugin storage is (yuzu_ctx_storage_* by the plugin's own declared name).
+// This namespace MUST be a reserved plugin name, or a native plugin could claim it and forge the
+// policy rules the engine reloads as authoritative at boot. plugin_loader.hpp (include/) cannot
+// include this src/ file, so the literal is duplicated in kReservedPluginNames and pinned here -
+// the same bind-or-drift pattern as the journal's kJournalNamespace pin.
+static_assert(is_reserved_plugin_name(kKvNamespace),
+              "kKvNamespace must be a reserved plugin name (plugin_loader.hpp) - otherwise a "
+              "native plugin can claim the GuardianEngine rule-state kv_store namespace");
 
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";

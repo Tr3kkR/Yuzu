@@ -89,6 +89,15 @@ namespace pb = ::yuzu::agent::v1;
 namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
+// #2303 sec-L. The daily-sync scheduler (ADR-0016) persists last-hash / need_full state in this
+// kv_store namespace, keyed the same way plugin storage is (by the plugin's own declared name).
+// It MUST be a reserved plugin name, or a native plugin could claim it and forge/clear the sync
+// state to force or suppress a daily push. The static_assert binds this constant to
+// kReservedPluginNames so the two cannot drift; both kv_store call sites use it.
+constexpr std::string_view kSyncKvNamespace = "__sync__";
+static_assert(is_reserved_plugin_name(kSyncKvNamespace),
+              "kSyncKvNamespace must be a reserved plugin name (plugin_loader.hpp)");
+
 #if defined(_WIN32)
 constexpr const char* kAgentOs = "windows";
 constexpr const char* kAgentArch = "x86_64";
@@ -1811,12 +1820,12 @@ public:
                                    sync_stop_.load(std::memory_order_acquire);
                         };
                         auto kv_get = [this](const std::string& key) -> std::string {
-                            auto v = kv_store_ ? kv_store_->get("__sync__", key) : std::nullopt;
+                            auto v = kv_store_ ? kv_store_->get(kSyncKvNamespace, key) : std::nullopt;
                             return v ? *v : std::string{};
                         };
                         auto kv_set = [this](const std::string& key, const std::string& value) {
                             if (kv_store_)
-                                kv_store_->set("__sync__", key, value);
+                                kv_store_->set(kSyncKvNamespace, key, value);
                         };
                         auto sender =
                             [this, &sync_stub](

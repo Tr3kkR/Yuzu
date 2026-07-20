@@ -296,34 +296,46 @@ TEST_CASE("is_reserved_plugin_name matches the reserved set", "[plugin_loader][r
     REQUIRE_FALSE(is_reserved_plugin_name("__guard__ "));
 }
 
-TEST_CASE("kReservedPluginNames covers guardian, system, update, journal",
+TEST_CASE("kReservedPluginNames covers the exact reserved set",
           "[plugin_loader][reserved_name]") {
     // Sanity-check the exact namespace. If a new reserved name is added,
     // this test is the deliberate trip-wire reminding authors to update
-    // docs/cpp-conventions.md and the plugin ABI reference.
-    REQUIRE(yuzu::agent::kReservedPluginNames.size() == 4);
+    // docs/cpp-conventions.md and docs/user-manual/metrics.md (the
+    // reserved_name rejection-reason row) to match.
+    REQUIRE(yuzu::agent::kReservedPluginNames.size() == 6);
     REQUIRE(yuzu::agent::kReservedPluginNames[0] == "__guard__");
     REQUIRE(yuzu::agent::kReservedPluginNames[1] == "__system__");
     REQUIRE(yuzu::agent::kReservedPluginNames[2] == "__update__");
     REQUIRE(yuzu::agent::kReservedPluginNames[3] == "__guardian_journal__");
+    REQUIRE(yuzu::agent::kReservedPluginNames[4] == "__guardian__");
+    REQUIRE(yuzu::agent::kReservedPluginNames[5] == "__sync__");
 }
 
-TEST_CASE("the Guardian lifecycle-journal namespace is a reserved plugin name",
+TEST_CASE("agent-internal kv_store namespaces are reserved plugin names",
           "[plugin_loader][reserved_name]") {
-    // #2303 C2. yuzu_ctx_storage_* keys KvStore by the plugin's own declared
-    // name, on the SAME kv_store connection GuardianLifecycleJournal borrows.
-    // A native plugin able to claim this name could read, delete (silent
-    // evidence loss), or FORGE the arm/disarm records the journal later
-    // replays over the authenticated stream. The name is otherwise
-    // well-formed, so is_valid_plugin_name alone does NOT stop it - only the
-    // reserved-name check does. Both halves are asserted here.
-    REQUIRE(yuzu::agent::is_valid_plugin_name("__guardian_journal__"));
-    REQUIRE(yuzu::agent::is_reserved_plugin_name("__guardian_journal__"));
+    // #2303 C2 + sec-M/sec-L. yuzu_ctx_storage_* keys KvStore by the plugin's
+    // own declared name, on the SAME kv_store connection these subsystems use.
+    // A native plugin able to claim one of these names could read, delete, or
+    // FORGE the state the subsystem loads as authoritative - Guardian rule
+    // state, the arm/disarm audit journal, or the daily-sync scheduler state.
+    // Each name is otherwise well-formed, so is_valid_plugin_name alone does
+    // NOT stop it - only the reserved-name check does. Both halves are asserted.
+    for (const auto* ns : {"__guardian_journal__", "__guardian__", "__sync__"}) {
+        INFO("namespace: " << ns);
+        REQUIRE(yuzu::agent::is_valid_plugin_name(ns)); // well-formed identifier
+        REQUIRE(yuzu::agent::is_reserved_plugin_name(ns)); // ...but reserved
+    }
 
-    // Same near-miss discipline as __guard__: exact, case-sensitive match only.
-    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__GUARDIAN_JOURNAL__"));
-    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__guardian_journal"));
-    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("x__guardian_journal__"));
+    // Near-miss discipline (same as __guard__): exact, case-sensitive match only.
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__GUARDIAN__"));
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__guardian_"));
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("x__guardian__"));
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__sync"));
+    REQUIRE_FALSE(yuzu::agent::is_reserved_plugin_name("__SYNC__"));
+    // __guardian__ and __guardian_journal__ are DISTINCT reserved names, not a
+    // prefix match - claiming one must not be read as claiming the other.
+    REQUIRE(yuzu::agent::is_reserved_plugin_name("__guardian__"));
+    REQUIRE(yuzu::agent::is_reserved_plugin_name("__guardian_journal__"));
 }
 
 // ── #822 plugin-name validation ──────────────────────────────────────────────
