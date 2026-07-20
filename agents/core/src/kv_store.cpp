@@ -538,4 +538,10 @@ int KvStore::pragma_synchronous() {
     return -1;
 }
 
+void KvStore::enable_extended_result_codes_for_test() {
+    std::lock_guard lock(mu_);
+    if (db_)
+        sqlite3_extended_result_codes(db_, 1);
+}
+
 } // namespace yuzu::agent

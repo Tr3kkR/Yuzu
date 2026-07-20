@@ -143,6 +143,16 @@ public:
      */
     [[nodiscard]] int pragma_synchronous();
 
+    /**
+     * TEST-ONLY: turn on SQLite extended result codes for this connection.
+     * Production code never enables them here, so rename_key's PK-conflict
+     * classification uses `rc & 0xFF`; this seam lets a test exercise that
+     * masking by making step() actually return the extended code
+     * SQLITE_CONSTRAINT_PRIMARYKEY (1555) instead of the primary 19. Without
+     * the mask that test would see Error, not Conflict.
+     */
+    void enable_extended_result_codes_for_test();
+
 private:
     explicit KvStore(sqlite3* db);
 
