@@ -67,7 +67,8 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the target feature se
 - `fix/<short-description>` for bug fixes
 - `fix/<finding-id>-<short-description>` for RC sprint findings (e.g., `fix/C1-gateway-tls`)
 
-Branch from `main`. Keep branches focused on a single change.
+Branch from `dev` — all work merges into `dev`; `main` is release-only. Keep branches focused
+on a single change.
 
 ## Erlang Gateway
 
@@ -86,12 +87,35 @@ The MCP server is embedded in the C++ server at `POST /mcp/v1/`. Changes to MCP 
 
 All code changes follow mandatory governance gates defined in `CLAUDE.md`. In summary: change summary, security + docs deep-dive, domain-triggered review, correctness & resilience analysis (happy-path + unhappy-path + consistency-auditor in parallel), chaos analysis (chaos-injector), all findings addressed before merge. See the Agent Team section in CLAUDE.md for the full workflow and gate definitions.
 
+## Filing Issues
+
+Issue filing, labelling, and closing follow the repo standard:
+[`docs/agents/issue-standard.md`](docs/agents/issue-standard.md). The short version:
+
+- **Search for duplicates before filing** — comment new evidence on an existing issue rather
+  than filing a twin.
+- One actionable outcome per issue, with Context / Evidence / Acceptance criteria / Origin
+  sections in the body. (Reporting via the web templates? A description and reproduction steps
+  are enough — triage fills in the rest; the full format binds the `gh`/agent path.)
+- Every issue carries exactly one type label; every non-`roadmap` issue also carries one triage
+  state (`roadmap` = parked scope: no triage state, no priority). Priority (`P0`/`P1`/`P2`)
+  is a triage decision: set it if you have the context (agents and maintainers do);
+  leave it off a drive-by report and triage will add it.
+- **Never file an exploitable security vulnerability as a public issue.** Use
+  [GitHub private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new)
+  (see [SECURITY.md](SECURITY.md)). Public `security`-labelled issues are for hardening and
+  defense-in-depth work only.
+- A PR that resolves an issue says `Closes #N` in its body; partial work says `Relates to #N`
+  and never uses a closing keyword.
+
 ## Pull Request Process
 
 1. Ensure CI passes (builds on Linux, Windows, macOS, ARM64)
 2. Run `clang-tidy` locally against changed files (the repo `.clang-tidy` config is picked up automatically)
 3. Write a clear PR title and description using the PR template
-4. Keep PRs small where possible; large features should be broken into incremental PRs
+4. Declare linked issues in the PR body: `Closes #N` for every issue the PR fully resolves;
+   `Relates to #N` for partial work
+5. Keep PRs small where possible; large features should be broken into incremental PRs
 
 ## Changelog
 
