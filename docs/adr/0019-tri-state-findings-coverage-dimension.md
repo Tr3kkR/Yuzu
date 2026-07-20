@@ -324,9 +324,10 @@ it isn't silently skipped, the same discipline ADR-0023 followed.
 **`/readyz` posture diverges from ADR-0023 by design.** ADR-0023's findings store is wired into the
 server's `/readyz` `stores_ok` conjunction (its Decision 8). The module's findings+disposition store
 is **its own Postgres, with no `/readyz` coupling to the server at all** — a deliberate consequence
-of it being a separate deployable (ADR-1005 Decision 3 / `docs/adr-1005-execution-plan.md` Decision 11), not an oversight. Naming this explicitly
-so an operator reading only this ADR doesn't assume the module follows the in-server health-check
-pattern; the module needs its own readiness/health surface, not the server's.
+of it being a separate deployable (ADR-1005 Decision 3 / `docs/adr-1005-execution-plan.md` Decision
+11), not an oversight. Naming this explicitly so an operator reading only this ADR doesn't assume the
+module follows the in-server health-check pattern; the module needs its own readiness/health surface,
+not the server's.
 
 **Scope note.** This amendment governs the assessment vocabulary as adopted by the Vulnerability
 Management UCE module. It does **not** retroactively change ADR-0023's in-server implementation
