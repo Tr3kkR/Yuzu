@@ -415,7 +415,7 @@ TEST_CASE("journal reopen: a fresh instance seeds its size gauges from the on-di
     GuardianLifecycleJournal b(t.kv.get());
     CHECK(b.journal_batch_count() == 2);
     // Byte-EXACT, not merely non-zero: this cross-pins namespace_size's
-    // SUM(LENGTH(CAST(value AS BLOB))) against the value.size() accounting persist/prune use.
+    // SUM(octet_length(value)) against the value.size() accounting persist/prune use.
     CHECK(b.journal_bytes() == bytes_before);
 }
 
@@ -440,7 +440,7 @@ TEST_CASE("journal reopen: the write ceiling is enforced against pre-existing ba
 
 TEST_CASE("journal reopen: multibyte values are sized in BYTES, not characters",
           "[guardian][journal][persist][reopen]") {
-    // Guards the CAST(value AS BLOB) in namespace_size: bare LENGTH() on a TEXT column counts
+    // Guards the octet_length(value) in namespace_size: bare LENGTH() on a TEXT column counts
     // CHARACTERS, so a multibyte rule_name would seed the byte gauge LOW - the one direction
     // that silently loosens the write ceiling.
     TestKv t;
