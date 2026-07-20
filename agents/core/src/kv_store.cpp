@@ -457,7 +457,12 @@ KvRename KvStore::rename_key(std::string_view plugin, std::string_view from_key,
     }
     if (rc == SQLITE_DONE)
         return KvRename::NotFound; // from_key matched no row
-    if (rc == SQLITE_CONSTRAINT)
+    // Mask to the PRIMARY result code (#2303 K1). Extended result codes are off on this
+    // connection today, so a bare == SQLITE_CONSTRAINT happens to match; the moment anything
+    // enables sqlite3_extended_result_codes() the step would return SQLITE_CONSTRAINT_PRIMARYKEY
+    // (1555) and a genuine PK conflict would silently misreport as Error. Masking makes the
+    // classification independent of that setting.
+    if ((rc & 0xFF) == SQLITE_CONSTRAINT)
         return KvRename::Conflict; // to_key already exists (PK), ABORT default
     spdlog::error("KvStore::rename_key step failed: {}", sqlite3_errmsg(db_));
     return KvRename::Error;
