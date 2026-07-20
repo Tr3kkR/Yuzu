@@ -249,6 +249,93 @@ TEST_CASE("parse_system_profiler_apps_json: an element with no (or empty) _name 
     CHECK(apps[0].name == "Named");
 }
 
+// ── BR-06: non-string/null field values never throw ────────────────────────
+//
+// Runtime-confirmed crash: json::value("_name", "") on a JSON number throws
+// json::exception::type_error.302 -- these fixtures cover a non-string
+// _name (record dropped, matching the empty/missing-name contract) and
+// non-string version/path/lastModified (record kept, those fields degrade
+// to "").
+
+TEST_CASE("parse_system_profiler_apps_json: a numeric _name is dropped, never throws",
+          "[installed_apps][macos][enrich]") {
+    auto apps = parse_system_profiler_apps_json(
+        R"({"SPApplicationsDataType": [
+              {"_name": 42, "path": "/Applications/Numeric.app"},
+              {"_name": "Named", "path": "/Applications/Named.app"}
+        ]})");
+    REQUIRE(apps.size() == 1);
+    CHECK(apps[0].name == "Named");
+}
+
+TEST_CASE("parse_system_profiler_apps_json: a null _name is dropped, never throws",
+          "[installed_apps][macos][enrich]") {
+    auto apps = parse_system_profiler_apps_json(
+        R"({"SPApplicationsDataType": [{"_name": null, "path": "/Applications/Null.app"}]})");
+    CHECK(apps.empty());
+}
+
+TEST_CASE("parse_system_profiler_apps_json: non-string version/path/lastModified degrade "
+          "to empty rather than throwing, the record survives",
+          "[installed_apps][macos][enrich]") {
+    auto apps = parse_system_profiler_apps_json(
+        R"({"SPApplicationsDataType": [
+              {"_name": "Weird", "version": 1, "path": true, "lastModified": {}}
+        ]})");
+    REQUIRE(apps.size() == 1);
+    CHECK(apps[0].name == "Weird");
+    CHECK(apps[0].version.empty());
+    CHECK(apps[0].path.empty());
+    CHECK(apps[0].last_modified.empty());
+}
+
+TEST_CASE("parse_system_profiler_apps_json: an array _name is dropped, never throws",
+          "[installed_apps][macos][enrich]") {
+    auto apps = parse_system_profiler_apps_json(
+        R"({"SPApplicationsDataType": [{"_name": ["not", "a", "string"]}]})");
+    CHECK(apps.empty());
+}
+
+// ── BR-05: a truncated system_profiler capture never parses to a false
+// empty success -- the plugin (not this pure parser) is what turns
+// output_truncated into the honest nonzero path, but the parser itself
+// must survive genuinely truncated (invalid) JSON without throwing, same
+// as any other malformed-JSON case above.
+
+TEST_CASE("parse_system_profiler_apps_json: JSON truncated mid-object degrades to an "
+          "empty vector, never throws",
+          "[installed_apps][macos][enrich]") {
+    // A realistic truncation: capture cut off mid-way through a record,
+    // same shape run_bounded_subprocess's output_truncated cap produces.
+    auto apps = parse_system_profiler_apps_json(
+        R"json({"SPApplicationsDataType": [{"_name": "App Store", "path": "/System/Applications/App)json");
+    CHECK(apps.empty());
+}
+
+TEST_CASE("truncated_listing_outcome: output_truncated=true yields the honest sentinel "
+          "row and nonzero rc, never the empty-success 'No applications found' rc 0",
+          "[installed_apps][macos][enrich]") {
+    // Pure fixture -- no subprocess spawned. Mirrors what do_list_macos sees
+    // when run_bounded_subprocess's internal size cap truncates a >1MB
+    // system_profiler capture: tool_ran/exit_code still look like a clean
+    // success, only output_truncated flags the honest partial.
+    SubprocessResult sp_result{
+        .tool_ran = true, .exit_code = 0, .timed_out = false, .output_truncated = true};
+
+    auto outcome = truncated_listing_outcome(sp_result);
+    REQUIRE(outcome.has_value());
+    CHECK(outcome->second != 0);
+    CHECK(outcome->first != "app|No applications found|-|-|-|-|-");
+    CHECK(outcome->first.find("truncated") != std::string::npos);
+}
+
+TEST_CASE("truncated_listing_outcome: output_truncated=false defers to the caller's own "
+          "empty/populated handling",
+          "[installed_apps][macos][enrich]") {
+    SubprocessResult sp_result{.tool_ran = true, .exit_code = 0, .timed_out = false};
+    CHECK_FALSE(truncated_listing_outcome(sp_result).has_value());
+}
+
 // ── signature_status_from / bundle_id_from (PLAN-02 short-circuit) ─────────
 
 TEST_CASE("signature_status_from: nullopt (never attempted) is honest unknown",
@@ -377,4 +464,37 @@ TEST_CASE("format_operator_list_row: empty version/publisher/last_modified each 
     MacAppRecord app{.name = "Bare", .path = "/Applications/Bare.app"};
     auto row = format_operator_list_row(app, std::nullopt, std::nullopt);
     CHECK(row == "app|Bare|-|-|-|unknown|-");
+}
+
+// ── BR-07: dynamic fields are escaped via safe_output_field ────────────────
+//
+// A hostile app name (or, via plutil, bundle id) carrying '|' or CR/LF
+// could otherwise inject a column or a fabricated row into the
+// pipe-delimited output stream; every dynamic field goes through
+// yuzu::util::safe_output_field, matching the escaping other pipe-row
+// producers in this codebase already apply to untrusted strings.
+
+TEST_CASE("format_operator_list_row: a name/publisher/last_modified carrying '|' and "
+          "CR/LF is escaped, never injects a column or row",
+          "[installed_apps][macos][enrich]") {
+    MacAppRecord app{.name = "Evil|App\r\nInjected",
+                     .version = "1.0|beta",
+                     .path = "/Applications/Evil.app",
+                     .publisher = "Bad\nActor|Inc",
+                     .last_modified = "2024-01-01T00:00:00Z\r|extra"};
+    auto row = format_operator_list_row(app, std::nullopt, std::nullopt);
+    CHECK(row == "app|Evil\\|App  Injected|1.0\\|beta|Bad Actor\\|Inc|"
+                "2024-01-01T00:00:00Z \\|extra|unknown|-");
+}
+
+TEST_CASE("format_operator_list_row: a bundle_id carrying '|' and CR/LF is escaped",
+          "[installed_apps][macos][enrich]") {
+    MacAppRecord app{.name = "Foo", .path = "/Applications/Foo.app"};
+    SubprocessResult plutil_result{.tool_ran = true,
+                                   .exit_code = 0,
+                                   .timed_out = false,
+                                   .output = "com.example|evil\r\napp\n"};
+
+    auto row = format_operator_list_row(app, std::nullopt, plutil_result);
+    CHECK(row == "app|Foo|-|-|-|unknown|com.example\\|evil  app");
 }

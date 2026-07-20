@@ -29,6 +29,7 @@
 #include "filesystem_macos_sig.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/string_utils.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -36,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::installed_apps::macos_enrich {
@@ -54,6 +56,17 @@ struct MacAppRecord {
 };
 
 namespace detail {
+
+// A JSON value at `key` that isn't a string (or is absent) degrades to ""
+// rather than throwing -- system_profiler's schema is not contractually
+// typed, so a plugin/OS update that turns e.g. `_name` into a number (or
+// omits it) must never crash the whole listing. Mirrors derive_publisher's
+// find()+is_*() guard below.
+inline std::string string_or_empty(const nlohmann::json& app_json, const char* key) {
+    if (auto it = app_json.find(key); it != app_json.end() && it->is_string())
+        return it->get<std::string>();
+    return {};
+}
 
 // `signed_by` (when present) is the codesign certificate chain, leaf first
 // -- e.g. ["Developer ID Application: Spotify (2FNC3A47ZF)", "Developer ID
@@ -92,8 +105,13 @@ inline std::string derive_publisher(const nlohmann::json& app_json) {
 // never a thrown exception, matching this codebase's
 // json::parse(..., allow_exceptions=false) convention for subprocess-derived
 // JSON (dex_linux_journal.cpp, tar_software_core.cpp). A record with no
-// `_name` is dropped, mirroring do_list_inventory's "row dropped if name is
-// empty" contract -- an unnamed row can't be meaningfully reported.
+// (string) `_name` is dropped, mirroring do_list_inventory's "row dropped if
+// name is empty" contract -- an unnamed row can't be meaningfully reported.
+// `version`/`path`/`lastModified` go through the same is_string() guard
+// (detail::string_or_empty) but degrade to "" rather than dropping the
+// record -- a non-string value there (e.g. a future system_profiler schema
+// change) must never throw json::type_error, matching derive_publisher's
+// existing guard below.
 inline std::vector<MacAppRecord> parse_system_profiler_apps_json(std::string_view json_text) {
     std::vector<MacAppRecord> out;
 
@@ -111,12 +129,12 @@ inline std::vector<MacAppRecord> parse_system_profiler_apps_json(std::string_vie
             continue;
 
         MacAppRecord rec;
-        rec.name = app_json.value("_name", "");
+        rec.name = detail::string_or_empty(app_json, "_name");
         if (rec.name.empty())
             continue;
-        rec.version = app_json.value("version", "");
-        rec.path = app_json.value("path", "");
-        rec.last_modified = app_json.value("lastModified", "");
+        rec.version = detail::string_or_empty(app_json, "version");
+        rec.path = detail::string_or_empty(app_json, "path");
+        rec.last_modified = detail::string_or_empty(app_json, "lastModified");
         rec.publisher = detail::derive_publisher(app_json);
         out.push_back(std::move(rec));
     }
@@ -154,19 +172,43 @@ bundle_id_from(const std::optional<yuzu::agent::SubprocessResult>& result) {
 // run_bounded_subprocess() results (nullopt if that subprocess was never
 // attempted for this app) -- classification and the timed_out short-circuit
 // happen inside this function so the plugin's do_list() never has to name a
-// yuzu::filesystem_macos type directly.
+// yuzu::filesystem_macos type directly. Every dynamic (endpoint-controlled)
+// field -- name/version/publisher/last_modified/bundle_id -- goes through
+// safe_output_field so a hostile app name or bundle id can't inject a `|`
+// column or a CR/LF row into the pipe-delimited stream; signature_status is
+// our own enum-to-string and needs no escaping.
 inline std::string
 format_operator_list_row(const MacAppRecord& app,
                          const std::optional<yuzu::agent::SubprocessResult>& codesign_result,
                          const std::optional<yuzu::agent::SubprocessResult>& plutil_result) {
     const auto signature_status = signature_status_from(codesign_result);
     const auto bundle_id = bundle_id_from(plutil_result);
-    return std::format("app|{}|{}|{}|{}|{}|{}", app.name,
-                        app.version.empty() ? "-" : app.version,
-                        app.publisher.empty() ? "-" : app.publisher,
-                        app.last_modified.empty() ? "-" : app.last_modified,
-                        yuzu::filesystem_macos::to_string(signature_status),
-                        bundle_id.available ? bundle_id.value : "-");
+    return std::format(
+        "app|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(app.name),
+        app.version.empty() ? "-" : yuzu::util::safe_output_field(app.version),
+        app.publisher.empty() ? "-" : yuzu::util::safe_output_field(app.publisher),
+        app.last_modified.empty() ? "-" : yuzu::util::safe_output_field(app.last_modified),
+        yuzu::filesystem_macos::to_string(signature_status),
+        bundle_id.available ? yuzu::util::safe_output_field(bundle_id.value) : "-");
+}
+
+// BR-05: an sp_result with output_truncated set must render the honest
+// truncated-listing sentinel row + nonzero rc, never fall through to the
+// same-shaped "No applications found" rc-0 success row below it -- a >1MB
+// system_profiler JSON truncates mid-object under run_bounded_subprocess's
+// internal size cap and would otherwise parse to an empty vector,
+// misreporting a real partial listing as a genuinely empty one.
+// do_list_macos calls this first, before its apps.empty() check. Pulled out
+// to a pure function (rather than inlined row/rc literals in the plugin) so
+// a fixture test can inject a SubprocessResult and assert the row+rc
+// pairing directly, without spawning system_profiler.
+inline std::optional<std::pair<std::string, int>>
+truncated_listing_outcome(const yuzu::agent::SubprocessResult& sp_result) {
+    if (!sp_result.output_truncated)
+        return std::nullopt;
+    MacAppRecord none;
+    none.name = "system_profiler output truncated -- listing incomplete";
+    return std::make_pair(format_operator_list_row(none, std::nullopt, std::nullopt), 1);
 }
 
 } // namespace yuzu::installed_apps::macos_enrich

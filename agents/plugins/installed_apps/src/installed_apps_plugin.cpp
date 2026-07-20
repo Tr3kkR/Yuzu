@@ -11,9 +11,15 @@
  *             (no "-" placeholders, no sentinel row on an empty result).
  *
  * Output is pipe-delimited, one record per line via write_output():
- *   app|name|version|publisher|install_date                       (list/query)
+ *   app|name|version|publisher|install_date|signature_status|bundle_id  (list)
+ *   app|name|version|publisher                                         (query)
  *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
  *       signature_status|distro_id|distro_version                 (list_inventory)
+ *
+ * `list`'s trailing signature_status/bundle_id are real values on macOS
+ * (codesign/plutil enrichment) and "-|-" placeholders elsewhere -- every
+ * platform emits the same declared 6-column shape, including the empty/
+ * no-results sentinel row, so a consumer never has to branch on OS.
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
  * (content/definitions/installed_apps.yaml et al.) — extend `list_inventory`,
@@ -551,6 +557,18 @@ int do_list_macos(yuzu::CommandContext& ctx) {
                     ? mac_enrich::parse_system_profiler_apps_json(sp_result.output)
                     : std::vector<mac_enrich::MacAppRecord>{};
 
+    // A capture that hit run_bounded_subprocess's internal size cap is an
+    // honest partial, not a complete listing -- a >1MB system_profiler JSON
+    // truncates mid-object, fails to parse, and would otherwise degrade
+    // silently into the "No applications found" rc 0 case below, reporting
+    // a false empty success. Report the truncation itself instead, with
+    // nonzero rc, before that check ever runs. (Decision lives in
+    // truncated_listing_outcome so a fixture test can exercise it directly.)
+    if (auto truncated = mac_enrich::truncated_listing_outcome(sp_result)) {
+        ctx.write_output(truncated->first);
+        return truncated->second;
+    }
+
     if (apps.empty()) {
         mac_enrich::MacAppRecord none;
         none.name = "No applications found";
@@ -562,13 +580,24 @@ int do_list_macos(yuzu::CommandContext& ctx) {
     std::size_t enriched_count = 0;
 
     for (const auto& app : apps) {
-        const bool attempt_enrich = !app.path.empty() && enriched_count < kMaxEnrichedApps &&
-                                    std::chrono::steady_clock::now() < budget_deadline;
+        const auto now = std::chrono::steady_clock::now();
+        const bool attempt_enrich =
+            !app.path.empty() && enriched_count < kMaxEnrichedApps && now < budget_deadline;
 
         std::optional<yuzu::agent::SubprocessResult> codesign_result;
         std::optional<yuzu::agent::SubprocessResult> plutil_result;
         if (attempt_enrich) {
             ++enriched_count;
+
+            // Bound each call to whichever is smaller: its own per-call
+            // deadline, or however much of the WHOLE-listing budget is left
+            // -- so a listing near its 60s budget can't still hand codesign
+            // (or plutil) a full fresh 10s on the last few apps and blow
+            // past the budget by more than one bounded call.
+            const auto codesign_deadline = std::min(
+                kEnrichSubprocessDeadline,
+                std::chrono::duration_cast<std::chrono::milliseconds>(budget_deadline - now));
+
             // merge_stderr=true: classify_codesign_result reads codesign's
             // diagnostic text, which codesign writes to stderr. plutil's
             // success path is stdout-only (`-o -`) and its failure path
@@ -577,13 +606,26 @@ int do_list_macos(yuzu::CommandContext& ctx) {
             // captured on the SubprocessResult for a future caller to log.
             codesign_result = yuzu::agent::run_bounded_subprocess(
                 {"codesign", "--verify", "--deep", "--strict", app.path},
-                yuzu::agent::SubprocessOptions{.deadline = kEnrichSubprocessDeadline,
+                yuzu::agent::SubprocessOptions{.deadline = codesign_deadline,
                                                 .merge_stderr = true});
-            plutil_result = yuzu::agent::run_bounded_subprocess(
-                {"plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-",
-                 app.path + "/Contents/Info.plist"},
-                yuzu::agent::SubprocessOptions{.deadline = kEnrichSubprocessDeadline,
-                                                .merge_stderr = true});
+
+            // Re-check the budget after codesign (which can itself run up
+            // to codesign_deadline) before spending anything on plutil; if
+            // nothing is left, plutil_result stays nullopt -- an honest
+            // "never attempted" (PLAN-02 short-circuit), never a fabricated
+            // verdict.
+            const auto after_codesign = std::chrono::steady_clock::now();
+            if (after_codesign < budget_deadline) {
+                const auto plutil_deadline =
+                    std::min(kEnrichSubprocessDeadline,
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 budget_deadline - after_codesign));
+                plutil_result = yuzu::agent::run_bounded_subprocess(
+                    {"plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-",
+                     app.path + "/Contents/Info.plist"},
+                    yuzu::agent::SubprocessOptions{.deadline = plutil_deadline,
+                                                    .merge_stderr = true});
+            }
         }
 
         ctx.write_output(sanitize_utf8(
@@ -608,14 +650,21 @@ int do_list(yuzu::CommandContext& ctx) {
     std::vector<AppInfo> apps;
 #endif
 
+    // Trailing "-|-": the macOS path's signature_status/bundle_id columns
+    // (PLAN-03) don't exist here -- Windows/Linux have no codesign/plutil
+    // equivalent wired up -- but every platform must emit the same
+    // declared 6-column shape so a consumer parsing this row doesn't have
+    // to branch on OS. That includes the empty/sentinel row below: it must
+    // not degrade to a shorter row shape just because there's no app data
+    // to append it to.
     if (apps.empty()) {
-        ctx.write_output("app|No applications found|-|-|-");
+        ctx.write_output("app|No applications found|-|-|-|-|-");
         return 0;
     }
 
     for (const auto& app : apps) {
         ctx.write_output(sanitize_utf8(
-            std::format("app|{}|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
+            std::format("app|{}|{}|{}|{}|-|-", app.name, app.version.empty() ? "-" : app.version,
                         app.publisher.empty() ? "-" : app.publisher,
                         app.install_date.empty() ? "-" : app.install_date)));
     }
