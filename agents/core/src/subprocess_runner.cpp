@@ -26,10 +26,11 @@
  *     THIS invocation's pipe() and its fcntl(F_SETFD, FD_CLOEXEC) would
  *     otherwise inherit a not-yet-CLOEXEC write end into an unrelated
  *     child, starving this invocation's own EOF (a false timeout) for as
- *     long as that other child runs. A file-local mutex serializes
- *     [pipe()..fork()] across every invocation to close that window; the
- *     child inherits it already locked and never touches it (see
- *     g_fork_pipe_mutex's comment below).
+ *     long as that other child runs. BR-001: the process-wide
+ *     yuzu::agent::global_fork_lock() (fork_lock.hpp) serializes
+ *     [pipe()..fork()] across every fork/popen launcher in the agent, not
+ *     just this file, to close that window; the child inherits it already
+ *     locked and never touches it (see fork_lock.hpp's contract).
  *   - The child calls setsid() so a timeout kill can take out the whole
  *     process group, not just the direct child (a CLI can spawn helpers
  *     that inherit the group).
@@ -54,6 +55,8 @@
 #include <atomic>
 
 #ifndef _WIN32
+#include <yuzu/agent/fork_lock.hpp>
+
 #include <array>
 #include <cerrno>
 #include <csignal>
@@ -292,23 +295,6 @@ int dup2_retry(int oldfd, int newfd) {
     _exit(127);
 }
 
-// BR-01: serializes pipe-creation-through-fork across every concurrent
-// invocation of run_bounded_subprocess. macOS/BSD has no atomic
-// O_CLOEXEC pipe creation (no pipe2(); CLOEXEC is set via a separate
-// fcntl() call after pipe()), so a fork()+exec() on another thread that
-// lands between this invocation's pipe() and its fcntl(F_SETFD,
-// FD_CLOEXEC) would inherit this invocation's not-yet-CLOEXEC write
-// end(s) -- keeping a copy of the write end open in a second process and
-// starving this invocation's read side of EOF (a false timeout).
-//
-// Held across [pipe()..fork()] in run_bounded_subprocess below so no
-// other thread's fork() can land in that window; released in the PARENT
-// immediately after fork() returns. The child inherits it already locked
-// and must NEVER touch it -- it always _exit()s or execvp()s out without
-// running any C++ destructors, so the lock simply stays locked (and
-// irrelevant) in the child's own address space; no deadlock results.
-std::mutex g_fork_pipe_mutex;
-
 } // namespace
 
 SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
@@ -324,11 +310,11 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         c_argv.push_back(const_cast<char*>(arg.c_str()));
     c_argv.push_back(nullptr);
 
-    // BR-01: serialize pipe-creation-through-fork against every other
-    // concurrent invocation (see g_fork_pipe_mutex's comment) -- held from
-    // here through fork() below; every early return in between releases it
-    // via this lock's destructor.
-    std::unique_lock<std::mutex> fork_pipe_lock(g_fork_pipe_mutex);
+    // BR-001: serialize pipe-creation-through-fork against every other
+    // fork/popen launcher in the agent, not just this file (see
+    // fork_lock.hpp's contract) -- held from here through fork() below;
+    // every early return in between releases it via this lock's destructor.
+    std::unique_lock<std::mutex> fork_pipe_lock(global_fork_lock());
 
     int raw_pipe[2];
     if (pipe(raw_pipe) != 0)
@@ -367,8 +353,8 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
 
     if (pid == 0) {
         // Child: inherits fork_pipe_lock already locked -- NEVER lock,
-        // unlock, or otherwise touch it (see g_fork_pipe_mutex's comment
-        // above). Safe specifically because this branch never returns
+        // unlock, or otherwise touch it (see fork_lock.hpp's contract).
+        // Safe specifically because this branch never returns
         // through a normal C++ path -- it always _exit()s or execvp()s
         // below -- so the lock's destructor never runs on this side of the
         // fork either.
@@ -433,8 +419,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     }
 
     // Parent: fork() has returned and this is not the child branch --
-    // release the pipe-creation lock now (see g_fork_pipe_mutex's comment
-    // above).
+    // release the pipe-creation lock now (see fork_lock.hpp's contract).
     fork_pipe_lock.unlock();
 
     // Parent: guard the child from here on so an exception anywhere below

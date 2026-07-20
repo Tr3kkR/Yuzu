@@ -42,6 +42,8 @@
 #include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
 #else
+#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
+
 #include <csignal>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -191,6 +193,13 @@ int run_process_win(yuzu::CommandContext& ctx, const std::string& cmd_line, int 
 
 int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>& argv,
                       int timeout_secs) {
+    // BR-001: hold the process-wide fork lock across [pipe()..fork()] --
+    // macOS/BSD has no pipe2(), so an unrelated thread's fork() landing in
+    // this window could inherit these still-inheritable fds. Released in
+    // the PARENT right after fork() returns; the child inherits it locked
+    // and never touches it (see fork_lock.hpp's contract).
+    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
+
     int pipe_fd[2];
     if (pipe(pipe_fd) != 0) {
         ctx.write_output("status|error");
@@ -246,6 +255,10 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
 #endif
         _exit(127); // exec failed
     }
+
+    // Parent: fork() has returned and this is not the child branch --
+    // release the fork lock now (see fork_lock.hpp's contract).
+    fork_pipe_lock.unlock();
 
     // Parent
     close(pipe_fd[1]);

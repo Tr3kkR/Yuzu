@@ -36,6 +36,8 @@
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
+#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
+
 #include <openssl/evp.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -343,6 +345,14 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
     argv.push_back(nullptr);
 
     // Create pipe for stdout capture
+    //
+    // BR-001: hold the process-wide fork lock across [pipe()..fork()] --
+    // macOS/BSD has no pipe2(), so an unrelated thread's fork() landing in
+    // this window could inherit these still-inheritable fds. Released in
+    // the PARENT right after fork() returns; the child inherits it locked
+    // and never touches it (see fork_lock.hpp's contract).
+    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
+
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         output = "failed to create pipe";
@@ -367,6 +377,10 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
         execvp(exe_str.c_str(), const_cast<char* const*>(argv.data()));
         _exit(127); // execvp failed
     }
+
+    // Parent: fork() has returned and this is not the child branch --
+    // release the fork lock now (see fork_lock.hpp's contract).
+    fork_pipe_lock.unlock();
 
     // Parent
     close(pipefd[1]); // close write end
