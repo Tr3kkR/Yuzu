@@ -412,8 +412,15 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // permanently mark the boot prune done and let over-cap data page unpruned.
     if (!boot_pruned_) {
         // Call prune_locked_ directly: we already hold paging_mutex_ (prune() would re-lock it).
-        if (prune_locked_(now_ms).read_ok)
-            boot_pruned_ = true;
+        if (!prune_locked_(now_ms).read_ok)
+            return stats; // #2303 C4: the barrier means "prune BEFORE any candidate can page".
+                          // Latching only on read_ok (M5) is necessary but not sufficient - on a
+                          // failed scan we must also PAGE NOTHING this pass, or we hand the
+                          // runtime candidates a successful prune would have evicted, defeating
+                          // the barrier on exactly the passes it exists for. Bounded and
+                          // self-correcting: the tick's periodic prune and the next token-bearing
+                          // pass retry, and expired rows are skipped below regardless.
+        boot_pruned_ = true;
     }
 
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
