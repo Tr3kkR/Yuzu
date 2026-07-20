@@ -4,17 +4,22 @@ date: 2026-07-01
 owner: "@lesault (Andy Younie)"
 depends-on: 0018 (server-authoritative matching — the engine that produces these findings); 0005 (two-matcher split)
 related: docs/vuln-scan-engine-design.md §4.4; docs/vuln-scan-roadmap.md M2; docs/vuln-scan-capability-map.md V4; 0023 (correlation engine — first consumer, provisional number)
-amended: 2026-07-05 (correlation-engine grill-with-docs session) — adds a fourth status `potential` and an orthogonal confidence axis (see Amendment); 2026-07-12 (vulnerability-management UCE module design) — retires `potential` in favour of a four-state assessment (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) and renames `confidence` to `provenance tier` (HIGH/MEDIUM/LOW) — see second Amendment
+amended: 2026-07-05 (correlation-engine grill-with-docs session) — adds a fourth status `potential` and an orthogonal confidence axis (see Amendment); 2026-07-12 (vulnerability-management UCE module design) — retires `potential` in favour of a four-state assessment (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) and renames `confidence` to `provenance tier` (HIGH/MEDIUM/LOW) — see second Amendment (proposed, unratified — open legs: @FortitudeEtc review, `/governance` on the implementing PR)
 ---
 
 # 0019 — Vulnerability findings carry a multi-value status; coverage is a dimension separate from vulnerability
 
 > **Reading guide (added 2026-07-12) — this file now layers three things, read the right one for
-> your purpose.** (1) The original Decision below plus (2) the 2026-07-05 Amendment are **shipped,
-> in production today**, via ADR-0023's in-server implementation (PRs #1917/#1919/#1924) —
-> tri-state + a fourth `potential` status + a `confidence` axis. This is what a customer
-> questionnaire, support answer, or SOC 2 CC7.1 audit sample should cite; frontmatter
-> `status: accepted` covers exactly this. (3) The 2026-07-12 Amendment is a **proposed** four-state
+> your purpose.** (1) The original Decision below plus (2) the 2026-07-05 Amendment describe the
+> vocabulary **merged and schema-live in-server** via ADR-0023's implementation (PRs #1917/#1919/#1924:
+> `VulnFindingStore` wired into `/readyz`'s `stores_ok` conjunction) — tri-state + a fourth `potential`
+> status + a `confidence` axis. **The producing engine was never built**: the series stopped at PR
+> 3/6, `VulnFindingStore::reconcile_agent` has no caller anywhere in the codebase, and the matching
+> work was superseded by the Vulnerability Management UCE module decision (Amendment 2, below). The
+> store therefore cannot be populated in production and **must not be cited as a customer
+> questionnaire, support answer, or SOC 2 CC7.1 audit-sample target** — there is no live control to
+> sample. Frontmatter `status: accepted` records this ADR's own acceptance, not a claim that a running
+> production control exists. (3) The 2026-07-12 Amendment is a **proposed** four-state
 > model (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) + provenance tier for the not-yet-built Vulnerability
 > Management UCE module — **not yet ratified, not through `/governance`, not shown to
 > @FortitudeEtc, and not shipped anywhere.** Do not cite (3) as current behavior.
@@ -173,6 +178,13 @@ the reporting surface. **Accepted per @Tr3kkR's standing convention (2026-07-09,
 Convention"): an ADR merged via reviewed PR carries `status: accepted` on `dev`.** Already merged
 and standing on `dev` since 2026-07-01 without objection.
 
+**Carve-out (2026-07-12) — open leg on the second Amendment below.** The 2026-07-12 Amendment (four-state
+assessment / provenance tier, Vulnerability Management UCE module) is **not** covered by the acceptance
+above. Per the same convention, this is a named sign-off leg recorded after 2026-07-09 and therefore
+governs regardless of the document's overall `status: accepted`: the Amendment remains **proposed,
+unratified** until it has been through `/governance` and reviewed by @FortitudeEtc. Do not treat this
+document's frontmatter `status: accepted` as covering that Amendment.
+
 ## Amendment — 2026-07-12: a four-state assessment (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) supersedes `potential`; `provenance tier` replaces `confidence`
 
 > Written during the Vulnerability Management use-case-engine (UCE) module design
@@ -252,8 +264,7 @@ onto it.** Two reasons: `UNKNOWN` is intentionally broader than VEX's `under_inv
 covers a stale feed snapshot and an unparseable version string, neither of which is "under
 investigation" in the VEX sense, so reusing that word would undersell what it means here. And this
 program already has a precedent for keeping internal vocabulary distinct from an external standard's
-— ADR-0028 (agent-side component inventory collection; **pending merge on PR #1958, not yet on
-`dev`, currently under re-review** — cited here as directional precedent, not settled fact) names its
+— ADR-0028 (agent-side component inventory collection; `status: accepted`, merged via PR #1958) names its
 collection capability "component inventory," not "SBOM," reserving the standard's
 name for the export/import document format rather than the internal model. Same logic here: keep
 OPEN/FIXED/NOT-APPLICABLE/UNKNOWN as the internal vocabulary, map to real VEX terms only if/when a
