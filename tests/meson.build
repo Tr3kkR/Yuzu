@@ -190,7 +190,6 @@ agent_test_exe = executable(
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
-    'unit/test_installed_apps_macos_enrich.cpp',  # #2273/1.10: pure system_profiler -json enrich parse
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
   ),
   include_directories: [

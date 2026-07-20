@@ -6,11 +6,6 @@
 ##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
 ##   Linux:   dpkg-query, rpm, or pacman (auto-detected)
 ##   macOS:   system_profiler SPApplicationsDataType
-##
-## macOS `list` additionally enriches each app with a codesign
-## signature_status and bundle_id (system_profiler -json, per-listing app
-## cap + time budget -- #2273/1.10). Those two columns are macOS-only: a
-## Windows/Linux `list` row does not carry them at all.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -18,17 +13,14 @@ kind: InstructionDefinition
 metadata:
   id: crossplatform.software.inventory
   displayName: List Installed Applications
-  version: 1.1.0
+  version: 1.0.0
   description: >
     Enumerates all installed applications on the endpoint. On Windows,
     reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and
     HKCU), deduplicates by name+version, and skips system components.
     On Linux, auto-detects the package manager (dpkg, rpm, or pacman).
     On macOS, queries system_profiler for GUI applications. Returns
-    application name, version, publisher, and install date. On macOS
-    only, also returns each app's codesign signature_status and
-    bundle_id (bounded by a per-listing app cap and time budget); these
-    two columns are not emitted on Windows or Linux.
+    application name, version, publisher, and install date.
   tags: [software, inventory, compliance]
 
 spec:
@@ -53,10 +45,6 @@ spec:
       - name: publisher
         type: string
       - name: install_date
-        type: string
-      - name: signature_status
-        type: string
-      - name: bundle_id
         type: string
     aggregation:
       groupBy:
