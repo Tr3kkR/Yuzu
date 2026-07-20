@@ -24,8 +24,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -40,6 +42,16 @@
 
 #ifdef __linux__
 #include <fstream>
+#endif
+
+#ifdef __APPLE__
+// system_profiler -json parse + row-assembly for the operator `list`
+// action's macOS publisher/signature_status/bundle_id enrichment
+// (#2273/1.10). In a header so the unit test exercises the same parse/
+// format code the plugin runs (pattern: #1662, filesystem_macos_sig.hpp).
+#include "installed_apps_macos_enrich.hpp"
+
+#include <yuzu/agent/subprocess_runner.hpp>
 #endif
 
 #ifdef _WIN32
@@ -501,15 +513,97 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── macOS: operator `list` enrichment (A-1.10) ─────────────────────────────
+//
+// A SEPARATE collector from get_installed_apps_macos() above (PLAN-04): that
+// one also feeds the daily-sync blob (get_inventory_macos) and the per-user
+// query (do_list_per_user), neither of which should pay codesign/plutil
+// subprocess cost for values they would only discard. This collector talks
+// to `system_profiler -json` specifically because it -- unlike the
+// `-detailLevel mini` text get_installed_apps_macos() scrapes -- carries
+// each app's real bundle path (PLAN-05), which codesign/plutil need. Wired
+// ONLY into do_list()'s macOS branch below; do_query() keeps calling
+// get_installed_apps_macos() unchanged (byte-identical `query` output).
+#ifdef __APPLE__
+
+namespace mac_enrich = yuzu::installed_apps::macos_enrich;
+
+// Bounds for the WHOLE listing (PLAN-04), not just each subprocess call:
+// codesign can hang on a network volume, and a fleet endpoint can have
+// hundreds of apps, so the per-call deadline alone would not stop a single
+// `list` invocation from running for minutes. Once either bound is spent,
+// remaining apps are still emitted -- just un-enriched, never dropped.
+constexpr std::size_t kMaxEnrichedApps = 500;
+constexpr std::chrono::seconds kEnrichmentBudget{60};
+constexpr std::chrono::milliseconds kEnrichSubprocessDeadline{10000};
+constexpr std::chrono::milliseconds kListingSubprocessDeadline{20000};
+
+int do_list_macos(yuzu::CommandContext& ctx) {
+    auto sp_result = yuzu::agent::run_bounded_subprocess(
+        {"system_profiler", "-json", "SPApplicationsDataType"},
+        yuzu::agent::SubprocessOptions{.deadline = kListingSubprocessDeadline});
+
+    // Honest empty on any failure shape (missing tool, timeout, non-zero
+    // exit) -- matches the "No applications found" convention below for a
+    // genuinely empty result, rather than trying to interpret output
+    // system_profiler itself didn't stand behind.
+    auto apps = (sp_result.tool_ran && !sp_result.timed_out && sp_result.exit_code == 0)
+                    ? mac_enrich::parse_system_profiler_apps_json(sp_result.output)
+                    : std::vector<mac_enrich::MacAppRecord>{};
+
+    if (apps.empty()) {
+        mac_enrich::MacAppRecord none;
+        none.name = "No applications found";
+        ctx.write_output(mac_enrich::format_operator_list_row(none, std::nullopt, std::nullopt));
+        return 0;
+    }
+
+    const auto budget_deadline = std::chrono::steady_clock::now() + kEnrichmentBudget;
+    std::size_t enriched_count = 0;
+
+    for (const auto& app : apps) {
+        const bool attempt_enrich = !app.path.empty() && enriched_count < kMaxEnrichedApps &&
+                                    std::chrono::steady_clock::now() < budget_deadline;
+
+        std::optional<yuzu::agent::SubprocessResult> codesign_result;
+        std::optional<yuzu::agent::SubprocessResult> plutil_result;
+        if (attempt_enrich) {
+            ++enriched_count;
+            // merge_stderr=true: classify_codesign_result reads codesign's
+            // diagnostic text, which codesign writes to stderr. plutil's
+            // success path is stdout-only (`-o -`) and its failure path
+            // reads only the exit code, so merging is harmless there --
+            // done anyway so a plutil failure's diagnostic is at least
+            // captured on the SubprocessResult for a future caller to log.
+            codesign_result = yuzu::agent::run_bounded_subprocess(
+                {"codesign", "--verify", "--deep", "--strict", app.path},
+                yuzu::agent::SubprocessOptions{.deadline = kEnrichSubprocessDeadline,
+                                                .merge_stderr = true});
+            plutil_result = yuzu::agent::run_bounded_subprocess(
+                {"plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-",
+                 app.path + "/Contents/Info.plist"},
+                yuzu::agent::SubprocessOptions{.deadline = kEnrichSubprocessDeadline,
+                                                .merge_stderr = true});
+        }
+
+        ctx.write_output(sanitize_utf8(
+            mac_enrich::format_operator_list_row(app, codesign_result, plutil_result)));
+    }
+    return 0;
+}
+
+#endif // __APPLE__
+
 // ── list action ───────────────────────────────────────────────────────────
 
 int do_list(yuzu::CommandContext& ctx) {
+#ifdef __APPLE__
+    return do_list_macos(ctx);
+#else
 #ifdef _WIN32
     auto apps = get_installed_apps_windows();
 #elif defined(__linux__)
     auto apps = get_installed_apps_linux();
-#elif defined(__APPLE__)
-    auto apps = get_installed_apps_macos();
 #else
     std::vector<AppInfo> apps;
 #endif
@@ -526,6 +620,7 @@ int do_list(yuzu::CommandContext& ctx) {
                         app.install_date.empty() ? "-" : app.install_date)));
     }
     return 0;
+#endif
 }
 
 // ── query action ──────────────────────────────────────────────────────────
