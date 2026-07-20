@@ -75,6 +75,15 @@ std::vector<double> guardian_event_store_buckets() {
             0.05,   0.1,     0.25,   0.5,   1.0,    2.5,   5.0,  10.0};
 }
 
+// Bind the hand-written warm-create list below to the enum: a new EventInsertOutcome must not
+// silently land on an un-warm-created (default-bucket) "unknown" series (unhappy-path UP-2). If
+// this fires, add the new outcome to BOTH event_insert_status_label and the warm-create loop.
+static_assert(static_cast<int>(EventInsertOutcome::Inserted) == 0 &&
+                  static_cast<int>(EventInsertOutcome::Redelivered) == 1 &&
+                  static_cast<int>(EventInsertOutcome::Conflict) == 2 &&
+                  static_cast<int>(EventInsertOutcome::Error) == 3,
+              "EventInsertOutcome changed; update event_insert_status_label + the warm-create loop");
+
 void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
     const auto buckets = guardian_event_store_buckets();
     for (const EventInsertOutcome status :

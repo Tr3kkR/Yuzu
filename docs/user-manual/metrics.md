@@ -247,7 +247,9 @@ notification of any attempt.
 
 ## Histogram buckets
 
-All histogram metrics use the same default bucket boundaries (in seconds):
+Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom
+ladder called out in their own row (e.g. `yuzu_server_guardian_event_store_duration_seconds` uses
+a 0.1ms-10s ladder, and `yuzu_pg_acquire_wait_seconds` extends into the 10-60s tail). The default:
 
 ```
 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0

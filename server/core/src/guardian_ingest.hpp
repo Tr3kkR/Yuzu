@@ -47,8 +47,9 @@ namespace pb = ::yuzu::agent::v1;
 /// operator-routed per-signal alerts also cover both wire paths. nullptr
 /// disables routing.
 ///
-/// `metrics` (optional): when non-null, observes the end-to-end ingest latency
-/// of one "event" into `yuzu_server_guardian_ingest_duration_seconds`. Threaded
+/// `metrics` (optional): when non-null, times exactly the `insert_event_classified`
+/// store call and observes it into `kGuardianEventStoreDurationMetric` under the
+/// event's outcome `status` label (inserted|redelivered|conflict|error). Threaded
 /// through this one chokepoint so the direct and gateway paths time identically.
 /// nullptr disables timing (tests / metrics-less configs).
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,

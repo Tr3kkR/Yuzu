@@ -925,6 +925,11 @@ public:
         // Birth the four status series with the custom ladder ONCE (boundaries fix at first
         // creation) so the hot observe path is a cheap name+label lookup and the series are on
         // /metrics from boot. Mirrors the yuzu_pg_acquire_wait_seconds pattern above.
+        // LOAD-BEARING (unhappy-path UP-1): this MUST run in the ServerImpl ctor, before the gRPC
+        // listener opens (run() -> BuildAndStart), or the first ingest would default-construct the
+        // series with the 5ms-floor buckets and silently lose the sub-ms resolution. Do not move
+        // it after the listener starts, and do not switch the observe site to the no-warm-create
+        // (default-bucket) path.
         yuzu::server::detail::warm_create_guardian_event_store_metric(metrics_);
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
