@@ -19,11 +19,13 @@
 #include <yuzu/plugin.hpp>
 
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <format>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -617,7 +619,10 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
         }
         tmp << pem_block;
     }
-    auto base_cmd = std::format("openssl x509 -noout -in \"{}\"", tmp_file.path());
+    // Absolute path -- matches the /usr/bin/security convention used by
+    // every other privileged subprocess call in this file (PATH is not
+    // trusted for a process that can run as root).
+    auto base_cmd = std::format("/usr/bin/openssl x509 -noout -in \"{}\"", tmp_file.path());
 
     // Subject
     auto subj = run_command(std::format("{} -subject 2>/dev/null", base_cmd).c_str());
@@ -750,28 +755,77 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user() {
  * output": PLAN-12 requires every SELECTED keychain read to go through this
  * helper, so a failure surfaces as an honest `not_available` result instead
  * of a silent empty list that reads identically to "this keychain has zero
- * certificates" (#2274's false-empty gap). A single popen()/pclose() pair
+ * certificates" (#2274's false-empty gap). `exit_code` additionally exposes
+ * the raw WEXITSTATUS so the delete path can classify its own outcome by
+ * rc (never by grepping output text) -- see delete_cert_macos(). `ok` also
+ * requires the read loop to have reached EOF cleanly (no `ferror()`): a
+ * zero exit status alone does not prove the parent captured the child's
+ * complete output, and callers that rely on `output` being the FULL
+ * enumeration (list/details/keychain_contains_thumbprint) must not treat a
+ * truncated capture as a trustworthy read. A single popen()/pclose() pair
  * captures both output and status from one run of the command.
  */
 struct CheckedCommandResult {
     std::string output;
     bool ok = false;
+    // WEXITSTATUS(status) when the child exited normally; -1 if popen()
+    // itself failed or the child did not exit normally (signaled, ...).
+    int exit_code = -1;
 };
 
 CheckedCommandResult run_command_checked(const char* cmd) {
     CheckedCommandResult result;
-    std::array<char, 4096> buf{};
-    FILE* pipe = popen(cmd, "r");
+
+    // Own the FILE* pipe via unique_ptr from the moment it's acquired so a
+    // throw while appending to result.output below (e.g. std::bad_alloc)
+    // still runs pclose() -- a bare popen()/pclose() pair previously leaked
+    // both the pipe and the (possibly still-running) child process on that
+    // path. Same RAII-over-a-C-handle idiom as macos_console_user.hpp's
+    // console_user()/CfStringReleaser. pclose()'s own exit status is
+    // captured explicitly via release()+pclose() below, since the
+    // deleter's return value is otherwise discarded when invoked
+    // automatically.
+    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd, "r"), &pclose);
     if (!pipe)
         return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
+
+    std::array<char, 4096> buf{};
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get())) {
         result.output += buf.data();
     }
-    int status = pclose(pipe);
-    result.ok = (status != -1) && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    // fgets() above stops on EOF *or* a stream error indistinguishably --
+    // ferror() (checked before pclose() invalidates the handle) tells them
+    // apart. A stream error partway through means `result.output` is a
+    // truncated prefix of the child's real output, which must not be
+    // reported as a complete, trustworthy read even if the child itself
+    // still went on to exit 0.
+    const bool capture_complete = (ferror(pipe.get()) == 0);
+
+    int status = pclose(pipe.release());
+    if (status != -1 && WIFEXITED(status)) {
+        result.exit_code = WEXITSTATUS(status);
+        result.ok = capture_complete && (result.exit_code == 0);
+    }
     while (!result.output.empty() && (result.output.back() == '\n' || result.output.back() == '\r'))
         result.output.pop_back();
     return result;
+}
+
+/**
+ * Canonicalize a thumbprint to uppercase hex so every downstream comparison
+ * against a PEM-parsed value (parse_pem_block_macos always emits uppercase,
+ * from openssl's `-fingerprint -sha1` output) is a plain `==`. The
+ * `thumbprint` request parameter is documented as case-insensitive
+ * (content/definitions/certificates.yaml) but was compared as-is, so a
+ * lowercase caller-supplied value silently failed to match. `s` is assumed
+ * already hex-validated by is_valid_thumbprint(); this only changes case,
+ * never rejects input.
+ */
+std::string canonical_thumbprint(std::string_view s) {
+    std::string out{s};
+    for (auto& c : out)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
 }
 
 /** Enumerate one keychain's PEM blocks and emit rows for it, filtered by expiry. */
@@ -808,7 +862,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
     // silently contributing zero rows.
     if (plan.want_system) {
         auto sys_result = run_command_checked(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
+            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
                        yuzu::macos::system_keychain_path())
                 .c_str());
         if (sys_result.ok) {
@@ -820,7 +874,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
 
     if (plan.want_root) {
         auto root_result = run_command_checked(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
+            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
                        yuzu::macos::root_keychain_path())
                 .c_str());
         if (root_result.ok) {
@@ -872,10 +926,17 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
         return;
     }
 
+    // Canonicalized once so the loop below is a plain `==` against
+    // parse_pem_block_macos's always-uppercase output -- the thumbprint
+    // parameter is documented case-insensitive (certificates.yaml) but was
+    // previously compared as-is, so a lowercase caller-supplied thumbprint
+    // silently never matched (CERT-READ-01).
+    auto needle = canonical_thumbprint(thumbprint);
+
     auto check = [&](const std::string& pem, const std::string& store) -> bool {
         for (const auto& block : split_pem_blocks(pem)) {
             auto rec = parse_pem_block_macos(block, store);
-            if (rec.thumbprint == thumbprint) {
+            if (rec.thumbprint == needle) {
                 ctx.write_output(rec.to_row());
                 return true;
             }
@@ -894,7 +955,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
     if (plan.want_system) {
         auto sys_result = run_command_checked(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
+            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
                        yuzu::macos::system_keychain_path())
                 .c_str());
         if (!sys_result.ok) {
@@ -907,7 +968,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
     if (plan.want_root) {
         auto root_result = run_command_checked(
-            std::format("security find-certificate -a -p {} 2>/dev/null",
+            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
                        yuzu::macos::root_keychain_path())
                 .c_str());
         if (!root_result.ok) {
@@ -954,23 +1015,137 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     ctx.write_output("status|not_found");
 }
 
-void delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
-                       std::string_view /*store*/) {
+/**
+ * Re-enumerate `keychain_path` and report whether `canonical_needle` (an
+ * already-uppercased thumbprint -- see canonical_thumbprint) is present.
+ * Used by delete_cert_macos() to VERIFY a delete actually took effect
+ * rather than trusting a zero exit status alone -- `security
+ * delete-certificate` can exit 0 without the item actually being gone
+ * (ACL/SIP quirks, an unexpected keychain state), and reporting "deleted"
+ * in that case would be exactly the false-success this package exists to
+ * prevent. Returns std::nullopt when the keychain itself could not be read
+ * (locked, missing, permission denied, a `security` failure, ...) --
+ * delete_cert_macos() treats that as the unreadable-keychain verdict,
+ * never "absent": a verification read that could not run proves nothing
+ * about the outcome. ALSO returns std::nullopt if any enumerated block
+ * fails to yield a validated 40-hex-character thumbprint
+ * (parse_pem_block_macos falls back to a literal "(unknown)" on a
+ * per-record openssl/temp-file failure) -- a block whose identity can't be
+ * established could BE the certificate being searched for, so an
+ * inconclusive scan must be treated the same as a scan that could not read
+ * the keychain at all, never silently skipped as "not a match". Reuses
+ * run_command_checked + the same PEM-enumeration path as list/details
+ * rather than adding a second certificate-reading mechanism.
+ */
+std::optional<bool> keychain_contains_thumbprint(const std::string& keychain_path,
+                                                  const std::string& canonical_needle) {
+    auto result = run_command_checked(
+        std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null", keychain_path)
+            .c_str());
+    if (!result.ok)
+        return std::nullopt;
+    for (const auto& block : split_pem_blocks(result.output)) {
+        auto rec = parse_pem_block_macos(block, "");
+        if (!is_valid_thumbprint(rec.thumbprint))
+            return std::nullopt;
+        if (rec.thumbprint == canonical_needle)
+            return true;
+    }
+    return false;
+}
+
+bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
+                       std::string_view store) {
     // Validate thumbprint is hex-only to prevent command injection.
     if (!is_valid_thumbprint(thumbprint)) {
         ctx.write_output("error|invalid thumbprint format (expected 40 hex characters)");
-        return;
+        return false;
     }
-    // macOS: use security delete-certificate with the SHA-1 hash
-    auto result = run_command(std::format("security delete-certificate -Z {} "
-                                          "/Library/Keychains/System.keychain 2>&1",
-                                          thumbprint)
-                                  .c_str());
-    if (result.find("error") != std::string::npos || result.find("Error") != std::string::npos) {
-        ctx.write_output("status|not_found");
-    } else {
+
+    // SystemRootCertificates.keychain is SEALED on modern (SIP-protected)
+    // macOS -- /System/Library/Keychains/... sits under the sealed system
+    // volume and cannot be modified by `security delete-certificate` (or
+    // anything else short of disabling SIP). Advertising deletion from it
+    // as achievable would report a root-trust change that can never
+    // actually take effect: reject outright, before ever shelling out, with
+    // the same fail-closed posture as the unsupported-store branch below --
+    // never silently redirect to a writable keychain either. This check
+    // MUST come before resolve_delete_keychain_path(): that resolver maps
+    // "root" to a real path (it is a legitimate read target for list/
+    // details), so the delete-specific sealed-root rejection has to happen
+    // here, not there.
+    if (store == "root") {
+        ctx.write_output(
+            "certificates|unsupported|SystemRootCertificates.keychain is sealed on this macOS "
+            "version (System Integrity Protection) and cannot be modified");
+        return false;
+    }
+
+    // Delete acts on exactly one keychain; store otherwise preserves
+    // today's unconditional System.keychain target for the unset/"MY"
+    // default and "System" (see yuzu::macos::resolve_delete_keychain_path).
+    // store=login is deliberately NOT supported for delete here -- unlike
+    // list/details it would need the same asuser/sudo dance (and its own
+    // honest-sentinel handling) for a destructive action that has no test
+    // coverage in this change; left for a follow-up if a real need shows
+    // up. "login", "all", and any other unrecognized value (root is
+    // already handled above) are REJECTED rather than silently redirected
+    // to System.keychain -- a destructive action must never target a
+    // keychain the caller didn't ask for.
+    auto target = yuzu::macos::resolve_delete_keychain_path(store);
+    if (!target) {
+        ctx.write_output(std::format("error|store '{}' is not supported for delete", store));
+        return false;
+    }
+
+    auto needle = canonical_thumbprint(thumbprint);
+
+    // Inspect the ACTUAL pclose()/exit status of `security
+    // delete-certificate` rather than grepping its combined stdout+stderr
+    // for words like "error": text-only classification would report
+    // "deleted" for any output that doesn't happen to contain those words,
+    // including genuine operational failures (permission denied, a locked
+    // keychain, ...).
+    auto delete_result = run_command_checked(
+        std::format("/usr/bin/security delete-certificate -Z {} {} 2>&1", needle, *target)
+            .c_str());
+
+    // Only re-enumerate to verify when the delete command itself exited 0
+    // -- a nonzero/abnormal exit is already a terminal failure, and
+    // re-checking presence after a command that didn't run to completion
+    // would tell us nothing its own exit status didn't already tell us.
+    // Checked via exit_code rather than .ok deliberately: .ok also
+    // requires a fully-captured read of THIS command's own diagnostic
+    // 2>&1 text (see run_command_checked), which is irrelevant here --
+    // only whether `security delete-certificate` itself exited cleanly
+    // decides whether a re-enumeration is warranted.
+    std::optional<bool> still_present;
+    if (delete_result.exit_code == 0) {
+        still_present = keychain_contains_thumbprint(*target, needle);
+    }
+
+    switch (yuzu::macos::classify_delete_verdict(delete_result.exit_code, still_present)) {
+    case yuzu::macos::DeleteVerdict::kCommandFailed:
+        ctx.write_output(std::format("error|delete failed (exit {}): {}",
+                                     delete_result.exit_code, delete_result.output));
+        return false;
+    case yuzu::macos::DeleteVerdict::kVerifyUnreadable:
+        // rc==0 alone is never sufficient: the keychain could not be
+        // re-read to confirm the certificate is actually gone, so this is
+        // reported as an unverified failure, NEVER as "deleted" -- an
+        // unreadable keychain must not be treated as "absent".
+        ctx.write_output(
+            "error|delete reported success but the keychain could not be re-read to verify");
+        return false;
+    case yuzu::macos::DeleteVerdict::kStillPresent:
+        ctx.write_output(
+            "error|delete reported success but certificate is still present in the keychain");
+        return false;
+    case yuzu::macos::DeleteVerdict::kDeleted:
         ctx.write_output("status|deleted");
+        return true;
     }
+    return false; // unreachable -- silences -Wreturn-type
 }
 
 #endif // __APPLE__
@@ -1061,7 +1236,13 @@ public:
 #elif defined(__linux__)
             delete_cert_linux(ctx, thumbprint, store);
 #elif defined(__APPLE__)
-            delete_cert_macos(ctx, thumbprint, store);
+            // delete_cert_macos() returns false only for a request REJECTED
+            // outright (sealed root / unsupported store) or a delete that
+            // was never verified as actually taking effect -- propagate
+            // that as a non-zero rc so orchestration can't mistake "nothing
+            // was deleted" for a successful no-op.
+            if (!delete_cert_macos(ctx, thumbprint, store))
+                return 1;
 #endif
             return 0;
         }

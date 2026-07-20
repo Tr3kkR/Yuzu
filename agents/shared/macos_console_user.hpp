@@ -387,4 +387,76 @@ inline std::optional<std::string> console_user() {
     return std::nullopt;
 #endif
 }
+
+// --- Appended for the certificates plugin's macOS delete path (#2274 DELETE half) ---
+// `security delete-certificate` can exit 0 without the certificate actually
+// being removed (ACL/SIP quirks, an unexpected keychain state), so the
+// certificates plugin's macOS delete never trusts a zero exit status alone
+// -- it re-enumerates the target keychain afterward and only reports
+// "deleted" on a POSITIVELY-PROVEN absence (see delete_cert_macos() in
+// certificates_plugin.cpp). This enum + classifier factor that decision out
+// of the popen-calling .cpp into a pure function the unit test can exercise
+// with fixture int/optional<bool> inputs, without forking `security` --
+// same header-for-testability split as every other symbol in this file.
+
+// The four possible outcomes of a macOS certificate delete request whose
+// thumbprint and target keychain already passed validation (invalid
+// thumbprints, a SIP-sealed root store, and unsupported stores are all
+// rejected earlier, before a delete is ever attempted -- this classifier
+// only covers what happens once `security delete-certificate` has actually
+// been run).
+enum class DeleteVerdict {
+    // The delete subprocess itself did not exit 0 (WEXITSTATUS != 0, or it
+    // could not be spawned at all) -- an operational failure. Never
+    // "deleted", never "absent": a failing command proves nothing about
+    // the certificate's presence.
+    kCommandFailed,
+    // The delete subprocess exited 0, but the post-delete re-enumeration
+    // used to verify the outcome could not read the target keychain at all
+    // (locked, permission denied, missing, a `security` failure, ...). An
+    // unreadable keychain MUST NOT be reported as "absent"/"deleted".
+    kVerifyUnreadable,
+    // The delete subprocess exited 0, AND the post-delete re-enumeration
+    // successfully read the keychain but still found the thumbprint --
+    // exactly the false-success this package exists to catch.
+    kStillPresent,
+    // The delete subprocess exited 0, AND the post-delete re-enumeration
+    // positively proved the thumbprint is gone. The only verdict that may
+    // report a completed delete.
+    kDeleted,
+};
+
+// Pure decision: did the delete command exit 0 (`delete_exit_code`, from
+// run_command_checked's WEXITSTATUS-derived `exit_code` field -- 0 for a
+// clean successful exit, a positive POSIX exit code for a clean failure,
+// or -1 if popen() itself failed or the child did not exit normally
+// (signaled/abnormal termination)), and -- ONLY when it did -- did the
+// post-delete re-enumeration succeed in reading the keychain, and if so
+// was the thumbprint still present (`still_present`)?
+//
+// Takes the raw exit code rather than a pre-collapsed bool so this pure
+// decision is directly fixture-testable against representative rc values
+// (zero, a representative nonzero exit, and the -1 spawn-failure/abnormal-
+// termination sentinel) without needing to fork a real subprocess to reach
+// them. The WIFEXITED/WEXITSTATUS extraction itself deliberately stays in
+// run_command_checked() (certificates_plugin.cpp): those macros are
+// POSIX-only (<sys/wait.h>), so they cannot live in this header, which is
+// framework-free by design and compiles on every host including MSVC (see
+// the file banner and test_certificates_macos.cpp's own doc comment).
+//
+// `still_present` is std::nullopt in exactly one situation: the delete
+// succeeded (`delete_exit_code == 0`) but the verification re-enumeration
+// itself could not read the target keychain. When `delete_exit_code != 0`
+// the delete already failed outright, so no re-enumeration should have
+// been attempted and `still_present` is ignored regardless of what it
+// holds.
+inline DeleteVerdict classify_delete_verdict(int delete_exit_code,
+                                              std::optional<bool> still_present) {
+    if (delete_exit_code != 0)
+        return DeleteVerdict::kCommandFailed;
+    if (!still_present.has_value())
+        return DeleteVerdict::kVerifyUnreadable;
+    return *still_present ? DeleteVerdict::kStillPresent : DeleteVerdict::kDeleted;
+}
+
 } // namespace yuzu::macos

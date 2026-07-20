@@ -20,6 +20,7 @@
 
 #include <macos_console_user.hpp>
 
+#include <optional>
 #include <string>
 
 using namespace yuzu::macos;
@@ -313,4 +314,47 @@ TEST_CASE("build_login_keychain_read_command rejects when both uid and username 
          "[certificates][macos]") {
     CHECK(build_login_keychain_read_command("", "", true).empty());
     CHECK(build_login_keychain_read_command("nope", "nope; rm -rf /", true).empty());
+}
+
+// ── classify_delete_verdict (PLAN-06: rc + still-present -> verdict) ────────
+//
+// delete_cert_macos()'s tri-state post-delete verify, factored out as a pure
+// decision so it is exercised here with fixture int/optional<bool> inputs
+// -- no `security` subprocess, no real keychain, matching every other
+// vector in this file. The first argument is the raw exit code
+// (run_command_checked's `exit_code` field), not a pre-collapsed bool, so
+// representative nonzero values and the -1 spawn-failure/abnormal-
+// termination sentinel are exercised directly.
+
+TEST_CASE("classify_delete_verdict: a failed delete command is always kCommandFailed",
+         "[certificates][macos]") {
+    // still_present is meaningless when the delete command itself never
+    // succeeded -- a real caller never populates it in that case, but the
+    // classifier must still be safe (and consistent) if it somehow is.
+    CHECK(classify_delete_verdict(-1, std::nullopt) ==
+         DeleteVerdict::kCommandFailed); // spawn failure / abnormal termination
+    CHECK(classify_delete_verdict(1, std::nullopt) ==
+         DeleteVerdict::kCommandFailed); // representative nonzero POSIX exit
+    CHECK(classify_delete_verdict(1, true) == DeleteVerdict::kCommandFailed);
+    CHECK(classify_delete_verdict(-1, false) == DeleteVerdict::kCommandFailed);
+}
+
+TEST_CASE("classify_delete_verdict: rc==0 but the verify re-enumeration couldn't read the "
+         "keychain -> kVerifyUnreadable, never kDeleted",
+         "[certificates][macos]") {
+    // The exact false-success gap this package exists to close: a zero
+    // exit status alone must never be reported as "deleted" -- an
+    // unreadable keychain proves nothing about whether the certificate is
+    // actually gone.
+    CHECK(classify_delete_verdict(0, std::nullopt) == DeleteVerdict::kVerifyUnreadable);
+}
+
+TEST_CASE("classify_delete_verdict: rc==0 but the certificate is still present -> kStillPresent",
+         "[certificates][macos]") {
+    CHECK(classify_delete_verdict(0, true) == DeleteVerdict::kStillPresent);
+}
+
+TEST_CASE("classify_delete_verdict: rc==0 and the certificate is proven absent -> kDeleted",
+         "[certificates][macos]") {
+    CHECK(classify_delete_verdict(0, false) == DeleteVerdict::kDeleted);
 }
