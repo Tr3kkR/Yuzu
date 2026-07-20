@@ -135,6 +135,9 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_journal_format.cpp',
+    'unit/test_guardian_lifecycle_journal.cpp',
+    'unit/test_guardian_journal_heartbeat.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -605,6 +608,16 @@ test('flake-retry selftest',
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
+)
+
+# Issue-lifecycle hygiene (ADR-3001 A1): CLAUDE.md character budget,
+# do-not-close.txt parses clean (the never-close guard every automated close
+# path reads), and issue-standard.md keeps its never-close section.
+test('issue lifecycle docs',
+  _python3_test,
+  args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
 )
 
 # Runner-local CI telemetry contract: v2->v3 migration preserves history,
