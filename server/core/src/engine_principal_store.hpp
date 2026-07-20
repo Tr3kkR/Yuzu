@@ -169,6 +169,27 @@ public:
     [[nodiscard]] std::expected<bool, std::string>
     transfer_owner(const std::string& principal_id, const std::string& new_owner);
 
+    /// Admin/auditor list surface — every engine principal, ANY lifecycle_state
+    /// by default, ordered by created_at. Pass `include_revoked=false` to
+    /// filter to `lifecycle_state='active'` only. Bounded (few engine
+    /// principals exist), parameterised, read-only. Best-effort: a lease/query
+    /// failure is logged at warn and returns an empty vector rather than
+    /// propagating the error — callers (admin list, auditor query) treat this
+    /// as a best-effort read, not an authorization chokepoint (unlike
+    /// `get_for_auth`, which fails closed with a distinct StoreUnreachable
+    /// state).
+    [[nodiscard]] std::vector<EnginePrincipalRow> list_all(bool include_revoked = true) const;
+
+    /// Count of ACTIVE engine principals owned by `owner_username` (uses
+    /// `engine_principals_owner_idx`). Backs the owner-delete guard: a user
+    /// cannot be deleted while owning an active engine principal. Returns
+    /// `std::nullopt` on a lease/query failure — NOT `0` — so the caller's
+    /// guard can fail CLOSED (treat "cannot verify" as "block the delete"),
+    /// mirroring the authoritative posture elsewhere in this store. A `0`
+    /// return is a verified count of zero, not "unknown".
+    [[nodiscard]] std::optional<std::size_t>
+    count_active_owned_by(const std::string& owner_username) const;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};

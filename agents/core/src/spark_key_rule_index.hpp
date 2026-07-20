@@ -85,30 +85,73 @@ private:
 
 inline bool SparkKeyRuleIndex::add(std::string_view spark_key, std::string_view rule_id) {
     if (auto rit = by_rule_.find(rule_id); rit != by_rule_.end()) {
-        if (rit->second == spark_key) return false; // identical (key, rule): no-op
-        remove_rule(rule_id);                        // moved to a new key: drop the old
+        if (rit->second == spark_key)
+            return false; // identical (key, rule): idempotent no-op
+        // A rule already mapped to a DIFFERENT key (a spec change). This is a supported
+        // move, but it is NOT strong-guarantee: remove_rule mutates before the new-key
+        // allocation below, so a bad_alloc after this point leaves the rule on NEITHER
+        // key. Production never hits it - attach_rule always detach_rule_locked()s first,
+        // so a redeploy is remove_rule(old) then add(new) - and it also does not surface
+        // the OLD key's ->0 disarm edge here (the caller drives disarm off remove_rule).
+        // The strong guarantee below covers only the common not-already-mapped path.
+        remove_rule(rule_id);
     }
+    // Strong exception guarantee (for a rule not already mapped elsewhere): either BOTH
+    // indexes gain the mapping, or a throw from any allocation leaves the index exactly
+    // as on entry - no EMPTY by_key_ set (which would make a later add's set.empty()
+    // mis-report the 0->1 edge and DOUBLE-ARM) and no forward/reverse desync. Every
+    // rollback erase is BY ITERATOR (allocation-free, noexcept), so cleanup can never
+    // itself throw and leave a forward-only mapping (Sol/Fable rung-7.7b review).
     std::string key{spark_key};
-    auto& rules = by_key_[key];
-    const bool first = rules.empty();
-    rules.emplace(rule_id);
-    by_rule_.insert_or_assign(std::string{rule_id}, std::move(key));
-    return first;
+    const auto kit = by_key_.find(key);
+    if (kit == by_key_.end()) {
+        // New key (0->1 edge). Create the node, then populate it + the reverse index;
+        // erase the whole node by iterator on any throw.
+        const auto [new_kit, _] = by_key_.emplace(key, std::set<std::string>{}); // may throw: nothing else mutated
+        try {
+            new_kit->second.emplace(rule_id);                       // may throw
+            by_rule_.emplace(std::string{rule_id}, new_kit->first); // may throw
+        } catch (...) {
+            by_key_.erase(new_kit); // by-iterator: noexcept
+            throw;
+        }
+        return true;
+    }
+    // Existing key: add to the live set (keep the returned iterator for an alloc-free
+    // undo), then the reverse index; roll the set insert back by iterator if it throws.
+    const auto [sit, inserted] = kit->second.emplace(rule_id);      // strong: set unchanged on throw
+    try {
+        by_rule_.emplace(std::string{rule_id}, kit->first);         // may throw
+    } catch (...) {
+        if (inserted)
+            kit->second.erase(sit); // by-iterator: noexcept, no temporary string
+        throw;
+    }
+    return false;
 }
 
 inline std::optional<std::string> SparkKeyRuleIndex::remove_rule(std::string_view rule_id) {
     auto rit = by_rule_.find(rule_id);
     if (rit == by_rule_.end()) return std::nullopt;
-    const std::string key = rit->second; // copy before erase: needed for the return + lookup
-    by_rule_.erase(rit);
-    if (auto kit = by_key_.find(key); kit != by_key_.end()) {
-        kit->second.erase(std::string{rule_id});
-        if (kit->second.empty()) {
-            by_key_.erase(kit);
-            return key; // ->0 edge: caller disarms the shared watcher
-        }
+    // The ONLY allocation is this key copy, taken BEFORE any mutation, so a throw here
+    // leaves the index untouched. Locate the inner-set node up front using the STORED
+    // rule_id string (rit->first) so the find needs no temporary; then every erase is
+    // by-iterator/node = noexcept. The old code erased by_rule_ first and then did
+    // `set.erase(std::string{rule_id})`, whose temporary could throw and leave a
+    // forward-only mapping with a leaked watcher (Sol/Fable rung-7.7b review).
+    std::string key = rit->second;
+    const auto kit = by_key_.find(key);
+    const bool have_node = kit != by_key_.end();
+    auto sit = have_node ? kit->second.find(rit->first) : std::set<std::string>::iterator{};
+    const bool have_sit = have_node && sit != kit->second.end();
+    by_rule_.erase(rit); // invalidates rit; key/sit already captured
+    if (have_sit)
+        kit->second.erase(sit);
+    if (have_node && kit->second.empty()) {
+        by_key_.erase(kit);
+        return key; // ->0 edge: caller disarms the shared watcher
     }
-    return std::nullopt; // siblings remain: the watcher stays armed
+    return std::nullopt; // siblings remain (or unknown key): the watcher stays armed
 }
 
 inline std::vector<std::string> SparkKeyRuleIndex::rules_for(std::string_view spark_key) const {

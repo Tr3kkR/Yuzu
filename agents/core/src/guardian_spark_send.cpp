@@ -1,5 +1,7 @@
 #include "guardian_spark_send.hpp"
 
+#include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the legacy path)
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -46,34 +48,18 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
     set_common(ev, e, platform);
 
     switch (e.domain) {
-    case OutboxDomain::Compliance: {
-        // Mirrors the legacy GuardianEngine::emit_guard_event mapping so the spark
-        // and legacy paths produce byte-equivalent compliance events - EXCEPT the
-        // event_id/timestamp, which the outbox fixes at enqueue rather than at send.
-        const GuardDrift& d = e.drift;
-        ev.set_rule_name(d.rule_name);
-        ev.set_guard_type(d.guard_type);
-        ev.set_detected_value(d.detected_value);
-        ev.set_expected_value(d.expected_value);
-        ev.set_detection_latency_us(d.detection_latency_us);
-        if (d.compliant) {
-            // A compliant edge is never a write-back: no remediation fields.
-            ev.set_event_type("guard.compliant");
-        } else if (d.remediation_attempted) {
-            ev.set_remediation_action(d.remediation_action);
-            ev.set_remediation_success(d.remediation_success);
-            ev.set_remediation_latency_us(d.remediation_latency_us);
-            ev.set_event_type(d.remediation_success ? "drift.remediated" : "remediation.failed");
-        } else {
-            ev.set_event_type("drift.detected");
-        }
-        // drift_rate carries the count of additional detections the sink debounce
-        // collapsed into this one event (0 = sole detection in its window).
-        if (d.collapsed_count > 0)
-            ev.set_drift_rate(static_cast<double>(d.collapsed_count));
+    case OutboxDomain::Compliance:
+        // The compliance-family drift fields are shared byte-for-byte with the legacy
+        // GuardianEngine::emit_guard_event path via apply_drift_to_event (#2237 item 1).
+        // event_id/timestamp differ by design - the outbox fixes them at enqueue, not
+        // at send - and rule_id/guard_category/platform are already set by set_common.
+        apply_drift_to_event(e.drift, ev);
         break;
-    }
     case OutboxDomain::Health:
+        // Health/Lifecycle carry guard_type/rule_name on the entry (Compliance carries
+        // them inside drift); set them so the wire event is fully identified (#2237).
+        ev.set_guard_type(e.guard_type);
+        ev.set_rule_name(e.rule_name);
         // healthy = the watch recovered (Unknown -> Known); !healthy = a read error
         // left the guard unable to evaluate. Separate from compliance state. The
         // read-error text goes into detail_json as a STRUCTURED JSON object
@@ -92,6 +78,8 @@ gpb::GuaranteedStateEvent guardian_outbox_entry_to_event(const OutboxEntry& e,
         }
         break;
     case OutboxDomain::Lifecycle:
+        ev.set_guard_type(e.guard_type);
+        ev.set_rule_name(e.rule_name);
         // lifecycle_kind is one of "armed" | "disarmed" | "errored"; the wire token
         // is "guard." + kind. (Routed here only via GuardianLifecycleLog, whose drain
         // shares this send path - GuardianOutbox itself rejects Lifecycle entries.)
