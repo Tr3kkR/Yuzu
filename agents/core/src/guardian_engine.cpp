@@ -455,6 +455,11 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
     return s;
 }
 
+std::uint64_t GuardianEngine::unhealthy_suppressed() const {
+    std::lock_guard lock(mtx_);
+    return spark_runtime_ ? spark_runtime_->unhealthy_suppressed() : 0;
+}
+
 std::expected<std::size_t, std::string>
 GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     std::lock_guard lock(mtx_);
