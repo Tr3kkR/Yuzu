@@ -13,6 +13,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,6 +96,37 @@ TEST_CASE("drain_once sends everything currently pending", "[spark][guardian][dr
     worker.drain_once();
 
     CHECK(sink.count() == 1); // the "armed" lifecycle entry from attach_rule
+}
+
+TEST_CASE("worker survives + counts a throwing send (item 4 hardening)",
+          "[spark][guardian][drain]") {
+    // A send that throws (e.g. a bad_alloc serializing an entry) must NOT terminate the
+    // bare worker thread - which would abort the whole agent (#2037 class). drain_log_
+    // unlocked catches the send throw (counting send_exception_count, retaining the head);
+    // the entry drains once the send stops throwing. (The worker's own drain_exception_
+    // count is a further backstop for a throw in the drain MACHINERY - front_copy/
+    // pop_front_if bad_alloc - which needs an allocation-fault seam to exercise; covered by
+    // review, not this test.)
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+
+    std::atomic<int> throws_left{2};
+    std::atomic<bool> drained{false};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        if (throws_left.fetch_sub(1) > 0)
+            throw std::runtime_error("send boom");
+        drained = true;
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink, /*periodic_bound_ms=*/20); // fast retry
+    worker.start();
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // enqueues "armed"
+
+    // Reaching here at all proves the worker thread did not terminate on the throws.
+    REQUIRE(spin_until([&] { return drained.load(); }, 3s));
+    CHECK(rt->send_exception_count() >= 1); // the send throws were counted, not silent
+    worker.stop();
 }
 
 TEST_CASE("start()/stop() wake promptly on a fresh enqueue, not waiting for the periodic bound",

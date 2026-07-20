@@ -189,7 +189,45 @@ The Windows toolchain is codified in [`deploy/windows/`](../deploy/windows/READM
 (the native-Windows analog of `deploy/docker/Dockerfile.ci-linux`): a versioned
 provisioning spec, a manifest, and a runner self-test. All four runners share one
 vcpkg binary cache via `RUNNER_TOOL_CACHE=D:\ci\tool_cache` (mirroring
-`CCACHE_DIR`), so the CCD split doesn't fragment the cache 4×.
+`CCACHE_DIR`), so the CCD split doesn't fragment the cache 4×. The provisioner
+also enforces the four exact Defender work-root exclusions (`D:\ci\work-0` …
+`work-3`), covering each runner's `_temp` and build outputs without excluding
+user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper routes native
+`TEMP`/`TMP` and MSYS2 `TMPDIR` into the matching per-runner `_temp`; the CI
+telemetry start step exports the same values for already-running listeners.
+
+### Persistent runner-local test history
+
+Every self-hosted runner agent owns a separate `test-runs.db` outside its
+checkout. Big Tam stores it below that agent's registered tool cache at
+`/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`;
+Wee Tam stores it at
+`D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. The files survive
+`actions/checkout`, branch-switch build wipes and runner restarts. They are
+deliberately per-agent rather than per-host: telemetry must not introduce a
+shared SQLite writer lock between the four jobs whose contention it measures.
+
+The Linux and Windows jobs in `ci.yml` call `scripts/ci/ci-telemetry.py` near
+job start and from an `always()` finalizer. Schema v3 records GitHub run attempt,
+job/platform/runner, commit/branch/event, conclusion and wall time, ccache ratio,
+each Meson test entry's result/duration/timeout, and any listed flake recovered
+by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
+that prevents post-steps intentionally leaves an `in_progress` row, which is
+itself evidence of runner/job termination rather than a fabricated result.
+
+Provisioning is versioned in
+[`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)
+and [`deploy/windows/Provision-Windows-Runner.ps1`](../deploy/windows/Provision-Windows-Runner.ps1).
+Query a runner in place by setting `YUZU_TEST_DB` and using:
+
+```bash
+bash scripts/test/test-db-query.sh ci-stats --since 30d
+bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
+bash scripts/test/test-db-query.sh ci-flakes --since 30d
+```
+
+GitHub-hosted macOS agents are ephemeral and cannot meet this runner-local
+persistence contract; their test logs remain retained Actions artifacts.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
@@ -424,10 +462,12 @@ quirk); OS-scoped ones a `::notice`. Entries older than 90 days get a soft
 `::warning` nag (never a hard fail). The wrapper validates the list up front and
 fails fast on a malformed one.
 
-No DB: visibility is the job summary + annotations; a per-case trend store is
-deferred to a future `ci-ingest`-style step (the junit artifacts are the raw
-data source). This is reversible test tooling — no ADR (rationale in the wrapper
-header).
+The job summary + annotations remain the immediate signal. In addition,
+`flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
+recovered listed cases into the runner's `ci_flake_events` table alongside the
+suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
+the database is observation history, never an implicit allowlist. This is
+reversible test tooling — no ADR (rationale in the wrapper header).
 
 ## Workflow-PR canary
 
