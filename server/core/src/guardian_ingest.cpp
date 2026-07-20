@@ -100,7 +100,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
             spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
-            return; // a malformed frame never reaches the store — not a timed ingest
+            return; // a malformed frame never reaches the store - not a timed ingest
         }
         GuaranteedStateEventRow ev_row;
         ev_row.event_id = ev.event_id();
@@ -148,7 +148,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // + alert observers below run ONLY on a genuine first insert (`Inserted`) — a
         // redelivery must NOT re-fire them (false blast-radius sightings / duplicate
         // routed alerts), and a mismatched collision stays on the loud CC7.3 metric.
-        // Time the store operation (insert_event_classified: the classify+store SQLite txn —
+        // Time the store operation (insert_event_classified: the classify+store SQLite txn -
         // the redelivery byte-compare on redelivered/conflict, projection+commit on insert),
         // split by outcome `status`. This is the store-latency signal the off-write-path compare
         // (#2298) is VALIDATED against, NOT the go/no-go itself: an aggregate histogram can't

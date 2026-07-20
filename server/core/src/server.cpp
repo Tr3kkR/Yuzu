@@ -917,7 +917,7 @@ public:
             "Server-side latency of insert_event_classified (the classify+store SQLite operation) "
             "for one Guardian event, split by outcome `status` (inserted|redelivered|conflict|"
             "error). redelivered/conflict run the redelivery byte-compare; inserted does "
-            "projection+commit. A validation signal for the off-write-path compare work (#2298) — "
+            "projection+commit. A validation signal for the off-write-path compare work (#2298) - "
             "NOT the go/no-go (an aggregate histogram can't attribute compare-CPU vs lock-wait; "
             "that needs a concurrent benchmark). Covers the direct-Subscribe and gateway-proxied "
             "paths. Buckets 0.1ms-10s.",

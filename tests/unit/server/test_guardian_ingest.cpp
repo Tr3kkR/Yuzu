@@ -50,7 +50,7 @@ apb::CommandResponse make_observation(const std::string& event_id, const std::st
     return resp;
 }
 
-// An event that the store rejects with EventInsertOutcome::Error — an embedded NUL in a text
+// An event that the store rejects with EventInsertOutcome::Error - an embedded NUL in a text
 // field (the store never store-truncates one; recipe from test_guaranteed_state_store.cpp). Not
 // a ruleless observation, so it never touches the DEX observers.
 apb::CommandResponse make_error_event(const std::string& event_id) {

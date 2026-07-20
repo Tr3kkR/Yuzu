@@ -65,7 +65,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
 inline constexpr char kGuardianEventStoreDurationMetric[] =
     "yuzu_server_guardian_event_store_duration_seconds";
 
-/// The custom bucket ladder for that histogram — sub-millisecond (SQLite single-row insert)
+/// The custom bucket ladder for that histogram - sub-millisecond (SQLite single-row insert)
 /// through the seconds tail (Postgres / lock contention). Boundaries are fixed at first series
 /// creation, so warm-create and any observe MUST agree; this is the single source.
 [[nodiscard]] std::vector<double> guardian_event_store_buckets();
