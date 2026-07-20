@@ -17,6 +17,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
 
 #include <array>
 #include <cctype>
@@ -25,7 +26,6 @@
 #include <cstring>
 #include <ctime>
 #include <format>
-#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -49,16 +49,18 @@
 #ifdef __APPLE__
 // geteuid() -- privilege detection for the store-read sudo hop (mirrors
 // quarantine_plugin.cpp's sudo_prefix()). macos_console_user.hpp declares
-// `namespace yuzu::macos` -- both MUST be included here, at global scope,
-// before the anonymous namespace below opens: including them inside
-// `namespace { ... }` would nest `yuzu::macos` under
-// `(anonymous namespace)::yuzu`, shadowing the global `::yuzu` namespace
-// (from <yuzu/plugin.hpp> above) for every unqualified `yuzu::` lookup in
-// this file -- e.g. `yuzu::TempFile` below would then fail to resolve,
-// since the nested `(anonymous namespace)::yuzu` has no TempFile member.
-#include <sys/wait.h> // WIFEXITED / WEXITSTATUS -- interpret run_command_checked()'s pclose() status
+// `namespace yuzu::macos`, and subprocess_runner.hpp declares
+// `namespace yuzu::agent` -- ALL THREE headers below MUST be included
+// here, at global scope, before the anonymous namespace below opens:
+// including them inside `namespace { ... }` would nest `yuzu::macos`/
+// `yuzu::agent` under `(anonymous namespace)::yuzu`, shadowing the global
+// `::yuzu` namespace (from <yuzu/plugin.hpp> above) for every unqualified
+// `yuzu::` lookup in this file -- e.g. `yuzu::TempFile` below would then
+// fail to resolve, since the nested `(anonymous namespace)::yuzu` has no
+// TempFile member.
 #include <unistd.h>
-#include <macos_console_user.hpp> // shared console-user + store/keychain mapping (#2277)
+#include <macos_console_user.hpp>          // shared console-user + store/keychain mapping (#2277)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
 #endif
 
 namespace {
@@ -125,8 +127,23 @@ struct CertRecord {
     std::string key_usage;
 
     std::string to_row() const {
-        return std::format("{}|{}|{}|{}|{}|{}|{}|{}", subject, issuer, thumbprint, not_before,
-                           not_after, serial, store, key_usage);
+        // subject/issuer/serial/key_usage come from parsed certificate data
+        // (subject/issuer are attacker-influenced DN text on any store
+        // that can hold a self-signed or otherwise untrusted leaf cert;
+        // serial/key_usage are wrapped too for defense-in-depth even
+        // though they are openssl-derived hex/enum text) -- escaped via
+        // safe_output_field so a hostile '|' or embedded CR/LF can never
+        // inject an extra column or row into this pipe-delimited output
+        // (BR-07). thumbprint/not_before/not_after/store are excluded:
+        // thumbprint is hex-validated (is_valid_thumbprint) or a literal
+        // "(unknown)" sentinel, the dates are produced entirely by this
+        // file's own date formatting, and store is always one of this
+        // plugin's own fixed literal labels -- none of the four can carry
+        // attacker-controlled bytes.
+        return std::format("{}|{}|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(subject),
+                           yuzu::util::safe_output_field(issuer), thumbprint, not_before,
+                           not_after, yuzu::util::safe_output_field(serial), store,
+                           yuzu::util::safe_output_field(key_usage));
     }
 };
 
@@ -596,9 +613,156 @@ std::vector<std::string> split_pem_blocks(const std::string& pem_stream) {
     return blocks;
 }
 
-CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string& store_name) {
+// ── Bounded-execution bounds (BR-03) ────────────────────────────────────────
+//
+// Mirrors installed_apps_plugin.cpp's kEnrichmentBudget/kMaxEnrichedApps
+// pattern: a per-call deadline alone does not bound a WHOLE action against
+// a pathological keychain with many thousands of entries, so every
+// action-level entry point (list/details/the delete verify step) also
+// computes a wall-clock budget shared across everything IT does, and caps
+// how many certificates it will parse out of any single keychain.
+constexpr std::chrono::milliseconds kCertParseDeadline{5000};     // one openssl parse of one PEM block (local temp file -- no network)
+constexpr std::chrono::milliseconds kKeychainReadDeadline{15000}; // one `security find-certificate` keychain read (incl. the login-keychain launchctl/sudo hop)
+constexpr std::chrono::seconds kCertActionBudget{60};             // whole list/details/delete-verify action, across every keychain it reads
+constexpr std::size_t kMaxCertsPerKeychain = 2000;                // per-keychain parsed-certificate cap
+
+/**
+ * Run `argv` through the bounded subprocess runner and reduce it to the
+ * {output, ok, exit_code} shape the macOS cert-reading call sites below
+ * were already written against (pre-#2273 they called a popen()-backed
+ * run_command_checked() with this exact shape) -- so replacing the
+ * transport only touches the two lines that build the call, never the
+ * surrounding read/verify logic. `ok` requires a CLEAN, COMPLETE capture:
+ * the process actually ran, was not killed at its deadline, was not cut
+ * off by the runner's internal capture cap, and exited 0 -- the same bar
+ * the old ferror()-based `capture_complete` check enforced, now expressed
+ * via SubprocessResult's own timed_out/output_truncated fields (BR-03's
+ * "honest sentinel on truncation/timeout").
+ */
+struct CheckedCommandResult {
+    std::string output;
+    bool ok = false;
+    // Populated whenever the child was spawned, independent of `ok` --
+    // delete_cert_macos() reads this directly (not `ok`) to decide whether
+    // its post-delete re-enumeration is warranted; see its own comment.
+    // -1 when the child could not be spawned or did not exit normally
+    // (signaled, killed at the deadline/cancel).
+    int exit_code = -1;
+};
+
+CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
+                                         const yuzu::agent::SubprocessOptions& opts) {
+    auto result = yuzu::agent::run_bounded_subprocess(argv, opts);
+    CheckedCommandResult out;
+    out.output = std::move(result.output);
+    if (result.tool_ran)
+        out.exit_code = result.exit_code;
+    out.ok = result.tool_ran && !result.timed_out && !result.output_truncated &&
+             result.exit_code == 0;
+    return out;
+}
+
+/**
+ * Clamp `per_call_cap` to whatever remains of the whole-action budget
+ * (`action_deadline`) so a later subprocess can never receive its own full,
+ * independent deadline regardless of how much of the action budget is
+ * already spent (fix-round finding FP-CERTS-03: `action_deadline` was
+ * previously created only after console-user resolution had already run,
+ * and every keychain-level `security` read still got the full
+ * kKeychainReadDeadline unconditionally -- stacking up to roughly 100s of
+ * real wall time behind a nominal 60s budget). Returns
+ * std::chrono::milliseconds::zero() once the action budget is already
+ * exhausted; callers MUST treat zero as "the budget is spent, do not even
+ * attempt this subprocess" rather than issuing a call with a near-zero
+ * deadline that spawns a child only to kill it almost immediately.
+ */
+std::chrono::milliseconds clamp_to_action_budget(
+    std::chrono::steady_clock::time_point action_deadline,
+    std::chrono::milliseconds per_call_cap) {
+    auto remaining = action_deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero())
+        return std::chrono::milliseconds::zero();
+    auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    return remaining_ms < per_call_cap ? remaining_ms : per_call_cap;
+}
+
+/**
+ * Parses LibreSSL/OpenSSL's NATIVE ASN1_TIME_print date format -- the only
+ * format /usr/bin/openssl can produce on this host: LibreSSL 3.3.6 rejects
+ * `-dateopt iso_8601` outright (exit 1, "unknown option -dateopt" -- see
+ * this file's macOS banner / BR-02). Native format is e.g.
+ * "Jul 20 19:06:44 2026 GMT" or "Jan  1 00:00:00 2025 GMT" -- a
+ * single-digit day is space-padded to width 2, so the run of whitespace
+ * between month and day varies by one character; tokenizing on whitespace
+ * (rather than fixed-width substring slicing) handles both shapes without
+ * a special case. Returns "(unknown)" for anything that doesn't match the
+ * expected shape -- never a fabricated date.
+ */
+std::string parse_openssl_native_date(std::string_view value) {
+    static constexpr std::array<std::string_view, 12> kMonths = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+    std::istringstream iss{std::string{value}};
+    std::string mon, day, time_of_day, year;
+    if (!(iss >> mon >> day >> time_of_day >> year))
+        return "(unknown)";
+
+    int month_num = 0;
+    for (std::size_t i = 0; i < kMonths.size(); ++i) {
+        if (mon == kMonths[i]) {
+            month_num = static_cast<int>(i) + 1;
+            break;
+        }
+    }
+    if (month_num == 0)
+        return "(unknown)";
+
+    if (day.empty() || day.size() > 2)
+        return "(unknown)";
+    for (char c : day) {
+        if (c < '0' || c > '9')
+            return "(unknown)";
+    }
+    if (year.size() != 4)
+        return "(unknown)";
+    for (char c : year) {
+        if (c < '0' || c > '9')
+            return "(unknown)";
+    }
+
+    int day_num = std::atoi(day.c_str());
+    if (day_num < 1 || day_num > 31)
+        return "(unknown)";
+
+    return std::format("{}-{:02d}-{:02d}", year, month_num, day_num);
+}
+
+/// Strip leading ASCII spaces/tabs. Used both for openssl's oneline
+/// "label=<one leading space>value" fields and for the variably-indented
+/// lines inside a `-text` dump.
+std::string strip_leading_blank(std::string s) {
+    std::size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
+        ++i;
+    s.erase(0, i);
+    return s;
+}
+
+// `deadline` is the CALLER's already-clamped budget for this one openssl
+// call (see clamp_to_action_budget) -- never the raw kCertParseDeadline
+// constant directly, so a whole-action budget nearing exhaustion (BR-03/
+// FP-CERTS-03) is honoured even for a single PEM block's parse.
+CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string& store_name,
+                                 std::chrono::milliseconds deadline) {
     CertRecord rec;
     rec.store = store_name;
+    rec.subject = "(unknown)";
+    rec.issuer = "(unknown)";
+    rec.not_before = "(unknown)";
+    rec.not_after = "(unknown)";
+    rec.serial = "(unknown)";
+    rec.thumbprint = "(unknown)";
+    rec.key_usage = "(none)";
 
     // Write PEM to a temp file to avoid shell injection via echo (PEM
     // content from the keychain could contain single quotes that break an
@@ -619,89 +783,108 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
         }
         tmp << pem_block;
     }
-    // Absolute path -- matches the /usr/bin/security convention used by
-    // every other privileged subprocess call in this file (PATH is not
-    // trusted for a process that can run as root).
-    auto base_cmd = std::format("/usr/bin/openssl x509 -noout -in \"{}\"", tmp_file.path());
 
-    // Subject
-    auto subj = run_command(std::format("{} -subject 2>/dev/null", base_cmd).c_str());
-    if (subj.starts_with("subject=")) {
-        rec.subject = subj.substr(8);
-        while (!rec.subject.empty() && rec.subject.front() == ' ')
-            rec.subject.erase(rec.subject.begin());
-    } else {
-        rec.subject = "(unknown)";
-    }
+    // ONE bounded subprocess call for every field (was up to 7 separate
+    // popen() calls). LibreSSL happily accepts multiple print options on a
+    // single invocation and emits them in the EXACT order given, so
+    // -subject/-issuer/-startdate/-enddate/-serial/-fingerprint each
+    // contribute one fixed-position, never-indented "label=value" line,
+    // followed by the full -text dump (used only for Key Usage below --
+    // -text replaces the removed `-ext keyUsage`, which LibreSSL also
+    // rejects). Absolute path, matching the /usr/bin/security convention
+    // used by every other privileged subprocess call in this file (PATH is
+    // not trusted for a process that can run as root).
+    auto result = yuzu::agent::run_bounded_subprocess(
+        {"/usr/bin/openssl", "x509", "-noout", "-in", tmp_file.path(), "-subject", "-issuer",
+         "-startdate", "-enddate", "-serial", "-fingerprint", "-sha1", "-text"},
+        yuzu::agent::SubprocessOptions{.deadline = deadline});
 
-    // Issuer
-    auto iss = run_command(std::format("{} -issuer 2>/dev/null", base_cmd).c_str());
-    if (iss.starts_with("issuer=")) {
-        rec.issuer = iss.substr(7);
-        while (!rec.issuer.empty() && rec.issuer.front() == ' ')
-            rec.issuer.erase(rec.issuer.begin());
-    } else {
-        rec.issuer = "(unknown)";
-    }
+    // A killed or capture-capped run's output is only a PARTIAL prefix of
+    // the real dump -- it may have captured subject/issuer but been cut
+    // off before serial/fingerprint/Key Usage, which would silently shift
+    // every subsequent positional field read below onto the wrong line.
+    // Treated as wholly unusable rather than parsed piecemeal, the same
+    // discipline filesystem_plugin.cpp applies to a timed-out codesign run
+    // (PLAN-02: never report a partial capture as if it were a complete,
+    // trustworthy read) -- BR-03's "honest sentinel on truncation/timeout".
+    // A nonzero exit is rejected too (fix-round finding FP-CERTS-05): a
+    // fully-captured, non-timed-out run can still have failed partway
+    // through -- e.g. openssl prints a plausible preamble then exits
+    // nonzero -- so trusting the captured text without checking the exit
+    // status would risk misreporting a failure as valid certificate data.
+    if (!result.tool_ran || result.timed_out || result.output_truncated ||
+        result.exit_code != 0)
+        return rec;
 
-    // Dates (ISO 8601)
-    auto start_date =
-        run_command(std::format("{} -startdate -dateopt iso_8601 2>/dev/null", base_cmd).c_str());
-    if (start_date.starts_with("notBefore=") && start_date.size() >= 20) {
-        rec.not_before = start_date.substr(10, 10);
-    } else {
-        rec.not_before = "(unknown)";
-    }
+    std::istringstream iss(result.output);
 
-    auto end_date =
-        run_command(std::format("{} -enddate -dateopt iso_8601 2>/dev/null", base_cmd).c_str());
-    if (end_date.starts_with("notAfter=") && end_date.size() >= 19) {
-        rec.not_after = end_date.substr(9, 10);
-    } else {
-        rec.not_after = "(unknown)";
-    }
+    // Reads the next line if present. Used for the fixed six-field
+    // preamble below, one call per -subject/-issuer/-startdate/-enddate/
+    // -serial/-fingerprint flag in that EXACT argv order -- so each call
+    // can only ever see the ONE line openssl generated for that specific
+    // flag, never a line from -text's dump further down the stream. A
+    // hostile subject/issuer containing literal "subject="/"serial="/
+    // "X509v3 Key Usage:"/... text cannot be picked up as a DIFFERENT
+    // field: it can only ever land inside the one line already reserved
+    // for its own field (openssl's oneline printer also hex-escapes any
+    // raw control byte -- e.g. a literal newline -- as `\XX`, so a hostile
+    // value can never fabricate an extra LINE either; verified empirically
+    // against this host's /usr/bin/openssl).
+    auto next_line = [&]() -> std::string {
+        std::string line;
+        return std::getline(iss, line) ? line : std::string{};
+    };
 
-    // Serial
-    auto serial = run_command(std::format("{} -serial 2>/dev/null", base_cmd).c_str());
-    if (serial.starts_with("serial=")) {
-        rec.serial = serial.substr(7);
-    } else {
-        rec.serial = "(unknown)";
-    }
-
-    // SHA1 fingerprint (thumbprint)
-    auto fp = run_command(std::format("{} -fingerprint -sha1 2>/dev/null", base_cmd).c_str());
-    auto eq = fp.find('=');
-    if (eq != std::string::npos) {
-        auto hex = fp.substr(eq + 1);
+    if (auto line = next_line(); line.starts_with("subject="))
+        rec.subject = strip_leading_blank(line.substr(8));
+    if (auto line = next_line(); line.starts_with("issuer="))
+        rec.issuer = strip_leading_blank(line.substr(7));
+    if (auto line = next_line(); line.starts_with("notBefore="))
+        rec.not_before = parse_openssl_native_date(line.substr(10));
+    if (auto line = next_line(); line.starts_with("notAfter="))
+        rec.not_after = parse_openssl_native_date(line.substr(9));
+    if (auto line = next_line(); line.starts_with("serial="))
+        rec.serial = line.substr(7);
+    if (auto line = next_line();
+        line.starts_with("SHA1 Fingerprint=") || line.starts_with("sha1 Fingerprint=")) {
+        auto hex = line.substr(line.find('=') + 1);
         std::string clean;
         clean.reserve(hex.size());
         for (char c : hex) {
             if (c != ':')
                 clean += c;
         }
-        rec.thumbprint = clean;
-    } else {
-        rec.thumbprint = "(unknown)";
+        if (!clean.empty())
+            rec.thumbprint = clean;
     }
 
-    // Key usage
-    auto usage = run_command(std::format("{} -ext keyUsage 2>/dev/null", base_cmd).c_str());
-    if (!usage.empty()) {
-        std::istringstream uss(usage);
-        std::string uline;
-        std::string last_line;
-        while (std::getline(uss, uline)) {
-            while (!uline.empty() && (uline.front() == ' ' || uline.front() == '\t'))
-                uline.erase(uline.begin());
-            if (!uline.empty() && uline.find("X509v3") == std::string::npos &&
-                uline.find("critical") == std::string::npos) {
-                last_line = uline;
-            }
+    // Remaining lines are the -text dump. The "X509v3 Key Usage:" header
+    // (present only when the extension exists) is a fixed label openssl
+    // itself generates -- never derived from certificate content -- and
+    // always precedes its value on the NEXT line, indented one level
+    // deeper, regardless of whether the extension is marked `critical`
+    // (verified empirically: both shapes end with either "critical" or a
+    // bare trailing space on the header line). Any OTHER line in the dump
+    // that happens to CONTAIN a hostile subject/issuer's text (e.g.
+    // "        Issuer: CN=X509v3 Key Usage: fake") still starts with
+    // openssl's own "Issuer:"/"Subject:" label after trimming, never with
+    // "X509v3 Key Usage:" itself, so a forged match is not reachable
+    // through DN content.
+    std::string line;
+    while (std::getline(iss, line)) {
+        auto trimmed = strip_leading_blank(line);
+        if (!trimmed.starts_with("X509v3 Key Usage:"))
+            continue;
+        std::string usage_line;
+        if (std::getline(iss, usage_line)) {
+            usage_line = strip_leading_blank(usage_line);
+            while (!usage_line.empty() &&
+                   (usage_line.back() == '\r' || usage_line.back() == '\n'))
+                usage_line.pop_back();
+            if (!usage_line.empty())
+                rec.key_usage = usage_line;
         }
-        rec.key_usage = last_line.empty() ? "(none)" : last_line;
-    } else {
-        rec.key_usage = "(none)";
+        break;
     }
 
     return rec;
@@ -731,84 +914,52 @@ bool caller_is_root() {
  * the shared allowlist/numeric validation: an unsafe value is never
  * interpolated into a command, so it is treated exactly like "no console
  * user" rather than risking a later step trusting it.
+ *
+ * `action_deadline` is the CALLER's whole-action budget (BR-03/
+ * FP-CERTS-03): this is the FIRST subprocess work any action performs, so
+ * both calls below clamp to it via clamp_to_action_budget rather than the
+ * raw kCertParseDeadline constant, and bail out to std::nullopt (same as
+ * "no console session") if the budget is already exhausted before either
+ * can even be attempted.
  */
-std::optional<yuzu::macos::ConsoleUser> resolve_console_user() {
-    auto stat_out = run_command("/usr/bin/stat -f%Su /dev/console 2>/dev/null");
-    auto username = yuzu::macos::parse_console_user_output(stat_out);
+std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
+        std::chrono::steady_clock::time_point action_deadline) {
+    auto stat_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
+    if (stat_deadline <= std::chrono::milliseconds::zero())
+        return std::nullopt;
+    auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
+                                           yuzu::agent::SubprocessOptions{
+                                               .deadline = stat_deadline});
+    auto username =
+        yuzu::macos::parse_console_user_output(stat_result.ok ? stat_result.output : std::string{});
     if (yuzu::macos::is_no_console_user(username))
         return std::nullopt;
     if (!yuzu::macos::is_valid_username(username))
         return std::nullopt;
 
-    auto uid = run_command(std::format("/usr/bin/id -u {} 2>/dev/null", username).c_str());
+    // `username` is already allowlist-validated above -- run_bounded_subprocess
+    // execs argv directly (no shell), so this was never a shell-injection
+    // vector even before, but the validate-before-use order is unchanged.
+    auto id_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
+    if (id_deadline <= std::chrono::milliseconds::zero())
+        return std::nullopt;
+    auto id_result = run_bounded_checked({"/usr/bin/id", "-u", username},
+                                         yuzu::agent::SubprocessOptions{
+                                             .deadline = id_deadline});
+    // parse_console_user_output is a plain leading/trailing-whitespace trim
+    // (see its own doc comment) -- reused here for `id -u`'s output too
+    // (fix-round finding FP-CERTS-01): run_bounded_subprocess's `.output`
+    // is the raw captured stream, trailing '\n' included, and
+    // is_valid_uid() rejects any non-digit character outright, so an
+    // untrimmed "501\n" always failed validation and this branch always
+    // returned std::nullopt -- silently disabling login-keychain reads
+    // entirely for every real console user.
+    auto uid = yuzu::macos::parse_console_user_output(id_result.ok ? id_result.output
+                                                                   : std::string{});
     if (!yuzu::macos::is_valid_uid(uid))
         return std::nullopt;
 
     return yuzu::macos::ConsoleUser{std::move(username), std::move(uid)};
-}
-
-/**
- * Like run_command(), but also reports whether the subprocess exited
- * successfully (status 0). A `security` failure (missing binary, an
- * unreadable keychain, a missing sudoers grant, a failed `launchctl asuser`
- * hop, ...) is NOT interchangeable with "the command succeeded with no
- * output": PLAN-12 requires every SELECTED keychain read to go through this
- * helper, so a failure surfaces as an honest `not_available` result instead
- * of a silent empty list that reads identically to "this keychain has zero
- * certificates" (#2274's false-empty gap). `exit_code` additionally exposes
- * the raw WEXITSTATUS so the delete path can classify its own outcome by
- * rc (never by grepping output text) -- see delete_cert_macos(). `ok` also
- * requires the read loop to have reached EOF cleanly (no `ferror()`): a
- * zero exit status alone does not prove the parent captured the child's
- * complete output, and callers that rely on `output` being the FULL
- * enumeration (list/details/keychain_contains_thumbprint) must not treat a
- * truncated capture as a trustworthy read. A single popen()/pclose() pair
- * captures both output and status from one run of the command.
- */
-struct CheckedCommandResult {
-    std::string output;
-    bool ok = false;
-    // WEXITSTATUS(status) when the child exited normally; -1 if popen()
-    // itself failed or the child did not exit normally (signaled, ...).
-    int exit_code = -1;
-};
-
-CheckedCommandResult run_command_checked(const char* cmd) {
-    CheckedCommandResult result;
-
-    // Own the FILE* pipe via unique_ptr from the moment it's acquired so a
-    // throw while appending to result.output below (e.g. std::bad_alloc)
-    // still runs pclose() -- a bare popen()/pclose() pair previously leaked
-    // both the pipe and the (possibly still-running) child process on that
-    // path. Same RAII-over-a-C-handle idiom as macos_console_user.hpp's
-    // console_user()/CfStringReleaser. pclose()'s own exit status is
-    // captured explicitly via release()+pclose() below, since the
-    // deleter's return value is otherwise discarded when invoked
-    // automatically.
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd, "r"), &pclose);
-    if (!pipe)
-        return result;
-
-    std::array<char, 4096> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get())) {
-        result.output += buf.data();
-    }
-    // fgets() above stops on EOF *or* a stream error indistinguishably --
-    // ferror() (checked before pclose() invalidates the handle) tells them
-    // apart. A stream error partway through means `result.output` is a
-    // truncated prefix of the child's real output, which must not be
-    // reported as a complete, trustworthy read even if the child itself
-    // still went on to exit 0.
-    const bool capture_complete = (ferror(pipe.get()) == 0);
-
-    int status = pclose(pipe.release());
-    if (status != -1 && WIFEXITED(status)) {
-        result.exit_code = WEXITSTATUS(status);
-        result.ok = capture_complete && (result.exit_code == 0);
-    }
-    while (!result.output.empty() && (result.output.back() == '\n' || result.output.back() == '\r'))
-        result.output.pop_back();
-    return result;
 }
 
 /**
@@ -828,22 +979,81 @@ std::string canonical_thumbprint(std::string_view s) {
     return out;
 }
 
-/** Enumerate one keychain's PEM blocks and emit rows for it, filtered by expiry. */
-void emit_keychain_rows_macos(yuzu::CommandContext& ctx, const std::string& pem,
-                              const std::string& store_label, int expiring_days) {
+// The three possible outcomes of comparing one parsed certificate block's
+// thumbprint against a search needle (details_cert_macos / delete's
+// keychain_contains_thumbprint). kInconclusive is the fix-round finding
+// FP-CERTS-02's core distinction: parse_pem_block_macos falls back to the
+// literal "(unknown)" sentinel whenever its own openssl call was
+// killed/capped/failed (never a fabricated identity), and a block whose
+// identity could not be established might BE the certificate being
+// searched for -- a caller must never fold that into a clean "not this
+// one", the same way it must never fold "the read itself failed" into
+// "not this one".
+enum class BlockIdentityOutcome { kMatch, kNoMatch, kInconclusive };
+
+/**
+ * Pure per-block classification: does `parsed_thumbprint` match `needle`,
+ * definitively not match, or is the block's identity simply unknown (not a
+ * validated 40-hex-char thumbprint)? Shared by details_cert_macos's
+ * per-keychain scan and keychain_contains_thumbprint's post-delete verify
+ * scan so the two searches can never drift on this decision.
+ */
+BlockIdentityOutcome classify_block_identity(std::string_view parsed_thumbprint,
+                                              std::string_view needle) {
+    if (!is_valid_thumbprint(parsed_thumbprint))
+        return BlockIdentityOutcome::kInconclusive;
+    return parsed_thumbprint == needle ? BlockIdentityOutcome::kMatch
+                                        : BlockIdentityOutcome::kNoMatch;
+}
+
+/**
+ * Enumerate one keychain's PEM blocks and emit rows for it, filtered by
+ * expiry. `action_deadline` is the CALLER's whole-action budget (shared
+ * across every keychain that single list_certs_macos() call reads);
+ * kMaxCertsPerKeychain additionally caps how many blocks THIS keychain
+ * alone contributes, so one pathological keychain can't spend the entire
+ * action budget by itself. Once either bound is spent, remaining blocks in
+ * this keychain are simply not parsed/emitted -- never a fabricated row --
+ * and this returns false so the caller can emit an honest "scan
+ * incomplete" sentinel instead of silently presenting a truncated keychain
+ * as a complete result (fix-round finding FP-CERTS-02). Returns true only
+ * when every block in `pem` was scanned within budget.
+ */
+bool emit_keychain_rows_macos(yuzu::CommandContext& ctx, const std::string& pem,
+                              const std::string& store_label, int expiring_days,
+                              std::chrono::steady_clock::time_point action_deadline) {
+    std::size_t parsed = 0;
     for (const auto& block : split_pem_blocks(pem)) {
-        auto rec = parse_pem_block_macos(block, store_label);
+        auto parse_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
+        if (parsed >= kMaxCertsPerKeychain || parse_deadline <= std::chrono::milliseconds::zero())
+            return false;
+        ++parsed;
+        auto rec = parse_pem_block_macos(block, store_label, parse_deadline);
         if (expires_within_days(rec.not_after, expiring_days)) {
             ctx.write_output(rec.to_row());
         }
     }
+    return true;
 }
 
 void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                       int expiring_days) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    auto console_user = resolve_console_user();
+    // Whole-action budget across EVERYTHING this call does, including
+    // console-user resolution (BR-03, mirrors installed_apps_plugin.cpp's
+    // kEnrichmentBudget) -- started here, before the first subprocess this
+    // action may run, so the 60s bound covers the call's entire wall-clock
+    // cost rather than just the per-certificate parsing loops (fix-round
+    // finding FP-CERTS-03: previously this was created only AFTER
+    // console-user resolution, and every keychain-level `security` read
+    // still received its own full, unclamped kKeychainReadDeadline
+    // regardless of how much budget was already spent -- letting one call
+    // run to roughly 100s in the worst case). See emit_keychain_rows_macos's
+    // own comment for how the per-keychain cap and this budget interact.
+    const auto action_deadline = std::chrono::steady_clock::now() + kCertActionBudget;
+
+    auto console_user = resolve_console_user(action_deadline);
     auto plan = yuzu::macos::resolve_store_plan(store_filter, console_user.has_value());
 
     if (plan.sentinel_required) {
@@ -855,33 +1065,51 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         return;
     }
 
-    // PLAN-12: every selected keychain goes through run_command_checked, not
+    // PLAN-12: every selected keychain goes through run_bounded_checked, not
     // just login -- at BASE, System/root used unchecked run_command, so a
     // `security` failure was indistinguishable from a genuinely empty
     // keychain. A checked failure emits an honest sentinel row instead of
     // silently contributing zero rows.
     if (plan.want_system) {
-        auto sys_result = run_command_checked(
-            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::system_keychain_path())
-                .c_str());
-        if (sys_result.ok) {
-            emit_keychain_rows_macos(ctx, sys_result.output, "System.keychain", expiring_days);
+        auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+        if (read_deadline <= std::chrono::milliseconds::zero()) {
+            ctx.write_output("not_available|System.keychain action deadline exceeded");
         } else {
-            ctx.write_output("not_available|System.keychain read failed");
+            auto sys_result = run_bounded_checked(
+                {"/usr/bin/security", "find-certificate", "-a", "-p",
+                 yuzu::macos::system_keychain_path()},
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+            if (sys_result.ok) {
+                if (!emit_keychain_rows_macos(ctx, sys_result.output, "System.keychain",
+                                              expiring_days, action_deadline)) {
+                    ctx.write_output("not_available|System.keychain scan incomplete");
+                }
+            } else {
+                ctx.write_output("not_available|System.keychain read failed");
+            }
         }
     }
 
     if (plan.want_root) {
-        auto root_result = run_command_checked(
-            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::root_keychain_path())
-                .c_str());
-        if (root_result.ok) {
-            emit_keychain_rows_macos(ctx, root_result.output, "SystemRootCertificates.keychain",
-                                     expiring_days);
+        auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+        if (read_deadline <= std::chrono::milliseconds::zero()) {
+            ctx.write_output(
+                "not_available|SystemRootCertificates.keychain action deadline exceeded");
         } else {
-            ctx.write_output("not_available|SystemRootCertificates.keychain read failed");
+            auto root_result = run_bounded_checked(
+                {"/usr/bin/security", "find-certificate", "-a", "-p",
+                 yuzu::macos::root_keychain_path()},
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+            if (root_result.ok) {
+                if (!emit_keychain_rows_macos(ctx, root_result.output,
+                                              "SystemRootCertificates.keychain", expiring_days,
+                                              action_deadline)) {
+                    ctx.write_output(
+                        "not_available|SystemRootCertificates.keychain scan incomplete");
+                }
+            } else {
+                ctx.write_output("not_available|SystemRootCertificates.keychain read failed");
+            }
         }
     }
 
@@ -898,17 +1126,38 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
             // a silent no-op if it somehow does.
             ctx.write_output("not_available|login keychain command construction failed");
         } else {
-            auto login_result = run_command_checked(cmd.c_str());
-            if (login_result.ok) {
-                emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
-                                         expiring_days);
+            auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+            if (read_deadline <= std::chrono::milliseconds::zero()) {
+                ctx.write_output("not_available|login keychain action deadline exceeded");
             } else {
-                // A missing sudoers grant, a launchctl/sudo failure, or an
-                // inaccessible keychain path all land here. Report it
-                // honestly instead of emitting zero rows, which would be
-                // indistinguishable from "this keychain is genuinely
-                // empty".
-                ctx.write_output("not_available|login keychain read failed");
+                // The launchctl/sudo wrapper relies on the outer shell's
+                // `~username` expansion (build_login_keychain_read_command's
+                // own comment) -- run_bounded_subprocess execs argv directly
+                // with no shell, so it can't expand that itself. `cmd` is a
+                // single, already-validated (uid/username allowlist-checked
+                // inside build_login_keychain_read_command) string with no
+                // caller-controlled shell metacharacters, so handing it to
+                // "/bin/sh -c" as ONE argv element keeps the outer exec
+                // shell-argument-free while still routing the whole call
+                // through the bounded runner for its deadline/cap/cancel
+                // support -- the same "trusted script as a single argv
+                // element" shape script_exec_plugin.cpp's bash action uses.
+                auto login_result = run_bounded_checked(
+                    {"/bin/sh", "-c", cmd},
+                    yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                if (login_result.ok) {
+                    if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
+                                                  expiring_days, action_deadline)) {
+                        ctx.write_output("not_available|login keychain scan incomplete");
+                    }
+                } else {
+                    // A missing sudoers grant, a launchctl/sudo failure, or an
+                    // inaccessible keychain path all land here. Report it
+                    // honestly instead of emitting zero rows, which would be
+                    // indistinguishable from "this keychain is genuinely
+                    // empty".
+                    ctx.write_output("not_available|login keychain read failed");
+                }
             }
         }
     }
@@ -918,7 +1167,12 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                         std::string_view store_filter) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    auto console_user = resolve_console_user();
+    // Whole-action budget across EVERYTHING this call does, including
+    // console-user resolution -- see list_certs_macos's matching comment
+    // (BR-03/fix-round finding FP-CERTS-03).
+    const auto action_deadline = std::chrono::steady_clock::now() + kCertActionBudget;
+
+    auto console_user = resolve_console_user(action_deadline);
     auto plan = yuzu::macos::resolve_store_plan(store_filter, console_user.has_value());
 
     if (plan.sentinel_required) {
@@ -933,51 +1187,108 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // silently never matched (CERT-READ-01).
     auto needle = canonical_thumbprint(thumbprint);
 
-    auto check = [&](const std::string& pem, const std::string& store) -> bool {
+    // Tri-state per-keychain scan outcome (fix-round finding FP-CERTS-02):
+    // a search that hits the cap/deadline before reaching a conclusive
+    // answer, or that encounters a block classify_block_identity can't
+    // establish the identity of (a failed/timed-out per-cert openssl
+    // parse leaves the honest "(unknown)" sentinel, never a fabricated
+    // thumbprint), can never positively prove the needle is ABSENT from
+    // that keychain -- both must report kIncomplete, never silently fold
+    // into a clean kNotFound that ultimately surfaces as the definitive
+    // "status|not_found" below.
+    enum class ScanOutcome { kFound, kNotFound, kIncomplete };
+
+    auto check = [&](const std::string& pem, const std::string& store) -> ScanOutcome {
+        std::size_t parsed = 0;
         for (const auto& block : split_pem_blocks(pem)) {
-            auto rec = parse_pem_block_macos(block, store);
-            if (rec.thumbprint == needle) {
+            auto parse_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
+            if (parsed >= kMaxCertsPerKeychain ||
+                parse_deadline <= std::chrono::milliseconds::zero())
+                return ScanOutcome::kIncomplete;
+            ++parsed;
+            auto rec = parse_pem_block_macos(block, store, parse_deadline);
+            switch (classify_block_identity(rec.thumbprint, needle)) {
+            case BlockIdentityOutcome::kMatch:
                 ctx.write_output(rec.to_row());
-                return true;
+                return ScanOutcome::kFound;
+            case BlockIdentityOutcome::kInconclusive:
+                return ScanOutcome::kIncomplete;
+            case BlockIdentityOutcome::kNoMatch:
+                break;
             }
         }
-        return false;
+        return ScanOutcome::kNotFound;
     };
 
-    // A checked read failure on a selected store means the search below is
-    // incomplete for that store -- remembered (first failure wins) so the
-    // final result can honestly report "not_available" instead of a false
-    // "not_found" if no match turns up. A match found in a store that DID
-    // read successfully is still reported normally, even if an earlier
-    // store had already failed.
+    // A checked read failure, an exhausted action budget, or an incomplete
+    // scan on a selected store all mean the search below is incomplete for
+    // that store -- remembered (first failure wins) so the final result
+    // can honestly report "not_available" instead of a false "not_found"
+    // if no match turns up. A match found in a store that DID read/scan
+    // successfully is still reported normally, even if an earlier store
+    // had already failed.
     bool read_failed = false;
     std::string_view failure_reason;
 
     if (plan.want_system) {
-        auto sys_result = run_command_checked(
-            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::system_keychain_path())
-                .c_str());
-        if (!sys_result.ok) {
+        auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+        if (read_deadline <= std::chrono::milliseconds::zero()) {
             read_failed = true;
-            failure_reason = "System.keychain read failed";
-        } else if (check(sys_result.output, "System.keychain")) {
-            return;
+            failure_reason = "System.keychain action deadline exceeded";
+        } else {
+            auto sys_result = run_bounded_checked(
+                {"/usr/bin/security", "find-certificate", "-a", "-p",
+                 yuzu::macos::system_keychain_path()},
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+            if (!sys_result.ok) {
+                read_failed = true;
+                failure_reason = "System.keychain read failed";
+            } else {
+                switch (check(sys_result.output, "System.keychain")) {
+                case ScanOutcome::kFound:
+                    return;
+                case ScanOutcome::kIncomplete:
+                    read_failed = true;
+                    failure_reason = "System.keychain scan incomplete";
+                    break;
+                case ScanOutcome::kNotFound:
+                    break;
+                }
+            }
         }
     }
 
     if (plan.want_root) {
-        auto root_result = run_command_checked(
-            std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null",
-                       yuzu::macos::root_keychain_path())
-                .c_str());
-        if (!root_result.ok) {
+        auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+        if (read_deadline <= std::chrono::milliseconds::zero()) {
             if (!read_failed) {
                 read_failed = true;
-                failure_reason = "SystemRootCertificates.keychain read failed";
+                failure_reason = "SystemRootCertificates.keychain action deadline exceeded";
             }
-        } else if (check(root_result.output, "SystemRootCertificates.keychain")) {
-            return;
+        } else {
+            auto root_result = run_bounded_checked(
+                {"/usr/bin/security", "find-certificate", "-a", "-p",
+                 yuzu::macos::root_keychain_path()},
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+            if (!root_result.ok) {
+                if (!read_failed) {
+                    read_failed = true;
+                    failure_reason = "SystemRootCertificates.keychain read failed";
+                }
+            } else {
+                switch (check(root_result.output, "SystemRootCertificates.keychain")) {
+                case ScanOutcome::kFound:
+                    return;
+                case ScanOutcome::kIncomplete:
+                    if (!read_failed) {
+                        read_failed = true;
+                        failure_reason = "SystemRootCertificates.keychain scan incomplete";
+                    }
+                    break;
+                case ScanOutcome::kNotFound:
+                    break;
+                }
+            }
         }
     }
 
@@ -990,14 +1301,39 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 failure_reason = "login keychain command construction failed";
             }
         } else {
-            auto login_result = run_command_checked(cmd.c_str());
-            if (!login_result.ok) {
+            auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+            if (read_deadline <= std::chrono::milliseconds::zero()) {
                 if (!read_failed) {
                     read_failed = true;
-                    failure_reason = "login keychain read failed";
+                    failure_reason = "login keychain action deadline exceeded";
                 }
-            } else if (check(login_result.output, "login.keychain-db")) {
-                return;
+            } else {
+                // See list_certs_macos's matching comment: `cmd` needs the
+                // outer shell's `~username` expansion, so it is run as a
+                // single trusted argv element via "/bin/sh -c" rather than a
+                // clean multi-element argv.
+                auto login_result = run_bounded_checked(
+                    {"/bin/sh", "-c", cmd},
+                    yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                if (!login_result.ok) {
+                    if (!read_failed) {
+                        read_failed = true;
+                        failure_reason = "login keychain read failed";
+                    }
+                } else {
+                    switch (check(login_result.output, "login.keychain-db")) {
+                    case ScanOutcome::kFound:
+                        return;
+                    case ScanOutcome::kIncomplete:
+                        if (!read_failed) {
+                            read_failed = true;
+                            failure_reason = "login keychain scan incomplete";
+                        }
+                        break;
+                    case ScanOutcome::kNotFound:
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1005,9 +1341,10 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     if (read_failed) {
         // Don't fall through to "status|not_found" below -- that would
         // claim a completed, negative search when a selected keychain was
-        // never actually readable (missing sudoers grant, launchctl/sudo
-        // failure, an inaccessible keychain path, ...). See
-        // list_certs_macos's matching comment.
+        // never actually readable OR its scan never reached a conclusive
+        // answer (missing sudoers grant, launchctl/sudo failure, an
+        // inaccessible keychain path, the cap/deadline hit mid-scan, an
+        // unparseable block, ...). See list_certs_macos's matching comment.
         ctx.write_output(std::format("not_available|{}", failure_reason));
         return;
     }
@@ -1034,22 +1371,54 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
  * established could BE the certificate being searched for, so an
  * inconclusive scan must be treated the same as a scan that could not read
  * the keychain at all, never silently skipped as "not a match". Reuses
- * run_command_checked + the same PEM-enumeration path as list/details
+ * run_bounded_checked + the same PEM-enumeration path as list/details
  * rather than adding a second certificate-reading mechanism.
+ *
+ * `action_deadline` is the CALLER's whole-action budget (fix-round finding
+ * FP-CERTS-R3: this used to start its own fresh kCertActionBudget window
+ * regardless of how much of delete_cert_macos()'s own budget the preceding
+ * `security delete-certificate` call had already spent, letting the pair
+ * run to roughly 75s worst case). The keychain read AND every per-block
+ * parse below now clamp to this same shared deadline via
+ * clamp_to_action_budget, same as list/details_cert_macos. If the budget is
+ * already exhausted before the read can even be attempted, this returns
+ * std::nullopt without issuing a doomed call -- classify_delete_verdict
+ * already treats std::nullopt as kVerifyUnreadable (an honest "action
+ * deadline exceeded" outcome), never kDeleted.
  */
-std::optional<bool> keychain_contains_thumbprint(const std::string& keychain_path,
-                                                  const std::string& canonical_needle) {
-    auto result = run_command_checked(
-        std::format("/usr/bin/security find-certificate -a -p {} 2>/dev/null", keychain_path)
-            .c_str());
+std::optional<bool> keychain_contains_thumbprint(
+    const std::string& keychain_path, const std::string& canonical_needle,
+    std::chrono::steady_clock::time_point action_deadline) {
+    auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+    if (read_deadline <= std::chrono::milliseconds::zero()) {
+        return std::nullopt;
+    }
+    auto result = run_bounded_checked(
+        {"/usr/bin/security", "find-certificate", "-a", "-p", keychain_path},
+        yuzu::agent::SubprocessOptions{.deadline = read_deadline});
     if (!result.ok)
         return std::nullopt;
+
+    std::size_t parsed = 0;
     for (const auto& block : split_pem_blocks(result.output)) {
-        auto rec = parse_pem_block_macos(block, "");
-        if (!is_valid_thumbprint(rec.thumbprint))
+        auto parse_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
+        if (parsed >= kMaxCertsPerKeychain || parse_deadline <= std::chrono::milliseconds::zero()) {
+            // Budget/cap spent before reaching a conclusive answer -- an
+            // incomplete scan must be treated the same as a scan that
+            // could not read the keychain at all (see the comment above):
+            // it can never positively prove absence.
             return std::nullopt;
-        if (rec.thumbprint == canonical_needle)
+        }
+        ++parsed;
+        auto rec = parse_pem_block_macos(block, "", parse_deadline);
+        switch (classify_block_identity(rec.thumbprint, canonical_needle)) {
+        case BlockIdentityOutcome::kMatch:
             return true;
+        case BlockIdentityOutcome::kInconclusive:
+            return std::nullopt;
+        case BlockIdentityOutcome::kNoMatch:
+            break;
+        }
     }
     return false;
 }
@@ -1100,28 +1469,56 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
     auto needle = canonical_thumbprint(thumbprint);
 
-    // Inspect the ACTUAL pclose()/exit status of `security
-    // delete-certificate` rather than grepping its combined stdout+stderr
-    // for words like "error": text-only classification would report
-    // "deleted" for any output that doesn't happen to contain those words,
-    // including genuine operational failures (permission denied, a locked
-    // keychain, ...).
-    auto delete_result = run_command_checked(
-        std::format("/usr/bin/security delete-certificate -Z {} {} 2>&1", needle, *target)
-            .c_str());
+    // Whole-action budget (BR-03) covering BOTH the delete command AND its
+    // post-delete verify read, same pattern as list/details_cert_macos
+    // (fix-round finding FP-CERTS-R3: before this, the verify read computed
+    // its own fresh kCertActionBudget window independent of what the delete
+    // call above it had already spent, letting the pair run to roughly 75s
+    // worst case). Every subprocess this action runs clamps to it via
+    // clamp_to_action_budget rather than receiving its own full, unclamped
+    // deadline.
+    const auto action_deadline = std::chrono::steady_clock::now() + kCertActionBudget;
+    auto delete_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+    if (delete_deadline <= std::chrono::milliseconds::zero()) {
+        // Defensive only -- action_deadline is set immediately above, so a
+        // freshly-clamped kKeychainReadDeadline cannot itself be zero. Kept
+        // for parity with clamp_to_action_budget's other call sites, which
+        // must all treat zero as "do not even attempt this subprocess"
+        // (see its own comment).
+        ctx.write_output("error|action deadline exceeded before delete could run");
+        return false;
+    }
+
+    // Inspect the ACTUAL exit status of `security delete-certificate`
+    // rather than grepping its combined stdout+stderr for words like
+    // "error": text-only classification would report "deleted" for any
+    // output that doesn't happen to contain those words, including
+    // genuine operational failures (permission denied, a locked keychain,
+    // ...). merge_stderr=true (was the shell string's `2>&1`) so a failure
+    // diagnostic -- `security` writes those to stderr -- is captured into
+    // `.output` for the error message below.
+    auto delete_result = run_bounded_checked(
+        {"/usr/bin/security", "delete-certificate", "-Z", needle, *target},
+        yuzu::agent::SubprocessOptions{.deadline = delete_deadline, .merge_stderr = true});
 
     // Only re-enumerate to verify when the delete command itself exited 0
     // -- a nonzero/abnormal exit is already a terminal failure, and
     // re-checking presence after a command that didn't run to completion
     // would tell us nothing its own exit status didn't already tell us.
     // Checked via exit_code rather than .ok deliberately: .ok also
-    // requires a fully-captured read of THIS command's own diagnostic
-    // 2>&1 text (see run_command_checked), which is irrelevant here --
-    // only whether `security delete-certificate` itself exited cleanly
-    // decides whether a re-enumeration is warranted.
+    // requires a fully-captured, non-timed-out, non-capped read of THIS
+    // command's own diagnostic text (see run_bounded_checked), which is
+    // irrelevant here -- only whether `security delete-certificate` itself
+    // exited cleanly decides whether a re-enumeration is warranted.
     std::optional<bool> still_present;
     if (delete_result.exit_code == 0) {
-        still_present = keychain_contains_thumbprint(*target, needle);
+        // keychain_contains_thumbprint clamps to the SAME action_deadline
+        // (see its own comment) -- if the delete call above consumed most
+        // of the budget, the verify read either gets whatever remains or,
+        // if nothing remains, an honest std::nullopt (never a doomed call).
+        // classify_delete_verdict below maps that to kVerifyUnreadable,
+        // never kDeleted.
+        still_present = keychain_contains_thumbprint(*target, needle, action_deadline);
     }
 
     switch (yuzu::macos::classify_delete_verdict(delete_result.exit_code, still_present)) {
