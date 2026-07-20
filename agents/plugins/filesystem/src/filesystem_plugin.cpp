@@ -78,6 +78,8 @@
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
+#include <mutex>
+#include <yuzu/agent/fork_lock.hpp> // yuzu::agent::global_fork_lock (BR-001)
 #endif
 
 #ifdef __APPLE__
@@ -246,6 +248,13 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
 
 std::string compute_hash_unix(const std::string& path, std::string_view algorithm) {
     // Use execvp-based approach to avoid shell injection via path
+
+    // BR-001: serialize pipe-creation-through-fork against every other
+    // fork/popen launcher in the agent (see fork_lock.hpp's contract) --
+    // held from here through fork() below; every early return in between
+    // releases it via this lock's destructor.
+    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
+
     int pipe_fd[2];
     if (pipe(pipe_fd) != 0)
         return {};
@@ -258,6 +267,10 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
     }
 
     if (pid == 0) {
+        // Child: inherits fork_pipe_lock already locked -- NEVER lock,
+        // unlock, or otherwise touch it (see fork_lock.hpp's contract). Safe
+        // because this branch never returns through a normal C++ path -- it
+        // always _exit()s or execs below.
         close(pipe_fd[0]);
         dup2(pipe_fd[1], STDOUT_FILENO);
         close(pipe_fd[1]);
@@ -277,6 +290,10 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 #endif
         _exit(127);
     }
+
+    // Parent: fork() has returned and this is not the child branch --
+    // release the pipe-creation lock now (see fork_lock.hpp's contract).
+    fork_pipe_lock.unlock();
 
     close(pipe_fd[1]);
 
@@ -1068,6 +1085,24 @@ private:
 
         return 0;
 #elif defined(__APPLE__)
+        // BR-006: re-run validate_path on the exact path about to be handed
+        // to codesign, immediately before building its argv. This narrows,
+        // but does not eliminate, the check(validate_path above)-to-use
+        // (codesign's own open()) TOCTOU window: an unprivileged writer
+        // inside base_dir who swapped `validated` for a symlink to an
+        // out-of-scope target between the earlier validate_path() call and
+        // here is caught. A swap landing in the remaining gap -- between
+        // this re-check and codesign's own open() -- is inherent to any
+        // path-based external tool (codesign takes a path, not an fd) and
+        // cannot be closed from here; base_dir must not be writable by
+        // lower-privileged principals (docs/agent-privilege-model.md).
+        if (validate_path(validated, base_dir) != validated) {
+            ctx.write_output(std::format("signature_status|{}",
+                yuzu::filesystem_macos::to_string(
+                    yuzu::filesystem_macos::SignatureStatus::unknown)));
+            return 0;
+        }
+
         // codesign --verify --deep --strict is the macOS analogue of
         // WinVerifyTrust: it walks the whole bundle (or a lone Mach-O) and
         // fails on ANY broken seal, not just a missing top-level signature.
@@ -1297,6 +1332,22 @@ private:
         // fabricating a version.
         auto info_plist = select_info_plist(validated, base_dir);
         if (info_plist.empty()) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        // BR-006: re-run validate_path on the exact Info.plist path about to
+        // be handed to plutil, immediately before building its argv. This
+        // narrows, but does not eliminate, the check(select_info_plist
+        // above)-to-use (plutil's own open()) TOCTOU window: an unprivileged
+        // writer inside base_dir who swapped `info_plist` for a symlink to
+        // an out-of-scope target between select_info_plist()'s validation
+        // and here is caught. A swap landing in the remaining gap -- between
+        // this re-check and plutil's own open() -- is inherent to any
+        // path-based external tool (plutil takes a path, not an fd) and
+        // cannot be closed from here; base_dir must not be writable by
+        // lower-privileged principals (docs/agent-privilege-model.md).
+        if (validate_path(info_plist, base_dir) != info_plist) {
             ctx.write_output("version_status|not_available");
             return 0;
         }

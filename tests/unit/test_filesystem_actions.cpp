@@ -5,10 +5,10 @@
  * atomic_write_file) and core file operation logic (search, replace,
  * append, delete_lines) by replicating the algorithms from the plugin.
  * Also covers the macOS get_signature/get_version_info plugin-level seams
- * (select_info_plist's PLAN-08 base_dir re-validation, and the PLAN-02
- * timed_out short-circuit) -- the classify_codesign_result/
- * classify_plutil_extract mappers themselves are covered separately by
- * test_filesystem_macos_sig.cpp.
+ * (select_info_plist's PLAN-08 base_dir re-validation, the BR-006 immediate
+ * pre-exec TOCTOU re-check, and the PLAN-02 timed_out short-circuit) -- the
+ * classify_codesign_result/classify_plutil_extract mappers themselves are
+ * covered separately by test_filesystem_macos_sig.cpp.
  *
  * Same pattern as test_filesystem_read.cpp: helpers are copied into the
  * test file's anonymous namespace since we cannot link the plugin directly.
@@ -1128,6 +1128,118 @@ TEST_CASE("SelectInfoPlist: PLAN-08 -- a symlinked Info.plist resolving outside 
     } else {
         auto result = select_info_plist((base / "Evil.app").string(), base.string());
         CHECK(result.empty());
+    }
+
+    fs::remove(outside_target, ec);
+    fs::remove_all(base, ec);
+}
+
+// ── BR-006: TOCTOU re-check (get_signature / get_version_info) ─────────────
+//
+// do_get_signature/do_get_version_info re-run validate_path on the exact
+// path about to be handed to codesign/plutil immediately before building
+// that tool's argv, comparing the result against the already-validated
+// value. These fixtures drive the replicated validate_path/select_info_plist
+// helpers through the same two-call sequence the plugin uses, simulating an
+// unprivileged writer inside base_dir swapping the target for a symlink to
+// an out-of-scope path in the window between the first validate_path() call
+// and the re-check -- no codesign/plutil fork involved (pure path helpers
+// only).
+
+TEST_CASE("BR-006: re-check of an untouched validated path still matches (get_signature seam)",
+          "[filesystem][macos_sig][br006]") {
+    auto base = fsaction_base() / "yuzu_test_br006_stable_base";
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    REQUIRE(!ec);
+    auto target = base / "Target.app";
+    fs::create_directories(target, ec);
+    REQUIRE(!ec);
+
+    auto validated = validate_path(target.string(), base.string());
+    REQUIRE(!validated.empty());
+
+    // Re-run exactly as do_get_signature does immediately before building
+    // codesign's argv -- nothing changed on disk, so it must match.
+    auto recheck = validate_path(validated, base.string());
+    CHECK(recheck == validated);
+
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("BR-006: re-check catches a path swapped for a symlink outside base_dir "
+          "after the initial validate (get_signature seam)",
+          "[filesystem][macos_sig][br006]") {
+    auto base = fsaction_base() / "yuzu_test_br006_swap_base";
+    std::error_code ec;
+    fs::create_directories(base, ec);
+    REQUIRE(!ec);
+    auto target = base / "Target.app";
+    fs::create_directories(target, ec);
+    REQUIRE(!ec);
+
+    // Step 1 (mirrors do_get_signature's earlier validate_path call): the
+    // path is legitimate and inside base_dir at this point.
+    auto validated = validate_path(target.string(), base.string());
+    REQUIRE(!validated.empty());
+
+    // Step 2: an attacker swaps the validated path for a symlink resolving
+    // OUTSIDE base_dir, in the window before codesign is ever invoked.
+    auto outside_target = fsaction_base() / "yuzu_test_br006_outside_target";
+    fs::create_directories(outside_target, ec);
+    REQUIRE(!ec);
+    fs::remove_all(target, ec);
+    fs::create_directory_symlink(outside_target, target, ec);
+    if (ec) {
+        SUCCEED("symlinks unsupported on this platform — skip");
+    } else {
+        // Step 3 (the BR-006 re-check, immediately before building the
+        // codesign argv): must no longer match the originally validated
+        // value, so do_get_signature aborts rather than invoking the tool.
+        auto recheck = validate_path(validated, base.string());
+        CHECK(recheck != validated);
+    }
+
+    fs::remove_all(outside_target, ec);
+    fs::remove_all(base, ec);
+}
+
+TEST_CASE("BR-006: re-check catches an Info.plist swapped for a symlink outside base_dir "
+          "after select_info_plist (get_version_info seam)",
+          "[filesystem][macos_sig][br006]") {
+    auto base = fsaction_base() / "yuzu_test_br006_plist_swap_base";
+    std::error_code ec;
+    fs::create_directories(base / "MyApp.app" / "Contents", ec);
+    REQUIRE(!ec);
+    auto plist = base / "MyApp.app" / "Contents" / "Info.plist";
+    {
+        std::ofstream f(plist);
+        f << "<plist/>";
+    }
+
+    // Step 1 (do_get_version_info's select_info_plist call, PLAN-08): the
+    // derived Info.plist path is legitimate and inside base_dir.
+    auto info_plist = select_info_plist((base / "MyApp.app").string(), base.string());
+    REQUIRE(!info_plist.empty());
+
+    // Step 2: an attacker swaps the Info.plist for a symlink resolving
+    // OUTSIDE base_dir, in the window before plutil is ever invoked.
+    auto outside_target = fsaction_base() / "yuzu_test_br006_plist_outside.plist";
+    {
+        std::ofstream f(outside_target);
+        f << "<plist>secret</plist>";
+    }
+    fs::remove(plist, ec);
+    fs::create_symlink(outside_target, plist, ec);
+    if (ec) {
+        SUCCEED("symlinks unsupported on this platform — skip");
+    } else {
+        // Step 3 (the BR-006 re-check, immediately before building the
+        // plutil argv): must no longer match the value select_info_plist
+        // returned, so do_get_version_info aborts to not_available rather
+        // than invoking the tool.
+        auto recheck = validate_path(info_plist, base.string());
+        CHECK(recheck != info_plist);
     }
 
     fs::remove(outside_target, ec);
