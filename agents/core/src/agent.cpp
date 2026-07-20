@@ -46,6 +46,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
@@ -1717,6 +1718,10 @@ public:
                     }
                     guardian_->set_event_sink(
                         [this](const gpb::GuaranteedStateEvent& ev) { emit_guardian_event(ev); });
+                    // Replay the durable lifecycle journal into the send window now that the
+                    // sink is live on the new stream (item 7 PR-Ag). The drain worker sends the
+                    // paged backlog on its next pass. Inert unless prefer_spark.
+                    guardian_->page_journal();
                 }
 
                 // 4b. Spawn OTA update check thread
@@ -1984,9 +1989,19 @@ public:
                             // manual operator action. Always emitted — including
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
-                            if (guardian_)
+                            if (guardian_) {
                                 tags["yuzu.guardian_generation"] =
                                     std::to_string(guardian_->policy_generation());
+                                // Drive durable lifecycle-journal maintenance on the
+                                // heartbeat cadence: retry any persist a prior write left
+                                // pending, so a failed write self-heals with no new push /
+                                // reconnect (item 7 PR-Ag; inert unless prefer_spark).
+                                guardian_->journal_maintenance_tick();
+                                // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
+                                // non-zero counters ship, so a quiescent / inert journal adds
+                                // no heartbeat tags.
+                                emit_guardian_journal_heartbeat_tags(tags, guardian_->journal_stats());
+                            }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
                             // Windows / Linux / macOS; no-op platforms have none). Both tags are
@@ -2957,6 +2972,13 @@ private:
         cancel_ctx(heartbeat_ctx_);
         if (snapshot_pump_thread_.joinable())
             snapshot_pump_thread_.join();
+        // LIFETIME INVARIANT (Guardian lifecycle journal, item 7 PR-Ag): the heartbeat thread
+        // (guardian_->journal_maintenance_tick / journal_stats) and the run-loop reconnect hook
+        // (guardian_->page_journal) capture a RAW GuardianLifecycleJournal* under the engine mtx_
+        // and use it OFF-lock. That pointer stays valid ONLY because these threads are joined HERE,
+        // before guardian_ is destroyed (declared later, destroyed earlier). Do NOT reorder a
+        // guardian_ teardown ahead of these joins, and keep new guardian_-touching threads joined
+        // in this block.
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
         sync_stop_.store(true, std::memory_order_release);

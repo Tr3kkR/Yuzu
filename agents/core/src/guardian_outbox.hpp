@@ -87,6 +87,13 @@ struct OutboxEntry {
     std::string guard_type;      ///< Health/Lifecycle: "file" | "registry" | "service"
     std::string rule_name;       ///< Health/Lifecycle: human-readable rule name
 
+    // Journal-replay provenance (item 7 PR-Ag): set ONLY on Lifecycle entries PAGED back
+    // from the durable journal, so the send path can write the batch's sent-label after its
+    // LAST entry sends. Empty/false on live + compliance/health entries. NOT wire fields -
+    // guardian_outbox_entry_to_event ignores them, so they never change the server compare.
+    std::string journal_batch_key;     ///< the durable batch this replayed entry came from ("" if live)
+    bool journal_last_in_batch{false}; ///< this is that batch's LAST entry - write sent:<key> on send
+
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
                                   std::string event_id, std::int64_t enqueued_ns, GuardDrift drift) {
         OutboxEntry e;
@@ -369,6 +376,53 @@ public:
     [[nodiscard]] std::size_t size() const { return pending_.size(); }
     [[nodiscard]] bool empty() const { return pending_.empty(); }
     [[nodiscard]] std::uint64_t backpressure_drops() const { return backpressure_drops_; }
+
+    /// Journal-replay support (item 7 PR-Ag): is `event_id` already buffered? The loader
+    /// scans the window to skip re-paging an entry already present (membership = window
+    /// scan, no allocating set). O(size); the window is bounded.
+    [[nodiscard]] bool contains(std::string_view event_id) const {
+        for (const auto& e : pending_)
+            if (e.event_id == event_id)
+                return true;
+        return false;
+    }
+    /// Journal-replay support (item 7 PR-Ag): build a membership set of the currently-buffered
+    /// event_ids in ONE O(size) pass, so the loader can test a whole batch's records in O(1)
+    /// each instead of re-scanning the window per record - which is O(records x window) and, on
+    /// the heartbeat/run-loop thread, can starve heartbeats under a large backlog (review
+    /// UP-12 / perf P-2). The returned views ALIAS this log's entries: valid only while the
+    /// caller holds the runtime's outbox_mu_ and does not erase from the log. enqueue()/push_back
+    /// keeps std::list nodes (and their string storage) stable, so pages appended after this
+    /// call do not invalidate the views - they simply are not in the (pre-batch) set, which is
+    /// correct because a batch's own records carry distinct event_ids.
+    [[nodiscard]] std::unordered_set<std::string_view> event_id_set() const {
+        std::unordered_set<std::string_view> ids;
+        ids.reserve(pending_.size());
+        for (const auto& e : pending_)
+            ids.insert(e.event_id);
+        return ids;
+    }
+    /// Free slots before the capacity cap - the loader pages a batch only when the window
+    /// has >= the batch's size of headroom (else it defers the batch to a later pass).
+    [[nodiscard]] std::size_t headroom() const {
+        return capacity_ > pending_.size() ? capacity_ - pending_.size() : 0;
+    }
+
+    /// Back-fill journal provenance onto still-buffered LIVE entries (item 7 PR-Ag M3): for each
+    /// entry whose event_id belongs to a just-persisted batch, stamp the batch key and mark ONLY
+    /// the batch's LAST record last-in-batch, so a live send writes the sent-label instead of the
+    /// batch later ageing out counted evicted_without_send_evidence. The window drains FIFO, so
+    /// the last-in-batch entry sends after the earlier ones and the label is never premature.
+    void stamp_provenance(const std::string& batch_key,
+                          const std::unordered_set<std::string>& event_ids,
+                          const std::string& last_event_id) {
+        for (auto& e : pending_) {
+            if (event_ids.count(e.event_id)) {
+                e.journal_batch_key = batch_key;
+                e.journal_last_in_batch = (e.event_id == last_event_id);
+            }
+        }
+    }
 
 private:
     std::size_t capacity_;

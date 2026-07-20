@@ -11,6 +11,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -47,7 +48,11 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
       boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
-      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {}
+      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {
+    // Reserve the staging vector ONCE - never from rule count. push_back then never
+    // reallocates, which is what makes stage_pending_locked's noexcept contract real.
+    pending_journal_.reserve(kMaxPendingJournalRecords);
+}
 
 GuardianSparkRuntime::~GuardianSparkRuntime() {
     // No in-flight pass can be running: a pass keeps the runtime alive through the
@@ -444,14 +449,132 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     // Called from attach_rule/detach_rule_locked - never on the detached-post-
     // read path - so calling agent_id_fn_() directly (not pre-snapshotted) is
     // safe here, unlike evaluate_key's read path.
-    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const auto wall = std::chrono::system_clock::now().time_since_epoch(); // noexcept arithmetic
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
-    const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
-    auto entry = OutboxEntry::lifecycle(rule_id, generation, make_event_id(rule_id, ms, agent_id),
-                                        ns, kind, guard_type, rule_name);
+
+    if (kind == "armed") {
+        // ARM: every throwing op here PROPAGATES, so attach_rule's GuardianRollback undoes the
+        // arm and nothing is staged (no phantom). The event_id is minted ONCE and shared by the
+        // window entry + the durable record (rev-4.1 #4). The window enqueue is the LAST throwing
+        // op before the caller's noexcept commit; the journal push after it is noexcept.
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        const std::string event_id = make_event_id(rule_id, ms, agent_id);
+        auto entry =
+            OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+        std::shared_ptr<JournalRecord> record =
+            build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing, rolls back arm
+        stage_pending_locked(std::move(record));                        // noexcept
+        return accepted;
+    }
+
+    // DISARM: the teardown already happened, so NO throw may propagate (it would break the
+    // caller mid-teardown). Firewall the WHOLE construction: agent_id, the event_id mint, the
+    // OutboxEntry, and the record all allocate, and a bad_alloc in ANY of them post-teardown is
+    // the reachable journal_stage_failures loss channel (rev-4.1 #5 / review B3). Then stage the
+    // durable record FIRST so a best-effort window-enqueue throw cannot lose a real disarm.
+    OutboxEntry entry;
+    std::shared_ptr<JournalRecord> record;
+    try {
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        const std::string event_id = make_event_id(rule_id, ms, agent_id);
+        entry =
+            OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+        record = build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+    } catch (...) {
+        journal_stage_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false; // nothing built, nothing to stage or enqueue
+    }
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    return lifecycle_log_.enqueue(std::move(entry));
+    stage_pending_locked(std::move(record)); // durable disarm staged first (noexcept)
+    try {
+        return lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
+    } catch (...) {
+        return false; // window enqueue failed post-teardown; the durable record already stands
+    }
+}
+
+std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
+    const std::string& rule_id, std::uint64_t generation, const std::string& event_id,
+    std::int64_t enqueued_ns, const std::string& kind, const std::string& guard_type,
+    const std::string& rule_name) {
+    auto jr = std::make_shared<JournalRecord>(
+        JournalRecord{.rule_id = rule_id, .generation = generation, .event_id = event_id,
+                      .enqueued_ns = enqueued_ns, .kind = kind, .guard_type = guard_type,
+                      .rule_name = rule_name});
+    switch (validate_record(*jr)) {
+    case JournalReject::None:
+        return jr;
+    case JournalReject::SkewedClock:
+        journal_clock_rejected_.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    default: // EmbeddedNul / Oversized / InvalidUtf8 - a field the journal cannot carry byte-exact
+        journal_field_rejected_.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+}
+
+void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> record) noexcept {
+    if (!record)
+        return; // rejected at build - sent live, never journaled
+    if (pending_journal_.size() >= kMaxPendingJournalRecords) {
+        pending_journal_.erase(pending_journal_.begin()); // drop oldest; O(n) only under sustained failure
+        journal_stage_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Reserve is fixed at construction, so this never reallocates and shared_ptr move is
+    // noexcept - the push cannot throw (the enclosing noexcept documents + enforces it).
+    pending_journal_.push_back(std::move(record));
+}
+
+std::vector<std::shared_ptr<const JournalRecord>> GuardianSparkRuntime::snapshot_pending() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return {pending_journal_.begin(), pending_journal_.end()};
+}
+
+void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n) {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    n = std::min(n, pending_journal_.size());
+    pending_journal_.erase(pending_journal_.begin(),
+                           pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+std::size_t GuardianSparkRuntime::pending_journal_depth() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return pending_journal_.size();
+}
+
+std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+    if (entries.empty())
+        return 0;
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    // Headroom gate (design §5): page the batch only if it fits whole; else leave it for a
+    // later pass once the window drains (never a partial page that splits a batch).
+    if (lifecycle_log_.headroom() < entries.size())
+        return 0;
+    std::size_t added = 0;
+    // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
+    // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
+    // starve heartbeats under a large backlog (review UP-12 / perf P-2). The batch's records
+    // carry distinct event_ids, so a static pre-batch set is correct here.
+    const auto present = lifecycle_log_.event_id_set();
+    for (auto& e : entries) {
+        if (!present.count(e.event_id)) // O(1) membership: skip a re-page of an entry in the window
+            if (lifecycle_log_.enqueue(std::move(e)))
+                ++added;
+    }
+    return added;
+}
+
+void GuardianSparkRuntime::backfill_batch_provenance(const std::string& batch_key,
+                                                     const std::vector<std::string>& event_ids,
+                                                     const std::string& last_event_id) {
+    if (event_ids.empty())
+        return;
+    const std::unordered_set<std::string> ids(event_ids.begin(), event_ids.end());
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    lifecycle_log_.stamp_provenance(batch_key, ids, last_event_id);
 }
 
 namespace {

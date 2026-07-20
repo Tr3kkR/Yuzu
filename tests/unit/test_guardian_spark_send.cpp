@@ -166,3 +166,21 @@ TEST_CASE("send-map: Health + Lifecycle carry guard_type/rule_name (PR-1 item 2)
         CHECK(ev.rule_name() == "No debugger");
     }
 }
+
+TEST_CASE("send-map: journal-replay provenance NEVER reaches the wire event (item 7 PR-Ag A-2)",
+          "[spark][sendmap]") {
+    // journal_batch_key / journal_last_in_batch are LOCAL replay provenance for the sent-label. If
+    // they ever leaked onto the wire they would flip the server's redelivery compare to a false
+    // Conflict on every replay (the M6 channel). Pin that guardian_outbox_entry_to_event ignores
+    // them - a guardrail against a future OutboxEntry->event mapping change (architect A-2).
+    auto e = OutboxEntry::lifecycle("r", 1, "evt-id", kEnq, "armed", "file", "rule name");
+    e.journal_batch_key = "lc:deadbeefdeadbeef:000000000042";
+    e.journal_last_in_batch = true;
+
+    auto ev = guardian_outbox_entry_to_event(e, "linux");
+    const std::string wire = ev.SerializeAsString();
+    CHECK(wire.find("deadbeef") == std::string::npos); // the batch key appears nowhere on the wire
+    // Sanity: the legitimate fields DID serialize, so the negative search above is meaningful.
+    CHECK(ev.event_id() == "evt-id");
+    CHECK(ev.rule_name() == "rule name");
+}
