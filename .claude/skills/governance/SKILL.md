@@ -205,6 +205,59 @@ of actor, do ALL of the following — do not sample:
    never re-stamped. "Audit events are emitted" is NOT enough — the
    fields must be *correct* for the new actor.
 
+## Design-contract & state-machine tracing (LOAD-BEARING)
+
+Added after PR #2284: an external reviewer reading the design doc
+line-by-line found real defects across THREE rounds that a 14-agent
+`/governance` + Hermes ×2 had passed — because our gates reviewed the
+*diff mechanics* (does the merge compile, is the carve-out present) but
+never traced the PR's own *published contracts* and *state-machine
+semantics* against the code. Fold that depth in here.
+
+When a PR (a) touches a **state machine** (rotation, lifecycle CRUD,
+deployment, enrollment — anything with ordered transitions or
+paired/linked rows), (b) makes a **published-contract** claim (a
+normative statement in docs / OpenAPI / changelog / a design doc — "a
+second mint errors", "rejected outright, never truncated", "revocation
+resolves the rotation state", "idempotent — does not re-emit"), or (c)
+adds/changes a **classifier** (a substring allowlist, an enum switch, an
+error→status map), do ALL of the following:
+
+1. **Trace every normative claim to code.** For each "always / never /
+   must / rejects / idempotent" statement in the docs / OpenAPI /
+   changelog / design doc this PR touches, find the line that enforces it
+   and confirm it actually does. A claim is a CONTRACT, not a
+   description. #2284 shipped "a second mint errors" (no ceiling check),
+   "rejected outright, never truncated" (the MCP twin silently clamped),
+   and an OpenAPI `{id}` description that 404'd every real principal. If
+   doc and code disagree, ONE is a bug — say which; never assume the doc.
+
+2. **Enumerate mutation × state for the machine.** List every mutating
+   operation the actor can invoke AND every state a linked/paired row can
+   be in, then walk the cross-product: does any combination wedge the
+   machine, orphan a partner, or drop to an unsafe terminal? Trace the
+   OUT-OF-BAND paths — a single manual revoke mid-rotation, a retry after
+   a lost response, a delete of a linked row — not just the happy
+   transitions. #2284 §7: a manual successor-revoke let the sweep
+   auto-revoke the principal's ONLY credential to zero; a manual
+   predecessor-revoke wedged the pair classifier.
+
+3. **Prove classifier / allowlist completeness.** For a substring
+   allowlist or enum map: enumerate EVERY value it must handle — every
+   distinct `unexpected(...)` / error string the callee can emit, every
+   enum case — and confirm each is classified. A shared classifier must
+   be complete for BOTH transports (REST + MCP). A missed value defaults
+   silently to the wrong class: #2284 mapped a permanent "not found" to a
+   *retryable* error twice, on strings the allowlist missed. Require a
+   unit test that locks the mapping (grep the callee's error strings;
+   assert each maps to the intended class).
+
+4. **Fail-visibility of a sole-enforcement path.** If a background /
+   periodic task is the ONLY thing enforcing an invariant (an auto-revoke
+   sweep, a reconcile loop), confirm its failures are observable — a
+   swallowed error that returns empty must still bump a counter / log, or
+   the invariant silently lapses with the alert at zero (#2284 M6).
+
 ## New-error-branch audit
 
 If this PR adds any new 4xx/5xx error-response branch in a handler,
@@ -421,6 +474,18 @@ Focus on compound failures where two or more risks interact:
 - audit detail unescaped -> stored XSS on dashboard render
 - MCP token scope confusion vs principal match
 
+If this PR touches a STATE MACHINE (rotation, lifecycle CRUD,
+deployment, enrollment — ordered transitions or paired/linked rows),
+also enumerate **mutation × state**: every mutating op × every state a
+linked/paired row can be in, and walk the cross-product for a
+combination that wedges the machine, orphans a partner, or drops to an
+unsafe terminal (e.g. zero credentials). Prioritise OUT-OF-BAND paths —
+a single manual revoke/delete of one linked row mid-transition, a retry
+after a lost response — over the happy transitions (see the security
+preamble's "Design-contract & state-machine tracing" check; this is how
+#2284's §7 auto-revoke-to-zero and pair-wedge defects shipped past an
+earlier /governance run).
+
 ## Output format
 
 Risk register with entries shaped as:
@@ -502,6 +567,21 @@ state, schema, and contract consistency. Check:
    security-guardian co-checks `readOnlyHint`/`destructiveHint`/
    `idempotentHint` truthfulness against tier + dispatch behavior —
    a false safe-direction hint is a BLOCKING (HIGH) finding.
+
+10. **Published-contract vs code, and classifier completeness** (see the
+   security preamble's "Design-contract & state-machine tracing" check).
+   For every normative claim this PR touches in docs / OpenAPI /
+   changelog / a design doc ("a second X errors", "rejected outright,
+   never truncated", "idempotent — does not re-emit", a `{id}`/param
+   format), trace the enforcing line and confirm the code actually does
+   it — a claim is a CONTRACT; if doc and code disagree, ONE is a bug,
+   name which. For any substring allowlist / enum→status map this PR adds
+   or changes, enumerate EVERY value the callee can emit (grep its
+   `unexpected(...)` strings / enum cases) and confirm each is classified
+   the same on BOTH transports — a missed value silently defaults to the
+   wrong class (#2284 mapped a permanent "not found" to a retryable error
+   twice). A shared classifier of this kind must have a unit test locking
+   the mapping.
 
 ## Output format
 
