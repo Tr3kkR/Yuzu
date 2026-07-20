@@ -114,6 +114,37 @@ new kind of actor:
 - **Comment-vs-code.** Diff each comment near a new authz branch against
   the code — #2202 shipped one asserting the opposite of its behavior.
 
+## Design-contract & state-machine tracing (LOAD-BEARING — added after #2284)
+
+An external reviewer reading the design doc line-by-line found real
+defects across THREE rounds that a 14-agent `/governance` + Hermes ×2 had
+passed — because the gates reviewed the *diff mechanics*, never the PR's
+own *published contracts* and *state-machine semantics* vs the code. When
+a PR touches a **state machine** (rotation/lifecycle/deployment/enrollment
+— ordered transitions or paired/linked rows), makes a **published-contract
+claim** (docs/OpenAPI/changelog/design-doc "always/never/rejects/idempotent"),
+or adds/changes a **classifier** (substring allowlist, enum→status map):
+
+- **Trace every normative claim to the enforcing line** and confirm the
+  code does it. A claim is a CONTRACT. #2284 shipped "a second mint errors"
+  (no check), "rejected outright, never truncated" (MCP silently clamped),
+  and a `{id}` OpenAPI description that 404'd every real principal. Doc≠code
+  ⇒ one is a bug; name which, never assume the doc.
+- **Enumerate mutation × state** for the machine — every mutating op × every
+  state a linked row can be in — and walk the cross-product for a wedge, an
+  orphaned partner, or an unsafe terminal (zero rows). Trace the OUT-OF-BAND
+  paths (a single manual revoke/delete mid-transition, a lost-response
+  retry), not just happy transitions (#2284 §7: manual successor-revoke →
+  sweep auto-revoked the last credential to zero).
+- **Prove classifier completeness** — enumerate EVERY value the callee emits
+  (grep its `unexpected(...)` strings / enum cases); each must be classified
+  the same on BOTH transports. A missed value silently defaults to the wrong
+  class (#2284 mapped a permanent "not found" to retryable twice). Require a
+  unit test locking the mapping.
+- **Fail-visibility** — if a background/periodic task is the SOLE enforcement
+  of an invariant, a swallowed error must still bump a counter/log, or the
+  invariant lapses with the alert at zero (#2284 M6).
+
 ## Review Checklist
 
 When performing deep-dive review:

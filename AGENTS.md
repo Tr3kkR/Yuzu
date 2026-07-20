@@ -78,6 +78,8 @@ Standing up or debugging the stack? **Read `docs/uat-environment.md` first.** It
 
 The `/test` skill (`.codex/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate — compiles HEAD, upgrades from the previous release image, runs the standard test surface, persists every gate result and sub-step timing to a SQLite test-runs DB at `~/.local/share/yuzu/test-runs.db` (XDG dir, survives `git clean`; override with `YUZU_TEST_DB=path`). Three modes: `--quick` (~10 min sanity), default (~30–45 min), `--full` (~60–120 min — adds OTA, dispatched sanitizers, coverage enforcement, perf measure-and-report). Query history via `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend ...|--flaky`. Coverage baseline (`tests/coverage-baseline.json`) and perf calibration (`docs/perf-baseline-calibration-2026-05-03.md`) details live in the skill — perf is measure-only as of 2026-05-03 (no σ band, ceiling-bounded distributions).
 
+CI history is separate from the developer-local DB: every Big Tam and Wee Tam runner agent owns a persistent `test-runs.db` outside its checkout (never one shared host-wide SQLite file). Big Tam uses `/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`; Wee Tam uses `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. `ci.yml` records job and Meson test-entry outcomes/timings plus recovered known flakes. Query with `test-db-query.sh ci-stats|ci-suite-stats|ci-flakes`; provisioning and the full contract live in `docs/ci-architecture.md`.
+
 ## Instruction Engine
 
 The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via the `CommandRequest` wire protocol; `yaml_source` is authoritative, denormalized columns are for queries. Architecture: `docs/Instruction-Engine.md`; DSL spec: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
@@ -306,11 +308,11 @@ The `frontend-design` plugin (`frontend-design@claude-plugins-official`) is scop
 
 ### Issue tracker
 
-GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. Filing, labelling, and closing follow `docs/agents/issue-standard.md` (ADR-3001): duplicate search before filing is **mandatory**; bodies carry Context / Evidence (`file:line`) / Acceptance criteria / Origin; automation never closes `security`-labelled or `do-not-close` issues, and neither should you without verifying against current `origin/dev`. Exploitable vulnerabilities are never public issues — private advisories only (`SECURITY.md`). Command crib: `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) — all five now exist in the repo's label set, alongside a broader categorization set (`bug`, `security`, `P0`/`P1`/`P2`, `enhancement`, `documentation`, `reliability`, workstream-* and phase-* tags, etc.). See `docs/agents/triage-labels.md`.
+Every issue carries exactly one type label; every non-`roadmap` issue also carries exactly one triage state. The `gh` path additionally sets one of `P0`/`P1`/`P2` — or `roadmap` for parked scope, which carries neither priority nor triage state. The canonical five triage roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) map 1:1 to labels, unchanged. Active backlog = `is:open -label:roadmap`. Full taxonomy and axes: `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

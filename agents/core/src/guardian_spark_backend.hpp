@@ -66,6 +66,17 @@ public:
             return std::unexpected(
                 "GuardianSparkEngineBackend: arm() called before bind_consumer() completed "
                 "wiring - this is a caller-sequencing bug, not a runtime condition");
+        // Deliberately NOT firewalled: a throwing SparkEngine::arm (a bad_alloc inside
+        // arm_impl) must PROPAGATE so GuardianEngine::apply_rules's per-rule firewall
+        // counts it and HOLDS the policy generation (transient arm failures must retry
+        // via the heartbeat). Converting it to a returned error here routed the throw
+        // around that firewall (reconcile treats a returned attach error as a plain
+        // `return false`, which apply_rules does not count -> generation advanced ->
+        // silent enforcement hole; Fable B4->B1 finding). The propagating throw is
+        // terminate-safe (GuardianRollback) and cannot corrupt the index (strong-guarantee
+        // add). What it CANNOT do is repair the engine's partial arm_impl state - that
+        // strong-guarantee gap, and the durable reconcile-side transient-vs-permanent
+        // generation-hold distinction, are tracked as PR-2 flip blockers in #2270.
         return engine_->arm(consumer_, spec);
     }
 

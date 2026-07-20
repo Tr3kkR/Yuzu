@@ -230,6 +230,140 @@ without which the server cannot tell which backend a device is running or distin
 design; the process is gone before anything could be sent. It is a best-effort marker
 persisted before the exit, then read, reported and cleared on the next boot.
 
+## 7.7b split — pre-cutover hardening (settled 2026-07-18)
+
+7.7b was first planned as one PR folding the #2237 send-path items and #2238 test
+seams into the flip. Three independent reviews — Sol/Codex (opine), Claude
+(adjudication, every claim verified against code), and Fable (advisor) — converged on:
+**the flip is unsafe in one PR; split into an inert-hardening PR-1 and a thin-cutover
+PR-2, with the `prefer_spark` flip as the last commit either way.** Every finding below
+was verified against the worktree at `origin/dev` (b09cdd19).
+
+**"Inert" is placement-inert, not behaviour-inert.** PR-1 changes *no* detection or
+enforcement *placement* (`prefer_spark` stays false), but it is not a no-op: the shared
+builder refactors the live legacy emit path (`guardian_engine.cpp:500`), the
+`apply_rules` firewall changes live per-push failure semantics (`guardian_engine.cpp:326`),
+and the telemetry ships new heartbeat tags every beat. State this in the PR so a gate
+reviews it as a live-path change, not a rubber-stamp of a false "inert" premise.
+
+### The cutover-blocking finding (Fable M1): `guard.unhealthy` re-emission flood
+
+The read-failure path calls `unhealthy()` **unconditionally** on every `!read.known`
+(`guardian_rule_eval.cpp:63/111/132`) — there is **no into-unknown edge guard**; only
+*recovery* is edge-forced (`pack()`'s `recovered` bit). `build_entries` then pushes a
+**fresh-`event_id`** health entry on every `Unhealthy` (`guardian_spark_runtime.cpp:405-413`).
+An unhealthy rule stays in `pending_initial` (`:357`), which the priority lane re-sweeps
+every ~5 s (`guardian_convergence_scheduler.hpp:60` `priority_poll_ms{5000}`). Net: one
+mundane unreadable target (ACL-denied file, missing hive path) emits **~17 k
+`guard.unhealthy`/day/rule/agent**, each its own server-side insert transaction. Legacy
+has no health stream, so this traffic class switches on **at the flip** — a self-inflicted
+fleet ingest DoS. **The `guardian_rule_eval.cpp:15` comment "edge-triggered
+guard.unhealthy" is false.** Fix (send-path, flag-gated inert → PR-1, flip unsafe
+without it): transition-edge health emission (emit on the false→true unknown edge + a
+slow periodic refresh only) + evict never-Known rules from the 5 s priority lane to
+their normal lane cadence.
+
+### PR-1 hardening items (commit order 1→2→3→4→7→5→6→9→8)
+
+1. **Shared drift-event builder.** Extract `apply_drift_to_event`; legacy build at
+   `guardian_engine.cpp:500`, spark at `guardian_spark_send.cpp:43` — extract, not just
+   a cross-check test (a cross-check leaves two drifting impls).
+2. **OutboxEntry guard_type/rule_name for Health/Lifecycle** (empty today,
+   `guardian_spark_send.cpp:76`).
+3. **attach_rule + live `apply_rules` exception firewall (Fable M3 — harder than #2237
+   item 2).** `index_->add()` runs *before* `rollback.fn` is assigned
+   (`guardian_spark_runtime.cpp:108` vs `:129`); a **throwing** `arm()` leaves a ghost
+   `by_rule_` entry → the next sibling attach's `keys_.at(key)` throws `out_of_range`
+   (`:143`) through the un-firewalled `apply_rules`. And `SparkKeyRuleIndex::add`'s
+   emplace-throw (`spark_key_rule_index.hpp:92`) leaves an *empty set* → a false 0→1
+   edge on the next add → double-arm → **untracked live subscription leak on a success
+   path**. Requires a strong-guarantee/noexcept `SparkKeyRuleIndex::add` + fault
+   injection of a throwing `arm()`; wrapping callers is not enough.
+4. **Drain-without-lock.** `GuardianSparkRuntime::drain()` holds `outbox_mu_`
+   (`:441`) across `send_guardian_outbox_entry`'s synchronous gRPC `Write()`
+   (`agent.cpp:2700`); the stall cascade is `Write` → `outbox_mu_` → `evaluate_key`
+   commit under `registry_mu_` → `apply_rules` under engine `mtx_` → heartbeat/status.
+   Restructure to peek/copy → unlock → send → conditional-remove by `event_id` alone
+   (globally unique per enqueue — `agent_id`+boot-nonce+`rule_id`+ms+seq — so it pins the
+   exact sent node with no separate generation check; as implemented, `pop_front_if`).
+   Sub-contracts: `drain_once()` is public/off-thread-callable → keep a drain-in-progress
+   guard; the lifecycle log has no index (`guardian_outbox.hpp:294`) → conditional-remove
+   needs a front-`event_id` check; a coalesce during the unlocked send replaces the node
+   with a new `event_id` (`:151`) → remove-by-`event_id` handles it, write the test.
+   **Drain order fix (M6):** send lifecycle *before* compliance (currently `:443-444`
+   sends compliance first) so a rule's "armed" audit entry never arrives after its first
+   drift event.
+5. **Two-count executor + physical-orphan ceiling (Fable M4).** Today inflight counters
+   free at OS-thread-exit (`guardian_io_executor.hpp:338`), so `kMaxProcessIoWorkers=10`
+   is a real physical bound. Freeing the *logical* admission slot on the run() deadline
+   requires a **separate physical-orphan ceiling strictly > sum(quotas)** (else 10 wedged
+   orphans re-create the exact cross-class starvation R3 eliminated) + same-key
+   single-flight retained until orphan exit + an exactly-once logical-vs-physical
+   decrement handshake (a double-decrement inflates quota). Pin the ceiling **value** in
+   the PR description (R3's own lesson).
+6. **F3 KV marker** (R4): best-effort marker persisted before `hard_exit()`, read/reported/
+   cleared next boot.
+7. **Lifecycle-audit durability.** `GuardianLifecycleLog` is in-memory, reject-new+count-
+   on-full, never-evict (`guardian_outbox.hpp:263`), and the send drops on `Write()==true`
+   (queued ≠ acked) → at-most-once + capacity-lossy + crash-lossy = **not audit-grade**.
+   Compliance drift stays documented best-effort telemetry; **lifecycle
+   (`guard.armed/disarmed/errored`) becomes durable**: a retention-bounded journal +
+   replay on boot **and every reconnect**, leaning on the server's existing `event_id`
+   idempotency (PK rollback at `guaranteed_state_store.cpp:670` absorbs replay dups;
+   boot-nonce'd `event_id`s). Delete-on-`Write()==true` alone re-inherits the hole — the
+   entry leaves the journal only after replay-safe confirmation. **Substrate: reuse
+   `KvStore`/`kv_store.db`** (already open, WAL, Guardian writes rules there) — not a new
+   file. Constraints: `get()` truncates at NUL (`kv_store.cpp:178`) → payload is JSON not
+   raw proto; no txn API, each `set()` is a commit+fsync → a 500-rule `full_sync` = ~1000
+   fsyncs → **batch/persist-per-push, not per-entry**; do **not** journal inside
+   `enqueue_lifecycle_locked` (under `registry_mu_`+`outbox_mu_`) or it recreates the
+   coupling item 4 removes — journal at the engine layer under `mtx_`.
+8. **Test seams + TSan** (#2238): the re-arm-throw degrade fault hook, the prefer_spark
+   thread-start introspection, and a concurrent start-drain-then-stop TSan test with the
+   real `this`-capturing send callback.
+9. **R4 telemetry as a producer+consumer contract**, not just agent tags: each field
+   needs an agent writer + `agent_registry.cpp:1323` server parser + family-clear +
+   reset-handling + bounded labels + current-vs-cumulative semantics + a writer/reader
+   cross-pin test; both outbox domains reported separately; the F3 marker included. The
+   `SparkFailed`-prevalence alert ships here reporting the inactive posture, and needs a
+   **paired `reporting`-drop condition** (a correlated crash-loop manifests as
+   `yuzu_fleet_spark_reporting` dropping, not `failed` rising, because a fast loop dies
+   before heartbeating).
+
+Also folded into PR-1: the **R2 `unsupported` terminal state + rung-8 telemetry +
+reconcile-test rewrites**. Verified flag-gated inert — the whole Arm/Unsupported branch
+is under `if (prefer_spark_ && Available)` (`guardian_engine.cpp:845`; the legacy
+fallthrough it replaces is `:882-885`) and the reconcile tests already construct
+`prefer_spark=true` (`test_guardian_engine_spark_reconcile.cpp:160`). Moving it here
+pulls the largest piece of unspecified new semantics off the flip PR.
+
+### PR-2 (thin cutover)
+
+`prefer_spark = !cfg_.spark_disable` (`agent.cpp:~579`, R1) as the **final commit**; the
+**intentional-delta registry** (R2 consequence 2 — pulled forward from rung 10 because
+7.7b changes the behaviour parity classifies); **production-order cached-KV
+restart/upgrade tests** (the current fixture runs `start_local()` before
+`wire_spark_engine()`, the reverse of production `agent.cpp:962` vs `990`, with an empty
+KV — it masks the rehydration path); parity + resource + **3-OS/gateway** evidence
+(Linux File/Service/inert-systemd; Windows File/Registry/Service + shared-watcher
+refcount; macOS all-unsupported + `--spark-disable` legacy-restore; slow/stalled-`Write`;
+long pre-connect/outage; reconnect-during-drain; a server-side reconnect-storm
+events/sec ingest figure); and the **grep-enumerated stale-prose sweep** (`"legacy
+IGuard"`/`"unaffected"`/`"remediated"` — false after the flip at `guardian_engine.cpp:264`,
+`agent.cpp:934-984`, `guaranteed-state.md:344`).
+
+### Two decisions settled 2026-07-18
+
+- **M2 — one-legged recovery.** `event_state_from_type` maps `guard.unhealthy`→errored
+  but `guard.healthy`→`nullptr` (`guaranteed_state_store.cpp:64-67`); recovery clears
+  `errored` only via a paired *compliance* event, which works solely because the prod
+  attach hardcodes `emit_compliant_edge=true` (`guardian_engine.cpp:861`). **Ruled:** add
+  a **cross-pin test** in PR-1 that fails if any attach uses `edge=false`; the real
+  server-side `guard.healthy` census mapping lands with the health surface at **rung 4**.
+- **Flap detector** (design-mandated, §Kill-switch / F3 notes): **deferred to rung 11**
+  alongside the `SparkFailed`-prevalence alert (both server-side fleet-signal work),
+  recorded here so the deferral is explicit rather than silent.
+
 ## Consumer architecture
 
 Guardian becomes a SparkEngine client. The seam:
@@ -880,15 +1014,48 @@ Each rung is an independently-governed PR on `dev`, run through the full
      `false` - **zero placement behaviour change.** Ships R4's 7.7a log set.
      Qualifies shutdown and the F3 hard-exit path, **including its interaction with
      `Restart=always`** (see below).
-   - **7.7b.** The cutover (R1): `prefer_spark = !cfg_.spark_disable`. Real rule
-     placement; the `unsupported` terminal state (R2) + rung-8 telemetry co-landed;
-     audit-on-arm; mechanism liveness; R4's 7.7b heartbeat tags including
-     `yuzu.guardian_backend`; the reconcile-test rewrites (R2 consequence 1). Runs
-     the Windows churn rig with the spark path selected. **This is where detection
-     moves to spark and legacy enforcement stops** (until rung 3).
+   - **7.7b — SPLIT into two governed PRs (settled 2026-07-18, §7.7b split below).**
+     Three reviewers (Sol/Codex, Claude, Fable) found the send/placement path is not
+     yet safe to make live in one PR. The flip is the **last commit** either way.
+
+     **PR-1 is itself landed as two governed PRs (decided 2026-07-18) so each is
+     reviewable as one unit and item 9's counters land before their consumers:**
+     - **PR-1a** = the send/exception/drain cluster: items 1 (shared drift builder),
+       2 (guard_type/rule_name), 3 (exception firewall), 4 (drain-without-lock), plus
+       their two Sol/Fable hardening folds and this governance round. Behaviourally
+       inert (`prefer_spark` false), but item 3's `apply_rules` firewall is a **live
+       legacy-path** crash-prevention fix (see the changelog fragment).
+     - **PR-1b** = items 5 (two-count executor + orphan ceiling), 6 (F3 marker),
+       7 (KV lifecycle journal), 9 (R4 telemetry + the heartbeat wiring for the
+       PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
+       fix)**, and the R2 `unsupported` terminal state.
+     - **FLIP GATE:** M1, item 9's heartbeat wiring, #2270, and the lifecycle-audit
+       journal ALL land in PR-1b and **gate PR-2** — the `prefer_spark` flip must not
+       ship while any is open. M1 in particular is a fleet ingest-DoS if the flip
+       precedes it, so it is not enough that it is "in PR-1" — it is specifically in
+       PR-1b, after PR-1a.
+
+     - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
+       detection/enforcement *placement*).** The shared drift-event builder;
+       OutboxEntry guard_type/rule_name for Health/Lifecycle; attach_rule + live
+       `apply_rules` exception firewall (strong-guarantee `SparkKeyRuleIndex::add`);
+       **drain-without-lock** (transport outside `outbox_mu_`); the two-count executor
+       + a **physical-orphan ceiling strictly > sum(quotas)**; the F3 KV marker;
+       **lifecycle-audit durability** (KV-backed journal, replay on boot+reconnect);
+       the **transition-edge health-emission fix** (see §7.7b split M1 — the flip is a
+       fleet ingest-DoS without it); the `unsupported` terminal state (R2) + rung-8
+       telemetry + reconcile-test rewrites (flag-gated inert, so they land here not on
+       the flip); R4 telemetry producers+consumers + the `SparkFailed`-prevalence
+       alert, all reporting the *inactive* posture; the #2238 test seams + TSan.
+     - **PR-2 (thin cutover).** `prefer_spark = !cfg_.spark_disable`; the
+       intentional-delta registry (R2 consequence 2, pulled forward from rung 10 since
+       7.7b changes the behaviour it classifies); production-order cached-KV
+       restart/upgrade tests; parity + resource + **3-OS/gateway** evidence; the
+       grep-enumerated stale-prose sweep; the flip as the **final commit**. **This is
+       where detection moves to spark and legacy enforcement stops** (until rung 3).
    - **8.** `mech_unsupported_total` + `yuzu_fleet_spark_unsupported` - **folded into
-     7.7b** per R2, not a later rung (unsupported must be loud the moment a rule can
-     land on spark).
+     7.7b PR-1** per R2 (unsupported must be loud the moment a rule can land on spark);
+     current-gauge vs cumulative-counter split per §7.7b split.
    - **10.** Parity + durability + integration matrix. Semantic ports land **before**
      7.7b where possible; live/equivalence after. Carries the **intentional-delta
      registry** (R2 consequence 2) so zero-tolerance parity survives the legacy-no-op
