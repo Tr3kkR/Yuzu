@@ -84,6 +84,14 @@ inline std::string escape_pipes(std::string_view s) {
     return out;
 }
 
+/// Escape a value for a pipe-delimited output field: escape '|' and fold
+/// CR/LF to spaces so untrusted endpoint data cannot inject columns/rows.
+inline std::string safe_output_field(std::string_view value) {
+    std::string out = escape_pipes(value);
+    for (char& ch : out) { if (ch == '\r' || ch == '\n') ch = ' '; }
+    return out;
+}
+
 /// Sanitize input: only allow alphanumeric, spaces, dots, hyphens, underscores,
 /// and slashes. Used to prevent command injection in subprocess arguments.
 inline std::string sanitize_input(std::string_view input) {
