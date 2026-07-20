@@ -9,6 +9,9 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
+#include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
@@ -19,6 +22,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -409,6 +413,169 @@ TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spa
     // Legacy DID attempt to arm (whether it succeeds depends on the platform's
     // real ServiceGuard/SystemdServiceGuard - not this test's concern; only
     // that spark was never touched).
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+// ── Durable-journal persist boundary + inertness (item 7 PR-Ag C2) ───────────
+
+TEST_CASE("prefer_spark=true: an armed rule's record is persisted to the durable journal",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    f.apply(make_service_rule("r1")); // arms via spark → stages "armed" → apply_rules flush persists
+
+    // The journal namespace is distinct from the rule namespace and survives full_sync.
+    auto rows = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty()); // a batch was durably written by the flush guard
+
+    bool found_armed_r1 = false;
+    for (const auto& row : *rows) {
+        auto b = yuzu::agent::parse_journal_batch(row.value);
+        REQUIRE(b.has_value());
+        for (const auto& e : b->entries)
+            if (e.rule_id == "r1" && e.kind == "armed")
+                found_armed_r1 = true;
+    }
+    CHECK(found_armed_r1);
+}
+
+TEST_CASE("prefer_spark=false: no lifecycle record is journaled (inert)",
+          "[spark][guardian][reconcile][journal]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false}; // production default
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    // Inert: persist_lifecycle_journal_locked is prefer_spark_-gated AND no spark staging
+    // happened (the rule armed on the legacy backend). The maintenance tick is inert too.
+    engine.journal_maintenance_tick();
+    auto rows = kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=true: the maintenance tick retries a persist a write failure left pending",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    f.apply(make_service_rule("r1")); // the apply_rules flush persist FAILS → record stays pending
+
+    auto before = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(before.has_value());
+    CHECK(before->empty()); // nothing durable yet - the write failed
+
+    f.engine->journal_maintenance_tick(); // NO new push/reconnect - the tick alone retries
+
+    auto after = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(after.has_value());
+    bool found = false;
+    for (const auto& row : *after) {
+        auto b = yuzu::agent::parse_journal_batch(row.value);
+        REQUIRE(b.has_value());
+        for (const auto& e : b->entries)
+            if (e.rule_id == "r1" && e.kind == "armed")
+                found = true;
+    }
+    CHECK(found); // BLOCKER-4: the failed write self-healed via the heartbeat tick
+}
+
+TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left pending",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    f.apply(make_service_rule("r1")); // persist fails → pending
+    CHECK(f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
+
+    f.engine->stop(); // the final flush persists the leftover pending record
+
+    auto rows = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    CHECK_FALSE(rows->empty()); // durable after stop's final flush
+}
+
+TEST_CASE("prefer_spark=true: page_journal runs a paging pass", "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f;
+    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 0);
+    f.engine->page_journal();
+    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 1); // it paged (not gated out)
+}
+
+TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal untouched)",
+          "[spark][guardian][reconcile][journal]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    // Seed the journal namespace with a batch that must be left untouched.
+    REQUIRE(kv.set(yuzu::agent::kJournalNamespace, "lc:seed:000000000000",
+                   R"({"v":4,"ts_ms":1700000000000,"entries":[{"rule_id":"r","generation":1,)"
+                   R"("event_id":"e","enqueued_ns":1700000000000000000,"kind":"armed",)"
+                   R"("guard_type":"file","rule_name":"n"}]})"));
+
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+
+    engine.page_journal();
+    engine.journal_maintenance_tick();
+    CHECK(engine.lifecycle_journal_for_test()->pages() == 0);            // no paging pass ran
+    CHECK(kv.exists(yuzu::agent::kJournalNamespace, "lc:seed:000000000000")); // seed untouched
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertness)",
+          "[spark][guardian][reconcile][journal]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+
+    // Apply a rule + drive BOTH maintenance paths - none of it touches the journal.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+    engine.journal_maintenance_tick();
+    engine.page_journal();
+
+    // Every journal counter is zero, so the sparse emitter ships NO tags (design §7/§8).
+    std::map<std::string, std::string> tags;
+    yuzu::agent::emit_guardian_journal_heartbeat_tags(tags, engine.journal_stats());
+    CHECK(tags.empty());
 
     engine.stop();
     spark_engine.stop();
