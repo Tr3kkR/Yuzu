@@ -2001,6 +2001,11 @@ public:
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
                                 emit_guardian_journal_heartbeat_tags(tags, guardian_->journal_stats());
+                                // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
+                                // edge-emitted and each suppressed repeat is counted, so the
+                                // suppression is observable (not silent). Sparse: non-zero only.
+                                if (const auto us = guardian_->unhealthy_suppressed(); us != 0)
+                                    tags["yuzu.guardian_unhealthy_suppressed"] = std::to_string(us);
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —

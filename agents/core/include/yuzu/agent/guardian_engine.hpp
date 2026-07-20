@@ -154,6 +154,12 @@ public:
     /// zero when prefer_spark is off / the journal is quiescent.
     [[nodiscard]] GuardianJournalStats journal_stats() const;
 
+    /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
+    /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
+    /// `yuzu.guardian_unhealthy_suppressed` so a rule stuck errored is observable
+    /// without flooding the health stream. Zero when prefer_spark is off / no runtime.
+    [[nodiscard]] std::uint64_t unhealthy_suppressed() const;
+
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     void stop();

@@ -12,10 +12,15 @@ namespace {
 /// The Unknown outcome: arm the recovery-force bit and hand back the read-error
 /// detail. EmitDeciderState is left UNTOUCHED - a read failure must never move
 /// last_compliant/last_emit (that would turn "can't tell" into a committed
-/// verdict). The runtime turns this into an edge-triggered guard.unhealthy.
+/// verdict). Marks the EDGE (the first Unknown of an errored episode); the runtime
+/// emits guard.unhealthy only on that edge and suppresses+counts a repeat Unknown,
+/// so a rule stuck errored does not flood the health stream every convergence tick.
 EvalOutcome unhealthy(RuleEvalState& state, std::string detail) {
+    const bool edge = !state.in_unknown; // first transition into the errored episode
     state.in_unknown = true;
-    return EvalOutcome{EvalStatus::Unhealthy, GuardDrift{}, std::move(detail)};
+    EvalOutcome out{EvalStatus::Unhealthy, GuardDrift{}, std::move(detail)};
+    out.unhealthy_edge = edge;
+    return out;
 }
 
 /// Run the shared decide_emit tail and pack its result + the guard's

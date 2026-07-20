@@ -454,6 +454,77 @@ TEST_CASE("a configured capacity below two is floored so a recovery pair can nev
     REQUIRE(rt->pending_initial(key).empty());
 }
 
+TEST_CASE("Unknown flood guard: repeat errored evals emit one health(false), count the rest (M1)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    // First errored eval -> exactly one guard.unhealthy on the wire; nothing suppressed yet.
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // The convergence priority lane re-visits a rule still owing a verdict every tick. Three
+    // more errored re-evals must produce NO new wire entries - each is counted instead, so a
+    // rule stuck errored can't flood the fleet's health-event ingest.
+    for (int i = 0; i < 3; ++i)
+        rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+    REQUIRE_FALSE(rt->pending_initial(key).empty()); // still Unknown -> still owes a verdict
+
+    // Recovery emits guard.healthy (+ the compliant edge) and re-arms the edge: the NEXT
+    // Unknown emits a fresh health(false), and the suppression counter is untouched by it.
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE_FALSE(drain_all(*rt).empty());
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+}
+
+TEST_CASE("Unknown edge rejected at outbox cap is retried, never counted as suppressed (M1)",
+          "[spark][runtime]") {
+    // Metrics-honesty invariant: unhealthy_suppressed_ counts only COMMITTED repeat-Unknowns,
+    // never an edge the outbox rejected (that edge is re-attempted, not suppressed). Guards the
+    // counter's placement AFTER the accept-check + COMMIT against a future refactor that hoists it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor
+    auto rt = make_rt(r, b, cfg);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true); // drifts
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true); // drifts
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc", /*present=*/true), true);
+
+    // Fill the outbox with two drifts (no slot left).
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    // Edge Unknown for rc while the outbox is full: its single health(false) entry is rejected
+    // (both-or-neither), so nothing commits, rc stays pending, and NOTHING is counted suppressed -
+    // the edge was not delivered and will be retried, so counting it would over-report.
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(kc, EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+    REQUIRE(rt->pending_initial(kc) == std::vector<std::string>{"rc"});
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // Drain frees a slot; the STILL-first Unknown re-attempts as a fresh edge and lands.
+    drain_all(*rt);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    REQUIRE(drain_all(*rt).size() == 1);      // the edge health(false) finally delivered, not lost
+    REQUIRE(rt->unhealthy_suppressed() == 0); // still an edge, never a suppression
+}
+
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
