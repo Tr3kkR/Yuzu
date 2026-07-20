@@ -222,14 +222,35 @@ public:
     ~ChildGuard() {
         if (pid_ <= 0)
             return;
+        if (child_reaped_) {
+            // BR-002: the run loop's own try_reap() already confirmed this
+            // PID is gone (waitpid returned it, or ECHILD) before an
+            // exception unwound into this destructor -- e.g. std::bad_alloc
+            // while collecting output after the child exited. The kernel is
+            // free to have recycled the PID for an unrelated process by now,
+            // so kill_child_or_group()'s direct-PID kill(pid_, SIGKILL)
+            // fallback must never fire here (it would SIGKILL a stranger).
+            // Only the process GROUP id is still meaningful, and only
+            // best-effort -- a still-running descendant may have kept it
+            // alive, but the pid itself is not safe to signal directly.
+            (void)kill(-pid_, SIGKILL);
+            return;
+        }
         kill_child_or_group(pid_);
         if (!try_reap_bounded(pid_, kGuardReapGrace))
             reap_async(pid_);
     }
     void discharge() { pid_ = -1; }
+    // BR-002: called from the run loop's try_reap() the instant the child is
+    // confirmed reaped, so the guard's destructor knows -- if it still fires
+    // after that point (an exception thrown before discharge()) -- that
+    // pid_ may already have been recycled and must not be signalled
+    // directly.
+    void mark_child_reaped() noexcept { child_reaped_ = true; }
 
 private:
     pid_t pid_;
+    bool child_reaped_ = false;
 };
 
 // EINTR-retrying dup2() -- async-signal-safe (no allocation), safe to call
@@ -398,7 +419,12 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // automatically on a successful execvp(); on failure the code
         // below writes to it explicitly before exiting.
 
-        execvp(c_argv[0], c_argv.data());
+        // BR-003: execv(), not execvp() -- execvp() is not on Darwin's
+        // async-signal-safe list because it does a PATH search (fopen()
+        // internally on some libc implementations); every production
+        // caller already passes an absolute tool path (e.g. /bin/sh,
+        // /usr/bin/codesign), so no PATH search is ever needed here.
+        execv(c_argv[0], c_argv.data());
         // exec failed -- report why and exit; see
         // report_setup_failure_and_exit's comment above for the
         // EINTR-retry and unconditional-_exit(127) reasoning (shared with
@@ -484,6 +510,11 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         } while (waited < 0 && errno == EINTR);
         if (waited == pid) {
             child_reaped = true;
+            // BR-002: tell the guard immediately -- if an exception unwinds
+            // into ~ChildGuard anywhere after this point (e.g. std::bad_alloc
+            // in the output-collection code below), it must not signal pid_
+            // directly since the kernel may have already recycled it.
+            guard.mark_child_reaped();
             // Only ever set on a normal exit -- a signal-killed child (the
             // deadline/cancel path below) leaves this at its -1 sentinel;
             // WIFEXITED is false for a SIGKILL death, so there is no path
@@ -492,6 +523,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 result.exit_code = WEXITSTATUS(status);
         } else if (waited < 0 && errno == ECHILD) {
             child_reaped = true;
+            guard.mark_child_reaped(); // BR-002: see comment above
         }
     };
 

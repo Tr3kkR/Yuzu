@@ -53,6 +53,22 @@ TEST_CASE("classify_codesign_result: non-zero exit with no output is unknown, no
     CHECK(to_string(status) == "unknown");
 }
 
+TEST_CASE("classify_codesign_result: a trust-chain failure maps to unknown, not invalid",
+         "[filesystem][macos][signature]") {
+    // BR-005: a CSSMERR_TP_NOT_TRUSTED (or similar policy/notarization)
+    // failure means the cert chain/local trust policy rejected an
+    // otherwise-intact seal -- it is not tampering. Confirmed reachable on
+    // a real host (codesign --verify --deep --strict against an
+    // otherwise-signed bundle can exit non-zero this way); mapping it to
+    // `invalid` would report a false "tampered" compliance result.
+    std::string_view output =
+        "/tmp/App.app: CSSMERR_TP_NOT_TRUSTED\n"
+        "explicit requirement satisfied, but the certificate chain is not trusted\n";
+    auto status = classify_codesign_result(true, 1, output);
+    CHECK(status == SignatureStatus::unknown);
+    CHECK(to_string(status) == "unknown");
+}
+
 TEST_CASE("classify_codesign_result: tool_ran=false is unknown regardless of exit_code/output",
          "[filesystem][macos][signature]") {
     // tool_ran == false models exec() itself failing (codesign missing from

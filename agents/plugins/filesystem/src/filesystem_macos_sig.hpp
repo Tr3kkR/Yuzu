@@ -58,6 +58,36 @@ inline std::string_view to_string(SignatureStatus status) noexcept {
     return "unknown";
 }
 
+// BR-005: this header was originally a verbatim salvage of a mapping that
+// treated EVERY non-zero codesign exit carrying any output as `invalid`.
+// That is wrong -- a TRUST failure on an otherwise well-formed, unmodified
+// signature (e.g. CSSMERR_TP_NOT_TRUSTED: the seal is intact but the cert
+// chain, a notarization ticket, or local policy isn't trusted) is not
+// tampering, and reporting it as `invalid` produces a false "tampered"
+// compliance result. Only diagnostics that actually PROVE a broken seal, a
+// bad code requirement, or a corrupt/mismatched sealed resource may map to
+// `invalid`; everything else non-zero (trust/policy/notarization failures,
+// or any diagnostic we don't recognise) honestly falls through to
+// `unknown`, per the enum's own contract above.
+//
+// codesign's diagnostic text is stable across macOS releases (it comes from
+// Security.framework's SecStaticCode error strings).
+constexpr std::string_view kInvalidDiagnostics[] = {
+    "a sealed resource is missing or invalid",
+    "resource envelope is obsolete",
+    "code has no resources but signature indicates they must be present",
+    "main executable failed strict validation",
+    "the signature is invalid",
+};
+
+inline bool matches_invalid_diagnostic(std::string_view output) noexcept {
+    for (auto diagnostic : kInvalidDiagnostics) {
+        if (output.find(diagnostic) != std::string_view::npos)
+            return true;
+    }
+    return false;
+}
+
 // `tool_ran` is false only when the codesign binary itself could not be
 // launched (e.g. missing from PATH) -- callers signal this distinctly from a
 // real codesign invocation that happened to exit non-zero. `output` is the
@@ -71,18 +101,18 @@ inline SignatureStatus classify_codesign_result(bool tool_ran, int exit_code,
     if (exit_code == 0)
         return SignatureStatus::valid;
 
-    // codesign's diagnostic text is stable across macOS releases (it comes
-    // from Security.framework's SecStaticCode error strings).
     if (output.find("code object is not signed at all") != std::string_view::npos)
         return SignatureStatus::not_signed;
 
-    // Any other non-zero exit WITH a codesign diagnostic means codesign ran
-    // and found a real problem with the signature or the code it covers.
-    if (!output.empty())
+    // Only a recognised broken-seal/bad-requirement/corrupt-resource
+    // diagnostic proves tampering. A trust failure (CSSMERR_TP_NOT_TRUSTED
+    // and friends -- untrusted cert chain, missing notarization, local
+    // policy) or any other unrecognised non-zero-exit diagnostic is not
+    // evidence of tampering, so it stays `unknown` rather than being
+    // reported as `invalid`.
+    if (matches_invalid_diagnostic(output))
         return SignatureStatus::invalid;
 
-    // Non-zero exit, no captured output at all -- codesign gave us nothing to
-    // reason from; honest unknown rather than guessing invalid.
     return SignatureStatus::unknown;
 }
 
