@@ -1,8 +1,8 @@
 /**
  * test_string_utils.cpp — Unit tests for shared string utility functions
  *
- * Covers: icontains, sanitize_utf8, escape_pipes, sanitize_input,
- *         format_uptime, split_args, chargen_line
+ * Covers: icontains, sanitize_utf8, escape_pipes, safe_output_field,
+ *         sanitize_input, format_uptime, split_args, chargen_line
  */
 
 #include <yuzu/string_utils.hpp>
@@ -133,19 +133,44 @@ TEST_CASE("escape_pipes: only pipes", "[string_utils][pipes]") {
     REQUIRE(escape_pipes("|||") == "\\|\\|\\|");
 }
 
+TEST_CASE("escape_pipes: literal backslash is doubled", "[string_utils][pipes]") {
+    REQUIRE(escape_pipes("a\\b") == "a\\\\b");
+}
+
+TEST_CASE("escape_pipes: trailing backslash is doubled, not folded", "[string_utils][pipes]") {
+    REQUIRE(escape_pipes("value ending in\\") == "value ending in\\\\");
+}
+
+TEST_CASE("escape_pipes: backslash-pipe sequence escapes both bytes",
+          "[string_utils][pipes]") {
+    // Input '\|' (one backslash, one pipe) must not collide with the escape
+    // sequence escape_pipes itself uses for a lone '|' -- backslashes are
+    // escaped first, so this becomes '\\' + '\|' (four bytes).
+    REQUIRE(escape_pipes("a\\|b") == "a\\\\\\|b");
+}
+
 // ── safe_output_field ───────────────────────────────────────────────────────
 
 namespace {
-// Mirrors server/core/src/result_parsing.hpp's find_unescaped_pipe exactly
-// (kept local to this test -- the server file is out of scope for this
-// change) so the round-trip tests below assert against the real
-// consumer-side parsing semantics, not just this header's own escaping.
+// Mirrors server/core/src/result_parsing.hpp's find_unescaped_pipe /
+// unescape_pipes exactly (kept local to this test -- the server file lives
+// in a different build target/suite) so the round-trip tests below assert
+// against the real consumer-side parsing semantics: a '|' is a real
+// separator iff preceded by an EVEN run of backslashes (0 counts as even),
+// matching escape_pipes always escaping '\' before '|'.
+size_t test_backslash_run_length(const std::string& s, size_t p) {
+    size_t n = 0;
+    while (n < p && s[p - 1 - n] == '\\')
+        ++n;
+    return n;
+}
+
 size_t test_find_unescaped_pipe(const std::string& s, size_t pos) {
     while (pos < s.size()) {
         auto p = s.find('|', pos);
         if (p == std::string::npos)
             return std::string::npos;
-        if (p > 0 && s[p - 1] == '\\') {
+        if (test_backslash_run_length(s, p) % 2 != 0) {
             pos = p + 1;
             continue;
         }
@@ -154,45 +179,140 @@ size_t test_find_unescaped_pipe(const std::string& s, size_t pos) {
     return std::string::npos;
 }
 
+std::string test_unescape_pipes(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size() && (s[i + 1] == '\\' || s[i + 1] == '|')) {
+            out += s[i + 1];
+            ++i;
+            continue;
+        }
+        out += s[i];
+    }
+    return out;
+}
+
 std::vector<std::string> test_split_fields(const std::string& line) {
     std::vector<std::string> parts;
     size_t pos = 0;
     while (pos <= line.size()) {
         auto p = test_find_unescaped_pipe(line, pos);
         if (p == std::string::npos) {
-            parts.push_back(line.substr(pos));
+            parts.push_back(test_unescape_pipes(line.substr(pos)));
             break;
         }
-        parts.push_back(line.substr(pos, p - pos));
+        parts.push_back(test_unescape_pipes(line.substr(pos, p - pos)));
         pos = p + 1;
     }
     return parts;
 }
 } // namespace
 
-TEST_CASE("safe_output_field: trailing backslash does not swallow the following separator",
+TEST_CASE("safe_output_field: trailing backslash round-trips and does not swallow "
+          "the following separator",
           "[string_utils][safe_output_field]") {
-    // A value ending in a literal backslash used to leave that backslash in
-    // the output, which the server's find_unescaped_pipe reads as escaping
-    // the very next '|' -- collapsing two real fields into one.
-    std::string field1 = safe_output_field("value ending in\\");
+    // A value ending in a literal backslash used to be lossily folded to '/'
+    // on the way out; it must now round-trip byte-for-byte.
+    std::string original = "value ending in\\";
+    std::string field1 = safe_output_field(original);
     std::string line = field1 + "|" + "next";
 
     auto parts = test_split_fields(line);
     REQUIRE(parts.size() == 2);
-    CHECK(parts[0] == field1);
+    CHECK(parts[0] == original);
     CHECK(parts[1] == "next");
 }
 
-TEST_CASE("safe_output_field: literal backslash-pipe stays inside one field",
+TEST_CASE("safe_output_field: literal backslash-pipe round-trips and stays inside one field",
           "[string_utils][safe_output_field]") {
-    std::string field1 = safe_output_field("contains \\| inside");
+    std::string original = "contains \\| inside";
+    std::string field1 = safe_output_field(original);
     std::string line = field1 + "|" + "next";
 
     auto parts = test_split_fields(line);
     REQUIRE(parts.size() == 2);
-    CHECK(parts[0] == field1);
+    CHECK(parts[0] == original);
     CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: bare double pipe round-trips as two escaped pipes",
+          "[string_utils][safe_output_field]") {
+    std::string original = "||";
+    std::string field1 = safe_output_field(original);
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == original);
+    CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: a bare pipe round-trips", "[string_utils][safe_output_field]") {
+    std::string original = "|";
+    std::string field1 = safe_output_field(original);
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == original);
+    CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: doubled-backslash-then-pipe round-trips",
+          "[string_utils][safe_output_field]") {
+    std::string original = "a\\\\|b";
+    std::string field1 = safe_output_field(original);
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == original);
+    CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: a plain value with no special bytes round-trips unchanged",
+          "[string_utils][safe_output_field]") {
+    std::string original = "plain value";
+    std::string field1 = safe_output_field(original);
+    std::string line = field1 + "|" + "next";
+
+    auto parts = test_split_fields(line);
+    REQUIRE(parts.size() == 2);
+    CHECK(parts[0] == original);
+    CHECK(field1 == original); // no escaping needed at all
+    CHECK(parts[1] == "next");
+}
+
+TEST_CASE("safe_output_field: an 8-field row survives a trailing-backslash DN field intact",
+          "[string_utils][safe_output_field]") {
+    // Mirrors certificates_plugin.cpp's CertRecord::to_row() shape (BR-07):
+    // subject/issuer/serial/key_usage are escaped, the rest are trusted
+    // literals. A DN ending in a literal backslash must not shift every
+    // later column.
+    std::vector<std::string> fields = {
+        safe_output_field("CN=example.com\\"), safe_output_field("CN=Example CA"),
+        "5A1F4258CB5026DCA9C6FB7702EDA6933AF351CB",                                "2026-07-20",
+        "2027-07-20",                          safe_output_field("B7AC9DB9CAF6ADDB"),
+        "System.keychain",                     safe_output_field("Digital Signature"),
+    };
+    std::string row;
+    for (size_t i = 0; i < fields.size(); ++i) {
+        if (i)
+            row += '|';
+        row += fields[i];
+    }
+
+    auto parts = test_split_fields(row);
+    REQUIRE(parts.size() == 8);
+    CHECK(parts[0] == "CN=example.com\\");
+    CHECK(parts[1] == "CN=Example CA");
+    CHECK(parts[2] == "5A1F4258CB5026DCA9C6FB7702EDA6933AF351CB");
+    CHECK(parts[3] == "2026-07-20");
+    CHECK(parts[4] == "2027-07-20");
+    CHECK(parts[5] == "B7AC9DB9CAF6ADDB");
+    CHECK(parts[6] == "System.keychain");
+    CHECK(parts[7] == "Digital Signature");
 }
 
 // ── sanitize_input ──────────────────────────────────────────────────────────

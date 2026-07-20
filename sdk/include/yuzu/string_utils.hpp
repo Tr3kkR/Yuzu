@@ -71,12 +71,23 @@ inline std::string sanitize_utf8(const std::string& s) {
     return out;
 }
 
-/// Escape pipe characters in output values.
+/// Escape a value for a pipe-delimited output field, reversibly.
+///
+/// Backslash is the escape character, so every literal backslash is doubled
+/// FIRST ('\' -> '\\'), then every literal pipe is escaped ('|' -> '\|').
+/// Order matters: escaping backslashes before pipes means the '\' that
+/// escape_pipes itself inserts ahead of a '|' is never mistaken for input
+/// data, so the server's parity-based unescaper (an EVEN run of backslashes
+/// before a '|' is a real separator, an ODD run means the '|' is escaped
+/// data) can invert this unambiguously — no input byte sequence collides
+/// with another's encoding.
 inline std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
-        if (c == '|')
+        if (c == '\\')
+            out += "\\\\";
+        else if (c == '|')
             out += "\\|";
         else
             out += c;
@@ -84,21 +95,15 @@ inline std::string escape_pipes(std::string_view s) {
     return out;
 }
 
-/// Escape a value for a pipe-delimited output field: escape '|' and fold
-/// CR/LF to spaces so untrusted endpoint data cannot inject columns/rows.
-///
-/// A literal backslash in the INPUT is folded to '/' before escape_pipes
-/// runs. The server's parser treats any '|' preceded by a backslash as
-/// escaped (single-backslash lookback), so a value legitimately ending in
-/// '\' would otherwise leave a dangling backslash that consumes the real
-/// field separator right after it, shifting every later column. Folding
-/// first guarantees the only backslashes ever present in the output are
-/// the ones escape_pipes itself just introduced immediately before a '|',
-/// so the server's escape detection stays unambiguous.
+/// Escape a value for a pipe-delimited output field: reversibly escape '\'
+/// and '|' (see escape_pipes), then fold CR/LF to spaces so untrusted
+/// endpoint data cannot inject rows. CR/LF folding is lossy by design —
+/// newlines are the row separator and carry no escape representation in
+/// this grammar — but '\' and '|' now round-trip exactly through the
+/// server's parity-based unescaper, including a value that ends in a
+/// literal backslash.
 inline std::string safe_output_field(std::string_view value) {
-    std::string folded(value);
-    for (char& ch : folded) { if (ch == '\\') ch = '/'; }
-    std::string out = escape_pipes(folded);
+    std::string out = escape_pipes(value);
     for (char& ch : out) { if (ch == '\r' || ch == '\n') ch = ' '; }
     return out;
 }
