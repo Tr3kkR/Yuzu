@@ -36,13 +36,18 @@ The `cpp-expert` and `cpp-safety` agents load this document on any C++ source ch
 
 The agent reserves a small namespace of plugin names for internal dispatch intercepts. Any plugin declaring one of these names in `YuzuPluginDescriptor::name` is **rejected at load time** by `PluginLoader::scan` (see `agents/core/include/yuzu/agent/plugin_loader.hpp` `kReservedPluginNames`) — the rejection is logged at `error` and counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}`.
 
-| Name          | Purpose                                                            |
-|---------------|--------------------------------------------------------------------|
-| `__guard__`   | Guardian engine dispatch (see `docs/yuzu-guardian-design-v1.1.md` §7.2) |
-| `__system__`  | Reserved for future system-scope commands                          |
-| `__update__`  | Reserved for OTA update commands                                   |
+| Name                    | Purpose                                                            |
+|-------------------------|--------------------------------------------------------------------|
+| `__guard__`             | Guardian engine command dispatch (see `docs/yuzu-guardian-design-v1.1.md` §7.2) |
+| `__system__`            | Reserved for future system-scope commands                          |
+| `__update__`            | Reserved for OTA update commands                                   |
+| `__guardian_journal__`  | Guardian lifecycle-journal `kv_store` namespace (#2303 C2)         |
+| `__guardian__`          | GuardianEngine rule-state `kv_store` namespace (#2303 sec-M)       |
+| `__sync__`              | Daily-sync scheduler-state `kv_store` namespace (#2303 sec-L)      |
 
-Do not pick names matching `__*__` for third-party plugins; treat the double-underscore-bracketed convention as the internal-dispatch namespace and avoid it entirely. Adding a new reserved name requires updating `kReservedPluginNames` and the unit test in `tests/unit/test_plugin_loader.cpp` that pins the exact set.
+The last three are `kv_store` namespaces keyed by a plugin's own declared name (`yuzu_ctx_storage_*`) on a shared connection: reserving them stops a plugin from reading, deleting, or forging the state the owning subsystem loads as authoritative (Guardian rule state, the arm/disarm audit journal, daily-sync state). Native plugins are trusted — the plugin ABI has no sandbox — so this is a hygiene / audit-integrity control, not isolation; there is no isolation mechanism to invoke instead. Each `kv_store`-namespace entry is pinned to its source constant by a `static_assert` in the owning translation unit so the two cannot drift.
+
+Do not pick names matching `__*__` for third-party plugins; treat the double-underscore-bracketed convention as the internal-dispatch namespace and avoid it entirely. Adding a new reserved name requires updating `kReservedPluginNames`, the unit test in `tests/unit/test_plugin_loader.cpp` that pins the exact set, this table, and the `reserved_name` rejection-reason row in `docs/user-manual/metrics.md`.
 
 ## Entry points
 
