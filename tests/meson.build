@@ -440,6 +440,9 @@ if build_server
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
+      'unit/server/test_principal_quota.cpp', # PR 4.4 per-principal quota cap primitive
+      'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)
+      'unit/server/test_principal_quota_chokepoint.cpp', # PR 4.4 chokepoint wiring coverage
       'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-1005 PR 1.1 gRPC end-to-end enforcement
       'unit/server/test_principal_class.cpp', # ADR-1005 PR 1.2 actor-class label
       'unit/server/test_insecure_tls_gate.cpp',
