@@ -14,11 +14,14 @@
  *   event|timestamp|level|event_id|source|message
  */
 
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <format>
 #include <string>
@@ -79,6 +82,13 @@ std::string sanitize_input(std::string_view input) {
     }
     return out;
 }
+
+// ── macOS `log show` deadline ────────────────────────────────────────────
+
+// Hard wall-clock bound on macOS `log show`: it has no built-in timeout and
+// GNU `timeout` isn't available on macOS, so an unbounded shell-out could
+// otherwise block the collection thread indefinitely (#2273).
+constexpr auto kLogShowDeadline = std::chrono::milliseconds(10000);
 
 // ── errors action ──────────────────────────────────────────────────────────
 
@@ -158,20 +168,21 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format("log show --predicate 'messageType == error' --last {}h "
-                           "--style compact 2>/dev/null | head -100",
-                           hours);
-    auto lines = run_command_lines(cmd.c_str());
-    if (lines.empty()) {
-        ctx.write_output("error|none|-|No error events found");
-        return 0;
-    }
-    for (const auto& line : lines) {
+    constexpr std::size_t kMaxLines = 100;
+    std::vector<std::string> argv{"log",         "show",
+                                   "--predicate", "messageType == error",
+                                   "--last",      std::format("{}h", hours),
+                                   "--style",     "compact"};
+    auto result = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{
+                  .deadline = kLogShowDeadline, .max_lines = kMaxLines, .merge_stderr = false});
+
+    auto emit_error_line = [&ctx](const std::string& line) {
         // Compact format: "timestamp  process[pid]  message"
         auto first_space = line.find("  ");
         if (first_space == std::string::npos) {
             ctx.write_output(std::format("error|{}|-|{}", line, line));
-            continue;
+            return;
         }
         auto timestamp = line.substr(0, first_space);
         auto rest = line.substr(first_space + 2);
@@ -185,7 +196,24 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (message.size() > 200)
             message = message.substr(0, 200);
         ctx.write_output(std::format("error|{}|{}|{}", timestamp, process, message));
+    };
+
+    if (result.timed_out) {
+        // Never masquerade a timeout as an empty success: emit whatever
+        // partial lines were collected before the deadline, then an honest
+        // incomplete-query row in the same 4-column shape.
+        for (const auto& line : result.lines)
+            emit_error_line(line);
+        ctx.write_output("error|timeout|-|log show timed out before completing");
+        return 1;
     }
+
+    if (result.lines.empty()) {
+        ctx.write_output("error|none|-|No error events found");
+        return 0;
+    }
+    for (const auto& line : result.lines)
+        emit_error_line(line);
 
 #else
     ctx.write_output("error|platform not supported|-|-");
@@ -275,19 +303,24 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format("log show --predicate 'eventMessage contains \"{}\"' --last 24h "
-                           "--style compact 2>/dev/null | head -{}",
-                           filter, count);
-    auto lines = run_command_lines(cmd.c_str());
-    if (lines.empty()) {
-        ctx.write_output("event|none|-|No matching events found");
-        return 0;
-    }
-    for (const auto& line : lines) {
+    std::vector<std::string> argv{"log",
+                                   "show",
+                                   "--predicate",
+                                   std::format("eventMessage contains \"{}\"", filter),
+                                   "--last",
+                                   "24h",
+                                   "--style",
+                                   "compact"};
+    auto result = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = kLogShowDeadline,
+                                              .max_lines = static_cast<std::size_t>(count),
+                                              .merge_stderr = false});
+
+    auto emit_event_line = [&ctx](const std::string& line) {
         auto first_space = line.find("  ");
         if (first_space == std::string::npos) {
             ctx.write_output(std::format("event|{}|-|{}", line, line));
-            continue;
+            return;
         }
         auto timestamp = line.substr(0, first_space);
         auto rest = line.substr(first_space + 2);
@@ -301,7 +334,24 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (message.size() > 200)
             message = message.substr(0, 200);
         ctx.write_output(std::format("event|{}|{}|{}", timestamp, process, message));
+    };
+
+    if (result.timed_out) {
+        // Never masquerade a timeout as an empty success: emit whatever
+        // partial lines were collected before the deadline, then an honest
+        // incomplete-query row in the same 4-column shape.
+        for (const auto& line : result.lines)
+            emit_event_line(line);
+        ctx.write_output("event|timeout|-|log show timed out before completing");
+        return 1;
     }
+
+    if (result.lines.empty()) {
+        ctx.write_output("event|none|-|No matching events found");
+        return 0;
+    }
+    for (const auto& line : result.lines)
+        emit_event_line(line);
 
 #else
     ctx.write_output("error|platform not supported");
