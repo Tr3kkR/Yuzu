@@ -12,6 +12,8 @@
 
 #include "guardian_ingest.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
 #include "guaranteed_state_store.hpp"
@@ -87,4 +89,40 @@ TEST_CASE("guardian ingest: DEX observers fire once on insert, never on redelive
     CHECK(store.events_dropped_total() == 1);
     CHECK(incidents == 1);
     CHECK(alerts == 1);
+}
+
+TEST_CASE("guardian ingest: latency histogram observes every store outcome, skips non-events",
+          "[guardian][ingest][metrics]") {
+    // Pins the yuzu_server_guardian_ingest_duration_seconds placement (A / #2298 warm-up):
+    // the RAII timer sits AFTER the parse guard, so every event that reaches the store —
+    // Inserted, Redelivered, AND Conflict — is timed exactly once, while a fast pre-store
+    // reject (non-"event" action, unparseable frame) is NOT timed and a null registry is
+    // inert. The store-compare latency this captures is the signal a future off-write-path
+    // compare (#2298) would be judged against, so an under-count here would hide it.
+    GuaranteedStateStore store(":memory:");
+    yuzu::MetricsRegistry metrics;
+    const std::string kName = "yuzu_server_guardian_ingest_duration_seconds";
+
+    const auto resp = make_observation("__observation__-1", "svc.exe");
+
+    // Inserted -> Redelivered -> Conflict: three store outcomes, three observations.
+    ingest_guardian_response(store, "agent-A", resp, nullptr, nullptr, &metrics); // Inserted
+    ingest_guardian_response(store, "agent-A", resp, nullptr, nullptr, &metrics); // Redelivered
+    ingest_guardian_response(store, "agent-B", resp, nullptr, nullptr, &metrics); // Conflict
+    CHECK(metrics.histogram(kName).snapshot().count == 3);
+    // A real ingest takes non-zero wall time, so the sum is strictly positive (guards
+    // against a placement that observed a zero-length or default-constructed duration).
+    CHECK(metrics.histogram(kName).snapshot().sum > 0.0);
+
+    // A non-"event" __guard__ action is dropped before any store work -> NOT timed.
+    apb::CommandResponse status;
+    status.set_action("status");
+    ingest_guardian_response(store, "agent-A", status, nullptr, nullptr, &metrics);
+    CHECK(metrics.histogram(kName).snapshot().count == 3);
+
+    // Null registry (the gateway path with no metrics wired) -> inert, no crash, still ingests.
+    ingest_guardian_response(store, "agent-C", make_observation("__observation__-2", "svc.exe"),
+                             nullptr, nullptr, nullptr);
+    CHECK(store.event_count() == 2);
+    CHECK(metrics.histogram(kName).snapshot().count == 3);
 }

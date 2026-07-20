@@ -14,6 +14,10 @@
 
 #include "agent.pb.h"
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
 class GuaranteedStateStore;
 class BlastRadiusDetector;
@@ -40,9 +44,15 @@ namespace pb = ::yuzu::agent::v1;
 /// `alert_router` (optional, F1): fed the same ruleless observations so
 /// operator-routed per-signal alerts also cover both wire paths. nullptr
 /// disables routing.
+///
+/// `metrics` (optional): when non-null, observes the end-to-end ingest latency
+/// of one "event" into `yuzu_server_guardian_ingest_duration_seconds`. Threaded
+/// through this one chokepoint so the direct and gateway paths time identically.
+/// nullptr disables timing (tests / metrics-less configs).
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp,
                               BlastRadiusDetector* blast_radius = nullptr,
-                              DexAlertRouter* alert_router = nullptr);
+                              DexAlertRouter* alert_router = nullptr,
+                              yuzu::MetricsRegistry* metrics = nullptr);
 
 } // namespace yuzu::server::detail

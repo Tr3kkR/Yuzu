@@ -5,6 +5,7 @@
 #include <ctime>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
@@ -51,14 +52,32 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
 } // namespace
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
-                              const pb::CommandResponse& resp,
-                              BlastRadiusDetector* blast_radius, DexAlertRouter* alert_router) {
+                              const pb::CommandResponse& resp, BlastRadiusDetector* blast_radius,
+                              DexAlertRouter* alert_router, yuzu::MetricsRegistry* metrics) {
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
             spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
-            return;
+            return; // a malformed frame never reaches the store — not a timed ingest
         }
+        // Time the real ingest work (build -> enrich -> classify+store -> observers) via
+        // RAII so EVERY store-outcome exit is observed — Redelivered/Conflict/Error early
+        // returns and the normal fall-through alike. Placed AFTER the parse guard so a
+        // fast malformed-frame reject doesn't dilute the store-latency signal. Label-less,
+        // default latency buckets (5ms-10s, docs/observability-conventions.md). Inert when
+        // `metrics` is null (tests / metrics-less configs).
+        struct IngestTimer {
+            yuzu::MetricsRegistry* m;
+            std::chrono::steady_clock::time_point t0;
+            ~IngestTimer() {
+                if (!m)
+                    return;
+                const double secs =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                m->histogram("yuzu_server_guardian_ingest_duration_seconds").observe(secs);
+            }
+        } ingest_timer{metrics, std::chrono::steady_clock::now()};
+
         GuaranteedStateEventRow ev_row;
         ev_row.event_id = ev.event_id();
         ev_row.rule_id = ev.rule_id();

@@ -911,6 +911,15 @@ public:
                           "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
                           "server restart.",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_ingest_duration_seconds",
+                          "Server-side latency to ingest one Guardian side-channel event "
+                          "(parse -> severity-enrich -> classify+store -> Inserted-only observers), "
+                          "covering both the direct Subscribe and gateway-proxied paths. The "
+                          "dominant term is the in-txn classify+store redelivery compare "
+                          "(insert_event_classified); this is the latency signal a future "
+                          "off-write-path compare (#2298) would be judged against. Label-less; "
+                          "default latency buckets (5ms-10s).",
+                          "histogram");
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
