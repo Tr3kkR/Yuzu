@@ -53,7 +53,7 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
 
 // The `status` label value for a store outcome (bounded set = the four enum values). Kept in
 // sync with the warm-create loop below and the EventInsertOutcome enum.
-std::string_view event_insert_status_label(EventInsertOutcome outcome) noexcept {
+[[nodiscard]] std::string_view event_insert_status_label(EventInsertOutcome outcome) noexcept {
     switch (outcome) {
     case EventInsertOutcome::Inserted:
         return "inserted";
@@ -75,14 +75,20 @@ std::vector<double> guardian_event_store_buckets() {
             0.05,   0.1,     0.25,   0.5,   1.0,    2.5,   5.0,  10.0};
 }
 
-// Bind the hand-written warm-create list below to the enum: a new EventInsertOutcome must not
-// silently land on an un-warm-created (default-bucket) "unknown" series (unhappy-path UP-2). If
-// this fires, add the new outcome to BOTH event_insert_status_label and the warm-create loop.
+// Guard the hand-written warm-create list against enum drift (unhappy-path UP-2). This pins the
+// four current values, so a REORDER / RENUMBER / REMOVAL trips the build. It does NOT catch an
+// APPEND (a 5th value leaves 0..3 intact) - that case is caught instead by the non-`default`
+// -Wswitch in event_insert_status_label (a build WARNING; werror is off, so non-fatal). An
+// appended outcome that slipped past the warning would get a lazily-created default-bucket
+// "unknown" series - wrong buckets on that one series, never a crash. A hard append-catch would
+// need a Count sentinel on EventInsertOutcome, which would ripple -Wswitch into the store's own
+// ingest switch - out of scope for a metric. If this fires (or -Wswitch warns), add the new
+// outcome to BOTH event_insert_status_label and the warm-create loop.
 static_assert(static_cast<int>(EventInsertOutcome::Inserted) == 0 &&
                   static_cast<int>(EventInsertOutcome::Redelivered) == 1 &&
                   static_cast<int>(EventInsertOutcome::Conflict) == 2 &&
                   static_cast<int>(EventInsertOutcome::Error) == 3,
-              "EventInsertOutcome changed; update event_insert_status_label + the warm-create loop");
+              "EventInsertOutcome reordered/renumbered; update event_insert_status_label + warm-create");
 
 void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
     const auto buckets = guardian_event_store_buckets();
@@ -159,11 +165,20 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         const auto store_t0 = std::chrono::steady_clock::now();
         const EventInsertResult res = store.insert_event_classified(ev_row);
         if (metrics) {
-            const double secs =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - store_t0).count();
-            metrics->histogram(kGuardianEventStoreDurationMetric,
-                               {{"status", std::string(event_insert_status_label(res.outcome))}})
-                .observe(secs);
+            // This runs on the gRPC ingest thread, whose Subscribe / ForwardGuardianMessage loops
+            // have NO catch-all above them (same reason the observer block below is guarded). The
+            // series are warm-created, so in steady state only the transient Labels/key alloc can
+            // throw (OOM) - swallow it: a best-effort metric observation must never tear down the
+            // agent's stream. Uniform no-escape posture (cpp-safety Gate-3).
+            try {
+                const double secs =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - store_t0)
+                        .count();
+                metrics->histogram(kGuardianEventStoreDurationMetric,
+                                   {{"status", std::string(event_insert_status_label(res.outcome))}})
+                    .observe(secs);
+            } catch (...) { // best-effort metric; never propagate onto the ingest thread
+            }
         }
         switch (res.outcome) {
         case EventInsertOutcome::Inserted:
