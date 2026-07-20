@@ -33,6 +33,23 @@ int64_t now_epoch_seconds() {
         .count();
 }
 
+// Build the LIKE operand for a prefix match: escape the wildcards SQLite's LIKE would otherwise
+// interpret ('%', '_') and the escape char itself, then append '%'. Every prefix-scanning query
+// pairs this with ESCAPE '\'. Extracted so the three call sites (list, list_entries,
+// namespace_size) cannot drift - an unescaped '_' silently widens the scan to keys the caller
+// never asked for.
+std::string escape_like_prefix(std::string_view prefix) {
+    std::string escaped;
+    escaped.reserve(prefix.size() + 1);
+    for (char c : prefix) {
+        if (c == '%' || c == '_' || c == '\\')
+            escaped += '\\';
+        escaped += c;
+    }
+    escaped += '%';
+    return escaped;
+}
+
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
@@ -236,15 +253,7 @@ std::vector<std::string> KvStore::list(std::string_view plugin, std::string_view
         return result;
 
     // L6: Escape LIKE wildcards (%, _, \) in the prefix to prevent unintended matching
-    std::string escaped_prefix;
-    escaped_prefix.reserve(prefix.size());
-    for (char c : prefix) {
-        if (c == '%' || c == '_' || c == '\\') {
-            escaped_prefix += '\\';
-        }
-        escaped_prefix += c;
-    }
-    escaped_prefix += '%';
+    const std::string escaped_prefix = escape_like_prefix(prefix);
 
     const char* sql = "SELECT key FROM kv_store WHERE plugin = ? AND key LIKE ? ESCAPE '\\' ORDER BY key";
 
@@ -299,14 +308,7 @@ KvStore::list_entries(std::string_view plugin, std::string_view prefix) {
     if (!db_)
         return std::unexpected(KvStoreError{"kv_store is closed"});
 
-    std::string escaped_prefix;
-    escaped_prefix.reserve(prefix.size());
-    for (char c : prefix) {
-        if (c == '%' || c == '_' || c == '\\')
-            escaped_prefix += '\\';
-        escaped_prefix += c;
-    }
-    escaped_prefix += '%';
+    const std::string escaped_prefix = escape_like_prefix(prefix);
 
     const char* sql =
         "SELECT key, value FROM kv_store WHERE plugin = ? AND key LIKE ? ESCAPE '\\' ORDER BY key";
@@ -338,6 +340,48 @@ KvStore::list_entries(std::string_view plugin, std::string_view prefix) {
         return std::unexpected(
             KvStoreError{std::format("list_entries step failed: {}", sqlite3_errmsg(db_))});
     return result;
+}
+
+std::expected<KvNamespaceSize, KvStoreError>
+KvStore::namespace_size(std::string_view plugin, std::string_view prefix) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected(KvStoreError{"kv_store is closed"});
+
+    const std::string escaped_prefix = escape_like_prefix(prefix);
+
+    // octet_length(value) is the BYTE length of the value's UTF-8 encoding - matching
+    // KvRow::value.size() and persist()'s value.size() accounting. It is deliberately NOT bare
+    // LENGTH(): LENGTH() on a TEXT column counts CHARACTERS, under-counting a multibyte value so
+    // the byte gauge reads low - the one direction that loosens the write ceiling. It is chosen
+    // over the equally byte-correct LENGTH(CAST(value AS BLOB)) because octet_length keeps
+    // SQLite's header-only length path (no overflow-page reads on spilled values); available
+    // since SQLite 3.43 (the vendored build is far newer). COALESCE covers the empty-set SUM
+    // (NULL). The aggregate always yields exactly one row.
+    const char* sql = "SELECT COUNT(*), COALESCE(SUM(octet_length(value)), 0) "
+                      "FROM kv_store WHERE plugin = ? AND key LIKE ? ESCAPE '\\'";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK)
+        return std::unexpected(
+            KvStoreError{std::format("namespace_size prepare failed: {}", sqlite3_errmsg(db_))});
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, escaped_prefix.c_str(),
+                      static_cast<int>(escaped_prefix.size()), SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt.get());
+    if (rc != SQLITE_ROW)
+        return std::unexpected(
+            KvStoreError{std::format("namespace_size step failed: {}", sqlite3_errmsg(db_))});
+
+    // Both columns are non-negative by construction (COUNT, and a SUM of LENGTHs), so the
+    // int64 -> uint64 widening cannot wrap; clamp anyway rather than trust a corrupt page.
+    const std::int64_t n = sqlite3_column_int64(stmt.get(), 0);
+    const std::int64_t b = sqlite3_column_int64(stmt.get(), 1);
+    return KvNamespaceSize{n > 0 ? static_cast<std::uint64_t>(n) : 0,
+                           b > 0 ? static_cast<std::uint64_t>(b) : 0};
 }
 
 KvInsert KvStore::insert_if_absent(std::string_view plugin, std::string_view key,

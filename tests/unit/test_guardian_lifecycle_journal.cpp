@@ -394,3 +394,86 @@ TEST_CASE("journal size gauges track live batches + bytes across persist and pru
     CHECK(j.journal_bytes() > 0);
     CHECK(j.journal_bytes() < bytes2);
 }
+
+// ── #2303 C1: the write ceiling must not forget the on-disk journal at startup ──
+
+TEST_CASE("journal reopen: a fresh instance seeds its size gauges from the on-disk journal",
+          "[guardian][journal][persist][reopen]") {
+    TestKv t;
+    std::uint64_t bytes_before = 0;
+    {
+        GuardianLifecycleJournal a(t.kv.get());
+        REQUIRE(a.persist(one("r1", "armed")) == 1);
+        REQUIRE(a.persist(one("r2", "armed")) == 1);
+        REQUIRE(a.journal_batch_count() == 2);
+        bytes_before = a.journal_bytes();
+    }
+
+    // Restart: a new journal instance over the SAME on-disk journal. Before the fix both gauges
+    // started at 0 here, so the write ceiling was blind to everything already on disk until the
+    // first successful prune - and start_local()'s arm flush persists before any prune runs.
+    GuardianLifecycleJournal b(t.kv.get());
+    CHECK(b.journal_batch_count() == 2);
+    // Byte-EXACT, not merely non-zero: this cross-pins namespace_size's
+    // SUM(LENGTH(CAST(value AS BLOB))) against the value.size() accounting persist/prune use.
+    CHECK(b.journal_bytes() == bytes_before);
+}
+
+TEST_CASE("journal reopen: the write ceiling is enforced against pre-existing batches",
+          "[guardian][journal][persist][reopen]") {
+    TestKv t;
+    {
+        GuardianLifecycleJournal a(t.kv.get());
+        REQUIRE(a.persist(one("r1", "armed")) == 1);
+        REQUIRE(a.persist(one("r2", "armed")) == 1);
+    }
+
+    // The reopened instance is at its ceiling from its FIRST write - no free window in which a
+    // crash-loop could grow the SHARED kv_store.db past the hard cap.
+    GuardianLifecycleJournal b(t.kv.get());
+    b.set_write_ceiling_for_test(/*max_batches=*/2, /*max_bytes=*/kNoCap);
+    CHECK(b.persist(one("r3", "armed")) == 0);
+    CHECK(b.write_capacity_rejected() == 1);
+    CHECK(b.write_failures() == 0);                 // refused by the ceiling, not a failed write
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2); // r3 never reached the shared DB
+}
+
+TEST_CASE("journal reopen: multibyte values are sized in BYTES, not characters",
+          "[guardian][journal][persist][reopen]") {
+    // Guards the CAST(value AS BLOB) in namespace_size: bare LENGTH() on a TEXT column counts
+    // CHARACTERS, so a multibyte rule_name would seed the byte gauge LOW - the one direction
+    // that silently loosens the write ceiling.
+    TestKv t;
+    std::uint64_t bytes_before = 0;
+    {
+        GuardianLifecycleJournal a(t.kv.get());
+        auto r = rec("r1", "armed");
+        r.rule_name = "café-日本語-Ünïcödé"; // multibyte
+        std::vector<std::shared_ptr<const JournalRecord>> pending{
+            std::make_shared<const JournalRecord>(r)};
+        REQUIRE(a.persist(pending) == 1);
+        bytes_before = a.journal_bytes();
+    }
+
+    GuardianLifecycleJournal b(t.kv.get());
+    CHECK(b.journal_batch_count() == 1);
+    CHECK(b.journal_bytes() == bytes_before);
+}
+
+TEST_CASE("journal reopen: an un-sizable journal fails CLOSED (assume at ceiling)",
+          "[guardian][journal][persist][reopen]") {
+    TestKv t;
+    // Move the store out from under the journal: the moved-from KvStore is closed (db_ null),
+    // so the construction-time size probe fails exactly as a chronic SQLITE_BUSY or a corrupt
+    // page would. We have least right to assume "empty" precisely when we cannot read it, so
+    // the posture is assume-at-ceiling: refuse + COUNT, never silently write on.
+    KvStore closed{std::move(*t.kv)};
+
+    GuardianLifecycleJournal j(t.kv.get());
+    CHECK(j.journal_batch_count() == kMaxJournalBatches * 2); // the default hard ceiling
+    CHECK(j.journal_bytes() == kMaxJournalBytes * 2);
+
+    CHECK(j.persist(one("r1", "armed")) == 0);
+    CHECK(j.write_capacity_rejected() == 1);
+    CHECK(j.write_failures() == 0); // refused BEFORE the write, not attempted and failed
+}

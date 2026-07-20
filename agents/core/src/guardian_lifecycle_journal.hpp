@@ -245,6 +245,11 @@ private:
     /// boot-prune barrier inside page_into_window calls this directly (it already holds it).
     JournalPruneStats prune_locked_(std::int64_t now_ms);
 
+    /// Seed the size gauges from the journal already on disk so the write-side ceiling is
+    /// honest from this process's FIRST write, not only after a successful prune (#2303 C1).
+    /// Called from the ctor; fails CLOSED (assume-at-ceiling) if the journal cannot be sized.
+    void seed_size_gauges_();
+
     KvStore* kv_;                ///< BORROWED; outlives this (agent owns it)
     std::string boot_nonce_;     ///< random, fixed at construction - batch-key uniqueness across restarts
     std::uint64_t batch_seq_{0}; ///< per-process monotonic batch-key sequence (persist runs single-threaded under mtx_)

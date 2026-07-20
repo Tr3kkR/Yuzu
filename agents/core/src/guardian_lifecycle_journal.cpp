@@ -69,6 +69,50 @@ GuardianLifecycleJournal::GuardianLifecycleJournal(KvStore* kv)
                          "power-loss durability of the lifecycle journal is not guaranteed",
                          sync);
     }
+    seed_size_gauges_();
+}
+
+// #2303 C1. The size gauges are what the write-side ceiling in persist() reads, but they were
+// only ever RECONSTRUCTED by a successful prune scan - they started at 0 on every construction.
+// A journal that survived a restart was therefore invisible to the ceiling until the first
+// successful prune, and start_local()'s arm-record flush persists BEFORE any tick or reconnect
+// prune runs, so the gauge-at-zero window opened on EVERY restart. A crash-loop over an already
+// full journal could then grow the SHARED kv_store.db past the "hard" ceiling, taking unrelated
+// plugins' KV with it. Seeding here closes the window: the ceiling is honest from the first
+// write of the process.
+//
+// namespace_size() is the aggregate probe rather than list_entries() on purpose - the hard
+// ceiling is 2x the soft caps (2000 batches / 64 MiB), and materializing that to learn two
+// numbers would be a multi-tens-of-MiB allocation on an endpoint at startup.
+//
+// Probe FAILURE is the interesting case, and it fails CLOSED: an un-scannable journal means we
+// cannot bound what is already on disk, so we assume-at-ceiling and let persist() reject +
+// count write_capacity_rejected_ until a successful prune reconstructs the true size. Records
+// already staged are retried, not dropped, as long as a prune EVENTUALLY succeeds; only a
+// SUSTAINED double-failure (this probe AND every subsequent prune both failing) past the bounded
+// RAM staging (kMaxPendingJournalRecords) drops the oldest - and that drop is counted, not silent
+// (journal_stage_dropped). Fail-OPEN here would be the strictly worse trade: it is precisely the
+// un-scannable journal (chronic SQLITE_BUSY, a corrupt page) whose size we have least right to
+// assume is zero.
+void GuardianLifecycleJournal::seed_size_gauges_() {
+    if (!kv_)
+        return; // no store to borrow: persist() writes nothing, so the gauges are moot
+
+    auto sz = kv_->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    if (!sz) {
+        journal_batch_count_.store(hard_max_batches_, std::memory_order_relaxed);
+        journal_bytes_.store(hard_max_bytes_, std::memory_order_relaxed);
+        spdlog::warn("Guardian journal: could not size the on-disk journal at startup ({}); "
+                     "assuming AT the write ceiling until a successful prune - lifecycle records "
+                     "will be staged in RAM and retried, not written",
+                     sz.error().message);
+        return;
+    }
+    journal_batch_count_.store(sz->count, std::memory_order_relaxed);
+    journal_bytes_.store(sz->bytes, std::memory_order_relaxed);
+    if (sz->count > 0)
+        spdlog::debug("Guardian journal: resuming over {} batch(es) / {} bytes already on disk",
+                      sz->count, sz->bytes);
 }
 
 std::size_t
