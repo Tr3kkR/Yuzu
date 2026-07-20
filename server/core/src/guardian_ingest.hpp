@@ -11,6 +11,8 @@
 /// gateway-asserted on the gateway path — and is NEVER read from the frame.
 
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "agent.pb.h"
 
@@ -54,5 +56,22 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                               BlastRadiusDetector* blast_radius = nullptr,
                               DexAlertRouter* alert_router = nullptr,
                               yuzu::MetricsRegistry* metrics = nullptr);
+
+/// Prometheus metric name for the store-operation latency histogram: server-side latency of
+/// `insert_event_classified` (the classify+store SQLite txn) for one Guardian event, split by
+/// outcome `status`. Shared by the observe site (guardian_ingest.cpp) and the describe +
+/// warm-create site (server.cpp) so the name cannot drift between them.
+inline constexpr char kGuardianEventStoreDurationMetric[] =
+    "yuzu_server_guardian_event_store_duration_seconds";
+
+/// The custom bucket ladder for that histogram — sub-millisecond (SQLite single-row insert)
+/// through the seconds tail (Postgres / lock contention). Boundaries are fixed at first series
+/// creation, so warm-create and any observe MUST agree; this is the single source.
+[[nodiscard]] std::vector<double> guardian_event_store_buckets();
+
+/// Birth all four `status` series (inserted|redelivered|conflict|error) with the custom ladder
+/// so the boundaries are pinned before the first observe and the series appear on /metrics from
+/// boot. Call once at startup (server.cpp) and in tests that assert the histogram.
+void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics);
 
 } // namespace yuzu::server::detail

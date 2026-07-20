@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 #include <yuzu/metrics.hpp>
@@ -49,7 +50,39 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
 }
+
+// The `status` label value for a store outcome (bounded set = the four enum values). Kept in
+// sync with the warm-create loop below and the EventInsertOutcome enum.
+std::string_view event_insert_status_label(EventInsertOutcome outcome) noexcept {
+    switch (outcome) {
+    case EventInsertOutcome::Inserted:
+        return "inserted";
+    case EventInsertOutcome::Redelivered:
+        return "redelivered";
+    case EventInsertOutcome::Conflict:
+        return "conflict";
+    case EventInsertOutcome::Error:
+        return "error";
+    }
+    return "unknown";
+}
 } // namespace
+
+std::vector<double> guardian_event_store_buckets() {
+    // 0.1ms .. 10s: sub-ms resolution for a healthy SQLite single-row insert, plus the
+    // seconds tail for Postgres / lock contention (and the pending SQLite->Postgres move).
+    return {0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025,
+            0.05,   0.1,     0.25,   0.5,   1.0,    2.5,   5.0,  10.0};
+}
+
+void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
+    const auto buckets = guardian_event_store_buckets();
+    for (const EventInsertOutcome status :
+         {EventInsertOutcome::Inserted, EventInsertOutcome::Redelivered,
+          EventInsertOutcome::Conflict, EventInsertOutcome::Error})
+        metrics.histogram(kGuardianEventStoreDurationMetric,
+                          {{"status", std::string(event_insert_status_label(status))}}, buckets);
+}
 
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp, BlastRadiusDetector* blast_radius,
@@ -60,24 +93,6 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
             return; // a malformed frame never reaches the store — not a timed ingest
         }
-        // Time the real ingest work (build -> enrich -> classify+store -> observers) via
-        // RAII so EVERY store-outcome exit is observed — Redelivered/Conflict/Error early
-        // returns and the normal fall-through alike. Placed AFTER the parse guard so a
-        // fast malformed-frame reject doesn't dilute the store-latency signal. Label-less,
-        // default latency buckets (5ms-10s, docs/observability-conventions.md). Inert when
-        // `metrics` is null (tests / metrics-less configs).
-        struct IngestTimer {
-            yuzu::MetricsRegistry* m;
-            std::chrono::steady_clock::time_point t0;
-            ~IngestTimer() {
-                if (!m)
-                    return;
-                const double secs =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                m->histogram("yuzu_server_guardian_ingest_duration_seconds").observe(secs);
-            }
-        } ingest_timer{metrics, std::chrono::steady_clock::now()};
-
         GuaranteedStateEventRow ev_row;
         ev_row.event_id = ev.event_id();
         ev_row.rule_id = ev.rule_id();
@@ -124,7 +139,24 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // + alert observers below run ONLY on a genuine first insert (`Inserted`) — a
         // redelivery must NOT re-fire them (false blast-radius sightings / duplicate
         // routed alerts), and a mismatched collision stays on the loud CC7.3 metric.
-        switch (auto res = store.insert_event_classified(ev_row); res.outcome) {
+        // Time the store operation (insert_event_classified: the classify+store SQLite txn —
+        // the redelivery byte-compare on redelivered/conflict, projection+commit on insert),
+        // split by outcome `status`. This is the store-latency signal the off-write-path compare
+        // (#2298) is VALIDATED against, NOT the go/no-go itself: an aggregate histogram can't
+        // attribute compare-CPU vs lock-wait vs txn, so the decision needs a concurrent
+        // benchmark. Series are warm-created at startup, so this is a cheap name+label lookup
+        // (no per-event bucket-vector alloc). Inert when `metrics` is null (tests / gateway
+        // without a registry).
+        const auto store_t0 = std::chrono::steady_clock::now();
+        const EventInsertResult res = store.insert_event_classified(ev_row);
+        if (metrics) {
+            const double secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - store_t0).count();
+            metrics->histogram(kGuardianEventStoreDurationMetric,
+                               {{"status", std::string(event_insert_status_label(res.outcome))}})
+                .observe(secs);
+        }
+        switch (res.outcome) {
         case EventInsertOutcome::Inserted:
             break; // fall through to the observers below
         case EventInsertOutcome::Redelivered:
