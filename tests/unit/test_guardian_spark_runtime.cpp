@@ -1563,5 +1563,16 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     stop.store(true, std::memory_order_relaxed);
     for (auto& w : workers)
         w.join();
-    SUCCEED("no data race across concurrent persist/page/prune/drain");
+
+    // Beyond race-freedom (TSan): the running-counter gauges (#2303) must stay ACCOUNTING-correct
+    // under the real concurrent persist/prune interleaving, not just data-race-free. A final
+    // settle prune (prune ignores stopping_, so it still runs) rebases to on-disk truth; the
+    // gauges must then exactly equal what namespace_size sees on disk - proving no lost update
+    // and no drift accumulated across the concurrent run.
+    rig.journal->prune(1'700'000'900'000);
+    auto sz = rig.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(sz.has_value());
+    CHECK(rig.journal->journal_batch_count() == sz->count);
+    CHECK(rig.journal->journal_bytes() == sz->bytes);
+    CHECK(rig.journal->gauge_underflow() == 0); // never fell into the fail-open underflow window
 }

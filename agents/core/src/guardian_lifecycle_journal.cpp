@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <format>
 #include <random>
@@ -95,21 +96,32 @@ GuardianLifecycleJournal::GuardianLifecycleJournal(KvStore* kv)
 // un-scannable journal (chronic SQLITE_BUSY, a corrupt page) whose size we have least right to
 // assume is zero.
 void GuardianLifecycleJournal::seed_size_gauges_() {
+    // #2303 UP-7: this is the ONLY non-RMW gauge writer (an absolute .store()). It is race-free
+    // ONLY because it runs once, in the ctor, before the journal pointer is published to any
+    // thread. A future re-seed while persist/prune threads are live would reintroduce the exact
+    // lost-update class this fix removes. The call-once assert pins that contract in debug builds.
+    assert(!size_seeded_.exchange(true, std::memory_order_relaxed) &&
+           "seed_size_gauges_ must run once, at construction, before any thread sees the journal");
     if (!kv_)
         return; // no store to borrow: persist() writes nothing, so the gauges are moot
 
     auto sz = kv_->namespace_size(kJournalNamespace, kBatchKeyPrefix);
     if (!sz) {
-        journal_batch_count_.store(hard_max_batches_, std::memory_order_relaxed);
-        journal_bytes_.store(hard_max_bytes_, std::memory_order_relaxed);
+        // Fail CLOSED at the ceiling. This is a CONSERVATIVE seed that a later successful
+        // prune scan REBASES back to on-disk reality (rebase-as-delta) - do not treat it as
+        // permanent, or an agent that boots once with a busy/corrupt kv_store.db would brick
+        // its journal writes forever.
+        journal_batch_count_.store(static_cast<std::int64_t>(hard_max_batches_),
+                                   std::memory_order_relaxed);
+        journal_bytes_.store(static_cast<std::int64_t>(hard_max_bytes_), std::memory_order_relaxed);
         spdlog::warn("Guardian journal: could not size the on-disk journal at startup ({}); "
                      "assuming AT the write ceiling until a successful prune - lifecycle records "
                      "will be staged in RAM and retried, not written",
                      sz.error().message);
         return;
     }
-    journal_batch_count_.store(sz->count, std::memory_order_relaxed);
-    journal_bytes_.store(sz->bytes, std::memory_order_relaxed);
+    journal_batch_count_.store(static_cast<std::int64_t>(sz->count), std::memory_order_relaxed);
+    journal_bytes_.store(static_cast<std::int64_t>(sz->bytes), std::memory_order_relaxed);
     if (sz->count > 0)
         spdlog::debug("Guardian journal: resuming over {} batch(es) / {} bytes already on disk",
                       sz->count, sz->bytes);
@@ -171,8 +183,17 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
             // the writes that set that up). The cached size (set exactly by each prune scan,
             // incremented below on a durable write) drives it: reject + count + circuit-break,
             // leaving the records in the bounded RAM staging.
-            if (journal_batch_count_.load(std::memory_order_relaxed) + 1 > hard_max_batches_ ||
-                journal_bytes_.load(std::memory_order_relaxed) + value.size() > hard_max_bytes_) {
+            const std::int64_t raw_count = journal_batch_count_.load(std::memory_order_relaxed);
+            const std::int64_t raw_bytes = journal_bytes_.load(std::memory_order_relaxed);
+            // UP-2: a NEGATIVE gauge here means an over-subtraction bug - clamp_nonneg would floor
+            // it to 0 and admit a write (fail-OPEN on the shared kv_store.db). Correct operation
+            // never goes negative at a ceiling read, so surface it as a counter rather than let
+            // the clamp hide it. (The write still proceeds under the clamped-0 read; the counter
+            // is the tripwire, and a later prune rebase self-heals the value.)
+            if (raw_count < 0 || raw_bytes < 0)
+                gauge_underflow_.fetch_add(1, std::memory_order_relaxed);
+            if (clamp_nonneg(raw_count) + 1 > hard_max_batches_ ||
+                clamp_nonneg(raw_bytes) + value.size() > hard_max_bytes_) {
                 write_capacity_rejected_.fetch_add(1, std::memory_order_relaxed);
                 return written; // the rest stay pending; a later prune shrinks, then the tick retries
             }
@@ -192,9 +213,19 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
                 ++batch_seq_;
                 batches_written_.fetch_add(1, std::memory_order_relaxed);
                 // Track the live-size gauges so the write-side ceiling above and the operator
-                // size signal stay honest between prune scans (review UP-1 / sre).
+                // size signal stay honest between prune scans (review UP-1 / sre). fetch_add
+                // (not an absolute store) so a concurrent prune rebase never loses this
+                // increment (#2303 gauge-race fix).
+                //
+                // ORDERING IS LOAD-BEARING (#2303 UP-4): this fetch_add MUST stay AFTER the
+                // durable insert_if_absent above. That ordering is what makes a prune rebase
+                // racing this persist an OVER-count (the row is on disk, seen by the scan, and
+                // also fetch_add'd -> ceiling tightens, safe) rather than an UNDER-count (gauge
+                // bumped for a row not yet on disk -> ceiling loosens -> fail-open). Do NOT
+                // reorder to "reserve then write".
                 journal_batch_count_.fetch_add(1, std::memory_order_relaxed);
-                journal_bytes_.fetch_add(value.size(), std::memory_order_relaxed);
+                journal_bytes_.fetch_add(static_cast<std::int64_t>(value.size()),
+                                         std::memory_order_relaxed);
                 i += consumed;
                 written = i; // count the durably-committed slots BEFORE building the best-effort
                              // provenance record, so a throw there loses only the sent-label
@@ -252,12 +283,42 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         prune_failures_.fetch_add(1, std::memory_order_relaxed);
         return stats; // read_ok stays false, same as a real list_entries failure
     }
+    // #2303 gauge-race fix (rebase-as-delta). Snapshot the gauge count IMMEDIATELY before the
+    // scan; after the scan we fetch_add the SIGNED difference (scanned-actual minus this
+    // snapshot) rather than storing an absolute. A concurrent persist() fetch_add landing
+    // between this load and the rebase is preserved (both are RMW on the same atomic), where
+    // an absolute store would silently clobber it and under-count the write ceiling. This is
+    // also the sole path that walks a fail-closed boot seed back down to reality.
+    const std::int64_t pre_count = journal_batch_count_.load(std::memory_order_relaxed);
+    const std::int64_t pre_bytes = journal_bytes_.load(std::memory_order_relaxed);
+
+    // TEST-ONLY interleaving seam (#2303 UP-3): fire a simulated concurrent persist AFTER the
+    // pre_count snapshot but BEFORE the scan - the window where the inserted row is BOTH seen by
+    // list_entries and carries its own fetch_add (the transient double-count). Null in production.
+    if (pre_scan_hook_)
+        pre_scan_hook_();
+
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
     if (!rows) {
         prune_failures_.fetch_add(1, std::memory_order_relaxed); // read error: fail-safe, retry next pass
         return stats; // read_ok stays false: the boot barrier will NOT latch on a failed scan (M5)
     }
     stats.read_ok = true;
+
+    // Rebase to what the scan actually observed on disk (all lc: rows, parseable or not); the
+    // quarantine + eviction below then fetch_sub exactly what they REMOVE, so the gauge lands
+    // at the true post-prune size without ever taking an absolute snapshot.
+    std::int64_t scanned_bytes = 0;
+    for (const auto& row : *rows)
+        scanned_bytes += static_cast<std::int64_t>(row.value.size());
+    journal_batch_count_.fetch_add(static_cast<std::int64_t>(rows->size()) - pre_count,
+                                   std::memory_order_relaxed);
+    journal_bytes_.fetch_add(scanned_bytes - pre_bytes, std::memory_order_relaxed);
+
+    // TEST-ONLY interleaving seam: fire a simulated concurrent persist() in the exact window
+    // between the rebase and the removal accounting (null in production).
+    if (post_scan_hook_)
+        post_scan_hook_();
 
     struct Live {
         std::string key;
@@ -274,6 +335,10 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                 KvRename::Renamed) {
                 quarantined_.fetch_add(1, std::memory_order_relaxed);
                 ++stats.quarantined;
+                // Left the lc: namespace: subtract it from the rebased gauge (RMW, #2303).
+                journal_batch_count_.fetch_sub(1, std::memory_order_relaxed);
+                journal_bytes_.fetch_sub(static_cast<std::int64_t>(row.value.size()),
+                                         std::memory_order_relaxed);
             } else {
                 quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
             }
@@ -292,12 +357,9 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     std::size_t total_bytes = 0;
     for (const auto& l : live)
         total_bytes += l.bytes;
-    // Snapshot the pre-eviction size: the write-side ceiling cache reflects on-disk reality even
-    // when the delete below fails (UP-1) - the scan succeeded, so this IS what is on disk now.
-    const std::size_t live_count = live.size();
-    const std::size_t live_bytes = total_bytes;
 
     std::vector<std::string> evict;
+    std::int64_t evicted_bytes = 0; // #2303: bytes to fetch_sub once the delete SUCCEEDS
     std::size_t surviving = live.size();
     for (const auto& l : live) { // oldest first: age is absolute, count/bytes trim from this end
         const bool too_old = l.ts_ms < min_ts;
@@ -305,6 +367,7 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         const bool too_big = total_bytes > max_bytes_;
         if (too_old || too_many || too_big) {
             evict.push_back(l.key);
+            evicted_bytes += static_cast<std::int64_t>(l.bytes);
             --surviving;
             total_bytes -= l.bytes;
         }
@@ -324,14 +387,24 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         }
         if (n <= 0) {
             prune_failures_.fetch_add(1, std::memory_order_relaxed);
-            // Nothing was evicted, so the journal is still the full scanned set: keep the size
-            // cache honest under a chronic delete failure so the write-side ceiling still bounds it.
-            journal_batch_count_.store(live_count, std::memory_order_relaxed);
-            journal_bytes_.store(live_bytes, std::memory_order_relaxed);
+            // Nothing was evicted. Under rebase-as-delta the gauge already reflects the scanned
+            // on-disk reality and we subtracted only what we actually removed, so a failed
+            // delete correctly requires NO gauge change (#2303 - the old absolute store here
+            // was itself a lost-update site).
             return stats; // do NOT touch survivors' sent-labels this pass
         }
         batches_pruned_.fetch_add(static_cast<std::uint64_t>(n), std::memory_order_relaxed);
         stats.evicted = static_cast<std::size_t>(n);
+        // Evicted keys left the lc: namespace: subtract them from the rebased gauge (RMW).
+        // Count uses `n` (RETURNING rows), bytes uses evicted_bytes (the whole evict set): the
+        // two bases match ONLY because n == evict.size() here. del_keys rolls back on any
+        // failure (n==0), and under paging_mutex_ the sole concurrent writer (persist) only
+        // INSERTS - no other path deletes an lc: key - so every evicted key is still present at
+        // delete time and n can never be a partial 0<n<size. If a future out-of-lock lc:
+        // deleter is added, switch bytes to sum only the actually-deleted keys (a rebase heals
+        // the skew next scan regardless).
+        journal_batch_count_.fetch_sub(static_cast<std::int64_t>(n), std::memory_order_relaxed);
+        journal_bytes_.fetch_sub(evicted_bytes, std::memory_order_relaxed);
         for (const auto& key : evict) {
             // Best-effort classification: a live entry may age out before its batch key exists,
             // so absence of a sent-label != "never sent".
@@ -342,18 +415,15 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         }
     }
 
-    // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC, and the
-    // authoritative post-prune size for the write-side ceiling cache + operator size gauges.
+    // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC. The
+    // size gauges are NOT stored here any more - the rebase above plus the quarantine/eviction
+    // fetch_subs already left them at the true on-disk size via RMW only, so a concurrent
+    // persist increment is never lost (#2303 gauge-race fix).
     const std::set<std::string> evicted_set(evict.begin(), evict.end());
     std::set<std::string> survivors;
-    std::uint64_t surviving_bytes = 0;
     for (const auto& l : live)
-        if (!evicted_set.count(l.key)) {
+        if (!evicted_set.count(l.key))
             survivors.insert(l.key);
-            surviving_bytes += l.bytes;
-        }
-    journal_batch_count_.store(survivors.size(), std::memory_order_relaxed);
-    journal_bytes_.store(surviving_bytes, std::memory_order_relaxed);
 
     // Sent-label GC: drop any sent:<...> whose batch no longer survives - an evicted batch's
     // label, or an orphan from a crash between the pop-after-send label write and eviction.
@@ -459,10 +529,19 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         }
         if (!replayable) {
             if (kv_->rename_key(kJournalNamespace, row.key, journal_quarantine_key(row.key)) ==
-                KvRename::Renamed)
+                KvRename::Renamed) {
                 quarantined_.fetch_add(1, std::memory_order_relaxed);
-            else
+                // The row left the lc: namespace here too - keep the running-counter gauges
+                // exact (#2303), matching prune's quarantine fetch_sub. Page does not rebase,
+                // so without this the gauge over-counts the renamed-away row until the next
+                // prune scan (safe direction, but the "RMW exactly what leaves lc:" invariant
+                // must hold on every remover, not just prune).
+                journal_batch_count_.fetch_sub(1, std::memory_order_relaxed);
+                journal_bytes_.fetch_sub(static_cast<std::int64_t>(row.value.size()),
+                                         std::memory_order_relaxed);
+            } else {
                 quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
         cands.push_back(Cand{row.key, b->ts_ms, std::move(*b)});
