@@ -266,14 +266,14 @@ their normal lane cadence.
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.
 Still OPEN and still gating the `prefer_spark` flip (folded into #2298 gate 6):
-(a) the **slow periodic refresh** — without it a lost/coalesced edge leaves the server's errored
-view stale until recovery (unhappy-path UP-1/2/4/11); (b) the **priority-lane eviction** — a
+(a) the **slow periodic refresh** - without it a lost/coalesced edge leaves the server's errored
+view stale until recovery (unhappy-path UP-1/2/4/11); (b) the **priority-lane eviction** - a
 stuck-Unknown rule still re-reads its target every ~5 s forever, so only the *wire* flood is
 fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for the suppression
-tag (the signal is agent-heartbeat-only today) — this is **pilot-trust-blocking**, not just SOC2
+tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
 `/status.errored_rules` is still the fail-closed placeholder. The census edge-record still depends
-on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` — do NOT sever that.
+on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` - do NOT sever that.
 
 ### PR-1 hardening items (commit order 1→2→3→4→7→5→6→9→8)
 

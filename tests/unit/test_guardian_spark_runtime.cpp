@@ -483,7 +483,7 @@ TEST_CASE("Unknown flood guard: repeat errored evals emit one health(false), cou
     rt->evaluate_key(key, EvalReason::Event);
     const auto recovered = drain_all(*rt);
     // Precisely: recovery MUST emit a guard.healthy (Health domain, healthy=true), not merely
-    // "some entry" — a regression that dropped health(true) on recovery would leave the health
+    // "some entry" - a regression that dropped health(true) on recovery would leave the health
     // stream stuck errored forever (qa Gate-3 SHOULD).
     REQUIRE(std::any_of(recovered.begin(), recovered.end(), [](const OutboxEntry& e) {
         return e.domain == OutboxDomain::Health && e.healthy;

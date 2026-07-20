@@ -26,7 +26,7 @@ TEST_CASE("health heartbeat: non-zero suppression emits the pinned key + value",
     std::map<std::string, std::string> tags;
     emit_guardian_health_heartbeat_tags(tags, 42);
     CHECK(tags.size() == 1);
-    // Pinned wire key — the #2298 rollup reader MUST match this exact string.
+    // Pinned wire key - the #2298 rollup reader MUST match this exact string.
     CHECK(tags.at("yuzu.guardian_unhealthy_suppressed") == "42");
     CHECK(std::string(kGuardianUnhealthySuppressedTag) == "yuzu.guardian_unhealthy_suppressed");
 }
