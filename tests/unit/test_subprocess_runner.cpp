@@ -5,11 +5,14 @@
  * Unlike most of the suite this drives REAL child processes (/bin/sleep,
  * /bin/sh, /usr/bin/printf) -- run_bounded_subprocess()'s whole contract is
  * about actual kill/reap and exec-outcome behaviour, which a pure-string
- * fixture can't exercise. Every case here is bounded well under the suite
- * timeout: the longest possible single wait is one deadline (at most a few
- * hundred ms, or one cooperative cancel) plus the runner's own internal
- * drain grace (2s), so a bug that makes the deadline/cancel not fire fails
- * the test loudly instead of hanging CI.
+ * fixture can't exercise. Every single-call case here is bounded well under
+ * the suite timeout: the longest possible single wait is one deadline (at
+ * most a few hundred ms, or one cooperative cancel) plus the runner's own
+ * internal drain grace (2s), so a bug that makes the deadline/cancel not
+ * fire fails the test loudly instead of hanging CI. The one multi-threaded
+ * case (BR-01 below) is bounded differently -- by the aggregate runtime of
+ * a handful of sequential real-child iterations per thread run concurrently
+ * across threads, a few seconds total -- rather than by a single deadline.
  *
  * POSIX only (subprocess_runner.hpp's implementation is itself
  * `#ifndef _WIN32`-gated) -- this file is still registered unconditionally
@@ -27,6 +30,7 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <algorithm>
+#include <barrier>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -271,6 +275,118 @@ TEST_CASE("run_bounded_subprocess discards stderr by default (merge_stderr=false
     CHECK(result.tool_ran);
     CHECK(result.output.empty());
     CHECK(result.lines.empty());
+}
+
+TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a concurrent invocation "
+          "never leaks a write end into another invocation's child (BR-01)",
+          "[subprocess][concurrency][macos][linux]") {
+    // BR-01: macOS has no atomic O_CLOEXEC pipe (no pipe2()) -- FD_CLOEXEC is
+    // set via a separate fcntl() call that follows pipe(). Linux DOES have
+    // pipe2(O_CLOEXEC), but this implementation deliberately uses the same
+    // pipe()+fcntl() sequence on both platforms (one code path, not a
+    // per-OS branch) -- so the window this test targets is real on Linux
+    // too, even though Linux has a pipe2()-based alternative it doesn't
+    // take. Without serializing that window, a fork() on ANOTHER thread
+    // landing between this invocation's pipe() and its fcntl(F_SETFD,
+    // FD_CLOEXEC) inherits this invocation's not-yet-CLOEXEC write end
+    // into a totally unrelated child. If that other child execs into a
+    // longer-lived program, the extra open copy of the write end keeps
+    // THIS invocation's read side from ever seeing EOF -- even though this
+    // invocation's own child already exited -- until the other program
+    // eventually exits too. Observed from outside, that is a false timeout
+    // on a call whose own child finished almost instantly. The mutex fix
+    // closes that window on both platforms; it is a no-op in terms of
+    // correctness on Linux (pipe2() would also close it), just not the
+    // mechanism used there.
+    //
+    // Rather than relying on uncoordinated scheduler jitter across a large
+    // number of threads to get lucky (expensive in CI process/thread
+    // budget -- see BR-01 follow-up FP-003), every thread below is
+    // released from a shared std::barrier at the start of each round, so
+    // every thread's pipe()..fork() sequence for that round starts at
+    // essentially the same instant. That turns "some other thread's
+    // fork() happens to land inside my few-CPU-cycle window" from a rare
+    // coincidence into the common case each round, without needing more
+    // than a small, fixed thread count or many iterations to make it
+    // likely. "Host" threads fork a real child that outlives every
+    // "victim" thread's much shorter deadline; "victim" threads fork a
+    // child that exits almost instantly, so a leaked write end from a
+    // still-running host can only manifest as an honest timed_out on a
+    // victim whose own child already exited. This is not a mathematical
+    // guarantee against the pre-fix code -- true simultaneity is still up
+    // to the OS scheduler -- but empirically it fails (nonzero
+    // false_timeouts below) reliably against the pre-fix code (no mutex)
+    // and always passes against the fix. If it were ever to pass
+    // spuriously against pre-fix code on some host, false_timeouts == 0 is
+    // still the correct invariant to assert: a genuinely fixed runner must
+    // never report a false timeout here, regardless of how reliably the
+    // race itself reproduces on a given machine.
+    constexpr unsigned kNumHostThreads = 4;
+    constexpr unsigned kNumVictimThreads = 8;
+    constexpr unsigned kNumThreads = kNumHostThreads + kNumVictimThreads; // 12: a small,
+                                                                           // CI-safe fixed
+                                                                           // ceiling (not
+                                                                           // scaled by
+                                                                           // hardware_concurrency)
+                                                                           // -- see FP-003.
+    constexpr int kRounds = 5; // bounded: kNumThreads * kRounds == 60 total child
+                                // processes for the whole test, never more.
+    constexpr auto kVictimDeadline = 400ms; // comfortably < the host's real 1s runtime
+    constexpr auto kHostDeadline = 3000ms;  // generous; the host's own timing isn't under test
+
+    std::atomic<int> false_timeouts{0};
+    std::atomic<int> unexpected_no_run{0};
+    std::atomic<int> victim_calls{0};
+
+    // Synchronizes every thread's per-round call to run_bounded_subprocess
+    // so they start together -- see the rationale above.
+    std::barrier sync_point(static_cast<std::ptrdiff_t>(kNumThreads));
+
+    std::vector<std::thread> threads;
+    threads.reserve(kNumThreads);
+
+    for (unsigned t = 0; t < kNumHostThreads; ++t) {
+        threads.emplace_back([&sync_point]() {
+            // Leak host: outlives every victim's deadline, so if it ends up
+            // holding a victim's write end open (the race), the victim is
+            // starved for the host's whole runtime, not just a few
+            // microseconds -- long enough to land past its own deadline.
+            for (int r = 0; r < kRounds; ++r) {
+                sync_point.arrive_and_wait();
+                (void)run_bounded_subprocess({"/bin/sleep", "1"},
+                                              SubprocessOptions{.deadline = kHostDeadline});
+            }
+        });
+    }
+    for (unsigned t = 0; t < kNumVictimThreads; ++t) {
+        threads.emplace_back([&]() {
+            for (int r = 0; r < kRounds; ++r) {
+                sync_point.arrive_and_wait();
+                // Victim: exits essentially instantly. A leaked fd from
+                // another concurrent invocation keeps its own read side
+                // from ever seeing EOF, which can only manifest here as an
+                // honest timed_out at kVictimDeadline -- "the child already
+                // exited but the pipe never closed" isn't observable any
+                // other way from outside this function.
+                SubprocessResult r_result = run_bounded_subprocess(
+                    {"/usr/bin/printf", "x"}, SubprocessOptions{.deadline = kVictimDeadline});
+                victim_calls.fetch_add(1, std::memory_order_relaxed);
+                if (r_result.timed_out)
+                    false_timeouts.fetch_add(1, std::memory_order_relaxed);
+                else if (!r_result.tool_ran)
+                    unexpected_no_run.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : threads)
+        th.join();
+
+    CAPTURE(victim_calls.load());
+    // The observable invariant BR-01 guards: no invocation whose own child
+    // exited promptly ever reports a false timeout because another
+    // invocation's leaked write end kept its pipe open.
+    CHECK(false_timeouts.load() == 0);
+    CHECK(unexpected_no_run.load() == 0);
 }
 
 #endif // !_WIN32

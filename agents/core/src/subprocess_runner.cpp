@@ -21,6 +21,15 @@
  *     inherits already-locked and then deadlocks on.
  *   - Both the output pipe and the exec-error pipe are FD_CLOEXEC on both
  *     ends, so neither leaks into whatever the child execs into.
+ *   - Setting FD_CLOEXEC is NOT atomic with pipe() on this platform (no
+ *     pipe2()) -- a concurrent fork() on another thread landing between
+ *     THIS invocation's pipe() and its fcntl(F_SETFD, FD_CLOEXEC) would
+ *     otherwise inherit a not-yet-CLOEXEC write end into an unrelated
+ *     child, starving this invocation's own EOF (a false timeout) for as
+ *     long as that other child runs. A file-local mutex serializes
+ *     [pipe()..fork()] across every invocation to close that window; the
+ *     child inherits it already locked and never touches it (see
+ *     g_fork_pipe_mutex's comment below).
  *   - The child calls setsid() so a timeout kill can take out the whole
  *     process group, not just the direct child (a CLI can spawn helpers
  *     that inherit the group).
@@ -28,8 +37,9 @@
  *     failed" from "the program ran and legitimately exited with some
  *     code": on a successful execvp() the write end's CLOEXEC flag closes
  *     it automatically, so the parent sees EOF with nothing ever written;
- *     on failure the child write()s its errno to it (async-signal-safe,
- *     no allocation) before _exit(127).
+ *     on failure -- either execvp() itself or a load-bearing setup step
+ *     before it, e.g. the stdout dup2 -- the child write()s its errno to
+ *     it (async-signal-safe, no allocation) before _exit(127).
  *
  * Pipe EOF alone does not prove the child has exited (a descendant can
  * close its inherited copy of the write end while the direct child keeps
@@ -49,6 +59,7 @@
 #include <csignal>
 #include <ctime>
 #include <fcntl.h>
+#include <mutex>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -221,6 +232,62 @@ private:
     pid_t pid_;
 };
 
+// EINTR-retrying dup2() -- async-signal-safe (no allocation), safe to call
+// from the forked child between fork() and execvp(). dup2() is not
+// documented to return EINTR on every platform, but where it can, this
+// keeps a spurious interrupt from being mistaken for a real setup
+// failure.
+int dup2_retry(int oldfd, int newfd) {
+    int rc;
+    do {
+        rc = dup2(oldfd, newfd);
+    } while (rc == -1 && errno == EINTR);
+    return rc;
+}
+
+// Async-signal-safe: writes `err` to the exec-error pipe (retried across
+// EINTR, no allocation) then terminates the child immediately via
+// _exit(127). Shared by a failed execvp() and by a load-bearing setup
+// failure caught before execvp() is ever reached (e.g. the child's own
+// stdout dup2) -- either way the parent must see a definite failure on
+// this pipe rather than an ambiguous EOF, and the child must never
+// proceed to execvp() with broken plumbing. A real write failure other
+// than EINTR is still best-effort only: the parent's "no byte ever
+// arrived" then stays inconclusive (tool_ran stays false) rather than
+// assuming success.
+[[noreturn]] void report_setup_failure_and_exit(int err_fd, int err) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&err);
+    std::size_t sent = 0;
+    while (sent < sizeof(err)) {
+        ssize_t w = write(err_fd, bytes + sent, sizeof(err) - sent);
+        if (w > 0) {
+            sent += static_cast<std::size_t>(w);
+        } else if (w < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    _exit(127);
+}
+
+// BR-01: serializes pipe-creation-through-fork across every concurrent
+// invocation of run_bounded_subprocess. macOS/BSD has no atomic
+// O_CLOEXEC pipe creation (no pipe2(); CLOEXEC is set via a separate
+// fcntl() call after pipe()), so a fork()+exec() on another thread that
+// lands between this invocation's pipe() and its fcntl(F_SETFD,
+// FD_CLOEXEC) would inherit this invocation's not-yet-CLOEXEC write
+// end(s) -- keeping a copy of the write end open in a second process and
+// starving this invocation's read side of EOF (a false timeout).
+//
+// Held across [pipe()..fork()] in run_bounded_subprocess below so no
+// other thread's fork() can land in that window; released in the PARENT
+// immediately after fork() returns. The child inherits it already locked
+// and must NEVER touch it -- it always _exit()s or execvp()s out without
+// running any C++ destructors, so the lock simply stays locked (and
+// irrelevant) in the child's own address space; no deadlock results.
+std::mutex g_fork_pipe_mutex;
+
 } // namespace
 
 SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
@@ -235,6 +302,12 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     for (const auto& arg : argv)
         c_argv.push_back(const_cast<char*>(arg.c_str()));
     c_argv.push_back(nullptr);
+
+    // BR-01: serialize pipe-creation-through-fork against every other
+    // concurrent invocation (see g_fork_pipe_mutex's comment) -- held from
+    // here through fork() below; every early return in between releases it
+    // via this lock's destructor.
+    std::unique_lock<std::mutex> fork_pipe_lock(g_fork_pipe_mutex);
 
     int raw_pipe[2];
     if (pipe(raw_pipe) != 0)
@@ -272,20 +345,51 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         return result; // all four fds close themselves
 
     if (pid == 0) {
-        // Child: new session/process group so the whole group can be
-        // SIGKILLed as a unit on timeout, even if the target CLI spawns
-        // helper processes. Only async-signal-safe calls from here on.
-        setsid();
+        // Child: inherits fork_pipe_lock already locked -- NEVER lock,
+        // unlock, or otherwise touch it (see g_fork_pipe_mutex's comment
+        // above). Safe specifically because this branch never returns
+        // through a normal C++ path -- it always _exit()s or execvp()s
+        // below -- so the lock's destructor never runs on this side of the
+        // fork either.
+        //
+        // New session/process group so the whole group can be SIGKILLed as
+        // a unit on timeout, even if the target CLI spawns helper
+        // processes. Only async-signal-safe calls from here on. Result is
+        // checked (rather than silently discarded) but treated as
+        // non-load-bearing: a failure here only degrades the timeout kill
+        // to the direct child (kill_child_or_group()'s existing
+        // ESRCH/EPERM fallback), not the captured output/exit code below,
+        // so it does not go through report_setup_failure_and_exit.
+        if (setsid() == -1) {
+            // no-op: intentionally not load-bearing, see comment above.
+        }
 
-        dup2(write_fd.get(), STDOUT_FILENO);
+        // Both dup2s below ARE the plumbing that makes this invocation's
+        // captured output/exit-code contract correct, so a failure here is
+        // load-bearing: report it over the exec-error pipe and exit rather
+        // than exec'ing with the wrong fd wired to stdout/stderr.
+        if (dup2_retry(write_fd.get(), STDOUT_FILENO) == -1)
+            report_setup_failure_and_exit(err_write_fd.get(), errno);
         if (opts.merge_stderr) {
-            dup2(write_fd.get(), STDERR_FILENO);
+            if (dup2_retry(write_fd.get(), STDERR_FILENO) == -1)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
         } else {
             int devnull = open("/dev/null", O_WRONLY);
             if (devnull >= 0) {
-                dup2(devnull, STDERR_FILENO);
+                // Best-effort: the dup2's result is checked (rather than
+                // silently discarded) but, like the open() above, its
+                // failure is not load-bearing -- stderr is simply left
+                // wherever it was rather than silenced, which cannot
+                // corrupt the captured stdout/exit-code result, unlike the
+                // dup2s above that ARE checked-and-fatal.
+                if (dup2_retry(devnull, STDERR_FILENO) == -1) {
+                    // no-op: intentionally not load-bearing, see comment above.
+                }
                 close(devnull);
             }
+            // else: open() itself failed -- also not load-bearing, stderr
+            // is simply left wherever it was (checked via the >= 0 guard
+            // above, no report_setup_failure_and_exit for the same reason).
         }
         close(read_fd.get());
         close(write_fd.get());
@@ -295,31 +399,17 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // below writes to it explicitly before exiting.
 
         execvp(c_argv[0], c_argv.data());
-        // exec failed -- report why (async-signal-safe write(), no
-        // allocation) then exit. Retried across EINTR: a signal landing
-        // between fork() and here could otherwise interrupt the write
-        // before any byte transfers, and the parent's EOF-means-success
-        // read has no way to tell that apart from a genuine successful
-        // exec. _exit(127) follows unconditionally regardless of how the
-        // retry loop ends -- a real write failure other than EINTR is
-        // still best-effort only, so the parent's "no byte ever arrived"
-        // stays inconclusive (tool_ran stays false) rather than assuming
-        // success.
-        int failure_errno = errno;
-        const auto* bytes = reinterpret_cast<const unsigned char*>(&failure_errno);
-        std::size_t sent = 0;
-        while (sent < sizeof(failure_errno)) {
-            ssize_t w = write(err_write_fd.get(), bytes + sent, sizeof(failure_errno) - sent);
-            if (w > 0) {
-                sent += static_cast<std::size_t>(w);
-            } else if (w < 0 && errno == EINTR) {
-                continue;
-            } else {
-                break;
-            }
-        }
-        _exit(127);
+        // exec failed -- report why and exit; see
+        // report_setup_failure_and_exit's comment above for the
+        // EINTR-retry and unconditional-_exit(127) reasoning (shared with
+        // the load-bearing setup checks above).
+        report_setup_failure_and_exit(err_write_fd.get(), errno);
     }
+
+    // Parent: fork() has returned and this is not the child branch --
+    // release the pipe-creation lock now (see g_fork_pipe_mutex's comment
+    // above).
+    fork_pipe_lock.unlock();
 
     // Parent: guard the child from here on so an exception anywhere below
     // (e.g. std::bad_alloc while collecting output) cannot leave it
