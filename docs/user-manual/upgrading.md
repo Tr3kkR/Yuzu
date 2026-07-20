@@ -18,6 +18,37 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: `yuzu-agent` no longer restart-loops forever (ADR-0021 rung 7.7a)
+
+The `yuzu-agent` systemd unit now sets `StartLimitIntervalSec=300` + `StartLimitBurst=5` in its `[Unit]` section. Previously the unit was `Restart=always` with no start limit, so an agent that could not stay up restarted every 10 seconds indefinitely. With this change, if the agent exits 5 times within 300 seconds systemd stops retrying and the unit enters `failed`.
+
+This matters because the agent's Guardian engine can now `hard_exit()` when an I/O worker is wedged past a grace period (a permanently wedged watched target, e.g. a dead NFS mount or a hung service query); without the start limit that would be a silent 10-second crash loop.
+
+**What to do:** if you alert on systemd unit state, add `yuzu-agent` entering `failed` to your alerts - it means the agent gave up after a crash loop and the device is now dark, which the old restart-forever behaviour hid. Recover with `systemctl reset-failed yuzu-agent` once the underlying cause (e.g. the wedged mount) is resolved, then `systemctl start yuzu-agent`. The Guardian spark detection path this rung wires is dormant (`--spark-disable` unchanged, legacy detection unaffected), so there is no detection-behaviour change to account for. See also [`server-admin.md`](server-admin.md) "Stopping a wedged agent".
+
+## Behaviour change: a Guardian rule that fails to arm no longer crashes the agent (ADR-0021 rung 7.7b PR-1a)
+
+Independent of the dormant spark path above, the Guardian engine's `apply_rules` (which runs on the **live legacy detection path** regardless of `--spark-disable`) now firewalls a per-rule reconcile failure. Previously, if arming a rule threw - e.g. a `std::thread` creation failure under resource exhaustion, or a `bad_alloc` - the exception escaped onto the agent's dispatch thread and aborted the whole daemon. It now degrades: the failure is caught and counted, the rule stays persisted, and the agent keeps running. The `full_sync` teardown and the dispatch boundary carry the same firewall.
+
+One behaviour to be aware of: when a rule fails to arm, the agent **holds its policy generation** (does not report "caught up") so the server's heartbeat reconcile keeps re-pushing and retrying - a transient resource failure self-heals within a reconcile cycle. A rule that fails **persistently** (rare - it requires a durable resource condition, not bad rule content) keeps the agent behind-generation and drives a re-push each reconcile interval; this is visible in the server's `guaranteed_state.reconcile` audit rows for that agent. No operator action is required.
+
+## Behaviour change: Guardian event-drop metric narrows to genuine collisions (ADR-0021 rung 7.7b PR-Sv)
+
+Guardian event ingest now distinguishes an idempotent **redelivery** (a matching-fields `event_id` PK conflict — the durable agent lifecycle journal's expected at-least-once retry) from a genuine **collision** (a mismatched-payload conflict — a forged-id pre-claim or an `event_seq_` reset carrying a different event). Three operator-visible consequences:
+
+- **`yuzu_server_guardian_events_dropped_total` narrows.** It now counts only mismatched collisions; benign redeliveries move to the new `yuzu_server_guardian_events_redelivered_total`. **If you deployed the bundled `YuzuGuardianEventsDropped` rule from `docs/prometheus/yuzu-alerts.yml`** (a copy, not something the server auto-upgrades) **with your own or a wider threshold tuned to reconnect churn, re-apply the updated rule (now `> 5/1h`)** — otherwise your old threshold's baseline drops post-upgrade and the alert goes **silently dead**, not loud, on a CC7.3 signal.
+- **A metric series steps down, and a new one appears.** Any Grafana panel/PromQL against `..._events_dropped_total` shows a step-change *drop* at upgrade with no incident — **expected, not data loss**; watch total PK-conflict volume via the new `..._events_redelivered_total` series. A third new series, `..._events_ingest_errors_total` (with a bundled `YuzuGuardianIngestErrors` alert), counts operational ingest faults so a persistent fault can't silently hide collisions.
+- **DEX de-duplication on reconnect.** Before this change, a redelivered event re-ran the DEX blast-radius + alert observers on every agent reconnect. If you saw duplicate/false blast-radius sightings or duplicate routed alerts during reconnect storms, those stop now — an intentional fix, not a regression.
+
+**Verify:** post-upgrade, confirm the new series are present and re-tune any custom copy of the drop alert:
+
+```promql
+yuzu_server_guardian_events_redelivered_total   # should appear and climb on reconnects
+yuzu_server_guardian_events_ingest_errors_total # should stay at 0 in a healthy fleet
+```
+
+No config or data migration is required.
+
 ## Behaviour change: dashboard YAML Save is schema-aware and stricter (#1993)
 
 `POST /api/instructions/yaml` (the New Definition panel's Save endpoint) and
@@ -204,6 +235,79 @@ inline `parameter_schema` per action (where a published `InstructionDefinition` 
 the caller holds `InstructionDefinition:Read`) plus a top-level `actions_enriched_with_schema`
 count. The change is purely additive; any client that pinned `version == 1` should relax the
 check to a minimum (`>= 1`).
+
+## ⚠️ Breaking: API and MCP bearer tokens are invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030)
+
+`ApiTokenStore` — the store backing every `Authorization: Bearer` API token and
+every MCP token — moves from SQLite (`api-tokens.db`) to the server's PostgreSQL
+substrate in this release (engine-principals PR 4.1; ADR-0006/ADR-0030). This is
+a **fresh-start cutover with no data migration**: the new server creates an empty
+Postgres `api_token_store.api_tokens` table and **never reads the old
+`api-tokens.db`**, so every API/MCP token minted before the upgrade stops working
+the instant the new server starts. Interactive cookie-session login (dashboard,
+OIDC/SAML SSO) is **not** affected — only bearer tokens.
+
+The rationale for no backfill (convention with every prior server-store migration,
+plus the token store holds only verify-only hashes) is in ADR-0030.
+
+**Who this affects:** every external automation consumer that authenticates with an
+API or MCP bearer token — CI/CD scripts, SIEM/webhook pollers, cron jobs, MCP
+clients. Because it is a fresh-start cutover, **all of them break at once** at the
+moment of upgrade; there is no rolling/staged token continuity.
+
+**Remediate:** after upgrading, **re-mint every API/MCP bearer token** (`POST
+/api/v1/tokens`) and update the credential wherever it is stored (CI secrets, cron
+configs, MCP client configs). Plan the upgrade in a **maintenance window** and
+**notify automation/integration owners in advance** so a batch of `401`s across
+every integration is expected, not a surprise incident.
+
+**Diagnostic:** if the legacy `api-tokens.db` is still on disk, the server logs
+`[auth] Legacy SQLite api-tokens.db found at … — API/MCP tokens now live in
+PostgreSQL and any prior tokens were INVALIDATED by the migration (ADR-0030)` at
+boot. The old file is inert (never read again) and can be removed once you have
+re-minted; it contains only token hashes + metadata, no plaintext secret.
+
+**Multi-instance note:** the Postgres substrate now permits running multiple server
+replicas against one database. Token *validation* uses a per-process 60-second
+cache, so a token revoked on one replica may remain accepted on another replica for
+up to that window — see ADR-0030 for the tracked hardening.
+
+## ⚠️ Breaking: `engine:` namespace reservation — server refuses to start on a pre-existing collision (engine principals PR 4.2)
+
+This release introduces the **engine principal** class — a distinct identity
+class for autonomous/agentic callers, stored in the new `EnginePrincipalStore`
+and resolved through RBAC/`ApiTokenStore` (design doc §3.1/§3.3). To make that
+resolution unambiguous, the `engine:` prefix is now a **reserved namespace**
+for both local usernames (`users.username`) and local RBAC group names
+(`groups.name`).
+
+**Pre-upgrade collision check** (mirrors the plugin-trust-bundle filename
+collision check above). At boot, the server now scans for any pre-existing
+`engine:`-prefixed local user or local RBAC group and **refuses to start** if
+it finds one — silently coexisting with (or being shadowed by) a real engine
+principal is not an acceptable outcome, so this fails closed rather than
+booting into an ambiguous state (decision log #3). Before upgrading, run
+against your `auth.db` and `rbac.db`:
+
+```sql
+-- auth.db
+SELECT username FROM users WHERE username LIKE 'engine:%';
+
+-- rbac.db
+SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';
+```
+
+If either query returns rows, rename or remove those users/groups **before**
+upgrading — the new server will not boot until the collision is cleared (or,
+if the boot-time collision scan itself fails, e.g. a mid-scan database error,
+the server also fails closed rather than guessing). See
+[`docs/ops-runbooks/engine-principal-store-recovery.md`](../ops-runbooks/engine-principal-store-recovery.md)
+for the full recovery procedure if you hit this at boot.
+
+**Scope of this release:** PR 4.2 ships the engine-principal store, RBAC
+resolution, and attribution plumbing only — there is **no operator-facing
+surface yet** (no dashboard/REST CRUD for minting or managing engine
+principals). That ships in PR 4.3.
 
 ## ⚠️ Breaking: `--mfa-enforcement` now enforces
 

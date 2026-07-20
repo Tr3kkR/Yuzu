@@ -15,6 +15,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -42,7 +43,11 @@ struct AuthRoutesFixture {
     Config cfg{};
     auth::AuthManager auth_mgr{};
     fs::path tmp_dir;
-    std::unique_ptr<ApiTokenStore> api_tokens;
+    // ApiTokenStore ported to Postgres (PR 4.1) — clones an ephemeral database
+    // via the shared ApiTokenStorePg helper. Constructing this fixture now
+    // SKIPs the current TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset, and
+    // FAILs when it is set but broken (same posture as every other [pg] test).
+    yuzu::test::ApiTokenStorePg api_tokens;
     std::unique_ptr<AnalyticsEventStore> analytics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;  // empty
@@ -57,9 +62,7 @@ struct AuthRoutesFixture {
                   ("yuzu_auth_routes_test_" + std::to_string(::getpid()) + "_" +
                    std::to_string(seq.fetch_add(1)));
         fs::create_directories(tmp_dir);
-        api_tokens = std::make_unique<ApiTokenStore>(tmp_dir / "api_tokens.db");
         analytics = std::make_unique<AnalyticsEventStore>(tmp_dir / "analytics.db");
-        REQUIRE(api_tokens->is_open());
         REQUIRE(analytics->is_open());
 
         // Register a known user so synthesize_token_session resolves a real role.

@@ -1484,7 +1484,7 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 19 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -1551,29 +1551,149 @@ header, so these names stay rejected on client ingress permanently.
 ## Engine principals & delegation (ADR-1005 — design)
 
 - **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
-  2b, feeds Phases 4–5). Not yet implemented — nothing below is a shipped
-  surface.
+  2b, feeds Phases 4–5). **Shipped (PR 4.1–4.3):** the identity store + RBAC
+  resolution (PR 4.1–4.2) and the operator-facing REST + MCP + admin-console
+  lifecycle surface (PR 4.3) below are live. Delegation (Phase 5, RFC 8693
+  token exchange) remains design-only — not yet implemented.
 - Third principal class (`engine`) for use-case-engine hosts: dedicated
   born-on-Postgres `EnginePrincipalStore` (named human owner, justification,
-  soft-retained after revoke), reserved `engine:` id namespace, per-module
-  granularity.
+  required `internal`/`external` classification, soft-retained after revoke),
+  reserved `engine:` id namespace, per-module granularity.
 - Token sessions branch on a persisted `ApiToken.principal_kind`
   (`human`|`engine`) — an engine token attributes to the engine principal
-  itself (`auth_source="engine_token"`), never to its creating human.
+  itself (`auth_source="engine_token"`), never to its creating human. Engine
+  tokens are referentially checked against `EnginePrincipalStore` at mint
+  time, always `mcp_tier=readonly`, and always carry a ≤90-day expiry.
+- **Session-authorization semantics — RBAC-only, no fallback (PR 4.2 fix
+  round).** `AuthRoutes::require_permission`/`require_scoped_permission`
+  branch on `session->principal_kind == "engine"` **before** falling through
+  to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
+  for human and agent sessions. An engine session's authority is resolved
+  **exclusively** against `RbacStore`:
+  - `rbac_store_` null/unopened → **`503`** (cannot evaluate authority;
+    retryable, never a silent allow).
+  - RBAC disabled, or no matching `(principal="engine:<slug>", role, scope)`
+    grant → **`403`**.
+  - A matching grant → allowed.
+
+  This closes the gap where an engine credential — before this fix — inherited
+  fleet-wide `Read` the moment RBAC was off (the historical default), via the
+  same legacy fallback human sessions still use. Engine principals now get
+  **no** legacy fallback and **no** service-scoped fallback under any
+  circumstance; the only path to authority is an explicit assignment. This is
+  the concrete mechanism behind design §4.2's promise: *"An engine principal
+  with no assignments can do nothing."*
+- **Audit attribution.** `AuthRoutes::make_audit_event` re-stamps
+  `principal_class="engine"` from the resolved session's `principal_kind`
+  after the generic (credential-presentation-based) classification runs —
+  an engine principal's bearer-token requests previously mislabelled as
+  `"agent"` in the audit trail (design §6 / `adr-1005-execution-plan.md`
+  Decision 9) now attribute truthfully.
+- **Reserved-namespace fail-closed guards.** `find_local_groups_with_prefix`
+  returns `std::nullopt` (not an engaged-empty optional) when the RBAC store
+  can't be read, and the `server.cpp` boot-time `engine:`-collision preflight
+  requires `rbac_store_->is_open()` before trusting a clean scan — a corrupt
+  `rbac.db` now fails the boot closed rather than booting "clean" past a
+  reserved-namespace collision it could not actually see. `upsert_sso_identity`
+  separately rejects any `engine:`-prefixed write at the SSO identity-sync
+  surface (design §3.3), sharing the `kEngineReservedPrefix` constant with the
+  store's own create-path guard.
+- **Fleet-wide role-assignment authoring (PR 4.2 deliverable, design §4.1).**
+  `GET`/`POST`/`DELETE /api/v1/engine-principals/{id}/roles` (+ MCP twins
+  `list_engine_roles`/`assign_engine_role`/`unassign_engine_role`) are the
+  authoring surface that makes `RbacStore::assign_role(principal_type="engine")`
+  reachable in production — see `docs/user-manual/rest-api.md` "Engine
+  Principals" for the full contract. Mutations require admin + MFA step-up;
+  admin/built-in/wildcard role targets are rejected as `4xx`, never silently
+  narrowed or a `500` (design §4.2 "no admin, ever").
 - Authorization model: scoped role assignments `(principal, role, scope)`
   for **all** principal classes, evaluated permissions ∩ scope through
   ADR-0017's `authorize_list_read` chokepoint for list/fan-out reads and
   the per-device scoped-permission path for single-target operations
   (ADR-0017 PR-A is a named prerequisite, its charter to be amended or
   extended for the `engine` principal type). Engine principals are
-  default-deny, structurally barred from `admin`.
+  default-deny, structurally barred from `admin`. **Today (PR 4.2) grants are
+  fleet-wide only** — scoped (management-group) engine assignment is rejected
+  pending that Phase-5 chokepoint.
 - Delegation (Phase 5): RFC 8693 token-exchange shape — server-issued
   opaque, audience-bound, short-TTL artifact; effective authority = engine
   principal's assignments ∩ operator's assignments ∩ operator's scope
   (decision-level intersection — a delegation only ever narrows);
   self-asserted delegation stays rejected permanently.
 - Engine credentials: 90-day ceiling, overlap-pair rotation (≤2 active),
-  MCP tier hard-locked `readonly` for v1.
+  minted **credentials** are MCP tier hard-locked `readonly` for v1. This is
+  distinct from the tier a *human/automation caller* needs to invoke the
+  lifecycle surface itself — see "Lifecycle surface (PR 4.3)" below.
+
+### Lifecycle surface (PR 4.3)
+
+Operator-facing CRUD for engine-principal identities and their credentials —
+full reference: `docs/user-manual/rest-api.md` "Engine Principals" section,
+`docs/user-manual/mcp.md` tools 55–63 (52–54 are the role-assignment tools), `docs/user-manual/engine-principals.md`
+walkthrough.
+
+- **Surfaces:** 9 REST routes under `/api/v1/engine-principals` (create, list,
+  get, delete, credential mint/rotate/confirm, transfer-owner, and the
+  `GET /audit/no-admin` auditor), 9 MCP twin tools, and an "Engine Principals"
+  section in the Settings admin console (create form, list, mint/rotate buttons
+  behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
+  revoke detail).
+- **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
+  the three read routes (list, get, `audit/no-admin`) are human-admin + RBAC
+  gated (`Security:Read`/`AuditLog:Read`) but not step-up gated. Every route —
+  reads included — structurally denies a caller whose own session is
+  engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
+  §9 belt): an engine principal can never read or mutate its own or another
+  engine principal's lifecycle surface.
+- **MCP gating:** the 6 mutating tools all gate on `Security:Write`
+  (`mint_engine_credential`/`rotate_engine_credential` included — aligned with
+  their REST twins, not `Security:Execute`), require the `supervised` tier,
+  and are maker-checker approval-gated (approver ≠ submitter), same posture
+  as every other destructive MCP op. The 3 read tools (`list_engine_principals`,
+  `get_engine_principal`, `audit_engine_no_admin`) are plain `Read`-class RBAC
+  checks available on every MCP tier including `readonly`, and are not
+  approval-gated. **All 9 tools**, mutating and read alike, carry the same §9
+  engine-session denial belt as their REST twins — an engine-classed MCP
+  caller is denied on every one of them, including the three reads.
+- **Overlap-pair credential rotation** (design §7): at most 2 active
+  credentials per principal, a 24-hour minimum overlap window (rejected
+  outright, never truncated, below the floor), a ~120-second grace window
+  that re-serves the same successor secret on a same-caller retry, and a
+  60-second background sweep that auto-revokes the predecessor once its
+  overlap window elapses and warns (an operational, non-security signal) on
+  an unused successor nearing expiry.
+- **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
+  MCP `audit_engine_no_admin` — independently resolves every engine
+  principal's actual roles + effective permissions against the live RBAC
+  reference tables and reports any violation (literal admin/system-role
+  grant, or a full securable × operation wildcard grant). Fails closed
+  (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
+  reference data can't be resolved.
+- **Owner-delete interlock (two-mode enforcement):** a user who owns an
+  active engine principal must not be silently removed, or the principal's
+  audit trail loses its named responsible human. Enforcement mode is chosen
+  by whether an operator is in the loop (enterprise-architect ruling, PR 4.3
+  governance):
+  - **Interactive dashboard delete → prevention.** `DELETE
+    /api/settings/users/{username}` (`settings_routes.cpp`) is blocked with
+    `409` until ownership is transferred (`count_active_owned_by`,
+    fail-closed on a store-unreachable read). An admin is present and can
+    transfer first.
+  - **Automated SCIM deprovision → detection.** SCIM deactivate/delete
+    (`scim_routes.cpp` `deactivate()` + inline `DELETE`) is a CC6.8-mandated
+    termination with no operator to transfer-first. Refusing it would leave a
+    terminated employee **active** (a worse control failure); cascade
+    auto-revoke is rejected because `revoke()` is terminal/irreversible (an
+    IdP flap would destroy machine identities). So the deprovision **always
+    succeeds** and a shared `flag_owner_deprovisioned` helper emits a
+    high-signal audit `engine_principal.owner_deprovisioned` + increments
+    `yuzu_engine_principal_owner_deprovisioned_total` when the departing user
+    owned active principals (or ownership can't be verified), for out-of-band
+    reassignment. It fires ONLY on the two genuine deprovision paths — never
+    on SCIM undo/rollback (`remove_user` used to clean up a just-created or
+    revived account). The orphaned principal keeps authenticating on its own
+    `principal_type='engine'` credential and never derived authority from the
+    owner, so the departed user gains nothing. Alert on the metric.
 
 ## Agent enrollment (3 tiers)
 

@@ -37,6 +37,11 @@ class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
+// EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
+// (assign_engine_role/unassign_engine_role/list_engine_roles) AND the PR 4.3
+// engine-principal lifecycle tools (ADR-1005 item 2b). Forward-declared
+// (pointer-only here); the .cpp includes engine_principal_store.hpp.
+class EnginePrincipalStore;
 }
 
 namespace yuzu::server::detail {
@@ -169,6 +174,45 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id)>;
 
+    /// Owner-FK existence check for engine-principal create/transfer-owner
+    /// (design doc `docs/auth-engine-principals-design.md` §3.1:
+    /// "owner_username — must reference an existing user", enforced by the
+    /// CALLER — `EnginePrincipalStore::create`/`transfer_owner` themselves
+    /// only check non-empty, deliberately store-agnostic re: users so the
+    /// store never couples to `AuthDB`). Returns true iff `username` names an
+    /// existing user. FAIL-CLOSED contract: an unset (`{}`) predicate means
+    /// every create/transfer-owner call is denied ("owner existence check
+    /// unavailable"), never silently admitted — mirrors
+    /// `ApiTokenStore::set_engine_referent_check`'s fail-closed-when-unwired
+    /// posture, not the FAIL-OPEN-WHEN-UNWIRED contract used by
+    /// ResponseScopeFn/InventoryScopeFn above (those are defense-in-depth
+    /// filters over an already-gated read; this is the sole check standing
+    /// between an MCP write and a dangling owner reference).
+    using OwnerExistsFn = std::function<bool(const std::string& username)>;
+
+    /// Injects the engine-principal + engine-credential store pointers and
+    /// the owner-FK predicate via SETTERS rather than growing the already
+    /// 30-parameter build_handler()/register_routes() trailing-parameter
+    /// tail further. The handler returned by build_handler() is a non-static
+    /// member function's `[=]` lambda, which implicitly captures `this` — so
+    /// a setter called AFTER build_handler() still takes live effect on the
+    /// very next request, the same live-read property the `read_only_mode`/
+    /// `mcp_disabled` pointer captures give today. Safe because the sole
+    /// production `McpServer` instance (server.cpp's `mcp_server_`, a
+    /// `unique_ptr` member of `ServerImpl`) outlives every handler it
+    /// produces. Unset (`nullptr`/`{}`) ⇒ every engine-principal tool answers
+    /// "unavailable" rather than crashing or silently no-op'ing — production
+    /// wiring is a follow-up task (server.cpp is out of scope for this PR).
+    void set_engine_principal_store(EnginePrincipalStore* store) {
+        engine_principal_store_ = store;
+    }
+    /// The SAME `ApiTokenStore` instance server.cpp wires everywhere else —
+    /// not an engine-only store. Used here for `create_token`(engine
+    /// readonly)/`rotate_engine_credential`/`list_active_for_principal`/
+    /// `revoke_for_principal`.
+    void set_engine_credential_store(ApiTokenStore* store) { engine_credential_store_ = store; }
+    void set_owner_exists_fn(OwnerExistsFn fn) { owner_exists_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -226,7 +270,14 @@ public:
                             std::vector<std::string> allowed_origins = {},
                             // ADR-0024: backs the query_software_licenses discovery read
                             // (the MCP twin of GET /api/v1/sle/agents/{id}).
-                            SoftwareLicensingStore* software_licensing_store = nullptr);
+                            SoftwareLicensingStore* software_licensing_store = nullptr,
+                            // PR 4.2 (design §4.1): backs assign_engine_role /
+                            // unassign_engine_role / list_engine_roles — the MCP twins
+                            // of the REST engine-principal role-assignment surface.
+                            // Trailing optional dep; nullptr leaves assign/unassign
+                            // answering an internal-error JSON-RPC response (list still
+                            // works if rbac_store is wired).
+                            EnginePrincipalStore* engine_principal_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -270,7 +321,21 @@ public:
                          McpSessionRegistry* sessions = nullptr,
                          const bool* mcp_streaming_disabled = nullptr,
                          std::vector<std::string> allowed_origins = {},
-                         SoftwareLicensingStore* software_licensing_store = nullptr);
+                         SoftwareLicensingStore* software_licensing_store = nullptr,
+                         // PR 4.2 (design §4.1): engine-principal role-assignment MCP
+                         // twins (the 4.2 grant handlers capture this param).
+                         EnginePrincipalStore* engine_principal_store = nullptr);
+
+private:
+    // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
+    // COEXISTENCE (4.2→4.3 rebase): the 4.2 role-assignment handlers use the
+    // register_routes `engine_principal_store` PARAM above; the 4.3 lifecycle
+    // handlers use these MEMBERS (set via the setters above). server.cpp wires
+    // BOTH to the same store. Follow-up: unify onto the member. Nullable;
+    // every tool checks before use and answers a clean "unavailable" error.
+    EnginePrincipalStore* engine_principal_store_{nullptr};
+    ApiTokenStore* engine_credential_store_{nullptr};
+    OwnerExistsFn owner_exists_fn_;
 };
 
 } // namespace yuzu::server::mcp

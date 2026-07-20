@@ -34,6 +34,7 @@
 #include "deployment_store.hpp"
 #include "discover_routes.hpp" // A2 discovery surface: /api/v1/discover/* (roadmap Issue 17.1)
 #include "discovery_store.hpp"
+#include "engine_principal_store.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
@@ -86,6 +87,7 @@
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
@@ -614,16 +616,16 @@ public:
         // every sweep, live-actionable at rung 1 — its `> 0 for: 30m` rule ships ACTIVE.
         metrics_.describe("yuzu_fleet_spark_reporting",
                           "Agents (per `os`) whose latest heartbeat reported the SparkEngine "
-                          "running (spark_running=1) — the denominator for all spark telemetry",
+                          "running (spark_running=1) - the denominator for all spark telemetry",
                           "gauge");
         metrics_.describe("yuzu_fleet_spark_disabled",
                           "Agents (per `os`) running with SparkEngine deliberately off "
-                          "(--spark-disable). An operator decision — expected to be non-zero; "
+                          "(--spark-disable). An operator decision - expected to be non-zero; "
                           "do NOT alert on it", "gauge");
         metrics_.describe("yuzu_fleet_spark_failed",
                           "Agents (per `os`) where SparkEngine was ENABLED but boot-time "
                           "instantiation THREW, so the agent degraded to no-spark. Distinct from "
-                          "`disabled` on purpose: this is a fault, not a choice — ALERT on it. "
+                          "`disabled` on purpose: this is a fault, not a choice - ALERT on it. "
                           "Absent = no agent of that os reported a failure this cycle", "gauge");
         metrics_.describe("yuzu_fleet_spark_mechanisms",
                           "Agents (per {`os`,`mechanism`}) whose spark capability includes that "
@@ -645,10 +647,10 @@ public:
                           "Fleet sum (per `os`) of cumulative queued handlers that threw "
                           "(consumer_errors_total)", "gauge");
         metrics_.describe("yuzu_fleet_spark_watch_rejected",
-                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections — "
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative watch-cap rejections - "
                           "a rule that could not arm (denial-of-detection)", "gauge");
         metrics_.describe("yuzu_fleet_spark_quarantined",
-                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines — "
+                          "Fleet sum (per {`os`,`mechanism`}) of cumulative mechanism quarantines - "
                           "a structural leak that should stay 0; any value is page-worthy", "gauge");
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
@@ -890,10 +892,45 @@ public:
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
         metrics_.describe("yuzu_server_guardian_events_dropped_total",
                           "Cumulative Guaranteed-State events dropped at ingest on an event_id "
-                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
-                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
-                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "PK/UNIQUE conflict where the incoming payload MISMATCHES the stored row "
+                          "(a forged-id pre-claim #1360, or an agent event_seq_ reset / clock skew "
+                          "carrying a different event). Matching-fields redeliveries are NOT counted "
+                          "here (see ..._events_redelivered_total). >0 distinguishes 'no drift' from "
+                          "'drift silently discarded' (CC7.3 evidence gap #1414).",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_events_redelivered_total",
+                          "Cumulative idempotent event redeliveries at ingest — a matching-fields "
+                          "event_id conflict, i.e. the durable agent lifecycle journal's expected "
+                          "at-least-once retry. High is normal after an agent outage/reconnect; this "
+                          "is NOT a loss signal (that is ..._events_dropped_total).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_events_ingest_errors_total",
+                          "Cumulative OPERATIONAL Guardian ingest faults (a failed BEGIN/prepare/"
+                          "insert/commit, or a redelivery compare that could not run). A sustained "
+                          "rate means conflicts are going UNCLASSIFIED, so a genuine collision can "
+                          "escape ..._events_dropped_total — this is itself alertable (sec-M2). "
+                          "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
+                          "server restart.",
+                          "counter");
+        metrics_.describe(
+            yuzu::server::detail::kGuardianEventStoreDurationMetric,
+            "Server-side latency of insert_event_classified (the classify+store SQLite operation) "
+            "for one Guardian event, split by outcome `status` (inserted|redelivered|conflict|"
+            "error). redelivered/conflict run the redelivery byte-compare; inserted does "
+            "projection+commit. A validation signal for the off-write-path compare work (#2298) - "
+            "NOT the go/no-go (an aggregate histogram can't attribute compare-CPU vs lock-wait; "
+            "that needs a concurrent benchmark). Covers the direct-Subscribe and gateway-proxied "
+            "paths. Buckets 0.1ms-10s.",
+            "histogram");
+        // Birth the four status series with the custom ladder ONCE (boundaries fix at first
+        // creation) so the hot observe path is a cheap name+label lookup and the series are on
+        // /metrics from boot. Mirrors the yuzu_pg_acquire_wait_seconds pattern above.
+        // LOAD-BEARING (unhappy-path UP-1): this MUST run in the ServerImpl ctor, before the gRPC
+        // listener opens (run() -> BuildAndStart), or the first ingest would default-construct the
+        // series with the 5ms-floor buckets and silently lose the sub-ms resolution. Do not move
+        // it after the listener starts, and do not switch the observe site to the no-warm-create
+        // (default-bucket) path.
+        yuzu::server::detail::warm_create_guardian_event_store_metric(metrics_);
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -908,6 +945,28 @@ public:
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
+        // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
+        // Deliberately a bounded `reason` label set (currently one value,
+        // "successor_unused") and NOT `event="security"` — this is an
+        // OPERATIONAL health signal (the module hasn't picked up its new
+        // credential yet), distinct from the theft-detection alert channel.
+        metrics_.describe("yuzu_engine_principal_rotation_events_total",
+                          "Cumulative engine-credential rotation sweep events, by reason "
+                          "(bounded label set)",
+                          "counter");
+        metrics_.describe("yuzu_engine_principal_rotation_auto_revoked_total",
+                          "Cumulative engine-credential predecessors auto-revoked at overlap "
+                          "window end",
+                          "counter");
+        // A persistent sweep fault (PG unreachable / audit throw every tick)
+        // silently stops predecessor auto-revocation — overlap windows then
+        // never close (two live credentials persist). The per-tick try/catch
+        // keeps the thread alive; this counter makes that degradation
+        // alertable instead of log-only (Gate 8 UP8-6).
+        metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
+                          "Cumulative engine-credential rotation-sweep ticks that failed with an "
+                          "exception (predecessor auto-revocation skipped for that tick)",
+                          "counter");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");
@@ -1457,6 +1516,83 @@ public:
                               "(database reachable but the vuln_finding_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
+            }
+        }
+
+        // ApiTokenStore — born-on-PG Bearer-token store (plan PR 4.1). Same
+        // fail-CLOSED construction posture as the other born-on-PG stores
+        // (ADR-0012 §1): a reachable database whose schema can't migrate/open
+        // is a deploy error, not a serve-degraded state. FRESH START — no
+        // SQLite backfill; the legacy api-tokens.db is no longer opened.
+        if (pg_pool_ && !startup_failed_) {
+            api_token_store_ = std::make_unique<ApiTokenStore>(*pg_pool_);
+            if (!api_token_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: api-token store migration/open failed "
+                              "(database reachable but the api_token_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                // FRESH-START migration (ADR-0030): the legacy SQLite
+                // api-tokens.db is never opened; existing API/MCP tokens are
+                // invalidated on upgrade. Warn if the stale file is still on
+                // disk so an in-place upgrade's mass 401s are diagnosable (the
+                // file is inert + hash-only and can be deleted).
+                std::error_code ec;
+                const auto legacy_db = cfg_.db_dir() / "api-tokens.db";
+                if (std::filesystem::exists(legacy_db, ec)) {
+                    spdlog::warn("[auth] Legacy SQLite api-tokens.db found at {} — API/MCP "
+                                 "tokens now live in PostgreSQL and any prior tokens were "
+                                 "INVALIDATED by the migration (ADR-0030); re-mint them. The "
+                                 "old file is inert and can be removed.",
+                                 legacy_db.string());
+                }
+            }
+        }
+
+        // EnginePrincipalStore — born-on-PG identity store for autonomous
+        // engine principals (plan PR 4.2, design doc §3.1). Same fail-CLOSED
+        // construction posture as the other born-on-PG stores (ADR-0012 §1):
+        // a reachable database whose schema can't migrate/open is a deploy
+        // error, not a serve-degraded state.
+        if (pg_pool_ && !startup_failed_) {
+            engine_principal_store_ = std::make_unique<EnginePrincipalStore>(*pg_pool_);
+            if (!engine_principal_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: engine-principal store migration/open "
+                              "failed");
+                startup_failed_ = true;
+            } else if (api_token_store_ && api_token_store_->is_open()) {
+                // Wire the referential-integrity resolver seam (design §6) now
+                // that both born-on-PG stores are open. api_token_store_'s
+                // create_token engine block fails closed until this is set.
+                api_token_store_->set_engine_referent_check(
+                    [this](const std::string& id) {
+                        // F5 (Hermes pass-2 MEDIUM M3): null-guard in addition to the
+                        // declaration-order fix above — belt-and-braces against any future
+                        // code path that resets engine_principal_store_ (e.g. a hot-reload)
+                        // while this resolver is still installed. Treat "store gone" the
+                        // same as "store unreachable": retryable/fail-closed, never a silent
+                        // crash or a false Active.
+                        //
+                        // G9 (governance hardening, cpp-safety SHOULD): this null-check is
+                        // sound ONLY under the current lifecycle — engine_principal_store_ is
+                        // constructed once above, before the server starts serving requests,
+                        // and (per shutdown ordering elsewhere in this file) is only ever
+                        // reset to null AFTER the HTTP request-handling threads have drained.
+                        // There is today no code path that resets engine_principal_store_
+                        // while a request is concurrently in flight, so a bare pointer read
+                        // here is race-free. A FUTURE hot-reload feature that swaps or resets
+                        // engine_principal_store_ while the server is still live would turn
+                        // this into a genuine TOCTOU/use-after-free the null-guard does NOT
+                        // cover (reading a non-null pointer here does not guarantee it stays
+                        // valid through the get_for_auth() call below). Any such future path
+                        // MUST swap the pointer under a mutex or make it a
+                        // std::atomic<EnginePrincipalStore*> (or shared_ptr), and MUST add
+                        // TSan coverage exercising the reload racing a live lookup — do not
+                        // extend the null-guard-only pattern to cover it.
+                        return engine_principal_store_
+                                   ? engine_principal_store_->get_for_auth(id).status
+                                   : EngineLookupStatus::StoreUnreachable;
+                    });
             }
         }
 
@@ -2187,6 +2323,82 @@ public:
             auto rbac_db = cfg_.db_dir() / "rbac.db";
             rbac_store_ = std::make_unique<RbacStore>(rbac_db);
         }
+
+        // Engine-principal namespace collision-scan preflight (design doc
+        // §3.1 upgrade hazard / decision log #3): "the PR 4.2 migration
+        // itself scans for pre-existing colliding names rather than allowing
+        // silent coexistence". An `engine:`-named local user or RBAC group
+        // predating this reservation could otherwise be silently shadowed by
+        // (or silently grant roles to) a real engine principal — fail closed
+        // and refuse to start rather than let that ambiguity stand. Runs once
+        // engine_principal_store_ + rbac_store_ both exist; auth_mgr_.auth_db_ptr()
+        // is available from construction.
+        if (!startup_failed_ && engine_principal_store_) {
+            std::vector<std::string> colliding_users;
+            // Symmetric with the groups scan below (governance G3 residual): a
+            // users-scan error must fail this preflight CLOSED, not read as
+            // "no colliding users" — find_reserved_prefix_users returns nullopt
+            // on a scan error vs an empty vector for a completed-clean scan.
+            bool users_scan_failed = false;
+            if (auto* db = auth_mgr_.auth_db_ptr()) {
+                if (auto scan = db->find_reserved_prefix_users("engine:")) {
+                    colliding_users = std::move(*scan);
+                } else {
+                    users_scan_failed = true;
+                }
+            }
+            std::vector<std::string> colliding_groups;
+            // G3 (governance hardening, UP-2): `find_local_groups_with_prefix`
+            // returns nullopt on a scan error (as opposed to a genuinely empty,
+            // successfully-completed scan) — a scan error must fail this
+            // preflight closed, not be misread as "no collision found".
+            bool groups_scan_failed = false;
+            if (rbac_store_) {
+                // A non-open store (missing/corrupt/failed-to-load rbac.db)
+                // must never be trusted to report a genuine empty scan —
+                // treat it exactly like a scan error so this preflight
+                // fails closed instead of booting past an unreadable
+                // rbac.db (find_local_groups_with_prefix also returns
+                // nullopt on !db_, but the explicit is_open() guard here
+                // means we never even issue the scan on a store we know is
+                // unusable).
+                if (!rbac_store_->is_open()) {
+                    groups_scan_failed = true;
+                } else if (auto scan = rbac_store_->find_local_groups_with_prefix("engine:")) {
+                    colliding_groups = std::move(*scan);
+                } else {
+                    groups_scan_failed = true;
+                }
+            }
+            if (!colliding_users.empty() || !colliding_groups.empty() || users_scan_failed ||
+                groups_scan_failed) {
+                auto join = [](const std::vector<std::string>& v) {
+                    std::string out;
+                    for (size_t i = 0; i < v.size(); ++i) {
+                        if (i)
+                            out += ", ";
+                        out += v[i];
+                    }
+                    return out;
+                };
+                if (users_scan_failed || groups_scan_failed) {
+                    spdlog::error(
+                        "[auth] Refusing to start: the 'engine:' namespace collision scan failed "
+                        "(users_scan_failed={}, groups_scan_failed={}; see prior error) — cannot "
+                        "verify the reserved namespace is clear, failing closed rather than "
+                        "booting with an unknown collision state.",
+                        users_scan_failed, groups_scan_failed);
+                } else {
+                    spdlog::error(
+                        "[auth] Refusing to start: the 'engine:' namespace is reserved for engine "
+                        "principals (design doc §3.3) but pre-existing names collide with it — "
+                        "colliding users: [{}]; colliding local RBAC groups: [{}]. Rename or "
+                        "remove these before upgrading.",
+                        join(colliding_users), join(colliding_groups));
+                }
+                startup_failed_ = true;
+            }
+        }
         {
             auto mgmt_db = cfg_.db_dir() / "management-groups.db";
             mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
@@ -2226,10 +2438,6 @@ public:
             agent_service_.set_mgmt_group_store(mgmt_group_store_.get());
             if (gateway_service_)
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
-        }
-        {
-            auto token_db = cfg_.db_dir() / "api-tokens.db";
-            api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
         }
         {
             auto quar_db = cfg_.db_dir() / "quarantine.db";
@@ -3008,6 +3216,11 @@ public:
             cfg_, auth_mgr_, rbac_store_.get(), api_token_store_.get(), audit_store_.get(),
             mgmt_group_store_.get(), tag_store_.get(), analytics_store_.get(), oidc_mu_,
             oidc_provider_, saml_provider_.get());
+        // Nullable setter (design §6) — a null engine_principal_store_ (no PG
+        // configured, or its construction failed before startup_failed_ was
+        // checked here) makes AuthRoutes::synthesize_token_session fail closed
+        // for every engine-kind token rather than dereference a dangling store.
+        auth_routes_->set_engine_principal_store(engine_principal_store_.get());
 
         start_web_server();
 
@@ -3263,6 +3476,10 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_dropped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_redelivered_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_redelivered_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_ingest_errors_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_ingest_errors_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
@@ -3373,6 +3590,151 @@ public:
                                  "server.default_certs_in_use");
                     }
                 });
+        }
+
+        // T12 (design doc §7): engine-credential overlap-pair rotation
+        // sweep — auto-revoke + successor-unused warning. Only started when
+        // api_token_store_ is actually open (nothing to sweep otherwise).
+        // 60s cadence: overlap windows floor at 24h (kOverlapFloorSecs in
+        // api_token_store.cpp), so a minute of sweep latency is immaterial
+        // to either half's correctness — the sweep is idempotent and a
+        // missed tick simply defers to the next one (see
+        // sweep_expired_rotations's doc comment).
+        if (api_token_store_ && api_token_store_->is_open()) {
+            engine_rotation_sweep_thread_ = std::thread([this]() {
+                spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
+                // Successor-unused warnings are process-local, best-effort
+                // de-duplication (mirrors ApiTokenStore's own rotation-grace
+                // cache precedent) — keyed on rotation_group, so the SAME
+                // pair isn't re-audited/re-counted every tick while its
+                // window is still open. Pruned each tick to whatever
+                // list_rotations_nearing_expiry_unused still returns, so a
+                // resolved pair (revoked, confirmed, or finally used) frees
+                // its slot for a future rotation on the same principal. A
+                // process restart forfeits the de-dup state and re-warns
+                // once — acceptable for an operational signal.
+                std::unordered_set<std::string> warned_rotation_groups;
+                // Warn once the predecessor's overlap window has this much
+                // time left — matches the 24h overlap floor: the operator
+                // gets a full floor-window's notice before auto-revoke, the
+                // shortest lead time that is never a false "already gone"
+                // read against the shortest window an operator can even set.
+                constexpr std::int64_t kSuccessorUnusedWarnLeadSecs = 24 * 3600;
+
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
+                         ++i) {
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    // S-SWEEP-EXCEPTION-GUARD: an exception escaping a
+                    // std::thread body calls std::terminate (whole-process
+                    // crash) — a transient failure here (e.g. an
+                    // audit_store_->log throw, bad_alloc) must instead log
+                    // and let the loop continue to the next tick
+                    // (fail-safe, self-healing; matches the sweep's own
+                    // "a missed tick simply defers to the next one" posture).
+                    try {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        continue; // defensive — construction-time guard above should hold
+
+                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+
+                    // Half 1: auto-revoke elapsed predecessors + clear the
+                    // surviving successor's rotation state. A failed tick (pool
+                    // contention / query error) is reported via the out-param —
+                    // the store swallows it (returns empty) rather than throwing,
+                    // so without this the sweep-failures alert would stay at zero
+                    // while rotated-out credentials silently outlive their window.
+                    bool sweep_tick_failed = false;
+                    auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
+                    if (sweep_tick_failed) {
+                        spdlog::warn("Engine-credential rotation sweep tick could not run (pool "
+                                     "contention / query failure) — predecessor auto-revoke deferred "
+                                     "to the next tick");
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                    for (const auto& predecessor : revoked) {
+                        metrics_.counter("yuzu_engine_principal_rotation_auto_revoked_total")
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log(
+                                {.timestamp = now,
+                                 .principal = "system",
+                                 .principal_role = "system",
+                                 .action = "engine_principal.rotation.auto_revoke",
+                                 .target_type = "ApiToken",
+                                 .target_id = predecessor.token_id,
+                                 .detail = "principal_id=" + predecessor.principal_id +
+                                           " reason=overlap_window_elapsed",
+                                 .result = "success"});
+                        }
+                        // Any pair that just resolved no longer needs its
+                        // warned-state tracked — the token_id it was keyed
+                        // under (rotation_group == successor's token_id,
+                        // never the predecessor's) is pruned below anyway,
+                        // but drop it here too for clarity/promptness.
+                        warned_rotation_groups.erase(predecessor.rotation_group);
+                    }
+
+                    // Half 2: successor-unused warning — an OPERATIONAL
+                    // health signal (bounded reason label, NOT
+                    // event="security"; see the design doc §7 / the
+                    // metrics_.describe comment above), kept on its own
+                    // channel from any theft-detection alert.
+                    auto nearing = api_token_store_->list_rotations_nearing_expiry_unused(
+                        now, kSuccessorUnusedWarnLeadSecs);
+                    std::unordered_set<std::string> still_nearing;
+                    for (const auto& pair : nearing) {
+                        still_nearing.insert(pair.successor.rotation_group);
+                        if (warned_rotation_groups.contains(pair.successor.rotation_group))
+                            continue; // already warned this rotation attempt — don't re-spam
+                        warned_rotation_groups.insert(pair.successor.rotation_group);
+
+                        metrics_
+                            .counter("yuzu_engine_principal_rotation_events_total",
+                                     {{"reason", "successor_unused"}})
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log(
+                                {.timestamp = now,
+                                 .principal = "system",
+                                 .principal_role = "system",
+                                 .action = "engine_principal.rotation.successor_unused",
+                                 .target_type = "ApiToken",
+                                 .target_id = pair.successor.token_id,
+                                 .detail = "principal_id=" + pair.predecessor.principal_id +
+                                           " predecessor_token_id=" + pair.predecessor.token_id +
+                                           " overlap_expires_at=" +
+                                           std::to_string(pair.predecessor.overlap_expires_at),
+                                 .result = "warning"});
+                        }
+                    }
+                    // Prune de-dup entries for pairs that no longer appear
+                    // (resolved via revoke, confirm, or the successor
+                    // finally being used) so a later rotation on the same
+                    // principal can warn again.
+                    std::erase_if(warned_rotation_groups, [&](const std::string& group) {
+                        return !still_nearing.contains(group);
+                    });
+                    } catch (const std::exception& e) {
+                        spdlog::error("Engine-credential rotation sweep tick failed: {}",
+                                     e.what());
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    } catch (...) {
+                        spdlog::error("Engine-credential rotation sweep tick failed: unknown "
+                                      "exception");
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                }
+                spdlog::info("Engine-credential rotation sweep thread stopped");
+            });
         }
 
         agent_server_->Wait();
@@ -3486,6 +3848,15 @@ public:
         // Join the insecure-TLS reminder thread (issue #79)
         if (insecure_tls_reminder_thread_.joinable()) {
             insecure_tls_reminder_thread_.join();
+        }
+
+        // T12: join the engine-credential rotation sweep thread (borrows
+        // api_token_store_ + audit_store_ — must stop before either is torn
+        // down; api_token_store_.reset() happens further below alongside
+        // engine_principal_store_, per the F5 destruct-before-pool ordering
+        // note on those members).
+        if (engine_rotation_sweep_thread_.joinable()) {
+            engine_rotation_sweep_thread_.join();
         }
 
         if (schedule_engine_)
@@ -3619,6 +3990,20 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // ApiTokenStore borrows pg_pool_ — drop before the pool. No background
+        // thread borrows it (only auth_routes_/settings_routes_/rest_api_v1_
+        // hold a raw pointer, and every HTTP handler thread is already
+        // quiesced by the drain above); keep the ADR-0012 teardown discipline
+        // so a future consumer can't UAF.
+        // F5: api_token_store_ MUST reset before engine_principal_store_ — its
+        // set_engine_referent_check resolver derefs engine_principal_store_, so
+        // dropping api_token_store_ first ensures no lingering resolver can ever
+        // observe engine_principal_store_ mid-reset (belt-and-braces alongside
+        // the declaration-order fix + the resolver's own null-guard above).
+        api_token_store_.reset();
+        // EnginePrincipalStore borrows pg_pool_ — drop before the pool, same
+        // discipline as api_token_store_ above (ADR-0012 destruct-before-pool).
+        engine_principal_store_.reset();
         // Same discipline for the software-inventory store (gov cpp-safety): null the
         // borrowed raw pointers in both ingest services, then drop the store, BEFORE
         // the pool — otherwise the store briefly holds a dangling PgPool& after the
@@ -4519,10 +4904,14 @@ private:
     }
 
     // -- Auth helpers: thin delegation wrappers to AuthRoutes -----------------
-
-    auth::Session synthesize_token_session(const ApiToken& api_token) {
-        return auth_routes_->synthesize_token_session(api_token);
-    }
+    //
+    // NOTE: a `synthesize_token_session` thin-wrapper used to live here. T8
+    // integration (design doc §6/PR 4.2) verified it has zero callers —
+    // AuthRoutes' own internal call sites (resolve_session) call
+    // `AuthRoutes::synthesize_token_session` directly, not through
+    // ServerImpl — so it was deleted rather than widened to the new
+    // `std::optional<auth::Session>` return type. If a caller resurfaces,
+    // reintroduce it with that signature.
 
     std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res) {
         return auth_routes_->require_auth(req, res);
@@ -5392,6 +5781,8 @@ private:
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                {"engine_principal_store",
+                 engine_principal_store_ && engine_principal_store_->is_open()},
                 // Load-bearing for the MCP write surface + REST /api/approvals/*
                 // (governance sre-BLOCKING-1). is_open() is false after a failed
                 // consumed_at migration, so a broken approval schema fails readyz.
@@ -6168,6 +6559,14 @@ private:
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
+        // PR 4.3 (T13): wire the LIVE owner-delete guard + admin console
+        // fragment. Nullable — a null/unwired engine_principal_store_ leaves
+        // the guard permissive (documented on set_engine_principal_store) and
+        // the console fragment renders "not configured", same posture as
+        // every other optional-store wiring in this file.
+        if (engine_principal_store_) {
+            settings_routes_->set_engine_principal_store(engine_principal_store_.get());
+        }
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -10660,7 +11059,8 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get(), cfg_.scim_admin_group);
+                                          audit_store_.get(), cfg_.scim_admin_group,
+                                          engine_principal_store_.get());
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
@@ -10701,7 +11101,33 @@ private:
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
+        // PR 4.3 (T13): shared owner-existence resolver for the
+        // engine-principal create/transfer-owner FK check — RestApiV1 and
+        // McpServer both need the identical "does this username name a real
+        // user" predicate. AuthDB::user_exists is non-const and returns
+        // std::expected<bool, AuthDBError> (no value_or on std::expected);
+        // a lookup failure reads as "does not exist" — fail-closed on the
+        // owner FK, same posture break_glass_account_problem uses elsewhere
+        // in auth_db.cpp.
+        auto engine_owner_exists_fn = [this](const std::string& username) -> bool {
+            auto* db = auth_mgr_.auth_db_ptr();
+            if (db == nullptr)
+                return false;
+            auto exists = db->user_exists(username);
+            return exists.has_value() && *exists;
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
+        // Both setters MUST run BEFORE register_routes() (captured by value
+        // at registration time, not `this`) — see set_engine_principal_store/
+        // set_user_exists_fn's doc comments in rest_api_v1.hpp. Nullable:
+        // an unwired engine_principal_store_ leaves the engine-principal
+        // routes answering 503, same posture as every other optional-store
+        // wiring in this file.
+        if (engine_principal_store_) {
+            rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
+            rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
+        }
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -10749,8 +11175,21 @@ private:
                    bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
                 const auto revoke = auth_mgr_.invalidate_user_sessions(username);
                 std::size_t tokens = 0;
+                bool api_tokens_db_persisted = true; // vacuously true when not requested
                 if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
-                    tokens = api_token_store_->revoke_for_principal(username);
+                    auto revoked = api_token_store_->revoke_for_principal(username);
+                    if (revoked.has_value()) {
+                        tokens = *revoked;
+                    } else {
+                        // The API-token revoke did NOT persist (lease timeout /
+                        // query error). Do NOT report a count — 0 would read as
+                        // "the principal had no tokens". Flag it so the handler
+                        // audits "partial", never a false "signed out
+                        // everywhere" (ADR-0030 §Posture, the stolen-laptop path).
+                        api_tokens_db_persisted = false;
+                        spdlog::error("revoke_for_principal did not persist for {}: {}", username,
+                                      revoked.error());
+                    }
                 }
                 // CC7.2 anomaly-detection signal: a spike in this counter
                 // is the operator's automated alert for compromised-account
@@ -10758,18 +11197,21 @@ private:
                 // Caller dimension is inferred from the api-tokens flag:
                 // /me passes true (self full-credential revoke), admin
                 // path passes false (cookies only, automation tokens
-                // intact). Result dimension carries db_persisted so SOC 2
+                // intact). Result dimension is "partial" if EITHER the cookie
+                // dual-write OR the API-token revoke failed, so SOC 2
                 // partial-failure rows are filterable.
+                const bool all_persisted = revoke.db_persisted && api_tokens_db_persisted;
                 metrics_
                     .counter("yuzu_auth_sessions_revoked_total",
                              {{"caller", revoke_api_tokens ? "self" : "admin"},
-                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"result", all_persisted ? "success" : "partial"},
                               {"scope", revoke_api_tokens ? "all" : "cookies"}})
                     .increment();
                 return RestApiV1::SessionRevokeResult{
                     revoke.count,
                     tokens,
                     revoke.db_persisted,
+                    api_tokens_db_persisted,
                 };
             },
             // W5.1 — pass the per-execution event bus into the REST
@@ -10946,7 +11388,9 @@ private:
                 return response_agent_in_scope(username, agent_id);
             },
             // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
-            app_perf_providers);
+            app_perf_providers,
+            // PR 4.2 — fleet-wide engine role-assignment authoring surface.
+            engine_principal_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -10971,6 +11415,20 @@ private:
             // → web_server_->stop()) before any member destructs — no handler
             // runs after the join, so member-destruction order is irrelevant.
             mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
+            // PR 4.3 (T13): wire the engine-principal store + the SAME
+            // engine-credential store (api_token_store_) + the shared
+            // owner-existence predicate the 8 engine tools need. Setters
+            // are safe before OR after register_routes (the handler
+            // captures `this`, see mcp_server.hpp's doc comment) but set
+            // here, before build_handler() runs, for consistency with the
+            // REST/settings wiring above. Nullable — an unwired
+            // engine_principal_store_ leaves every engine-principal tool
+            // answering "unavailable" rather than 503/crashing.
+            if (engine_principal_store_) {
+                mcp_server_->set_engine_principal_store(engine_principal_store_.get());
+                mcp_server_->set_engine_credential_store(api_token_store_.get());
+                mcp_server_->set_owner_exists_fn(engine_owner_exists_fn);
+            }
             mcp_server_->register_routes(
                 *web_server_,
                 [this](const httplib::Request& req, httplib::Response& res)
@@ -11146,7 +11604,9 @@ private:
                 // ADR-0024: the SLE discovery store backs the query_software_licenses
                 // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
                 // per-user user_ref PII stays on the audited REST drill).
-                software_licensing_store_.get());
+                software_licensing_store_.get(),
+                // PR 4.2 — engine role-assignment MCP twins.
+                engine_principal_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
@@ -11438,6 +11898,23 @@ private:
     // during shutdown. Do not reorder these two.
     std::unique_ptr<RbacStore> rbac_store_;
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
+    // F5 (Hermes pass-2 MEDIUM M3): engine_principal_store_ MUST be declared
+    // BEFORE api_token_store_ — order is load-bearing, same pattern as the
+    // rbac_store_/mgmt_group_store_ note above. api_token_store_'s
+    // `set_engine_referent_check` resolver captures `this` and derefs
+    // `engine_principal_store_` on every `create_token` call. Members
+    // destruct in REVERSE declaration order, so declaring
+    // engine_principal_store_ first means it destructs SECOND (after
+    // api_token_store_) — it always outlives the resolver holder. The
+    // opposite order would let engine_principal_store_ be destroyed while
+    // api_token_store_ (and its resolver) still exists, so a late
+    // `create_token` call during shutdown could deref a freed store. Do not
+    // reorder these two. Both still borrow pg_pool_ and are declared after
+    // it, so normal reverse-declaration-order destruction is correct there
+    // too; stop() also explicitly resets api_token_store_ before
+    // engine_principal_store_ before pg_pool_.reset() (ADR-0012
+    // destruct-before-pool discipline).
+    std::unique_ptr<EnginePrincipalStore> engine_principal_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<ResultSetStore> result_set_store_;
@@ -11618,6 +12095,18 @@ private:
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;
+
+    // T12 (design doc §7): engine-credential overlap-pair rotation sweep —
+    // auto-revoke elapsed predecessors + the successor-unused warning. A
+    // dedicated thread rather than piggybacking on health_recompute_thread_:
+    // that thread's own comment (see start_web_server()) already flags its
+    // sweep body as a serial budget shared with a SECURITY-relevant
+    // revocation sweep — adding unrelated PG-bound work there would grow
+    // that shared stall window. Joined before api_token_store_ resets in
+    // stop() (it borrows api_token_store_ + audit_store_, same ADR-0012
+    // destruct-before-pool discipline as every other PG-borrowing thread
+    // here).
+    std::thread engine_rotation_sweep_thread_;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> stop_entered_{false};

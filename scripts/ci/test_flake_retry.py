@@ -6,9 +6,10 @@ fake Catch2 stubs on PATH, exercising the orchestration the unit `--selftest`
 can't reach: `meson test` -> meson suite-level junit -> `meson introspect` ->
 re-run the suite binary with Catch2's junit reporter -> isolated case retries.
 
-Scenarios: green pass, a listed flake that recovers on retry, a listed flake
-that fails all retries (blocks), an unlisted failure (blocks), and a
-non-classifiable (non-Catch2) suite (blocks).
+Scenarios: green pass (including an unavailable telemetry-report path), a
+listed flake that recovers on retry, a listed flake that fails all retries
+(blocks), an unlisted failure (blocks), and a non-classifiable (non-Catch2)
+suite (blocks).
 
 POSIX-only (the fakes are chmod +x shebang scripts); skipped on Windows, where
 the real CI exercises the binary-execution mechanics anyway.
@@ -53,6 +54,10 @@ if a and a[0] == "test":
     j = os.path.join(logs, "testlog.junit.xml")
     if os.environ.get("FAKE_MESON_TEST_PASS") == "1":
         open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0"/></testsuite></testsuites>')
+        if os.environ.get("FAKE_REPORT_PATH_IS_FILE") == "1":
+            os.remove(j)
+            os.rmdir(logs)
+            open(logs, "w").write("not a directory")
         sys.exit(0)
     open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0">'
                        '<failure>boom</failure></testcase></testsuite></testsuites>')
@@ -133,6 +138,9 @@ def main():
     listed = [{"case": "FlakeA", "platforms": [THIS_OS], "reason": "test flake", "added": "2026-06-23"}]
     results = [
         run_scenario("green pass", {"FAKE_MESON_TEST_PASS": "1"}, listed, True),
+        run_scenario("green pass survives unavailable retry-report path",
+                     {"FAKE_MESON_TEST_PASS": "1", "FAKE_REPORT_PATH_IS_FILE": "1"},
+                     listed, True),
         run_scenario("listed flake recovers on retry", {"FAKE_FAIL_CASES": "FlakeA"}, listed, True),
         run_scenario("listed flake fails all retries -> block",
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_ALWAYS_FAIL": "FlakeA"}, listed, False),

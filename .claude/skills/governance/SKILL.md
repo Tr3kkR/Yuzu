@@ -131,6 +131,133 @@ implements the same semantic (e.g. "revoke token", "update group",
 Explicit "grep for sibling paths and compare" is the invariant — not
 "trust that other paths are fine."
 
+## New authz surface / principal class check (LOAD-BEARING)
+
+Added after PR #2202: a rebase of already-gated engine-principal code
+shipped **4 HIGH** auth findings (fleet-wide-read-when-RBAC-off,
+boots-clean-on-corrupt-rbac.db, engine-audit-mislabelled, resolver
+branch with no production caller) through a 14-agent `/governance` run
+AND two Hermes passes. An external panel caught all four on first
+contact. The gap: reviewers checked the *new routes* and the surface a
+recently-added deny-belt already covered, and never traced the
+capability's authority across the whole authz layer.
+
+When a diff adds or changes a **principal class**, an `auth_source`, an
+authorization **entry point**, or any capability reachable by a new kind
+of actor, do ALL of the following — do not sample:
+
+1. **Chokepoint coverage, not file coverage.** Enumerate *every*
+   authorization chokepoint an actor of that class can reach —
+   `require_permission`, `require_scoped_permission`, `require_admin`,
+   every inline `check_permission`/`check_scoped_permission`,
+   `authorize_list_read` (`AuthRoutes::require_list_read` + its MCP /
+   dashboard wrappers), the MCP tier gate, any service-scoped/elevation/
+   legacy fallback — and prove the intended posture (allow/deny/step-up)
+   at EACH. **List/fan-out reads of per-agent data are a DISTINCT
+   chokepoint from per-object permission checks**: they MUST go through
+   the admit-then-filter `authorize_list_read` (World A, ADR-0017 —
+   `docs/adr/0017-management-group-confinement-list-reads.md`), never a
+   bare global `require_permission` (which is inert for a confined
+   operator and fails *open* on a corrupt `rbac.db`). A carve-out that
+   gets every single-target check right but leaks a fleet-wide list is
+   the same failure mode as #2202. A carve-out that sits only on the new
+   routes, or only where a sibling guard happens to already sit, is the
+   #2202 gap. Grep for the chokepoint functions (incl.
+   `authorize_list_read`/`require_list_read`); do not reason from "the
+   new code looks right."
+
+2. **Test the DEFAULT deployment config, not the hardened one.** Re-run
+   the authorization reasoning with the security-relevant toggle in its
+   **default** state (e.g. RBAC *off* — the default — not RBAC on). The
+   #2202 fleet-wide-read only triggered with RBAC off, which is exactly
+   what nobody exercised. Ask: "what does this grant/deny when the admin
+   has configured nothing?"
+
+3. **Reachability of every new branch.** For each new authorization or
+   resolution branch (a new `principal_type` arm, a new store method, a
+   new grant path), grep for a **production caller**. A branch reachable
+   only from tests is either dead code or a shipped-incomplete
+   deliverable — say which. (#2202 Blocker 4: the engine RBAC resolver
+   had no route that could author the grant it consumed.)
+
+4. **Fail-closed on infra failure.** For any authoritative read in the
+   authz/identity path — a *new* read, OR an existing resolver that this
+   change makes newly load-bearing for the new actor type (a resolver can
+   become security-critical for a new principal without a line in it
+   changing) — confirm a store/DB failure denies or refuses boot, never
+   reads as an empty/absent result that silently allows. Check the
+   engaged-empty-vs-`nullopt` / `std::expected` distinction.
+
+5. **Comment-vs-code diff.** Read each comment near a new authz branch
+   against the code it describes. #2202 Blocker 2 shipped a comment that
+   asserted the *opposite* of what the function did (`nullopt` on
+   failure) — a lying comment is a strong signal, not decoration.
+
+6. **Audit attribution survives to the row.** Trace the new actor through
+   EVERY audit helper it can reach (`make_audit_event`,
+   `emit_behavioral_audit`, any inline `audit_log`/`.log({...})`) and
+   prove the persisted row carries the stable authorization principal,
+   the correct `principal_class`, the correct `auth_source`, the
+   effective role, AND correct attribution on the *denied* path — never
+   the creating human, a presentation-only default, or a half-set field.
+   #2202 Blocker 3 stamped engine actions as `principal_class=agent`
+   because `make_audit_event` set the class before session resolution and
+   never re-stamped. "Audit events are emitted" is NOT enough — the
+   fields must be *correct* for the new actor.
+
+## Design-contract & state-machine tracing (LOAD-BEARING)
+
+Added after PR #2284: an external reviewer reading the design doc
+line-by-line found real defects across THREE rounds that a 14-agent
+`/governance` + Hermes ×2 had passed — because our gates reviewed the
+*diff mechanics* (does the merge compile, is the carve-out present) but
+never traced the PR's own *published contracts* and *state-machine
+semantics* against the code. Fold that depth in here.
+
+When a PR (a) touches a **state machine** (rotation, lifecycle CRUD,
+deployment, enrollment — anything with ordered transitions or
+paired/linked rows), (b) makes a **published-contract** claim (a
+normative statement in docs / OpenAPI / changelog / a design doc — "a
+second mint errors", "rejected outright, never truncated", "revocation
+resolves the rotation state", "idempotent — does not re-emit"), or (c)
+adds/changes a **classifier** (a substring allowlist, an enum switch, an
+error→status map), do ALL of the following:
+
+1. **Trace every normative claim to code.** For each "always / never /
+   must / rejects / idempotent" statement in the docs / OpenAPI /
+   changelog / design doc this PR touches, find the line that enforces it
+   and confirm it actually does. A claim is a CONTRACT, not a
+   description. #2284 shipped "a second mint errors" (no ceiling check),
+   "rejected outright, never truncated" (the MCP twin silently clamped),
+   and an OpenAPI `{id}` description that 404'd every real principal. If
+   doc and code disagree, ONE is a bug — say which; never assume the doc.
+
+2. **Enumerate mutation × state for the machine.** List every mutating
+   operation the actor can invoke AND every state a linked/paired row can
+   be in, then walk the cross-product: does any combination wedge the
+   machine, orphan a partner, or drop to an unsafe terminal? Trace the
+   OUT-OF-BAND paths — a single manual revoke mid-rotation, a retry after
+   a lost response, a delete of a linked row — not just the happy
+   transitions. #2284 §7: a manual successor-revoke let the sweep
+   auto-revoke the principal's ONLY credential to zero; a manual
+   predecessor-revoke wedged the pair classifier.
+
+3. **Prove classifier / allowlist completeness.** For a substring
+   allowlist or enum map: enumerate EVERY value it must handle — every
+   distinct `unexpected(...)` / error string the callee can emit, every
+   enum case — and confirm each is classified. A shared classifier must
+   be complete for BOTH transports (REST + MCP). A missed value defaults
+   silently to the wrong class: #2284 mapped a permanent "not found" to a
+   *retryable* error twice, on strings the allowlist missed. Require a
+   unit test that locks the mapping (grep the callee's error strings;
+   assert each maps to the intended class).
+
+4. **Fail-visibility of a sole-enforcement path.** If a background /
+   periodic task is the ONLY thing enforcing an invariant (an auto-revoke
+   sweep, a reconcile loop), confirm its failures are observable — a
+   swallowed error that returns empty must still bump a counter / log, or
+   the invariant silently lapses with the alert at zero (#2284 M6).
+
 ## New-error-branch audit
 
 If this PR adds any new 4xx/5xx error-response branch in a handler,
@@ -347,6 +474,18 @@ Focus on compound failures where two or more risks interact:
 - audit detail unescaped -> stored XSS on dashboard render
 - MCP token scope confusion vs principal match
 
+If this PR touches a STATE MACHINE (rotation, lifecycle CRUD,
+deployment, enrollment — ordered transitions or paired/linked rows),
+also enumerate **mutation × state**: every mutating op × every state a
+linked/paired row can be in, and walk the cross-product for a
+combination that wedges the machine, orphans a partner, or drops to an
+unsafe terminal (e.g. zero credentials). Prioritise OUT-OF-BAND paths —
+a single manual revoke/delete of one linked row mid-transition, a retry
+after a lost response — over the happy transitions (see the security
+preamble's "Design-contract & state-machine tracing" check; this is how
+#2284's §7 auto-revoke-to-zero and pair-wedge defects shipped past an
+earlier /governance run).
+
 ## Output format
 
 Risk register with entries shaped as:
@@ -428,6 +567,21 @@ state, schema, and contract consistency. Check:
    security-guardian co-checks `readOnlyHint`/`destructiveHint`/
    `idempotentHint` truthfulness against tier + dispatch behavior —
    a false safe-direction hint is a BLOCKING (HIGH) finding.
+
+10. **Published-contract vs code, and classifier completeness** (see the
+   security preamble's "Design-contract & state-machine tracing" check).
+   For every normative claim this PR touches in docs / OpenAPI /
+   changelog / a design doc ("a second X errors", "rejected outright,
+   never truncated", "idempotent — does not re-emit", a `{id}`/param
+   format), trace the enforcing line and confirm the code actually does
+   it — a claim is a CONTRACT; if doc and code disagree, ONE is a bug,
+   name which. For any substring allowlist / enum→status map this PR adds
+   or changes, enumerate EVERY value the callee can emit (grep its
+   `unexpected(...)` strings / enum cases) and confirm each is classified
+   the same on BOTH transports — a missed value silently defaults to the
+   wrong class (#2284 mapped a permanent "not found" to a retryable error
+   twice). A shared classifier of this kind must have a unit test locking
+   the mapping.
 
 ## Output format
 
@@ -544,6 +698,27 @@ One full governance run on a non-trivial commit range is ~6-9 parallel agent cal
 
 Skipping Gate 4 or Gate 5 to save time is rarely worth it. Skipping Gate 3 domain agents is sometimes fine if the change is genuinely small in scope (one file, no public API change); use the decision matrix to judge.
 
-## Post-run follow-ups
+## Post-run follow-ups — file deferred findings per the issue standard
 
-After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items that should be filed as GitHub issues (SHOULD findings that were scoped out of the PR). See prior examples in issues #340..#353. Group by domain (tech-debt, chaos, observability, devops) and include full-context bodies so a future session can pick them up cold.
+After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items (SHOULD findings scoped out of the PR). Governance is the repo's largest issue-inflow source, so filing follows `docs/agents/issue-standard.md` exactly; the binding procedure:
+
+1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
+2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
+   ```bash
+   gh issue list --repo Tr3kkR/Yuzu --state open --search "<file-or-symbol>" --json number,title
+   gh search issues --repo Tr3kkR/Yuzu --state open "<title keywords>" --json number,title --limit 20
+   ```
+   An existing issue covers it → comment the new evidence there instead of filing. Related but a distinct outcome → file with `Relates to #N` in the body.
+3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
+   ```bash
+   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+     --label <type> --label governance-deferred --label <P1|P2> --label ready-for-agent \
+     --body-file <candidate>.md
+   ```
+   (`<type>` and `<P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
+   `gh search issues` is rate-limited (~30/min): on a 403 mid-batch, wait 60 seconds and continue —
+   never skip the probe.)
+   **Every governance filing carries `governance-deferred`** (that label is how agent inflow is counted). Add facet labels as they genuinely apply (`tech-debt`, `reliability` for chaos findings, `observability`, `devops`, `security` for hardening — never for exploitable vulnerabilities, which go to private advisories per `SECURITY.md`).
+4. **The run report enumerates BOTH lists** — filed (with issue numbers) and not-filed (with the duplicate verdict and the issue each deduped against) — so inflow is auditable run over run.
+
+Prior examples: issues #340..#353 (pre-standard; the body format is now the standard's four sections).

@@ -186,6 +186,41 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — macOS firewall `state` now reports the Application Firewall (backend key changed)
+
+The `firewall` plugin's macOS `state` action previously reported the pf packet
+filter — which is off by default and unrelated to the Application Firewall a
+Mac admin means — so a Mac with the real firewall on could read `disabled`.
+Three things are visible after upgrading agents:
+
+1. **The `backend` row value changes from `pf` to `appfirewall`**, and `state`
+   now reflects `socketfilterfw --getglobalstate`. Integrations keying on
+   `backend|pf` or treating `state` as pf state must switch to the new rows.
+   Two additive rows appear: `mode|block_all` (only when block-all is set) and
+   `pf|<state>` (the demoted pf signal; `unknown` on agents not running as
+   root). `state|unknown` means the check was unreadable — never assumed safe.
+2. **Mixed-fleet blend during rollout:** agents not yet upgraded keep emitting
+   `backend|pf` + pf-based `state`. Expect both shapes side by side until the
+   fleet is fully upgraded — not a server bug; the `backend` row disambiguates
+   per device.
+3. **Existing installs keep the old definition description.** Bundled
+   definitions seed insert-or-skip by id at boot, so the corrected
+   `security.firewall.state` description (v1.1.0) lands on fresh installs
+   only; upgraded fleets get the corrected *behavior* regardless. To refresh
+   the text, delete `security.firewall.state` and re-import it via
+   `POST /api/instructions/import` — do not edit it in the dashboard YAML
+   editor, which drops the definition's `spec.visualization` on save.
+### vNEXT — API/MCP bearer tokens invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030) (breaking)
+
+The API/MCP bearer-token store moves from SQLite (`api-tokens.db`) to the PostgreSQL substrate as
+a **fresh-start cutover with no data migration** — every pre-upgrade API token and MCP token stops
+working the instant the new server starts (interactive cookie-session/SSO login is unaffected).
+**Re-mint every API/MCP bearer token** after upgrading (`POST /api/v1/tokens`) and update the
+credential wherever it is stored; plan a maintenance window and notify automation owners, since all
+bearer-token integrations break at once. A boot-time warning names the legacy file (inert,
+removable). Full detail + multi-instance caveat: the `## ⚠️ Breaking` section in
+`docs/user-manual/upgrading.md` and ADR-0030.
+
 ### vNEXT — MCP notification POSTs now answer `202` (was `204`); Streamable HTTP sessions added
 
 The `/mcp/v1/` endpoint gains the MCP-spec **Streamable HTTP** transport (track
@@ -1314,6 +1349,16 @@ on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
 the handler is the posture that stays killable.)
 
+**Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
+`RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
+rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`;
+against a *permanently* wedged target (a dead NFS mount, a hung service query) that would
+otherwise restart-loop every 10s forever. Instead, after 5 restarts within 300s systemd
+puts the unit into `failed` and stops retrying (the device goes dark rather than looping
+silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
+once the wedged target is resolved. Alert on the `failed` state; the old restart-forever
+behaviour hid a crash-looping agent.
+
 **Installation:**
 
 ```bash
@@ -1366,18 +1411,18 @@ REM Register the service (binPath is written for you, including the internal
 REM --service marker the agent needs to run under the SCM control protocol)
 yuzu-agent.exe --install-service
 
-REM Point it at your server / data dir / log file via sc config -- this is the
-REM EXACT quoting convention the shipped installer's own [Run] sc.exe config
-REM line uses (empirically verified working per #1822): quote ONLY the
-REM executable path, leave --service and the flag tokens bare/individually
-REM quoted after it. sc.exe reassembles all of this back into one binPath
-REM value regardless of how many separate quoted segments the command line
-REM contains, so this still works unmodified under a spaced path like
-REM "Program Files" (Gate 4 consistency-auditor finding, governance re-run --
-REM a prior revision of this example wrapped the entire value in one outer
-REM quote pair with escaped inner quotes, a different, less copy-paste-
-REM friendly convention from what the installer itself actually ships).
-sc.exe config YuzuAgent binPath= "C:\Yuzu\bin\yuzu-agent.exe" --service --server yuzu.example.com:50051 --data-dir "C:\ProgramData\Yuzu" --plugin-dir "C:\Yuzu\plugins" --log-file "C:\Yuzu\logs\yuzu-agent.log"
+REM Point it at your server / data dir / log file via sc config. binPath= takes a
+REM SINGLE value, so the whole "exe + arguments" string must be ONE quoted token,
+REM with the quotes around a spaced exe path escaped as \" -- sc.exe does NOT
+REM reassemble several quoted segments back into one binPath. Written the other way
+REM round (quoting only the exe and leaving the flags bare after it) sc.exe parses
+REM --service/--server/... as unknown OPTIONS to sc itself, prints its usage block,
+REM and exits 1639 ERROR_INVALID_COMMAND_LINE without touching the service. That is
+REM #1468: the shipped installer had exactly that defect, and because Inno ignores
+REM [Run] exit codes it failed silently -- the service kept the argument-less binPath
+REM --install-service had written, so the agent ran with no --server and fail-closed
+REM on TLS. Check your work with `sc qc YuzuAgent`: every flag below must appear.
+sc.exe config YuzuAgent binPath= "\"C:\Yuzu\bin\yuzu-agent.exe\" --service --server yuzu.example.com:50051 --data-dir \"C:\ProgramData\Yuzu\" --plugin-dir \"C:\Yuzu\plugins\" --log-file \"C:\Yuzu\logs\yuzu-agent.log\""
 
 sc.exe start YuzuAgent
 sc.exe stop YuzuAgent

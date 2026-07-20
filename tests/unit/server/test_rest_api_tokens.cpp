@@ -18,8 +18,10 @@
  */
 
 #include "api_token_store.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "secure_random.hpp"
 #include "test_route_sink.hpp"
@@ -35,6 +37,7 @@
 #include "../test_helpers.hpp"
 
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -43,14 +46,6 @@ namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
-
-// Delegates to the shared salt + atomic counter helper (#482). The prior
-// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
-// #473 traced back to. yuzu_test_ prepended so files land inside the Wee Tam
-// Defender exclusion wildcard yuzu_* (K1/CX1 on the #1883 sweep).
-static fs::path unique_temp_path(const std::string& prefix) {
-    return yuzu::test::unique_temp_path("yuzu_test_" + prefix + "-");
-}
 
 struct AuditRecord {
     std::string action;
@@ -62,17 +57,27 @@ struct AuditRecord {
 struct RestTokensHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    // TempDbFile members sit ABOVE the store unique_ptrs (reverse-order
+    // TempDbFile member sits ABOVE the store unique_ptrs (reverse-order
     // destruction closes each store before its file + -wal/-shm are removed)
-    // and replace the old manual dtor, which never removed the WAL/SHM
-    // companions (both stores run journal_mode=WAL) and never ran at all if
-    // a ctor REQUIRE threw (#486 / qe-B1). db_file is initialised in the
-    // ctor: the broken_token_db arm adopts a path under a missing parent dir
-    // via the adopt-a-path ctor (removal is then a harmless no-op).
-    yuzu::test::TempDbFile db_file;
+    // — replaces the old manual dtor, which never removed the WAL/SHM
+    // companions (DeviceTokenStore runs journal_mode=WAL) and never ran at
+    // all if a ctor REQUIRE threw (#486 / qe-B1).
     yuzu::test::TempDbFile device_db_file{"yuzu_test_rest_api_device_tokens-"};
-    std::unique_ptr<ApiTokenStore> token_store;
+
+    // ApiTokenStore ported to Postgres (PR 4.1). The happy-path arm clones an
+    // ephemeral database via the shared ApiTokenStorePg helper (SKIPs when
+    // YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken); the
+    // broken_token_db arm bypasses that helper entirely — see the ctor.
+    std::unique_ptr<yuzu::server::pg::PgPool> broken_pool;
+    std::optional<yuzu::test::ApiTokenStorePg> token_store_pg;
+    std::unique_ptr<ApiTokenStore> token_store_broken;
     std::unique_ptr<DeviceTokenStore> device_token_store;
+
+    /// Returns the ApiTokenStore under test regardless of which arm
+    /// constructed it.
+    ApiTokenStore* token_store() const {
+        return token_store_pg ? token_store_pg->get() : token_store_broken.get();
+    }
 
     // Mock session state — the caller sets these before calling any
     // endpoint; the auth_fn closure captures by reference and returns a
@@ -96,19 +101,26 @@ struct RestTokensHarness {
 
     RestApiV1 api;
 
-    /// `broken_token_db` points the ApiTokenStore at a path whose parent
-    /// directory does not exist, so sqlite3_open fails and db_ stays null —
-    /// the #347 CH-3 injection (storage down, routes still registered).
-    explicit RestTokensHarness(bool broken_token_db = false)
-        : db_file(broken_token_db
-                      ? unique_temp_path("rest-api-tokens") / "missing-dir" / "tokens.db"
-                      : unique_temp_path("rest-api-tokens")) {
-        token_store = std::make_unique<ApiTokenStore>(db_file.path);
+    /// `broken_token_db` points the ApiTokenStore at a Postgres address
+    /// nothing listens on, so construction-time `pool_.acquire()` fails and
+    /// `is_open()` stays false — the PG-era equivalent of the pre-port
+    /// "sqlite3_open on a missing parent dir" #347 CH-3 injection (storage
+    /// down, routes still registered). Deliberately does NOT need
+    /// YUZU_TEST_POSTGRES_DSN — it never reaches a real database, so this
+    /// arm runs even in an environment with no Postgres configured. The
+    /// happy-path arm uses the shared ApiTokenStorePg helper like every
+    /// other fixture (SKIPs when unset, FAILs when set but broken).
+    explicit RestTokensHarness(bool broken_token_db = false) {
+        if (broken_token_db) {
+            broken_pool = std::make_unique<yuzu::server::pg::PgPool>(
+                yuzu::server::pg::PgPool::Options{
+                    .conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1});
+            token_store_broken = std::make_unique<ApiTokenStore>(*broken_pool);
+            REQUIRE_FALSE(token_store_broken->is_open());
+        } else {
+            token_store_pg.emplace();
+        }
         device_token_store = std::make_unique<DeviceTokenStore>(device_db_file.path);
-        if (broken_token_db)
-            REQUIRE_FALSE(token_store->is_open());
-        else
-            REQUIRE(token_store->is_open());
         REQUIRE(device_token_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -151,7 +163,7 @@ struct RestTokensHarness {
         // POST /api/v1/device-tokens can be exercised by the same harness.
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
-                            /*mgmt_store=*/nullptr, token_store.get(),
+                            /*mgmt_store=*/nullptr, token_store(),
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
                             /*instruction_store=*/nullptr,
@@ -171,12 +183,12 @@ struct RestTokensHarness {
     }
 
     std::string create_token_for(const std::string& owner, const std::string& name) {
-        auto raw = token_store->create_token(name, owner);
+        auto raw = token_store()->create_token(name, owner);
         REQUIRE(raw.has_value());
         // list_tokens orders by `created_at DESC`, so the newest token is
         // front(). Using back() would return the oldest and break if a test
         // ever creates multiple tokens per owner on the same harness.
-        auto listing = token_store->list_tokens(owner);
+        auto listing = token_store()->list_tokens(owner).value();
         REQUIRE(!listing.empty());
         return listing.front().token_id;
     }
@@ -203,7 +215,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][toke
     CHECK(res->status == 200);
 
     // Store state: token is now revoked.
-    auto looked_up = h.token_store->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->revoked);
 
@@ -231,7 +243,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)"
     CHECK(res->status == 404);
 
     // Store state: token is NOT revoked.
-    auto looked_up = h.token_store->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK_FALSE(looked_up->revoked);
 
@@ -278,7 +290,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
     REQUIRE(res);
     CHECK(res->status == 200);
 
-    auto looked_up = h.token_store->get_token(token_id);
+    auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->revoked);
 
@@ -353,7 +365,7 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)"
 
     // Store contains no token for alice — the failure path must not leak
     // a half-created row.
-    auto listing = h.token_store->list_tokens("alice");
+    auto listing = h.token_store()->list_tokens("alice").value();
     CHECK(listing.empty());
 }
 
@@ -393,7 +405,7 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure emits failure audit (
 
 TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
           "audit row via AuditStore (F-002, site 3)",
-          "[rest][token][csprng][audit]") {
+          "[pg][rest][token][csprng][audit]") {
     // The settings_routes site logs via `audit_store_->log({...})` directly
     // (the HTMX dashboard surface bypasses the `audit_fn` lambda used by
     // /api/v1/ routes). Standing up the full SettingsRoutes harness here
@@ -412,26 +424,25 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
     // expected fields. Any divergence between this row and the one the
     // handler emits would be caught by the source-level edit pattern in
     // the same commit.
-    // TempDbFile guards declared before the inner scope: the stores close on
-    // scope exit (even via a failing REQUIRE unwinding), then the guards
-    // remove the files — the old trailing fs::remove pair leaked both DBs on
-    // any assertion failure (#486).
+    // TempDbFile guard declared before the inner scope: the store closes on
+    // scope exit (even via a failing REQUIRE unwinding), then the guard
+    // removes the file — the old trailing fs::remove pair leaked the DB on
+    // any assertion failure (#486). ApiTokenStore ported to Postgres (PR
+    // 4.1) — SKIPs when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but
+    // broken.
     yuzu::test::TempDbFile audit_db{"yuzu_test_rest_api_audit-"};
-    yuzu::test::TempDbFile token_db{"yuzu_test_rest_api_csprng_store-"};
+    yuzu::test::ApiTokenStorePg token_store;
 
     {
         AuditStore audit_store(audit_db.path, /*retention_days=*/365,
                                /*cleanup_interval_min=*/0);
         REQUIRE(audit_store.is_open());
 
-        ApiTokenStore token_store(token_db.path);
-        REQUIRE(token_store.is_open());
-
         // Force CSPRNG failure on the next fill_random call (the one inside
         // generate_raw_token). This is the exact entropy-exhaustion failure
         // the production handler would observe.
         yuzu::server::test_hooks::force_next_failure_for_this_thread();
-        auto result = token_store.create_token("dashboard-token", "alice",
+        auto result = token_store->create_token("dashboard-token", "alice",
                                                /*expires_at=*/0, {}, {});
         REQUIRE_FALSE(result.has_value());
 

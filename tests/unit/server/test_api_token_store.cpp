@@ -1,37 +1,81 @@
 /**
- * test_api_token_store.cpp — Unit tests for API token authentication store
+ * test_api_token_store.cpp — Unit tests for the Postgres-backed API token
+ * authentication store (PR 4.1 port, schema `api_token_store`, ADR-0006/0012).
+ *
+ * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, FAILS when it is set
+ * but broken (test_helpers.hpp skip-vs-fail contract). Store-behaviour tests
+ * clone a pre-migrated PgTestTemplate (one migration paid across the whole
+ * file, not per test); the migration-failure test stays on plain
+ * YUZU_REQUIRE_PG_DB — it needs an unmigrated database to pre-seed a
+ * conflicting schema against.
  */
 
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"
+
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_api_token_pg_helper.hpp" // shared "apitoken" PgTestTemplate (one registration)
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+
 #include <chrono>
-#include <filesystem>
+#include <expected>
+#include <latch>
+#include <optional>
+#include <semaphore>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
-namespace {
+// The pre-migrated "apitoken" PgTestTemplate is defined once in
+// test_api_token_pg_helper.hpp (as yuzu::test::apitoken_pg_template) and shared
+// by every auth fixture TU. This file reuses it rather than registering a second
+// callback under the same key, which used to force an extra replay-verification
+// migration per suite run.
 
-// Per-test SQLite temp file. yuzu::test::TempDbFile carries the collision-safe
-// naming (process salt + atomic counter) and -wal/-shm cleanup. The previous
-// fixture salted with std::hash<std::thread::id> ^ steady_clock — the exact
-// formula behind flake #473 (constant thread-id hash under single-threaded
-// Catch2; coarse MSVC steady_clock under Defender I/O serialisation), and a
-// cross-JOB hazard on the shared-identity CI pools (#1883).
-struct TempDb : yuzu::test::TempDbFile {
-    TempDb() : TempDbFile("yuzu_test_api_tokens-") {}
-};
+// ── Construction fail-closed ──────────────────────────────────────────────
+//
+// ADR-0012 §1: construction is fail-CLOSED — a reachable database whose
+// schema can't migrate leaves the store !is_open(), which server.cpp wires
+// to startup_failed_ (refuse to start, not serve-degraded). Force the
+// failure by pre-seeding the store's schema with a conflicting table and no
+// schema_meta row: the migration runner's drift guard refuses. Mirrors
+// test_preflight_run_store.cpp's "reports !is_open on a migration failure".
+TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA api_token_store")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(), "CREATE TABLE api_token_store.api_tokens (bogus int)")};
+        REQUIRE(t.ok());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApiTokenStore store{pool};
+    CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ (fail-closed)
+}
 
-} // namespace
+// ── Regression guard: behaviour preserved verbatim across the PG port ────
 
-TEST_CASE("ApiTokenStore: create and validate token", "[token][crud]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: create and validate token", "[pg][token][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ApiTokenStore store{pool};
     REQUIRE(store.is_open());
 
     auto result = store.create_token("Test Token", "admin");
@@ -46,25 +90,28 @@ TEST_CASE("ApiTokenStore: create and validate token", "[token][crud]") {
     CHECK(validated->created_at > 0);
 }
 
-TEST_CASE("ApiTokenStore: invalid token rejected", "[token][auth]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: invalid token rejected", "[pg][token][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto validated = store.validate_token("yuzu_invalid_token_123456789012");
     CHECK(!validated.has_value());
 }
 
-TEST_CASE("ApiTokenStore: empty token rejected", "[token][auth]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: empty token rejected", "[pg][token][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto validated = store.validate_token("");
     CHECK(!validated.has_value());
 }
 
-TEST_CASE("ApiTokenStore: revoked token rejected", "[token][auth]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: revoked token rejected", "[pg][token][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto raw = store.create_token("Revocable", "admin");
     REQUIRE(raw.has_value());
@@ -74,17 +121,19 @@ TEST_CASE("ApiTokenStore: revoked token rejected", "[token][auth]") {
     REQUIRE(valid1.has_value());
 
     // Revoke
-    bool revoked = store.revoke_token(valid1->token_id);
-    CHECK(revoked);
+    auto revoked = store.revoke_token(valid1->token_id);
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
 
     // Validate after revocation
     auto valid2 = store.validate_token(*raw);
     CHECK(!valid2.has_value());
 }
 
-TEST_CASE("ApiTokenStore: expired token rejected", "[token][auth]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: expired token rejected", "[pg][token][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     // Create token that expired 1 second ago
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -97,21 +146,22 @@ TEST_CASE("ApiTokenStore: expired token rejected", "[token][auth]") {
     CHECK(!validated.has_value());
 }
 
-TEST_CASE("ApiTokenStore: list tokens", "[token][crud]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: list tokens", "[pg][token][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     store.create_token("Token A", "alice");
     store.create_token("Token B", "alice");
     store.create_token("Token C", "bob");
 
-    auto all = store.list_tokens();
+    auto all = store.list_tokens().value();
     CHECK(all.size() == 3);
 
-    auto alice_tokens = store.list_tokens("alice");
+    auto alice_tokens = store.list_tokens("alice").value();
     CHECK(alice_tokens.size() == 2);
 
-    auto bob_tokens = store.list_tokens("bob");
+    auto bob_tokens = store.list_tokens("bob").value();
     CHECK(bob_tokens.size() == 1);
 
     // Token hashes should never be exposed in listings
@@ -119,9 +169,10 @@ TEST_CASE("ApiTokenStore: list tokens", "[token][crud]") {
         CHECK(t.token_hash.empty());
 }
 
-TEST_CASE("ApiTokenStore: delete token", "[token][crud]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: delete token", "[pg][token][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto raw = store.create_token("Deletable", "admin");
     REQUIRE(raw.has_value());
@@ -129,64 +180,70 @@ TEST_CASE("ApiTokenStore: delete token", "[token][crud]") {
     auto valid = store.validate_token(*raw);
     REQUIRE(valid.has_value());
 
-    bool deleted = store.delete_token(valid->token_id);
-    CHECK(deleted);
+    auto deleted = store.delete_token(valid->token_id);
+    REQUIRE(deleted.has_value());
+    CHECK(*deleted);
 
     auto after = store.validate_token(*raw);
     CHECK(!after.has_value());
 
-    auto list = store.list_tokens();
+    auto list = store.list_tokens().value();
     CHECK(list.empty());
 }
 
-TEST_CASE("ApiTokenStore: last_used_at updated on validation", "[token][auth]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: last_used_at updated on validation", "[pg][token][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto raw = store.create_token("Usage", "admin");
     REQUIRE(raw.has_value());
 
-    auto before = store.list_tokens();
+    auto before = store.list_tokens().value();
     REQUIRE(before.size() == 1);
     CHECK(before[0].last_used_at == 0);
 
     store.validate_token(*raw);
 
-    auto after = store.list_tokens();
+    auto after = store.list_tokens().value();
     REQUIRE(after.size() == 1);
     CHECK(after[0].last_used_at > 0);
 }
 
-TEST_CASE("ApiTokenStore: empty name rejected", "[token][crud]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: empty name rejected", "[pg][token][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto result = store.create_token("", "admin");
     CHECK(!result.has_value());
 }
 
-TEST_CASE("ApiTokenStore: revoke nonexistent token", "[token][crud]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: revoke nonexistent token", "[pg][token][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
-    bool revoked = store.revoke_token("nonexistent");
-    CHECK(!revoked);
+    auto revoked = store.revoke_token("nonexistent");
+    REQUIRE(revoked.has_value()); // DB write ran fine — the id just didn't exist
+    CHECK_FALSE(*revoked);
 }
 
 // ── get_token: metadata lookup for owner-scoped revoke (#222) ────────────────
 
 TEST_CASE("ApiTokenStore: get_token returns metadata for ownership check",
-          "[token][crud][owner]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+          "[pg][token][crud][owner]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     auto raw = store.create_token("Alice's token", "alice");
     REQUIRE(raw.has_value());
-    auto listing = store.list_tokens("alice");
+    auto listing = store.list_tokens("alice").value();
     REQUIRE(listing.size() == 1);
     auto token_id = listing[0].token_id;
 
-    auto looked_up = store.get_token(token_id);
+    auto looked_up = store.get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK(looked_up->token_id == token_id);
     CHECK(looked_up->principal_id == "alice");
@@ -197,16 +254,17 @@ TEST_CASE("ApiTokenStore: get_token returns metadata for ownership check",
 }
 
 TEST_CASE("ApiTokenStore: get_token returns nullopt for unknown id",
-          "[token][crud][owner]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+          "[pg][token][crud][owner]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
-    CHECK(!store.get_token("does-not-exist").has_value());
-    CHECK(!store.get_token("").has_value());
+    CHECK(!store.get_token("does-not-exist").value().has_value());
+    CHECK(!store.get_token("").value().has_value());
 }
 
 TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
-          "[token][crud][owner]") {
+          "[pg][token][crud][owner]") {
     // Gate 4 consistency auditor finding C1: the Settings dashboard
     // `render_api_tokens_fragment` previously called list_tokens() with no
     // principal filter, rendering every user's token IDs, names, owners,
@@ -216,18 +274,19 @@ TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
     // underlying store contract the fix depends on: list_tokens(principal)
     // must return ONLY that principal's tokens, with no leakage across
     // owners.
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     REQUIRE(store.create_token("alice-a", "alice").has_value());
     REQUIRE(store.create_token("alice-b", "alice").has_value());
     REQUIRE(store.create_token("bob-a", "bob").has_value());
     REQUIRE(store.create_token("root-a", "root").has_value());
 
-    auto alice_tokens = store.list_tokens("alice");
-    auto bob_tokens = store.list_tokens("bob");
-    auto root_tokens = store.list_tokens("root");
-    auto all_tokens = store.list_tokens();
+    auto alice_tokens = store.list_tokens("alice").value();
+    auto bob_tokens = store.list_tokens("bob").value();
+    auto root_tokens = store.list_tokens("root").value();
+    auto all_tokens = store.list_tokens().value();
 
     REQUIRE(alice_tokens.size() == 2);
     REQUIRE(bob_tokens.size() == 1);
@@ -250,26 +309,1013 @@ TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
 }
 
 TEST_CASE("ApiTokenStore: get_token distinguishes owners for IDOR defense",
-          "[token][crud][owner]") {
+          "[pg][token][crud][owner]") {
     // This test encodes the core invariant that the REST DELETE handler
     // relies on to close #222: looking up a token by id must surface the
     // owning principal_id so the handler can reject cross-user revokes.
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
 
     REQUIRE(store.create_token("alice-key", "alice").has_value());
     REQUIRE(store.create_token("bob-key", "bob").has_value());
 
-    auto alice_tokens = store.list_tokens("alice");
-    auto bob_tokens = store.list_tokens("bob");
+    auto alice_tokens = store.list_tokens("alice").value();
+    auto bob_tokens = store.list_tokens("bob").value();
     REQUIRE(alice_tokens.size() == 1);
     REQUIRE(bob_tokens.size() == 1);
 
-    auto alice_looked_up = store.get_token(alice_tokens[0].token_id);
-    auto bob_looked_up = store.get_token(bob_tokens[0].token_id);
+    auto alice_looked_up = store.get_token(alice_tokens[0].token_id).value();
+    auto bob_looked_up = store.get_token(bob_tokens[0].token_id).value();
     REQUIRE(alice_looked_up.has_value());
     REQUIRE(bob_looked_up.has_value());
     CHECK(alice_looked_up->principal_id == "alice");
     CHECK(bob_looked_up->principal_id == "bob");
     CHECK(alice_looked_up->principal_id != bob_looked_up->principal_id);
+}
+
+// ── New coverage (PR 4.1): principal_kind ─────────────────────────────────
+
+TEST_CASE("ApiTokenStore: principal_kind defaults to 'human' for a row inserted without it",
+          "[pg][token][crud][principal_kind]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Bypass principal_kind entirely — the column's DEFAULT 'human' must
+    // apply, mirroring every pre-port token row (the migration adds the
+    // column with that default; existing rows never set it explicitly).
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "INSERT INTO api_token_store.api_tokens (token_id, token_hash, name, principal_id) "
+            "VALUES ($1,$2,$3,$4)",
+            std::vector<std::string>{"legacy-row", "legacy-row-hash", "Legacy Token", "admin"});
+        REQUIRE(res.ok());
+    }
+
+    auto looked_up = store.get_token("legacy-row").value();
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->principal_kind == "human");
+
+    auto listing = store.list_tokens("admin").value();
+    REQUIRE(listing.size() == 1);
+    CHECK(listing[0].principal_kind == "human");
+}
+
+// PR 4.1 keeps principal_kind INERT: `create_token` has no parameter to write
+// "engine" (that write path + its lifecycle/tier/referential checks land in
+// PR 4.2, design doc §§6-8/11), so the ONLY thing this store mints is "human".
+// The seam is proven two ways: the create path is pinned to "human", and the
+// column's CHECK is the schema-level allowlist that bounds any direct write.
+// (A previous revision of this test minted an `engine` token through
+// `create_token(..., "engine")` and asserted it round-tripped — that enshrined
+// an engine code path the attribution layer does not yet honour; removed.)
+TEST_CASE("ApiTokenStore: create_token pins principal_kind to 'human'; the CHECK bounds the column",
+          "[pg][token][crud][principal_kind]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    // Engine block prerequisites (design doc §6/§7/§8): mcp_tier must be
+    // "readonly", expires_at must be non-zero and within the 90-day ceiling,
+    // and the referent resolver must be wired — a stub reporting Active,
+    // matching how server.cpp wires the real EnginePrincipalStore.
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    auto human_raw = store.create_token("human-token", "alice");
+    REQUIRE(human_raw.has_value());
+    // The get_token/validate paths returning std::expected are covered by the
+    // dedicated PR-4.1 read tests below; here we assert both the human and the
+    // engine mint paths succeed against the wired referent check.
+    auto v = store.validate_token(*human_raw);
+    REQUIRE(v.has_value());
+    CHECK(v->principal_kind == "human");
+    auto meta = store.get_token(v->token_id).value();
+    REQUIRE(meta.has_value());
+    CHECK(meta->principal_kind == "human");
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    auto engine_raw =
+        store.create_token("engine-token", "svc-ci", now + 3600, "", "readonly", "engine");
+    REQUIRE(engine_raw.has_value());
+    auto ev = store.validate_token(*engine_raw);
+    REQUIRE(ev.has_value());
+    CHECK(ev->principal_kind == "engine");
+
+    // (b) The column CHECK is the schema-level allowlist: a direct write of a
+    // value outside ('human','engine') is rejected at the database, never
+    // silently stored. ('engine' itself is in the allowlist — it is the seam
+    // PR 4.2 will use — so we probe with a value the allowlist excludes.)
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "INSERT INTO api_token_store.api_tokens "
+            "(token_id, token_hash, name, principal_id, principal_kind) VALUES ($1,$2,$3,$4,$5)",
+            std::vector<std::string>{"bad-kind", "bad-kind-hash", "Bad Kind", "admin", "robot"});
+        CHECK_FALSE(res.ok()); // CHECK (principal_kind IN ('human','engine')) violation
+    }
+}
+
+// ── New coverage (PR 4.1): RETURNING-based mutate-and-return idiom (#1033) ─
+
+TEST_CASE("ApiTokenStore: revoke_token RETURNING contract — false for an unknown id, true "
+          "and cache-invalidated for a real one",
+          "[pg][token][crud][returning]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto miss = store.revoke_token("does-not-exist");
+    REQUIRE(miss.has_value()); // DB write ran; nothing matched (a real 404, not an error)
+    CHECK_FALSE(*miss);
+
+    auto raw = store.create_token("returning-revoke", "admin");
+    REQUIRE(raw.has_value());
+    auto validated = store.validate_token(*raw); // populates the in-memory cache
+    REQUIRE(validated.has_value());
+    CHECK(store.cache_size() == 1);
+
+    auto hit = store.revoke_token(validated->token_id);
+    REQUIRE(hit.has_value());
+    CHECK(*hit);
+    // Cache invalidation: a follow-up validate must not resurrect the
+    // pre-revoke cached (revoked=false) entry within the 60s TTL window —
+    // it must fall through to Postgres and see revoked=TRUE.
+    CHECK_FALSE(store.validate_token(*raw).has_value());
+}
+
+TEST_CASE("ApiTokenStore: delete_token RETURNING contract — false for an unknown id, true "
+          "and cache-invalidated for a real one",
+          "[pg][token][crud][returning]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    CHECK_FALSE(store.delete_token("does-not-exist").value());
+
+    auto raw = store.create_token("returning-delete", "admin");
+    REQUIRE(raw.has_value());
+    auto validated = store.validate_token(*raw);
+    REQUIRE(validated.has_value());
+
+    CHECK(store.delete_token(validated->token_id).value());
+    CHECK_FALSE(store.validate_token(*raw).has_value());
+    CHECK_FALSE(store.get_token(validated->token_id).value().has_value());
+}
+
+TEST_CASE("ApiTokenStore: revoke_for_principal returns the exact affected count and "
+          "invalidates every cached hash",
+          "[pg][token][crud][returning]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r1 = store.create_token("p1", "carol");
+    auto r2 = store.create_token("p2", "carol");
+    auto r3 = store.create_token("other-owner", "dave");
+    REQUIRE(r1.has_value());
+    REQUIRE(r2.has_value());
+    REQUIRE(r3.has_value());
+
+    // Populate the cache for all three so invalidation is actually exercised.
+    REQUIRE(store.validate_token(*r1).has_value());
+    REQUIRE(store.validate_token(*r2).has_value());
+    REQUIRE(store.validate_token(*r3).has_value());
+    CHECK(store.cache_size() == 3);
+
+    auto n = store.revoke_for_principal("carol");
+    REQUIRE(n.has_value());
+    CHECK(*n == 2);
+
+    // Carol's tokens are gone even via cache (invalidated) — not merely
+    // revoked-in-the-database-but-still-cached-valid.
+    CHECK_FALSE(store.validate_token(*r1).has_value());
+    CHECK_FALSE(store.validate_token(*r2).has_value());
+    // Dave's token, and his cache entry, are untouched.
+    CHECK(store.validate_token(*r3).has_value());
+
+    // No principal / unknown principal is a strict no-op — never a fail-open
+    // "revoked everything", and (post PR-4.1 typed result) never an error:
+    // the DB write ran and simply matched nothing.
+    auto none = store.revoke_for_principal("nobody");
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+    auto empty = store.revoke_for_principal("");
+    REQUIRE(empty.has_value()); // empty principal is an argument guard, not a DB failure
+    CHECK(*empty == 0);
+}
+
+// PR 4.1 typed-revoke contract (ADR-0030 §Posture): a revoke whose DB write
+// does NOT land must return `unexpected`, never a value that reads as "nothing
+// matched" — otherwise "Sign out everywhere" reports success during an outage.
+// Force a deterministic write failure by dropping the table out from under an
+// open store (each YUZU_REQUIRE_PG_DB_TPL test gets its own clone, so this
+// cannot bleed into another case). Before the typed result both calls returned
+// 0/false — indistinguishable from a clean "no such token", the exact silent
+// success this PR's review blocked.
+TEST_CASE("ApiTokenStore: revoke surfaces a DB write failure as unexpected, not a false 'no match'",
+          "[pg][token][crud][returning]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("victim", "erin");
+    REQUIRE(raw.has_value());
+    auto v = store.validate_token(*raw);
+    REQUIRE(v.has_value());
+
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(lease.get(), "DROP TABLE api_token_store.api_tokens",
+                                    std::vector<std::string>{});
+        REQUIRE(drop.ok());
+    }
+
+    auto single = store.revoke_token(v->token_id);
+    CHECK_FALSE(single.has_value()); // DB error → unexpected, NOT value(false)
+
+    auto bulk = store.revoke_for_principal("erin");
+    CHECK_FALSE(bulk.has_value()); // DB error → unexpected, NOT value(0)
+}
+
+// ── New coverage (PR 4.1): revoke_generation_ cache TOCTOU guard ─────────
+//
+// The header/impl comment (api_token_store.hpp/.cpp) documents the contract:
+// under the pool there is no single connection-wide mutex serializing a
+// validate_token's SELECT against a concurrent revoke_token's UPDATE the way
+// the old sqlite db_mtx_ did, so revoke_generation_ is the SOLE guard against
+// a stale (revoked=false) cache write surviving a race.
+//
+// A literal single-threaded reproduction is not possible through the public
+// API alone (there is no injection point to pause validate_token between its
+// snapshot and its cache-write re-check without a store-side test hook,
+// which is out of this port's scope). This test instead makes the race
+// reliable — not luck-dependent — by exploiting a structural asymmetry:
+// validate_token needs TWO sequential Postgres round trips (SELECT, then the
+// last_used_at UPDATE) before it reaches the generation re-check, while
+// revoke_token's generation bump is an in-memory fetch_add that runs BEFORE
+// its own single UPDATE round trip even starts. Releasing both calls from
+// the same std::latch means revoke_token's bump is essentially guaranteed to
+// land inside validate_token's window every run on any real machine (an
+// atomic increment vs. two live network round trips), so this is
+// deterministic in practice even though it is two threads, not one.
+TEST_CASE("ApiTokenStore: revoke_generation_ guard prevents a stale cache write racing a "
+          "concurrent revoke",
+          "[pg][token][auth][toctou]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("race-token", "admin");
+    REQUIRE(raw.has_value());
+    auto listing = store.list_tokens("admin").value();
+    REQUIRE(listing.size() == 1);
+    auto token_id = listing[0].token_id;
+
+    std::latch start{2};
+    std::optional<ApiToken> validated;
+    std::expected<bool, std::string> revoked;
+    std::thread t_validate([&] {
+        start.arrive_and_wait();
+        validated = store.validate_token(*raw);
+    });
+    std::thread t_revoke([&] {
+        start.arrive_and_wait();
+        revoked = store.revoke_token(token_id);
+    });
+    t_validate.join();
+    t_revoke.join();
+
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+    // Whatever validate_token itself returned for THIS race is secondary —
+    // the guard's job is that no STALE cache entry survives. Assert against
+    // the cache directly: a follow-up validate_token (strictly after both
+    // threads have joined) must never resurrect a pre-revoke "still valid"
+    // answer from a racy cache write.
+    auto after = store.validate_token(*raw);
+    CHECK_FALSE(after.has_value());
+}
+
+TEST_CASE("ApiTokenStore: the post-commit generation bump prevents a validate that read "
+          "pre-commit data from poisoning the cache",
+          "[pg][token][auth][toctou]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}}; // revoke + validate each need a lease concurrently
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("poison-token", "admin");
+    REQUIRE(raw.has_value());
+    auto id = store.list_tokens("admin").value().at(0).token_id;
+
+    // Do NOT validate raw before the race — its cache must start empty.
+
+    std::binary_semaphore first_bump_done{0};
+    std::binary_semaphore release_revoke{0};
+    std::binary_semaphore validate_selected{0};
+    std::binary_semaphore release_validate{0};
+
+    store.test_hook_after_first_revoke_bump_ = [&] {
+        first_bump_done.release(); // tell main the first bump landed
+        release_revoke.acquire();  // pause revoke here (before its UPDATE) until main lets it proceed
+    };
+    store.test_hook_after_validate_select_ = [&] {
+        validate_selected.release(); // tell main the SELECT (pre-commit read) is done
+        release_validate.acquire();  // pause validate before its generation re-check until main lets it proceed
+    };
+
+    std::expected<bool, std::string> revoked;
+    std::optional<ApiToken> validated;
+    std::thread t_revoke([&] { revoked = store.revoke_token(id); });
+    first_bump_done.acquire(); // first bump done; revoke paused before UPDATE (row still revoked=false)
+
+    std::thread t_validate([&] { validated = store.validate_token(*raw); });
+    validate_selected.acquire(); // validate snapshotted gen (post-first-bump), SELECTed revoked=false, paused before re-check
+
+    release_revoke.release(); // let revoke finish: UPDATE commit + SECOND bump + invalidate_cache
+    t_revoke.join();          // ensure revoke's invalidate ran BEFORE validate's re-check/insert
+
+    release_validate.release(); // let validate do its re-check (must observe the second bump -> skip cache write)
+    t_validate.join();
+
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+
+    // Clear hooks so the verification call runs normally.
+    store.test_hook_after_first_revoke_bump_ = nullptr;
+    store.test_hook_after_validate_select_ = nullptr;
+
+    // THE ASSERTION THAT ISOLATES THE FIX: no poisoned entry survives. Without the
+    // post-commit second bump, validate's re-check would have matched its snapshot
+    // and cached the stale revoked=false row (inserted after revoke's invalidate),
+    // and this next call would resurrect the revoked token from cache.
+    auto after = store.validate_token(*raw);
+    CHECK_FALSE(after.has_value());
+}
+
+// ── New coverage (PR 4.3): overlap-pair credential rotation, design doc §7 ─
+
+namespace {
+
+int64_t test_now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+constexpr int64_t kDay = 24 * 3600;
+constexpr int64_t k90Days = 90 * kDay;
+constexpr int64_t kDefaultOverlapSecs = 7 * kDay;
+
+// Direct-SQL peek at a token row's raw `token_hash` column — used only to
+// prove the raw secret was never persisted anywhere, not exercised through
+// the store's own (hash-masking) public API.
+std::string raw_hash_column(PgPool& pool, const std::string& token_id) {
+    auto lease = pool.acquire();
+    if (!lease)
+        return {};
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT token_hash FROM api_token_store.api_tokens WHERE token_id = $1",
+                        std::vector<std::string>{token_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return {};
+    return PQgetvalue(res.get(), 0, 0);
+}
+
+} // namespace
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects an overlap window below the 24h "
+          "floor",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    auto now = test_now_epoch();
+    // No active credential exists at all — the floor check still fires
+    // first (pure math, no DB dependency), and its message is distinct from
+    // the "no active credential" rejection.
+    auto rotated =
+        store.rotate_engine_credential("engine:rotation-floor", kDay - 1, now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error().find("floor") != std::string::npos);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential with no active credential is rejected",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    auto now = test_now_epoch();
+    auto rotated = store.rotate_engine_credential("engine:rotation-empty", kDefaultOverlapSecs,
+                                                  now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects a window exceeding the "
+          "predecessor's own expiry rather than truncating it",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-tight-expiry";
+    auto now = test_now_epoch();
+    // Predecessor expires in 1h — a 24h (floor) overlap window cannot fit
+    // before it, so the mint must be rejected, not silently shrunk.
+    auto minted =
+        store.create_token("tight", principal, now + 3600, "", "readonly", "engine");
+    REQUIRE(minted.has_value());
+
+    auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error().find("expiry") != std::string::npos);
+
+    // Rejected mint must not have minted a successor.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 1);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential mints a successor, stamps the rotation "
+          "pair, and returns the raw secret exactly once — never persisted",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-mint";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto before = store.list_active_for_principal(principal);
+    REQUIRE(before.size() == 1);
+    const std::string predecessor_id = before[0].token_id;
+
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    CHECK(rotated->starts_with("yuzu_"));
+    CHECK(*rotated != *predecessor_raw);
+
+    auto after = store.list_active_for_principal(principal);
+    REQUIRE(after.size() == 2);
+
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : after) {
+        CHECK(t.token_hash.empty()); // masked, per list_active_for_principal's contract
+        if (t.token_id == predecessor_id)
+            predecessor = &t;
+        else
+            successor = &t;
+    }
+    REQUIRE(predecessor != nullptr);
+    REQUIRE(successor != nullptr);
+
+    CHECK_FALSE(predecessor->rotation_group.empty());
+    CHECK(predecessor->rotation_group == successor->rotation_group);
+    CHECK(predecessor->overlap_expires_at == now + kDefaultOverlapSecs);
+    CHECK(successor->supersedes_token_id == predecessor->token_id);
+    CHECK(predecessor->supersedes_token_id.empty());
+
+    // The raw secret is never stored — only its SHA-256 hash.
+    auto stored_hash = raw_hash_column(pool, successor->token_id);
+    CHECK_FALSE(stored_hash.empty());
+    CHECK(stored_hash != *rotated);
+    CHECK(stored_hash.size() == 64); // hex-encoded SHA-256
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential re-serves the same raw within the grace "
+          "window, and never mints a third credential",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-reserve";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto first = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(first.has_value());
+
+    // Retry "immediately" (a lost-response / dropped-connection scenario) —
+    // must re-serve the SAME successor raw, never mint a new one, PROVIDED
+    // the retry comes from the SAME operator who initiated the rotation
+    // (Hermes F4).
+    auto retry = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(retry.has_value());
+    CHECK(*retry == *first);
+
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2); // still exactly the predecessor + one successor
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects a grace-window re-serve to a "
+          "different operator than the one who initiated the rotation",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-reserve-wrong-user";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto first = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(first.has_value());
+
+    // A DIFFERENT operator retrying within the grace window must never
+    // receive admin's in-flight successor secret (Hermes F4).
+    auto stolen = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "mallory");
+    REQUIRE_FALSE(stolen.has_value());
+    CHECK(stolen.error().find("different operator") != std::string::npos);
+
+    // The rejection did not mint a third credential, and the SAME operator
+    // can still re-serve successfully afterward.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+
+    auto retry_same_user =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(retry_same_user.has_value());
+    CHECK(*retry_same_user == *first);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential rejects a retry once the grace window has "
+          "elapsed — no third credential is ever minted",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-grace-lapsed";
+    auto now = test_now_epoch();
+    auto predecessor_raw =
+        store.create_token("svc", principal, now + k90Days, "", "readonly", "engine");
+    REQUIRE(predecessor_raw.has_value());
+
+    auto first = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(first.has_value());
+
+    // Simulate the grace window (kRotationGraceSecs, 120s) lapsing by
+    // advancing the caller-supplied `now` rather than sleeping — the epoch
+    // side of the idempotency check (now - successor.created_at) is what
+    // gates this, independent of wall-clock elapsed time.
+    auto lapsed_now = now + 300;
+    auto retry =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, lapsed_now, "admin");
+    REQUIRE_FALSE(retry.has_value());
+    CHECK(retry.error().find("grace") != std::string::npos);
+
+    // No third credential was minted by the rejected retry.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential defensively rejects when three active "
+          "credentials already exist for the principal (the ≤2 ceiling holds even against a "
+          "credential minted outside rotate)",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-over-ceiling";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("a", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("b", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("c", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 3);
+
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error().find("more than two") != std::string::npos);
+
+    // Never picks one to arbitrate — the count stays exactly 3, no fourth
+    // credential minted either.
+    CHECK(store.list_active_for_principal(principal).size() == 3);
+}
+
+// ── Hermes review (PR 4.3 round 2): F1-F5 hardening ───────────────────────
+
+TEST_CASE("ApiTokenStore: concurrent rotate_engine_credential calls for the same principal "
+          "never exceed the ≤2 active ceiling (Hermes F1)",
+          "[pg][token][rotation][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-concurrent";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Every thread races rotate_engine_credential for the SAME principal at
+    // the SAME `now`, with a distinct requesting_user each — before F1, the
+    // unlocked read-then-mint let multiple threads all observe 1-active and
+    // all mint, blowing the ≤2 ceiling. std::latch lines every thread up at
+    // the starting gun so they hit the advisory lock as concurrently as the
+    // test process can arrange.
+    constexpr int kThreads = 6;
+    std::latch start_latch{kThreads};
+    std::vector<std::thread> threads;
+    std::mutex results_mtx;
+    std::vector<std::expected<std::string, std::string>> results;
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i]() {
+            start_latch.arrive_and_wait();
+            auto r = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now,
+                                                     "operator-" + std::to_string(i));
+            std::lock_guard lock(results_mtx);
+            results.push_back(std::move(r));
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    // Exactly ONE thread's call is the 1-active mint winner — every other
+    // thread's call is serialized behind the advisory lock and, upon its
+    // own re-read, sees 2-active. Since every thread used a DIFFERENT
+    // requesting_user, none of the losers share the winner's identity, so
+    // F4's binding rejects every one of them (never a silent re-serve to
+    // the wrong caller, and never a THIRD mint).
+    int successes = 0;
+    for (const auto& r : results) {
+        if (r.has_value())
+            ++successes;
+        else
+            CHECK(r.error().find("different operator") != std::string::npos);
+    }
+    CHECK(successes == 1);
+
+    // The ≤2 ceiling holds under concurrency — never 3.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential never leaves an orphaned rotation pair — "
+          "mint and pair-stamp always commit together (Hermes F2)",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-no-orphan";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    // Every row with a non-empty rotation_group must have exactly one
+    // sibling sharing it (predecessor + successor) — never a lone stamped
+    // row, which would mean the INSERT committed without the pair-stamp (or
+    // vice versa).
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    CHECK_FALSE(active[0].rotation_group.empty());
+    CHECK(active[0].rotation_group == active[1].rotation_group);
+
+    const ApiToken* predecessor = active[0].supersedes_token_id.empty() ? &active[0] : &active[1];
+    const ApiToken* successor = active[0].supersedes_token_id.empty() ? &active[1] : &active[0];
+    CHECK(predecessor->overlap_expires_at > 0);
+    CHECK(successor->supersedes_token_id == predecessor->token_id);
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: rolls back the predecessor's revoke when "
+          "the successor's rotation-state clear fails — neither half applies (Hermes F3)",
+          "[pg][token][rotation][sweep]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-sweep-rollback";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : active) {
+        if (t.supersedes_token_id.empty())
+            predecessor = &t;
+        else
+            successor = &t;
+    }
+    REQUIRE(predecessor != nullptr);
+    REQUIRE(successor != nullptr);
+    const std::string predecessor_id = predecessor->token_id;
+    const std::string successor_id = successor->token_id;
+    const std::string rotation_group = predecessor->rotation_group;
+
+    // Force the successor's rotation-state clear to fail with a genuine SQL
+    // execution error (never merely a zero-row match) — a BEFORE UPDATE
+    // trigger that raises only when THIS successor's rotation_group is
+    // being cleared. Scoped to this test's own cloned database (PgTestTemplate),
+    // so it can't leak into any other test.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string fn_sql =
+            "CREATE OR REPLACE FUNCTION api_token_store.f3_force_clear_fail() "
+            "RETURNS trigger AS $$ BEGIN IF NEW.token_id = '" +
+            successor_id +
+            "' AND NEW.rotation_group = '' THEN "
+            "RAISE EXCEPTION 'F3 test: forced clear failure'; END IF; RETURN NEW; END; $$ "
+            "LANGUAGE plpgsql;";
+        PgResult fn_res{PQexec(conn.get(), fn_sql.c_str())};
+        REQUIRE(fn_res.ok());
+        PgResult trig_res{PQexec(
+            conn.get(),
+            "CREATE TRIGGER f3_force_clear_fail BEFORE UPDATE ON api_token_store.api_tokens "
+            "FOR EACH ROW EXECUTE FUNCTION api_token_store.f3_force_clear_fail();")};
+        REQUIRE(trig_res.ok());
+    }
+
+    // AFTER the overlap window elapses, sweep attempts to revoke the
+    // predecessor + clear the successor together in one transaction — the
+    // clear fails, so NEITHER change may commit.
+    auto swept = store.sweep_expired_rotations(now + kDay + 1);
+    CHECK(swept.empty());
+
+    auto predecessor_after = store.get_token(predecessor_id).value();
+    REQUIRE(predecessor_after.has_value());
+    CHECK_FALSE(predecessor_after->revoked); // rolled back — NOT revoked
+
+    auto successor_after = store.get_token(successor_id).value();
+    REQUIRE(successor_after.has_value());
+    CHECK_FALSE(successor_after->rotation_group.empty()); // rolled back — still linked
+    CHECK(successor_after->rotation_group == rotation_group);
+
+    // Idempotent: re-running the (still-failing) sweep doesn't corrupt
+    // anything further — same clean rollback each time.
+    auto swept_again = store.sweep_expired_rotations(now + kDay + 2);
+    CHECK(swept_again.empty());
+    auto predecessor_still = store.get_token(predecessor_id).value();
+    REQUIRE(predecessor_still.has_value());
+    CHECK_FALSE(predecessor_still->revoked);
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation cuts over immediately — revokes the predecessor, "
+          "sets confirmed_at, and clears the successor's rotation state (Hermes F5)",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    auto before = store.list_active_for_principal(principal);
+    REQUIRE(before.size() == 2);
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : before) {
+        if (t.supersedes_token_id.empty())
+            predecessor = &t;
+        else
+            successor = &t;
+    }
+    REQUIRE(predecessor != nullptr);
+    REQUIRE(successor != nullptr);
+    const std::string predecessor_id = predecessor->token_id;
+    const std::string successor_id = successor->token_id;
+
+    auto confirmed = store.confirm_rotation(principal, "admin");
+    REQUIRE(confirmed.has_value());
+
+    auto predecessor_after = store.get_token(predecessor_id).value();
+    REQUIRE(predecessor_after.has_value());
+    CHECK(predecessor_after->revoked); // immediate cutover, not "wait for the window"
+
+    auto successor_after = store.get_token(successor_id).value();
+    REQUIRE(successor_after.has_value());
+    CHECK_FALSE(successor_after->revoked);
+    CHECK(successor_after->confirmed_at > 0); // the previously-dead column, now live
+    CHECK(successor_after->rotation_group.empty());
+    CHECK(successor_after->supersedes_token_id.empty());
+    CHECK(successor_after->overlap_expires_at == 0);
+
+    // Exactly one active credential remains — the confirmed successor.
+    auto active_after = store.list_active_for_principal(principal);
+    REQUIRE(active_after.size() == 1);
+    CHECK(active_after[0].token_id == successor_id);
+
+    // A fresh rotation may now begin (the pair fully resolved).
+    auto next_rotate =
+        store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    CHECK(next_rotate.has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initiate the "
+          "rotation (Hermes F4/F5 binding)",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-wrong-user";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    auto stolen_confirm = store.confirm_rotation(principal, "mallory");
+    REQUIRE_FALSE(stolen_confirm.has_value());
+    CHECK(stolen_confirm.error().find("different operator") != std::string::npos);
+
+    // Rejected — both credentials remain exactly as rotate left them.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+    for (const auto& t : active)
+        CHECK(t.confirmed_at == 0);
+
+    // The SAME operator who initiated it can still confirm afterward.
+    auto real_confirm = store.confirm_rotation(principal, "admin");
+    CHECK(real_confirm.has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation with no in-flight rotation is rejected",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-none";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Only one active credential — nothing to confirm.
+    auto confirmed = store.confirm_rotation(principal, "admin");
+    REQUIRE_FALSE(confirmed.has_value());
+}
+
+// ── Manual revoke resolves the rotation pair (design §7, PR #2284 review Major 3) ──
+
+TEST_CASE("ApiTokenStore: revoking a rotation PREDECESSOR resolves the pair — the successor "
+          "becomes a standalone active credential",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:revoke-predecessor";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    const std::string predecessor_id = store.list_active_for_principal(principal).at(0).token_id;
+    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin").has_value());
+
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (t.token_id != predecessor_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    auto revoked = store.revoke_token(predecessor_id);
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+
+    // The successor is now the sole active credential with its rotation state cleared.
+    auto after = store.list_active_for_principal(principal);
+    REQUIRE(after.size() == 1);
+    CHECK(after[0].token_id == successor_id);
+    CHECK(after[0].rotation_group.empty());
+    CHECK(after[0].supersedes_token_id.empty());
+    CHECK(after[0].overlap_expires_at == 0);
+}
+
+TEST_CASE("ApiTokenStore: revoking a rotation SUCCESSOR clears the predecessor's rotation state so "
+          "the sweep does NOT auto-revoke the principal's last credential",
+          "[pg][token][rotation][sweep]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:revoke-successor";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    const std::string predecessor_id = store.list_active_for_principal(principal).at(0).token_id;
+    // Short overlap so the sweep would fire after now+kDay.
+    REQUIRE(store.rotate_engine_credential(principal, kDay, now, "admin").has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (t.token_id != predecessor_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Revoke the SUCCESSOR — the predecessor is now the only credential.
+    auto revoked = store.revoke_token(successor_id);
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked);
+
+    // Predecessor's rotation state is cleared (overlap_expires_at -> 0) so it is
+    // no longer a sweep target.
+    auto pred = store.get_token(predecessor_id);
+    REQUIRE(pred.has_value());
+    REQUIRE(pred->has_value());
+    CHECK_FALSE((*pred)->revoked);
+    CHECK((*pred)->overlap_expires_at == 0);
+    CHECK((*pred)->rotation_group.empty());
+
+    // Run the sweep AFTER the original overlap window would have elapsed. Without
+    // the §7 fix the sweep would auto-revoke the predecessor as
+    // "overlap_window_elapsed", leaving the principal with ZERO credentials.
+    bool tick_failed = false;
+    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
+    CHECK_FALSE(tick_failed);
+    CHECK(swept.empty()); // nothing to auto-revoke — the pair was already resolved
+
+    auto still = store.get_token(predecessor_id);
+    REQUIRE(still.has_value());
+    REQUIRE(still->has_value());
+    CHECK_FALSE((*still)->revoked); // predecessor survives — principal keeps a credential
+    CHECK(store.list_active_for_principal(principal).size() == 1);
 }

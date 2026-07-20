@@ -135,6 +135,10 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_journal_format.cpp',
+    'unit/test_guardian_lifecycle_journal.cpp',
+    'unit/test_guardian_journal_heartbeat.cpp',
+    'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -152,11 +156,28 @@ agent_test_exe = executable(
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
     'unit/test_shutdown_pipe.cpp',
+    'unit/test_hard_exit.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
+    'unit/test_spark_key_rule_index.cpp',
     'unit/test_spark_mechanism.cpp',
+    'unit/test_guardian_spark_bridge.cpp',
+    'unit/test_guardian_spark_backend.cpp',
+    'unit/test_guardian_emit_decider.cpp',
+    'unit/test_guardian_rule_eval.cpp',
+    'unit/test_guardian_drift_event.cpp',
+    'unit/test_guardian_scope_guard.cpp',
+    'unit/test_guardian_outbox.cpp',
+    'unit/test_guardian_spark_send.cpp',
+    'unit/test_guardian_spark_runtime.cpp',
+    'unit/test_guardian_state_reader.cpp',
+    'unit/test_guardian_convergence_scheduler.cpp',
+    'unit/test_guardian_io_executor.cpp',
+    'unit/test_guardian_outbox_drain_worker.cpp',
+    'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
+    'unit/test_firewall_parsers.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -169,14 +190,17 @@ agent_test_exe = executable(
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
+    'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -342,6 +366,12 @@ if build_server
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_engine_principal_store.cpp',
+      'unit/server/test_engine_principal_integration.cpp',
+      'unit/server/test_rest_engine_principal_roles.cpp',
+      'unit/server/test_mcp_engine_principal_roles.cpp',
+      'unit/server/test_engine_principal_lifecycle.cpp',
+      'unit/server/test_engine_store_error_class.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
@@ -355,6 +385,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',
@@ -558,6 +589,17 @@ test('changelog order',
   timeout: 10,
 )
 
+# Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
+# parser fixtures (incl. PR #1711, the canonical negated close) + the decision
+# ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes
+# always run the heavy platform jobs, so meson coverage alone is sufficient.
+test('close automation logic',
+  _python3_test,
+  args: [files('test_close_automation.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit
 # parsing, budget rows). Wired here (#2092) so the shard-retry contract the
 # server entries above rely on is enforced on every platform, not just when
@@ -565,6 +607,26 @@ test('changelog order',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Issue-lifecycle hygiene (ADR-3001 A1): CLAUDE.md character budget,
+# do-not-close.txt parses clean (the never-close guard every automated close
+# path reads), and issue-standard.md keeps its never-close section.
+test('issue lifecycle docs',
+  _python3_test,
+  args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
+# flake recoveries land in the persistent per-runner test-runs.db.
+test('ci telemetry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_ci_telemetry.py')],
   suite: 'docs',
   timeout: 30,
 )

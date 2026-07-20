@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <iterator>
 #include <optional>
 #include <string_view>
@@ -144,6 +145,12 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
     if (register_race_hook_for_test_)
         register_race_hook_for_test_();
     bool inserted = false;
+    // Captures an emplace() throw (e.g. bad_alloc) rather than letting it
+    // propagate straight out of the locked block: `consumer` going out of
+    // scope with its thread still joinable would call std::terminate before
+    // this function's caller ever sees the exception (Sol rung-7.5 review
+    // finding 2). Quiesced + rethrown below, OUTSIDE consumers_mu_.
+    std::exception_ptr emplace_exception;
     {
         std::lock_guard lk(consumers_mu_);
         // Re-check: stop() can land between the stopped_ check above and this
@@ -155,9 +162,17 @@ SparkEngine::register_consumer(std::string name, QueuedHandler handler, std::siz
         // "register safe from any thread" contract (governance Tr3kkR finding,
         // PR #1927 review).
         if (!stopped_) {
-            consumers_.emplace(id, consumer);
-            inserted = true;
+            try {
+                consumers_.emplace(id, consumer);
+                inserted = true;
+            } catch (...) {
+                emplace_exception = std::current_exception();
+            }
         }
+    }
+    if (emplace_exception) {
+        quiesce_consumer(consumer);
+        std::rethrow_exception(emplace_exception);
     }
     if (!inserted) {
         // Lost the race: quiesce the just-started thread ourselves, exactly as
