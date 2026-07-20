@@ -66,9 +66,10 @@ found"** on a host that is a swiss-cheese of unpatched CVEs. That is not a cover
 
 **A vulnerability finding is tri-state, and coverage is tracked as a dimension separate from
 vulnerability status.** *(This tri-state model is superseded below by two amendments — 2026-07-05
-adds a fourth `potential` status, still shipped/current; 2026-07-12 proposes a different four-state
-replacement for the UCE module, not yet ratified. This original text is left as the decision
-history and is not the current shipped model on its own.)*
+adds a fourth `potential` status, still the accepted/ratified vocabulary as opposed to the 2026-07-12
+amendment (proposed, not yet ratified); "accepted" here is ratification status, not a production-
+liveness claim — see the reading guide above for that distinction. This original text is left as the
+decision history and is not the current shipped model on its own.)*
 
 1. **Per-`(host, package)` status is one of three values:**
    - **Vulnerable** — matched an advisory in a covering feed.
