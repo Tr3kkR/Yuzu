@@ -191,6 +191,7 @@ agent_test_exe = executable(
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_installed_apps_macos_enrich.cpp',  # #2273/1.10: pure system_profiler -json enrich parse
+    'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -203,6 +204,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
     include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
     include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
+    include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly

@@ -346,7 +346,7 @@ TEST_CASE("run_bounded_subprocess serializes pipe-creation-through-fork so a con
     threads.reserve(kNumThreads);
 
     for (unsigned t = 0; t < kNumHostThreads; ++t) {
-        threads.emplace_back([&sync_point]() {
+        threads.emplace_back([&]() {
             // Leak host: outlives every victim's deadline, so if it ends up
             // holding a victim's write end open (the race), the victim is
             // starved for the host's whole runtime, not just a few

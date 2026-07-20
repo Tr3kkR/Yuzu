@@ -14,6 +14,8 @@
  *   event|timestamp|level|event_id|source|message
  */
 
+#include "event_logs_macos.hpp"
+
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
 
@@ -177,43 +179,14 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
         argv, yuzu::agent::SubprocessOptions{
                   .deadline = kLogShowDeadline, .max_lines = kMaxLines, .merge_stderr = false});
 
-    auto emit_error_line = [&ctx](const std::string& line) {
-        // Compact format: "timestamp  process[pid]  message"
-        auto first_space = line.find("  ");
-        if (first_space == std::string::npos) {
-            ctx.write_output(std::format("error|{}|-|{}", line, line));
-            return;
-        }
-        auto timestamp = line.substr(0, first_space);
-        auto rest = line.substr(first_space + 2);
-        auto second_space = rest.find("  ");
-        std::string process = "-";
-        std::string message = rest;
-        if (second_space != std::string::npos) {
-            process = rest.substr(0, second_space);
-            message = rest.substr(second_space + 2);
-        }
-        if (message.size() > 200)
-            message = message.substr(0, 200);
-        ctx.write_output(std::format("error|{}|{}|{}", timestamp, process, message));
-    };
-
-    if (result.timed_out) {
-        // Never masquerade a timeout as an empty success: emit whatever
-        // partial lines were collected before the deadline, then an honest
-        // incomplete-query row in the same 4-column shape.
-        for (const auto& line : result.lines)
-            emit_error_line(line);
-        ctx.write_output("error|timeout|-|log show timed out before completing");
-        return 1;
-    }
-
-    if (result.lines.empty()) {
-        ctx.write_output("error|none|-|No error events found");
-        return 0;
-    }
-    for (const auto& line : result.lines)
-        emit_error_line(line);
+    // decide_log_show_output is the single source of truth for the
+    // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
+    // calls it and emits whatever it returns.
+    auto decision = yuzu::event_logs_macos::decide_log_show_output(result, "error",
+                                                                     "No error events found");
+    for (const auto& row : decision.rows)
+        ctx.write_output(row);
+    return decision.rc;
 
 #else
     ctx.write_output("error|platform not supported|-|-");
@@ -316,42 +289,14 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                                               .max_lines = static_cast<std::size_t>(count),
                                               .merge_stderr = false});
 
-    auto emit_event_line = [&ctx](const std::string& line) {
-        auto first_space = line.find("  ");
-        if (first_space == std::string::npos) {
-            ctx.write_output(std::format("event|{}|-|{}", line, line));
-            return;
-        }
-        auto timestamp = line.substr(0, first_space);
-        auto rest = line.substr(first_space + 2);
-        auto second_space = rest.find("  ");
-        std::string process = "-";
-        std::string message = rest;
-        if (second_space != std::string::npos) {
-            process = rest.substr(0, second_space);
-            message = rest.substr(second_space + 2);
-        }
-        if (message.size() > 200)
-            message = message.substr(0, 200);
-        ctx.write_output(std::format("event|{}|{}|{}", timestamp, process, message));
-    };
-
-    if (result.timed_out) {
-        // Never masquerade a timeout as an empty success: emit whatever
-        // partial lines were collected before the deadline, then an honest
-        // incomplete-query row in the same 4-column shape.
-        for (const auto& line : result.lines)
-            emit_event_line(line);
-        ctx.write_output("event|timeout|-|log show timed out before completing");
-        return 1;
-    }
-
-    if (result.lines.empty()) {
-        ctx.write_output("event|none|-|No matching events found");
-        return 0;
-    }
-    for (const auto& line : result.lines)
-        emit_event_line(line);
+    // decide_log_show_output is the single source of truth for the
+    // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
+    // calls it and emits whatever it returns.
+    auto decision = yuzu::event_logs_macos::decide_log_show_output(result, "event",
+                                                                     "No matching events found");
+    for (const auto& row : decision.rows)
+        ctx.write_output(row);
+    return decision.rc;
 
 #else
     ctx.write_output("error|platform not supported");
