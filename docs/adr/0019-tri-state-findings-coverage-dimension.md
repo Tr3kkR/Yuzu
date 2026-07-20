@@ -21,10 +21,12 @@ amended: 2026-07-05 (correlation-engine grill-with-docs session) — adds a four
 > sample. Frontmatter `status: accepted` records this ADR's own acceptance, not a claim that a running
 > production control exists. (3) The 2026-07-12 Amendment is a **proposed** four-state
 > model (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) + provenance tier for the not-yet-built Vulnerability
-> Management UCE module — **not yet ratified.** This docs PR itself ran a 9-agent `/governance`
-> pass (docs-only, Gate 5 skipped), but that is not the same leg: the amendment has **not been shown
-> to @FortitudeEtc**, and the code that implements it has **not been through `/governance` on its own
-> implementing PR**, nor shipped anywhere. Do not cite (3) as current behavior.
+> Management UCE module — **not yet ratified.** This docs PR itself has been through this project's
+> `/governance` review process (docs-only; Gate 3 domain-triggered agents not applicable, no code
+> touched; Gate 5 skipped, no injectable runtime fault), but that is not the same leg: the amendment
+> has **not been shown to @FortitudeEtc**, and the code that implements it has **not been through
+> `/governance` on its own implementing PR**, nor shipped anywhere. Do not cite (3) as current
+> behavior.
 
 > Crystallised in the 2026-07-01 grill-with-docs session. Records *what a scan result means* for a
 > package the feeds do not cover — the difference between "we looked and it's clean" and "we never
