@@ -435,6 +435,9 @@ std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneratio
         // A repeat Unknown while already errored produces NO entry here (the caller counts it
         // via unhealthy_suppressed_) - convergence re-evaluates a stuck rule every ~5s to catch
         // recovery, but must not re-mint a fresh health event each tick (fleet ingest flood).
+        // NOTE: the emitted health_detail is this episode's FIRST read-error string; a reason
+        // that changes across suppressed re-evals while still Unknown (EACCES -> ENODEV) is not
+        // re-surfaced until recovery starts a new episode. Accepted trade for the flood fix.
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
                                         /*healthy=*/false, out.health_detail, gtype, rname));
     // Silent, a suppressed repeat-Unknown, + !recovered -> empty (nothing to publish).

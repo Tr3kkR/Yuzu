@@ -46,6 +46,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
@@ -2004,8 +2005,10 @@ public:
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted and each suppressed repeat is counted, so the
                                 // suppression is observable (not silent). Sparse: non-zero only.
-                                if (const auto us = guardian_->unhealthy_suppressed(); us != 0)
-                                    tags["yuzu.guardian_unhealthy_suppressed"] = std::to_string(us);
+                                // Key pinned in guardian_health_heartbeat.hpp (drift-proofs the
+                                // #2298 server-side rollup reader).
+                                emit_guardian_health_heartbeat_tags(tags,
+                                                                    guardian_->unhealthy_suppressed());
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —

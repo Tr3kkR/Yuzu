@@ -481,7 +481,13 @@ TEST_CASE("Unknown flood guard: repeat errored evals emit one health(false), cou
     // Unknown emits a fresh health(false), and the suppression counter is untouched by it.
     r->file = read_known(FileSnapshot{.exists = true});
     rt->evaluate_key(key, EvalReason::Event);
-    REQUIRE_FALSE(drain_all(*rt).empty());
+    const auto recovered = drain_all(*rt);
+    // Precisely: recovery MUST emit a guard.healthy (Health domain, healthy=true), not merely
+    // "some entry" — a regression that dropped health(true) on recovery would leave the health
+    // stream stuck errored forever (qa Gate-3 SHOULD).
+    REQUIRE(std::any_of(recovered.begin(), recovered.end(), [](const OutboxEntry& e) {
+        return e.domain == OutboxDomain::Health && e.healthy;
+    }));
     r->file = read_unknown<FileSnapshot>("io");
     rt->evaluate_key(key, EvalReason::Event);
     REQUIRE(drain_all(*rt).size() == 1);
@@ -523,6 +529,31 @@ TEST_CASE("Unknown edge rejected at outbox cap is retried, never counted as supp
     rt->evaluate_key(kc, EvalReason::Convergence);
     REQUIRE(drain_all(*rt).size() == 1);      // the edge health(false) finally delivered, not lost
     REQUIRE(rt->unhealthy_suppressed() == 0); // still an edge, never a suppression
+}
+
+TEST_CASE("Unknown flood guard: two rules on one key each count suppression independently (M1)",
+          "[spark][runtime]") {
+    // The counter increments PER RULE inside the per-key eval loop, not once per key. A refactor
+    // that hoisted the increment outside the loop would silently under-count a multi-rule key
+    // (qa Gate-3 SHOULD). Two rules share one spark_key; both go Unknown together.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    // First pass: both rules edge -> two health(false) on the wire, nothing suppressed.
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 2);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // Second pass: both rules repeat -> no wire entries, +2 suppressed (one per rule, not one
+    // per key).
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 2);
 }
 
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
