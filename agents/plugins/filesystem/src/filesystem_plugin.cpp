@@ -8,7 +8,11 @@
  *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
  *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
  *   "search_dir"      — Find directories/files by name pattern (glob/regex).
- *   "get_version_info" — Extract PE version resource info (Windows only).
+ *   "get_signature"   — Verify a code signature: Authenticode on Windows
+ *                        (WinVerifyTrust), codesign on macOS.
+ *   "get_version_info" — Extract version info: PE version resource on
+ *                        Windows, Info.plist (CFBundleShortVersionString /
+ *                        CFBundleVersion) via plutil on macOS.
  *   "search"          — Search file contents for a pattern.
  *   "replace"         — Find/replace text in a file (atomic write).
  *   "write_content"   — Write or overwrite file contents.
@@ -32,6 +36,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp>
 
 #include <algorithm>
 #include <array>
@@ -73,6 +78,11 @@
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (#2273)
+#include "filesystem_macos_sig.hpp"         // yuzu::filesystem_macos classifiers
 #endif
 
 namespace {
@@ -391,6 +401,46 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
     if (ec) { fs::remove(tmp, ec); return false; }
     return true;
 }
+
+#ifdef __APPLE__
+// ── get_version_info (macOS): Info.plist path selection ────────────────
+// `validated` is already base_dir-validated by the caller (validate_path
+// above) and may be a .app bundle directory or a direct Info.plist file.
+// Returns the FINAL path plutil will read, itself canonicalized and
+// re-validated against base_dir (PLAN-08) -- the caller only validated the
+// bundle directory, but the DERIVED Contents/Info.plist inside it can be a
+// symlink that resolves outside base_dir, and that escape must be caught
+// before plutil ever opens it. Empty return means "no plist to read"
+// (honest not_available), never a fabricated path.
+std::string select_info_plist(const std::string& validated, std::string_view base_dir) {
+    fs::path vpath(validated);
+    std::error_code ec;
+    std::string candidate;
+    if (fs::is_directory(vpath, ec) && vpath.extension() == ".app") {
+        candidate = (vpath / "Contents" / "Info.plist").string();
+    } else if (vpath.filename() == "Info.plist") {
+        candidate = validated;
+    } else {
+        return {};
+    }
+
+    return validate_path(candidate, base_dir);
+}
+
+// plutil hands back the plist value verbatim -- an untrusted Info.plist can
+// embed a pipe or a CR/LF into CFBundleShortVersionString/CFBundleVersion,
+// which would otherwise corrupt the pipe-delimited output framing (read as
+// extra columns/rows downstream). Escape pipes and fold line breaks to
+// spaces before the value ever reaches write_output.
+std::string safe_output_field(std::string_view value) {
+    auto out = yuzu::util::escape_pipes(value);
+    for (char& ch : out) {
+        if (ch == '\r' || ch == '\n')
+            ch = ' ';
+    }
+    return out;
+}
+#endif // __APPLE__
 
 } // namespace
 
@@ -1017,8 +1067,33 @@ private:
         WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_id, &trust_data);
 
         return 0;
+#elif defined(__APPLE__)
+        // codesign --verify --deep --strict is the macOS analogue of
+        // WinVerifyTrust: it walks the whole bundle (or a lone Mach-O) and
+        // fails on ANY broken seal, not just a missing top-level signature.
+        // Its status vocabulary is deliberately its OWN honest enum (see
+        // filesystem_macos_sig.hpp) -- reusing the Windows Authenticode
+        // strings here would misrepresent a codesign verdict as a
+        // WinVerifyTrust one.
+        auto run = yuzu::agent::run_bounded_subprocess(
+            {"codesign", "--verify", "--deep", "--strict", validated},
+            yuzu::agent::SubprocessOptions{.merge_stderr = true});
+
+        // PLAN-02: a codesign killed at the deadline can still have
+        // tool_ran=true, a nonzero exit_code, and partial stderr diagnostics
+        // captured before the SIGKILL -- classify_codesign_result would read
+        // that as a genuine "invalid" verdict. Short-circuit to unknown
+        // BEFORE classify so a timed-out run is never reported as a broken
+        // signature.
+        auto status = run.timed_out
+            ? yuzu::filesystem_macos::SignatureStatus::unknown
+            : yuzu::filesystem_macos::classify_codesign_result(run.tool_ran, run.exit_code,
+                                                                run.output);
+        ctx.write_output(
+            std::format("signature_status|{}", yuzu::filesystem_macos::to_string(status)));
+        return 0;
 #else
-        ctx.write_output("error|Authenticode signature verification is not supported on this platform");
+        ctx.write_output("error|code signature verification is not supported on this platform");
         return 1;
 #endif
     }
@@ -1209,8 +1284,62 @@ private:
         }
 
         return 0;
+#elif defined(__APPLE__)
+        // macOS has no PE version resource; the nearest equivalent is the
+        // bundle's Info.plist, read via `plutil -extract ... raw -o -`.
+        // plutil handles BOTH binary (bplist00) and XML plists natively, so
+        // no bplist parsing is needed here. `validated` must resolve to
+        // either a .app bundle directory or an Info.plist file directly --
+        // anything else, or a bundle whose derived Info.plist escapes
+        // base_dir (PLAN-08), honestly reports not_available rather than
+        // fabricating a version.
+        auto info_plist = select_info_plist(validated, base_dir);
+        if (info_plist.empty()) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        // CFBundleShortVersionString is the user-visible "marketing"
+        // version (n.n.n) -- the closest analogue of Windows ProductVersion.
+        auto short_ver_run = yuzu::agent::run_bounded_subprocess(
+            {"plutil", "-extract", "CFBundleShortVersionString", "raw", "-o", "-", info_plist},
+            yuzu::agent::SubprocessOptions{});
+
+        // CFBundleVersion is the machine-readable, monotonically increasing
+        // build number -- the closest analogue of Windows FileVersion.
+        auto build_ver_run = yuzu::agent::run_bounded_subprocess(
+            {"plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist},
+            yuzu::agent::SubprocessOptions{});
+
+        // PLAN-02: a plutil run killed at the deadline is honest-absent,
+        // never handed to classify_plutil_extract (which would otherwise
+        // trust its exit_code/output as if the run had actually finished).
+        yuzu::filesystem_macos::PlutilExtractResult short_ver;
+        if (!short_ver_run.timed_out) {
+            short_ver = yuzu::filesystem_macos::classify_plutil_extract(
+                short_ver_run.tool_ran, short_ver_run.exit_code, short_ver_run.output);
+        }
+        yuzu::filesystem_macos::PlutilExtractResult build_ver;
+        if (!build_ver_run.timed_out) {
+            build_ver = yuzu::filesystem_macos::classify_plutil_extract(
+                build_ver_run.tool_ran, build_ver_run.exit_code, build_ver_run.output);
+        }
+
+        if (!short_ver.available && !build_ver.available) {
+            ctx.write_output("version_status|not_available");
+            return 0;
+        }
+
+        if (short_ver.available)
+            ctx.write_output(
+                std::format("product_version|{}", safe_output_field(short_ver.value)));
+        if (build_ver.available)
+            ctx.write_output(
+                std::format("file_version|{}", safe_output_field(build_ver.value)));
+
+        return 0;
 #else
-        ctx.write_output("error|PE version info is only available on Windows");
+        ctx.write_output("error|version info extraction is not supported on this platform");
         return 1;
 #endif
     }
