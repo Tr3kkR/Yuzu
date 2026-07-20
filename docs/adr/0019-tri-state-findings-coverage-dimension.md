@@ -21,8 +21,10 @@ amended: 2026-07-05 (correlation-engine grill-with-docs session) — adds a four
 > sample. Frontmatter `status: accepted` records this ADR's own acceptance, not a claim that a running
 > production control exists. (3) The 2026-07-12 Amendment is a **proposed** four-state
 > model (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) + provenance tier for the not-yet-built Vulnerability
-> Management UCE module — **not yet ratified, not through `/governance`, not shown to
-> @FortitudeEtc, and not shipped anywhere.** Do not cite (3) as current behavior.
+> Management UCE module — **not yet ratified.** This docs PR itself ran a 9-agent `/governance`
+> pass (docs-only, Gate 5 skipped), but that is not the same leg: the amendment has **not been shown
+> to @FortitudeEtc**, and the code that implements it has **not been through `/governance` on its own
+> implementing PR**, nor shipped anywhere. Do not cite (3) as current behavior.
 
 > Crystallised in the 2026-07-01 grill-with-docs session. Records *what a scan result means* for a
 > package the feeds do not cover — the difference between "we looked and it's clean" and "we never
@@ -182,25 +184,27 @@ and standing on `dev` since 2026-07-01 without objection.
 assessment / provenance tier, Vulnerability Management UCE module) is **not** covered by the acceptance
 above. Per the same convention, this is a named sign-off leg recorded after 2026-07-09 and therefore
 governs regardless of the document's overall `status: accepted`: the Amendment remains **proposed,
-unratified** until it has been through `/governance` and reviewed by @FortitudeEtc. Do not treat this
-document's frontmatter `status: accepted` as covering that Amendment.
+unratified** until it has been reviewed by @FortitudeEtc and its implementing PR has been through its
+own `/governance` pass. Do not treat this document's frontmatter `status: accepted` as covering that
+Amendment.
 
 ## Amendment — 2026-07-12: a four-state assessment (OPEN/FIXED/NOT-APPLICABLE/UNKNOWN) supersedes `potential`; `provenance tier` replaces `confidence`
 
 > Written during the Vulnerability Management use-case-engine (UCE) module design
-> (`VULN_UCE_MODULE_DESIGN.md`, ADR-1005 Decision 6 / `docs/adr-1005-execution-plan.md` Phase 2d),
-> informed by the adversarially-reviewed CVE-matching research (`CVE_MATCHING_STRATEGY_ARBITRATED.md`,
-> 25 accept/5 partial/0 reject). `potential` (2026-07-05 amendment, above) was scaffolding for a
-> specific in-server sequencing problem: ADR-0023's M1a shipped NVD-fallback-only, before OVAL
+> (`VULN_UCE_MODULE_DESIGN.md`, itself an untracked working draft, not yet reviewed as a production
+> artefact — ADR-1005 Decision 6 / `docs/adr-1005-execution-plan.md` Phase 2d), informed by the
+> adversarially-reviewed CVE-matching research (`CVE_MATCHING_STRATEGY_ARBITRATED.md`, likewise an
+> untracked working draft, 25 accept/5 partial/0 reject). `potential` (2026-07-05 amendment, above)
+> was scaffolding for a specific in-server sequencing problem: ADR-0023's M1a shipped NVD-fallback-only, before OVAL
 > (Lane 1's real backport-aware source) existed, so it needed a hedge state to avoid asserting
 > `Vulnerable` on an NVD-on-distro hit that backporting could invalidate. The module carries no such
 > constraint — it can build the regime-split, tracker-first architecture from day one instead of
 > replaying the NVD-only-then-OVAL sequence, so there is no window where an unconfirmed NVD-on-distro
 > hit needs its own status: the tracker gives a direct FIXED/OPEN/NOT-APPLICABLE answer, or its
-> absence gives UNKNOWN. This is not a reversal of this ADR's core invariant — "never assert a clear
-> you can't back up, never silently drop an unresolved case" is *fully* satisfied by UNKNOWN +
-> provenance tier; `potential` was a symptom of staged in-server delivery, not a load-bearing part of
-> the honesty model.
+> absence gives UNKNOWN. This is not a reversal of this ADR's core invariant — never assert a status
+> you can't back up, never silently drop an unresolved case as clean — which is *fully* satisfied by
+> UNKNOWN + provenance tier; `potential` was a symptom of staged in-server delivery, not a
+> load-bearing part of the honesty model.
 
 **The finding status is redefined to four values, replacing the three-plus-`potential` model above:**
 
@@ -252,7 +256,7 @@ and `MEDIUM` provenance-tier matches may produce `FIXED` or `NOT-APPLICABLE`. **
 suppressed** — a `LOW`-provenance-tier match that would otherwise read `FIXED` or `NOT-APPLICABLE`
 routes to `UNKNOWN` instead (reason `identity-low-confidence`); a `LOW`-provenance-tier match against
 an in-range advisory still surfaces as `OPEN (provenance: LOW)` — this carve-out only ever removes a
-clear verdict, never a positive one, exactly as before. `MEDIUM` is deliberately clean-verdict-eligible
+clean verdict, never a positive one, exactly as before. `MEDIUM` is deliberately clean-verdict-eligible
 — consistent with the arbitrated research's own `MEDIUM`-tier examples (a KB/supersedence-derived
 FIXED with a freshness caveat, a tight-range NVD CPE match, a `github_reviewed` OSV/GHSA hit), which
 already include genuine FIXED/NOT-APPLICABLE outcomes, not just OPEN ones — stating this explicitly
@@ -272,14 +276,18 @@ VEX document is actually exported (plausible given roadmap Issue 18.5's SBOM-ing
 mapping is cheap since the concepts already align.
 
 **Disposition (triage) lifecycle is layered on top, orthogonal to this assessment axis, and is
-out of this ADR's scope** — the module design doc defines the disposition state machine
+out of this ADR's scope** — the module design doc proposed an 8-state disposition state machine
 (`new`/`triaged`/`mitigated`/`accepted-risk`/`disputed`/`verification-failed`/`remediated`/`reopened`)
 and its own risk-acceptance fields (`risk_acceptance_ref`, `accepted_risk_review_date`, required
-together whenever disposition = `accepted-risk`). **This 8-state list is provisional** — it is 3
-states larger than `docs/adr-1005-execution-plan.md`'s own M3 milestone text, which currently names
-only 5 (`new`/`triaged`/`accepted-risk`/`remediated`/`reopened`); not yet reconciled with Dave Rae,
-who owns that document. Coverage (this ADR's other contribution) is unaffected by this amendment:
-UNKNOWN-fraction + LOW-provenance-tier-fraction per endpoint, stamped as-of-inventory.
+together whenever disposition = `accepted-risk`). **Resolved by ADR-4004 (2026-07-16)** —
+`docs/adr/4004-vulnerability-finding-disposition-lifecycle.md` reconciled this 8-state list against
+`docs/adr-1005-execution-plan.md`'s M3 milestone (which had separately named 5 states) and CAVM v20's
+gate model (ADR-4003), and ratifies a **9-state** list — this 8-state list plus `dismissed` (a
+disputed finding confirmed as a genuine matcher/identity mistake, not a real finding) — as M3's
+disposition-lifecycle spec. Read ADR-4004 for the authoritative state definitions, required fields,
+and `gate_state` reconciliation; this amendment's 8-state list is superseded by it, not a still-open
+reconciliation with Dave Rae. Coverage (this ADR's other contribution) is unaffected by this
+amendment: UNKNOWN-fraction + LOW-provenance-tier-fraction per endpoint, stamped as-of-inventory.
 
 **Row lifecycle on re-assessment: never delete, unlike ADR-0023's shipped in-server pattern.**
 ADR-0023 Decision 5's in-server engine **deletes** a row when it resolves to a clean verdict
@@ -316,7 +324,7 @@ it isn't silently skipped, the same discipline ADR-0023 followed.
 **`/readyz` posture diverges from ADR-0023 by design.** ADR-0023's findings store is wired into the
 server's `/readyz` `stores_ok` conjunction (its Decision 8). The module's findings+disposition store
 is **its own Postgres, with no `/readyz` coupling to the server at all** — a deliberate consequence
-of it being a separate deployable (ADR-1005 Decision 3/11), not an oversight. Naming this explicitly
+of it being a separate deployable (ADR-1005 Decision 3 / `docs/adr-1005-execution-plan.md` Decision 11), not an oversight. Naming this explicitly
 so an operator reading only this ADR doesn't assume the module follows the in-server health-check
 pattern; the module needs its own readiness/health surface, not the server's.
 
