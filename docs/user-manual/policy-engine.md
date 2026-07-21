@@ -212,6 +212,13 @@ before the stores are destroyed** in `~ServerImpl`/`stop()` — the eval thread
 dispatches through those stores, so the join-before-stores order is a
 use-after-free guard any shutdown refactor must preserve.
 
+Evaluation dispatches mint **`polchk-*` correlation ids**, which
+`notify_exec_tracker` (in `agent_service_impl.cpp`) deliberately **skips**:
+compliance checks get no execution-tracker row and no SSE event, so they do
+NOT appear in the executions drawer. Any change to the tracker's skip logic
+must keep the `polchk-*` exemption — a policy evaluating on a 60-second
+interval would otherwise flood execution history.
+
 > **Remediation is never automatic.** Detection runs on the schedule above;
 > applying a fix is always an explicit, operator-gated action (see
 > `POST /api/policies/{id}/remediate` below). On a server restart, any agent
