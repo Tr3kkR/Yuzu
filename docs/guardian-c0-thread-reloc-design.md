@@ -194,10 +194,10 @@ reviewer diffs against reality, not the plan.
   `page_into_window` gained an entry check (taken BEFORE `paging_mutex_`, so a page never
   queues behind an in-flight prune during shutdown) and a check in the candidate-build loop,
   on top of its existing per-batch gate.
-- **Hazard 6 (cadence)** — `kDefaultPruneIntervalMs = 120'000`, measured on `steady_clock`
+- **Hazard 6 (cadence)** — `kGuardianJournalPruneInterval` (120 s), measured on `steady_clock`
   (the retention comparison itself still uses wall clock, since batch `ts_ms` is `system_clock`
-  and must survive a reboot). The timer is seeded at CONSTRUCTION and stamped BEFORE each pass,
-  so neither the boot barrier nor a throwing/stop-aborted prune causes a re-prune storm.
+  and must survive a reboot). The timers are LOCALS in `loop()` and, since the Sol review, stamped AFTER each pass so the
+  cadence is a minimum GAP rather than start-to-start.
 
 ### Departures from the design
 
@@ -224,7 +224,7 @@ reviewer diffs against reality, not the plan.
 
 ### Validation
 
-- `[spark][guardian][drain][maint]` — 10 new cases in
+- `[spark][guardian][drain][maint]` — new cases in
   `tests/unit/test_guardian_outbox_drain_worker.cpp`: paging + the same-wake re-drain, the
   reconnect kick's promptness, notify-after-stop inertness, the TIME-based cadence (the
   explicit regression guard against a per-wake prune), stop-during-maintenance joining cleanly,
@@ -250,8 +250,8 @@ several are corrections to claims made ABOVE, not just to code.
   independent reviewers reached the same fix. `notify()` now also sets a `force_page_` flag
   so the reconnect kick still pages immediately, which is what keeps the cadence from
   delaying replay.
-- **The drain pass is bounded** (`kGuardianDrainBudget = 512`, new `max_entries` parameter on
-  `GuardianSparkRuntime::drain`). Unbounded, a slow stream drains the whole 4096-entry window
+- **The drain pass is bounded** (`kGuardianDrainBudget = 512`, via the new
+  `GuardianSparkRuntime::drain_bounded()`; plain `drain()` is unchanged). Unbounded, a slow stream drains the whole 4096-entry window
   - measured at ~82 s at 20 ms/send - and post-C0 that starves retention until the journal
   hits its write ceiling and DROPS audit records. Pre-C0 prune ran on the heartbeat thread and
   was immune; this coupling is created by the relocation, so it is C0's to fix. A truncated
@@ -313,6 +313,10 @@ count-based erase racing drop-oldest; renaming `GuardianOutboxDrainWorker` /
 `page_journal()` now that neither name describes what it does; handing the worker a
 `shared_ptr` to delete the declaration-order dependency; and documenting
 `guardian_journal_maint_exceptions` in the metrics manual.
+
+(Of that list, the `shared_ptr` change, the metrics-manual entry, and the
+build-before-headroom-check waste were subsequently FOLDED IN rather than filed — see the
+later rounds below.)
 
 ---
 

@@ -618,12 +618,12 @@ all, so absence means "nothing to report", not "not collected".
 
 | Tag | Meaning | What to do |
 |---|---|---|
-| `guardian_journal_maint_exceptions` | Cumulative maintenance passes that threw and were firewalled: the heartbeat's retry-persist plus the drain worker's retention prune and replay paging. Nonzero means the journal path hit an exception (typically `bad_alloc` under memory pressure) and was contained rather than terminating the agent. | Investigate endpoint memory pressure. A steadily climbing value with a growing `guardian_journal_bytes` means retention is not keeping up. |
-| `guardian_journal_write_capacity_rejected` | Records refused because the journal is at its hard write ceiling. | Check whether prune is failing (`guardian_journal_prune_failures`) or the store is unwritable. |
-| `guardian_journal_prune_failures` | Retention passes that could not read the journal. | A sustained nonzero value means the shared `kv_store.db` is busy or corrupt. |
-| `guardian_journal_evicted_without_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. |
+| `yuzu.guardian_journal_maint_exceptions` | Cumulative Guardian background passes that threw and were firewalled: the heartbeat's retry-persist, the drain worker's retention prune and replay paging, and the convergence lanes' sweeps. Nonzero means the journal path hit an exception (typically `bad_alloc` under memory pressure) and was contained rather than terminating the agent. | Investigate endpoint memory pressure. A steadily climbing value with a growing `yuzu.guardian_journal_bytes` means retention is not keeping up. |
+| `yuzu.guardian_journal_write_capacity_rejected` | Records refused because the journal is at its hard write ceiling. | Check whether prune is failing (`yuzu.guardian_journal_prune_failures`) or the store is unwritable. |
+| `yuzu.guardian_journal_prune_failures` | Retention passes that could not read the journal. | A sustained nonzero value means the shared `kv_store.db` is busy or corrupt. |
+| `yuzu.guardian_journal_evicted_without_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. |
 
-Counters are cumulative for the agent process and reset on restart. `guardian_journal_maint_exceptions`
+Counters are cumulative for the agent process and reset on restart. `yuzu.guardian_journal_maint_exceptions`
 aggregates two internal sources (see the drain-worker note in
 `docs/guardian-c0-thread-reloc-design.md`); it is deliberately one operator-facing number.
 

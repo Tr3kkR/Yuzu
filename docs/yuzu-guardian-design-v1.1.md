@@ -2459,25 +2459,20 @@ This would be a Phase 15+ addition, not a rearchitecture of the current Phases A
 Pulled out of CLAUDE.md so the design doc carries them. Every PR in the
 Guardian ladder must check these.
 
-- **The Guardian outbox drain worker must NEVER take `GuardianEngine::mtx_`.**
-  `GuardianEngine::stop()` holds `mtx_` across its whole body AND joins the
-  worker inside it, so any `mtx_` acquisition on that thread is a lock-vs-join
-  deadlock — a hung agent shutdown, fleet-wide. Everything the worker runs is
-  in scope: the durable journal's prune/page maintenance, and the INJECTED
-  `send`, which is an arbitrary `std::function` supplied from `agent.cpp` and
-  is the easiest place to reintroduce the bug. The journal and runtime are
-  handed to the worker as a pre-resolved raw pointer / reference at
-  construction, never re-read off the engine under its lock. `mtx_` is a
-  `WorkerHostileMutex` that asserts against this in debug/sanitizer builds, so
-  a violation fails a test rather than hanging a fleet — but the assert is a
-  backstop, not a licence to reason loosely. (C0, #2298 gate 1.)
-- **`lifecycle_journal_` is declared BEFORE `spark_drain_worker_` in
-  `guardian_engine.hpp` — do not reorder.** The worker holds a raw pointer to
-  the journal for both its send-wrap (`mark_batch_sent`) and its maintenance
-  pass, so it must be joined while the journal is still alive. That ordering
-  makes reverse-order destruction do it automatically, instead of resting
-  solely on every teardown path remembering to call `stop()` first. Nothing
-  would catch a reorder. (C0, #2298 gate 1.)
+- **No thread `GuardianEngine::stop()` joins may take `GuardianEngine::mtx_`.**
+  `stop()` holds `mtx_` across its whole body AND joins BOTH the
+  `ConvergenceScheduler` lanes and the outbox drain worker inside it, so an
+  `mtx_` acquisition on any of those threads is a lock-vs-join deadlock — a hung
+  agent shutdown, fleet-wide. Everything those threads run is in scope: the
+  journal's prune/page maintenance, the convergence sweeps, and the INJECTED
+  `send`, which is an arbitrary `std::function` supplied from `agent.cpp` and is
+  the easiest place to reintroduce it. Collaborators are handed to the workers as
+  pre-resolved handles at construction, never re-read off the engine under its
+  lock. `mtx_` is a `WorkerHostileMutex` that ABORTS on violation in
+  debug/sanitizer builds, keyed on the thread-local marker in
+  `guardian_joined_thread_role.hpp` — but the abort is a backstop, not a licence
+  to reason loosely, and it compiles out of a plain release build. (C0, #2298
+  gate 1 + Gate 4.)
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.

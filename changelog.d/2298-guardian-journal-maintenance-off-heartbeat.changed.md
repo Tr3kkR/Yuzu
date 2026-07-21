@@ -8,10 +8,18 @@
   paging inline - replay after a reconnect stays prompt. Both maintenance passes are paced on
   their own timers (30 s for replay paging, ~2 minutes for retention) rather than on a tick
   count, so an event burst cannot make them run repeatedly. Operator-visible behaviour is
-  unchanged: prune/page failures still surface under the same `guardian_journal_maint_exceptions`
-  heartbeat counter.
+  otherwise unchanged: prune/page failures still surface under the same
+  `yuzu.guardian_journal_maint_exceptions` heartbeat counter. This machinery is wired but
+  dormant until the Spark detection path becomes the authoritative backend, so no
+  currently-released agent changes behaviour.
 - **A slow server connection can no longer starve Guardian journal retention.** Each drain pass
-  now ships at most 512 entries before the worker re-checks its other work, and re-drains
-  immediately if more remain. Previously one pass drained the entire 4096-entry send window,
-  which on a slow link took long enough to hold off retention until the journal reached its
-  write ceiling and began dropping lifecycle audit records.
+  now ships at most 512 entries (or 2 seconds' worth, whichever comes first) before the worker
+  re-checks its other work, and re-drains immediately if more remain. Previously one pass drained
+  the entire 4096-entry send window, which on a slow link took long enough to hold off retention
+  until the journal reached its write ceiling and began dropping lifecycle audit records. The
+  compliance/health outbox is also guaranteed a share of each pass, so a busy lifecycle log
+  cannot delay drift reporting.
+- **A Guardian convergence lane that throws no longer terminates the agent.** The four
+  convergence sweep threads ran without an exception firewall, so an allocation failure during a
+  sweep took down the whole daemon; they now count and log the failure and keep running, matching
+  the drain worker.
