@@ -936,6 +936,16 @@ jobs:
           # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
           # ADR-0006) runs autoreconf during its build and the hosted macOS
           # image doesn't ship autotools.
+          brew install ninja ccache pipx autoconf automake libtool
+          # Pin CMake < 4.4 on the macOS leg: the runner's Homebrew CMake 4.4.0
+          # regressed meson's httplib dependency resolution — find_package(httplib)
+          # from vcpkg fails under 4.4.0, so `meson setup` aborts at the
+          # httplib/cpp-httplib probe (meson.build). 4.3.4 is the last-known-good
+          # version the passing macOS runs used. Prepended via $GITHUB_PATH so it
+          # takes precedence over any Homebrew cmake in the Configure step.
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v4.3.4/cmake-4.3.4-macos-universal.tar.gz -o /tmp/cmake.tar.gz
+          tar -xzf /tmp/cmake.tar.gz -C /tmp
+          echo "/tmp/cmake-4.3.4-macos-universal/CMake.app/Contents/bin" >> "$GITHUB_PATH"
           #
           # cmake deliberately excluded from this brew line, pinned via pipx
           # below instead. 2026-07-16: brew's floating `cmake` drifted to

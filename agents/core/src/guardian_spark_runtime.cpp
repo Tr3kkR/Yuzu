@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <optional>
 #include <random>
 #include <set>
@@ -529,6 +530,12 @@ std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
 }
 
 void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> record) noexcept {
+    // #2303 K6. The noexcept below is only real because the ctor's reserve() means push_back
+    // never reallocates. That is an invariant of a DIFFERENT function, so assert it here where
+    // it is relied on - if a future edit drops or shrinks the reserve, a debug build trips
+    // immediately instead of a release build calling std::terminate on an OOM realloc.
+    assert(pending_journal_.capacity() >= kMaxPendingJournalRecords &&
+           "pending_journal_ reserve is what makes stage_pending_locked's noexcept real");
     if (!record)
         return; // rejected at build - sent live, never journaled
     if (pending_journal_.size() >= kMaxPendingJournalRecords) {
