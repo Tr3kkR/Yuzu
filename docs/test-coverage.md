@@ -83,7 +83,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | users | Wide string conversion, FILETIME formatting | Net API, utmp, dscl |
 | procfetch | Pipe escaping | File hashing, process enum |
 | tags | Key/value validation | File I/O |
-| antivirus | (none) | Get-CimInstance, pgrep |
+| antivirus | macOS parsers (`antivirus_parsers.hpp` — PlistBuddy version, `systemextensionsctl list`) in `test_antivirus_parsers.cpp` | Get-CimInstance, pgrep, PlistBuddy, systemextensionsctl |
 | bitlocker | (none) | PowerShell |
 | status | RSS parsing | Hostname, architecture |
 | agent_actions | Log level validation | spdlog state changes |
