@@ -39,11 +39,11 @@
 /// The writer is SPARSE: a counter that is 0 ships no tag.
 /// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 22 at the top of
 /// every sweep and re-publishes only those at least one retained agent reported this
-/// cycle. So an absent family means exactly: NO RETAINED AGENT CURRENTLY REPORTS A
-/// NON-ZERO VALUE for it. It does NOT establish that the journal is healthy, quiescent,
-/// or inert - a working journal with no lifecycle event since restart emits nothing,
-/// and a healthy agent that wrote one batch keeps `..._batches_written` non-zero for
-/// its whole process lifetime.
+/// cycle. So an absent family means: no retained agent's latest heartbeat carried a
+/// value for it that PASSED the forged-value parse. Note both edges, each pinned by a
+/// test in tests/unit/server/test_agent_health_store.cpp: a non-conforming agent's
+/// explicit "0" parses and PUBLISHES the family at 0, and a rejected non-zero value
+/// (over the ceiling, say) leaves it ABSENT while incrementing `..._tag_rejected`.
 ///
 /// The two META-SIGNALS below are NOT in the table and are published on every completed
 /// sweep INCLUDING at 0, so they are never absent once a sweep has completed. That is
@@ -104,56 +104,26 @@ struct GuardianJournalMetric {
 /// agents/core/src/guardian_journal_heartbeat.hpp for reviewability; nothing depends
 /// on it.
 ///
-/// TYPE-HONESTY AND ALERTING, READ BEFORE WRITING A RULE. All 22 are exported as
-/// `gauge` because that is what they are server-side - a per-sweep recomputed fleet
-/// sum, cleared and rebuilt, never monotonic: it drops when an agent ages out or
-/// restarts, and a family nobody reports goes absent.
+/// TYPE-HONESTY. All 22 are exported as `gauge` because that is what they are
+/// server-side - a per-sweep recomputed fleet sum, cleared and rebuilt, never
+/// monotonic: it drops when an agent ages out or restarts, and a family nobody reports
+/// goes absent.
 ///
-/// NO SOUND CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. That is the
-/// precise claim: an unlabelled fleet SUM cannot tell a new per-agent increment from
-/// a returning agent, because the information needed to separate them is already lost
-/// by the time it is summed. Three forms were evaluated; all three fail, each for a
-/// different reason (governance Gate-4 unhappy-path + Gate-6 sre):
-///   - increase()/rate(): a fleet sum over a CHURNING population is not a valid
-///     counter. An agent ageing out or restarting reads as a counter reset and
-///     manufactures a phantom increment; and a series that first APPEARS at a
-///     non-zero value contributes no increase at all, missing the one-off loss these
-///     counters exist to surface. (Same analysis the spark preamble records in
-///     docs/prometheus/yuzu-alerts.yml.)
-///   - delta(): needs two samples inside the window, so an absent -> non-zero series
-///     has no earlier 0 to diff against. Identical first-loss blind spot, different
-///     cause.
-///   - bare `> 0`: sound PER AGENT (a should-stay-0 monotonic that self-clears when
-///     that agent restarts). Over the fleet SUM it remains a true predicate, but a
-///     much weaker one than it looks: it says "at least one currently retained agent
-///     reports a historical non-zero value", not "something just happened". The set it
-///     tests only grows as fleet-days accumulate and only shrinks when that SPECIFIC
-///     agent restarts or ages out, so at 10k agents with weeks-long uptimes it is
-///     effectively always true: the rule would fire within hours of cutover and never
-///     clear, and the operator would silence the group. It also cannot re-notify on a
-///     later event, and cannot name the endpoint.
-///
-/// So the alert group in docs/prometheus/yuzu-alerts.yml stays COMMENTED OUT - and not
-/// only because the journal is inert until the prefer_spark cutover. The interim form
-/// closest to correct is a rising edge, `(X > 0) unless (X offset 15m > 0)`, which
-/// notifies once per absent->present transition instead of continuously; it still
-/// cannot tell "a second agent also broke" from "same agent, still broken", because
-/// there is no per-agent axis to separate on. That needs a per-agent delta plus a
-/// server-owned monotonic counter (#2083 is the spark-scoped tracker; the journal side
-/// belongs on #2298's cutover-gate list, and is not yet filed there). Until then these
-/// are MONITOR-ONLY: graph them,
-/// review them, do not page on them.
-///
-/// None of the three live-depth gauges is alertable either. `_pending` drains on a
-/// healthy AGENT, but the published series is the fleet SUM, which at scale is non-zero
-/// essentially always - so it fails for the same reason as the loss counters, not a
-/// different one. `_bytes` and `_batch_count` sit non-zero on any working journal
-/// between retention passes. All three are capacity/backlog watch signals, never alert
-/// conditions.
+/// ALERTING: THESE ARE MONITOR-ONLY. No churn-robust new-increment alert exists over an
+/// unlabelled fleet sum of per-agent cumulative counters. The full analysis - why
+/// increase()/rate(), delta() and bare `> 0` each fail, what the rising-edge template
+/// does and does not buy, and the enable-time prerequisites - is stated ONCE, in the
+/// `yuzu-guardian-journal` preamble in docs/prometheus/yuzu-alerts.yml. It is
+/// deliberately not restated here: it used to be, on four surfaces, and every fix had
+/// to land four times.
 ///
 /// ADR-1005 exception ledger, 2026-07-14 class-level entry: a `/metrics`-only fleet
 /// gauge family is observability, not capability, so it carries no REST/MCP twin
 /// obligation. Cited here so a future rollup does not relitigate it.
+///
+/// SCOPE OF WHAT THIS FILE ASSERTS: the mechanics stated above are the ones the pin
+/// test and the store tests actually assert. Anything beyond them - what a reading
+/// proves about fleet health - is deliberately not stated here.
 inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
     // ── Staging loss channels (agent runtime, pre-persist) ───────────────────────
     {"yuzu.guardian_journal_stage_dropped", "yuzu_fleet_guardian_journal_stage_dropped",
@@ -192,8 +162,9 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
     {"yuzu.guardian_journal_write_failures", "yuzu_fleet_guardian_journal_write_failures",
      "Fleet sum of failed journal batch writes. Records stay staged and retry, so this is "
      "not itself loss. Sustained failure fills the pending reserve, after which staging "
-     "overflow increments stage_dropped. It leads stage_dropped on THAT path only - other "
-     "loss counters (field/clock rejection, capacity refusal) can move without it"},
+     "overflow increments stage_dropped. It leads stage_dropped on THAT path only: the "
+     "loss channels field_rejected and clock_rejected move without it, and the "
+     "capacity-refusal path can reach stage_dropped without a single write failure"},
     {"yuzu.guardian_journal_key_collisions", "yuzu_fleet_guardian_journal_key_collisions",
      "Fleet sum of journal batch key collisions. Should stay 0 in correct operation; any "
      "value is an accounting or id-generation bug surfacing, so investigate rather than "

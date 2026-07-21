@@ -826,10 +826,12 @@ groups:
   # in production today and an enabled rule could only fire on a FORGED heartbeat.
   # (Same reason the spark group above is commented out at rung 1.)
   #
-  # REASON 2 - NO SOUND ALERTING FORM EXISTS OVER THIS SHAPE. This one does not clear
-  # at the cutover; it clears at #2083. These are UNLABELLED fleet SUMS of per-agent
-  # CUMULATIVE counters over a CHURNING population, and all three candidate forms fail
-  # (governance Gate-4 unhappy-path + Gate-6 sre):
+  # REASON 2 - NO CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. This one does
+  # not clear at the cutover. It clears only when a per-agent axis exists for the
+  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is not filed (see below).
+  # These are UNLABELLED fleet SUMS of per-agent CUMULATIVE counters over a CHURNING
+  # population, and all three candidate forms fail (governance Gate-4 unhappy-path +
+  # Gate-6 sre):
   #
   #   increase()/rate() - an agent ageing out or restarting reads as a counter reset
   #     and manufactures a phantom increment; and a series that first APPEARS at a
@@ -992,8 +994,10 @@ groups:
   #         description: >-
   #           Records stay staged and retry, so this is not itself loss - but sustained
   #           failure fills the pending reserve, after which staging overflow increments
-  #           _stage_dropped. It leads _stage_dropped on THAT path only; field/clock
-  #           rejection and capacity refusal move loss counters without it.
+  #           _stage_dropped. It leads _stage_dropped on THAT path only: the loss
+  #           channels field_rejected and clock_rejected move without it, and the
+  #           capacity-refusal path can reach _stage_dropped without a single write
+  #           failure.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-write-failures"
   #     - alert: YuzuGuardianJournalCapacityRefusal
   #       expr: |

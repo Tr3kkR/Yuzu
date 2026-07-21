@@ -12,9 +12,9 @@
 
   The families follow the fleet-rollup **absent-not-zero** convention: the agent
   emits a journal tag only when the counter is non-zero, and the server publishes a
-  family only if some retained agent reported it, so an absent family means "no
-  retained agent currently reports a non-zero value" rather than a fabricated `0`.
-  A flatline zero would read as "checked, nothing lost" when nothing was checked. Values are
+  family only if some retained agent reported a value that passed the forged-value
+  parse, so an absent family reflects that rather than a fabricated `0`. A flatline
+  zero would read as "checked, nothing lost" when nothing was checked. Values are
   hostile-input parsed (garbage, negative, overlong and implausible all mean "did
   not report", never `0`), so no single agent can destroy a fleet sum with an
   overflowing or implausible magnitude. A forged-but-plausible value from an
@@ -32,9 +32,8 @@
   detects a stalled sweep, since they are never cleared and retain their last
   value) and `..._tag_rejected` (values
   that failed the forged-value parse, which would otherwise be a silent drop). No
-  alert rules are enabled: no sound alerting form exists over an unlabelled fleet
-  sum of per-agent cumulative counters that can distinguish a new increment from a
-  returning agent, so the reviewed group in
-  `docs/prometheus/yuzu-alerts.yml` ships commented out and the 22 counters are
-  monitor-only. See
+  alert rules are enabled: no churn-robust new-increment alert exists over an
+  unlabelled fleet sum of per-agent cumulative counters, so the reviewed group in
+  `docs/prometheus/yuzu-alerts.yml` ships commented out - that file carries the full
+  analysis - and the 22 counters are monitor-only. See
   [metrics.md → Guardian journal fleet gauges](docs/user-manual/metrics.md).

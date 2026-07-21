@@ -584,48 +584,26 @@ means no cardinality exposure at all.
 
 **What absence means, mechanically.** The agent emits a journal tag **only when the
 counter is non-zero**, and every family is cleared and re-published each sweep. So an
-absent family means exactly one thing: *no retained agent currently reports a non-zero
-value for it.* It does **not** establish that the journal is healthy, quiescent, or
-inert - a working journal that has seen no Guardian lifecycle event since restart emits
-nothing at all, and conversely a healthy agent that wrote one batch keeps
-`_batches_written` non-zero for its whole process lifetime. What the rollup avoids is
-publishing a fabricated `0` for a family nobody reported, which would read as "checked,
-nothing lost" when nothing was checked.
+absent family means: *no retained agent's latest heartbeat carried a value for it that
+passed the forged-value parse.* Both edges matter and both are pinned by tests - a
+non-conforming agent's explicit `"0"` parses and **publishes** the family at `0`, while
+a rejected non-zero value (over the plausibility ceiling, say) leaves it **absent** and
+increments `_tag_rejected`. What the rollup avoids is publishing a fabricated `0` for a
+family nobody reported, which would read as "checked, nothing lost" when nothing was
+checked.
 
 This page deliberately stops there. It tells you what each gauge counts and when it is
 emitted, not what a reading proves about fleet health - the interpretation belongs with
 whoever enables alerting at the `prefer_spark` cutover, against a live journal.
 
-**These are `gauge`-typed fleet sums, and no sound churn-robust *new-increment* alert
-exists over them.** Each series is recomputed every sweep: cleared, summed over the currently
-reporting agents, re-published. Three candidate forms were evaluated and all three
-fail:
-
-- **`increase()` / `rate()`** - a fleet sum over a churning population is not a valid
-  counter. An agent ageing out or restarting reads as a counter reset and manufactures
-  a phantom increment; and a series that first *appears* at a non-zero value
-  contributes no increase at all, so it misses the first-and-only loss these counters
-  exist to catch.
-- **`delta()`** - needs two samples inside the window, so an absent -> non-zero series
-  has no earlier `0` to diff against. Same first-loss blind spot, different cause.
-- **Bare `> 0`** - correct for a *single* agent (a should-stay-0 monotonic that clears
-  when that agent restarts). Over the fleet sum it stays a true predicate but a much
-  weaker one than it looks: it says "at least one retained agent reports a historical
-  non-zero value", not "something just happened". The set "some agent, ever,
-  tripped this since its last restart" only grows as fleet-days accumulate and only
-  shrinks when that specific agent restarts, so at 10k agents with weeks-long uptimes
-  it is non-zero essentially always: the rule would fire within hours and never clear,
-  and you would silence it.
-
-So **the 22 counters are monitor-only**: graph them, review them in post-incident
-analysis, do not page on them. A reviewed alert group ships commented out in
-`docs/prometheus/yuzu-alerts.yml` using a rising-edge form,
-`(X > 0) unless (X offset 15m > 0)`, which notifies once per absent->present
-transition; that is the closest to correct available today but is still not sufficient
-to enable, because it cannot distinguish "a second agent also broke" from "same agent,
-still broken". Closing that needs a per-agent delta plus a server-owned monotonic
-counter (`#2083` tracks the spark side; the journal side belongs on `#2298`'s
-cutover-gate list and is not yet filed there).
+**These are `gauge`-typed fleet sums, and they are monitor-only.** No churn-robust
+*new-increment* alert exists over an unlabelled fleet sum of per-agent cumulative
+counters: the sum cannot tell a new increment from a returning agent. The full analysis
+- why `increase()`/`rate()`, `delta()` and bare `> 0` each fail, what the rising-edge
+template does and does not buy, and the enable-time prerequisites - is stated once, in
+the `yuzu-guardian-journal` preamble in `docs/prometheus/yuzu-alerts.yml`, alongside the
+disabled templates themselves. Graph these, review them after an incident, do not page
+on them.
 
 **Two meta-signals are the exception.** `yuzu_fleet_guardian_journal_reporting` and
 `..._tag_rejected` are server-owned counts published on **every completed sweep,
@@ -642,7 +620,7 @@ including at `0`**, unlike the 22. Two consequences, and the second is easy to m
 **Two caveats that apply however you consume these.** An agent ageing out of the 90 s
 staleness window drops its counters from the fleet sum without the underlying loss having
 healed. After a server restart the series rebuild as agents heartbeat back in, which takes
-longer than one sweep (the sweep is 15 s; agent heartbeats are slower). Treat the metric
+longer than one sweep (the sweep is 15 s; the agent heartbeat interval defaults to 30 s). Treat the metric
 as a signal and the audit trail as the evidence.
 
 **Known limitations - read before citing these as assurance.** The signal is
@@ -669,7 +647,7 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_clock_rejected` | gauge | Fleet sum of records kept out by a skewed clock (timestamp ≤ 0). A **loss** channel, and the fleet's clock-health canary - a journal timestamp that cannot be trusted is not admissible evidence |
 | `yuzu_fleet_guardian_journal_pending` | gauge | Fleet sum of records staged but **not yet persisted**. A **live depth** gauge *per agent* - it drains as the backlog clears - but what is published is the fleet **sum**, which at 10k agents is non-zero essentially always, so `> 0` fires permanently on a healthy fleet and is **not** a valid alert. Monitor-only, like the rest of the family. Sustained depth is the leading indicator of the `_stage_dropped` loss that follows when the reserve overflows |
 | `yuzu_fleet_guardian_journal_batches_written` | gauge | Fleet sum of batches successfully persisted. A cumulative process-lifetime count: non-zero means that agent's journal has persisted at least one batch since it last restarted. It resets to 0 on agent restart, and a journal whose every write fails never sets it, so do not read it as liveness. Unit is **batches** of up to 256 records |
-| `yuzu_fleet_guardian_journal_write_failures` | gauge | Fleet sum of failed batch writes. Records stay staged and retry, so this is not itself loss - sustained failure fills the pending reserve, after which staging overflow increments `_stage_dropped`. It leads `_stage_dropped` **on that path only** - field/clock rejection and capacity refusal move loss counters without it |
+| `yuzu_fleet_guardian_journal_write_failures` | gauge | Fleet sum of failed batch writes. Records stay staged and retry, so this is not itself loss - sustained failure fills the pending reserve, after which staging overflow increments `_stage_dropped`. It leads `_stage_dropped` **on that path only**: `_field_rejected` and `_clock_rejected` move without it, and the capacity-refusal path can reach `_stage_dropped` without a single write failure |
 | `yuzu_fleet_guardian_journal_key_collisions` | gauge | Fleet sum of batch key collisions. Should stay 0; any value is an accounting or id-generation bug surfacing - investigate, do not threshold |
 | `yuzu_fleet_guardian_journal_quarantined` | gauge | Fleet sum of batches moved aside as unreadable/corrupt. Degrade-don't-destroy: the batch is preserved for forensics but its records are **not** replayed, so `> 0` means the server is missing lifecycle evidence that still exists on the endpoint. Unit is **batches** of up to 256 records |
 | `yuzu_fleet_guardian_journal_quarantine_failures` | gauge | Fleet sum of quarantine attempts that themselves failed - strictly worse than `_quarantined`: the corrupt batch could not even be set aside, so it may be re-hit every maintenance tick |
