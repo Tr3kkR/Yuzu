@@ -600,7 +600,7 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"bitlocker.state", "BitLocker / LUKS / FileVault status per volume"},
         // antivirus
         {"antivirus.products", "List installed antivirus products"},
-        {"antivirus.status", "Windows Defender detailed status"},
+        {"antivirus.status", "Detailed antivirus status (Windows Defender / macOS XProtect)"},
         // http_client
         {"http_client.download", "Download a file from URL with optional hash verification"},
         {"http_client.get", "HTTP GET a URL, return status and body"},

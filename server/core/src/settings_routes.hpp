@@ -10,6 +10,7 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "engine_principal_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
@@ -56,6 +57,17 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Inject the engine-principal store (nullable — a null pointer means
+    /// the feature is not yet wired; server.cpp wiring is a separate task
+    /// from this one, same deferral pattern as `AuthRoutes::
+    /// set_engine_principal_store`). While unset, the DELETE-user
+    /// owner-delete guard (design doc §3.1) and the Engine Principals
+    /// admin-console fragment are both skipped/inert. Setter rather than a
+    /// ctor param to keep the stacked-PR wiring in server.cpp low-risk.
+    void set_engine_principal_store(EnginePrincipalStore* store) {
+        engine_principal_store_ = store;
+    }
 
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
@@ -163,6 +175,15 @@ private:
     /// is recomputed at render time directly from the PEM file rather
     /// than denormalised, to avoid drift between disk + DB.
     std::string render_plugin_signing_fragment();
+    /// Render the Engine Principals admin-console fragment — a table of
+    /// every engine principal (`EnginePrincipalStore::list_all`, including
+    /// revoked rows) with owner, classification, lifecycle state, and
+    /// active-credential count (`ApiTokenStore::list_active_for_principal`).
+    /// Revoked rows surface the `superseded_by` linkage AND the revocation
+    /// reason explicitly (design doc §3.1) — never a merged history that
+    /// hides that a revocation occurred. Admin-only; a null
+    /// `engine_principal_store_` renders an inert "not configured" panel.
+    std::string render_engine_principals_fragment();
 
     // -- Dependency pointers (stored by register_routes) -----------------------
 
@@ -175,6 +196,9 @@ private:
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};
     ApiTokenStore* api_token_store_{};
+    // Nullable — see set_engine_principal_store(). Non-owning; lifetime is
+    // server.cpp's, which outlives this object.
+    EnginePrincipalStore* engine_principal_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{};
     TagStore* tag_store_{};
     UpdateRegistry* update_registry_{};

@@ -12,10 +12,15 @@ namespace {
 /// The Unknown outcome: arm the recovery-force bit and hand back the read-error
 /// detail. EmitDeciderState is left UNTOUCHED - a read failure must never move
 /// last_compliant/last_emit (that would turn "can't tell" into a committed
-/// verdict). The runtime turns this into an edge-triggered guard.unhealthy.
+/// verdict). Marks the EDGE (the first Unknown of an errored episode); the runtime
+/// emits guard.unhealthy only on that edge and suppresses+counts a repeat Unknown,
+/// so a rule stuck errored does not flood the health stream every convergence tick.
 EvalOutcome unhealthy(RuleEvalState& state, std::string detail) {
+    const bool edge = !state.in_unknown; // first transition into the errored episode
     state.in_unknown = true;
-    return EvalOutcome{EvalStatus::Unhealthy, GuardDrift{}, std::move(detail)};
+    EvalOutcome out{EvalStatus::Unhealthy, GuardDrift{}, std::move(detail)};
+    out.unhealthy_edge = edge;
+    return out;
 }
 
 /// Run the shared decide_emit tail and pack its result + the guard's
@@ -101,7 +106,10 @@ EvalOutcome eval_file(const RuleAssertion& a, const ReadResult<FileSnapshot>& re
         if (expected.empty()) // absent/unreadable/oversize drift: report the target hash
             expected = a.expected_hash.empty() ? state.baseline_hash : a.expected_hash;
     }
-    return pack(a, "file", compliant, std::move(detected), std::move(expected), state, now,
+    // guard_type via the shared guard_type_for(kind) so Compliance and Health/Lifecycle
+    // (which derive it the same way) can never report a different guard_type for one rule.
+    return pack(a, guard_type_for(a.kind), compliant, std::move(detected), std::move(expected),
+                state, now,
                 emit_compliant_edge, /*detection_latency_us=*/0);
 }
 
@@ -122,7 +130,8 @@ EvalOutcome eval_registry(const RuleAssertion& a, const ReadResult<RegistrySnaps
         compliant = (snap.value == a.expected_value);
         detected = snap.value;
     }
-    return pack(a, "registry", compliant, std::move(detected), a.expected_value, state, now,
+    return pack(a, guard_type_for(a.kind), compliant, std::move(detected), a.expected_value, state,
+                now,
                 emit_compliant_edge, detection_latency_us);
 }
 
@@ -156,7 +165,8 @@ EvalOutcome eval_service(const RuleAssertion& a, const ReadResult<ServiceRunStat
     // emit_compliant_edge default true UNIFIES the compliant-census signal across
     // platforms: legacy Windows-Service emitted it, legacy systemd did not. The caller
     // can pass false to preserve exact legacy-systemd silence (pinned in parity tests).
-    return pack(a, "service", compliant, std::move(detected), std::move(expected), state, now,
+    return pack(a, guard_type_for(a.kind), compliant, std::move(detected), std::move(expected),
+                state, now,
                 emit_compliant_edge, /*detection_latency_us=*/0);
 }
 

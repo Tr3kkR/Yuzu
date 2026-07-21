@@ -43,6 +43,7 @@
 #include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
+#include "principal_quota_gate.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
@@ -87,6 +88,7 @@
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
@@ -291,6 +293,17 @@ using yuzu::server::audit_token;
     return "/var/log/yuzu/server.log";
 #endif
 }
+
+// -- Per-principal quota chokepoint helpers (PR 4.4) --------------------------
+//
+// The GATE DECISION (principal_kind/auth_source == "engine" check, mcp-vs-
+// rest render pick, incl. is_streaming_path) and the thread_local slot
+// itself (`tls_quota_slot()`) now live in principal_quota_gate.hpp — the
+// latter moved there (UP-1) so streaming routes in other translation units
+// (rest_api_v1.cpp, workflow_routes.cpp) can adopt the pending slot into
+// their own stream lifetime via `adopt_quota_slot_into_stream`. server.cpp
+// keeps only the httplib-specific, worker-thread-affine call sites below.
+
 } // namespace detail
 
 // -- ServerImpl ---------------------------------------------------------------
@@ -302,7 +315,10 @@ public:
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_, cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
                          auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode),
-          api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
+          api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit),
+          principal_quota_(PrincipalQuotaConfig{.max_concurrency = cfg_.principal_max_concurrency,
+                                                 .rate_per_second = cfg_.principal_rate_limit,
+                                                 .burst = 2.0 * cfg_.principal_rate_limit}) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
         metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
@@ -363,6 +379,42 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+        // Per-principal quota cap exhaustions (PR 4.4, ADR-1005 class engine
+        // principals). Pre-seed all 4 closed series to 0 (docs/observability-
+        // conventions.md), mirroring yuzu_onbehalf_rejected_total above.
+        // Bounded labels only: side (engine/operator) x limit
+        // (concurrency/rate) — never principal_id. This is operational, not
+        // security (contrast the security event= on yuzu_onbehalf_rejected_
+        // total above) — a quota cap is expected steady-state behaviour, not
+        // an attack signal. side="operator" is dormant until Phase 5
+        // (delegation debits the operator side); it is pre-seeded anyway,
+        // deliberately, because it is a real documented QuotaSide dimension
+        // (unlike the withheld principal_class="engine" pre-seed above,
+        // which is reserved but not yet a live enum value).
+        metrics_.describe("yuzu_server_principal_quota_exhausted_total",
+                          "Per-principal quota-cap exhaustions by side and limit dimension",
+                          "counter");
+        for (auto side : {"engine", "operator"}) {
+            for (auto limit : {"concurrency", "rate"}) {
+                metrics_.counter("yuzu_server_principal_quota_exhausted_total",
+                                 {{"side", side}, {"limit", limit}});
+            }
+        }
+        // Admits companion (sre, governance hardening round): every
+        // ADMITTED engine request, so exhaustion RATE (exhausted /
+        // (exhausted + admits)) is computable — a self-brick immediately
+        // after a --principal-* config change (rate near 1.0) is
+        // distinguishable from ordinary load-driven exhaustion, which
+        // yuzu_server_principal_quota_exhausted_total alone can't tell
+        // apart. Bounded label set (side only — never principal_id),
+        // pre-seeded beside the exhausted counter above for the same
+        // absent()-alert reason.
+        metrics_.describe("yuzu_server_principal_quota_admits_total",
+                          "Per-principal quota-cap admits (successful try_acquire) by side",
+                          "counter");
+        for (auto side : {"engine", "operator"}) {
+            metrics_.counter("yuzu_server_principal_quota_admits_total", {{"side", side}});
+        }
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
         // live by the pool's observer hooks wired at pool construction.
@@ -891,10 +943,45 @@ public:
                           "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
         metrics_.describe("yuzu_server_guardian_events_dropped_total",
                           "Cumulative Guaranteed-State events dropped at ingest on an event_id "
-                          "PK/UNIQUE conflict (redelivery, agent event_seq_ reset, clock skew, or "
-                          "a forged-id pre-claim #1360). >0 distinguishes 'no drift' from 'drift "
-                          "silently discarded' (CC7.3 evidence gap #1414).",
+                          "PK/UNIQUE conflict where the incoming payload MISMATCHES the stored row "
+                          "(a forged-id pre-claim #1360, or an agent event_seq_ reset / clock skew "
+                          "carrying a different event). Matching-fields redeliveries are NOT counted "
+                          "here (see ..._events_redelivered_total). >0 distinguishes 'no drift' from "
+                          "'drift silently discarded' (CC7.3 evidence gap #1414).",
                           "counter");
+        metrics_.describe("yuzu_server_guardian_events_redelivered_total",
+                          "Cumulative idempotent event redeliveries at ingest — a matching-fields "
+                          "event_id conflict, i.e. the durable agent lifecycle journal's expected "
+                          "at-least-once retry. High is normal after an agent outage/reconnect; this "
+                          "is NOT a loss signal (that is ..._events_dropped_total).",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_events_ingest_errors_total",
+                          "Cumulative OPERATIONAL Guardian ingest faults (a failed BEGIN/prepare/"
+                          "insert/commit, or a redelivery compare that could not run). A sustained "
+                          "rate means conflicts are going UNCLASSIFIED, so a genuine collision can "
+                          "escape ..._events_dropped_total — this is itself alertable (sec-M2). "
+                          "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
+                          "server restart.",
+                          "counter");
+        metrics_.describe(
+            yuzu::server::detail::kGuardianEventStoreDurationMetric,
+            "Server-side latency of insert_event_classified (the classify+store SQLite operation) "
+            "for one Guardian event, split by outcome `status` (inserted|redelivered|conflict|"
+            "error). redelivered/conflict run the redelivery byte-compare; inserted does "
+            "projection+commit. A validation signal for the off-write-path compare work (#2298) - "
+            "NOT the go/no-go (an aggregate histogram can't attribute compare-CPU vs lock-wait; "
+            "that needs a concurrent benchmark). Covers the direct-Subscribe and gateway-proxied "
+            "paths. Buckets 0.1ms-10s.",
+            "histogram");
+        // Birth the four status series with the custom ladder ONCE (boundaries fix at first
+        // creation) so the hot observe path is a cheap name+label lookup and the series are on
+        // /metrics from boot. Mirrors the yuzu_pg_acquire_wait_seconds pattern above.
+        // LOAD-BEARING (unhappy-path UP-1): this MUST run in the ServerImpl ctor, before the gRPC
+        // listener opens (run() -> BuildAndStart), or the first ingest would default-construct the
+        // series with the 5ms-floor buckets and silently lose the sub-ms resolution. Do not move
+        // it after the listener starts, and do not switch the observe site to the no-warm-create
+        // (default-bucket) path.
+        yuzu::server::detail::warm_create_guardian_event_store_metric(metrics_);
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -909,6 +996,28 @@ public:
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
+        // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
+        // Deliberately a bounded `reason` label set (currently one value,
+        // "successor_unused") and NOT `event="security"` — this is an
+        // OPERATIONAL health signal (the module hasn't picked up its new
+        // credential yet), distinct from the theft-detection alert channel.
+        metrics_.describe("yuzu_engine_principal_rotation_events_total",
+                          "Cumulative engine-credential rotation sweep events, by reason "
+                          "(bounded label set)",
+                          "counter");
+        metrics_.describe("yuzu_engine_principal_rotation_auto_revoked_total",
+                          "Cumulative engine-credential predecessors auto-revoked at overlap "
+                          "window end",
+                          "counter");
+        // A persistent sweep fault (PG unreachable / audit throw every tick)
+        // silently stops predecessor auto-revocation — overlap windows then
+        // never close (two live credentials persist). The per-tick try/catch
+        // keeps the thread alive; this counter makes that degradation
+        // alertable instead of log-only (Gate 8 UP8-6).
+        metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
+                          "Cumulative engine-credential rotation-sweep ticks that failed with an "
+                          "exception (predecessor auto-revocation skipped for that tick)",
+                          "counter");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");
@@ -3418,6 +3527,10 @@ public:
                         .set(static_cast<double>(guaranteed_state_store_->events_written_total()));
                     metrics_.gauge("yuzu_server_guardian_events_dropped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_dropped_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_redelivered_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_redelivered_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_ingest_errors_total")
+                        .set(static_cast<double>(guaranteed_state_store_->events_ingest_errors_total()));
                     metrics_.gauge("yuzu_server_guardian_events_reaped_total")
                         .set(static_cast<double>(guaranteed_state_store_->events_reaped_total()));
                     metrics_.gauge("yuzu_server_guardian_proj_failures_total")
@@ -3528,6 +3641,151 @@ public:
                                  "server.default_certs_in_use");
                     }
                 });
+        }
+
+        // T12 (design doc §7): engine-credential overlap-pair rotation
+        // sweep — auto-revoke + successor-unused warning. Only started when
+        // api_token_store_ is actually open (nothing to sweep otherwise).
+        // 60s cadence: overlap windows floor at 24h (kOverlapFloorSecs in
+        // api_token_store.cpp), so a minute of sweep latency is immaterial
+        // to either half's correctness — the sweep is idempotent and a
+        // missed tick simply defers to the next one (see
+        // sweep_expired_rotations's doc comment).
+        if (api_token_store_ && api_token_store_->is_open()) {
+            engine_rotation_sweep_thread_ = std::thread([this]() {
+                spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
+                // Successor-unused warnings are process-local, best-effort
+                // de-duplication (mirrors ApiTokenStore's own rotation-grace
+                // cache precedent) — keyed on rotation_group, so the SAME
+                // pair isn't re-audited/re-counted every tick while its
+                // window is still open. Pruned each tick to whatever
+                // list_rotations_nearing_expiry_unused still returns, so a
+                // resolved pair (revoked, confirmed, or finally used) frees
+                // its slot for a future rotation on the same principal. A
+                // process restart forfeits the de-dup state and re-warns
+                // once — acceptable for an operational signal.
+                std::unordered_set<std::string> warned_rotation_groups;
+                // Warn once the predecessor's overlap window has this much
+                // time left — matches the 24h overlap floor: the operator
+                // gets a full floor-window's notice before auto-revoke, the
+                // shortest lead time that is never a false "already gone"
+                // read against the shortest window an operator can even set.
+                constexpr std::int64_t kSuccessorUnusedWarnLeadSecs = 24 * 3600;
+
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
+                         ++i) {
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    // S-SWEEP-EXCEPTION-GUARD: an exception escaping a
+                    // std::thread body calls std::terminate (whole-process
+                    // crash) — a transient failure here (e.g. an
+                    // audit_store_->log throw, bad_alloc) must instead log
+                    // and let the loop continue to the next tick
+                    // (fail-safe, self-healing; matches the sweep's own
+                    // "a missed tick simply defers to the next one" posture).
+                    try {
+                    if (!api_token_store_ || !api_token_store_->is_open())
+                        continue; // defensive — construction-time guard above should hold
+
+                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+
+                    // Half 1: auto-revoke elapsed predecessors + clear the
+                    // surviving successor's rotation state. A failed tick (pool
+                    // contention / query error) is reported via the out-param —
+                    // the store swallows it (returns empty) rather than throwing,
+                    // so without this the sweep-failures alert would stay at zero
+                    // while rotated-out credentials silently outlive their window.
+                    bool sweep_tick_failed = false;
+                    auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
+                    if (sweep_tick_failed) {
+                        spdlog::warn("Engine-credential rotation sweep tick could not run (pool "
+                                     "contention / query failure) — predecessor auto-revoke deferred "
+                                     "to the next tick");
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                    for (const auto& predecessor : revoked) {
+                        metrics_.counter("yuzu_engine_principal_rotation_auto_revoked_total")
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log(
+                                {.timestamp = now,
+                                 .principal = "system",
+                                 .principal_role = "system",
+                                 .action = "engine_principal.rotation.auto_revoke",
+                                 .target_type = "ApiToken",
+                                 .target_id = predecessor.token_id,
+                                 .detail = "principal_id=" + predecessor.principal_id +
+                                           " reason=overlap_window_elapsed",
+                                 .result = "success"});
+                        }
+                        // Any pair that just resolved no longer needs its
+                        // warned-state tracked — the token_id it was keyed
+                        // under (rotation_group == successor's token_id,
+                        // never the predecessor's) is pruned below anyway,
+                        // but drop it here too for clarity/promptness.
+                        warned_rotation_groups.erase(predecessor.rotation_group);
+                    }
+
+                    // Half 2: successor-unused warning — an OPERATIONAL
+                    // health signal (bounded reason label, NOT
+                    // event="security"; see the design doc §7 / the
+                    // metrics_.describe comment above), kept on its own
+                    // channel from any theft-detection alert.
+                    auto nearing = api_token_store_->list_rotations_nearing_expiry_unused(
+                        now, kSuccessorUnusedWarnLeadSecs);
+                    std::unordered_set<std::string> still_nearing;
+                    for (const auto& pair : nearing) {
+                        still_nearing.insert(pair.successor.rotation_group);
+                        if (warned_rotation_groups.contains(pair.successor.rotation_group))
+                            continue; // already warned this rotation attempt — don't re-spam
+                        warned_rotation_groups.insert(pair.successor.rotation_group);
+
+                        metrics_
+                            .counter("yuzu_engine_principal_rotation_events_total",
+                                     {{"reason", "successor_unused"}})
+                            .increment();
+                        if (audit_store_ && audit_store_->is_open()) {
+                            (void)audit_store_->log(
+                                {.timestamp = now,
+                                 .principal = "system",
+                                 .principal_role = "system",
+                                 .action = "engine_principal.rotation.successor_unused",
+                                 .target_type = "ApiToken",
+                                 .target_id = pair.successor.token_id,
+                                 .detail = "principal_id=" + pair.predecessor.principal_id +
+                                           " predecessor_token_id=" + pair.predecessor.token_id +
+                                           " overlap_expires_at=" +
+                                           std::to_string(pair.predecessor.overlap_expires_at),
+                                 .result = "warning"});
+                        }
+                    }
+                    // Prune de-dup entries for pairs that no longer appear
+                    // (resolved via revoke, confirm, or the successor
+                    // finally being used) so a later rotation on the same
+                    // principal can warn again.
+                    std::erase_if(warned_rotation_groups, [&](const std::string& group) {
+                        return !still_nearing.contains(group);
+                    });
+                    } catch (const std::exception& e) {
+                        spdlog::error("Engine-credential rotation sweep tick failed: {}",
+                                     e.what());
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    } catch (...) {
+                        spdlog::error("Engine-credential rotation sweep tick failed: unknown "
+                                      "exception");
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                }
+                spdlog::info("Engine-credential rotation sweep thread stopped");
+            });
         }
 
         agent_server_->Wait();
@@ -3641,6 +3899,15 @@ public:
         // Join the insecure-TLS reminder thread (issue #79)
         if (insecure_tls_reminder_thread_.joinable()) {
             insecure_tls_reminder_thread_.join();
+        }
+
+        // T12: join the engine-credential rotation sweep thread (borrows
+        // api_token_store_ + audit_store_ — must stop before either is torn
+        // down; api_token_store_.reset() happens further below alongside
+        // engine_principal_store_, per the F5 destruct-before-pool ordering
+        // note on those members).
+        if (engine_rotation_sweep_thread_.joinable()) {
+            engine_rotation_sweep_thread_.join();
         }
 
         if (schedule_engine_)
@@ -5112,6 +5379,21 @@ private:
         web_server_->set_pre_routing_handler([this](const httplib::Request& req,
                                                     httplib::Response& res)
                                                  -> httplib::Server::HandlerResponse {
+            // Per-principal quota (PR 4.4) — defensive reset at the TOP of
+            // pre-routing. httplib's worker-thread affinity means a QuotaSlot
+            // stashed in tls_quota_slot() on this thread by a PRIOR request is
+            // normally released either by that request's post-routing handler
+            // (non-streaming) or by its stream's own resource-releaser via
+            // adopt_quota_slot_into_stream (streaming, UP-1) before this
+            // thread is handed a new one; this reset reclaims a slot leaked by
+            // any prior request that bypassed BOTH — the only such bypass
+            // today would be a future WebSocket upgrade (httplib DOES support
+            // WebSocket; this codebase just registers no handler for one
+            // today — the real safety is the absence of a handler, not a
+            // protocol limitation). See detail::tls_quota_slot()'s doc
+            // comment.
+            detail::tls_quota_slot().reset();
+
             // Lightweight probes — always allowed, no auth, no rate limit.
             // /health and /api/health are included here (governance Gate 7,
             // unhappy-path UP-1) so monitoring integrations behind a NAT or
@@ -5272,6 +5554,43 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // Per-principal quota cap (PR 4.4, ADR-1005 class engine
+            // principals) — THE single pre-routing chokepoint gate (#2225
+            // ADR-0017); no separate route, no bypass. Runs AFTER session
+            // resolution so we have a stable principal id. The security
+            // DECISION (principal_kind/auth_source == "engine" two-predicate
+            // check (S1), mcp-vs-rest render pick, UP-1 always-try_acquire)
+            // lives in the pure, testable detail::apply_engine_quota_gate —
+            // this is a thin caller that only owns the httplib-specific,
+            // worker-thread-affine slot stash (R2, see
+            // detail::tls_quota_slot()'s doc comment) and the
+            // Handled/Unhandled return. The gate mints its own correlation
+            // id lazily, only on the reject path — no cid is computed here.
+            {
+                bool rejected = false;
+                // "engine:<slug>" for an engine session — the STABLE
+                // authorization principal (see Session::username's doc
+                // comment); never display_name. auth_source is the second
+                // S1 predicate (see apply_engine_quota_gate's doc comment).
+                // Both ignored by the gate for a non-engine session.
+                auto slot = detail::apply_engine_quota_gate(session->principal_kind,
+                                                             session->auth_source,
+                                                             session->username, req, res,
+                                                             principal_quota_, metrics_,
+                                                             rejected);
+                if (rejected) {
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                if (slot) {
+                    // UP-1: this slot is now held regardless of whether the
+                    // route is streaming. A streaming route is expected to
+                    // `adopt_quota_slot_into_stream` it out of here before
+                    // post-routing's reset (below) fires; a normal route
+                    // leaves it here and post-routing releases it.
+                    detail::tls_quota_slot() = std::move(*slot);
+                }
+            }
+
             return httplib::Server::HandlerResponse::Unhandled;
         });
 
@@ -5298,6 +5617,11 @@ private:
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
         web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
                                                                        httplib::Response& res) {
+            // Per-principal quota (PR 4.4) — release the concurrency slot
+            // (if any) admitted for this request at pre-routing. A no-op for
+            // denied/streaming/non-engine requests, which never stash one.
+            detail::tls_quota_slot().reset();
+
             // -- Security response headers (SOC2-C1) ---------------------
             // Applied to ALL responses (dashboard, API, metrics, health,
             // error pages).
@@ -6343,6 +6667,14 @@ private:
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
+        // PR 4.3 (T13): wire the LIVE owner-delete guard + admin console
+        // fragment. Nullable — a null/unwired engine_principal_store_ leaves
+        // the guard permissive (documented on set_engine_principal_store) and
+        // the console fragment renders "not configured", same posture as
+        // every other optional-store wiring in this file.
+        if (engine_principal_store_) {
+            settings_routes_->set_engine_principal_store(engine_principal_store_.get());
+        }
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -6402,14 +6734,20 @@ private:
             // Note: httplib's chunked loop sets data_available = (l > 0) on
             // every write.  Our provider never writes 0 bytes (always at
             // least a 14-byte keepalive), so the loop runs indefinitely.
+            // UP-1: adopt any pending engine QuotaSlot into this stream's
+            // resource-releaser (see is_streaming_path/adopt_quota_slot_
+            // into_stream in principal_quota_gate.hpp) so the concurrency
+            // reservation survives for the stream's actual lifetime instead
+            // of releasing early at post-routing.
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
                     return detail::sse_content_provider(sink_state, offset, sink);
                 },
-                [sink_state, bus](bool success) {
-                    detail::sse_resource_release(sink_state, *bus, success);
-                });
+                detail::adopt_quota_slot_into_stream(
+                    [sink_state, bus](bool success) {
+                        detail::sse_resource_release(sink_state, *bus, success);
+                    }));
         });
 
         // -- Agent listing API ------------------------------------------------
@@ -10843,7 +11181,8 @@ private:
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
-                                          audit_store_.get(), cfg_.scim_admin_group);
+                                          audit_store_.get(), cfg_.scim_admin_group,
+                                          engine_principal_store_.get());
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
@@ -10884,7 +11223,33 @@ private:
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
+        // PR 4.3 (T13): shared owner-existence resolver for the
+        // engine-principal create/transfer-owner FK check — RestApiV1 and
+        // McpServer both need the identical "does this username name a real
+        // user" predicate. AuthDB::user_exists is non-const and returns
+        // std::expected<bool, AuthDBError> (no value_or on std::expected);
+        // a lookup failure reads as "does not exist" — fail-closed on the
+        // owner FK, same posture break_glass_account_problem uses elsewhere
+        // in auth_db.cpp.
+        auto engine_owner_exists_fn = [this](const std::string& username) -> bool {
+            auto* db = auth_mgr_.auth_db_ptr();
+            if (db == nullptr)
+                return false;
+            auto exists = db->user_exists(username);
+            return exists.has_value() && *exists;
+        };
+
         rest_api_v1_ = std::make_unique<RestApiV1>();
+        // Both setters MUST run BEFORE register_routes() (captured by value
+        // at registration time, not `this`) — see set_engine_principal_store/
+        // set_user_exists_fn's doc comments in rest_api_v1.hpp. Nullable:
+        // an unwired engine_principal_store_ leaves the engine-principal
+        // routes answering 503, same posture as every other optional-store
+        // wiring in this file.
+        if (engine_principal_store_) {
+            rest_api_v1_->set_engine_principal_store(engine_principal_store_.get());
+            rest_api_v1_->set_user_exists_fn(engine_owner_exists_fn);
+        }
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -11172,6 +11537,20 @@ private:
             // → web_server_->stop()) before any member destructs — no handler
             // runs after the join, so member-destruction order is irrelevant.
             mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
+            // PR 4.3 (T13): wire the engine-principal store + the SAME
+            // engine-credential store (api_token_store_) + the shared
+            // owner-existence predicate the 8 engine tools need. Setters
+            // are safe before OR after register_routes (the handler
+            // captures `this`, see mcp_server.hpp's doc comment) but set
+            // here, before build_handler() runs, for consistency with the
+            // REST/settings wiring above. Nullable — an unwired
+            // engine_principal_store_ leaves every engine-principal tool
+            // answering "unavailable" rather than 503/crashing.
+            if (engine_principal_store_) {
+                mcp_server_->set_engine_principal_store(engine_principal_store_.get());
+                mcp_server_->set_engine_credential_store(api_token_store_.get());
+                mcp_server_->set_owner_exists_fn(engine_owner_exists_fn);
+            }
             mcp_server_->register_routes(
                 *web_server_,
                 [this](const httplib::Request& req, httplib::Response& res)
@@ -11839,6 +12218,18 @@ private:
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;
 
+    // T12 (design doc §7): engine-credential overlap-pair rotation sweep —
+    // auto-revoke elapsed predecessors + the successor-unused warning. A
+    // dedicated thread rather than piggybacking on health_recompute_thread_:
+    // that thread's own comment (see start_web_server()) already flags its
+    // sweep body as a serial budget shared with a SECURITY-relevant
+    // revocation sweep — adding unrelated PG-bound work there would grow
+    // that shared stall window. Joined before api_token_store_ resets in
+    // stop() (it borrows api_token_store_ + audit_store_, same ADR-0012
+    // destruct-before-pool discipline as every other PG-borrowing thread
+    // here).
+    std::thread engine_rotation_sweep_thread_;
+
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> stop_entered_{false};
     std::atomic<bool> draining_{false};
@@ -11846,6 +12237,10 @@ private:
     // Rate limiting
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
+
+    // Per-principal quota cap (PR 4.4) — gates principal_kind=="engine"
+    // sessions only, at the pre-routing chokepoint. See principal_quota.hpp.
+    PrincipalQuota principal_quota_;
 };
 
 // -- Factory ------------------------------------------------------------------

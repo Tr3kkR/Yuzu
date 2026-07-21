@@ -280,7 +280,7 @@ TEST_CASE("GuaranteedStateStore: event insert + query", "[guaranteed_state_store
     CHECK(by_sev[0].event_id == "evt-2");
 }
 
-TEST_CASE("GuaranteedStateStore: duplicate event_id is dropped and counted (#1414)",
+TEST_CASE("GuaranteedStateStore: mismatched-payload event_id collision is dropped + counted (#1414)",
           "[guaranteed_state_store][events]") {
     GuaranteedStateStore store(":memory:");
 
@@ -288,14 +288,119 @@ TEST_CASE("GuaranteedStateStore: duplicate event_id is dropped and counted (#141
     CHECK(store.events_written_total() == 1);
     CHECK(store.events_dropped_total() == 0);
 
-    // Redelivery / forged-id pre-claim: same event_id collides on the global PK.
-    // The conflicting event must NOT be written, the failure surfaces as an error,
-    // and the silent-drop counter must advance (CC7.3 evidence — #1414).
+    // Forged-id pre-claim / seq-reset: the SAME event_id from a DIFFERENT agent (a
+    // MISMATCHED immutable field) is a genuine collision, not a redelivery — the
+    // event must NOT be written, the failure surfaces as an error, and the loud
+    // CC7.3 drop counter advances (#1414). A matching-fields redelivery is the quiet
+    // redelivered path — covered by the tri-state test below.
     auto r = store.insert_event(make_event("evt-dup", "rule-1", "agent-B"));
     REQUIRE_FALSE(r);
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
     CHECK(store.events_dropped_total() == 1);
+    CHECK(store.events_redelivered_total() == 0);
+}
+
+TEST_CASE("GuaranteedStateStore: matching-fields redelivery is quiet + counted apart (item-7)",
+          "[guaranteed_state_store][events][redelivery]") {
+    // The durable agent lifecycle journal re-sends on every reconnect, so a
+    // matching-fields event_id redelivery is EXPECTED + idempotent: NOT re-written,
+    // reported as Redelivered (so ingest skips the DEX observers), counted on the
+    // quiet redelivered metric. A SAME event_id with a DIFFERENT immutable field is a
+    // loud Conflict; a server-enriched severity change is EXCLUDED from the match.
+    GuaranteedStateStore store(":memory:");
+
+    auto e = make_event("evt-r", "rule-1", "agent-A");
+    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+
+    // Exact redelivery: identical row, same event_id.
+    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Redelivered);
+    CHECK(store.event_count() == 1);
+    CHECK(store.events_written_total() == 1);
+    CHECK(store.events_redelivered_total() == 1);
+    CHECK(store.events_dropped_total() == 0);
+    // The back-compat wrapper treats a redelivery as benign success.
+    CHECK(store.insert_event(e).has_value());
+    CHECK(store.events_redelivered_total() == 2);
+
+    // Same event_id, DIFFERENT immutable field -> genuine collision, stays loud.
+    auto forged = e;
+    forged.detected_value = "TAMPERED";
+    CHECK(store.insert_event_classified(forged).outcome == EventInsertOutcome::Conflict);
+    CHECK(store.events_dropped_total() == 1);
+    CHECK(store.events_redelivered_total() == 2); // unchanged
+    CHECK(store.event_count() == 1);              // not written
+
+    // Severity is server-enriched -> excluded from the match: a severity-only change
+    // is still a redelivery, not a collision.
+    auto sev = make_event("evt-r", "rule-1", "agent-A", "critical");
+    CHECK(store.insert_event_classified(sev).outcome == EventInsertOutcome::Redelivered);
+    CHECK(store.events_dropped_total() == 1); // no new drop
+}
+
+TEST_CASE("GuaranteedStateStore: an embedded-NUL event field is rejected as malformed (item-7)",
+          "[guaranteed_state_store][events][redelivery]") {
+    // A NUL would be silently truncated by SQLite's -1 text binds and corrupt both the
+    // event_id PK dedup and the redelivery compare — reject it as Error (malformed),
+    // never store-truncate it, and never count it as a collision. Guardian fields are
+    // structured text / JSON and never legitimately carry a NUL.
+    GuaranteedStateStore store(":memory:");
+
+    auto e = make_event("evt-nul", "rule-1", "agent-A");
+    e.detected_value = std::string("a\0b", 3); // embedded NUL
+    CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Error);
+    CHECK(store.event_count() == 0);
+    CHECK(store.events_dropped_total() == 0);       // malformed, NOT a collision
+    CHECK(store.events_redelivered_total() == 0);
+    CHECK_FALSE(store.insert_event(e).has_value()); // wrapper maps Error -> unexpected
+
+    // A NUL in event_id (would truncate the PK) is likewise rejected.
+    auto e2 = make_event(std::string("evt\0x", 5), "rule-1", "agent-A");
+    CHECK(store.insert_event_classified(e2).outcome == EventInsertOutcome::Error);
+    CHECK(store.event_count() == 0);
+}
+
+TEST_CASE("GuaranteedStateStore: every compared field triggers a Conflict when it differs (item-7)",
+          "[guaranteed_state_store][events][redelivery]") {
+    // A same-event_id re-insert that differs in ANY ONE immutable compared field must be
+    // a loud Conflict, not a quiet Redelivered — this pins the whole compare column set so
+    // a column-index off-by-one in stored_event_matches_locked is caught (qa-S2). severity
+    // is EXCLUDED (server-enriched) and is asserted to stay a Redelivery.
+    GuaranteedStateStore store(":memory:");
+
+    auto base = make_event("evt-f", "rule-1", "agent-A");
+    base.detail_json = R"({"k":"v"})";
+    REQUIRE(store.insert_event_classified(base).outcome == EventInsertOutcome::Inserted);
+
+    uint64_t dropped = 0;
+    auto expect_conflict = [&](auto mutate) {
+        auto e = base;
+        mutate(e); // one field differs; event_id stays "evt-f" so it conflicts on the PK
+        CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Conflict);
+        CHECK(store.events_dropped_total() == ++dropped);
+        CHECK(store.event_count() == 1); // never written
+    };
+
+    expect_conflict([](GuaranteedStateEventRow& e) { e.rule_id = "rule-2"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.agent_id = "agent-Z"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.event_type = "drift.detected"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.guard_type = "etw"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.guard_category = "condition"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.detected_value = "1"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.expected_value = "0"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.remediation_action = "other"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.remediation_success = false; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.detection_latency_us = 999; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.remediation_latency_us = 999; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.timestamp = "2026-04-19T13:00:00Z"; });
+    expect_conflict([](GuaranteedStateEventRow& e) { e.detail_json = R"({"k":"w"})"; });
+
+    // Control: severity is server-enriched -> excluded -> a severity-only change stays a
+    // Redelivery and does not bump the drop counter.
+    auto sev = base;
+    sev.severity = (base.severity == "high") ? "low" : "high";
+    CHECK(store.insert_event_classified(sev).outcome == EventInsertOutcome::Redelivered);
+    CHECK(store.events_dropped_total() == dropped); // unchanged
 }
 
 TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
@@ -604,9 +709,13 @@ TEST_CASE("GuaranteedStateStore: redelivered crash event_id does not double-coun
     crash.timestamp = "2026-06-08T12:00:00Z";
 
     REQUIRE(store.insert_event(crash));
+    // Matching-fields redelivery (item-7 PR-Sv): an idempotent success — NOT
+    // re-inserted or re-projected (event_id PK dedup), counted on the quiet
+    // redelivered metric, never the loud CC7.3 drop metric.
     auto dup = store.insert_event(crash); // same event_id redelivered
-    REQUIRE_FALSE(dup.has_value());
-    CHECK(is_conflict_error(dup.error())); // event PK conflict
+    REQUIRE(dup.has_value());
+    CHECK(store.events_redelivered_total() == 1);
+    CHECK(store.events_dropped_total() == 0);
 
     // Exactly one event row AND one projection row — no double-count.
     GuaranteedStateEventQuery q;

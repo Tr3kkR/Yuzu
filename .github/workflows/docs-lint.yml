@@ -37,6 +37,15 @@ jobs:
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py
 
+      # Issue-lifecycle hygiene (ADR-3001 A1) lives under this REQUIRED job on
+      # purpose: the meson `docs` suite also runs it, but only inside the heavy
+      # platform jobs, which docs-only PRs skip (#1978 gate) — and docs-only
+      # PRs are exactly the class that can push CLAUDE.md over its cap or break
+      # the never-close list. This job runs on every PR, so the invariant
+      # actually binds.
+      - name: Issue-lifecycle docs hygiene (CLAUDE.md cap, do-not-close.txt)
+        run: python3 tests/test_issue_docs.py
+
   # Changelog fragment convention (changelog.d/ — see changelog.d/README.md):
   # PRs add uniquely-named fragment files instead of editing CHANGELOG.md's
   # [Unreleased] section (the perpetual merge-conflict / approval-invalidation
