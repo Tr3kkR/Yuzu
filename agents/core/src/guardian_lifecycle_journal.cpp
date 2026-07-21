@@ -649,6 +649,16 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         if (stopping_.load(std::memory_order_acquire))
             break; // shutdown began: stop mutating the window (stop-race gate, rev-4.1 #7)
         Cand& c = cands[(start + n) % cands.size()];
+        // Check headroom BEFORE building anything. Two reasons (#2298 Gate 4 UP-2 + f-2):
+        // try_page_batch's own headroom gate is all-or-nothing per batch, so a full window
+        // means every OutboxEntry constructed below - up to 256 per batch, each carrying
+        // several strings - is built and immediately discarded; and the caller cannot
+        // otherwise distinguish "window full" from "already a member", which are opposite
+        // situations. Recording it here makes the distinction explicit and skips the waste.
+        if (rt.lifecycle_headroom() < c.batch.entries.size()) {
+            stats.headroom_blocked = true;
+            break; // no smaller batch will fit either; wait for the drain to free room
+        }
         const bool have_token = page_bucket_.ready(now_ms); // refills for elapsed time
 
         std::vector<OutboxEntry> entries;

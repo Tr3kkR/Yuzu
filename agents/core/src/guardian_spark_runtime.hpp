@@ -258,6 +258,12 @@ public:
         /// remain. The caller should re-drain without waiting rather than sleep.
         bool truncated{false};
     };
+    /// Free slots in the lifecycle send window. Lets the journal's replay path tell the two
+    /// reasons try_page_batch() returns 0 apart - "the window is FULL" versus "every entry
+    /// was already a member" - which are operationally opposite: the first is a backlog
+    /// waiting on drain progress, the second is a steady state needing no action at all.
+    [[nodiscard]] std::size_t lifecycle_headroom() const;
+
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
     DrainOutcome drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
                                const DrainLimits& limits);

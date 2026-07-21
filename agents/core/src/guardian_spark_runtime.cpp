@@ -666,6 +666,11 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
 }
 } // namespace
 
+std::size_t GuardianSparkRuntime::lifecycle_headroom() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.headroom();
+}
+
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
     // Drain lifecycle (audit) BEFORE compliance/health so a rule's "armed" precedes its
     // first drift on the wire in the common case (stream up, both drain fully). This is
@@ -702,6 +707,12 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
         reserve = total / limits.compliance_reserve_den * limits.compliance_reserve_num;
         if (reserve > total)
             reserve = total;
+        // Integer division floors to 0 whenever total < den, which silently removes the
+        // reserve and reopens the starvation this exists to prevent - with no diagnostic
+        // (#2298 Gate 4 UP-8). Guarantee at least one slot whenever there is more than one
+        // to give; at total == 1 there is nothing to split and lifecycle keeps first claim.
+        if (reserve == 0 && total > 1)
+            reserve = 1;
     }
 
     DrainPassLimits lim;
