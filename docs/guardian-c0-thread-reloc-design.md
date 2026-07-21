@@ -386,3 +386,48 @@ de-duplicates on the `event_id` PK, counting
 `yuzu_server_guardian_events_redelivered_total`, which the metrics manual documents as normal
 after an outage and explicitly not a loss signal. Changing the code to satisfy the original
 assertion would have broken replay.
+
+
+---
+
+## REQUIRED at the `prefer_spark` flip (Gate 6 enterprise-readiness)
+
+Everything in this change that relocates journal maintenance is DORMANT until the Spark
+detection path becomes authoritative. The changelog says so, which is the right posture for
+shipping now - but it creates an obligation later, and an obligation recorded only in a review
+transcript is one nobody will honour.
+
+Whichever PR flips `prefer_spark` MUST also:
+
+1. **Ship its own changelog entry** cross-referencing this one, stating that C0 is now live and
+   what actually changes for an operator: the heartbeat and reconnect paths no longer touch the
+   KvStore for journal work, and retention/paging now run on the drain worker at their own
+   cadences. Without this the behaviour changes with no release note of its own, because the
+   note was consumed by a release where nothing happened.
+2. **Update the `yuzu.guardian_journal_maint_exceptions` row** in `docs/user-manual/metrics.md`
+   to drop the dormancy framing. That counter's meaning has already shifted once during this
+   branch (it now aggregates the heartbeat's retry-persist, the drain worker's prune/page, and
+   the convergence sweeps) and shifts again in effect at the flip.
+3. **Close or explicitly risk-accept the shutdown-classification undercount** (Gate 6
+   compliance, CC7.2): when a stop lands mid-classification, the remaining evicted keys are
+   counted in neither `evicted_sent_unacked` nor `evicted_no_send_evidence`, so the counter an
+   auditor reads as "audit gap" reports a SMALLER gap than actually occurred. Under-counting a
+   loss indicator is worse than under-counting a success one. Dormancy caps the severity
+   today; it does not once C0 is live. This needs to be an explicit checklist item on #2298,
+   not prose in a design doc.
+4. **Land the `yuzu_fleet_guardian_*` server rollup** (#2298 gate 3). The loss and redelivery
+   signals exist only in per-agent heartbeat tags today, so compliance evidence automation
+   scraping `/metrics` cannot see them at all, and one wedged endpoint is invisible without
+   inspecting that host by hand.
+5. **Surface `gauge_underflow_`** (pre-existing #2303, self-flagged in
+   `guardian_lifecycle_journal.hpp` as needing to land WITH the cutover): the accounting bug it
+   detects camouflages as a healthy empty journal because `journal_batch_count` clamps to 0.
+6. **Add a "seconds since last successful page/prune pass" gauge** (Gate 6 sre). It is the only
+   viable liveness signal for the two wall-clock hazards AND for a release-build deadlock,
+   where the `mtx_` guard compiles out and a wedged worker is indistinguishable from an idle
+   healthy one.
+7. **Run chaos scenario CH-5** (live-event latency under KvStore contention, UAT rig). It is
+   the only scenario that measures the thing C0 was built to fix, so it is the flip's genuine
+   go/no-go rather than a formality.
+
+Tracked on #2298, which is the cutover gate list.

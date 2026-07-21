@@ -621,11 +621,35 @@ all, so absence means "nothing to report", not "not collected".
 | `yuzu.guardian_journal_maint_exceptions` | Cumulative Guardian background passes that threw and were firewalled: the heartbeat's retry-persist, the drain worker's retention prune and replay paging, and the convergence lanes' sweeps. Nonzero means the journal path hit an exception (typically `bad_alloc` under memory pressure) and was contained rather than terminating the agent. | Investigate endpoint memory pressure. A steadily climbing value with a growing `yuzu.guardian_journal_bytes` means retention is not keeping up. |
 | `yuzu.guardian_journal_write_capacity_rejected` | Records refused because the journal is at its hard write ceiling. | Check whether prune is failing (`yuzu.guardian_journal_prune_failures`) or the store is unwritable. |
 | `yuzu.guardian_journal_prune_failures` | Retention passes that could not read the journal. | A sustained nonzero value means the shared `kv_store.db` is busy or corrupt. |
-| `yuzu.guardian_journal_evicted_without_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. |
+| `yuzu.guardian_journal_evicted_no_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. A sudden large spike with no matching outage can also mean the endpoint's wall clock jumped FORWARD past the retention window (VM restored from an old snapshot, bad NTP correction), which expires the journal wholesale - check the endpoint's clock before concluding evidence was genuinely lost. |
+| `yuzu.guardian_journal_bytes` / `yuzu.guardian_journal_batch_count` | Current on-disk size and batch count of the journal. Gauges, not counters. | Not independently actionable - use them to interpret the rows above (a climbing size alongside `prune_failures` means retention is not keeping up). |
 
-Counters are cumulative for the agent process and reset on restart. `yuzu.guardian_journal_maint_exceptions`
-aggregates two internal sources (see the drain-worker note in
-`docs/guardian-c0-thread-reloc-design.md`); it is deliberately one operator-facing number.
+Note the tag KEY is not always the internal field name - the audit-gap row above is emitted
+as `..._evicted_no_send_evidence` though the field is `evicted_without_send_evidence`. Grep
+heartbeat payloads for the key in this table, not for the field name; the emitter in
+`agents/core/src/guardian_journal_heartbeat.hpp` is authoritative.
+
+This table covers the actionable subset. The emitter ships roughly twenty
+`yuzu.guardian_journal_*` tags in total (sparsely - only non-zero ones), so a tag absent from
+this table is not necessarily absent from the payload.
+
+Counters are cumulative for the agent process and reset on restart. ### How long Guardian audit evidence is retained ON the endpoint
+
+The durable lifecycle journal keeps records locally until they are replayed to the server,
+bounded by whichever of these is reached first:
+
+| Cap | Value | Behaviour at the cap |
+|---|---|---|
+| Age | 7 days | Older batches are evicted on the next retention pass |
+| Batch count | 1000 (soft) / 2000 (hard ceiling) | Oldest-first eviction at the soft cap; writes are REFUSED at the hard ceiling |
+| Size | 32 MiB (soft) / 64 MiB (hard ceiling) | As above |
+
+Eviction is keyed off each batch's recorded wall-clock timestamp, so the window survives a
+reboot. This is the ENDPOINT-side window only - once records reach the server they follow the
+server's own retention (see `guaranteed-state.md`). An endpoint offline for longer than the
+age cap, or generating more than the count/size caps allow, will have the excess evicted
+locally; `yuzu.guardian_journal_evicted_no_send_evidence` counts the batches that aged out
+with no evidence of ever having been sent.
 
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
 

@@ -19,7 +19,3 @@
   until the journal reached its write ceiling and began dropping lifecycle audit records. The
   compliance/health outbox is also guaranteed a share of each pass, so a busy lifecycle log
   cannot delay drift reporting.
-- **A Guardian convergence lane that throws no longer terminates the agent.** The four
-  convergence sweep threads ran without an exception firewall, so an allocation failure during a
-  sweep took down the whole daemon; they now count and log the failure and keep running, matching
-  the drain worker.
