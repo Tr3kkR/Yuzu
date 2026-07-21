@@ -44,7 +44,17 @@ struct GuardianJournalStats {
     std::uint64_t sent_labels_written{0};
     std::uint64_t evicted_sent_unacked{0};          ///< aged out WITH a sent-label (monitor)
     std::uint64_t evicted_without_send_evidence{0}; ///< aged out with NO sent-label (integrity gap, alert)
-    std::uint64_t maint_exceptions{0};              ///< swallowed tick/page/flush throws (review B4)
+    std::uint64_t maint_exceptions{0};              ///< swallowed persist/prune/page throws (review B4)
+    /// Firewalled OUTBOX-DELIVERY throws on the drain worker (bad_alloc in the drain
+    /// machinery). Separate from maint_exceptions: delivery failing and retention failing
+    /// need different operator responses.
+    std::uint64_t drain_exceptions{0};
+    /// Firewalled CONVERGENCE-SWEEP throws on the scheduler lanes. Deliberately NOT folded
+    /// into maint_exceptions (#2298 Gate 6 sre): these are drift-DETECTION failures with
+    /// nothing to do with the journal, and a tag named journal_maint_exceptions counting
+    /// them leaves an operator unable to tell "audit trail at risk" from "detection
+    /// degraded" - the two have different urgency and different remediation.
+    std::uint64_t sweep_exceptions{0};
 };
 
 /// Populate `tags` with the (sparse) journal telemetry. `TagMap` is any map with a string
@@ -77,6 +87,8 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_evicted_sent_unacked", s.evicted_sent_unacked);
     put("yuzu.guardian_journal_evicted_no_send_evidence", s.evicted_without_send_evidence);
     put("yuzu.guardian_journal_maint_exceptions", s.maint_exceptions);
+    put("yuzu.guardian_drain_exceptions", s.drain_exceptions);
+    put("yuzu.guardian_sweep_exceptions", s.sweep_exceptions);
 }
 
 } // namespace yuzu::agent

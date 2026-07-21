@@ -467,16 +467,22 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
         s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
     }
-    // Fold in every firewalled Guardian background throw (C0 #2298): prune/page used to be
-    // counted here from the heartbeat tick and are now counted on the drain worker, and the
-    // convergence lanes gained a firewall in Gate 4. All three surface under the SAME
-    // operator-facing tag - a counter that exists but reaches no heartbeat is not
-    // observability, and an operator watching this tag must not see it go silently dead
-    // just because the work moved threads.
+    // maint_exceptions keeps its NAME's meaning: journal work only - the heartbeat's
+    // retry-persist plus the drain worker's prune/page, which is where prune/page throws were
+    // counted before C0 moved them off the heartbeat. An operator watching this tag must not
+    // see it go dead just because the work changed threads.
+    //
+    // Outbox-delivery and convergence-sweep firewalls get their OWN tags rather than being
+    // folded in here (#2298 Gate 6 sre). Aggregating them looked like consolidation but
+    // destroyed the distinction that matters on call: a journal failure means the audit trail
+    // is at risk, a sweep failure means drift detection is degraded. Same number, opposite
+    // responses. A counter nobody can read is not observability - but neither is one that
+    // cannot be acted on.
     s.maint_exceptions =
         journal_maint_exceptions_.load(std::memory_order_relaxed) +
-        (spark_drain_worker_ ? spark_drain_worker_->journal_maint_exception_count() : 0) +
-        (spark_scheduler_ ? spark_scheduler_->sweep_exception_count() : 0);
+        (spark_drain_worker_ ? spark_drain_worker_->journal_maint_exception_count() : 0);
+    s.drain_exceptions = spark_drain_worker_ ? spark_drain_worker_->drain_exception_count() : 0;
+    s.sweep_exceptions = spark_scheduler_ ? spark_scheduler_->sweep_exception_count() : 0;
     return s;
 }
 
