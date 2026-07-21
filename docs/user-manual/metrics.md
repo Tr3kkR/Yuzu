@@ -245,6 +245,79 @@ there is no resolved principal to attribute — the metric (with
 signal. Alert on `increase(yuzu_onbehalf_rejected_total[1h]) > 0` if you want
 notification of any attempt.
 
+## Per-principal quota metric (PR 4.4, ADR-1005 class engine principals)
+
+```
+# HELP yuzu_server_principal_quota_exhausted_total Per-principal quota-cap exhaustions by side and limit dimension
+# TYPE yuzu_server_principal_quota_exhausted_total counter
+yuzu_server_principal_quota_exhausted_total{side="engine",limit="concurrency"} 0
+yuzu_server_principal_quota_exhausted_total{side="engine",limit="rate"} 0
+yuzu_server_principal_quota_exhausted_total{side="operator",limit="concurrency"} 0
+yuzu_server_principal_quota_exhausted_total{side="operator",limit="rate"} 0
+
+# HELP yuzu_server_principal_quota_admits_total Per-principal quota-cap admits (successful try_acquire) by side
+# TYPE yuzu_server_principal_quota_admits_total counter
+yuzu_server_principal_quota_admits_total{side="engine"} 0
+yuzu_server_principal_quota_admits_total{side="operator"} 0
+```
+
+All 4 `exhausted_total` series (the closed `side` × `limit` cross-product)
+are pre-seeded to `0` at startup, so `absent()` alerts stay meaningful. The
+gate applies only to `principal_kind=="engine"` sessions (username
+`engine:<slug>`) at the server's single pre-routing chokepoint —
+human/agent/anonymous traffic never touches it. `side` distinguishes which
+principal's budget was debited (`engine` is the only value emitted in PR
+4.4; `operator` is pre-seeded but dormant — it activates in Phase 5 when
+delegation debits the delegating operator's side too). `limit` distinguishes
+which of the two independent caps rejected the request: `concurrency`
+(in-flight requests, tunable via
+`--principal-max-concurrency`/`YUZU_PRINCIPAL_MAX_CONCURRENCY`, default 16)
+or `rate` (token-bucket requests/second, tunable via
+`--principal-rate-limit`/`YUZU_PRINCIPAL_RATE_LIMIT`, default 20.0/s, burst
+= 2x rate). Neither label carries `principal_id` — bounded cardinality only.
+This is an **operational** counter, not `event="security"` — a quota cap
+hit is expected steady-state behaviour for a busy engine principal, not an
+attack signal — and it deliberately has **no audit row** for the same
+high-frequency-operational reason (see `docs/user-manual/audit-log.md`).
+
+`yuzu_server_principal_quota_admits_total{side}` is the admits companion —
+every request that clears **both** the concurrency and rate checks
+increments it once. It exists so the exhaustion *rate* is computable rather
+than just the raw exhaustion count: `exhausted / (exhausted + admits)`. A
+raw exhaustion counter alone can't distinguish "an engine principal is
+hitting its cap on a small fraction of a huge request volume" (healthy, cap
+doing its job) from "almost everything this engine principal sends is being
+rejected" (self-brick, usually right after a config change that set the cap
+too low) — the ratio against admits is what tells them apart. Both series
+are pre-seeded to `0` at startup for the same reason; `side="engine"` is the
+only value emitted today (`side="operator"` is pre-seeded but dormant until
+Phase 5, same as the exhaustion counter). **Streaming requests are
+included** — a streaming request now takes a concurrency slot (held for the
+stream's lifetime) plus the rate debit, same as any other engine request
+(UP-1 hardening fix; see the streaming note below) — so a streaming request
+is counted here exactly like any other admitted engine request.
+
+**Streaming/SSE note (UP-1).** Streaming/SSE requests are **not** exempt
+from either dimension of this cap — they take a concurrency slot held for
+the stream's lifetime (released when the stream ends), plus the rate debit,
+the same two caps as any other engine request. An earlier revision of this
+primitive treated streaming as rate-only and concurrency-exempt, which left
+an engine principal able to open an unbounded number of concurrent streams;
+that gap is closed.
+
+**Per-instance caveat:** the cap is enforced in one process's memory. A
+multi-replica deployment's **effective ceiling is `configured_cap x
+replica_count`**, not the configured cap alone — each replica enforces the
+cap independently against its own share of traffic, so N replicas give each
+engine principal up to N x the configured per-replica cap in aggregate, not
+one fleet-wide budget. Durable, cross-instance quota is a Phase-8 follow-up.
+When alerting or sizing a cap for a multi-replica deployment, account for
+this multiplier — a cap sized for the single-instance default may be far too
+generous fleet-wide. Alert on `increase(yuzu_server_principal_quota_exhausted_total{side="engine"}[1h]) > 0`
+if you want notification that an engine principal is regularly hitting its
+cap (may indicate the cap is tuned too low for its workload, or a runaway
+caller).
+
 ## Histogram buckets
 
 Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom
