@@ -20,8 +20,58 @@
 
 #include <yuzu/agent/subprocess_runner.hpp>
 
+#include <cstddef>
+#include <string>
+#include <vector>
+
 using namespace yuzu::event_logs_macos;
 using yuzu::agent::SubprocessResult;
+
+namespace {
+
+// Mirrors the server's parity-based pipe-delimited splitter locally (no
+// server code linked into this pure-fixture test binary, no process
+// spawned): splits on a '|' only when it is preceded by an EVEN number of
+// consecutive backslashes -- an ODD run means the '|' is escaped data, not
+// a column separator (see yuzu::util::safe_output_field's doc comment).
+std::vector<std::string> split_pipe_delimited(const std::string& row) {
+    std::vector<std::string> fields;
+    std::string current;
+    std::size_t backslash_run = 0;
+    for (char c : row) {
+        if (c == '\\') {
+            current += c;
+            ++backslash_run;
+        } else if (c == '|' && backslash_run % 2 == 0) {
+            fields.push_back(current);
+            current.clear();
+            backslash_run = 0;
+        } else {
+            current += c;
+            backslash_run = 0;
+        }
+    }
+    fields.push_back(current);
+    return fields;
+}
+
+// Inverts yuzu::util::escape_pipes: "\|" -> "|" and "\\" -> "\", scanned
+// left to right.
+std::string unescape_field(const std::string& field) {
+    std::string out;
+    for (std::size_t i = 0; i < field.size(); ++i) {
+        if (field[i] == '\\' && i + 1 < field.size() &&
+            (field[i + 1] == '\\' || field[i + 1] == '|')) {
+            out += field[i + 1];
+            ++i;
+        } else {
+            out += field[i];
+        }
+    }
+    return out;
+}
+
+} // namespace
 
 TEST_CASE("classify_log_show_result: a clean run with no matches is honest ok",
          "[event_logs][macos]") {
@@ -272,4 +322,35 @@ TEST_CASE("decide_log_show_output: an overlong message is capped at 200 characte
     CHECK(decision.rc == 0);
     REQUIRE(decision.rows.size() == 1);
     CHECK(decision.rows[0] == "error|2026-07-20 12:00:00|kernel[0]|" + long_message.substr(0, 200));
+}
+
+TEST_CASE("decide_log_show_output: a message containing '|' and '\\' stays inside a single "
+          "message field after escaping (K-3)",
+          "[event_logs][macos]") {
+    // log show emits process names/messages verbatim from whatever wrote
+    // the entry -- a hostile '|' or '\' in the message must never inject
+    // an extra pipe-delimited column or corrupt a downstream split.
+    SubprocessResult result;
+    result.tool_ran = true;
+    result.exit_code = 0;
+    result.timed_out = false;
+    result.output_truncated = false;
+    result.lines = {"2026-07-20 12:00:00  kernel[0]  message|with\\backslash and pipe"};
+
+    auto decision = decide_log_show_output(result, "error", "No error events found");
+    CHECK(decision.rc == 0);
+    REQUIRE(decision.rows.size() == 1);
+
+    // Mirror the server's parity-based split locally instead of asserting
+    // a literal escaped string, so the fixture stays honest about what
+    // matters: the row still has exactly 4 columns, and the message
+    // column -- once unescaped -- reproduces the original text exactly,
+    // '|' and '\' included, with nothing bleeding into neighbouring
+    // columns.
+    auto fields = split_pipe_delimited(decision.rows[0]);
+    REQUIRE(fields.size() == 4);
+    CHECK(fields[0] == "error");
+    CHECK(fields[1] == "2026-07-20 12:00:00");
+    CHECK(fields[2] == "kernel[0]");
+    CHECK(unescape_field(fields[3]) == "message|with\\backslash and pipe");
 }

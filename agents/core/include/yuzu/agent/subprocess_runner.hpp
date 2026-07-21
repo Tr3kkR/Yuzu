@@ -4,9 +4,10 @@
  * subprocess_runner.hpp -- agent-core bounded, fork-safe POSIX subprocess
  * runner (#2273 foundation).
  *
- * Runs a fixed argv (resolved via PATH, exec'd directly with no shell in
- * between, so no shell-quoting/injection surface) as a child in its own
- * process group, with a hard wall-clock deadline: if the child hasn't
+ * Runs a fixed argv (argv[0] MUST be an absolute path -- exec'd via execv(),
+ * never execvp(), so there is no PATH search and no shell in between, hence
+ * no shell-quoting/injection surface) as a child in its own process group,
+ * with a hard wall-clock deadline: if the child hasn't
  * exited by then, its whole process group is SIGKILLed and reaped.
  * Callers that need to end a run early (agent shutdown, an operator
  * cancel) can cooperatively request that via request_subprocess_cancel()
@@ -63,8 +64,9 @@ struct SubprocessOptions {
 };
 
 struct SubprocessResult {
-    // false IFF exec itself failed (binary missing from PATH, not
-    // executable, etc). Determined by a close-on-exec exec-error pipe, NOT
+    // false IFF exec itself failed (binary missing at the given absolute
+    // path, not executable, etc -- argv[0] is never PATH-searched).
+    // Determined by a close-on-exec exec-error pipe, NOT
     // an exit-code heuristic -- a program that legitimately returns 127
     // (e.g. `sh -c 'exit 127'`) is still tool_ran=true, exit_code==127.
     // Callers treat !tool_ran as an honest "unknown", never a fabricated
@@ -106,8 +108,9 @@ struct SubprocessResult {
 };
 
 /**
- * Run `argv` (argv[0] resolved via PATH, exec'd directly -- no shell) as a
- * child in its own process group, collecting output until the child exits
+ * Run `argv` (argv[0] MUST be an absolute path -- exec'd via execv(), never
+ * execvp(), so there is no PATH search and no shell) as a child in its own
+ * process group, collecting output until the child exits
  * or opts.deadline elapses / a cancel is requested, whichever first. Never
  * blocks past that bound (plus a short, bounded grace period to observe the
  * pipe close and the child reap after a kill) and never fabricates a

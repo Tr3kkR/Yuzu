@@ -16,22 +16,25 @@
 // the outer sudo applies).
 //
 // Every function here is pure (string parsing/validation/formatting only --
-// no popen, no platform APIs), so the unit test
+// no subprocess calls, no platform APIs), so the unit test
 // (tests/unit/test_certificates_macos.cpp) exercises the exact logic the
 // certificates plugin runs against fixture strings, without needing a real
 // console session, `security`, or even to run on macOS at all -- same
 // header-for-testability pattern as
 // agents/plugins/installed_apps/src/installed_apps_inventory.hpp. The
-// certificates_plugin.cpp .cpp file keeps the popen calls (stat/id/
-// launchctl/sudo/security) and the console-user RESOLUTION (which does
-// need a subprocess); this header only ever sees strings it's handed.
+// certificates_plugin.cpp .cpp file keeps the bounded-runner calls (stat/id/
+// launchctl/sudo/security, all routed through
+// yuzu::agent::run_bounded_subprocess -- see run_bounded_checked()) and the
+// console-user RESOLUTION (which does need a subprocess); this header only
+// ever sees strings it's handed.
 //
 // Deliberately framework-free: no SystemConfiguration
 // (SCDynamicStoreCopyConsoleUser), so a CLT-only box still compiles this
 // (matches the batch's no-new-framework convention).
 //
-// Shell-injection guard: every value that ends up interpolated into a
-// popen'd command line -- console username, uid -- MUST pass
+// Shell-injection guard: every value that ends up interpolated into the
+// command line run_bounded_subprocess later execs via a single trusted
+// "/bin/sh -c <cmd>" argv element -- console username, uid -- MUST pass
 // is_valid_username / is_valid_uid here BEFORE use. build_login_keychain_
 // read_command() re-validates defensively and returns an empty string on
 // failure, so a missed guard upstream can never manufacture an executable
@@ -115,10 +118,10 @@ inline bool is_no_console_user(std::string_view username) {
 // Shell-injection guard for the console username: a safe-identifier
 // allowlist, NOT a full macOS-username-spec validator (macOS usernames
 // technically allow a broader POSIX set) -- narrower is safer here, since
-// this value is interpolated into a popen'd command line
-// (`sudo -u <username> ...`) and every character outside this allowlist is
-// either a shell metacharacter or otherwise unnecessary for any username
-// this mechanism needs to support.
+// this value is interpolated into the "/bin/sh -c <cmd>" command line
+// run_bounded_subprocess execs (`sudo -u <username> ...`) and every
+// character outside this allowlist is either a shell metacharacter or
+// otherwise unnecessary for any username this mechanism needs to support.
 inline bool is_valid_username(std::string_view username) {
     if (username.empty())
         return false;
@@ -169,11 +172,13 @@ inline std::string root_keychain_path() {
 // The console user's login keychain path, built directly from the
 // (caller-validated) username via the shell's `~username` (tilde-USERNAME)
 // expansion -- deliberately NOT a bare `~/Library/Keychains/
-// login.keychain-db`: the full command line is executed via popen(), which
-// runs it through `/bin/sh -c` as the INVOKING (agent) process before
-// launchctl/sudo/security ever start, so a BARE `~` would expand against
-// the invoking daemon's own home directory (root's, or `_yuzu`'s -- see the
-// file banner), not the target console user's. `~username` is a different,
+// login.keychain-db`: the full command line is handed to
+// run_bounded_subprocess as a single trusted "/bin/sh -c <cmd>" argv
+// element, which runs it through `/bin/sh -c` as the INVOKING (agent)
+// process before launchctl/sudo/security ever start, so a BARE `~` would
+// expand against the invoking daemon's own home directory (root's, or
+// `_yuzu`'s -- see the file banner), not the target console user's.
+// `~username` is a different,
 // well-defined expansion: POSIX shells resolve it via a getpwnam(username)
 // -style directory-services lookup for THAT specific account, independent
 // of the invoking process's own identity or $HOME -- so it correctly
@@ -395,9 +400,10 @@ inline std::optional<std::string> console_user() {
 // -- it re-enumerates the target keychain afterward and only reports
 // "deleted" on a POSITIVELY-PROVEN absence (see delete_cert_macos() in
 // certificates_plugin.cpp). This enum + classifier factor that decision out
-// of the popen-calling .cpp into a pure function the unit test can exercise
-// with fixture int/optional<bool> inputs, without forking `security` --
-// same header-for-testability split as every other symbol in this file.
+// of the bounded-runner-calling .cpp into a pure function the unit test can
+// exercise with fixture int/optional<bool> inputs, without forking
+// `security` -- same header-for-testability split as every other symbol in
+// this file.
 
 // The four possible outcomes of a macOS certificate delete request whose
 // thumbprint and target keychain already passed validation (invalid
@@ -427,22 +433,25 @@ enum class DeleteVerdict {
 };
 
 // Pure decision: did the delete command exit 0 (`delete_exit_code`, from
-// run_command_checked's WEXITSTATUS-derived `exit_code` field -- 0 for a
-// clean successful exit, a positive POSIX exit code for a clean failure,
-// or -1 if popen() itself failed or the child did not exit normally
-// (signaled/abnormal termination)), and -- ONLY when it did -- did the
-// post-delete re-enumeration succeed in reading the keychain, and if so
-// was the thumbprint still present (`still_present`)?
+// run_bounded_checked's CheckedCommandResult::exit_code -- itself copied
+// from run_bounded_subprocess's SubprocessResult when the child actually
+// ran; 0 for a clean successful exit, a positive POSIX exit code for a
+// clean failure, or -1 if the child could not be spawned (exec failure) or
+// did not exit normally (signaled -- e.g. killed at the deadline/cancel)),
+// and -- ONLY when it did -- did the post-delete re-enumeration succeed in
+// reading the keychain, and if so was the thumbprint still present
+// (`still_present`)?
 //
 // Takes the raw exit code rather than a pre-collapsed bool so this pure
 // decision is directly fixture-testable against representative rc values
-// (zero, a representative nonzero exit, and the -1 spawn-failure/abnormal-
-// termination sentinel) without needing to fork a real subprocess to reach
-// them. The WIFEXITED/WEXITSTATUS extraction itself deliberately stays in
-// run_command_checked() (certificates_plugin.cpp): those macros are
-// POSIX-only (<sys/wait.h>), so they cannot live in this header, which is
-// framework-free by design and compiles on every host including MSVC (see
-// the file banner and test_certificates_macos.cpp's own doc comment).
+// (zero, a representative nonzero exit, and the -1 exec-failure/signal-kill
+// sentinel) without needing to fork a real subprocess to reach them. The
+// WIFEXITED/WEXITSTATUS extraction itself deliberately stays in
+// subprocess_runner.cpp (agents/core/src/subprocess_runner.cpp): those
+// macros are POSIX-only (<sys/wait.h>), so they cannot live in this header,
+// which is framework-free by design and compiles on every host including
+// MSVC (see the file banner and test_certificates_macos.cpp's own doc
+// comment).
 //
 // `still_present` is std::nullopt in exactly one situation: the delete
 // succeeded (`delete_exit_code == 0`) but the verification re-enumeration

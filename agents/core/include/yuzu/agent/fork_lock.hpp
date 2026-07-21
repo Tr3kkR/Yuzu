@@ -41,9 +41,8 @@
  *   - agents/plugins/script_exec/src/script_exec_plugin.cpp (run_process_posix)
  *   - agents/plugins/content_dist/src/content_dist_plugin.cpp (safe_execute)
  *   - agents/core/src/trigger_engine.cpp (query_service_status, macOS popen)
- * agents/plugins/filesystem/src/filesystem_plugin.cpp has its own raw
- * pipe()+fork() (the hash-helper) and is deliberately NOT covered here --
- * tracked separately to avoid a merge conflict with that in-flight change.
+ *   - agents/plugins/filesystem/src/filesystem_plugin.cpp (compute_hash_unix,
+ *     its own raw pipe()+fork() hash-helper)
  * The remaining popen() call sites scattered across agents/plugins/* (most
  * single-shot `popen(cmd, "r")` info-gathering plugins) are not yet
  * covered; any of them can still race a locked launcher's window until they

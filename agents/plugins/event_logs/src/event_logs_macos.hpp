@@ -23,6 +23,7 @@
 // binary.
 
 #include <yuzu/agent/subprocess_runner.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 #include <format>
 #include <string>
@@ -85,10 +86,21 @@ struct LogShowDecision {
 // double-space columns aren't present. Identical logic previously lived
 // twice (do_errors' emit_error_line / do_query's emit_event_line) --
 // row_prefix is the only thing that ever differed between them.
+//
+// timestamp/process/message are all attacker-influenceable (log show emits
+// arbitrary process names and message text verbatim from whatever process
+// wrote the entry) -- each is escaped via safe_output_field so a hostile
+// '|' or embedded CR/LF can never inject an extra column or row into this
+// pipe-delimited output. Escaping happens after the 200-char message cap
+// (not before): capping the raw text first keeps the cap boundary from
+// ever landing mid-escape-sequence, which would otherwise break the
+// server's parity-based unescaper.
 inline std::string format_log_show_line(std::string_view row_prefix, const std::string& line) {
     auto first_space = line.find("  ");
-    if (first_space == std::string::npos)
-        return std::format("{}|{}|-|{}", row_prefix, line, line);
+    if (first_space == std::string::npos) {
+        auto safe_line = yuzu::util::safe_output_field(line);
+        return std::format("{}|{}|-|{}", row_prefix, safe_line, safe_line);
+    }
 
     auto timestamp = line.substr(0, first_space);
     auto rest = line.substr(first_space + 2);
@@ -101,7 +113,9 @@ inline std::string format_log_show_line(std::string_view row_prefix, const std::
     }
     if (message.size() > 200)
         message = message.substr(0, 200);
-    return std::format("{}|{}|{}|{}", row_prefix, timestamp, process, message);
+    return std::format("{}|{}|{}|{}", row_prefix, yuzu::util::safe_output_field(timestamp),
+                        yuzu::util::safe_output_field(process),
+                        yuzu::util::safe_output_field(message));
 }
 
 // The single SubprocessResult -> (rows, rc) decision for both macOS
