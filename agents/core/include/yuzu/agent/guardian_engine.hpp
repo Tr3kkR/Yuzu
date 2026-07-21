@@ -263,6 +263,22 @@ public:
         return lifecycle_journal_.get();
     }
 
+    /// TEST-ONLY: override the drain worker's periodic backstop and maintenance cadences.
+    /// MUST be called BEFORE wire_spark_engine(), which is what constructs the worker.
+    ///
+    /// Exists so a test can prove a journal page happened because of the reconnect KICK and
+    /// not because the backstop fired anyway: with the production 5 s bound the worker's
+    /// timer is already running during fixture setup, so any "it paged within 1 s" assertion
+    /// can pass for the wrong reason (#2298 governance quality-engineer BLOCKING-1).
+    /// 0 leaves the corresponding default in place. No production caller.
+    void set_drain_worker_timing_for_test(std::uint64_t periodic_bound_ms,
+                                          std::chrono::milliseconds page_interval = {},
+                                          std::chrono::milliseconds prune_interval = {}) {
+        test_periodic_bound_ms_ = periodic_bound_ms;
+        test_page_interval_ = page_interval;
+        test_prune_interval_ = prune_interval;
+    }
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -271,7 +287,37 @@ private:
     KvStore* kv_;
     std::string agent_id_;
 
-    mutable std::mutex mtx_;
+    /// A std::mutex that ASSERTS it is never locked on the Guardian drain-worker thread.
+    ///
+    /// GuardianEngine::stop() holds mtx_ across its whole body AND joins the drain worker
+    /// inside it, so any mtx_ acquisition from that worker is a lock-vs-join deadlock -
+    /// a hung agent shutdown, fleet-wide. Everything the worker runs (journal prune/page,
+    /// and the INJECTED send, which is an arbitrary std::function supplied by agent.cpp)
+    /// must therefore stay off this lock. That was previously a review-only invariant
+    /// recorded in comments; here it fails a debug/sanitizer test instead (#2298
+    /// governance A2). BasicLockable, so every `std::lock_guard lock(mtx_)` site is
+    /// unchanged by CTAD.
+    class WorkerHostileMutex {
+    public:
+        void lock() {
+            assert_not_worker_thread();
+            mu_.lock();
+        }
+        bool try_lock() {
+            assert_not_worker_thread();
+            return mu_.try_lock();
+        }
+        void unlock() { mu_.unlock(); }
+        /// Set once the drain worker exists; compared against the calling thread.
+        void set_worker(const GuardianOutboxDrainWorker* w) noexcept { worker_ = w; }
+
+    private:
+        void assert_not_worker_thread() const noexcept;
+        std::mutex mu_;
+        const GuardianOutboxDrainWorker* worker_{nullptr};
+    };
+
+    mutable WorkerHostileMutex mtx_;
     bool started_{false};
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
@@ -354,6 +400,11 @@ private:
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
+    /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
+    /// 0 / zero-duration means "keep the production default".
+    std::uint64_t test_periodic_bound_ms_{0};
+    std::chrono::milliseconds test_page_interval_{0};
+    std::chrono::milliseconds test_prune_interval_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---

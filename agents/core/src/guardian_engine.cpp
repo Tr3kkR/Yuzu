@@ -46,12 +46,14 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace yuzu::agent {
@@ -336,6 +338,24 @@ void GuardianEngine::stop() {
     started_ = false;
 }
 
+void GuardianEngine::WorkerHostileMutex::assert_not_worker_thread() const noexcept {
+    // Debug/sanitizer builds only: in a release build this compiles away, so the
+    // production hot path pays nothing for an invariant that CI proves.
+#if !defined(NDEBUG) || defined(__SANITIZE_THREAD__) || defined(YUZU_FORCE_WORKER_MUTEX_ASSERT)
+    if (worker_ && worker_->worker_thread_id() == std::this_thread::get_id()) {
+        // Not an exception: this is called from lock(), reached under noexcept paths, and
+        // the bug it catches is a deadlock we must not merely report and then enter.
+        try {
+            spdlog::critical("Guardian: the drain worker took GuardianEngine::mtx_ - this "
+                             "deadlocks against stop(), which holds mtx_ while joining that "
+                             "worker. See guardian_outbox_drain_worker.hpp (#2298).");
+        } catch (...) {
+        }
+        assert(false && "Guardian drain worker must never take GuardianEngine::mtx_");
+    }
+#endif
+}
+
 void GuardianEngine::persist_lifecycle_journal_locked() {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
     // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
@@ -400,10 +420,18 @@ void GuardianEngine::page_journal() {
     // Lock order mtx_ -> Signal.mu is safe and non-invertible: the worker thread NEVER takes
     // mtx_ (that is exactly why it is handed a pre-resolved journal pointer), so the
     // stop()-holds-mtx_-while-joining-the-worker shape cannot deadlock against this.
-    std::lock_guard lock(mtx_);
-    if (stopped_ || !prefer_spark_ || !spark_drain_worker_)
-        return;
-    spark_drain_worker_->notify();
+    // FIREWALLED (review B4a, restored after C0 dropped it): this runs on the BARE
+    // run-loop thread with no top-level handler, and both the lock and notify()'s own
+    // lock_guard can throw std::system_error. Losing a replay kick is a 30 s delay
+    // (the page cadence still fires); letting it escape terminates the agent.
+    try {
+        std::lock_guard lock(mtx_);
+        if (stopped_ || !prefer_spark_ || !spark_drain_worker_)
+            return;
+        spark_drain_worker_->notify();
+    } catch (...) {
+        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 GuardianJournalStats GuardianEngine::journal_stats() const {
@@ -1165,9 +1193,20 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         };
         // The same pointer also drives the worker's journal-maintenance pass (prune + page),
         // relocated off the heartbeat / reconnect threads by C0.
+        GuardianMaintenanceConfig maint{.journal = journal};
+        if (test_page_interval_.count() > 0)
+            maint.page_interval = test_page_interval_;
+        if (test_prune_interval_.count() > 0)
+            maint.prune_interval = test_prune_interval_;
         spark_drain_worker_ = std::make_unique<GuardianOutboxDrainWorker>(
             *spark_runtime_, std::move(journaled_send),
-            GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs, journal);
+            test_periodic_bound_ms_ > 0 ? test_periodic_bound_ms_
+                                        : GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
+            maint);
+        // Arm the debug/sanitizer assertion that no mtx_ acquisition ever happens on the
+        // worker thread. Cleared in rollback and left set for the engine's lifetime
+        // otherwise - the worker is joined before it or the mutex is destroyed.
+        mtx_.set_worker(spark_drain_worker_.get());
         // Start the convergence + drain machinery ONLY when spark is the ACTIVE
         // detection backend (prefer_spark_). At prefer_spark_=false (rung 7.7a: spark
         // wired but legacy authoritative) no rule ever places on spark, so the outbox
@@ -1202,8 +1241,15 @@ void GuardianEngine::rollback_spark_wiring_locked(SparkEngine* engine, bool regi
     // Unwind in the reverse order construction attempted them. Each step is
     // independently null-safe, so this is correct regardless of exactly how
     // far the wiring sequence got before it threw.
+    //
+    // Signal the journal FIRST, exactly as stop() does (#2298 governance cs-NICE): if
+    // wiring failed after the worker started, it may be inside a full maintenance pass,
+    // and without this the join below blocks BOOT for the length of that pass.
+    if (lifecycle_journal_)
+        lifecycle_journal_->request_stop();
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
+    mtx_.set_worker(nullptr); // the worker is joined and about to be destroyed
     spark_drain_worker_.reset();
     if (spark_scheduler_)
         spark_scheduler_->stop();
