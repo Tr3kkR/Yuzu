@@ -245,9 +245,84 @@ there is no resolved principal to attribute — the metric (with
 signal. Alert on `increase(yuzu_onbehalf_rejected_total[1h]) > 0` if you want
 notification of any attempt.
 
+## Per-principal quota metric (PR 4.4, ADR-1005 class engine principals)
+
+```
+# HELP yuzu_server_principal_quota_exhausted_total Per-principal quota-cap exhaustions by side and limit dimension
+# TYPE yuzu_server_principal_quota_exhausted_total counter
+yuzu_server_principal_quota_exhausted_total{side="engine",limit="concurrency"} 0
+yuzu_server_principal_quota_exhausted_total{side="engine",limit="rate"} 0
+yuzu_server_principal_quota_exhausted_total{side="operator",limit="concurrency"} 0
+yuzu_server_principal_quota_exhausted_total{side="operator",limit="rate"} 0
+
+# HELP yuzu_server_principal_quota_admits_total Per-principal quota-cap admits (successful try_acquire) by side
+# TYPE yuzu_server_principal_quota_admits_total counter
+yuzu_server_principal_quota_admits_total{side="engine"} 0
+yuzu_server_principal_quota_admits_total{side="operator"} 0
+```
+
+All 4 `exhausted_total` series (the closed `side` × `limit` cross-product)
+are pre-seeded to `0` at startup, so `absent()` alerts stay meaningful. The
+gate applies only to `principal_kind=="engine"` sessions (username
+`engine:<slug>`) at the server's single pre-routing chokepoint —
+human/agent/anonymous traffic never touches it. `side` distinguishes which
+principal's budget was debited (`engine` is the only value emitted in PR
+4.4; `operator` is pre-seeded but dormant — it activates in Phase 5 when
+delegation debits the delegating operator's side too). `limit` distinguishes
+which of the two independent caps rejected the request: `concurrency`
+(in-flight requests, tunable via
+`--principal-max-concurrency`/`YUZU_PRINCIPAL_MAX_CONCURRENCY`, default 16)
+or `rate` (token-bucket requests/second, tunable via
+`--principal-rate-limit`/`YUZU_PRINCIPAL_RATE_LIMIT`, default 20.0/s, burst
+= 2x rate). Neither label carries `principal_id` — bounded cardinality only.
+This is an **operational** counter, not `event="security"` — a quota cap
+hit is expected steady-state behaviour for a busy engine principal, not an
+attack signal — and it deliberately has **no audit row** for the same
+high-frequency-operational reason (see `docs/user-manual/audit-log.md`).
+
+`yuzu_server_principal_quota_admits_total{side}` is the admits companion —
+every request that clears **both** the concurrency and rate checks
+increments it once. It exists so the exhaustion *rate* is computable rather
+than just the raw exhaustion count: `exhausted / (exhausted + admits)`. A
+raw exhaustion counter alone can't distinguish "an engine principal is
+hitting its cap on a small fraction of a huge request volume" (healthy, cap
+doing its job) from "almost everything this engine principal sends is being
+rejected" (self-brick, usually right after a config change that set the cap
+too low) — the ratio against admits is what tells them apart. Both series
+are pre-seeded to `0` at startup for the same reason; `side="engine"` is the
+only value emitted today (`side="operator"` is pre-seeded but dormant until
+Phase 5, same as the exhaustion counter). **Streaming requests are
+included** — a streaming request now takes a concurrency slot (held for the
+stream's lifetime) plus the rate debit, same as any other engine request
+(UP-1 hardening fix; see the streaming note below) — so a streaming request
+is counted here exactly like any other admitted engine request.
+
+**Streaming/SSE note (UP-1).** Streaming/SSE requests are **not** exempt
+from either dimension of this cap — they take a concurrency slot held for
+the stream's lifetime (released when the stream ends), plus the rate debit,
+the same two caps as any other engine request. An earlier revision of this
+primitive treated streaming as rate-only and concurrency-exempt, which left
+an engine principal able to open an unbounded number of concurrent streams;
+that gap is closed.
+
+**Per-instance caveat:** the cap is enforced in one process's memory. A
+multi-replica deployment's **effective ceiling is `configured_cap x
+replica_count`**, not the configured cap alone — each replica enforces the
+cap independently against its own share of traffic, so N replicas give each
+engine principal up to N x the configured per-replica cap in aggregate, not
+one fleet-wide budget. Durable, cross-instance quota is a Phase-8 follow-up.
+When alerting or sizing a cap for a multi-replica deployment, account for
+this multiplier — a cap sized for the single-instance default may be far too
+generous fleet-wide. Alert on `increase(yuzu_server_principal_quota_exhausted_total{side="engine"}[1h]) > 0`
+if you want notification that an engine principal is regularly hitting its
+cap (may indicate the cap is tuned too low for its workload, or a runaway
+caller).
+
 ## Histogram buckets
 
-All histogram metrics use the same default bucket boundaries (in seconds):
+Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom
+ladder called out in their own row (including `yuzu_server_guardian_event_store_duration_seconds`
+at 0.1ms-10s and `yuzu_pg_acquire_wait_seconds` into the 10-60s tail). The default:
 
 ```
 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
@@ -484,6 +559,7 @@ enforcement-posture table.
 | `yuzu_server_guardian_events_redelivered_total` | counter | Cumulative **idempotent redeliveries** at ingest — an `event_id` PK conflict where the incoming payload **matches** the stored row across every immutable agent-supplied field. This is the durable agent lifecycle journal's expected at-least-once retry (it re-sends on every reconnect): the event is not re-written, the DEX observers are not re-fired, and the compliance signal is untouched. **High is normal after an agent outage/reconnect — it is NOT a loss signal** (that is `..._events_dropped_total`). Exposed as TYPE `counter`; resets on server restart. |
 | `yuzu_server_guardian_events_ingest_errors_total` | counter | Cumulative **operational** Guardian ingest faults — a failed `BEGIN`/`prepare`/`INSERT`/`COMMIT`, or a redelivery-compare `SELECT` that could not run (NOMEM/IOERR). A sustained rate means the ingest machinery is broken and event_id conflicts are going **unclassified**, so a genuine forged-id collision can escape `..._events_dropped_total` — hence the bundled `YuzuGuardianIngestErrors` alert (`increase(...[15m]) > 0`). Excludes malformed embedded-NUL input (rejected at the boundary; attacker-drivable, so kept off this operational signal). Resets on server restart. |
 | `yuzu_server_guardian_events_reaped_total` | counter | Cumulative Guardian event rows deleted by the retention reaper (disposal evidence). Exposed as TYPE `counter` (store-read value set via the gauge API, like the other `_total` counters here). |
+| `yuzu_server_guardian_event_store_duration_seconds{status}` | histogram | Server-side latency of `insert_event_classified` (the classify+store SQLite operation) for one Guardian event, split by outcome `status` (`inserted`/`redelivered`/`conflict`/`error`). Only `redelivered`/`conflict` execute the redelivery byte-compare; `inserted` does projection+commit - so read the series per-status, not as an aggregate. Covers the direct-Subscribe and gateway-proxied ingest paths. Custom buckets `0.1ms-10s` (sub-ms SQLite resolution + the seconds tail for Postgres / lock contention). Born at server start (all four status series present on `/metrics` from boot). This is a **validation** signal for the planned off-write-path compare (#2298) - it confirms a benchmarked gain survives real traffic; it is **not** the go/no-go decision, which needs a controlled concurrent benchmark (an aggregate histogram can't attribute latency to compare-CPU vs lock-wait vs transaction work). |
 | `yuzu_fleet_agents_dex_observer_disarmed` | gauge | Windows agents (DEX enabled) whose DEX signal observer is not currently healthy — it failed to arm at startup, or a channel subscription died at runtime (EventLog restart / channel ACL change). `> 0` means reliability telemetry is off or degraded on that many endpoints. Agents off Windows or started with `--dex-disable` are excluded, so this is a genuine fault count. Rolled up from agent heartbeats. Note: it does **not** detect a host where the underlying reporter is disabled (e.g. Windows Error Reporting off → no Event 1000, observer still armed). |
 | `yuzu_fleet_dex_observed_total` | gauge | Fleet-wide sum of DEX signals observed (all obs_types) since each agent started. **A gauge, not a monotonic counter** — it resets when an agent restarts, so do not apply `rate()`/`increase()`; per-signal detail lives in the Guardian events store (`GET /api/v1/guaranteed-state/events?rule_id=__observation__`) and the `/dex` dashboard. |
 | `yuzu_server_guardian_proj_failures_total` | counter | DEX observation projection failures. The source event is always preserved (degrade-don't-destroy); only the derived read-model row is lost. `> 0` means `/dex` is under-counting — investigate (commonly a stale-schema dev DB). |
@@ -616,7 +692,7 @@ the literal label values, not substring matches.
 
 | Reason label | Meaning | Operator action |
 |---|---|---|
-| `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`). Possible plugin-author error or a malicious shadowing attempt (#453). | Investigate the plugin source / drop. |
+| `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`, `__guardian_journal__`, `__guardian__`, `__sync__`). Possible plugin-author error or a malicious shadowing attempt (#453; the `kv_store`-namespace names added in #2303). | Investigate the plugin source / drop. |
 | `load_failed` | `dlopen` / `LoadLibrary` failed, missing `yuzu_plugin_descriptor` export, or ABI version mismatch. | Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI. |
 | `signature_missing` | `--plugin-trust-bundle` is set, `--plugin-require-signature` is set, and a plugin has no `<plugin>.so.sig` sibling. | Sign the plugin, deploy the `.sig` alongside, or relax the require flag. |
 | `signature_invalid` | `.sig` file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing). | Re-sign the plugin or investigate tampering. |

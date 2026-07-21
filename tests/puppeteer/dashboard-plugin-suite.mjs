@@ -173,7 +173,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function sendCommand(page, instruction) {
   // Clear and type
-  await page.click('#instr-input', { clickCount: 3 });
+  await page.click('#instr-input', { count: 3 });
   await page.keyboard.press('Backspace');
   await page.type('#instr-input', instruction);
   await page.click('#btn-send');

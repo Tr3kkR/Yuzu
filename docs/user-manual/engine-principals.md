@@ -210,6 +210,95 @@ auditor is gated on `AuditLog:Read`, not `Security`, deliberately: a
 read-only auditor role can run it without holding engine-principal write
 access.
 
+## Per-principal quota cap (PR 4.4)
+
+Every engine principal is subject to a per-principal quota cap enforced at
+the server's single pre-routing chokepoint — on both REST and MCP traffic,
+before the request reaches any route handler. Human, device-agent, and
+anonymous traffic is never gated by this cap. This is the minimum
+per-principal cap required by the #1973 production interlock: no engine
+principal may be enabled in production until it exists.
+
+### Layered limits for engine principals
+
+An engine-principal request on `/mcp/` can be rejected by up to four
+independent caps, evaluated in this order:
+
+| # | Cap | Scope | Error / code | Notes |
+|---|---|---|---|---|
+| a | Per-IP rate limiter (existing) | Source IP | HTTP `429` | Applies to every caller, not just engine principals; checked before any principal is resolved. |
+| b | MCP session cap (8 concurrent sessions) | MCP session lifecycle, checked on `initialize` | JSON-RPC `-32010` / HTTP `429` | Rejects a **new session**, never evicts a live one. |
+| c | Per-principal in-flight concurrency (16, PR 4.4) | Per engine principal, every `/mcp/` request | JSON-RPC `-32010` / HTTP `429` | This page's quota cap, concurrency dimension. |
+| d | Per-principal rate (20 rps, PR 4.4) | Per engine principal, every `/mcp/` request | JSON-RPC `-32010` / HTTP `429` | This page's quota cap, rate dimension. |
+
+(a) is the only dimension that also applies to REST and non-engine traffic.
+(b) is distinct from (c)/(d): it gates `initialize` only, on the *number of
+open sessions*, while (c)/(d) gate *every* `/mcp/` request on in-flight count
+and request rate regardless of session state. **(b) and (c)/(d) share the
+same JSON-RPC error code `-32010`** — disambiguate by `error.message`
+("session limit" vs "per-principal rate/concurrency cap exceeded") and by
+`retry_after_ms` (always `null` for (b); non-null for (c)/(d) — see
+[MCP — Troubleshooting](mcp.md#-32010-session-limit-reached-http-429)).
+
+Two independent dimensions are enforced behind one decision:
+
+| Dimension | Flag | Env var | Default | What it limits |
+|---|---|---|---|---|
+| Concurrency | `--principal-max-concurrency` | `YUZU_PRINCIPAL_MAX_CONCURRENCY` | `16` | In-flight requests for one engine principal at any instant. |
+| Rate | `--principal-rate-limit` | `YUZU_PRINCIPAL_RATE_LIMIT` | `20.0` (requests/second) | Sustained request rate for one engine principal (token bucket; burst capacity is 2x the configured rate). |
+
+Exceeding either cap returns HTTP `429` with a `Retry-After` header — the A4
+error envelope on REST, a JSON-RPC `id: null` error (code `-32010`) on MCP;
+see [REST API — Per-principal quota cap](rest-api.md#json-envelope) and
+[MCP — Troubleshooting](mcp.md#-32010-session-limit-reached-http-429) for the
+exact wire shapes. **Streaming/SSE requests take a concurrency slot held for
+the stream's lifetime (released when the stream ends), plus the rate
+debit — the same two caps as any other engine request** (UP-1; a hardening
+fix — an earlier revision of this doc, and of the primitive itself, treated
+streaming as rate-capped-only and concurrency-exempt, which left an engine
+principal able to open an unbounded number of concurrent streams).
+
+**Forward guard (track 2f).** When MCP Streamable-HTTP `GET`/`POST` gains a
+live SSE stream (today `GET /mcp/v1/` is a `405` placeholder — see
+[MCP — Streamable HTTP sessions](mcp.md#streamable-http-sessions)), that
+handler MUST adopt the pending concurrency slot into the stream exactly like
+the three routes already covered by this cap, or it silently reintroduces
+the UP-1 gap for MCP engine principals specifically — the surface this cap
+exists to protect.
+
+**Tuning guidance:** the defaults (16 concurrent, 20/s) are conservative
+starting points for a single autonomous module; raise
+`--principal-max-concurrency` for an engine that legitimately fans out many
+parallel reads, or raise `--principal-rate-limit` for a tight polling loop.
+Both flags are server-wide (they apply to every engine principal on this
+server instance, not per-principal-id tuning) — there is no per-principal
+override in PR 4.4.
+
+**Per-instance caveat.** The cap lives in one server process's memory. If you
+run multiple server replicas behind a load balancer, each replica enforces
+the cap independently — an engine principal whose traffic is spread across
+N replicas effectively gets N x the configured cap, not one fleet-wide
+budget. A durable, cross-instance quota (a shared store keyed by principal)
+is a Phase-8 follow-up; until then, size the caps assuming per-replica
+enforcement, or pin an engine principal's traffic to a single replica if a
+tighter fleet-wide bound matters.
+
+A quota rejection is observed via
+`yuzu_server_principal_quota_exhausted_total{side,limit}` (paired with the
+admits counter `yuzu_server_principal_quota_admits_total{side}` so the
+exhaustion rate is computable — see
+[Metrics](metrics.md#per-principal-quota-metric-pr-44-adr-1005-class-engine-principals))
+— it is metric-only and does **not** write an audit row (see
+[Audit Log](audit-log.md#logged-actions)); a quota rejection is a
+high-frequency operational event, not a lifecycle action against the
+principal.
+
+**Deferred to Phase 5:** the quota primitive only debits the engine
+principal's own budget today. Once delegation (RFC-8693-style) ships, a
+delegated call will need to debit both the engine principal's side and the
+delegating operator's side, and delegation-artifact issuance itself will
+need its own rate cap — both are out of scope for PR 4.4.
+
 ## Audit trail
 
 Every lifecycle action on this surface is recorded under an

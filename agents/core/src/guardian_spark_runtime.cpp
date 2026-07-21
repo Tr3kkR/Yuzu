@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <optional>
 #include <random>
 #include <set>
@@ -367,6 +368,11 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
                 enqueued_any = true;
 
             rg->eval = std::move(scratch); // COMMIT
+            // M1: a committed repeat Unknown (already errored, so build_entries emitted
+            // nothing) is counted here so the edge-suppression is observable, never silent
+            // (Option-A: every loss/suppression channel is a counted metric).
+            if (out.status == EvalStatus::Unhealthy && !out.unhealthy_edge)
+                unhealthy_suppressed_.fetch_add(1, std::memory_order_relaxed);
             // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
             // Unknown does not (it still owes a real verdict).
             if (out.status != EvalStatus::Unhealthy)
@@ -425,10 +431,17 @@ std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneratio
     if (out.status == EvalStatus::Emit)
         v.push_back(OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms, agent_id),
                                             ns, out.drift));
-    else if (out.status == EvalStatus::Unhealthy)
+    else if (out.status == EvalStatus::Unhealthy && out.unhealthy_edge)
+        // EDGE ONLY (M1): the first Unknown of an errored episode mints one guard.unhealthy.
+        // A repeat Unknown while already errored produces NO entry here (the caller counts it
+        // via unhealthy_suppressed_) - convergence re-evaluates a stuck rule every ~5s to catch
+        // recovery, but must not re-mint a fresh health event each tick (fleet ingest flood).
+        // NOTE: the emitted health_detail is this episode's FIRST read-error string; a reason
+        // that changes across suppressed re-evals while still Unknown (EACCES -> ENODEV) is not
+        // re-surfaced until recovery starts a new episode. Accepted trade for the flood fix.
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
                                         /*healthy=*/false, out.health_detail, gtype, rname));
-    // Silent + !recovered -> empty (nothing to publish).
+    // Silent, a suppressed repeat-Unknown, + !recovered -> empty (nothing to publish).
     return v;
 }
 
@@ -517,6 +530,12 @@ std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
 }
 
 void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> record) noexcept {
+    // #2303 K6. The noexcept below is only real because the ctor's reserve() means push_back
+    // never reallocates. That is an invariant of a DIFFERENT function, so assert it here where
+    // it is relied on - if a future edit drops or shrinks the reserve, a debug build trips
+    // immediately instead of a release build calling std::terminate on an OOM realloc.
+    assert(pending_journal_.capacity() >= kMaxPendingJournalRecords &&
+           "pending_journal_ reserve is what makes stage_pending_locked's noexcept real");
     if (!record)
         return; // rejected at build - sent live, never journaled
     if (pending_journal_.size() >= kMaxPendingJournalRecords) {

@@ -93,6 +93,8 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--break-glass-user <username>` | *(none)* | The single local account exempt from `--auth-mode=sso-only`, exempt **only while armed** (see `--break-glass-arm`). Under `sso-only` the server **refuses to start** unless this account exists and has **MFA enrolled** (a break-glass account must carry a second factor). A break-glass login is forced through MFA regardless of `--mfa-enforcement` and writes an `auth.breakglass.login` audit row. Env: `YUZU_BREAK_GLASS_USER`. |
 | `--break-glass-window-secs` | `86400` | Seconds the break-glass account stays armed after `--break-glass-arm` (default 24h). The arm **auto-expires** (evaluated lazily at login like the lockout window) — it is never a permanent standing exemption. Env: `YUZU_BREAK_GLASS_WINDOW_SECS`. |
 | `--break-glass-arm` | off | **Break-glass.** Arms `--break-glass-user` for the configured window and exits **without starting the server** — the recovery path when the IdP is down under `--auth-mode=sso-only`. Run on the server host as the service account (arming deliberately does **not** require a session). Validates the account (exists + MFA), verifies the audit store is writable **before** arming, and writes an `auth.breakglass.armed` audit row (principal = the OS account that ran the CLI). Requires `--break-glass-user` + `--data-dir`. Refuses (exit non-zero) if any check fails. |
+| `--principal-max-concurrency` | `16` | **Engine principals** (ADR-1005 class, PR 4.4). Maximum in-flight requests for a single engine principal at any instant, checked at the server's single pre-routing chokepoint on both REST and MCP. A streaming/SSE request holds its slot for the stream's lifetime, not just until routing hands off. Exceeding it returns HTTP `429`. Human, device-agent, and anonymous traffic is never gated by this cap. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_MAX_CONCURRENCY`. |
+| `--principal-rate-limit` | `20.0` | **Engine principals** (ADR-1005 class, PR 4.4). Sustained request rate cap (requests/second, token bucket, burst = 2x the configured rate) for a single engine principal. Exceeding it returns HTTP `429`. Independent of `--principal-max-concurrency` — either dimension alone can reject a request. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_RATE_LIMIT`. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
@@ -186,6 +188,29 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — macOS antivirus posture is now probed, not asserted
+
+The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`
+without reading anything, and its third-party checks grepped for the wrong
+process name. Visible after upgrading agents:
+
+1. **`av|XProtect|<state>` is now a real probe** of the XProtect definition
+   bundle: `active` comes with a new `xprotect_version|<n>` row; `unknown`
+   means the bundle was unreadable (never assumed active). Third-party EDR/AV
+   detected via endpoint-security system extensions emit an additional
+   `edr|<bundle id>|<version>` row each. Integrations keying on the old
+   always-present `av|XProtect|active` row should treat `unknown` as a signal
+   to investigate, not as product-absent.
+2. **The `status` action on macOS returns real XProtect data** (definition
+   version, freshness, Remediator/MRT versions) instead of
+   `status|not_available`. A new darwin-only definition
+   `security.antivirus.xprotect_status` exposes it; being a new id, it seeds
+   on upgraded installs at next boot (unlike edited descriptions, which reach
+   fresh installs only — the amended `security.antivirus.products` text lands
+   there alone).
+3. **Mixed-fleet blend during rollout:** agents not yet upgraded keep emitting
+   the hardcoded XProtect row and process-grep results. Not a server bug; the
+   presence of an `xprotect_version` row identifies an upgraded agent.
 ### vNEXT — macOS firewall `state` now reports the Application Firewall (backend key changed)
 
 The `firewall` plugin's macOS `state` action previously reported the pf packet

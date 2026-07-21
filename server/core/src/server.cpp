@@ -43,6 +43,7 @@
 #include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
+#include "principal_quota_gate.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
@@ -87,6 +88,7 @@
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
@@ -291,6 +293,17 @@ using yuzu::server::audit_token;
     return "/var/log/yuzu/server.log";
 #endif
 }
+
+// -- Per-principal quota chokepoint helpers (PR 4.4) --------------------------
+//
+// The GATE DECISION (principal_kind/auth_source == "engine" check, mcp-vs-
+// rest render pick, incl. is_streaming_path) and the thread_local slot
+// itself (`tls_quota_slot()`) now live in principal_quota_gate.hpp — the
+// latter moved there (UP-1) so streaming routes in other translation units
+// (rest_api_v1.cpp, workflow_routes.cpp) can adopt the pending slot into
+// their own stream lifetime via `adopt_quota_slot_into_stream`. server.cpp
+// keeps only the httplib-specific, worker-thread-affine call sites below.
+
 } // namespace detail
 
 // -- ServerImpl ---------------------------------------------------------------
@@ -302,7 +315,10 @@ public:
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_, cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
                          auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode),
-          api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
+          api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit),
+          principal_quota_(PrincipalQuotaConfig{.max_concurrency = cfg_.principal_max_concurrency,
+                                                 .rate_per_second = cfg_.principal_rate_limit,
+                                                 .burst = 2.0 * cfg_.principal_rate_limit}) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
         metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
@@ -363,6 +379,42 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+        // Per-principal quota cap exhaustions (PR 4.4, ADR-1005 class engine
+        // principals). Pre-seed all 4 closed series to 0 (docs/observability-
+        // conventions.md), mirroring yuzu_onbehalf_rejected_total above.
+        // Bounded labels only: side (engine/operator) x limit
+        // (concurrency/rate) — never principal_id. This is operational, not
+        // security (contrast the security event= on yuzu_onbehalf_rejected_
+        // total above) — a quota cap is expected steady-state behaviour, not
+        // an attack signal. side="operator" is dormant until Phase 5
+        // (delegation debits the operator side); it is pre-seeded anyway,
+        // deliberately, because it is a real documented QuotaSide dimension
+        // (unlike the withheld principal_class="engine" pre-seed above,
+        // which is reserved but not yet a live enum value).
+        metrics_.describe("yuzu_server_principal_quota_exhausted_total",
+                          "Per-principal quota-cap exhaustions by side and limit dimension",
+                          "counter");
+        for (auto side : {"engine", "operator"}) {
+            for (auto limit : {"concurrency", "rate"}) {
+                metrics_.counter("yuzu_server_principal_quota_exhausted_total",
+                                 {{"side", side}, {"limit", limit}});
+            }
+        }
+        // Admits companion (sre, governance hardening round): every
+        // ADMITTED engine request, so exhaustion RATE (exhausted /
+        // (exhausted + admits)) is computable — a self-brick immediately
+        // after a --principal-* config change (rate near 1.0) is
+        // distinguishable from ordinary load-driven exhaustion, which
+        // yuzu_server_principal_quota_exhausted_total alone can't tell
+        // apart. Bounded label set (side only — never principal_id),
+        // pre-seeded beside the exhausted counter above for the same
+        // absent()-alert reason.
+        metrics_.describe("yuzu_server_principal_quota_admits_total",
+                          "Per-principal quota-cap admits (successful try_acquire) by side",
+                          "counter");
+        for (auto side : {"engine", "operator"}) {
+            metrics_.counter("yuzu_server_principal_quota_admits_total", {{"side", side}});
+        }
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
         // live by the pool's observer hooks wired at pool construction.
@@ -911,6 +963,25 @@ public:
                           "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
                           "server restart.",
                           "counter");
+        metrics_.describe(
+            yuzu::server::detail::kGuardianEventStoreDurationMetric,
+            "Server-side latency of insert_event_classified (the classify+store SQLite operation) "
+            "for one Guardian event, split by outcome `status` (inserted|redelivered|conflict|"
+            "error). redelivered/conflict run the redelivery byte-compare; inserted does "
+            "projection+commit. A validation signal for the off-write-path compare work (#2298) - "
+            "NOT the go/no-go (an aggregate histogram can't attribute compare-CPU vs lock-wait; "
+            "that needs a concurrent benchmark). Covers the direct-Subscribe and gateway-proxied "
+            "paths. Buckets 0.1ms-10s.",
+            "histogram");
+        // Birth the four status series with the custom ladder ONCE (boundaries fix at first
+        // creation) so the hot observe path is a cheap name+label lookup and the series are on
+        // /metrics from boot. Mirrors the yuzu_pg_acquire_wait_seconds pattern above.
+        // LOAD-BEARING (unhappy-path UP-1): this MUST run in the ServerImpl ctor, before the gRPC
+        // listener opens (run() -> BuildAndStart), or the first ingest would default-construct the
+        // series with the 5ms-floor buckets and silently lose the sub-ms resolution. Do not move
+        // it after the listener starts, and do not switch the observe site to the no-warm-create
+        // (default-bucket) path.
+        yuzu::server::detail::warm_create_guardian_event_store_metric(metrics_);
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");
@@ -5308,6 +5379,21 @@ private:
         web_server_->set_pre_routing_handler([this](const httplib::Request& req,
                                                     httplib::Response& res)
                                                  -> httplib::Server::HandlerResponse {
+            // Per-principal quota (PR 4.4) — defensive reset at the TOP of
+            // pre-routing. httplib's worker-thread affinity means a QuotaSlot
+            // stashed in tls_quota_slot() on this thread by a PRIOR request is
+            // normally released either by that request's post-routing handler
+            // (non-streaming) or by its stream's own resource-releaser via
+            // adopt_quota_slot_into_stream (streaming, UP-1) before this
+            // thread is handed a new one; this reset reclaims a slot leaked by
+            // any prior request that bypassed BOTH — the only such bypass
+            // today would be a future WebSocket upgrade (httplib DOES support
+            // WebSocket; this codebase just registers no handler for one
+            // today — the real safety is the absence of a handler, not a
+            // protocol limitation). See detail::tls_quota_slot()'s doc
+            // comment.
+            detail::tls_quota_slot().reset();
+
             // Lightweight probes — always allowed, no auth, no rate limit.
             // /health and /api/health are included here (governance Gate 7,
             // unhappy-path UP-1) so monitoring integrations behind a NAT or
@@ -5468,6 +5554,43 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // Per-principal quota cap (PR 4.4, ADR-1005 class engine
+            // principals) — THE single pre-routing chokepoint gate (#2225
+            // ADR-0017); no separate route, no bypass. Runs AFTER session
+            // resolution so we have a stable principal id. The security
+            // DECISION (principal_kind/auth_source == "engine" two-predicate
+            // check (S1), mcp-vs-rest render pick, UP-1 always-try_acquire)
+            // lives in the pure, testable detail::apply_engine_quota_gate —
+            // this is a thin caller that only owns the httplib-specific,
+            // worker-thread-affine slot stash (R2, see
+            // detail::tls_quota_slot()'s doc comment) and the
+            // Handled/Unhandled return. The gate mints its own correlation
+            // id lazily, only on the reject path — no cid is computed here.
+            {
+                bool rejected = false;
+                // "engine:<slug>" for an engine session — the STABLE
+                // authorization principal (see Session::username's doc
+                // comment); never display_name. auth_source is the second
+                // S1 predicate (see apply_engine_quota_gate's doc comment).
+                // Both ignored by the gate for a non-engine session.
+                auto slot = detail::apply_engine_quota_gate(session->principal_kind,
+                                                             session->auth_source,
+                                                             session->username, req, res,
+                                                             principal_quota_, metrics_,
+                                                             rejected);
+                if (rejected) {
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                if (slot) {
+                    // UP-1: this slot is now held regardless of whether the
+                    // route is streaming. A streaming route is expected to
+                    // `adopt_quota_slot_into_stream` it out of here before
+                    // post-routing's reset (below) fires; a normal route
+                    // leaves it here and post-routing releases it.
+                    detail::tls_quota_slot() = std::move(*slot);
+                }
+            }
+
             return httplib::Server::HandlerResponse::Unhandled;
         });
 
@@ -5494,6 +5617,11 @@ private:
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
         web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
                                                                        httplib::Response& res) {
+            // Per-principal quota (PR 4.4) — release the concurrency slot
+            // (if any) admitted for this request at pre-routing. A no-op for
+            // denied/streaming/non-engine requests, which never stash one.
+            detail::tls_quota_slot().reset();
+
             // -- Security response headers (SOC2-C1) ---------------------
             // Applied to ALL responses (dashboard, API, metrics, health,
             // error pages).
@@ -6606,14 +6734,20 @@ private:
             // Note: httplib's chunked loop sets data_available = (l > 0) on
             // every write.  Our provider never writes 0 bytes (always at
             // least a 14-byte keepalive), so the loop runs indefinitely.
+            // UP-1: adopt any pending engine QuotaSlot into this stream's
+            // resource-releaser (see is_streaming_path/adopt_quota_slot_
+            // into_stream in principal_quota_gate.hpp) so the concurrency
+            // reservation survives for the stream's actual lifetime instead
+            // of releasing early at post-routing.
             res.set_chunked_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
                     return detail::sse_content_provider(sink_state, offset, sink);
                 },
-                [sink_state, bus](bool success) {
-                    detail::sse_resource_release(sink_state, *bus, success);
-                });
+                detail::adopt_quota_slot_into_stream(
+                    [sink_state, bus](bool success) {
+                        detail::sse_resource_release(sink_state, *bus, success);
+                    }));
         });
 
         // -- Agent listing API ------------------------------------------------
@@ -12095,6 +12229,10 @@ private:
     // Rate limiting
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
+
+    // Per-principal quota cap (PR 4.4) — gates principal_kind=="engine"
+    // sessions only, at the pre-routing chokepoint. See principal_quota.hpp.
+    PrincipalQuota principal_quota_;
 };
 
 // -- Factory ------------------------------------------------------------------

@@ -275,6 +275,21 @@ int main(int argc, char* argv[]) {
                    "Max login attempts/second per IP (default: 10)")
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
+    app.add_option("--principal-max-concurrency", cfg.principal_max_concurrency,
+                   "Max in-flight requests per engine principal (default: 16)")
+        ->default_val(16)
+        // A 0/negative value self-bricks every engine principal (every
+        // request 429s forever) with no clear signal why; reject at boot
+        // with CLI11's message instead of silently shipping a dead cap.
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_PRINCIPAL_MAX_CONCURRENCY");
+    app.add_option("--principal-rate-limit", cfg.principal_rate_limit,
+                   "Max requests/second per engine principal (default: 20)")
+        ->default_val(20.0)
+        // Same footgun as --principal-max-concurrency above: 0/negative
+        // would zero every engine principal's token bucket.
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_PRINCIPAL_RATE_LIMIT");
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
