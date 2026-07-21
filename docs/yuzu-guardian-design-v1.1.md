@@ -2490,6 +2490,29 @@ Guardian ladder must check these.
   — the push fan-out and the heartbeat reconcile both gate on it; it sources
   from each deployed Baseline's `deployed_snapshot`, not the live member set
   (the Push-not-Write invariant in `docs/user-manual/guaranteed-state.md`).
+- **Guard types are platform-gated; schema and handler arrays move together.**
+  `registry` (`guard_registry`) and `file` (`guard_file`) guards are
+  Windows-only — off-Windows `start()` returns false, so the guard never
+  reads as armed. The `service` guard is cross-platform via the
+  `make_service_guard()` factory (`guard_systemd.hpp`): Windows
+  `ServiceGuard` (SCM `NotifyServiceStatusChange`) or Linux
+  `SystemdServiceGuard` (systemd sd-bus `ActiveState` watch, **observe-only**
+  — enforce is deferred to a polkit-gated PR). The Linux guard maps systemd's
+  richer `ActiveState` onto the published `{running, stopped}` tokens
+  (`active`→running; `inactive`/`failed`/absent→stopped;
+  `activating`/`deactivating`/`reloading`/`maintenance`→transitional, held) —
+  deliberately adding NO new schema token, so the cross-checks stay
+  untouched. Published schema enums (`guardian_schema_registry.cpp`) and the
+  agent's per-type support arrays (`registry_support::kHives`,
+  `service_support::kStates`) are bound by schema↔handler cross-check unit
+  tests: add or remove a guard type in BOTH or neither.
+- **Guardian-store SQLite transactions use the RAII owners.** New or modified
+  transactions in the Guardian stores (`guaranteed-state.db`,
+  `guardian-baselines.db` / `BaselineStore`,
+  `server/core/src/baseline_store.{hpp,cpp}`) use `SqliteTxn` + `SqliteStmt`
+  from `server/core/src/sqlite_raii.hpp` (ROLLBACK-unless-`commit()` plus
+  guaranteed `finalize`), so an exception between `BEGIN` and `COMMIT` cannot
+  wedge the shared connection.
 - **Guardian wire payloads in `CommandRequest.parameters` are not
   gateway-safe.** Any field that carries raw proto bytes (serialised
   `GuaranteedStatePush`, binary signatures, etc.) must NOT be placed in a

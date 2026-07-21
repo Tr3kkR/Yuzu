@@ -163,3 +163,11 @@ from the same heartbeat facts as this page, via the shared
 disagree. The agent emits the literal `yuzu.net_*` heartbeat keys, which must
 match the server's `kNetTag*` constants — pinned by a `static_assert` in
 `test_network_perf_model.cpp`, so drift fails the build.
+
+The Windows heartbeat retransmit MIB (caveats in the platform table above) is
+whole-stack and measurement-first-unvalidated, so it is **withheld from the
+`yuzu_fleet_net_retrans_pct` gauge**: the server-side gate
+`retrans_gauge_eligible(os)` admits Linux only today (#1465). The Windows
+figure still renders on this page and the REST surface, caveated — it just
+does not feed the fleet gauge. All net gauges carry an `os` label; aggregate
+and alert **per-OS**, never on a cross-OS sum.
