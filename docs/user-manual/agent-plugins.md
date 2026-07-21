@@ -686,14 +686,14 @@ Plugins for displaying notifications, dialogs, and input prompts on endpoint des
 
 | | |
 |---|---|
-| **Version** | v1.0.0 |
+| **Version** | v0.3.0 |
 | **Platforms** | W L M |
 | **Description** | Desktop user interaction. Shows toast notifications, message box dialogs, and text input dialogs. Uses native APIs per platform: `ShellNotifyIcon` on Windows, `notify-send`/`zenity` on Linux, `osascript` on macOS. |
 
 | Action | Description |
 |---|---|
 | `notify` | Show a desktop notification/toast. Parameters: `title` (required), `message` (required), `type` (`info`, `warning`, or `error`; default `info`). |
-| `message_box` | Show a modal message box dialog that blocks until the user responds. Parameters: `title` (required), `message` (required), `buttons` (`ok`, `okcancel`, or `yesno`; default `ok`). Returns which button was clicked. |
+| `message_box` | Show a modal message box dialog that blocks until the user responds. Parameters: `title` (required), `message` (required), `buttons` (`ok`, `okcancel`, or `yesno`; default `ok`). On success returns which button was clicked in the `response` field. On macOS, when the agent has no desktop session (it runs as a GUI-less daemon, or no user is logged in), it returns `status\|not_reachable` instead of a fabricated button. |
 | `input` | Show a text input dialog. Parameters: `title` (required), `prompt` (required), `default_value` (optional). Returns the text entered by the user, or indicates cancellation. |
 
 ---
