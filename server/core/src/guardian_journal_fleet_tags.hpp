@@ -172,7 +172,8 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "when the reserve overflows"},
     // ── Persist ──────────────────────────────────────────────────────────────────
     {"yuzu.guardian_journal_batches_written", "yuzu_fleet_guardian_journal_batches_written",
-     "Fleet sum of journal batches successfully persisted, in BATCHES. A cumulative "
+     "Fleet sum of journal batches successfully persisted, in BATCHES of up to 256 "
+     "records. A cumulative "
      "process-lifetime count, so its presence means some agent's journal HAS WRITTEN since "
      "that agent last restarted - not that it is writing now. It is a WEAK liveness "
      "discriminator and fails in BOTH directions: a rolling reboot resets it to 0 so a "

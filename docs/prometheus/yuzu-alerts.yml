@@ -862,13 +862,14 @@ groups:
   # (reconnect, partition heal, laptop wake) raises the sum by its whole latched value
   # with no new loss, so it fires on reconnection churn - increase()'s disease, just
   # narrower. It is also blind to first appearance on its own (the offset side is
-  # absent), so it complements rather than replaces the form below. Neither form can
-  # ATTRIBUTE a rise - second agent vs same agent losing more vs reconnection churn -
-  # because there is no per-agent axis to separate on. It is still NOT sufficient to enable: it cannot
-  # distinguish "a second agent also broke" from "same agent, still broken", because
-  # there is no per-agent axis to separate on. Closing that needs the per-agent delta
-  # plus a server-owned monotonic counter - #2083 is the spark-scoped tracker, and the
-  # journal side belongs on #2298's cutover-gate list and is not yet filed there.
+  # absent), so it complements rather than replaces the form below.
+  #
+  # NEITHER FORM CAN ATTRIBUTE A RISE. "A second agent also broke", "the same agent lost
+  # more" and "an agent reconnected" are indistinguishable, because there is no
+  # per-agent axis to separate on. That, not the expression shape, is what keeps this
+  # group from being enable-ready. Closing it needs the per-agent delta plus a
+  # server-owned monotonic counter - #2083 is the spark-scoped tracker, and the journal
+  # side belongs on #2298's cutover-gate list and is not yet filed there.
   #
   # UNTIL BOTH REASONS CLEAR THESE ARE MONITOR-ONLY: graph them, review them in
   # post-incident analysis, do not page on them.
@@ -895,12 +896,14 @@ groups:
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
   # published on EVERY sweep including at 0, unlike the 22 counters. They are the only
-  # rules here that are sound today, because they are server-owned counts rather than
-  # fleet sums of agent monotonics - see YuzuGuardianJournalTelemetryDark below.
+  # rules here that CAN be sound, because they are server-owned counts rather than fleet
+  # sums of agent monotonics - but TelemetryDark is sound only once Guardian is actually
+  # deployed fleet-wide (its 0 also means "nothing journalled yet" - see its
+  # description below).
   #
   # - name: yuzu-guardian-journal
   #   rules:
-  #     # ---- Pipeline health (sound today; enable with the cutover) ----------------
+  #     # ---- Pipeline health (sound once Guardian is deployed) ---------------------
   #     - alert: YuzuGuardianJournalTelemetryDark
   #       expr: |
   #         yuzu_fleet_guardian_journal_reporting == 0
