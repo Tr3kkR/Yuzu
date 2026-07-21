@@ -329,6 +329,21 @@ Each row carries a human `detected_value` sentence plus a structured **`detail_j
 
 Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/v1/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide.
 
+## Reconnect replay traffic (durable lifecycle journal)
+
+**This is `prefer_spark`-gated and currently inert in production (`prefer_spark=false`).** It is documented here ahead of that flag flipping so a pilot's network monitoring is not surprised by it later.
+
+Once active, every agent reconnect (a new `Subscribe` stream) triggers the agent to replay its durable Guardian lifecycle journal into the outbound send window - "re-send-all": there is no delivery cursor, so an unexpired batch is re-paged on every reconnect (and on each periodic maintenance tick) until it ages out of retention. If your SOC or NDR tooling watches for reconnect-correlated outbound bursts, this is genuine, deliberate traffic, not beaconing - it rides the **existing agent-server gRPC/mTLS `Subscribe` stream** (the same stream carrying commands and other Guardian events); there is no new port, protocol, or egress destination.
+
+The traffic is bounded and small by construction:
+
+- **Rate:** a per-agent token bucket refills at 0.1 batches/sec (1 batch every ~10 seconds), so **one reconnecting agent adds at most 1 batch/10s of steady-state redelivery traffic**. A fleet of N agents therefore redelivers at most `N * 0.1` batches/sec server-wide - linear in fleet size, not bursty.
+- **Startup burst:** a small allowance of 5 batches can page immediately on reconnect before the steady-state rate applies.
+- **Per-pass cap:** a single reconnect (or maintenance tick) pages at most 128 batches, regardless of how much unexpired backlog exists, bounding the reconstruct-and-membership-scan work to a fixed cost per pass.
+- **Retention window:** the journal itself retains at most 7 days of unexpired batches (evicted oldest-first, also capped at 1000 batches / 32 MiB per agent). Replay can therefore never cover more than the last 7 days since an agent's last arm/disarm activity, never unbounded history. Worst case - an agent reconnecting with a full 1000-batch backlog - drains at the steady 1-batch-per-10s rate in a little under 3 hours, not all at once.
+
+**Observability gap:** today this is visible only **per-agent**, via that agent's heartbeat `status_tags` (`yuzu.guardian_journal_pages`, `yuzu.guardian_journal_records_paged`, and related `yuzu.guardian_journal_*` keys - see [Observability](#observability) below). There is currently no dashboard panel or fleet-wide Prometheus rollup of reconnect replay activity; closing that gap is tracked under issue #2298.
+
 ## Observability
 
 Guardian surfaces readiness and event counts via the standard observability endpoints:
