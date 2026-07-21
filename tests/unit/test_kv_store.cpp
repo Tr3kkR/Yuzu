@@ -525,3 +525,99 @@ TEST_CASE("KvStore: concurrent list while writing", "[kv_store][concurrency]") {
 
     CHECK(list_consistent.load());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Journal substrate primitives (item 7 PR-Ag C1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("KvStore::list_entries returns key+value, empty is not an error", "[kv_store][entries]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:n:0", "alpha"));
+    REQUIRE(t.store.set("p1", "lc:n:1", "beta"));
+    REQUIRE(t.store.set("p1", "other", "gamma"));
+
+    auto rows = t.store.list_entries("p1", "lc:");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    CHECK((*rows)[0].key == "lc:n:0");
+    CHECK((*rows)[0].value == "alpha");
+    CHECK((*rows)[1].key == "lc:n:1");
+    CHECK((*rows)[1].value == "beta");
+
+    // A non-matching prefix is an empty result, NOT an error (distinct from list()).
+    auto none = t.store.list_entries("p1", "zzz");
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+}
+
+TEST_CASE("KvStore::list_entries reads values byte-exact (NUL preserved)", "[kv_store][entries]") {
+    auto t = make_test_store();
+    const std::string with_nul = std::string("before") + '\0' + "after"; // 12 bytes
+    REQUIRE(t.store.set("p1", "lc:n:0", with_nul));
+
+    // get() truncates at the NUL (documented elsewhere); list_entries must not.
+    auto rows = t.store.list_entries("p1", "lc:");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].value.size() == with_nul.size());
+    CHECK((*rows)[0].value == with_nul);
+}
+
+TEST_CASE("KvStore::insert_if_absent reports Inserted vs Exists", "[kv_store][entries]") {
+    auto t = make_test_store();
+    CHECK(t.store.insert_if_absent("p1", "lc:n:0", "first") == KvInsert::Inserted);
+    // Second insert on the same key does nothing and reports Exists.
+    CHECK(t.store.insert_if_absent("p1", "lc:n:0", "second") == KvInsert::Exists);
+    auto v = t.store.get("p1", "lc:n:0");
+    REQUIRE(v.has_value());
+    CHECK(*v == "first"); // value NOT overwritten
+    // A different key is a fresh insert.
+    CHECK(t.store.insert_if_absent("p1", "lc:n:1", "other") == KvInsert::Inserted);
+}
+
+TEST_CASE("KvStore::rename_key moves atomically, reports Conflict/NotFound", "[kv_store][entries]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:n:0", "payload"));
+
+    CHECK(t.store.rename_key("p1", "lc:n:0", "quarantine:lc:n:0") == KvRename::Renamed);
+    CHECK_FALSE(t.store.exists("p1", "lc:n:0"));
+    auto moved = t.store.get("p1", "quarantine:lc:n:0");
+    REQUIRE(moved.has_value());
+    CHECK(*moved == "payload"); // value preserved
+
+    // Renaming a key that no longer exists.
+    CHECK(t.store.rename_key("p1", "lc:n:0", "lc:n:9") == KvRename::NotFound);
+
+    // Conflict: to_key already exists - both rows survive untouched.
+    REQUIRE(t.store.set("p1", "lc:a", "A"));
+    REQUIRE(t.store.set("p1", "lc:b", "B"));
+    CHECK(t.store.rename_key("p1", "lc:a", "lc:b") == KvRename::Conflict);
+    CHECK(t.store.get("p1", "lc:a").value_or("") == "A");
+    CHECK(t.store.get("p1", "lc:b").value_or("") == "B");
+}
+
+TEST_CASE("KvStore::del_keys removes only the listed keys, returns count", "[kv_store][entries]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "a", "1"));
+    REQUIRE(t.store.set("p1", "b", "2"));
+    REQUIRE(t.store.set("p1", "c", "3"));
+
+    CHECK(t.store.del_keys("p1", {"a", "c"}) == 2);
+    CHECK_FALSE(t.store.exists("p1", "a"));
+    CHECK(t.store.exists("p1", "b"));
+    CHECK_FALSE(t.store.exists("p1", "c"));
+
+    CHECK(t.store.del_keys("p1", {}) == 0);            // empty list
+    CHECK(t.store.del_keys("p1", {"nope"}) == 0);      // absent key, no error
+    CHECK(t.store.del_keys("p1", {"b", "nope"}) == 1); // counts only what existed
+    CHECK_FALSE(t.store.exists("p1", "b"));
+}
+
+TEST_CASE("KvStore::pragma_synchronous reports a valid level", "[kv_store][entries]") {
+    auto t = make_test_store();
+    const int level = t.store.pragma_synchronous();
+    // 0=OFF 1=NORMAL 2=FULL 3=EXTRA. The journal wants FULL; anything in range is
+    // a valid read (the caller soft-warns on < FULL, never aborts).
+    CHECK(level >= 0);
+    CHECK(level <= 3);
+}

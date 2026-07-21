@@ -135,6 +135,10 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_journal_format.cpp',
+    'unit/test_guardian_lifecycle_journal.cpp',
+    'unit/test_guardian_journal_heartbeat.cpp',
+    'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -173,6 +177,7 @@ agent_test_exe = executable(
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
+    'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
@@ -191,6 +196,7 @@ agent_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
@@ -608,6 +614,16 @@ test('flake-retry selftest',
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
+)
+
+# Issue-lifecycle hygiene (ADR-3001 A1): CLAUDE.md character budget,
+# do-not-close.txt parses clean (the never-close guard every automated close
+# path reads), and issue-standard.md keeps its never-close section.
+test('issue lifecycle docs',
+  _python3_test,
+  args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
 )
 
 # Runner-local CI telemetry contract: v2->v3 migration preserves history,

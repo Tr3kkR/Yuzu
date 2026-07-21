@@ -308,11 +308,11 @@ The `frontend-design` plugin (`frontend-design@claude-plugins-official`) is scop
 
 ### Issue tracker
 
-GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. Filing, labelling, and closing follow `docs/agents/issue-standard.md` (ADR-3001): duplicate search before filing is **mandatory**; bodies carry Context / Evidence (`file:line`) / Acceptance criteria / Origin; automation never closes `security`-labelled or `do-not-close` issues, and neither should you without verifying against current `origin/dev`. Exploitable vulnerabilities are never public issues — private advisories only (`SECURITY.md`). Command crib: `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) — all five now exist in the repo's label set, alongside a broader categorization set (`bug`, `security`, `P0`/`P1`/`P2`, `enhancement`, `documentation`, `reliability`, workstream-* and phase-* tags, etc.). See `docs/agents/triage-labels.md`.
+Every issue carries exactly one type label; every non-`roadmap` issue also carries exactly one triage state. The `gh` path additionally sets one of `P0`/`P1`/`P2` — or `roadmap` for parked scope, which carries neither priority nor triage state. The canonical five triage roles (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) map 1:1 to labels, unchanged. Active backlog = `is:open -label:roadmap`. Full taxonomy and axes: `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

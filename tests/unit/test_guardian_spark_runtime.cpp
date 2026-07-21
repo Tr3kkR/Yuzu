@@ -8,7 +8,12 @@
 
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_lifecycle_journal.hpp"
+
+#include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/spark.hpp>
+
+#include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -18,6 +23,7 @@
 #include <future>
 #include <latch>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -142,6 +148,35 @@ std::shared_ptr<GuardianSparkRuntime> make_rt(std::shared_ptr<FakeReader> r,
         std::move(r), std::move(b), cfg,
         [] { return clk::time_point{} + std::chrono::milliseconds(tick.fetch_add(1000)); });
 }
+
+// A replayable lifecycle entry for try_page_batch tests.
+OutboxEntry lc_entry(const std::string& rule, const std::string& eid, const std::string& kind = "armed") {
+    return OutboxEntry::lifecycle(rule, 1, eid, 1'700'000'000'000'000'000, kind, "file", "n");
+}
+
+// A component + runtime + KvStore rig for page_into_window integration (item 7 PR-Ag C5).
+struct PageRig {
+    yuzu::test::TempDbFile db{"yuzu_test_page-"};
+    std::unique_ptr<KvStore> kv;
+    std::shared_ptr<GuardianSparkRuntime> rt;
+    std::unique_ptr<GuardianLifecycleJournal> journal;
+    PageRig() {
+        auto r = KvStore::open(db.path);
+        REQUIRE(r.has_value());
+        kv = std::make_unique<KvStore>(std::move(*r));
+        rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+        journal = std::make_unique<GuardianLifecycleJournal>(kv.get());
+    }
+    // Persist one record as its own batch (a distinct persist call → a distinct batch key).
+    void persist(const std::string& rule, const std::string& kind = "armed") {
+        std::vector<std::shared_ptr<const JournalRecord>> pending{
+            std::make_shared<const JournalRecord>(
+                JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
+                              .enqueued_ns = 1'700'000'000'000'000'000, .kind = kind,
+                              .guard_type = "file", .rule_name = "n"})};
+        REQUIRE(journal->persist(pending) == 1);
+    }
+};
 } // namespace
 
 TEST_CASE("attach arms the watcher on the 0->1 edge; a sibling rule shares it", "[spark][runtime]") {
@@ -417,6 +452,108 @@ TEST_CASE("a configured capacity below two is floored so a recovery pair can nev
     const auto g = drain_all(*rt);
     REQUIRE(g.size() == 2); // the pair landed - not permanently rejected
     REQUIRE(rt->pending_initial(key).empty());
+}
+
+TEST_CASE("Unknown flood guard: repeat errored evals emit one health(false), count the rest (M1)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    // First errored eval -> exactly one guard.unhealthy on the wire; nothing suppressed yet.
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // The convergence priority lane re-visits a rule still owing a verdict every tick. Three
+    // more errored re-evals must produce NO new wire entries - each is counted instead, so a
+    // rule stuck errored can't flood the fleet's health-event ingest.
+    for (int i = 0; i < 3; ++i)
+        rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+    REQUIRE_FALSE(rt->pending_initial(key).empty()); // still Unknown -> still owes a verdict
+
+    // Recovery emits guard.healthy (+ the compliant edge) and re-arms the edge: the NEXT
+    // Unknown emits a fresh health(false), and the suppression counter is untouched by it.
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto recovered = drain_all(*rt);
+    // Precisely: recovery MUST emit a guard.healthy (Health domain, healthy=true), not merely
+    // "some entry" - a regression that dropped health(true) on recovery would leave the health
+    // stream stuck errored forever (qa Gate-3 SHOULD).
+    REQUIRE(std::any_of(recovered.begin(), recovered.end(), [](const OutboxEntry& e) {
+        return e.domain == OutboxDomain::Health && e.healthy;
+    }));
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+}
+
+TEST_CASE("Unknown edge rejected at outbox cap is retried, never counted as suppressed (M1)",
+          "[spark][runtime]") {
+    // Metrics-honesty invariant: unhealthy_suppressed_ counts only COMMITTED repeat-Unknowns,
+    // never an edge the outbox rejected (that edge is re-attempted, not suppressed). Guards the
+    // counter's placement AFTER the accept-check + COMMIT against a future refactor that hoists it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor
+    auto rt = make_rt(r, b, cfg);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true); // drifts
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true); // drifts
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc", /*present=*/true), true);
+
+    // Fill the outbox with two drifts (no slot left).
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    // Edge Unknown for rc while the outbox is full: its single health(false) entry is rejected
+    // (both-or-neither), so nothing commits, rc stays pending, and NOTHING is counted suppressed -
+    // the edge was not delivered and will be retried, so counting it would over-report.
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(kc, EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+    REQUIRE(rt->pending_initial(kc) == std::vector<std::string>{"rc"});
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // Drain frees a slot; the STILL-first Unknown re-attempts as a fresh edge and lands.
+    drain_all(*rt);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    REQUIRE(drain_all(*rt).size() == 1);      // the edge health(false) finally delivered, not lost
+    REQUIRE(rt->unhealthy_suppressed() == 0); // still an edge, never a suppression
+}
+
+TEST_CASE("Unknown flood guard: two rules on one key each count suppression independently (M1)",
+          "[spark][runtime]") {
+    // The counter increments PER RULE inside the per-key eval loop, not once per key. A refactor
+    // that hoisted the increment outside the loop would silently under-count a multi-rule key
+    // (qa Gate-3 SHOULD). Two rules share one spark_key; both go Unknown together.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    // First pass: both rules edge -> two health(false) on the wire, nothing suppressed.
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 2);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // Second pass: both rules repeat -> no wire entries, +2 suppressed (one per rule, not one
+    // per key).
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 2);
 }
 
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
@@ -989,4 +1126,404 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
     // the real detection-capability change.
     CHECK(rt->rule_count() == 1);
     CHECK(b->arms.load() >= 1);
+}
+
+// ── Durable-journal staging (item 7 PR-Ag C2) ────────────────────────────────
+
+TEST_CASE("attach_rule stages a durable record; its event_id matches the wire event",
+          "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    auto staged = rt->snapshot_pending();
+    REQUIRE(staged.size() == 1);
+    CHECK(staged[0]->rule_id == "r1");
+    CHECK(staged[0]->kind == "armed");
+    CHECK(staged[0]->enqueued_ns > 0);
+    CHECK_FALSE(staged[0]->event_id.empty());
+
+    // Mint-once: the durable record and the live wire event carry ONE id (rev-4.1 #4)
+    // - a replay must reproduce it byte-for-byte or the server sees a false Conflict.
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].event_id == staged[0]->event_id);
+    CHECK(lc[0].lifecycle_kind == staged[0]->kind);
+    CHECK(lc[0].guard_type == staged[0]->guard_type);
+    // The drain pops the send window, NOT the staging vector.
+    CHECK(rt->pending_journal_depth() == 1);
+}
+
+TEST_CASE("detach_rule stages a disarmed record after the armed one", "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true)); // stages "armed"
+    rt->detach_rule("r1");                                                         // ->0 edge, stages "disarmed"
+
+    auto staged = rt->snapshot_pending();
+    REQUIRE(staged.size() == 2);
+    CHECK(staged[0]->kind == "armed");
+    CHECK(staged[1]->kind == "disarmed");
+    CHECK(staged[1]->rule_id == "r1");
+}
+
+TEST_CASE("a refused arm stages no durable record (no phantom)", "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->fail_arm.store(true);
+    auto rt = make_rt(r, b);
+    CHECK_FALSE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    CHECK(rt->snapshot_pending().empty()); // arm refused before enqueue → nothing staged
+}
+
+TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->throw_arm.store(true);
+    auto rt = make_rt(r, b);
+    CHECK_THROWS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(rt->snapshot_pending().empty()); // rollback undid the arm; nothing staged
+}
+
+TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
+          "[spark][runtime][journal]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true));
+    REQUIRE(rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3"), true));
+    REQUIRE(rt->pending_journal_depth() == 3);
+
+    auto staged = rt->snapshot_pending();
+    REQUIRE(staged.size() == 3);
+    CHECK(staged[0]->rule_id == "r1");
+    CHECK(staged[2]->rule_id == "r3");
+
+    rt->erase_persisted_prefix(2); // drop the two oldest (r1, r2)
+    REQUIRE(rt->pending_journal_depth() == 1);
+    CHECK(rt->snapshot_pending()[0]->rule_id == "r3");
+
+    rt->erase_persisted_prefix(99); // clamps to size
+    CHECK(rt->pending_journal_depth() == 0);
+}
+
+// ── Replay: try_page_batch + page_into_window (item 7 PR-Ag C5) ───────────────
+
+TEST_CASE("try_page_batch pages new entries into the send window", "[spark][runtime][journal]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 2);
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 2);
+    CHECK(lc[0].event_id == "e1");
+    CHECK(lc[1].event_id == "e2");
+}
+
+TEST_CASE("try_page_batch skips entries already in the window (membership scan)",
+          "[spark][runtime][journal]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1);
+    // e1 already present; only e2 is net-new.
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 1);
+}
+
+TEST_CASE("try_page_batch defers a batch that does not fit the headroom", "[spark][runtime][journal]") {
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1); // headroom 2 → ok
+    // headroom now 1; a 2-entry batch is deferred WHOLE (never split).
+    CHECK(rt->try_page_batch({lc_entry("r2", "e2"), lc_entry("r3", "e3")}) == 0);
+    CHECK(rt->try_page_batch({lc_entry("r2", "e2")}) == 1); // a 1-entry batch fits
+}
+
+TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark][runtime][journal]") {
+    PageRig rig;
+    rig.persist("r1");
+    auto stats = rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000);
+    CHECK(stats.records_paged == 1);
+
+    auto lc = drain_lifecycle(*rig.rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].event_id == "e-r1");
+    CHECK(lc[0].journal_last_in_batch);         // provenance attached for the sent-label
+    CHECK_FALSE(lc[0].journal_batch_key.empty());
+}
+
+TEST_CASE("page_into_window does not re-page a windowed entry (re-send-all skips members)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    rig.persist("r1");
+    const std::int64_t now = 1'700'000'100'000;
+    CHECK(rig.journal->page_into_window(*rig.rt, now).records_paged == 1);
+    // The window still holds e-r1 (not drained): a second pass re-considers it but membership
+    // skips it - 0 net-new.
+    CHECK(rig.journal->page_into_window(*rig.rt, now + 60'000).records_paged == 0);
+}
+
+TEST_CASE("page_into_window reaches the never-sent tail on a stable connection (fair rotation)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    const int N = 12; // > burst; the head keeps re-arriving as it is sent + popped
+    for (int i = 0; i < N; ++i)
+        rig.persist("r" + std::to_string(i));
+
+    // Model a healthy connected agent: page, then drain (send + pop), each tick; the bucket
+    // refills as the clock advances. Oldest-first (the old code) would re-send the head forever
+    // and starve the tail; fair rotation must reach EVERY batch. (Design §10 mandated test.)
+    std::set<std::string> ever_sent;
+    std::int64_t t = 1'700'000'000'000;
+    for (int tick = 0; tick < 80 && ever_sent.size() < static_cast<std::size_t>(N); ++tick) {
+        rig.journal->page_into_window(*rig.rt, t);
+        rig.rt->drain([&](const OutboxEntry& e) {
+            if (e.domain == OutboxDomain::Lifecycle)
+                ever_sent.insert(e.event_id);
+            return SendResult::Sent;
+        });
+        t += 30'000; // 30 s / tick
+    }
+    CHECK(ever_sent.size() == static_cast<std::size_t>(N)); // no tail starvation
+}
+
+TEST_CASE("page_into_window bounds net-new work per pass (rate limit)", "[spark][runtime][journal]") {
+    PageRig rig;
+    for (int i = 0; i < 20; ++i)
+        rig.persist("r" + std::to_string(i));
+    // One pass with a fresh bucket pages at most burst + the single-batch overshoot; the rest
+    // are DELAYED (still journaled), never dropped.
+    const auto s = rig.journal->page_into_window(*rig.rt, 1'700'000'000'000);
+    CHECK(s.batches_paged >= 1);
+    CHECK(s.batches_paged <= 6); // burst (5) + 1 overshoot
+    CHECK(drain_lifecycle(*rig.rt).size() == s.batches_paged);
+}
+
+TEST_CASE("page_into_window prunes an expired batch before replaying (boot barrier)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    // Both batches written directly with CONTROLLED ts_ms (persist would stamp real-now).
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    write_batch("lc:old:000000000000", 1000, "e-old");             // ancient → older than 7 days
+    write_batch("lc:new:000000000000", 1'700'000'000'000, "e-new"); // recent
+
+    // The barrier prunes before paging: the ts_ms=1000 batch ages out and is never replayed.
+    auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'050'000LL);
+    CHECK(stats.records_paged == 1);
+    CHECK(rig.journal->batches_pruned() == 1); // the expired batch pruned by the barrier
+    auto lc = drain_lifecycle(*rig.rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].event_id == "e-new");
+}
+
+TEST_CASE("page_into_window stops enqueuing once request_stop is signalled (stop-race gate)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    for (int i = 0; i < 4; ++i)
+        rig.persist("r" + std::to_string(i));
+    rig.journal->request_stop();
+    // A page pass after stop began must not mutate the window.
+    CHECK(rig.journal->page_into_window(*rig.rt, 1'700'000'100'000).records_paged == 0);
+    CHECK(drain_lifecycle(*rig.rt).empty());
+}
+
+TEST_CASE("a paged batch's last entry, when sent, gets a sent-label (send-wrap logic)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    rig.persist("r1");
+    REQUIRE(rig.journal->page_into_window(*rig.rt, 1'700'000'100'000).records_paged == 1);
+
+    // Drain with the same wrap wire_spark_engine installs: on a Sent last-in-batch paged
+    // entry, write the sent-label.
+    rig.rt->drain([&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle && e.journal_last_in_batch &&
+            !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        return SendResult::Sent;
+    });
+    CHECK(rig.journal->sent_labels_written() == 1);
+    auto sent = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
+    REQUIRE(sent.has_value());
+    CHECK(sent->size() == 1);
+}
+
+TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
+          "[spark][runtime][journal][tsan]") {
+    PageRig rig;
+    for (int i = 0; i < 20; ++i)
+        rig.persist("r" + std::to_string(i));
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> pagers;
+    for (int p = 0; p < 3; ++p)
+        pagers.emplace_back([&, p] {
+            std::int64_t t = 1'700'000'000'000 + p * 1000;
+            while (!stop.load(std::memory_order_relaxed)) {
+                rig.journal->page_into_window(*rig.rt, t);
+                t += 10'000; // advance the clock so the bucket keeps refilling
+            }
+        });
+    std::thread drainer([&] {
+        while (!stop.load(std::memory_order_relaxed))
+            rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
+    });
+
+    // Interleave from the main thread too, then signal stop (also exercises the stop-race gate).
+    for (int i = 0; i < 200; ++i)
+        rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
+
+    rig.journal->request_stop();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : pagers)
+        t.join();
+    drainer.join();
+    SUCCEED("no data race / crash across concurrent pagers + drain");
+}
+
+TEST_CASE("page_into_window quarantines a corrupt batch instead of replaying it (M6)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    auto write = [&](const std::string& key, std::int64_t ts, const std::string& eid,
+                     std::int64_t ns, const std::string& kind) {
+        REQUIRE(rig.kv->set(kJournalNamespace, key,
+                            R"({"v":4,"ts_ms":)" + std::to_string(ts) +
+                                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                                R"(","enqueued_ns":)" + std::to_string(ns) + R"(,"kind":")" + kind +
+                                R"(","guard_type":"file","rule_name":"n"}]})"));
+    };
+    // enqueued_ns=0 floors to epoch second 0, so the server would stamp receipt-now -> a false
+    // Conflict every replay. A kind outside {armed,disarmed} is likewise corrupt/tampered.
+    write("lc:bad:000000000000", 1'700'000'000'000, "e-bad", 0, "armed");
+    write("lc:badkind:000000000000", 1'700'000'000'000, "e-bk", 1'700'000'000'000'000'000, "banana");
+    write("lc:good:000000000000", 1'700'000'000'000, "e-good", 1'700'000'000'000'000'000, "armed");
+
+    auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'050'000);
+    CHECK(stats.records_paged == 1);        // only the good batch replayed
+    CHECK(rig.journal->quarantined() >= 2); // both corrupt batches moved aside
+    CHECK(rig.kv->list_entries(kJournalNamespace, kQuarantineKeyPrefix)->size() >= 2);
+
+    auto sent = drain_lifecycle(*rig.rt);
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].event_id == "e-good"); // the poison batches never reach the wire
+}
+
+TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    // A live entry enters BOTH the send window and staging; persist it, then back-fill.
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    auto pending = rig.rt->snapshot_pending();
+    REQUIRE(pending.size() == 1);
+
+    std::vector<PersistedBatch> batches;
+    CHECK(rig.journal->persist(pending, &batches) == 1);
+    REQUIRE(batches.size() == 1);
+    for (const auto& b : batches)
+        rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
+
+    // The live entry now carries the batch key + last-in-batch, so its LIVE send writes a
+    // sent-label (before this fix a live-sent entry had no key and later false-alerted).
+    rig.rt->drain([&](const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle && e.journal_last_in_batch &&
+            !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        return SendResult::Sent;
+    });
+    CHECK(rig.journal->sent_labels_written() == 1);
+    auto sent_m3 = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
+    REQUIRE(sent_m3.has_value());
+    CHECK(sent_m3->size() == 1);
+}
+
+TEST_CASE("a hostile rule_name is rejected from the journal but never crashes the arm (QE-2)",
+          "[spark][runtime][journal]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+
+    // Feed embedded-NUL / invalid-UTF-8 / oversized rule_names through the REAL wired staging
+    // path (attach_rule -> enqueue_lifecycle_locked -> build_journal_record -> validate_record),
+    // not validate_record in isolation. This is the governance blind-spot #1593 lesson: a
+    // "rejected, not thrown" claim for the wired path needs a reproduction. Each must be kept out
+    // of the durable journal (journal_field_rejected++) while the arm itself still succeeds.
+    const auto arm_with_name = [&](const std::string& rid, const std::string& name) {
+        auto rule = file_exists_rule(rid);
+        rule.rule_name = name;
+        return rt->attach_rule(rid, file_spec("/" + rid), rule, true);
+    };
+
+    std::string nul = "bad";
+    nul.push_back('\0');
+    nul += "name";
+    REQUIRE(arm_with_name("r1", nul).has_value());                           // embedded NUL
+    REQUIRE(arm_with_name("r2", std::string("bad\xff\xfetail")).has_value()); // invalid UTF-8
+    REQUIRE(arm_with_name("r3", std::string(5000, 'x')).has_value());        // > kMaxJournalFieldBytes
+
+    CHECK(rt->journal_field_rejected() == 3); // all three kept OUT of the durable journal
+    CHECK(rt->journal_clock_rejected() == 0);
+    CHECK(rt->pending_journal_depth() == 0);  // nothing staged (the live audit entry still sent)
+}
+
+TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)",
+          "[spark][runtime][journal][tsan]") {
+    PageRig rig;
+    // A small retention cap keeps the pruner trimming the journal so page-passes stay O(small):
+    // TSan finds a race from the INTERLEAVING, not from volume, so a short bounded run suffices.
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/16,
+                                               /*max_bytes=*/static_cast<std::size_t>(-1),
+                                               /*max_quarantine=*/100);
+    for (int i = 0; i < 16; ++i)
+        rig.persist("seed" + std::to_string(i));
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> workers;
+    // Pagers: page_into_window (paging_mutex_ -> KvStore.mu_).
+    for (int p = 0; p < 2; ++p)
+        workers.emplace_back([&, p] {
+            std::int64_t t = 1'700'000'000'000 + p * 1000;
+            while (!stop.load(std::memory_order_relaxed)) {
+                rig.journal->page_into_window(*rig.rt, t);
+                t += 10'000;
+            }
+        });
+    // Pruner: prune() (paging_mutex_ -> KvStore.mu_) - the FR5 prune-vs-paging serialization this
+    // test exists to exercise under TSan (previously only single-threaded).
+    workers.emplace_back([&] {
+        std::int64_t t = 1'700'000'000'000;
+        while (!stop.load(std::memory_order_relaxed)) {
+            rig.journal->prune(t);
+            t += 5'000;
+        }
+    });
+    // Persister: persist() (KvStore.mu_, no paging_mutex_) - a single writer, as in production
+    // (always under the engine mtx_); it races page/prune only on the shared KvStore + atomics.
+    // Bounded to keep the run short; the pruner recycles the batch budget as it writes.
+    workers.emplace_back([&] {
+        for (int n = 0; n < 40 && !stop.load(std::memory_order_relaxed); ++n) {
+            std::vector<std::shared_ptr<const JournalRecord>> pending{
+                std::make_shared<const JournalRecord>(JournalRecord{
+                    .rule_id = "w" + std::to_string(n), .generation = 1,
+                    .event_id = "we-" + std::to_string(n), .enqueued_ns = 1'700'000'000'000'000'000,
+                    .kind = "armed", .guard_type = "file", .rule_name = "n"})};
+            (void)rig.journal->persist(pending);
+        }
+    });
+    // Drainer.
+    workers.emplace_back([&] {
+        while (!stop.load(std::memory_order_relaxed))
+            rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
+    });
+
+    for (int i = 0; i < 60; ++i)
+        rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
+
+    rig.journal->request_stop();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& w : workers)
+        w.join();
+    SUCCEED("no data race across concurrent persist/page/prune/drain");
 }

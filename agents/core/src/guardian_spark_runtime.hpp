@@ -48,6 +48,7 @@
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/spark.hpp> // SparkSpec, SparkEvent, SparkType, ServiceRunState
 
+#include "guardian_journal_format.hpp" // JournalRecord + caps (item 7 PR-Ag)
 #include "guardian_outbox.hpp"
 #include "guardian_rule_eval.hpp"
 
@@ -227,6 +228,63 @@ public:
     /// number SENT (not removed - a coalesced head counts as sent but is not popped).
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
 
+    // --- Durable lifecycle journal - staging seam (item 7 PR-Ag) ------------
+    // Staging lives HERE (co-located with lifecycle_log_ under outbox_mu_) because
+    // DISARM must stage inside detach_rule_locked. The KvStore-backed
+    // persist/page/retention live in an engine-owned GuardianLifecycleJournal that
+    // drives these via the narrow API below. The runtime NEVER touches a KvStore:
+    // it is the detach-survival object and must OWN everything it touches (file
+    // header), so the durable seam stays in the engine.
+
+    /// A FIFO copy of the currently-staged (built + validated, not-yet-persisted)
+    /// records. Immutable view; the caller serialises + writes them, then calls
+    /// erase_persisted_prefix() for the count it durably wrote.
+    [[nodiscard]] std::vector<std::shared_ptr<const JournalRecord>> snapshot_pending() const;
+
+    /// Drop the oldest `n` staged records (those a persist just durably wrote).
+    /// Clamped to the current size.
+    void erase_persisted_prefix(std::size_t n);
+
+    /// Page a REPLAYED batch into the send window: iff the window has >= batch-size
+    /// headroom, enqueue each entry NOT already present (window-scan membership, no
+    /// allocating set). Returns the count newly enqueued - 0 if deferred for headroom or
+    /// every entry was already present. Paged entries enter lifecycle_log_ ONLY (they are
+    /// already durable - never pending_journal_). Does NOT wake the drain; the caller (the
+    /// reconnect / low-water / tick hook, C6) drives sending.
+    [[nodiscard]] std::size_t try_page_batch(std::vector<OutboxEntry> entries);
+
+    /// Back-fill provenance onto the LIVE window entries of a just-persisted batch (review M3),
+    /// so a live send writes its sent-label rather than the batch later ageing out counted
+    /// evicted_without_send_evidence. Called from the engine persist boundary; takes outbox_mu_.
+    /// `event_ids` are the batch's records in order; `last_event_id` is its last-in-batch record.
+    void backfill_batch_provenance(const std::string& batch_key,
+                                   const std::vector<std::string>& event_ids,
+                                   const std::string& last_event_id);
+
+    /// Current staged-record depth (gauge). Takes outbox_mu_.
+    [[nodiscard]] std::size_t pending_journal_depth() const;
+
+    // Staging integrity counters (design §2 loss table). Lock-free.
+    [[nodiscard]] std::uint64_t journal_stage_dropped() const noexcept {
+        return journal_stage_dropped_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t journal_stage_failures() const noexcept {
+        return journal_stage_failures_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t journal_field_rejected() const noexcept {
+        return journal_field_rejected_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t journal_clock_rejected() const noexcept {
+        return journal_clock_rejected_.load(std::memory_order_relaxed);
+    }
+    /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
+    /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
+    /// first Unknown of an episode emits a health event. Non-zero means at least one rule is
+    /// persistently errored - the count is the number of ticks NOT flooded onto the wire.
+    [[nodiscard]] std::uint64_t unhealthy_suppressed() const noexcept {
+        return unhealthy_suppressed_.load(std::memory_order_relaxed);
+    }
+
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
     /// Does NOT join threads (the SparkEngine consumer join is phase 2, owned by
@@ -369,6 +427,18 @@ private:
     bool enqueue_lifecycle_locked(const std::string& rule_id, std::uint64_t generation,
                                   const std::string& kind, const std::string& guard_type,
                                   const std::string& rule_name);
+    /// Build + validate a durable JournalRecord (may throw bad_alloc on the string
+    /// copies - the caller decides whether that propagates). Returns nullptr if the
+    /// record is not journalable, counting the reason (field vs clock rejection).
+    std::shared_ptr<JournalRecord> build_journal_record(
+        const std::string& rule_id, std::uint64_t generation, const std::string& event_id,
+        std::int64_t enqueued_ns, const std::string& kind, const std::string& guard_type,
+        const std::string& rule_name);
+    /// Append a record to the bounded pending_journal_ reserve (outbox_mu_ held).
+    /// NOEXCEPT: the reserve is fixed at construction so push_back never reallocates;
+    /// overflow drops the oldest and counts journal_stage_dropped. A null record is a
+    /// no-op (it was rejected at build).
+    void stage_pending_locked(std::shared_ptr<JournalRecord> record) noexcept;
 
     std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
     std::shared_ptr<ISparkBackend> backend_; ///< OWNED
@@ -394,6 +464,15 @@ private:
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
     GuardianLifecycleLog lifecycle_log_; ///< capacity set in the ctor init list (see the .cpp)
+    /// Durable-journal staging: built + validated records awaiting persist. Bounded
+    /// (kMaxPendingJournalRecords), reserved ONCE in the ctor, drop-oldest on overflow.
+    /// outbox_mu_-guarded (co-located with lifecycle_log_); in practice mutated only by
+    /// mtx_-serialised engine paths (reconcile stage + persist), never by the drain.
+    std::vector<std::shared_ptr<JournalRecord>> pending_journal_;
+    std::atomic<std::uint64_t> journal_stage_dropped_{0};  ///< overflow drop-oldest (disk-full backpressure)
+    std::atomic<std::uint64_t> journal_stage_failures_{0}; ///< disarm record un-buildable post-teardown
+    std::atomic<std::uint64_t> journal_field_rejected_{0}; ///< NUL/oversized/non-UTF-8 field kept out
+    std::atomic<std::uint64_t> journal_clock_rejected_{0}; ///< skewed clock (secs<=0) kept out (rev-4.1 #2)
     // Serialises drain() calls WITHOUT blocking enqueuers (they take outbox_mu_, not
     // this): drain() releases outbox_mu_ across each send, so two concurrent drainers
     // could otherwise both peek+send the same head. drain_once() is public, so this is
@@ -401,6 +480,9 @@ private:
     // re-enter drain() (it would self-deadlock on this mutex); none does.
     std::mutex drain_mu_;
     std::atomic<std::uint64_t> send_exceptions_{0}; ///< drain sends that threw (item 4 hardening)
+    std::atomic<std::uint64_t> unhealthy_suppressed_{0}; ///< repeat Unknown evals whose guard.unhealthy
+                                                         ///< was edge-suppressed (rule stuck errored;
+                                                         ///< NOT re-minted every ~5s convergence tick). M1.
 };
 
 } // namespace yuzu::agent

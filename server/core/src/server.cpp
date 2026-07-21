@@ -88,6 +88,7 @@
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "network_perf_rules.hpp"
@@ -962,6 +963,25 @@ public:
                           "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
                           "server restart.",
                           "counter");
+        metrics_.describe(
+            yuzu::server::detail::kGuardianEventStoreDurationMetric,
+            "Server-side latency of insert_event_classified (the classify+store SQLite operation) "
+            "for one Guardian event, split by outcome `status` (inserted|redelivered|conflict|"
+            "error). redelivered/conflict run the redelivery byte-compare; inserted does "
+            "projection+commit. A validation signal for the off-write-path compare work (#2298) - "
+            "NOT the go/no-go (an aggregate histogram can't attribute compare-CPU vs lock-wait; "
+            "that needs a concurrent benchmark). Covers the direct-Subscribe and gateway-proxied "
+            "paths. Buckets 0.1ms-10s.",
+            "histogram");
+        // Birth the four status series with the custom ladder ONCE (boundaries fix at first
+        // creation) so the hot observe path is a cheap name+label lookup and the series are on
+        // /metrics from boot. Mirrors the yuzu_pg_acquire_wait_seconds pattern above.
+        // LOAD-BEARING (unhappy-path UP-1): this MUST run in the ServerImpl ctor, before the gRPC
+        // listener opens (run() -> BuildAndStart), or the first ingest would default-construct the
+        // series with the 5ms-floor buckets and silently lose the sub-ms resolution. Do not move
+        // it after the listener starts, and do not switch the observe site to the no-warm-create
+        // (default-bucket) path.
+        yuzu::server::detail::warm_create_guardian_event_store_metric(metrics_);
         metrics_.describe("yuzu_server_guardian_events_reaped_total",
                           "Cumulative Guaranteed-State events deleted by the retention reaper",
                           "counter");

@@ -51,7 +51,7 @@ async function main() {
     const cmd = COMMANDS[i];
     console.log(`[${i + 2}] Sending: "${cmd}"`);
 
-    await page.click('#instr-input', { clickCount: 3 });
+    await page.click('#instr-input', { count: 3 });
     await page.type('#instr-input', cmd);
     await page.click('#btn-send');
 
