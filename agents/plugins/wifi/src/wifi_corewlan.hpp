@@ -26,6 +26,8 @@
 #include <format>
 #include <string>
 
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-H1)
+
 namespace yuzu::wifi {
 
 struct WifiConnection {
@@ -48,13 +50,22 @@ struct WifiConnection {
 // name is unavailable (usually Location Services withholding on 14+, sometimes a
 // hidden SSID) reports "<ssid-withheld>" (an honest connection), never a false
 // "Not connected". Pure — unit-tested cross-platform.
+//
+// SSID/security/BSSID are the most attacker-controllable fields in the plugin
+// set (an AP can broadcast an SSID containing '|' — a legal 802.11 octet — or,
+// via a crafted beacon, an embedded newline), and `wifi` is NOT a key|value
+// plugin (server-side result_parsing splits it on ALL pipes), so an unescaped
+// '|' shifts every later column and a '\n' injects a fabricated row. Route each
+// through safe_output_field (plg-H1) — the same discipline the rest of this
+// branch applies (users desc, certificates subject/issuer, event_logs message).
 inline std::string format_connected_record(const WifiConnection& c) {
     if (!c.associated)
         return "connected|none|Not connected|0|none|none";
-    const std::string ssid = c.ssid_available ? c.ssid : "<ssid-withheld>";
+    const std::string ssid =
+        c.ssid_available ? yuzu::util::safe_output_field(c.ssid) : "<ssid-withheld>";
     return std::format("connected|{}|{}|{}|{}|{}", ssid, c.rssi,
-                       c.security.empty() ? "Unknown" : c.security,
-                       c.bssid.empty() ? "-" : c.bssid, c.channel);
+                       c.security.empty() ? "Unknown" : yuzu::util::safe_output_field(c.security),
+                       c.bssid.empty() ? "-" : yuzu::util::safe_output_field(c.bssid), c.channel);
 }
 
 #ifdef __APPLE__

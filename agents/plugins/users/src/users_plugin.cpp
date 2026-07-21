@@ -19,7 +19,12 @@
 
 #ifndef _WIN32
 #include <chrono>
+#include <spdlog/spdlog.h>
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#endif
+
+#if defined(__APPLE__)
+#include "users_macos_last.hpp" // pure `last -y` parsers (qe-M1)
 #endif
 
 #include <array>
@@ -69,6 +74,14 @@ namespace {
 bool is_safe_identifier(std::string_view s) {
     if (s.empty())
         return false;
+    // Reject a leading '-' or '.' (sec-L1): the value is interpolated as a bare
+    // token into `last -y -1 {user}` / `dscl` argument lists, and an option-like
+    // account name (`-foo`) would otherwise be misread as a flag by `last`
+    // (argument injection — no command injection, the allowlist below still
+    // blocks every shell metacharacter, but wrong/empty output). Mirrors the
+    // certificates plugin's is_valid_username first-character rule.
+    if (s.front() == '-' || s.front() == '.')
+        return false;
     for (char c : s) {
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
               c == '.' || c == '_' || c == '-')) {
@@ -111,6 +124,13 @@ std::string run_command(const char* cmd) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/bin/sh", "-c", cmd},
         yuzu::agent::SubprocessOptions{.deadline = kUsersCmdDeadline});
+    // A cut-short tool returns empty/partial output that parses as "no users /
+    // unknown last-logon" — a silent false-negative. Warn so an operator can
+    // distinguish a degraded scan from a genuinely empty result (sre-M1).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("users: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
@@ -340,74 +360,11 @@ int do_sessions(yuzu::CommandContext& ctx) {
 }
 
 #if defined(__APPLE__)
-// macOS `last` reports timestamps as "Weekday Mon DD HH:MM" — no year, no
-// seconds, and (for remote sessions) an extra host column before the
-// weekday whose presence isn't consistent. is_weekday finds the marker
-// token so the timestamp can be located without parsing the line
-// positionally.
-bool is_weekday(std::string_view tok) {
-    static constexpr std::array<std::string_view, 7> days = {"Sun", "Mon", "Tue", "Wed",
-                                                              "Thu", "Fri", "Sat"};
-    for (auto d : days) {
-        if (tok == d)
-            return true;
-    }
-    return false;
-}
-
-// Parse a `last -y`-style "Mon DD HH:MM YYYY" fragment into Windows-style
-// "YYYY-MM-DD HH:MM:SS". Plain BSD `last` never reports the year, which
-// would force guessing it from the current date — wrong for any record
-// older than ~12 months — so the caller requests `-y` and this parser
-// consumes the explicit year `last -y` prints instead of inferring one.
-// Seconds are always ":00" since `last` doesn't report them either.
-// Returns empty on a parse failure, leaving the caller's existing/
-// "unknown"/"Never" value in place.
-std::string parse_last_timestamp(std::string_view month_str, std::string_view day_str,
-                                 std::string_view year_str, std::string_view time_str) {
-    static const std::map<std::string, int> months = {
-        {"Jan", 1}, {"Feb", 2}, {"Mar", 3},  {"Apr", 4},  {"May", 5},  {"Jun", 6},
-        {"Jul", 7}, {"Aug", 8}, {"Sep", 9},  {"Oct", 10}, {"Nov", 11}, {"Dec", 12},
-    };
-    auto mit = months.find(std::string(month_str));
-    if (mit == months.end())
-        return {};
-    int month = mit->second;
-
-    int day = 0;
-    try {
-        day = std::stoi(std::string(day_str));
-    } catch (...) {
-        return {};
-    }
-    if (day < 1 || day > 31)
-        return {};
-
-    auto colon = time_str.find(':');
-    if (colon == std::string_view::npos)
-        return {};
-    int hour = 0;
-    int minute = 0;
-    try {
-        hour = std::stoi(std::string(time_str.substr(0, colon)));
-        minute = std::stoi(std::string(time_str.substr(colon + 1)));
-    } catch (...) {
-        return {};
-    }
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59)
-        return {};
-
-    int year = 0;
-    try {
-        year = std::stoi(std::string(year_str));
-    } catch (...) {
-        return {};
-    }
-    if (year < 1970)
-        return {};
-
-    return std::format("{:04}-{:02}-{:02} {:02}:{:02}:00", year, month, day, hour, minute);
-}
+// The `last -y` timestamp/weekday parsers live in users_macos_last.hpp so they
+// are independently unit-testable without a subprocess (qe-M1); bring them into
+// scope here unqualified to keep the call sites below unchanged.
+using yuzu::users_macos::is_weekday;
+using yuzu::users_macos::parse_last_timestamp;
 #endif // __APPLE__
 
 // ── local_users action ────────────────────────────────────────────────────

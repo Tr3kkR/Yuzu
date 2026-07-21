@@ -17,6 +17,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-H1)
 
 #include <array>
 #include <cstdio>
@@ -44,6 +45,12 @@
 #endif
 
 namespace {
+
+// Row-safe wrapper for the free-text fields (SSID / security / BSSID / raw scan
+// blobs) that come from tool output or an AP beacon. `wifi` is NOT a key|value
+// plugin server-side, so an unescaped '|' shifts columns and a '\n' injects a
+// row (plg-H1). Applied at every emission site below, all platforms.
+inline std::string sof(std::string_view v) { return yuzu::util::safe_output_field(v); }
 
 // ── subprocess helper (Linux / macOS) ──────────────────────────────────────
 
@@ -149,8 +156,8 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             auto bss_type = bss_type_to_string(net.dot11BssType);
             bool connected = (net.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0;
 
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", ssid, signal, security, bss_type,
-                                         connected ? "true" : "false"));
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid), signal, sof(security),
+                                         sof(bss_type), connected ? "true" : "false"));
         }
         WlanFreeMemory(net_list);
     }
@@ -183,9 +190,10 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             if (security.empty())
                 security = "Open";
 
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", ssid, signal.empty() ? "0" : signal,
-                                         security, channel.empty() ? "0" : channel,
-                                         bssid.empty() ? "-" : bssid));
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid),
+                                         signal.empty() ? "0" : signal, sof(security),
+                                         channel.empty() ? "0" : channel,
+                                         bssid.empty() ? "-" : sof(bssid)));
         }
     } else {
         // Fallback: try iw
@@ -201,7 +209,7 @@ int do_list_networks(yuzu::CommandContext& ctx) {
                                 iface)
                         .c_str());
                 if (!scan.empty()) {
-                    ctx.write_output(std::format("wifi|scan_output|{}", scan));
+                    ctx.write_output(std::format("wifi|scan_output|{}", sof(scan)));
                 }
             }
         } else {
@@ -285,9 +293,10 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             if (security.empty())
                 security = "Open";
 
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", ssid, rssi.empty() ? "0" : rssi,
-                                         security, channel.empty() ? "0" : channel,
-                                         bssid.empty() ? "-" : bssid));
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid),
+                                         rssi.empty() ? "0" : rssi, sof(security),
+                                         channel.empty() ? "0" : channel,
+                                         bssid.empty() ? "-" : sof(bssid)));
         }
     } else {
         // Fallback: system_profiler SPAirPortDataType. The textual form is
@@ -304,8 +313,9 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             auto flush = [&]() {
                 if (ssid.empty())
                     return;
-                ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", ssid, rssi.empty() ? "0" : rssi,
-                                             security.empty() ? "Unknown" : security,
+                ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", sof(ssid),
+                                             rssi.empty() ? "0" : rssi,
+                                             security.empty() ? "Unknown" : sof(security),
                                              channel.empty() ? "0" : channel));
                 emitted = true;
                 ssid.clear();
@@ -407,7 +417,8 @@ int do_connected(yuzu::CommandContext& ctx) {
         auto iface_name = from_wide(iface.strInterfaceDescription);
 
         ctx.write_output(
-            std::format("connected|{}|{}|{}|{}|{}", ssid, signal, security, bssid_str, iface_name));
+            std::format("connected|{}|{}|{}|{}|{}", sof(ssid), signal, sof(security), bssid_str,
+                        sof(iface_name)));
         found = true;
 
         WlanFreeMemory(conn_attrs);
@@ -449,14 +460,16 @@ int do_connected(yuzu::CommandContext& ctx) {
 
         if (!ssid.empty()) {
             ctx.write_output(
-                std::format("connected|{}|{}|{}|{}|{}", ssid, signal.empty() ? "0" : signal,
-                            security.empty() ? "Open" : security, bssid.empty() ? "-" : bssid,
-                            connection.empty() ? "-" : connection));
+                std::format("connected|{}|{}|{}|{}|{}", sof(ssid),
+                            signal.empty() ? "0" : signal,
+                            security.empty() ? "Open" : sof(security),
+                            bssid.empty() ? "-" : sof(bssid),
+                            connection.empty() ? "-" : sof(connection)));
         } else {
             // Fallback: iwconfig
             auto iw_out = run_command("iwconfig 2>/dev/null | grep -E 'ESSID|Signal'");
             if (!iw_out.empty() && iw_out.find("ESSID:off") == std::string::npos) {
-                ctx.write_output(std::format("connected|{}|0|unknown|-|-", iw_out));
+                ctx.write_output(std::format("connected|{}|0|unknown|-|-", sof(iw_out)));
             } else {
                 ctx.write_output("connected|none|Not connected|0|none|none");
             }

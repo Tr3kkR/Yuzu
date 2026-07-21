@@ -28,9 +28,12 @@
  *     child, starving this invocation's own EOF (a false timeout) for as
  *     long as that other child runs. BR-001: the process-wide
  *     yuzu::agent::global_fork_lock() (fork_lock.hpp) serializes
- *     [pipe()..fork()] across every fork/popen launcher in the agent, not
- *     just this file, to close that window; the child inherits it already
- *     locked and never touches it (see fork_lock.hpp's contract).
+ *     [pipe()..fork()] across every launcher that PARTICIPATES in it — this
+ *     runner plus the sites listed in fork_lock.hpp's coverage ledger — to
+ *     close that window; the child inherits it already locked and never
+ *     touches it. It is NOT automatic for every fork/popen in the agent: a
+ *     raw popen() that doesn't take the lock still races this window until it
+ *     is migrated (fork_lock.hpp tracks the residual uncovered sites).
  *   - The child calls setsid() so a timeout kill can take out the whole
  *     process group, not just the direct child (a CLI can spawn helpers
  *     that inherit the group).
@@ -57,7 +60,10 @@
 #ifndef _WIN32
 #include <yuzu/agent/fork_lock.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <array>
+#include <cassert>
 #include <cerrno>
 #include <csignal>
 #include <ctime>
@@ -76,10 +82,18 @@ namespace {
 // process-wide flag (not per-call, not per-connection), set once at agent
 // shutdown and never cleared -- see the agent.cpp call sites next to each
 // stop_requested_ latch site.
+//
+// CONTRACT (UP-12): this latch is SHUTDOWN-ONLY. Because it is global and
+// sticky, setting it kills EVERY in-flight and future subprocess for the
+// process lifetime. A future caller MUST NOT repurpose it for a per-operation
+// or per-connection cancel -- that would silently abort all concurrent capture
+// (TAR, DEX, plugin shell-outs) agent-wide. A bounded per-call cancel belongs
+// in SubprocessOptions, not here.
 std::atomic<bool> g_subprocess_cancel{false};
 } // namespace
 
 void request_subprocess_cancel(bool cancel) {
+    // See the shutdown-only contract on g_subprocess_cancel above.
     g_subprocess_cancel.store(cancel, std::memory_order_release);
 }
 
@@ -161,6 +175,17 @@ void reap_async(pid_t pid) {
         // exception escaping it would std::terminate() the whole agent. A
         // zombie left until the agent process itself exits (the kernel
         // reclaims it then regardless) is strictly preferable to that.
+        //
+        // Make the leak observable (UP-6): sustained detached-reaper spawn
+        // failures mean accumulating zombies, which an operator should be able
+        // to see rather than diagnose blind. spdlog is itself noexcept-ish, but
+        // guard it so this destructor-reachable path can never throw.
+        try {
+            spdlog::warn("subprocess_runner: could not spawn detached reaper for pid {} "
+                         "(resource exhaustion?); leaving it for process-exit reclamation",
+                         static_cast<long>(pid));
+        } catch (...) {
+        }
     }
 }
 
@@ -302,6 +327,14 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     SubprocessResult result;
     if (argv.empty())
         return result;
+
+    // argv[0] MUST be an absolute path -- execv() never PATH-searches, so a
+    // relative argv[0] silently exec-fails (tool_ran=false). Assert it in
+    // debug/test builds to catch a caller mistake early (cpp-I2); release
+    // behaviour is already correct (an honest tool_ran=false, never a fabricated
+    // verdict). `/bin/sh -c` callers and every in-tree caller pass an absolute.
+    assert(!argv.front().empty() && argv.front().front() == '/' &&
+           "run_bounded_subprocess: argv[0] must be an absolute path (execv does not PATH-search)");
 
     // Build the C-style argv BEFORE fork() -- see the file header comment.
     std::vector<char*> c_argv;

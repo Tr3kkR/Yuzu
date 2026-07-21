@@ -96,7 +96,12 @@ struct TempDir {
 };
 
 // ── Replicated: glob_match ──────────────────────────────────────────────
-// Exact copy from filesystem_plugin.cpp
+// Exact copy from filesystem_plugin.cpp's anonymous-namespace glob_match
+// (agents/plugins/filesystem/src/filesystem_plugin.cpp). This test links a
+// COPY, not the plugin symbol, so the two can silently diverge (qe-L1): keep
+// this replica byte-identical to the plugin, and re-sync it on any change to
+// the plugin-side helper. If a third consumer ever needs it, promote it to a
+// pure header (the *_macos.hpp pattern) so there is a single source of truth.
 
 bool glob_match(std::string_view pattern, std::string_view text) {
     size_t px = 0, tx = 0;

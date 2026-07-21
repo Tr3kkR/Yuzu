@@ -422,6 +422,11 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
     }
     SECTION("services macOS 5-field svc|label|pid|status|startup: honest startup, PID not the name (C-1.12, P10 fix)") {
         LiveHarness h;
+        // A macOS agent's OS is authoritative in production (the device record
+        // exists), so drive the OS-authoritative path (K-4) rather than the
+        // sniff — which for a 5-field row with an unknown OS now defaults to
+        // Windows (UP-5). The fixture is the real macOS shape.
+        h.device_os = "darwin";
         // Stopped launchd rows report pid "-" (not a number) per launchctl list's
         // real output -- the fixture must exercise that, not an impossible
         // running-style numeric PID on a stopped row.

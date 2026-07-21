@@ -402,8 +402,23 @@ constexpr std::size_t kNstatRecvBufSize = 8192;
 // last_update_mono stays fresh while a flow whose removal was lost stops getting
 // SRC_COUNTS and goes stale; anything not updated within kNstatFlowStaleSeconds is
 // reaped. (b) a hard-cap backstop for a burst faster than the reaper.
-constexpr std::int64_t kNstatFlowStaleSeconds = 60; // several 2s query cycles with no counts
+// UP-3: the reaper is a BACKSTOP for a lost SRC_REMOVED, not the primary close
+// path — a flow closing sends SRC_REMOVED (which emits the CLOSED event and
+// erases the entry directly). We only reach the reaper for a flow whose
+// SRC_REMOVED we never saw. Keying eviction on counter-staleness assumes the 2s
+// QUERY_SRC round-trip refreshes last_update_mono for a still-open flow (the
+// SRC_COUNTS handler refreshes on ANY counts reply, changed or not); if the
+// kernel silently omits COUNTS for a zero-delta idle flow — TODO(hardware-verify)
+// — a live keep-alive could otherwise be reaped and its later CLOSED event lost.
+// A wide window (150 query cycles) makes that false-eviction vanishingly likely
+// while the 50k hard cap + the at-cap reap still bound the table.
+constexpr std::int64_t kNstatFlowStaleSeconds = 300; // backstop for a lost SRC_REMOVED (UP-3)
 constexpr std::size_t kNstatMaxFlows = 50000;       // backstop cap; drops+counts beyond it
+// UP-2: consecutive fixed-size decode failures required before latching the
+// permanent layout-mismatch demotion. A genuine transcription mismatch fails
+// every message of that type so it reaches this in a burst; a single garbled
+// datagram never does.
+constexpr int kNstatMaxDecodeFailStreak = 3;
 
 // Monotonic seconds for liveness/staleness comparisons (stall detection, the flow
 // reaper) — never wall-clock time(), so an NTP/DST step cannot make a "seconds
@@ -452,6 +467,13 @@ struct NstatClient::Impl {
     // and must demote to the poll now, not after the 1-hour idle stall.
     bool sub_tcp_rejected{false};
     bool sub_tcp_kernel_rejected{false};
+
+    // UP-2: consecutive fixed-size decode failures (reader thread only). A real
+    // transcription/layout mismatch fails EVERY message of that type, so it
+    // trips the threshold immediately; a one-off truncated/garbled datagram
+    // resets on the next good decode and does not permanently disable nstat for
+    // the whole session. Reset to 0 on any successful SRC_DESC/SRC_COUNTS decode.
+    int decode_fail_streak{0};
 
     std::mutex query_cv_mu;
     std::condition_variable query_cv;
@@ -637,14 +659,26 @@ struct NstatClient::Impl {
                 // the provider filter, and it means our transcription disagrees
                 // with this kernel's descriptor size — fail to the inert state.
                 if (!nstat_length_matches_expected(hdr->type, hdr->length)) {
-                    spdlog::warn("TAR: nstat SRC_DESC decode mismatch — "
-                                "transcribed TcpDescriptor disagrees with "
-                                "this kernel; disabling the nstat client");
-                    layout_mismatch->store(true, std::memory_order_relaxed);
-                    stop_requested.store(true, std::memory_order_relaxed);
+                    // UP-2: latch permanent only after a run of failures. A real
+                    // TcpDescriptor-layout mismatch fails every SRC_DESC, so the
+                    // streak trips fast; a lone garbled datagram resets on the
+                    // next good decode and does not disable nstat for the session.
+                    if (++decode_fail_streak >= kNstatMaxDecodeFailStreak) {
+                        spdlog::warn("TAR: nstat SRC_DESC decode mismatch x{} — transcribed "
+                                     "TcpDescriptor disagrees with this kernel; disabling the "
+                                     "nstat client",
+                                     decode_fail_streak);
+                        layout_mismatch->store(true, std::memory_order_relaxed);
+                        stop_requested.store(true, std::memory_order_relaxed);
+                    } else {
+                        spdlog::debug("TAR: nstat SRC_DESC decode mismatch ({}/{}) — tolerating as a "
+                                      "possible one-off garbled datagram",
+                                      decode_fail_streak, kNstatMaxDecodeFailStreak);
+                    }
                 }
                 return;
             }
+            decode_fail_streak = 0; // a good decode clears the run
             bool first_desc = false;
             {
                 std::lock_guard<std::mutex> lk(flows_mu);
@@ -678,14 +712,22 @@ struct NstatClient::Impl {
             auto counts = nstat_decode_src_counts(raw);
             if (!counts) {
                 if (!nstat_length_matches_expected(hdr->type, hdr->length)) {
-                    spdlog::warn("TAR: nstat SRC_COUNTS decode mismatch — "
-                                "transcribed Counts disagrees with this "
-                                "kernel; disabling the nstat client");
-                    layout_mismatch->store(true, std::memory_order_relaxed);
-                    stop_requested.store(true, std::memory_order_relaxed);
+                    // UP-2: same consecutive-failure gate as the SRC_DESC path.
+                    if (++decode_fail_streak >= kNstatMaxDecodeFailStreak) {
+                        spdlog::warn("TAR: nstat SRC_COUNTS decode mismatch x{} — transcribed "
+                                     "Counts disagrees with this kernel; disabling the nstat client",
+                                     decode_fail_streak);
+                        layout_mismatch->store(true, std::memory_order_relaxed);
+                        stop_requested.store(true, std::memory_order_relaxed);
+                    } else {
+                        spdlog::debug("TAR: nstat SRC_COUNTS decode mismatch ({}/{}) — tolerating as "
+                                      "a possible one-off garbled datagram",
+                                      decode_fail_streak, kNstatMaxDecodeFailStreak);
+                    }
                 }
                 return;
             }
+            decode_fail_streak = 0; // a good decode clears the run
             {
                 std::lock_guard<std::mutex> lk(flows_mu);
                 auto it = flows.find(counts->srcref);
@@ -728,10 +770,15 @@ struct NstatClient::Impl {
             const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
             if (n <= 0) {
                 if (n < 0 && errno == ENOBUFS) {
-                    // TODO(hardware-verify, memo §6 risk 6): unconfirmed
-                    // whether a kctl SOCK_DGRAM recv actually surfaces
-                    // ENOBUFS on kernel-side overrun rather than silently
-                    // dropping — validate against a real connection storm.
+                    // TODO(hardware-verify, memo §6 risk 6 / UP-4): unconfirmed
+                    // whether a kctl SOCK_DGRAM recv actually surfaces ENOBUFS on
+                    // kernel-side overrun rather than silently dropping —
+                    // validate against a real connection storm. Until then the
+                    // overrun IS observable: each ENOBUFS bumps kernel_dropped,
+                    // which surfaces in the plugin status keys, so a sustained
+                    // rate is at least visible to an operator (a demote-to-poll
+                    // or resubscribe heuristic on that rate is the follow-up if
+                    // the storm test shows silent loss).
                     kernel_dropped->fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }

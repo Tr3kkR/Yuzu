@@ -48,6 +48,29 @@ TEST_CASE("wifi connected: associated with SSID/BSSID visible", "[wifi]") {
     CHECK(format_connected_record(c) == "connected|MyNet|-50|WPA3-Personal|aa:bb:cc:dd:ee:ff|11");
 }
 
+TEST_CASE("wifi connected: a pipe/newline in the SSID cannot shift columns or inject a row (plg-H1)",
+          "[wifi]") {
+    // `wifi` is NOT a key|value plugin server-side (result_parsing splits it on
+    // ALL pipes), and an AP can broadcast an SSID containing '|' (a legal 802.11
+    // octet) or, via a crafted beacon, an embedded newline. Both must be
+    // neutralised by safe_output_field: '|' -> "\|", '\n' -> ' '. Otherwise the
+    // security-posture row is corrupted or a fabricated row is injected.
+    WifiConnection c;
+    c.power_on = true;
+    c.associated = true;
+    c.ssid_available = true;
+    c.ssid = "Corp|Net\nEvil";
+    c.bssid = "aa:bb:cc:dd:ee:ff";
+    c.rssi = -50;
+    c.channel = 11;
+    c.security = "WPA2|x";
+    const std::string row = format_connected_record(c);
+    // Exactly six fields once the escaped pipe is accounted for -- the SSID's
+    // literal '|' is now "\|" (not a delimiter) and the newline is a space.
+    CHECK(row == "connected|Corp\\|Net Evil|-50|WPA2\\|x|aa:bb:cc:dd:ee:ff|11");
+    CHECK(row.find('\n') == std::string::npos); // no injected row
+}
+
 TEST_CASE("wifi connected: rssi 0 while associated is a real connection, not Not-connected",
           "[wifi]") {
     // A driver can momentarily report 0 dBm on a genuinely-associated link; that

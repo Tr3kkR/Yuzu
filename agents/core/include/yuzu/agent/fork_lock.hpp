@@ -42,11 +42,14 @@
  *   - agents/plugins/content_dist/src/content_dist_plugin.cpp (safe_execute)
  *   - agents/core/src/trigger_engine.cpp (query_service_status, macOS popen)
  * (filesystem_plugin.cpp's compute_hash_unix no longer forks directly -- it
- * now routes through the shared bounded runner, which is the first site above.)
+ * now routes through the shared bounded runner, which is the first site above.
+ * The bitlocker, msi_packages, services, users, network_config, and interaction
+ * plugins likewise route their POSIX shell-outs through run_bounded_subprocess,
+ * so they are covered transitively via the first site.)
  * The remaining popen() call sites scattered across the plugin directories
- * (most single-shot `popen(cmd, "r")` info-gathering plugins) are not yet
- * covered; any of them can still race a locked launcher's window until they
- * are migrated too. The Linux branch of trigger_engine.cpp's
+ * (most single-shot `popen(cmd, "r")` info-gathering plugins not yet migrated)
+ * are not covered; any of them can still race a locked launcher's window until
+ * they are migrated too. The Linux branch of trigger_engine.cpp's
  * query_service_status has its own, separate popen() call and is not
  * covered either -- only the macOS branch was in scope for BR-001.
  *

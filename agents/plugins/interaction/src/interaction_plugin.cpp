@@ -47,6 +47,8 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#else
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (arch-L1)
 #endif
 
 namespace {
@@ -112,22 +114,22 @@ bool require_param(yuzu::CommandContext& ctx, std::string_view value,
 }
 
 #if !defined(_WIN32)
+// A generous per-call wall-clock bound for the interaction shell-outs. osascript
+// dialogs are interactive and can legitimately block on a user, so this is
+// deliberately long — it only fires on a genuinely wedged invocation.
+constexpr std::chrono::seconds kInteractionCmdDeadline{120};
+
 /**
- * Run a command via popen and capture the first line of output.
- * Returns the output string (may be empty).
+ * Run a command and capture its output. Routed through the bounded,
+ * fork-lock-covered, CLOEXEC-pipe runner (arch-L1) instead of a raw popen, whose
+ * pipe is never CLOEXEC and whose fork is unserialized against the agent's other
+ * launchers. `/bin/sh -c` preserves the exact shell semantics popen used.
  */
 std::string run_command(const std::string& cmd) {
-    std::string output;
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return output;
-
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
-    }
-    pclose(pipe);
-
-    // Trim trailing newline
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
+    std::string output = res.output;
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
         output.pop_back();
     }
@@ -135,27 +137,15 @@ std::string run_command(const std::string& cmd) {
 }
 
 /**
- * Run a command via popen and return the exit code.
+ * Run a command and return its exit code. Runner-backed (arch-L1). Returns the
+ * -1 signal-death sentinel on a deadline/cancel kill, matching the old
+ * pclose(!WIFEXITED) path.
  */
 int run_command_status(const std::string& cmd) {
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return -1;
-
-    // Drain output
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        // discard
-    }
-    int status = pclose(pipe);
-#if defined(__linux__) || defined(__APPLE__)
-    // pclose returns the wait status; extract exit code
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return -1;
-#else
-    return status;
-#endif
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
+    return res.exit_code;
 }
 
 /**
@@ -217,24 +207,16 @@ private:
  * successful-but-unrecognized response.
  */
 CommandResult run_command_capture(const std::string& cmd) {
+    // One runner invocation yields both output and exit code (arch-L1) — the
+    // same single-round-trip contract the popen version had, now bounded,
+    // fork-lock-covered, and with CLOEXEC pipes. exit_code is WEXITSTATUS on a
+    // natural exit, -1 on a deadline/cancel signal-kill.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
     CommandResult result;
-    PopenPipe pipe(popen(cmd.c_str(), "r"));
-    if (!pipe) return result;
-
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.get()) != nullptr) {
-        result.output += buf.data();
-    }
-    int status = pipe.close();
-#if defined(__linux__) || defined(__APPLE__)
-    if (WIFEXITED(status)) {
-        result.exit_code = WEXITSTATUS(status);
-    }
-#else
-    result.exit_code = status;
-#endif
-
-    // Trim trailing newline
+    result.output = res.output;
+    result.exit_code = res.exit_code;
     while (!result.output.empty() &&
            (result.output.back() == '\n' || result.output.back() == '\r')) {
         result.output.pop_back();
@@ -570,23 +552,13 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
 
     auto result = run_command_capture(cmd);
 
-    if (result.exit_code != 0) {
-        // osascript failed outright (as opposed to the AppleScript-level
-        // "on error" above, which only catches user cancellation and still
-        // exits 0) — most likely no reachable GUI session. The captured
-        // text here is an error message, not user input; never wrap it in
-        // "response|...". Return non-zero so the agent core records this
-        // command as a terminal FAILURE rather than SUCCESS.
-        ctx.write_output("status|unavailable|no reachable GUI session");
-        return 1;
-    }
-
-    if (result.output == "##CANCELLED##") {
-        ctx.write_output("cancelled|true");
-    } else {
-        ctx.write_output(std::format("response|{}", result.output));
-    }
-    return 0;
+    // The exit-code/output decision is the pure classify_input_capture (qe-L2,
+    // unit-tested): a non-zero exit is a delivery failure reported as an honest
+    // status|unavailable (never the error text wrapped as a response), the
+    // ##CANCELLED## sentinel is a user cancel, everything else is real input.
+    auto decision = yuzu::interaction::classify_input_capture(result.exit_code, result.output);
+    ctx.write_output(decision.output_line);
+    return decision.rc;
 }
 
 #elif defined(__linux__)

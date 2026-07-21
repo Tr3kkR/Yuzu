@@ -695,15 +695,26 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
         h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(mon) + " of " +
              num(static_cast<int64_t>(g.types.size())) + " monitored</span></div>";
+        // UP-8: three distinct states, not two. `dark` = the family is not
+        // monitored on any connected platform. `no_data` = it IS monitored but
+        // no online agent is reporting (an absent denominator: n_scoped == 0),
+        // which is a "come back when a device is online" state, NOT "healthy"
+        // and NOT "unmonitored". Only a real, scored family shows a number.
+        const bool no_data = !dark && score < 0;
         if (score < 0)
             h += "<div class=\"fev\">&mdash;</div>";
         else
             h += "<div class=\"fev " + std::string(tone) + "\">" +
                  std::to_string(static_cast<int>(score + 0.5)) + "</div>";
         h += "<div class=\"fmeta\">" +
-             std::string(dark ? "not collected on your fleet" : "health score") + "</div>";
+             std::string(dark        ? "not collected on your fleet"
+                         : no_data   ? "no online agents reporting"
+                                     : "health score") +
+             "</div>";
         if (dark)
             h += "<div class=\"ftop\">no connected platform watches these</div>";
+        else if (no_data)
+            h += "<div class=\"ftop\">monitored, but no device is online to report</div>";
         else if (r.events > 0 && r.top)
             h += "<div class=\"ftop\"><b>" + dex_signal_label(r.top->obs_type) + "</b> &middot; " +
                  num(r.events) + " events</div>";

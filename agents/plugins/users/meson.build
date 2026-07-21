@@ -1,4 +1,4 @@
-users_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+users_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 users_cpp_args = []
 
 if host_machine.system() == 'windows'

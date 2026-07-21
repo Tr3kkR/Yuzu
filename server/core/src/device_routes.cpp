@@ -205,15 +205,13 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
                 // svc|name|display|status|startup and macOS (C-1.12, P10 fix)
                 // svc|label|pid|status|startup. Prefer the agent's authoritative
                 // OS (K-4) so a Windows service whose display name is all digits
-                // (or "-") is never misread as a macOS PID; fall back to sniffing
-                // the pid column only when the OS is unknown. A stopped launchd
-                // service reports pid "-" (services_plugin.cpp), not a number, so
-                // the sentinel counts as macOS in the fallback too.
-                const bool macos = os_known
-                    ? os_is_macos
-                    : (f[2] == "-" || (!f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
-                          return std::isdigit(ch) != 0;
-                      })));
+                // (or "-") is never misread as a macOS PID. When the OS is
+                // unknown (device record unavailable — rare, transient), default
+                // to Windows rather than content-sniffing the pid column
+                // (UP-5): a 5-field row with a display name is historically the
+                // Windows shape, and the sniff is exactly what dropped a numeric
+                // Windows display name in the K-4 bug.
+                const bool macos = os_known ? os_is_macos : false;
                 s.name = f[1];
                 if (macos) { s.status = f[3]; s.startup = f[4]; }               // svc|label|pid|status|startup
                 else { s.display = f[2]; s.status = f[3]; s.startup = f[4]; }   // svc|name|display|status|startup

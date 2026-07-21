@@ -369,15 +369,19 @@ TEST_CASE("DEX catalogue grid: macos_online=0 suppresses the score even with mac
     CHECK(family_score(html, "Network") == std::nullopt); // suppressed, never a fabricated number
 
     // Confirm the suppression is the N==0 guard, not the "dark / not collected"
-    // path: the card's meta text still reads "health score" (mon>0), and the
-    // rendered marker is the suppressed em-dash, not a number.
+    // path. The family IS monitored (mon>0) but has no online macOS agent, so
+    // the card shows the distinct "no online agents reporting" affordance
+    // (UP-8) — NOT the dark "not collected on your fleet" text, and NOT a
+    // fabricated "health score" number. The rendered marker is the suppressed
+    // em-dash.
     const auto name_pos = html.find("<div class=\"fn\">Network<span");
     REQUIRE(name_pos != std::string::npos);
     const auto next_card = html.find("<a class=\"gp-fcard", name_pos);
     const std::string card = html.substr(
         name_pos, next_card == std::string::npos ? std::string::npos : next_card - name_pos);
-    CHECK(card.find("&mdash;") != std::string::npos);      // suppressed marker
-    CHECK(card.find("health score") != std::string::npos); // proves mon>0 (not the dark case)
+    CHECK(card.find("&mdash;") != std::string::npos);                  // suppressed marker
+    CHECK(card.find("no online agents reporting") != std::string::npos); // mon>0, N==0 (not dark)
+    CHECK(card.find("not collected on your fleet") == std::string::npos); // NOT the dark case
 }
 
 TEST_CASE("DEX catalogue grid: \"all\" lens pins to windows_online + the COMBINED "

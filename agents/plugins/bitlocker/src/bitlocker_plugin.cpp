@@ -8,6 +8,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-L1)
 
 #include <array>
 #include <cstdio>
@@ -18,6 +19,7 @@
 
 #ifndef _WIN32
 #include <chrono>
+#include <spdlog/spdlog.h>
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
 #endif
 
@@ -58,6 +60,14 @@ std::string run_command(const char* cmd) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/bin/sh", "-c", cmd},
         yuzu::agent::SubprocessOptions{.deadline = kBitlockerCmdDeadline});
+    // A deadline-killed or exec-failed tool returns empty/partial output that
+    // would otherwise parse as a legitimate "FileVault absent / no volumes" —
+    // a silent false-negative. Warn so an operator can tell a cut-short scan
+    // from a genuinely empty result (sre-M1; mirrors the event_logs pattern).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("bitlocker: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
@@ -189,7 +199,12 @@ void report_filevault_status(yuzu::CommandContext& ctx) {
                fdesetup_output.find("FileVault is Off") != std::string::npos) {
         ctx.write_output("filevault|disabled");
     } else {
-        ctx.write_output(std::format("filevault|unknown|{}", fdesetup_output));
+        // Route the raw fdesetup text through safe_output_field (plg-L1): even
+        // though bitlocker is a key|value plugin (a literal '|' stays in the
+        // value), a multi-line fdesetup diagnostic would otherwise inject a row
+        // past write_output's newline framing.
+        ctx.write_output(
+            std::format("filevault|unknown|{}", yuzu::util::safe_output_field(fdesetup_output)));
     }
 
     auto diskutil_output = run_command("diskutil apfs list 2>/dev/null");

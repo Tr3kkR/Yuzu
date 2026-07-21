@@ -716,20 +716,28 @@ std::vector<NetConnection> enumerate_connections() {
 // is scoped to own-process flows only.
 std::vector<TcpQualitySample> collect_tcp_quality() {
     NstatClient* client = g_nstat_client.load(std::memory_order_acquire);
-    if (!client || !client->running() || !client->system_wide())
+    // Also gate on !stalled() (UP-1): a reader that has gone silent past the
+    // idle-fallback threshold is demoted to the poll for TCP lifecycle
+    // (tar_plugin.cpp's nstat_primary includes !stalled()), so the quality
+    // source must demote in lockstep rather than keep serving a stale snapshot.
+    if (!client || !client->running() || !client->system_wide() || client->stalled())
         return {};
     return client->snapshot_quality();
 }
 
-// "nstat" only while the registered client is running(), system_wide(), and
-// has not self-failed to a layout_mismatch() — running() already reflects a
-// layout-mismatch shutdown (the reader thread stops itself), but the extra
-// check keeps this honest even if that internal coupling ever changes.
-// "none" in every other case: no client registered, not running, own-process
-// scope only, or layout mismatch — never a partial/misleading "nstat".
+// "nstat" only while the registered client is running(), system_wide(), has not
+// self-failed to a layout_mismatch(), AND is not stalled() — running() already
+// reflects a layout-mismatch shutdown (the reader thread stops itself), but the
+// extra checks keep this honest even if that internal coupling changes. The
+// !stalled() gate (UP-1) matches the lifecycle demotion: once the stream goes
+// quiet past the idle threshold, the advertised method must fall to "none" in
+// lockstep with the source, never advertise nstat while data comes from the
+// poll. "none" in every other case: no client, not running, own-process scope,
+// layout mismatch, or stalled — never a partial/misleading "nstat".
 std::string_view netqual_effective_capture_method() {
     NstatClient* client = g_nstat_client.load(std::memory_order_acquire);
-    if (client && client->running() && client->system_wide() && !client->layout_mismatch())
+    if (client && client->running() && client->system_wide() && !client->layout_mismatch() &&
+        !client->stalled())
         return "nstat";
     return "none";
 }

@@ -48,6 +48,7 @@
 
 #ifdef __APPLE__
 #include <chrono>
+#include <spdlog/spdlog.h>
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
 
 #include "services_macos_launchd.hpp" // pure launchctl print-disabled parser (C-1.12)
@@ -265,6 +266,13 @@ std::string slurp_command_output(const char* cmd) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/bin/sh", "-c", cmd},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    // A cut-short launchctl returns empty/partial output that parses as "0
+    // services" — a silent false-negative. Warn so an operator can tell a
+    // degraded enumeration from a genuinely empty one (sre-M1).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("services: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
     return res.output;
 }
 

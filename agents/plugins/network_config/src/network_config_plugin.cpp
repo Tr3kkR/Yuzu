@@ -22,6 +22,12 @@
 #include <string>
 #include <string_view>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <chrono>
+#include <spdlog/spdlog.h>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (cpp-L2)
+#endif
+
 #if defined(__linux__)
 #include <cstdlib>
 #include <fstream>
@@ -64,15 +70,18 @@ namespace {
 
 #if defined(__linux__) || defined(__APPLE__)
 std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+    // Route through the bounded, fork-lock-covered runner instead of a raw,
+    // deadline-less popen (cpp-L2, same migration as the other macOS-parity
+    // plugins). `/bin/sh -c` preserves the shell semantics popen used (these
+    // commands use `2>/dev/null`), so the returned stdout blob is byte-identical
+    // — now with a hard deadline, an output cap, and the global fork-lock.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd}, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("network_config: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
     }
-    pclose(pipe);
+    std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }

@@ -46,6 +46,7 @@ static constexpr const char* kInstallLocation = "InstallLocation";
 #include <cstdio>
 #include <memory>
 
+#include <spdlog/spdlog.h>
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
 
 #include "msi_packages_macos.hpp"
@@ -120,6 +121,13 @@ std::string run_command(const std::string& cmd) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/bin/sh", "-c", cmd},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
+    // A cut-short pkgutil returns empty/partial output that parses as "no
+    // packages" — a silent false-negative. Warn so an operator can tell a
+    // degraded scan from a genuinely empty receipt DB (sre-M1).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("msi_packages: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();

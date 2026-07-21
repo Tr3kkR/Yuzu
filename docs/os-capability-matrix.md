@@ -185,13 +185,17 @@ source of truth (not carried forward from the prior snapshot):
 - **Spark** — corrected the "rung 2/3" note: rung 7 wired Guardian as consumer,
   but `prefer_spark_` defaults `false` with no `wire_spark_engine()` call sites, so
   legacy `IGuard` is still the only live path.
-- **DEX** — macOS collector confirmed **real & shipped** (17 signals via
-  `dex_macos_{signals,oslog,iokit}.cpp`); source-of-truth updated to the
-  `dex_obs_platforms()` coverage map.
+- **DEX** — macOS collector confirmed **real & shipped** (16 catalogued
+  obs_types via `dex_macos_{signals,oslog,iokit}.cpp` — 17 raw, with
+  `process.resource_limit` excluded from the taxonomy, per the
+  `dex_obs_platforms()` drift-net; the reliability-signals cell says 16);
+  source-of-truth updated to the `dex_obs_platforms()` coverage map.
 - **Plugins** — all **49** enumerated (CLAUDE.md's "47/49" reconciled to 49): 43
   fully cross-platform, **4** Windows-only (`rdp_control`, `registry`, `sccm`,
   `wmi`), **2** uneven (`tar`; and `msi_packages` — now Win+macOS via `pkgutil`
-  receipts, Linux still unimplemented).
+  receipts, Linux still unimplemented). (The 43 became **42** in the 2026-07-21
+  pass below once `interaction` moved to macOS-constrained; both tallies still
+  sum to 49.)
 
 _2026-07-21 macOS-parity consolidation._ This pass documents the macOS parity
 batch **landing in the same PR as this restructure** — every cited capability
