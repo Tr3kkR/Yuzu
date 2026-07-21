@@ -257,7 +257,7 @@ TEST_CASE("maintenance_once is a no-op without a journal (the pre-C0 constructio
                                                      std::make_shared<FakeBackend>());
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rt, std::ref(sink)); // journal defaults to null
-    CHECK_FALSE(worker.maintenance_once());
+    CHECK_FALSE(worker.maintenance_once({.prune = true, .page = true}).records_paged > 0);
     CHECK(worker.journal_maint_exception_count() == 0);
 }
 
@@ -269,13 +269,13 @@ TEST_CASE("maintenance_once pages a durable batch into the window and reports it
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink),
                                      GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
-                                     rig.journal.get());
+                                     {.journal = rig.journal.get()});
     // Nothing is in the window until maintenance pages it: the record was persisted
     // straight to the journal, never through the runtime.
     worker.drain_once();
     CHECK(sink.count() == 0);
 
-    CHECK(worker.maintenance_once()); // true == paged net-new, caller should drain again
+    CHECK(worker.maintenance_once({.prune = true, .page = true}).records_paged > 0);
     worker.drain_once();
     REQUIRE(sink.count() == 1);
     CHECK(sink.sent[0].event_id == "e-r1");
@@ -292,7 +292,7 @@ TEST_CASE("a running worker pages AND ships a durable batch in one wake (no seco
     // would time out. try_page_batch does not fire the enqueue waker, so shipping within
     // one wake is exactly the post-page re-drain C0 adds.
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/60'000,
-                                     rig.journal.get());
+                                     {.journal = rig.journal.get()});
     worker.start();
     worker.notify(); // the reconnect kick
     CHECK(spin_until([&] { return sink.count() == 1; }));
@@ -304,7 +304,7 @@ TEST_CASE("notify() wakes the worker promptly - the reconnect kick replaces inli
     JournalRig rig;
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/60'000,
-                                     rig.journal.get());
+                                     {.journal = rig.journal.get()});
     worker.start();
     worker.notify();
     CHECK(spin_until([&] { return rig.journal->pages() >= 1; })); // the kick, not the bound
@@ -319,7 +319,7 @@ TEST_CASE("notify() after stop() is a no-op and never resurrects the worker",
     JournalRig rig;
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/20,
-                                     rig.journal.get());
+                                     {.journal = rig.journal.get()});
     worker.start();
     worker.stop();
     const auto after_stop = rig.journal->pages();
@@ -328,23 +328,65 @@ TEST_CASE("notify() after stop() is a no-op and never resurrects the worker",
     CHECK(rig.journal->pages() == after_stop);
 }
 
-TEST_CASE("the prune cadence is TIME-based, not per-wake (an enqueue storm cannot spin prune)",
+TEST_CASE("the maintenance cadence is TIME-based, not per-wake (an enqueue storm cannot spin it)",
           "[spark][guardian][drain][maint]") {
+    // The regression guard for #2298 governance f-1/A1/sec-M1. The earlier version of this
+    // test drove maintenance_once() directly against an EMPTY journal and asserted
+    // batches_pruned()==0, which is trivially true whether prune ran once or twenty times -
+    // it proved nothing (Gate 3 quality-engineer). This one counts ACTUAL journal scans via
+    // the pre-scan hook, against a RUNNING worker being hammered with wakes, which is the
+    // shape that regresses if anyone reties the cadence to wake count.
     JournalRig rig;
+    rig.persist("r1"); // a real journal, so a scan has something to do
+
+    std::atomic<int> prune_scans{0};
+    rig.journal->set_pre_scan_hook_for_test([&] { prune_scans.fetch_add(1); });
+
     CollectingSink sink;
-    // A one-hour prune interval: no maintenance pass in this test may prune, however many
-    // times it runs. This is the regression guard for the old "every 4th tick" rule, which
-    // on a wake-driven worker would have pruned once every 4 enqueues.
-    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink),
-                                     GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
-                                     rig.journal.get(), /*prune_interval_ms=*/3'600'000);
-    for (int i = 0; i < 20; ++i)
-        worker.maintenance_once();
-    // page_into_window's boot barrier prunes exactly once (before the first replay candidate);
-    // the cadence must not have added any of its own on top.
-    CHECK(rig.journal->batches_pruned() == 0);
-    CHECK(rig.journal->prune_failures() == 0);
-    CHECK(rig.journal->pages() >= 1);
+    // Hour-long cadences: NOTHING in this test may legitimately prune or page after the
+    // forced boot page, however many times the worker wakes.
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/1,
+                                     {.journal = rig.journal.get(),
+                                      .page_interval = 1h,
+                                      .prune_interval = 1h});
+    worker.start();
+    // Hammer the waker the way a Guardian drift storm would.
+    for (int i = 0; i < 200; ++i)
+        worker.notify();
+    std::this_thread::sleep_for(150ms); // many wakes at a 1 ms periodic bound
+    worker.stop();
+
+    // notify() forces a page each time, and a page's boot barrier prunes ONCE (latching
+    // boot_pruned_). What must NOT happen is a scan per wake.
+    CHECK(prune_scans.load() <= 2);
+    CHECK(rig.journal->pages() <= 205); // forced pages only; no cadence pages on top
+}
+
+TEST_CASE("an enqueue-driven wake does not page (only the cadence and the kick do)",
+          "[spark][guardian][drain][maint]") {
+    // sec-M1 stated precisely: paging is a full journal scan, and the token bucket only
+    // throttles NET-NEW paging, so the scan itself must be cadence-bound. A wake caused by
+    // an ordinary outbox enqueue must therefore ship the entry WITHOUT rescanning.
+    JournalRig rig;
+    rig.persist("r1");
+
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/60'000,
+                                     {.journal = rig.journal.get(),
+                                      .page_interval = 1h,
+                                      .prune_interval = 1h});
+    worker.start();
+    CHECK(spin_until([&] { return rig.journal->pages() >= 1; })); // the seeded boot page
+    const auto pages_after_boot = rig.journal->pages();
+
+    // Now drive 50 enqueue wakes through the REAL waker (attach_rule enqueues a lifecycle
+    // entry, which fires the runtime's outbox waker).
+    for (int i = 0; i < 50; ++i)
+        rig.rt->attach_rule("r" + std::to_string(i), file_spec("/p" + std::to_string(i)),
+                            file_exists_rule("r" + std::to_string(i)), true);
+    CHECK(spin_until([&] { return sink.count() >= 50; })); // they shipped...
+    CHECK(rig.journal->pages() == pages_after_boot);       // ...with no extra journal scan
+    worker.stop();
 }
 
 TEST_CASE("a zero prune interval prunes every maintenance pass (retention still runs here)",
@@ -359,8 +401,8 @@ TEST_CASE("a zero prune interval prunes every maintenance pass (retention still 
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink),
                                      GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
-                                     rig.journal.get(), /*prune_interval_ms=*/0);
-    worker.maintenance_once();
+                                     {.journal = rig.journal.get(), .prune_interval = 0ms});
+    worker.maintenance_once({.prune = true, .page = true});
     CHECK(rig.journal->batches_pruned() >= 4); // trimmed to the 2-batch cap on the worker
 }
 
@@ -373,15 +415,47 @@ TEST_CASE("request_stop() makes a maintenance pass a no-op (bounds the drain-wor
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink),
                                      GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
-                                     rig.journal.get(), /*prune_interval_ms=*/0);
-    CHECK_FALSE(worker.maintenance_once());
+                                     {.journal = rig.journal.get(), .prune_interval = 0ms});
+    CHECK_FALSE(worker.maintenance_once({.prune = true, .page = true}).records_paged > 0);
     CHECK(rig.journal->pages() == 0);        // page_into_window bailed before its scan
     CHECK(rig.journal->batches_pruned() == 0); // prune bailed before its scan
     worker.drain_once();
     CHECK(sink.count() == 0); // and nothing reached the window after the stop signal
 }
 
-TEST_CASE("stop() while maintenance is running joins cleanly and stops mutating the window",
+TEST_CASE("a stop landing INSIDE a scan is honoured mid-pass, not just at the entry gate",
+          "[spark][guardian][drain][maint]") {
+    // The earlier version called request_stop() BEFORE stop(), so every subsequent pass
+    // short-circuited at prune's entry guard and the mid-loop gates added by 551e91ac were
+    // never executed (Gate 3 quality-engineer). Here the pre-scan hook fires request_stop()
+    // from INSIDE a scan already in flight, which is the interleaving those gates exist for.
+    JournalRig rig;
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/2,
+                                               /*max_bytes=*/static_cast<std::size_t>(-1),
+                                               /*max_quarantine=*/100);
+    for (int i = 0; i < 40; ++i)
+        rig.persist("r" + std::to_string(i));
+
+    std::atomic<bool> stopped_mid_scan{false};
+    rig.journal->set_pre_scan_hook_for_test([&] {
+        rig.journal->request_stop(); // the scan is already past its entry gate
+        stopped_mid_scan.store(true);
+    });
+
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink),
+                                     GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
+                                     {.journal = rig.journal.get(), .prune_interval = 0ms});
+    worker.maintenance_once({.prune = true, .page = true});
+
+    CHECK(stopped_mid_scan.load());
+    // The mid-scan gates must have aborted the pass: nothing was evicted despite 40 batches
+    // against a 2-batch cap, and the label-GC / quarantine-bounding scans never ran.
+    CHECK(rig.journal->batches_pruned() == 0);
+    CHECK(rig.journal->prune_failures() == 0); // an abort is not a failure
+}
+
+TEST_CASE("stop() during a running worker's maintenance joins cleanly",
           "[spark][guardian][drain][maint]") {
     JournalRig rig;
     for (int i = 0; i < 40; ++i)
@@ -389,17 +463,42 @@ TEST_CASE("stop() while maintenance is running joins cleanly and stops mutating 
 
     CollectingSink sink;
     GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/1,
-                                     rig.journal.get(), /*prune_interval_ms=*/0);
+                                     {.journal = rig.journal.get(), .prune_interval = 0ms});
     worker.start();
-    // Let it get into a maintenance pass, then tear down in the PRODUCTION order:
-    // GuardianEngine::stop() signals the journal FIRST, then joins the worker.
     CHECK(spin_until([&] { return rig.journal->pages() >= 1; }));
+    // Production teardown order: the journal is signalled FIRST, then the worker joined.
     rig.journal->request_stop();
     worker.stop();
     const auto pages_at_join = rig.journal->pages();
     std::this_thread::sleep_for(20ms);
     CHECK(rig.journal->pages() == pages_at_join); // no maintenance survived the join
     CHECK(worker.journal_maint_exception_count() == 0);
+}
+
+TEST_CASE("a throwing maintenance pass is firewalled, counted, and does not stop the loop",
+          "[spark][guardian][drain][maint]") {
+    // journal_maint_exception_count() was asserted ==0 everywhere but never driven nonzero
+    // (Gate 3 quality-engineer). The pre-scan hook throws straight out of prune_locked_
+    // uncaught, so no new seam is needed to prove the firewall.
+    JournalRig rig;
+    rig.persist("r1");
+    std::atomic<int> throws{0};
+    rig.journal->set_pre_scan_hook_for_test([&] {
+        if (throws.fetch_add(1) < 3)
+            throw std::runtime_error("scan boom");
+    });
+
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal.get(),
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    worker.start();
+    CHECK(spin_until([&] { return worker.journal_maint_exception_count() >= 1; }));
+    // The loop survived and kept going: once the hook stops throwing, work resumes.
+    CHECK(spin_until([&] { return rig.journal->pages() >= 1; }));
+    worker.stop();
+    CHECK(worker.drain_exception_count() == 0); // the drain firewall was NOT tripped
 }
 
 TEST_CASE("a throwing send does not suppress journal maintenance (independent firewalls)",
@@ -411,7 +510,7 @@ TEST_CASE("a throwing send does not suppress journal maintenance (independent fi
     // different threads, and folding them onto one must not let either starve the other.
     auto throwing = [](const OutboxEntry&) -> SendResult { throw std::runtime_error("boom"); };
     GuardianOutboxDrainWorker worker(*rig.rt, throwing, /*periodic_bound_ms=*/5,
-                                     rig.journal.get());
+                                     {.journal = rig.journal.get()});
     worker.start();
     CHECK(spin_until([&] { return rig.journal->records_paged() >= 1; }));
     CHECK(spin_until([&] { return rig.rt->send_exception_count() >= 1; }));
@@ -432,15 +531,41 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
     for (int i = 0; i < 16; ++i)
         rig.persist("seed" + std::to_string(i));
 
+    // The send is the PRODUCTION wrapper shape, not a bare sink: mark_batch_sent issues a
+    // KvStore WRITE from the worker thread, which must race prune's del_keys on the same
+    // store. A CollectingSink would never exercise that (Gate 3 cpp-safety).
     CollectingSink sink;
-    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/1,
-                                     rig.journal.get(), /*prune_interval_ms=*/0);
+    auto journaled_send = [&](const OutboxEntry& e) -> SendResult {
+        const SendResult r = sink(e);
+        if (r == SendResult::Sent && e.journal_last_in_batch && !e.journal_batch_key.empty())
+            rig.journal->mark_batch_sent(e.journal_batch_key);
+        return r;
+    };
+    GuardianOutboxDrainWorker worker(*rig.rt, journaled_send, /*periodic_bound_ms=*/1,
+                                     {.journal = rig.journal.get(), .prune_interval = 0ms});
     worker.start();
 
     std::atomic<bool> stop{false};
+    // Drives the REAL phase-1 persist path (snapshot_pending -> persist ->
+    // erase_persisted_prefix -> backfill_batch_provenance over outbox_mu_/pending_journal_),
+    // which is precisely the state C0 newly splits across two threads. Persisting straight
+    // into the journal, as this test previously did, bypasses all of it.
     std::thread persister([&] {
-        for (int i = 0; !stop.load(std::memory_order_relaxed) && i < 200; ++i)
-            rig.persist("live" + std::to_string(i));
+        for (int i = 0; !stop.load(std::memory_order_relaxed) && i < 200; ++i) {
+            const auto rid = "live" + std::to_string(i);
+            rig.rt->attach_rule(rid, file_spec("/" + rid), file_exists_rule(rid), true);
+            auto pending = rig.rt->snapshot_pending();
+            if (pending.empty())
+                continue;
+            std::vector<PersistedBatch> batches;
+            const std::size_t written = rig.journal->persist(pending, &batches);
+            if (written > 0) {
+                rig.rt->erase_persisted_prefix(written);
+                for (const auto& b : batches)
+                    if (!b.event_ids.empty())
+                        rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
+            }
+        }
     });
     std::thread kicker([&] {
         while (!stop.load(std::memory_order_relaxed))
@@ -456,4 +581,30 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
     rig.journal->request_stop();
     worker.stop();
     SUCCEED("no data race / crash across worker maintenance + persist + reconnect kicks");
+}
+
+TEST_CASE("worker_thread_id identifies the worker thread while running, and clears after stop",
+          "[spark][guardian][drain][maint]") {
+    // This is the mechanism GuardianEngine::WorkerHostileMutex asserts against: it compares
+    // the locking thread to this id to catch the one thing that deadlocks the agent - the
+    // worker taking mtx_, which stop() holds while joining that very worker (#2298 A2). The
+    // assert itself aborts, so what is testable here is that the id it reads is correct.
+    JournalRig rig;
+    std::atomic<std::thread::id> seen_inside{};
+    auto observing_send = [&](const OutboxEntry&) -> SendResult {
+        seen_inside.store(std::this_thread::get_id());
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rig.rt, observing_send, /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal.get()});
+    CHECK(worker.worker_thread_id() == std::thread::id{}); // not started
+    worker.start();
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    CHECK(spin_until([&] { return seen_inside.load() != std::thread::id{}; }));
+    // The send runs on the worker thread, so the engine would be asserting against exactly
+    // this id if that send ever reached for mtx_.
+    CHECK(seen_inside.load() == worker.worker_thread_id());
+    CHECK(worker.worker_thread_id() != std::this_thread::get_id());
+    worker.stop();
+    CHECK(worker.worker_thread_id() == std::thread::id{}); // cleared on exit
 }

@@ -153,7 +153,9 @@ struct SparkReconcileFixture {
     std::mutex sent_mu;
     std::vector<OutboxEntry> sent;
 
-    SparkReconcileFixture() {
+    /// `periodic_bound_ms > 0` pins the drain worker's backstop before it is constructed,
+    /// so a test can attribute a page to the reconnect kick rather than the backstop.
+    explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -165,6 +167,8 @@ struct SparkReconcileFixture {
 
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
         REQUIRE(engine->start_local().has_value());
+        if (periodic_bound_ms > 0)
+            engine->set_drain_worker_timing_for_test(periodic_bound_ms);
         engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
                                   [this](const OutboxEntry& e) {
                                       std::lock_guard<std::mutex> lk{sent_mu};
@@ -520,16 +524,28 @@ TEST_CASE("prefer_spark=true: page_journal kicks the drain worker into a paging 
     // C0 (#2298 gate 1): page_journal no longer pages INLINE on the caller's (reconnect)
     // thread - it wakes the drain worker, which runs the pass. Same observable replay, minus
     // a full KvStore scan on the thread that has just re-established the stream.
-    SparkReconcileFixture f;
+    //
+    // The worker's backstop is pinned to an hour BEFORE it is constructed, and the page
+    // cadence defaults to 30 s, so within this test's window the ONLY thing that can cause a
+    // paging pass is the kick. Without that pin the production 5 s backstop is already
+    // ticking through fixture setup and could fire inside the assertion window, letting this
+    // pass for the wrong reason (Gate 3 quality-engineer BLOCKING-1).
+    SparkReconcileFixture f{/*periodic_bound_ms=*/3'600'000};
     auto* journal = f.engine->lifecycle_journal_for_test();
+
+    // The worker forces one page on its first cycle (boot replay); wait that out first so the
+    // assertion below is attributable solely to the kick.
+    const auto deadline0 = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (journal->pages() == 0 && std::chrono::steady_clock::now() < deadline0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(journal->pages() >= 1);
+
     const auto before = journal->pages();
     f.engine->page_journal();
-    // Bounded well BELOW the worker's 5 s periodic backstop, so a pass observed here is the
-    // kick doing its job, not the backstop that would have happened anyway.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (journal->pages() == before && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    CHECK(journal->pages() > before); // the kick produced a pass (not gated out)
+    CHECK(journal->pages() > before); // only the kick could have caused this
 }
 
 TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal untouched)",
