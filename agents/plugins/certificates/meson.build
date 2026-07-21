@@ -1,5 +1,5 @@
 # Platform-specific crypto dependencies for certificate store access
-cert_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+cert_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 if host_machine.system() == 'windows'
   cert_deps += cxx.find_library('crypt32')
 endif
