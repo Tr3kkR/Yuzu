@@ -293,6 +293,28 @@ static_assert(offsetof(MsgSrcCounts, counts) == 32);
 // control replies (SUCCESS/ERROR) are 0/1 — NOT a sequential-from-2 scheme.
 inline constexpr std::uint32_t kNstatMsgError = 1;         // NSTAT_MSG_TYPE_ERROR
 inline constexpr std::uint32_t kNstatMsgAddAllSrcs = 1002; // NSTAT_MSG_TYPE_ADD_ALL_SRCS
+
+// Request contexts for the two ADD_ALL_SRCS subscriptions (echoed back in the
+// kernel's SUCCESS/ERROR control reply `hdr.context`). Non-zero and distinct so
+// an NSTAT_MSG_TYPE_ERROR can be attributed to the specific subscription it
+// rejects — a rejected subscription must demote the client promptly (poll
+// fallback), not hide behind the 1-hour idle-stall threshold.
+inline constexpr std::uint64_t kNstatCtxSubscribeTcp = 0xA1;
+inline constexpr std::uint64_t kNstatCtxSubscribeTcpKernel = 0xA2;
+
+/// Pure decision for the NSTAT_MSG_TYPE_ERROR handler: latch a rejection for
+/// whichever subscription the control reply's `context` names (an unrelated
+/// context latches nothing), and return true only once BOTH subscriptions have
+/// been rejected — the point at which the client can never receive a flow and
+/// must demote to the poll fallback immediately.
+inline bool nstat_subscription_rejected(std::uint64_t context, bool& tcp_rejected,
+                                        bool& tcp_kernel_rejected) noexcept {
+    if (context == kNstatCtxSubscribeTcp)
+        tcp_rejected = true;
+    else if (context == kNstatCtxSubscribeTcpKernel)
+        tcp_kernel_rejected = true;
+    return tcp_rejected && tcp_kernel_rejected;
+}
 inline constexpr std::uint32_t kNstatMsgQuerySrc = 1004;   // NSTAT_MSG_TYPE_QUERY_SRC
 inline constexpr std::uint32_t kNstatMsgGetSrcDesc = 1005; // NSTAT_MSG_TYPE_GET_SRC_DESC
 inline constexpr std::uint32_t kNstatMsgSrcAdded = 10001;  // NSTAT_MSG_TYPE_SRC_ADDED

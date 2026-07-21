@@ -135,6 +135,39 @@ TEST_CASE("nstat_decode_header rejects a too-short buffer", "[tar][netqual][nsta
     REQUIRE_FALSE(nstat_decode_header(empty_buf).has_value());
 }
 
+// ── nstat_subscription_rejected — the ERROR-reply demote latch ─────────────
+
+TEST_CASE("nstat_subscription_rejected demotes only once BOTH subscriptions are rejected",
+          "[tar][netqual][nstat]") {
+    bool tcp = false, tcp_kernel = false;
+
+    SECTION("an unrelated context latches nothing") {
+        REQUIRE_FALSE(nstat_subscription_rejected(0, tcp, tcp_kernel));
+        REQUIRE_FALSE(nstat_subscription_rejected(0xdeadbeef, tcp, tcp_kernel));
+        REQUIRE_FALSE(tcp);
+        REQUIRE_FALSE(tcp_kernel);
+    }
+
+    SECTION("one rejected subscription is informational, not a demote") {
+        REQUIRE_FALSE(nstat_subscription_rejected(kNstatCtxSubscribeTcp, tcp, tcp_kernel));
+        REQUIRE(tcp);
+        REQUIRE_FALSE(tcp_kernel);
+        // A repeat of the same rejection still doesn't demote.
+        REQUIRE_FALSE(nstat_subscription_rejected(kNstatCtxSubscribeTcp, tcp, tcp_kernel));
+    }
+
+    SECTION("both rejected demotes, in either order") {
+        REQUIRE_FALSE(nstat_subscription_rejected(kNstatCtxSubscribeTcpKernel, tcp, tcp_kernel));
+        REQUIRE(nstat_subscription_rejected(kNstatCtxSubscribeTcp, tcp, tcp_kernel));
+    }
+
+    SECTION("an unrelated context between the two rejections does not reset the latches") {
+        REQUIRE_FALSE(nstat_subscription_rejected(kNstatCtxSubscribeTcp, tcp, tcp_kernel));
+        REQUIRE_FALSE(nstat_subscription_rejected(7, tcp, tcp_kernel));
+        REQUIRE(nstat_subscription_rejected(kNstatCtxSubscribeTcpKernel, tcp, tcp_kernel));
+    }
+}
+
 // ── nstat_length_matches_expected — the layout-mismatch guard ──────────────
 
 TEST_CASE("nstat_length_matches_expected accepts exact fixed-size lengths",

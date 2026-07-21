@@ -418,6 +418,14 @@ struct NstatClient::Impl {
     std::thread query_thread;
     std::atomic<bool> stop_requested{false};
 
+    // Per-subscription rejection latches (reader thread only — no atomics
+    // needed). Subscribing both TCP provider ids is deliberately redundant
+    // ("harmless if one is invalid for this kernel"), so a single rejection is
+    // informational; BOTH rejected means the client can never receive a flow
+    // and must demote to the poll now, not after the 1-hour idle stall.
+    bool sub_tcp_rejected{false};
+    bool sub_tcp_kernel_rejected{false};
+
     std::mutex query_cv_mu;
     std::condition_variable query_cv;
 
@@ -665,6 +673,20 @@ struct NstatClient::Impl {
             return;
         }
         case kNstatMsgError:
+            // A control ERROR echoing one of our subscription contexts means
+            // that ADD_ALL_SRCS was REJECTED. One provider id being invalid on
+            // a given kernel is expected (the dual subscription is deliberately
+            // redundant); both rejected means no SRC_* message will ever
+            // arrive — demote to the poll fallback immediately rather than
+            // letting the dead client hide behind the idle-stall threshold.
+            if (nstat_subscription_rejected(hdr->context, sub_tcp_rejected,
+                                            sub_tcp_kernel_rejected)) {
+                spdlog::warn("TAR: nstat kernel rejected both ADD_ALL_SRCS "
+                             "subscriptions; disabling the nstat client "
+                             "(poll fallback takes over)");
+                stop_requested.store(true, std::memory_order_relaxed);
+                return;
+            }
             spdlog::debug("TAR: nstat kernel returned NSTAT_MSG_TYPE_ERROR (context={})",
                           hdr->context);
             return;
@@ -835,12 +857,14 @@ bool NstatClient::start() {
     nstat_raw::MsgAddAllSrcs add_tcp{};
     add_tcp.hdr.type = kNstatMsgAddAllSrcs;
     add_tcp.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp));
+    add_tcp.hdr.context = kNstatCtxSubscribeTcp; // attribute a control reply to this subscription
     add_tcp.provider = kNstatProviderTcp;
     raw->send_msg(&add_tcp, sizeof(add_tcp));
 
     nstat_raw::MsgAddAllSrcs add_tcp_kernel{};
     add_tcp_kernel.hdr.type = kNstatMsgAddAllSrcs;
     add_tcp_kernel.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp_kernel));
+    add_tcp_kernel.hdr.context = kNstatCtxSubscribeTcpKernel;
     add_tcp_kernel.provider = kNstatProviderTcpKernel;
     raw->send_msg(&add_tcp_kernel, sizeof(add_tcp_kernel));
     spdlog::info("TAR: nstat client active (provider=tcp, system_wide={})",
