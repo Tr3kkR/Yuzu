@@ -61,8 +61,9 @@ static_assert(std::has_unique_object_representations_v<GuardianJournalStats>,
 
 namespace {
 
-/// Every counter distinct and non-zero, so each key the agent can emit is exercised
-/// AND a tag/gauge mix-up in the table shows up as a wrong value rather than passing.
+/// Every counter distinct and non-zero, so each key the agent can emit is exercised AND
+/// a field/key mix-up in the emitter shows up as a wrong value (see the expected-map
+/// assertion in the bind test - the key-set checks alone cannot catch a value swap).
 GuardianJournalStats all_nonzero_stats() {
     GuardianJournalStats s;
     s.stage_dropped = 1;
@@ -109,6 +110,39 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         INFO("emitted key not recognised by the server rollup: " << key);
         CHECK(table_keys.count(key) == 1);
     }
+
+    // FIELD -> KEY BIND. The three checks around this one are all key-SET checks: they
+    // prove the writer and reader agree on WHICH 22 keys exist, and nothing more. Swap
+    // two values in the emitter - put(<stage_dropped key>, s.stage_failures) - and the
+    // emitted key set is byte-identical, so every one of them still passes while the
+    // server sums one counter under another counter's gauge and the wrong fleet alert
+    // fires on the wrong signal. all_nonzero_stats() gives each field a distinct value
+    // precisely so that mix-up is observable; this is the assertion that observes it.
+    const std::map<std::string, std::string> expected{
+        {"yuzu.guardian_journal_stage_dropped", "1"},
+        {"yuzu.guardian_journal_stage_failures", "2"},
+        {"yuzu.guardian_journal_field_rejected", "3"},
+        {"yuzu.guardian_journal_clock_rejected", "4"},
+        {"yuzu.guardian_journal_pending", "5"},
+        {"yuzu.guardian_journal_batches_written", "6"},
+        {"yuzu.guardian_journal_write_failures", "7"},
+        {"yuzu.guardian_journal_key_collisions", "8"},
+        {"yuzu.guardian_journal_quarantined", "9"},
+        {"yuzu.guardian_journal_quarantine_failures", "10"},
+        {"yuzu.guardian_journal_quarantine_capacity_evicted", "11"},
+        {"yuzu.guardian_journal_pruned", "12"},
+        {"yuzu.guardian_journal_prune_failures", "13"},
+        {"yuzu.guardian_journal_write_capacity_rejected", "14"},
+        {"yuzu.guardian_journal_bytes", "15"},
+        {"yuzu.guardian_journal_batch_count", "16"},
+        {"yuzu.guardian_journal_pages", "17"},
+        {"yuzu.guardian_journal_records_paged", "18"},
+        {"yuzu.guardian_journal_sent_labels", "19"},
+        {"yuzu.guardian_journal_evicted_sent_unacked", "20"},
+        {"yuzu.guardian_journal_evicted_no_send_evidence", "21"},
+        {"yuzu.guardian_journal_maint_exceptions", "22"},
+    };
+    CHECK(tags == expected);
     // READER -> WRITER: no table row may reference a key the agent never emits - such
     // a gauge would be permanently absent, indistinguishable from a healthy fleet.
     for (const auto& m : detail::kGuardianJournalMetrics) {

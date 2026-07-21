@@ -15,7 +15,10 @@
   fabricated `0` - a flatline zero on a loss counter would read as "checked,
   nothing lost" on a fleet whose journal is not even running. Values are
   hostile-input parsed (garbage, negative, overlong and implausible all mean "did
-  not report", never `0`), so one rogue agent cannot poison a fleet gauge. Gauge
+  not report", never `0`), so no single agent can destroy a fleet sum with an
+  overflowing or implausible magnitude. A forged-but-plausible value from an
+  enrolled agent still sets the gauge - that is inside the heartbeat trust
+  boundary, which is why the shipped alert templates stay warning-grade. Gauge
   names, tag keys and HELP text live in one table that also drives the metric
   registration, and a pin test binds that table to the agent's real emitter - with
   a `static_assert` that turns "added a journal counter but forgot its fleet

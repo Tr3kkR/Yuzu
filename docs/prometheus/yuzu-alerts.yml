@@ -839,23 +839,41 @@ groups:
   # trust boundary - one forged or buggy agent can set any of these, so a warning
   # routes to a ticket, not a page. Escalate per fleet policy on scale or spread.
   # An agent leaving the 90s staleness window RESOLVES these alerts without the loss
-  # having healed - the alert is the signal, the audit trail is the evidence.
+  # having healed, and a SERVER restart rebuilds the series within one sweep and so
+  # re-notifies an already-acknowledged incident - the alert is the signal, the audit
+  # trail is the evidence.
+  #
+  # ON THE SPARK COMPARISON, PRECISELY. Both families ship the same way today: a
+  # reviewed group, commented out. The difference is only enable-time intent. Spark's
+  # DISQUALIFYING counters (watch_rejected, slow_op) are self-healing pressure blips
+  # where a latch pages forever for a condition that has already passed; the journal
+  # loss counters record non-self-healing integrity events, where latch-until-
+  # investigated is the wanted semantic and an agent restart genuinely re-arms
+  # (they are process-lifetime atomics). Note yuzu_fleet_spark_quarantined is
+  # occurrence-grade by that same standard and still sits in the deferred bucket -
+  # so this is a per-counter judgement, not a blanket family-level rule.
   #
   # - name: yuzu-guardian-journal
   #   rules:
   #     - alert: YuzuGuardianJournalIntegrityGap
   #       expr: |
   #         yuzu_fleet_guardian_journal_evicted_no_send_evidence > 0
+  #       for: 5m
   #       labels:
   #         severity: warning
   #       annotations:
   #         summary: "Guardian lifecycle records lost with no send evidence"
   #         description: >-
   #           Journal batches aged out with no evidence their records were ever
-  #           transmitted - lifecycle audit records were silently lost between
-  #           endpoint and server (CC7.3). Treat as an incident: identify the
-  #           reporting agents via their heartbeat tags, investigate, then restart
-  #           them to re-arm the latch. The value does not re-notify while firing.
+  #           transmitted - lifecycle audit records were likely lost between
+  #           endpoint and server (CC7.3). Classification is BEST-EFFORT: a crash
+  #           between the send and the sent-label write counts a sent batch as
+  #           no-evidence, so corroborate with agent logs before calling it loss.
+  #           Investigate, then restart the contributing agents to re-arm the
+  #           latch; it does not re-notify on further losses while firing.
+  #           ATTRIBUTION GAP: the series is unlabelled and no operator surface
+  #           exposes per-agent yuzu.guardian_journal_* tags today, so this alert
+  #           cannot name the agents. Build that surface before enabling this rule.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-integrity-gap"
   #     - alert: YuzuGuardianJournalRecordsDropped
   #       expr: |

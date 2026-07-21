@@ -37,9 +37,10 @@
 /// (docs/observability-conventions.md, the fleet-rollup absent-not-zero rule).
 /// `AgentHealthStore::recompute_metrics` therefore `clear_gauge_family()`s all 22 at
 /// the top of every sweep and re-emits only those some agent reported this cycle.
-/// There is no separate `_reporting` denominator: `..._batches_written` IS the
-/// liveness signal (a journal that has persisted anything reports it), and a
-/// denominator that is itself absent on a healthy fleet would carry no information.
+/// There is no separate `_reporting` denominator: `..._batches_written` is the
+/// inert-vs-live discriminator (any agent whose journal has persisted anything since
+/// its last restart reports it), and a denominator that is itself absent on a healthy
+/// fleet would carry no information.
 ///
 /// ── NOT HERE YET ─────────────────────────────────────────────────────────────────
 /// `gauge_underflow` (GuardianLifecycleJournal::gauge_underflow()) is deliberately
@@ -144,10 +145,11 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "follows when the reserve overflows"},
     // ── Persist ──────────────────────────────────────────────────────────────────
     {"yuzu.guardian_journal_batches_written", "yuzu_fleet_guardian_journal_batches_written",
-     "Fleet sum of journal batches successfully persisted. The LIVENESS signal for this "
-     "whole family: its presence means some agent's journal is actually writing. Absent "
-     "across the fleet means the journal is inert everywhere (expected while "
-     "prefer_spark is off), NOT that it is healthy"},
+     "Fleet sum of journal batches successfully persisted. A cumulative process-lifetime "
+     "count, so its presence means some agent's journal HAS WRITTEN since that agent last "
+     "restarted - not that it is writing now. Still the inert-vs-live discriminator for "
+     "this family: absent across the fleet means the journal is inert everywhere "
+     "(expected while prefer_spark is off), NOT that it is healthy"},
     {"yuzu.guardian_journal_write_failures", "yuzu_fleet_guardian_journal_write_failures",
      "Fleet sum of failed journal batch writes. Records stay staged and retry, so this is "
      "not itself loss - but sustained failure fills the pending reserve and becomes "
@@ -216,10 +218,12 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "records were ever transmitted. This is the INTEGRITY GAP counter: > 0 means "
      "lifecycle audit records were silently lost between endpoint and server. Alert on "
      "> 0 at warning and treat any firing as an incident (CC7.3-relevant evidence "
-     "signal, not a tuning knob). Latches until the contributing agents restart and does "
-     "not re-notify on further losses - watch the value too. Do not use increase() - it "
-     "misses a first-and-only loss and fakes increments on agent churn. NOTE the unit is "
-     "BATCHES, each holding up to 256 records"},
+     "signal, not a tuning knob). Classification is BEST-EFFORT: a crash between the send "
+     "and the sent-label write counts a sent batch as no-evidence, so corroborate with "
+     "agent logs before calling it loss. Latches until the contributing agents restart and "
+     "does not re-notify on further losses - watch the value too. Do not use increase() - "
+     "it misses a first-and-only loss and fakes increments on agent churn. NOTE the unit "
+     "is BATCHES, each holding up to 256 records"},
     {"yuzu.guardian_journal_maint_exceptions", "yuzu_fleet_guardian_journal_maint_exceptions",
      "Fleet sum of exceptions swallowed by the journal maintenance tick (page/flush). "
      "Swallowed on purpose so maintenance cannot kill the agent, which is exactly why "

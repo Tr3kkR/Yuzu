@@ -611,9 +611,11 @@ alert state does not, so watch the value, not just the alert. That trade is
 deliberate for a lifecycle-audit integrity signal: an occurrence is an incident to
 investigate, not a rate to tune, and the alert should not resolve on its own. Two
 caveats: an agent ageing out of the 90 s staleness window resolves the alert without
-the evidence gap having healed (the alert is the signal; the audit trail is the
-evidence), and an intermittently-connected agent can flap a series at that boundary
-(the template's `for:` plus Alertmanager grouping bounds the noise). A reviewed
+the evidence gap having healed, and a **server** restart rebuilds the series within one
+sweep and so re-notifies an already-acknowledged incident (the alert is the signal; the
+audit trail is the evidence). An intermittently-connected agent can also flap a series
+at that staleness boundary - every shipped rule carries a `for:` clause, which together
+with Alertmanager grouping bounds that noise. A reviewed
 alert group ships commented out in `docs/prometheus/yuzu-alerts.yml`; it must stay
 disabled until the `prefer_spark` cutover makes the journal live, because until then
 any firing could only come from a forged heartbeat. Of the three live-depth gauges,
@@ -630,7 +632,7 @@ monotonic counter; that is #2083 and is not built yet.
 | `yuzu_fleet_guardian_journal_field_rejected` | gauge | Fleet sum of records kept out by a field failing validation (embedded NUL, oversized, non-UTF-8). A **loss** channel and a malformed-input signal |
 | `yuzu_fleet_guardian_journal_clock_rejected` | gauge | Fleet sum of records kept out by a skewed clock (timestamp ≤ 0). A **loss** channel, and the fleet's clock-health canary - a journal timestamp that cannot be trusted is not admissible evidence |
 | `yuzu_fleet_guardian_journal_pending` | gauge | Fleet sum of records staged but **not yet persisted**. A **live depth** gauge, not cumulative - `> 0 for: 15m` is a valid alert. Sustained depth is the leading indicator of the `_stage_dropped` loss that follows when the reserve overflows |
-| `yuzu_fleet_guardian_journal_batches_written` | gauge | Fleet sum of batches successfully persisted. The **liveness** signal for this whole family. Absent fleet-wide means the journal is inert everywhere (expected while `prefer_spark` is off) - **not** that it is healthy |
+| `yuzu_fleet_guardian_journal_batches_written` | gauge | Fleet sum of batches successfully persisted. A cumulative process-lifetime count, so its presence means some agent's journal **has written since that agent last restarted** - not that it is writing now. Still the inert-vs-live discriminator for this family: absent fleet-wide means the journal is inert everywhere (expected while `prefer_spark` is off) - **not** that it is healthy |
 | `yuzu_fleet_guardian_journal_write_failures` | gauge | Fleet sum of failed batch writes. Records stay staged and retry, so this is not itself loss - but sustained failure fills the pending reserve and becomes `_stage_dropped`. Alert here **before** the loss counter moves |
 | `yuzu_fleet_guardian_journal_key_collisions` | gauge | Fleet sum of batch key collisions. Should stay 0; any value is an accounting or id-generation bug surfacing - investigate, do not threshold |
 | `yuzu_fleet_guardian_journal_quarantined` | gauge | Fleet sum of batches moved aside as unreadable/corrupt. Degrade-don't-destroy: the batch is preserved for forensics but its records are **not** replayed, so `> 0` means the server is missing lifecycle evidence that still exists on the endpoint |
@@ -645,7 +647,7 @@ monotonic counter; that is #2083 and is not built yet.
 | `yuzu_fleet_guardian_journal_records_paged` | gauge | Fleet sum of journalled records newly enqueued into the replay window. Activity signal for how much backlog is being re-delivered |
 | `yuzu_fleet_guardian_journal_sent_labels` | gauge | Fleet sum of sent-labels written (best-effort delivery evidence). The denominator for the two eviction counters below: a batch aged out **with** a label was at least sent |
 | `yuzu_fleet_guardian_journal_evicted_sent_unacked` | gauge | Fleet sum of **batches** aged out of the journal **with** a sent-label but no ack (each batch holds up to 256 records). **Monitor, do not page**: their records were sent and are very likely stored server-side; only the ack did not come back. Read against its no-evidence sibling |
-| `yuzu_fleet_guardian_journal_evicted_no_send_evidence` | gauge | Fleet sum of **batches** aged out with **no** sent-label - no evidence their records were ever transmitted (each batch holds up to 256 records, so this understates the record count). This is the **integrity-gap** counter: `> 0` means lifecycle audit records were silently lost between endpoint and server. **Alert** on `> 0` at warning and treat any firing as an incident; a CC7.3-relevant evidence signal, not a tuning knob. Latches until the contributing agents restart and does not re-notify on further losses. Do not use `increase()` |
+| `yuzu_fleet_guardian_journal_evicted_no_send_evidence` | gauge | Fleet sum of **batches** aged out with **no** sent-label - no evidence their records were ever transmitted (each batch holds up to 256 records, so this understates the record count). This is the **integrity-gap** counter: `> 0` means lifecycle audit records were silently lost between endpoint and server. **Alert** on `> 0` at warning and treat any firing as an incident; a CC7.3-relevant evidence signal, not a tuning knob. Classification is **best-effort** - a crash between the send and the sent-label write counts a sent batch as no-evidence, so corroborate with agent logs before calling it loss. Latches until the contributing agents restart and does not re-notify on further losses. Do not use `increase()`. The series is unlabelled and no operator surface exposes per-agent `yuzu.guardian_journal_*` tags today, so a firing alert cannot name the agents - that surface is a prerequisite for enabling the rule |
 | `yuzu_fleet_guardian_journal_maint_exceptions` | gauge | Fleet sum of exceptions swallowed by the journal maintenance tick (page/flush). Swallowed so maintenance cannot kill the agent - which is exactly why they must be visible here: a climbing value means maintenance is failing silently and the counters beside it are **understating** reality |
 
 ## NVD CVE sync metrics
