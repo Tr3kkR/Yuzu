@@ -313,3 +313,50 @@ count-based erase racing drop-oldest; renaming `GuardianOutboxDrainWorker` /
 `page_journal()` now that neither name describes what it does; handing the worker a
 `shared_ptr` to delete the declaration-order dependency; and documenting
 `guardian_journal_maint_exceptions` in the metrics manual.
+
+---
+
+## Second hardening round (Sol adversarial review)
+
+An independent read of the post-governance branch found one BLOCKING defect and several
+material ones that the 7-agent pipeline had missed. Recorded because the BLOCKING one was
+introduced BY the first hardening round - the fix for a hazard was itself a hazard.
+
+- **The `mtx_` tripwire was a data race and a potential use-after-free.** It held a raw
+  pointer to the worker, written under `mtx_` but read BEFORE `mtx_` was acquired, and
+  wiring rollback destroys the worker right after clearing it. It also could not reliably
+  fire: `assert` is a no-op under `NDEBUG`, so a sanitizer-enabled release build logged the
+  violation and deadlocked anyway, and the enablement macro was GCC-only. Replaced with a
+  thread-local role marker plus `std::abort()`, enabled on GCC and Clang sanitizers.
+- **The bounded drain starved compliance.** Lifecycle drains first, so one shared budget let
+  it consume a whole pass - a rationed version of the detection blackout Gate 4 UP-3
+  explicitly removed, reintroduced four lines below the comment that documents it. Now a
+  reserved share with allowance transferring both ways.
+- **A count bound is not a time bound**, and nothing observed shutdown mid-pass: a whole
+  512-send pass could BEGIN after `stop()` was blocked in `join()`. Added a wall-clock cap
+  and a per-send stop predicate.
+- **A prune throw silently ate a forced page**, because prune and page shared one `try` and
+  both cadence stamps were taken before the pass. Separate firewalls; a forced page that did
+  not run re-arms.
+- **The cadence was start-to-start, not a minimum gap**, so a pass longer than its interval
+  was due again the instant it finished. Stamped after the attempt.
+- **Reconnect refill hole**: with a full window the kick's page places nothing, the drain
+  then empties the window, and the backlog waited a full interval. Re-armed for exactly that
+  case.
+- **Housekeeping stop-gates were incomplete** between the sent-label GC and quarantine
+  bounding.
+- **An existing test was silently invalidated** by the first-cycle-immediate change.
+
+Two further bugs surfaced while building the fairness fix, caught by the new tests rather
+than by review: the allowance rollover was one-directional, and an empty log with an
+exhausted budget falsely reported truncation.
+
+The journal also moved to `shared_ptr`, which DELETES the declaration-order dependency the
+first round documented as load-bearing. Section 24's invariant is kept, since the
+"never take mtx_" half still stands, but the ordering half is no longer correctness-critical.
+
+### Still not proven
+
+The `WorkerHostileMutex` abort is wired and its predicate is tested, but the abort itself is
+not exercised - that needs a subprocess death-test harness this suite does not have. Treat
+it as a backstop, not as a licence to reason loosely about what runs on the worker thread.
