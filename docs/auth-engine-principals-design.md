@@ -1,11 +1,17 @@
 # Engine principals & delegation — auth-architecture follow-up design (ADR-1005 item 2b)
 
-Status: **Draft for governance review** — this is the execution plan's item 2b
-(`docs/adr-1005-execution-plan.md`, Phase 2), the program's critical-path
-deliverable. Phase 4 (engine principal class) is gated on this design being
-accepted; Phase 5 (delegation/write-back) and 2c's Decision-14 confinement
-choice consume it. Nothing here ships code; every mechanism below lands via
-the Phase-4/5 PR ladder mapped in §11.
+Status: **Phase 4 shipped (PR 4.1–4.3); Phase 5 (delegation) pending.** This
+design is the execution plan's item 2b (`docs/adr-1005-execution-plan.md`,
+Phase 2). Phase 4 (engine principal class — the identity store, RBAC
+resolution, and the operator-facing REST/MCP/console lifecycle surface) is
+built and live as of PR 4.3; see `docs/user-manual/rest-api.md` "Engine
+Principals", `docs/user-manual/mcp.md`, and
+`docs/user-manual/engine-principals.md` for the shipped operator-facing
+surface. Phase 5 (delegation/write-back, RFC 8693 token exchange) and 2c's
+Decision-14 confinement choice remain design-only and still consume this
+document as their reference; every mechanism below not yet cross-referenced
+against a shipped PR should be treated as still-design until verified against
+code.
 
 Companion docs: `docs/adr/1005-headless-platform-use-case-engines.md` (the
 ADR; its Decision 5 is the trust-tier/delegation decision this design

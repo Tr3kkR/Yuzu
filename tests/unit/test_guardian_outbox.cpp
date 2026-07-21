@@ -47,6 +47,32 @@ TEST_CASE("outbox drains in FIFO order and removes every sent entry", "[spark][o
     REQUIRE(rec.sent == std::vector<std::string>{"0:a:e1", "0:b:e2", "0:c:e3"});
 }
 
+TEST_CASE("pop_front_if only removes the UNCHANGED head (unlock-during-send drain)",
+          "[spark][outbox]") {
+    // The runtime's item-4 drain copies the head, releases outbox_mu_, sends, then
+    // pop_front_if(event_id). If a coalesce replaced the head during that window (a fresh
+    // drift for the same rule), pop_front_if must NOT drop the newer entry.
+    GuardianOutbox ob{8};
+    REQUIRE(ob.enqueue(comp("a", 1, "e1", 100, "old")));
+    auto head = ob.front_copy();
+    REQUIRE(head);
+    CHECK(head->event_id == "e1");
+
+    // A coalescing enqueue replaces the node in place with a fresh event_id (the "drift
+    // arrived while we were sending e1" race).
+    REQUIRE(ob.enqueue(comp("a", 2, "e2", 200, "new")));
+    CHECK(ob.size() == 1); // coalesced, not appended
+
+    CHECK_FALSE(ob.pop_front_if("e1")); // head is now e2 - do NOT drop it
+    CHECK(ob.size() == 1);
+    auto head2 = ob.front_copy();
+    REQUIRE(head2);
+    CHECK(head2->event_id == "e2");
+    CHECK(ob.pop_front_if("e2")); // the current head pops
+    CHECK(ob.empty());
+    CHECK_FALSE(ob.pop_front_if("e2")); // empty -> no-op
+}
+
 TEST_CASE("compliance coalesces to the latest per rule, keeping position", "[spark][outbox]") {
     GuardianOutbox ob{16};
     REQUIRE(ob.enqueue(comp("a", 1, "e1", 100, "old")));

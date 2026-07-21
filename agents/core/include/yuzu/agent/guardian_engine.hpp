@@ -62,6 +62,8 @@ class SparkEngine;
 class GuardianSparkRuntime;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
+class GuardianLifecycleJournal;
+struct GuardianJournalStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 struct OutboxEntry;
@@ -133,6 +135,31 @@ public:
     /// to drain a buffered-events queue over the command stream.
     void sync_with_server();
 
+    /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7
+    /// PR-Ag). Two-phase (rev-4.1 #6): PHASE 1 under mtx_ retries any persist a prior
+    /// write left pending - this is what makes a failed write self-heal with NO new
+    /// push/reconnect (Sol BLOCKER-4); PHASE 2 (off mtx_) will page + prune (C4/C5).
+    /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
+    void journal_maintenance_tick();
+
+    /// Replay the durable lifecycle journal into the send window (item 7 PR-Ag). Captures the
+    /// runtime + journal under mtx_ (brief), then pages OFF mtx_ (KvStore + paging-mutex +
+    /// outbox_mu_, never mtx_). prefer_spark_-gated; a no-op after stop() and while stopping.
+    /// Called from the reconnect hook (after set_event_sink) and the maintenance tick.
+    void page_journal();
+
+    /// A snapshot of the durable-journal integrity + activity counters (item 7 PR-Ag §8),
+    /// assembled from the runtime (staging) + the journal component. The agent heartbeat
+    /// emits these SPARSELY (only non-zero) via emit_guardian_journal_heartbeat_tags. All
+    /// zero when prefer_spark is off / the journal is quiescent.
+    [[nodiscard]] GuardianJournalStats journal_stats() const;
+
+    /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
+    /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
+    /// `yuzu.guardian_unhealthy_suppressed` so a rule stuck errored is observable
+    /// without flooding the health stream. Zero when prefer_spark is off / no runtime.
+    [[nodiscard]] std::uint64_t unhealthy_suppressed() const;
+
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     void stop();
@@ -186,6 +213,17 @@ public:
     /// every successful apply_rules call. Persisted across restarts.
     std::uint64_t policy_generation() const;
 
+    /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
+    /// apply_rules — a rule that persisted but did not arm. This counts attempts, NOT
+    /// distinct rules: one persistently-failing rule increments it once per push (so it
+    /// is a rate signal / "a gap is open", not "how many rules are gapped"). A nonzero
+    /// value means an enforcement gap is (or was) open on this endpoint; surfaced via the
+    /// heartbeat by item 9 so a persistent gap stays fleet-visible even after the
+    /// generation later advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
+    [[nodiscard]] std::uint64_t arm_failure_count() const noexcept {
+        return arm_failures_.load(std::memory_order_relaxed);
+    }
+
     /// KV namespace used for all Guardian persistent state. Exposed for
     /// tests — do not read from this namespace in production code.
     static std::string_view kv_namespace();
@@ -216,6 +254,13 @@ public:
     /// The current, immutable-after-set outcome of wire_spark_engine().
     [[nodiscard]] SparkAvailability spark_availability() const;
 
+    /// TEST-ONLY: the durable-journal component, for fault injection (see
+    /// GuardianLifecycleJournal::inject_write_failures_for_test). Null until
+    /// wire_spark_engine runs. No production caller.
+    [[nodiscard]] GuardianLifecycleJournal* lifecycle_journal_for_test() {
+        return lifecycle_journal_.get();
+    }
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -229,10 +274,17 @@ private:
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
     std::size_t rule_count_{0};
+    std::atomic<std::uint64_t> arm_failures_{0}; ///< reconcile-throw count (item 3 / Sol B1)
 
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     void persist_generation_locked();
+    /// Flush the runtime's staged lifecycle records to the durable journal (item 7
+    /// PR-Ag). mtx_ held; snapshot → persist → erase-persisted-prefix, circuit-broken
+    /// on the first write failure. prefer_spark_-gated (inert when spark is not the
+    /// active backend). Fired via a terminate-safe guard on every apply_rules /
+    /// start_local exit.
+    void persist_lifecycle_journal_locked();
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,
@@ -295,6 +347,12 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
+    /// Journal maintenance/page/final-flush exceptions swallowed to keep the bare heartbeat
+    /// thread + the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4).
+    std::atomic<std::uint64_t> journal_maint_exceptions_{0};
+    /// Heartbeat-tick counter (mtx_-guarded): retention prune runs every Nth tick, not every
+    /// heartbeat, to bound the per-tick full-journal read on the heartbeat thread (review N1).
+    std::uint64_t journal_tick_count_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
@@ -306,6 +364,13 @@ private:
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
+    /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
+    /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
+    /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated. LIFETIME (review
+    /// N4): the drain-worker send-wrap captures this; declared after spark_drain_worker_ it is
+    /// destroyed FIRST, so its safety rests on stop() joining the drain worker before any member
+    /// destruction (~GuardianEngine calls stop()). That join is the load-bearing guarantee.
+    std::unique_ptr<GuardianLifecycleJournal> lifecycle_journal_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the

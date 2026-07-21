@@ -5,7 +5,7 @@
 ## Sources by platform:
 ##   Windows: ipconfig /flushdns, ping -n
 ##   Linux:   resolvectl flush-caches / systemd-resolve --flush-caches, ping -c
-##   macOS:   dscacheutil -flushcache, ping -c
+##   macOS:   dscacheutil -flushcache AND killall -HUP mDNSResponder, ping -c
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -18,9 +18,14 @@ metadata:
     Flushes the local DNS resolver cache on the endpoint. On Windows
     runs ipconfig /flushdns. On Linux attempts resolvectl flush-caches
     then falls back to systemd-resolve --flush-caches. On macOS runs
-    dscacheutil -flushcache. Returns a status indicator and the
-    command output. This is a mutating action that clears cached DNS
-    records, forcing fresh resolution on subsequent lookups.
+    both dscacheutil -flushcache and killall -HUP mDNSResponder — the
+    SIGHUP is the step that actually resets the resolver, so a flush
+    without it is incomplete. On macOS the status indicator reflects the
+    real exit codes of the underlying commands (ok only if both succeed),
+    not a blind success; the Windows and Linux branches currently report
+    the command output with a status|ok indicator. This is a mutating
+    action that clears cached DNS records, forcing fresh resolution on
+    subsequent lookups.
   tags: [network, dns, action, remediation]
 
 spec:

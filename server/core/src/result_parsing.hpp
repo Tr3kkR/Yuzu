@@ -61,7 +61,7 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
         "diagnostics",     "agent_actions",   "processes",     "services",
         "filesystem",      "network_diag",    "network_actions","firewall",
         "antivirus",       "bitlocker",       "windows_updates","event_logs",
-        "sccm",            "script_exec",     "software_actions"};
+        "sccm",            "script_exec",     "software_actions","interaction"};
 
     auto it = kSchemas.find(plugin);
     if (it != kSchemas.end()) return it->second;

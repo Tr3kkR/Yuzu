@@ -250,6 +250,31 @@ TEST_CASE("service read failure is Unknown, distinct from a stopped service", "[
     REQUIRE_FALSE(s.emit.last_compliant.has_value());
 }
 
+TEST_CASE("Unknown is edge-flagged: first errors, repeats are not edges, recovery re-arms it (M1)",
+          "[spark][eval]") {
+    const auto a = file_exists(true);
+    RuleEvalState s;
+    // First Unknown of an episode -> edge (the runtime emits guard.unhealthy on this one).
+    const auto first = eval_file(a, read_unknown<FileSnapshot>("io"), s, at_ms(0));
+    REQUIRE(first.status == EvalStatus::Unhealthy);
+    REQUIRE(first.unhealthy_edge);
+    REQUIRE(s.in_unknown);
+    // A repeat Unknown while already errored -> NOT an edge (the runtime suppresses + counts,
+    // so a rule stuck errored does not re-mint a health event every ~5s convergence tick).
+    const auto again = eval_file(a, read_unknown<FileSnapshot>("io"), s, at_ms(10));
+    REQUIRE(again.status == EvalStatus::Unhealthy);
+    REQUIRE_FALSE(again.unhealthy_edge);
+    REQUIRE(s.in_unknown);
+    // Recovery clears the episode; the NEXT Unknown is a fresh edge again, so the health
+    // stream re-errors after a recovery instead of staying silent forever.
+    REQUIRE(eval_file(a, read_known(FileSnapshot{.exists = true}), s, at_ms(20)).status ==
+            EvalStatus::Emit);
+    REQUIRE_FALSE(s.in_unknown);
+    const auto reerr = eval_file(a, read_unknown<FileSnapshot>("io"), s, at_ms(30));
+    REQUIRE(reerr.status == EvalStatus::Unhealthy);
+    REQUIRE(reerr.unhealthy_edge);
+}
+
 TEST_CASE("recovery from Unknown FORCES a compliant edge even when unchanged", "[spark][eval]") {
     const auto a = file_exists(true);
     RuleEvalState s;
