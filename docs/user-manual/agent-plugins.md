@@ -286,7 +286,7 @@ Plugins for network configuration, active connections, diagnostics, and administ
 |---|---|
 | **Version** | v1.0.0 |
 | **Platforms** | W L M |
-| **Description** | WiFi network scanning and connection status. Uses WlanAPI on Windows, `nmcli` on Linux, and `airport` on macOS. |
+| **Description** | WiFi network scanning and connection status. Uses WlanAPI on Windows, `nmcli` on Linux, and on macOS CoreWLAN for `connected` (SSID/BSSID withheld by Location Services on 14+ → `<ssid-withheld>`) with `airport`/`system_profiler` still backing `list_networks`. |
 
 | Action | Description |
 |---|---|
