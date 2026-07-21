@@ -142,7 +142,17 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_evicted_no_send_evidence", "21"},
         {"yuzu.guardian_journal_maint_exceptions", "22"},
     };
-    CHECK(tags == expected);
+    // Per-key, NOT `CHECK(tags == expected)`. Catch2 has no StringMaker for
+    // std::pair and neither CATCH_CONFIG_ENABLE_PAIR_STRINGMAKER nor
+    // ..._ALL_STRINGMAKERS is defined anywhere in this repo, so a whole-map compare
+    // renders both operands as `{ {?}, {?}, ... }` - it tells you the drift guard
+    // fired but not which key drifted, which is the one thing you need at that moment.
+    for (const auto& [key, want] : expected) {
+        INFO("tag " << key);
+        REQUIRE(tags.count(key) == 1);
+        CHECK(tags.at(key) == want);
+    }
+    CHECK(tags.size() == expected.size());
     // READER -> WRITER: no table row may reference a key the agent never emits - such
     // a gauge would be permanently absent, indistinguishable from a healthy fleet.
     for (const auto& m : detail::kGuardianJournalMetrics) {

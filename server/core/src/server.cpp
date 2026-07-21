@@ -717,6 +717,12 @@ public:
         // chosen form for the loss counters and why increase() is not.
         for (const auto& m : detail::kGuardianJournalMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
+        // The two meta-signals are NOT in that table (it is pinned 1:1 to the agent's
+        // GuardianJournalStats) and are published every sweep including at 0.
+        metrics_.describe(detail::kGuardianJournalReportingGauge,
+                          detail::kGuardianJournalReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianJournalTagRejectedGauge,
+                          detail::kGuardianJournalTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",

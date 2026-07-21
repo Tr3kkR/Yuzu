@@ -21,6 +21,16 @@
   boundary, which is why the shipped alert templates stay warning-grade. Gauge
   names, tag keys and HELP text live in one table that also drives the metric
   registration, and a pin test binds that table to the agent's real emitter - with
-  a `static_assert` that turns "added a journal counter but forgot its fleet
-  gauge" into a build failure. See
+  a test-build `static_assert` that turns "added a journal counter but forgot
+  its fleet gauge" into a compile error.
+
+  Two meta-signals sit outside that table and publish on every sweep **including
+  at zero**: `yuzu_fleet_guardian_journal_reporting` (the coverage denominator -
+  `0` while agents are connected means the telemetry pipeline is dark, otherwise
+  indistinguishable from a healthy quiet fleet) and `..._tag_rejected` (values
+  that failed the forged-value parse, which would otherwise be a silent drop). No
+  alert rules are enabled: no sound alerting form exists over an unlabelled fleet
+  sum of per-agent cumulative counters, so the reviewed group in
+  `docs/prometheus/yuzu-alerts.yml` ships commented out and the 22 counters are
+  monitor-only. See
   [metrics.md → Guardian journal fleet gauges](docs/user-manual/metrics.md).

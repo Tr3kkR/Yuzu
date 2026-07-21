@@ -512,7 +512,7 @@ if build_server
       # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
       # templates - no link to yuzu_agent_core, just the include path.
       #
-      # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
+      # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
       # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
       # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
@@ -523,7 +523,15 @@ if build_server
       # NOT solve a future collision by having server PRODUCTION code include an agent
       # header: that would be an upward dependency edge (server → agent), which the build
       # graph does not have and must not gain. The durable fix is to hoist the shared tag
-      # keys into one source of truth at rung 2, when the wire contract changes anyway.
+      # keys into one source of truth. NOTE THE SCOPE: that hoist is triggered by spark's
+      # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL keys
+      # are not part of that wire-contract change, so a rung-2 hoist sweeping only spark
+      # would leave the 22 yuzu.guardian_journal_* literals behind while this comment
+      # still read as though it covered them. Both key families must move together; the
+      # journal side is tracked on #2298's cutover-gate list. Concrete target when it
+      # happens: a hand-written header carried by proto/meson.build's
+      # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
+      # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on

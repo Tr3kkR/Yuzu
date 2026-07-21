@@ -1433,10 +1433,23 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // would suppress it and misreport a reporting fleet as absent.
     std::array<double, kNGuardianJournalMetrics> gj_sum{};
     std::array<bool, kNGuardianJournalMetrics> gj_reported{};
+    // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
+    // unconditionally, including at 0, unlike the 22 - they are server-owned counts
+    // that always have a true value, so 0 is a measurement, not a fabricated zero.
+    // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
+    // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
+    // `gj_tag_rejected` makes the forged-value parse's drop visible: a rejected value
+    // used to vanish silently, and if the rejected agent were the only reporter its
+    // family went absent, which reads as clean (governance Gate-4 UP-16 / Gate-5 CH-6).
+    int gj_reporting = 0;
+    int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
     // temporary key per lookup - 22 per agent per sweep. Built once (same pattern,
-    // and the same governance finding, as spark_mech_metric_keys above).
+    // and the same governance finding, as spark_mech_metric_keys above). It IS
+    // registered for static destruction (non-trivial destructor), which is safe only
+    // because health_recompute_thread_ - the sole production reader - is joined in
+    // ServerImpl::stop() before exit; there is no std::exit/abort shutdown path.
     static const std::array<std::string, kNGuardianJournalMetrics> gj_keys = [] {
         std::array<std::string, kNGuardianJournalMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
@@ -1666,12 +1679,25 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         // forged-value-safe parse (non-finite is impossible for an integer parse;
         // negative, overlong, garbage and implausible all become "did not report",
         // never 0 - one rogue agent must not poison a fleet integrity gauge).
+        bool journal_reported_any = false;
         for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i) {
-            if (auto v = parse_guardian_journal_count(get_view(gj_keys[i]))) {
+            const auto raw = get_view(gj_keys[i]);
+            // An ABSENT tag is the sparse writer's "nothing to report" and is not a
+            // rejection; only a PRESENT value that fails the parse counts as one. The
+            // parse returns nullopt for both, so the emptiness test is what separates
+            // them - do not collapse these two branches.
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_journal_count(raw)) {
                 gj_sum[i] += *v;
                 gj_reported[i] = true;
+                journal_reported_any = true;
+            } else {
+                ++gj_tag_rejected;
             }
         }
+        if (journal_reported_any)
+            ++gj_reporting;
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1796,6 +1822,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
         if (gj_reported[i])
             metrics.gauge(kGuardianJournalMetrics[i].gauge).set(gj_sum[i]);
+    // The two meta-signals publish ALWAYS, including 0 - that is the point of them.
+    // Not cleared above either: a family that is always written never goes stale.
+    metrics.gauge(kGuardianJournalReportingGauge).set(static_cast<double>(gj_reporting));
+    metrics.gauge(kGuardianJournalTagRejectedGauge)
+        .set(static_cast<double>(gj_tag_rejected));
 }
 
 } // namespace yuzu::server::detail

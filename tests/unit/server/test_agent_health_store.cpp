@@ -1019,3 +1019,134 @@ TEST_CASE("REAL AgentHealthStore: a rogue agent cannot poison a guardian journal
     CHECK(sum == 5.0); // only the honest agent contributed
     CHECK(std::isfinite(sum));
 }
+
+TEST_CASE("REAL AgentHealthStore: guardian journal meta-signals publish even at zero",
+          "[guardian][journal][rollup][real]") {
+    // The 22 counters are absent-not-zero; these two are the OPPOSITE and deliberately
+    // so. They are server-owned counts that always have a true value, so publishing 0
+    // is a measurement ("nothing is reporting") rather than a fabricated zero. Without
+    // them, a dark telemetry pipeline is indistinguishable from a healthy quiet fleet
+    // (governance Gate-4 UP-9 / Gate-6 sre).
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> quiet;
+    quiet["yuzu.os"] = "linux";
+    store.upsert("no-journal", quiet);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_tag_rejected") == 0.0);
+    // ...while the counters themselves stay absent, as before.
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_journal_batches_written"));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian journal reporting counts agents, not tags",
+          "[guardian][journal][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // Two reporters (one with four tags, one with one) and two non-reporters.
+    beat("j1", {{"yuzu.guardian_journal_batches_written", "10"},
+                {"yuzu.guardian_journal_pruned", "3"},
+                {"yuzu.guardian_journal_pages", "7"},
+                {"yuzu.guardian_journal_bytes", "2048"}});
+    beat("j2", {{"yuzu.guardian_journal_batches_written", "5"}});
+    beat("quiet-1", {});
+    beat("quiet-2", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    // AGENTS, not tags: j1's four tags count once.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 2.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_batches_written") == 15.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a rejected journal tag is counted, not silently dropped",
+          "[guardian][journal][rollup][real]") {
+    // Gate-5 CH-6 / Gate-4 UP-16. A value that fails the forged-value parse used to
+    // vanish without trace: if the rejecting agent was the ONLY reporter, its family
+    // went absent, and absent reads as "checked, nothing lost". Now the drop is
+    // counted, so an operator can tell "nothing to report" from "something unreadable".
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_journal_evicted_no_send_evidence"] = "1000000001"; // past the ceiling
+    rogue["yuzu.guardian_journal_stage_dropped"] = "garbage";
+    store.upsert("rogue", rogue);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_tag_rejected") == 2.0);
+    // The families stay ABSENT (the values were never admitted) - but the rejection
+    // counter is what stops that absence being misread as health.
+    CHECK_FALSE(
+        has_unlabelled_series(out, "yuzu_fleet_guardian_journal_evicted_no_send_evidence"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_journal_stage_dropped"));
+    // The agent reported nothing PARSEABLE, so it is not in the coverage denominator.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an explicit journal zero publishes as zero",
+          "[guardian][journal][rollup][real]") {
+    // The `reported` flag is tracked separately from the sum precisely so this case
+    // stays honest: the real writer is sparse and never emits "0", but a non-conforming
+    // or forked agent build can. An explicit "0" IS a report of zero, so it publishes
+    // as 0 rather than being suppressed into absence (which would misreport a
+    // reporting fleet as silent). Documented divergence, now covered.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_journal_stage_dropped"] = "0";
+    store.upsert("nonconforming", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_stage_dropped") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_tag_rejected") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a stale agent's journal counters leave the fleet sum",
+          "[guardian][journal][rollup][real]") {
+    // The staleness prune runs BEFORE the accumulation loop, so an aged-out agent's
+    // counters silently drop out of the sum - which is the mechanism behind the whole
+    // absent-not-zero story and was previously untested here (and is still untested for
+    // the sibling spark rollup). Driven with a zero staleness window so the prune is
+    // deterministic rather than timing-dependent.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_journal_evicted_no_send_evidence"] = "9";
+    store.upsert("doomed", tags);
+
+    // Generous window: the agent is fresh, so it counts.
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(unlabelled_series(metrics.serialize(),
+                              "yuzu_fleet_guardian_journal_evicted_no_send_evidence") == 9.0);
+
+    // Zero window: every snapshot is stale, so the agent is pruned before accumulation.
+    // Its integrity counter vanishes from the fleet view even though the loss it
+    // recorded really happened - the alert-resolves-without-the-gap-healing case.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    const std::string out = metrics.serialize();
+    CHECK_FALSE(
+        has_unlabelled_series(out, "yuzu_fleet_guardian_journal_evicted_no_send_evidence"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 0.0);
+}
