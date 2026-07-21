@@ -391,14 +391,14 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v0.1.0 |
+| **Version** | v0.2.0 |
 | **Platforms** | W L M |
 | **Description** | Antivirus product detection and status. |
 
 | Action | Description |
 |---|---|
-| `products` | List registered antivirus products with name, vendor, and version. |
-| `status` | Real-time protection state, signature date, and scan status per product. |
+| `products` | List detected antivirus products as `av\|<name>\|<state>` rows. Windows: SecurityCenter2 registered products (state is the raw productState code). Linux: process/directory detection. macOS: XProtect probed via its definition bundle (an `xprotect_version\|…` row rides alongside; `av\|XProtect\|unknown` means the bundle was unreadable — never assumed active) plus endpoint-security system extensions for third-party EDR/AV (each also emits `edr\|<bundle id>\|<version>`), with process detection as fallback. |
+| `status` | Windows: Defender real-time protection, signature version, last update, last quick scan. macOS: XProtect definition version, definition freshness (`last_update`), and Remediator/MRT engine versions — no real-time-protection row (macOS exposes no queryable equivalent); `status\|unknown` means the definition bundle was unreadable. Linux: `status\|not_available`. |
 
 ### firewall
 

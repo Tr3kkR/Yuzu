@@ -335,6 +335,7 @@ DESCRIPTOR_TEST("registry", "registry", 8, "get_value", "set_value", "delete_val
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
 DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
 DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")
+DESCRIPTOR_TEST("antivirus", "antivirus", 2, "products", "status")
 DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
 
 // ============================================================================
