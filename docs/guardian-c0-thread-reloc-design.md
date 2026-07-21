@@ -86,8 +86,10 @@ the `stopping_` atomic (stop).
   joined before the journal is destroyed. Established contract: engine::stop() joins
   the worker (`:324`) and both agent teardown paths call guardian_->stop() before
   ~GuardianEngine (ScopeExit `agent.cpp:792`, AgentImpl::stop `:2682`). SEE HAZARD 3 —
-  member declaration order today destroys `lifecycle_journal_` (declared last, `:373`)
-  BEFORE `spark_drain_worker_` (`:366`), so this relies on stop() having run.
+  member declaration order AT THE TIME OF WRITING destroyed `lifecycle_journal_` (declared
+  last, `:373`) BEFORE `spark_drain_worker_` (`:366`), so this relied on stop() having run.
+  As built this is reversed: the journal is declared FIRST, so reverse-order destruction
+  joins the worker while the journal is alive without depending on stop().
 - **S. stop-race.** `request_stop()` is called FIRST in engine::stop() (`:318`), before
   the worker join (`:324`). `page_into_window` checks `stopping_` between batches
   (`guardian_lifecycle_journal.cpp:492`). After C0 the worker IS the thread the join
@@ -149,6 +151,16 @@ the `stopping_` atomic (stop).
    storms. Proposed: TIME-based prune cadence (e.g. >= prune_interval since last prune),
    decoupled from wake frequency. Page runs every wake (bounded by the existing
    JournalPagingBucket rate limiter, so no fleet-cost regression). OPEN for Sol: interval.
+
+   > **WRONG, and shipped wrong in the first cut — corrected in the governance hardening
+   > round.** "Bounded by the JournalPagingBucket" is false: the bucket charges a token only
+   > when a batch pages NET-NEW work, so whenever the send window already holds every
+   > candidate (the normal state while the link is down and the backlog is retained) it never
+   > throttles and every wake re-runs a full `list_entries` + parse + `validate_record` sweep.
+   > The bucket is a WIRE limiter, not a SCAN limiter. Gate 3 measured the corrected steady
+   > state at one full scan per 10-20 s even after a naive fix, against one per 30 s pre-C0.
+   > Page therefore got its own 30 s time cadence, exactly like prune, with the reconnect kick
+   > forcing an immediate page so replay promptness is unaffected.
 
 ## Validation plan
 
@@ -222,3 +234,82 @@ reviewer diffs against reality, not the plan.
   The pre-existing `[spark][runtime][journal][tsan]` stress is unchanged and still passes.
 - `test_guardian_engine_spark_reconcile.cpp` — the `page_journal` case now asserts the
   ASYNC contract (a pass appears well inside the 5 s backstop, i.e. the kick caused it).
+
+---
+
+## Governance hardening round (#2298 C0)
+
+The first cut passed a full agent suite and a TSan run, then a 7-agent governance pipeline
+found two BLOCKING test defects and a set of real behavioural ones. Recorded here because
+several are corrections to claims made ABOVE, not just to code.
+
+### Behavioural corrections
+
+- **Page got its own 30 s cadence** (`kGuardianJournalPageInterval`). The design's "the
+  paging bucket already bounds it" was wrong - see the callout under hazard 6. Three
+  independent reviewers reached the same fix. `notify()` now also sets a `force_page_` flag
+  so the reconnect kick still pages immediately, which is what keeps the cadence from
+  delaying replay.
+- **The drain pass is bounded** (`kGuardianDrainBudget = 512`, new `max_entries` parameter on
+  `GuardianSparkRuntime::drain`). Unbounded, a slow stream drains the whole 4096-entry window
+  - measured at ~82 s at 20 ms/send - and post-C0 that starves retention until the journal
+  hits its write ceiling and DROPS audit records. Pre-C0 prune ran on the heartbeat thread and
+  was immune; this coupling is created by the relocation, so it is C0's to fix. A truncated
+  pass re-drains without waiting, so throughput is unchanged.
+- **The loop is reordered to maintenance-then-one-drain.** This ships anything paged in the
+  SAME cycle, which is what the old conditional second drain existed for - and that second
+  drain ran un-gated after `stop()` was already blocked in `join()`.
+- **The first cycle runs without waiting**, so the seeded boot replay no longer sits behind a
+  periodic bound or the first outbox enqueue.
+- **`stopping_` now PRECEDES the heavy KvStore calls** rather than straddling them: prune's
+  parse/quarantine loop (up to 2000 renames x 5 s busy timeout), its `del_keys`, and page's
+  `list_entries` after the boot barrier. Without this the post-`request_stop()` exit was
+  unbounded, and `stop()` holds `mtx_` across the join, so everything else blocked with it.
+- **`Signal::stopping` is atomic**, making `stop_requested()` lock-free and noexcept. It was
+  the only call in `loop()` outside a `try`, so a `std::system_error` from its `lock_guard`
+  would have terminated the agent (the #2037 class).
+- **`rollback_spark_wiring_locked` signals the journal first**, mirroring `stop()`, so a
+  wiring failure cannot block BOOT on a full maintenance pass.
+- **`page_journal()` regained its B4a firewall**, dropped in the first cut.
+
+### The invariant is now enforced, not just documented
+
+`GuardianEngine::mtx_` is a `WorkerHostileMutex` that asserts in debug/sanitizer builds that
+it is never locked on the drain-worker thread. The first cut hardened the wrong half: it
+removed the `this` capture from the send wrapper, but the real exposure is that `send` is an
+arbitrary `std::function` injected from `agent.cpp`, and nothing structural stopped a future
+PR adding a `guardian_->...` call to it. A violation now fails a test instead of hanging a
+fleet. The long-term shape - `stop()` not holding `mtx_` across the join, which deletes the
+invariant outright - is deliberately left to a later rung.
+
+### Test corrections (both were BLOCKING)
+
+- The "prune cadence is TIME-based" test asserted `batches_pruned() == 0` against an EMPTY
+  journal, which is true whether prune ran once or twenty times. It proved nothing, and its
+  own execution pattern was a live instance of the unbounded-rescan bug it was supposed to
+  guard. Rewritten to count real scans through `set_pre_scan_hook_for_test` against a running
+  worker under a 200-wake storm.
+- The reconcile `page_journal` test inferred "the kick caused this page" from a 1 s window
+  against a 5 s backstop - but the worker starts during fixture construction, so that backstop
+  was already ticking through setup and could fire inside the window. It now pins the bound to
+  an hour via a new `set_drain_worker_timing_for_test` seam, so only the kick can page.
+- The stop-during-maintenance test called `request_stop()` BEFORE `stop()`, so every pass
+  short-circuited at the entry gate and the mid-scan gates were never executed. It now fires
+  `request_stop()` from INSIDE a scan via the pre-scan hook.
+- The TSan stress persisted DIRECTLY into the journal, bypassing the real phase-1 path
+  (`snapshot_pending` -> `persist` -> `erase_persisted_prefix` -> `backfill_batch_provenance`)
+  - precisely the state C0 splits across two threads - and used a bare sink rather than the
+  `mark_batch_sent` wrapper, so no KvStore write ever raced prune's `del_keys`. Both fixed.
+- Added: maintenance-exception firewalling driven nonzero (the pre-scan hook throws straight
+  out of `prune_locked_`, so no new seam was needed), and an enqueue-wake-does-not-page case.
+
+### Filed as follow-ups, not fixed here
+
+Deliberately out of C0's scope: building `OutboxEntry` vectors before the window-headroom
+check (wasted work in the link-down state); prune and page each running their own full scan
+back-to-back; `JournalPagingBucket::refill` being fed `system_clock` (a backward NTP step
+freezes refill); the shutdown classification-counter under-count; `erase_persisted_prefix`'s
+count-based erase racing drop-oldest; renaming `GuardianOutboxDrainWorker` /
+`page_journal()` now that neither name describes what it does; handing the worker a
+`shared_ptr` to delete the declaration-order dependency; and documenting
+`guardian_journal_maint_exceptions` in the metrics manual.

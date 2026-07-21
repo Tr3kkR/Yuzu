@@ -2459,6 +2459,33 @@ This would be a Phase 15+ addition, not a rearchitecture of the current Phases A
 Pulled out of CLAUDE.md so the design doc carries them. Every PR in the
 Guardian ladder must check these.
 
+- **The Guardian outbox drain worker must NEVER take `GuardianEngine::mtx_`.**
+  `GuardianEngine::stop()` holds `mtx_` across its whole body AND joins the
+  worker inside it, so any `mtx_` acquisition on that thread is a lock-vs-join
+  deadlock — a hung agent shutdown, fleet-wide. Everything the worker runs is
+  in scope: the durable journal's prune/page maintenance, and the INJECTED
+  `send`, which is an arbitrary `std::function` supplied from `agent.cpp` and
+  is the easiest place to reintroduce the bug. The journal and runtime are
+  handed to the worker as a pre-resolved raw pointer / reference at
+  construction, never re-read off the engine under its lock. `mtx_` is a
+  `WorkerHostileMutex` that asserts against this in debug/sanitizer builds, so
+  a violation fails a test rather than hanging a fleet — but the assert is a
+  backstop, not a licence to reason loosely. (C0, #2298 gate 1.)
+- **`lifecycle_journal_` is declared BEFORE `spark_drain_worker_` in
+  `guardian_engine.hpp` — do not reorder.** The worker holds a raw pointer to
+  the journal for both its send-wrap (`mark_batch_sent`) and its maintenance
+  pass, so it must be joined while the journal is still alive. That ordering
+  makes reverse-order destruction do it automatically, instead of resting
+  solely on every teardown path remembering to call `stop()` first. Nothing
+  would catch a reorder. (C0, #2298 gate 1.)
+- **Journal maintenance is paced by TIME, never by wake count.** The drain
+  worker wakes on every outbox enqueue, and a paging pass is a full
+  `list_entries` + parse + `validate_record` sweep of the journal.
+  `JournalPagingBucket` does NOT bound that — it charges a token only when a
+  batch pages net-new work, so with a full send window it never throttles at
+  all. It is a wire limiter, not a scan limiter. Any future maintenance work
+  added to this worker must carry its own `steady_clock` cadence, or it becomes
+  O(event rate x journal size) on every managed endpoint. (C0, #2298 gate 1.)
 - **RBAC `Push` seed is Guardian-only.** `rbac_store.cpp` has TWO operation
   arrays: `ops[]` (the full catalogue, 6 entries including `Push`) and
   `crud_ops[]` (the 5 ops cross-seeded to every securable type in the

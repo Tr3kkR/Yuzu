@@ -5,7 +5,13 @@
   They now run on the existing Guardian outbox drain worker, which already does KvStore I/O per
   send, so no new thread is introduced. The heartbeat keeps only the cheap retry-persist that
   lets a failed durable write self-heal, and the reconnect hook now *wakes* the worker instead of
-  paging inline - replay after a reconnect stays prompt. Retention pruning is now paced on a
-  ~2-minute timer rather than a tick count, so an event burst cannot make it scan repeatedly.
-  Operator-visible behaviour is unchanged: prune/page failures still surface under the same
-  `guardian_journal_maint_exceptions` heartbeat counter.
+  paging inline - replay after a reconnect stays prompt. Both maintenance passes are paced on
+  their own timers (30 s for replay paging, ~2 minutes for retention) rather than on a tick
+  count, so an event burst cannot make them run repeatedly. Operator-visible behaviour is
+  unchanged: prune/page failures still surface under the same `guardian_journal_maint_exceptions`
+  heartbeat counter.
+- **A slow server connection can no longer starve Guardian journal retention.** Each drain pass
+  now ships at most 512 entries before the worker re-checks its other work, and re-drains
+  immediately if more remain. Previously one pass drained the entire 4096-entry send window,
+  which on a slow link took long enough to hold off retention until the journal reached its
+  write ceiling and began dropping lifecycle audit records.
