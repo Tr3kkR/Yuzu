@@ -3,8 +3,10 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <vector>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
@@ -48,16 +50,63 @@ std::string ts_to_iso8601(std::int64_t epoch_seconds) {
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
 }
+
+// The `status` label value for a store outcome (bounded set = the four enum values). Kept in
+// sync with the warm-create loop below and the EventInsertOutcome enum.
+[[nodiscard]] std::string_view event_insert_status_label(EventInsertOutcome outcome) noexcept {
+    switch (outcome) {
+    case EventInsertOutcome::Inserted:
+        return "inserted";
+    case EventInsertOutcome::Redelivered:
+        return "redelivered";
+    case EventInsertOutcome::Conflict:
+        return "conflict";
+    case EventInsertOutcome::Error:
+        return "error";
+    }
+    return "unknown";
+}
 } // namespace
 
+std::vector<double> guardian_event_store_buckets() {
+    // 0.1ms .. 10s: sub-ms resolution for a healthy SQLite single-row insert, plus the
+    // seconds tail for Postgres / lock contention (and the pending SQLite->Postgres move).
+    return {0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025,
+            0.05,   0.1,     0.25,   0.5,   1.0,    2.5,   5.0,  10.0};
+}
+
+// Guard the hand-written warm-create list against enum drift (unhappy-path UP-2). This pins the
+// four current values, so a REORDER / RENUMBER / REMOVAL trips the build. It does NOT catch an
+// APPEND (a 5th value leaves 0..3 intact) - that case is caught instead by the non-`default`
+// -Wswitch in event_insert_status_label (a build WARNING; werror is off, so non-fatal). An
+// appended outcome that slipped past the warning would get a lazily-created default-bucket
+// "unknown" series - wrong buckets on that one series, never a crash. A hard append-catch would
+// need a Count sentinel on EventInsertOutcome, which would ripple -Wswitch into the store's own
+// ingest switch - out of scope for a metric. If this fires (or -Wswitch warns), add the new
+// outcome to BOTH event_insert_status_label and the warm-create loop.
+static_assert(static_cast<int>(EventInsertOutcome::Inserted) == 0 &&
+                  static_cast<int>(EventInsertOutcome::Redelivered) == 1 &&
+                  static_cast<int>(EventInsertOutcome::Conflict) == 2 &&
+                  static_cast<int>(EventInsertOutcome::Error) == 3,
+              "EventInsertOutcome reordered/renumbered; update event_insert_status_label + warm-create");
+
+void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
+    const auto buckets = guardian_event_store_buckets();
+    for (const EventInsertOutcome status :
+         {EventInsertOutcome::Inserted, EventInsertOutcome::Redelivered,
+          EventInsertOutcome::Conflict, EventInsertOutcome::Error})
+        metrics.histogram(kGuardianEventStoreDurationMetric,
+                          {{"status", std::string(event_insert_status_label(status))}}, buckets);
+}
+
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
-                              const pb::CommandResponse& resp,
-                              BlastRadiusDetector* blast_radius, DexAlertRouter* alert_router) {
+                              const pb::CommandResponse& resp, BlastRadiusDetector* blast_radius,
+                              DexAlertRouter* alert_router, yuzu::MetricsRegistry* metrics) {
     if (resp.action() == "event") {
         ::yuzu::guardian::v1::GuaranteedStateEvent ev;
         if (!ev.ParseFromString(resp.payload())) {
             spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}", agent_id);
-            return;
+            return; // a malformed frame never reaches the store - not a timed ingest
         }
         GuaranteedStateEventRow ev_row;
         ev_row.event_id = ev.event_id();
@@ -78,9 +127,13 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // KiB is generous headroom over any real signal payload.
         constexpr std::size_t kMaxDetailJson = 16 * 1024;
         if (ev_row.detail_json.size() > kMaxDetailJson) {
+            // Sanitize the agent-controlled identifiers here too (sec-M1 sibling) — this
+            // WARN predates the classify switch and reaches a log line with the same
+            // CRLF-forging exposure.
             spdlog::warn("Guardian: dropping oversized detail_json ({} bytes) from agent {} "
                          "event {} (cap {})",
-                         ev_row.detail_json.size(), agent_id, ev_row.event_id, kMaxDetailJson);
+                         ev_row.detail_json.size(), sanitize_label(agent_id),
+                         sanitize_label(ev_row.event_id), kMaxDetailJson);
             ev_row.detail_json.clear();
         }
 
@@ -96,9 +149,63 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             ev_row.severity = rule->severity;
         if (ev_row.severity.empty())
             ev_row.severity = "unknown";
-        if (auto r = store.insert_event(ev_row); !r) {
-            spdlog::warn("Guardian: insert_event failed (agent={}, rule={}): {}", agent_id,
-                         ev_row.rule_id, r.error());
+        // Tri-state ingest (item-7 PR-Sv): the durable agent journal re-sends on every
+        // reconnect, so a matching-fields redelivery is EXPECTED. The DEX blast-radius
+        // + alert observers below run ONLY on a genuine first insert (`Inserted`) — a
+        // redelivery must NOT re-fire them (false blast-radius sightings / duplicate
+        // routed alerts), and a mismatched collision stays on the loud CC7.3 metric.
+        // Time the store operation (insert_event_classified: the classify+store SQLite txn -
+        // the redelivery byte-compare on redelivered/conflict, projection+commit on insert),
+        // split by outcome `status`. This is the store-latency signal the off-write-path compare
+        // (#2298) is VALIDATED against, NOT the go/no-go itself: an aggregate histogram can't
+        // attribute compare-CPU vs lock-wait vs txn, so the decision needs a concurrent
+        // benchmark. Series are warm-created at startup, so this is a cheap name+label lookup
+        // (no per-event bucket-vector alloc). Inert when `metrics` is null (tests / gateway
+        // without a registry).
+        const auto store_t0 = std::chrono::steady_clock::now();
+        const EventInsertResult res = store.insert_event_classified(ev_row);
+        if (metrics) {
+            // This runs on the gRPC ingest thread, whose Subscribe / ForwardGuardianMessage loops
+            // have NO catch-all above them (same reason the observer block below is guarded). The
+            // series are warm-created, so in steady state only the transient Labels/key alloc can
+            // throw (OOM) - swallow it: a best-effort metric observation must never tear down the
+            // agent's stream. Uniform no-escape posture (cpp-safety Gate-3).
+            try {
+                const double secs =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - store_t0)
+                        .count();
+                metrics->histogram(kGuardianEventStoreDurationMetric,
+                                   {{"status", std::string(event_insert_status_label(res.outcome))}})
+                    .observe(secs);
+            } catch (...) { // best-effort metric; never propagate onto the ingest thread
+            }
+        }
+        switch (res.outcome) {
+        case EventInsertOutcome::Inserted:
+            break; // fall through to the observers below
+        case EventInsertOutcome::Redelivered:
+            // Agent-controlled identifiers are sanitize_label'd before they reach any log
+            // line: the NUL guard strips \0 but not CR/LF, and the tightened
+            // YuzuGuardianEventsDropped alert directs operators to trust these logs, so a
+            // raw event_id could otherwise forge log lines (sec-M1). Same chokepoint the
+            // observer path uses. res.error is dropped on Conflict — it only repeats the
+            // (now-sanitized) event_id.
+            spdlog::debug("Guardian: idempotent event redelivery (no re-observe) "
+                          "event_id={} agent={} rule={}",
+                          sanitize_label(ev_row.event_id), sanitize_label(agent_id),
+                          sanitize_label(ev_row.rule_id));
+            return;
+        case EventInsertOutcome::Conflict:
+            spdlog::warn("Guardian: event_id collision with MISMATCHED fields (possible "
+                         "forged-id pre-claim / seq-reset) event_id={} agent={} rule={}",
+                         sanitize_label(ev_row.event_id), sanitize_label(agent_id),
+                         sanitize_label(ev_row.rule_id));
+            return;
+        case EventInsertOutcome::Error:
+            // res.error is server-constructed (SQLite errmsg / fixed strings) — no agent
+            // input — but the identifiers still get sanitized.
+            spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
+                         sanitize_label(agent_id), sanitize_label(ev_row.rule_id), res.error);
             return;
         }
         // Fleet-wide incident detection — RULELESS observations only, and only

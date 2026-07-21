@@ -74,12 +74,17 @@ kind: InstructionDefinition
 metadata:
   id: device.interaction.message_box
   displayName: Message Box Dialog
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Shows a modal message box dialog on the endpoint desktop. On Windows
     uses MessageBoxW, on Linux uses zenity, and on macOS uses osascript
-    'display dialog'. Returns which button the user clicked (ok, cancel,
-    yes, or no). The dialog blocks until the user responds.
+    'display dialog'. On success returns which button the user clicked in
+    the `response` column (ok, cancel, yes, or no); the dialog blocks until
+    the user responds. On macOS, when the agent cannot reach a desktop
+    session (it runs as a GUI-less root LaunchDaemon, or the user is not
+    logged in), it reports `status|not_reachable` instead of a fabricated
+    button — earlier agents (interaction plugin < 0.3.0) wrongly reported
+    `response|ok` for an undelivered dialog.
   tags: [interaction, dialog, user]
 
 spec:
@@ -115,6 +120,8 @@ spec:
         type: string
       - name: status
         type: string
+      - name: status # only on the macOS undeliverable path: `not_reachable`
+        type: string # (no GUI session). Empty on the normal button-press path.
 
   readablePayload: "Show message box: {{title}} ({{buttons}})"
 
@@ -129,6 +136,11 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
+    # Gates the agent daemon version, NOT the interaction plugin's own version
+    # (0.3.0, InteractionPlugin::version()) — no minPluginVersion mechanism
+    # exists today. An agent running interaction plugin < 0.3.0 keeps the prior
+    # macOS behavior (a false response|ok when undeliverable) rather than being
+    # gated out here; the mixed-fleet blend is called out in the description.
     minAgentVersion: 0.1.0
     requiredPlugins: [interaction]
 

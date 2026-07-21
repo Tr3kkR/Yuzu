@@ -4,6 +4,16 @@ Documentation=https://github.com/Tr3kkR/Yuzu
 After=network-online.target
 Wants=network-online.target
 
+# Crash-loop backstop (ADR-0021 rung 7.7a). Restart=always + RestartSec=10 would
+# otherwise restart forever; paired with the Guardian F3 orphan-exit (hard_exit on a
+# wedged I/O worker), a permanently-wedged watched target could restart-wedge-exit
+# every 10s indefinitely. If 5 starts occur within 300s systemd stops retrying and
+# enters `failed` (which alerts) instead of looping. The primary defense against a
+# single wedged read is still degrade-and-skip-that-rule inside the agent (rung 7.7b);
+# this is the belt-and-braces so a regression pages rather than loops silently.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=yuzu-agent

@@ -1780,7 +1780,7 @@ Side-panel on node / edge click in Threat mode. Buttons call existing plugin act
 ### Issue 19.7: Cross-Platform Parity Sweep — AV, Disk Encryption, Firewall
 **Capability:** 9.x extension | **Scope:** Agent (existing plugins) | **Status:** Proposed
 
-Audit `antivirus`, `bitlocker`, `firewall` plugins for macOS + Linux coverage. Plugin skeletons already have all three platform branches; verify each branch actually reports posture (gaps suspected on macOS XProtect / third-party AV, Linux ClamAV/SentinelOne/Crowdstrike, macOS FileVault, Linux LUKS, macOS `pfctl`, Linux `nftables`). Optionally rename `bitlocker` plugin to `disk_encryption` (decision deferred — breaking API token scope strings is the cost; recommendation in roadmap doc is to keep the name and add `disk_encryption` as an action alias).
+Audit `antivirus`, `bitlocker`, `firewall` plugins for macOS + Linux coverage. Plugin skeletons already have all three platform branches; verify each branch actually reports posture (macOS XProtect / third-party AV verified 2026-07-16 — real definition-bundle probe + endpoint-security extension enumeration, `security.antivirus.xprotect_status`; gaps remain: Linux ClamAV/SentinelOne/Crowdstrike, macOS FileVault, Linux LUKS, macOS `pfctl`, Linux `nftables`). Optionally rename `bitlocker` plugin to `disk_encryption` (decision deferred — breaking API token scope strings is the cost; recommendation in roadmap doc is to keep the name and add `disk_encryption` as an action alias).
 
 ### Issue 19.8: Container-Runtime Awareness — `Containerised` Edge Scope
 **Capability:** 28.8 | **Scope:** Server (topology classification) + agent (optional new plugin) | **Status:** Proposed

@@ -135,6 +135,10 @@ agent_test_exe = executable(
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
+    'unit/test_guardian_journal_format.cpp',
+    'unit/test_guardian_lifecycle_journal.cpp',
+    'unit/test_guardian_journal_heartbeat.cpp',
+    'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',
@@ -161,7 +165,10 @@ agent_test_exe = executable(
     'unit/test_guardian_spark_backend.cpp',
     'unit/test_guardian_emit_decider.cpp',
     'unit/test_guardian_rule_eval.cpp',
+    'unit/test_guardian_drift_event.cpp',
+    'unit/test_guardian_scope_guard.cpp',
     'unit/test_guardian_outbox.cpp',
+    'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_spark_runtime.cpp',
     'unit/test_guardian_state_reader.cpp',
     'unit/test_guardian_convergence_scheduler.cpp',
@@ -170,6 +177,8 @@ agent_test_exe = executable(
     'unit/test_guardian_engine_spark_reconcile.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
+    'unit/test_antivirus_parsers.cpp',
+    'unit/test_firewall_parsers.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -188,17 +197,24 @@ agent_test_exe = executable(
     'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
+    'unit/test_interaction_parsers.cpp',
+    'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
+    include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
+    include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated); also macos_console_user.hpp (test_certificates_macos.cpp)
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
     include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
+    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -397,6 +413,8 @@ if build_server
       'unit/server/test_engine_principal_integration.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
+      'unit/server/test_engine_principal_lifecycle.cpp',
+      'unit/server/test_engine_store_error_class.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
@@ -410,6 +428,7 @@ if build_server
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
+      'unit/server/test_guardian_ingest.cpp',
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',
@@ -476,6 +495,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
@@ -631,6 +651,26 @@ test('close automation logic',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Issue-lifecycle hygiene (ADR-3001 A1): CLAUDE.md character budget,
+# do-not-close.txt parses clean (the never-close guard every automated close
+# path reads), and issue-standard.md keeps its never-close section.
+test('issue lifecycle docs',
+  _python3_test,
+  args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# Runner-local CI telemetry contract: v2->v3 migration preserves history,
+# GitHub reruns remain distinct, and Meson suite durations/timeouts plus known
+# flake recoveries land in the persistent per-runner test-runs.db.
+test('ci telemetry selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_ci_telemetry.py')],
   suite: 'docs',
   timeout: 30,
 )
