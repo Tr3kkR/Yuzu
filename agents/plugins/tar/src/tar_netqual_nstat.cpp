@@ -77,9 +77,9 @@ std::optional<DecodedSrcRemoved> nstat_decode_src_removed(std::span<const std::b
 
 namespace {
 
-/// Darwin sockaddr_in / sockaddr_in6 field offsets within the raw 128-byte
-/// blob (sa_len[1] sa_family[1] port[2] ...) — NOT read via a system sockaddr
-/// type; see the header comment on nstat_raw::SockaddrBlob.
+/// Darwin sockaddr_in / sockaddr_in6 field offsets within the raw 28-byte
+/// sockaddr union (sa_len[1] sa_family[1] port[2] ...) — NOT read via a system
+/// sockaddr type; see the header comment on nstat_raw::SockaddrBlob.
 std::string format_ipv4(const std::uint8_t* b) {
     return std::format("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
 }
@@ -597,8 +597,11 @@ struct NstatClient::Impl {
                 // filters non-TCP away before the layout check runs, so a
                 // header that IS type SRC_DESC and STILL fails to decode has
                 // exhausted the benign explanations.
-                if (hdr->type == kNstatMsgSrcDesc &&
-                    !nstat_length_matches_expected(hdr->type, hdr->length)) {
+                // Already inside `case kNstatMsgSrcDesc`, so the type is fixed;
+                // a length self-check failure is the only way to get here after
+                // the provider filter, and it means our transcription disagrees
+                // with this kernel's descriptor size — fail to the inert state.
+                if (!nstat_length_matches_expected(hdr->type, hdr->length)) {
                     spdlog::warn("TAR: nstat SRC_DESC decode mismatch — "
                                 "transcribed TcpDescriptor disagrees with "
                                 "this kernel; disabling the nstat client");
@@ -610,10 +613,24 @@ struct NstatClient::Impl {
             bool first_desc = false;
             {
                 std::lock_guard<std::mutex> lk(flows_mu);
-                auto& flow = flows[desc->srcref]; // upsert — a DESC can race a missed ADDED
-                first_desc = !flow.has_desc;
-                nstat_apply_tcp_desc(flow, *desc);
-                flow.last_update_mono = mono;
+                // A DESC can race a missed ADDED, so this path also upserts —
+                // which means it must honour the same kNstatMaxFlows hard cap
+                // the ADDED path does (UP-2), or a burst of DESCs for unknown
+                // srcrefs could grow the table past the cap between reaps. Reap
+                // stale entries at the cap; if that frees nothing, drop this
+                // orphan (bounded + counted) rather than insert unconditionally.
+                auto it = flows.find(desc->srcref);
+                if (it == flows.end() && flows.size() >= kNstatMaxFlows)
+                    reap_stale_flows_locked(mono);
+                it = flows.find(desc->srcref);
+                if (it == flows.end() && flows.size() >= kNstatMaxFlows) {
+                    flow_reaped->fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    FlowState& flow = flows[desc->srcref];
+                    first_desc = !flow.has_desc;
+                    nstat_apply_tcp_desc(flow, *desc);
+                    flow.last_update_mono = mono;
+                }
                 flow_table_size->store(static_cast<std::int64_t>(flows.size()),
                                        std::memory_order_relaxed);
             }

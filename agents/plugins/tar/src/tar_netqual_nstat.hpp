@@ -107,6 +107,10 @@ struct NstatMsgHdr {
     std::uint16_t flags{0};
 };
 static_assert(sizeof(NstatMsgHdr) == 16);
+static_assert(offsetof(NstatMsgHdr, context) == 0);
+static_assert(offsetof(NstatMsgHdr, type) == 8);
+static_assert(offsetof(NstatMsgHdr, length) == 12);
+static_assert(offsetof(NstatMsgHdr, flags) == 14);
 
 /// Raw sockaddr storage — exactly the size of Darwin's
 /// `union { sockaddr_in; sockaddr_in6; }` (28 bytes: sockaddr_in6 is the
@@ -135,18 +139,22 @@ struct MsgAddAllSrcs {
 };
 static_assert(sizeof(MsgAddAllSrcs) == 56);
 static_assert(offsetof(MsgAddAllSrcs, provider) == 32);
+static_assert(offsetof(MsgAddAllSrcs, target_pid) == 36);
+static_assert(offsetof(MsgAddAllSrcs, target_uuid) == 40);
 
 struct MsgGetSrcDesc {
     NstatMsgHdr hdr;
     std::uint64_t srcref{0};
 };
 static_assert(sizeof(MsgGetSrcDesc) == 24);
+static_assert(offsetof(MsgGetSrcDesc, srcref) == 16);
 
 struct MsgQuerySrc {
     NstatMsgHdr hdr;
     std::uint64_t srcref{0};
 };
 static_assert(sizeof(MsgQuerySrc) == 24);
+static_assert(offsetof(MsgQuerySrc, srcref) == 16);
 
 /// nstat_msg_src_added. Field ORDER and WIDTH matter: `srcref` (u64) precedes
 /// `provider` (u32) + 4 reserved bytes — the reverse of a naive
@@ -166,6 +174,7 @@ struct MsgSrcRemoved {
     std::uint64_t srcref{0};
 };
 static_assert(sizeof(MsgSrcRemoved) == 24);
+static_assert(offsetof(MsgSrcRemoved, srcref) == 16);
 
 /// Fixed header of a SRC_DESC message (nstat_msg_src_description_header); the
 /// provider-specific descriptor (TcpDescriptor for the TCP providers) follows
@@ -180,6 +189,7 @@ struct MsgSrcDescHeader {
     std::uint8_t reserved[4]{};
 };
 static_assert(sizeof(MsgSrcDescHeader) == 40);
+static_assert(offsetof(MsgSrcDescHeader, srcref) == 16);
 static_assert(offsetof(MsgSrcDescHeader, provider) == 32);
 
 /// nstat_tcp_descriptor (TCP-provider SRC_DESC payload) at the macOS 13.3
@@ -260,6 +270,7 @@ static_assert(sizeof(Counts) == 112);
 static_assert(offsetof(Counts, txpackets) == 16);
 static_assert(offsetof(Counts, txretransmit) == 88);
 static_assert(offsetof(Counts, avg_rtt) == 104);
+static_assert(offsetof(Counts, var_rtt) == 108);
 
 /// nstat_msg_src_counts — like the SRC_DESC header, `event_flags` sits between
 /// `srcref` and the embedded counts.
@@ -270,6 +281,7 @@ struct MsgSrcCounts {
     Counts counts;
 };
 static_assert(sizeof(MsgSrcCounts) == 144);
+static_assert(offsetof(MsgSrcCounts, srcref) == 16);
 static_assert(offsetof(MsgSrcCounts, counts) == 32);
 
 } // namespace nstat_raw
