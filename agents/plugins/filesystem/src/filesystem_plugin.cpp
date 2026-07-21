@@ -75,6 +75,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
@@ -259,6 +260,18 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
     if (pipe(pipe_fd) != 0)
         return {};
 
+    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC on
+    // both pipe ends before the lock is released, so a concurrent locked
+    // launcher forking in the unlock->close window can never inherit a live,
+    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
+    // failed pipe() above rather than silently forking with a leaky fd.
+    if (fcntl(pipe_fd[0], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(pipe_fd[1], F_SETFD, FD_CLOEXEC) == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return {};
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         close(pipe_fd[0]);
@@ -275,17 +288,19 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
         dup2(pipe_fd[1], STDOUT_FILENO);
         close(pipe_fd[1]);
 
+        // Absolute paths only: no PATH search in the async-signal-safe child
+        // (matches subprocess_runner.cpp's BR-003 execv rationale).
 #ifdef __APPLE__
         if (algorithm == "sha1") {
-            execlp("shasum", "shasum", "-a", "1", path.c_str(), nullptr);
+            execl("/usr/bin/shasum", "shasum", "-a", "1", path.c_str(), nullptr);
         } else {
-            execlp("shasum", "shasum", "-a", "256", path.c_str(), nullptr);
+            execl("/usr/bin/shasum", "shasum", "-a", "256", path.c_str(), nullptr);
         }
 #else
         if (algorithm == "sha1") {
-            execlp("sha1sum", "sha1sum", path.c_str(), nullptr);
+            execl("/usr/bin/sha1sum", "sha1sum", path.c_str(), nullptr);
         } else {
-            execlp("sha256sum", "sha256sum", path.c_str(), nullptr);
+            execl("/usr/bin/sha256sum", "sha256sum", path.c_str(), nullptr);
         }
 #endif
         _exit(127);

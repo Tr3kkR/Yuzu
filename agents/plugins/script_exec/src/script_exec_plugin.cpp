@@ -207,6 +207,21 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
         return 1;
     }
 
+    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC
+    // (F_SETFD, distinct from the O_NONBLOCK F_SETFL below) on both pipe
+    // ends before the lock is released, so a concurrent locked launcher
+    // forking in the unlock->close window can never inherit a live,
+    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
+    // failed pipe() above rather than silently forking with a leaky fd.
+    if (fcntl(pipe_fd[0], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(pipe_fd[1], F_SETFD, FD_CLOEXEC) == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        ctx.write_output("status|error");
+        ctx.write_output("exit_code|-1");
+        return 1;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         close(pipe_fd[0]);

@@ -39,6 +39,7 @@
 #include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
 
 #include <openssl/evp.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -356,6 +357,19 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         output = "failed to create pipe";
+        return -1;
+    }
+
+    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC on
+    // both pipe ends before the lock is released, so a concurrent locked
+    // launcher forking in the unlock->close window can never inherit a live,
+    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
+    // failed pipe() above rather than silently forking with a leaky fd.
+    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        output = "failed to set pipe close-on-exec";
         return -1;
     }
 
