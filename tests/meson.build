@@ -409,6 +409,7 @@ if build_server
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_spark_fleet_tags.cpp',
+      'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -503,11 +504,13 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
-      # Spark tag-key pin: test_spark_fleet_tags.cpp includes the agent's
-      # spark_heartbeat.hpp (emit_spark_heartbeat_tags) to assert the agent's actual
-      # emitted keys equal the server-side spark_fleet_tags.hpp constants — a full
+      # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags), and
+      # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
+      # (emit_guardian_journal_heartbeat_tags), each asserting the agent's actual
+      # emitted keys equal the matching server-side *_fleet_tags.hpp table - a full
       # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
-      # template — no link to yuzu_agent_core, just the include path.
+      # templates - no link to yuzu_agent_core, just the include path.
       #
       # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
