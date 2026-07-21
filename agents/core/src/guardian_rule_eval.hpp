@@ -169,6 +169,12 @@ struct EvalOutcome {
     bool recovered{false};      ///< this Known outcome is the FIRST after an Unknown gap; the runtime
                                 ///< also emits guard.healthy so the health stream leaves the errored
                                 ///< state even when the verdict itself is Silent (systemd steady-compliant)
+    bool unhealthy_edge{false}; ///< iff status == Unhealthy: this is the FIRST Unknown of an errored
+                                ///< episode (in_unknown was false going in). The runtime emits
+                                ///< guard.unhealthy ONLY on this edge; a repeat Unknown while already
+                                ///< errored is suppressed + counted, so a rule stuck Unknown (unreadable
+                                ///< file, EACCES hive, unqueryable service) does not re-mint a fresh
+                                ///< health event on every ~5s convergence re-eval (M1 flood guard).
 };
 
 /// Evaluate a file rule against a tri-state read. Returns Emit / Silent / Unhealthy.

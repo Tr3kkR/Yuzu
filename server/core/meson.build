@@ -535,6 +535,7 @@ yuzu_server_core_lib = static_library(
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
     'src/rate_limiter.cpp',
+    'src/principal_quota.cpp',
     'src/cert_reloader.cpp',
     'src/x509_ca.cpp',
     # key_provider.cpp lives in the yuzu_key_provider leaf target above

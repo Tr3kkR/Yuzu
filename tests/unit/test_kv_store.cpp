@@ -621,3 +621,103 @@ TEST_CASE("KvStore::pragma_synchronous reports a valid level", "[kv_store][entri
     CHECK(level >= 0);
     CHECK(level <= 3);
 }
+
+// ── namespace_size (#2303 C1): direct coverage of the aggregate size probe ──────
+
+TEST_CASE("KvStore::namespace_size counts rows and sums value bytes", "[kv_store][entries]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:a", "12345"));   // 5 bytes
+    REQUIRE(t.store.set("p1", "lc:b", "678"));     // 3 bytes
+    REQUIRE(t.store.set("p1", "other:c", "9999")); // different prefix, must NOT count
+
+    auto sz = t.store.namespace_size("p1", "lc:");
+    REQUIRE(sz.has_value());
+    CHECK(sz->count == 2);
+    CHECK(sz->bytes == 8); // 5 + 3, the "other:" row excluded by the prefix
+
+    // Cross-check against list_entries: same rows, and the byte sum equals the sum
+    // of KvRow::value.size() - the exact accounting namespace_size must mirror.
+    auto rows = t.store.list_entries("p1", "lc:");
+    REQUIRE(rows.has_value());
+    std::uint64_t byte_sum = 0;
+    for (const auto& r : *rows)
+        byte_sum += r.value.size();
+    CHECK(sz->count == rows->size());
+    CHECK(sz->bytes == byte_sum);
+}
+
+TEST_CASE("KvStore::namespace_size on an empty namespace is {0,0}, not an error",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    // No rows at all, and a non-existent plugin: both must be a clean {0,0}, so a
+    // caller can distinguish "nothing there" from a DB error (the fail-closed seed
+    // in GuardianLifecycleJournal relies on exactly that distinction).
+    auto empty = t.store.namespace_size("p1", "lc:");
+    REQUIRE(empty.has_value());
+    CHECK(empty->count == 0);
+    CHECK(empty->bytes == 0);
+
+    REQUIRE(t.store.set("p1", "lc:a", "x"));
+    auto other_plugin = t.store.namespace_size("does-not-exist", "lc:");
+    REQUIRE(other_plugin.has_value());
+    CHECK(other_plugin->count == 0);
+    CHECK(other_plugin->bytes == 0);
+}
+
+TEST_CASE("KvStore::namespace_size sizes multibyte values in BYTES, not characters",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    const std::string v = "café-日本語"; // > one byte per code point
+    REQUIRE(t.store.set("p1", "lc:u", v));
+    auto sz = t.store.namespace_size("p1", "lc:");
+    REQUIRE(sz.has_value());
+    CHECK(sz->count == 1);
+    CHECK(sz->bytes == v.size()); // octet_length == std::string byte length, not glyph count
+}
+
+// ── LIKE-prefix escaping (#2303 C1): the shared escape_like_prefix helper ────────
+
+TEST_CASE("KvStore prefix scans escape LIKE wildcards in the prefix", "[kv_store][entries]") {
+    // list / list_entries / namespace_size all route their prefix through the one
+    // escape_like_prefix helper. A literal '_' or '%' in the prefix must match
+    // ITSELF, not act as a wildcard - otherwise a scan silently widens to keys the
+    // caller never asked for. Guards the extraction that folded three call sites.
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "a_b:1", "match"));   // literal underscore
+    REQUIRE(t.store.set("p1", "aXb:1", "wildcard")); // '_' would match this X
+    REQUIRE(t.store.set("p1", "a%b:1", "pct"));      // literal percent
+    REQUIRE(t.store.set("p1", "azzzb:1", "pctwild")); // '%' would match this run
+
+    // "a_b:" must match only the literal-underscore key, not "aXb:".
+    auto under = t.store.list("p1", "a_b:");
+    CHECK(under.size() == 1);
+    auto under_sz = t.store.namespace_size("p1", "a_b:");
+    REQUIRE(under_sz.has_value());
+    CHECK(under_sz->count == 1);
+
+    // "a%b:" must match only the literal-percent key, not "azzzb:".
+    auto pct = t.store.list_entries("p1", "a%b:");
+    REQUIRE(pct.has_value());
+    CHECK(pct->size() == 1);
+    CHECK(pct->front().value == "pct");
+}
+
+// ── rename_key extended-result-code masking (#2303 K1) ──────────────────────────
+
+TEST_CASE("KvStore::rename_key reports Conflict even with extended result codes on",
+          "[kv_store][entries]") {
+    // K1: rename_key classifies a PK conflict with `(rc & 0xFF) == SQLITE_CONSTRAINT`.
+    // With extended result codes enabled, step() returns SQLITE_CONSTRAINT_PRIMARYKEY
+    // (1555), whose low byte is SQLITE_CONSTRAINT (19). Without the mask the bare
+    // compare would miss and misreport the conflict as Error. This is the only test
+    // that turns extended codes on, so it is the one that actually pins the mask.
+    auto t = make_test_store();
+    t.store.enable_extended_result_codes_for_test();
+    REQUIRE(t.store.set("p1", "lc:a", "A"));
+    REQUIRE(t.store.set("p1", "lc:b", "B"));
+
+    CHECK(t.store.rename_key("p1", "lc:a", "lc:b") == KvRename::Conflict);
+    // Both rows survive untouched, exactly as in the primary-code path.
+    CHECK(t.store.get("p1", "lc:a").value_or("") == "A");
+    CHECK(t.store.get("p1", "lc:b").value_or("") == "B");
+}

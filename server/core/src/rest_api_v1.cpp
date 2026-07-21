@@ -15,6 +15,7 @@
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
+#include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -9038,6 +9039,11 @@ void RestApiV1::register_routes(
                 sink_state->cv.notify_one();
             });
 
+        // UP-1: adopt any pending engine QuotaSlot into this stream's
+        // resource-releaser so the concurrency reservation survives for the
+        // stream's actual lifetime instead of releasing early at
+        // post-routing (see is_streaming_path / adopt_quota_slot_into_stream
+        // in principal_quota_gate.hpp).
         res.set_chunked_content_provider(
             "text/event-stream",
             [sink_state, exec_id_for_capture, metrics_registry](size_t /*offset*/,
@@ -9149,15 +9155,16 @@ void RestApiV1::register_routes(
                     return false;
                 return true;
             },
-            [sink_state, bus, exec_id_for_capture, metrics_registry](bool /*success*/) {
-                sink_state->closed.store(true);
-                sink_state->cv.notify_all();
-                bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
-                if (metrics_registry) {
-                    metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
-                        .decrement();
-                }
-            });
+            detail::adopt_quota_slot_into_stream(
+                [sink_state, bus, exec_id_for_capture, metrics_registry](bool /*success*/) {
+                    sink_state->closed.store(true);
+                    sink_state->cv.notify_all();
+                    bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+                    if (metrics_registry) {
+                        metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
+                            .decrement();
+                    }
+                }));
     });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");

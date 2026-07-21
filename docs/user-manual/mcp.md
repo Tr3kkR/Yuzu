@@ -178,7 +178,11 @@ change: a notification POST now answers `202` instead of `204`).
   session cap returns `-32010` / `429` on `initialize` when full.
 - **`GET /mcp/v1/`** returns `405` today — the SSE channel (`Last-Event-ID`
   resume) and `notifications/progress` for long-running tools ship in the next 2f
-  rungs (see `docs/mcp-server.md`).
+  rungs (see `docs/mcp-server.md`). **Forward guard:** when that channel lands,
+  it must adopt an engine principal's per-principal quota concurrency slot
+  into the stream's lifetime, the same as the three routes already covered
+  by the PR 4.4 quota cap — see `docs/user-manual/engine-principals.md`
+  "Per-principal quota cap" for the UP-1 rationale.
 - The session id is **transport affinity only** — never an auth credential;
   per-request token auth runs on every method regardless.
 
@@ -817,6 +821,26 @@ never evicted to make room.
 
 **Fix**: End an unused session with `DELETE /mcp/v1/` (presenting its
 `Mcp-Session-Id`), or wait for an idle session to time out.
+
+> **Same code, second cause (PR 4.4, ADR-1005 class engine principals).**
+> `-32010` / HTTP `429` is also returned, on **any** `/mcp/` request (not just
+> `initialize`), when an **engine-principal** session (`principal_kind==
+> "engine"`, username `engine:<slug>`) exceeds its per-principal concurrency
+> or rate cap — the identical decision REST engine traffic gets, rendered as
+> a JSON-RPC `id: null` error instead of the A4 HTTP body (see
+> `docs/user-manual/rest-api.md` "Per-principal quota cap"). The code is
+> intentionally shared with the session-cap denial above (both are "you are
+> over a per-principal cap on `/mcp/`"); distinguish the two by `error.message`
+> ("per-principal rate limit exceeded" / "per-principal concurrency cap
+> exceeded" vs the session-limit message) and by the fact that this variant's
+> `retry_after_ms` is **non-null** — a rate rejection carries the token
+> bucket's actual refill time, a concurrency rejection a fixed 250ms backoff
+> — whereas the session-cap denial's `retry_after_ms` is always `null`. This
+> path applies **only** to engine-principal traffic; human/agent/anonymous
+> MCP sessions never hit it. It is per-server-process (a multi-replica
+> deployment gives each engine principal N x the configured cap) and is
+> metric-only — `yuzu_server_principal_quota_exhausted_total{side,limit}` —
+> with **no** audit row (see `docs/user-manual/audit-log.md`).
 
 ### -32004: MCP tier does not allow this operation
 

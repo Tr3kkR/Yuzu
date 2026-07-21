@@ -372,6 +372,11 @@ TEST_CASE("journal prune: over-cap quarantine eviction is counted, not silent (U
     j.prune(0); // quarantines 3, then sheds 2 over the cap of 1
     CHECK(count_keys(*t.kv, kQuarantineKeyPrefix) == 1);
     CHECK(j.quarantine_capacity_evicted() == 2); // the shed is COUNTED, not silent
+    // Gauge tracks the lc: namespace: the rebase counted all 3 garbage rows, the quarantine
+    // fetch_subs removed all 3 (they left lc:), so the live-batch gauge is back to 0 (#2303 -
+    // the quarantine-path fetch_sub, otherwise untested here).
+    CHECK(j.journal_batch_count() == 0);
+    CHECK(j.journal_bytes() == 0);
 }
 
 TEST_CASE("journal size gauges track live batches + bytes across persist and prune",
@@ -393,4 +398,239 @@ TEST_CASE("journal size gauges track live batches + bytes across persist and pru
     CHECK(j.journal_batch_count() == 1);
     CHECK(j.journal_bytes() > 0);
     CHECK(j.journal_bytes() < bytes2);
+}
+
+// ── #2303 C1: the write ceiling must not forget the on-disk journal at startup ──
+
+TEST_CASE("journal reopen: a fresh instance seeds its size gauges from the on-disk journal",
+          "[guardian][journal][persist][reopen]") {
+    TestKv t;
+    std::uint64_t bytes_before = 0;
+    {
+        GuardianLifecycleJournal a(t.kv.get());
+        REQUIRE(a.persist(one("r1", "armed")) == 1);
+        REQUIRE(a.persist(one("r2", "armed")) == 1);
+        REQUIRE(a.journal_batch_count() == 2);
+        bytes_before = a.journal_bytes();
+    }
+
+    // Restart: a new journal instance over the SAME on-disk journal. Before the fix both gauges
+    // started at 0 here, so the write ceiling was blind to everything already on disk until the
+    // first successful prune - and start_local()'s arm flush persists before any prune runs.
+    GuardianLifecycleJournal b(t.kv.get());
+    CHECK(b.journal_batch_count() == 2);
+    // Byte-EXACT, not merely non-zero: this cross-pins namespace_size's
+    // SUM(octet_length(value)) against the value.size() accounting persist/prune use.
+    CHECK(b.journal_bytes() == bytes_before);
+}
+
+TEST_CASE("journal reopen: the write ceiling is enforced against pre-existing batches",
+          "[guardian][journal][persist][reopen]") {
+    TestKv t;
+    {
+        GuardianLifecycleJournal a(t.kv.get());
+        REQUIRE(a.persist(one("r1", "armed")) == 1);
+        REQUIRE(a.persist(one("r2", "armed")) == 1);
+    }
+
+    // The reopened instance is at its ceiling from its FIRST write - no free window in which a
+    // crash-loop could grow the SHARED kv_store.db past the hard cap.
+    GuardianLifecycleJournal b(t.kv.get());
+    b.set_write_ceiling_for_test(/*max_batches=*/2, /*max_bytes=*/kNoCap);
+    CHECK(b.persist(one("r3", "armed")) == 0);
+    CHECK(b.write_capacity_rejected() == 1);
+    CHECK(b.write_failures() == 0);                 // refused by the ceiling, not a failed write
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2); // r3 never reached the shared DB
+}
+
+TEST_CASE("journal reopen: multibyte values are sized in BYTES, not characters",
+          "[guardian][journal][persist][reopen]") {
+    // Guards the octet_length(value) in namespace_size: bare LENGTH() on a TEXT column counts
+    // CHARACTERS, so a multibyte rule_name would seed the byte gauge LOW - the one direction
+    // that silently loosens the write ceiling.
+    TestKv t;
+    std::uint64_t bytes_before = 0;
+    {
+        GuardianLifecycleJournal a(t.kv.get());
+        auto r = rec("r1", "armed");
+        r.rule_name = "café-日本語-Ünïcödé"; // multibyte
+        std::vector<std::shared_ptr<const JournalRecord>> pending{
+            std::make_shared<const JournalRecord>(r)};
+        REQUIRE(a.persist(pending) == 1);
+        bytes_before = a.journal_bytes();
+    }
+
+    GuardianLifecycleJournal b(t.kv.get());
+    CHECK(b.journal_batch_count() == 1);
+    CHECK(b.journal_bytes() == bytes_before);
+}
+
+TEST_CASE("journal reopen: an un-sizable journal fails CLOSED (assume at ceiling)",
+          "[guardian][journal][persist][reopen]") {
+    TestKv t;
+    // Move the store out from under the journal: the moved-from KvStore is closed (db_ null),
+    // so the construction-time size probe fails exactly as a chronic SQLITE_BUSY or a corrupt
+    // page would. We have least right to assume "empty" precisely when we cannot read it, so
+    // the posture is assume-at-ceiling: refuse + COUNT, never silently write on.
+    KvStore closed{std::move(*t.kv)};
+
+    GuardianLifecycleJournal j(t.kv.get());
+    CHECK(j.journal_batch_count() == kMaxJournalBatches * 2); // the default hard ceiling
+    CHECK(j.journal_bytes() == kMaxJournalBytes * 2);
+
+    CHECK(j.persist(one("r1", "armed")) == 0);
+    CHECK(j.write_capacity_rejected() == 1);
+    CHECK(j.write_failures() == 0); // refused BEFORE the write, not attempted and failed
+}
+
+// ── #2303 gauge-race: prune must not clobber a concurrent persist ───────────────
+
+TEST_CASE("journal prune: rebase-as-delta preserves a concurrent persist's increment (#2303)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(j.journal_batch_count() == 2);
+
+    // Fire a simulated concurrent persist() in the exact window between prune's scan and its
+    // removal accounting - the window an absolute survivor-store clobbers. The scan captured
+    // 2 rows; the old `store(survivors.size())` would publish 2 and silently lose this 3rd
+    // insert, under-counting the write ceiling. Rebase-as-delta (RMW only) must keep it.
+    bool fired = false;
+    j.set_post_scan_hook_for_test([&] {
+        if (fired)
+            return;
+        fired = true;
+        REQUIRE(j.persist(one("r3", "armed")) == 1); // lands on disk + fetch_adds the gauge
+    });
+
+    auto s = j.prune(0); // retention wide open: nothing evicted, so gauge == true on-disk size
+    CHECK(s.read_ok);
+    CHECK(fired);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 3);
+    CHECK(j.journal_batch_count() == 3); // the concurrent insert survived the rebase, not clobbered
+    // Exact bytes, not merely > 0: cross-pin the byte gauge against the true on-disk size so a
+    // bytes-SIDE clobber (which the count check above would miss) also fails this test.
+    auto sz = t.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(sz.has_value());
+    CHECK(j.journal_bytes() == sz->bytes);
+    CHECK(sz->bytes > 0);
+}
+
+TEST_CASE("journal prune: rebases a fail-closed boot seed back to on-disk reality (#2303)",
+          "[guardian][journal][prune][reopen]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    j.set_write_ceiling_for_test(/*max_batches=*/1000, /*max_bytes=*/kNoCap);
+
+    // Stage the fail-closed boot seed: the ctor size-probe failed once, pinning the gauge at
+    // the hard ceiling. A pure fetch_sub scheme (no rebase) could never walk this back down -
+    // one unlucky boot would brick journal writes forever. Rebase-as-delta must recover it.
+    j.set_size_gauges_for_test(/*count=*/1000, /*bytes=*/1000);
+    CHECK(j.persist(one("bricked", "armed")) == 0); // ceiling reads full -> rejected
+    CHECK(j.write_capacity_rejected() == 1);
+
+    auto s = j.prune(0); // a successful scan rebases the gauge to the true 2 on disk
+    CHECK(s.read_ok);
+    CHECK(j.journal_batch_count() == 2); // recovered from the conservative seed
+    // Byte gauge recovers too: this is the ONLY test exercising the NEGATIVE-delta (ceiling ->
+    // reality walk-down) byte rebase, so cross-pin it against on-disk truth (consistency review).
+    auto sz = t.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(sz.has_value());
+    CHECK(j.journal_bytes() == sz->bytes);
+
+    CHECK(j.persist(one("r3", "armed")) == 1); // writes work again - no longer bricked
+    CHECK(j.journal_batch_count() == 3);
+}
+
+TEST_CASE("journal prune: a persist in the PRE-scan window over-counts safely, heals next scan "
+          "(#2303 UP-3)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(j.persist(one("r2", "armed")) == 1);
+
+    // Fire a concurrent persist in the window AFTER pre_count is snapshotted but BEFORE
+    // list_entries - so the new row is BOTH seen by the scan (in rows->size()) AND carries its
+    // own fetch_add: the transient DOUBLE-count. It must be an OVER-count (ceiling tightens,
+    // never loosens), then heal to on-disk truth on the next scan.
+    bool fired = false;
+    j.set_pre_scan_hook_for_test([&] {
+        if (fired)
+            return;
+        fired = true;
+        REQUIRE(j.persist(one("r3", "armed")) == 1);
+    });
+
+    auto s1 = j.prune(0);
+    CHECK(s1.read_ok);
+    CHECK(fired);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 3);
+    CHECK(j.journal_batch_count() == 4);  // double-counted: rebase(+1) on top of persist(+1)
+    CHECK(j.journal_batch_count() >= 3);  // the invariant: never BELOW on-disk (ceiling stays safe)
+
+    // Next scan (no hook) rebases via the unclamped pre_count and heals exactly to the 3 on disk.
+    j.set_pre_scan_hook_for_test(nullptr);
+    auto s2 = j.prune(0);
+    CHECK(s2.read_ok);
+    CHECK(j.journal_batch_count() == 3);
+    CHECK(j.gauge_underflow() == 0); // an over-count never trips the negative tripwire
+}
+
+TEST_CASE("journal persist: a negative gauge fails CLOSED and recovers after a prune rebase "
+          "(#2303 UP-2 / Sol)",
+          "[guardian][journal][persist]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+
+    // Force a negative gauge. This cannot happen in correct operation (every lc: row is
+    // counted), so the seam stages the state a future over-subtraction bug would produce.
+    j.set_size_gauges_for_test(/*count=*/-5, /*bytes=*/-5);
+
+    // FAIL-CLOSED: the write is REFUSED (not admitted on a clamp-to-0 read, which would be
+    // fail-OPEN and grow the shared kv_store.db on an untrusted size), and the tripwire counts.
+    CHECK(j.persist(one("neg", "armed")) == 0);
+    CHECK(j.gauge_underflow() >= 1);
+    CHECK(j.write_failures() == 0);                 // refused BEFORE the write, not attempted and failed
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1); // the refused row never reached the shared DB
+
+    // A successful prune rebases the gauge back to on-disk reality (the unclamped pre_count
+    // walks the negative up); writes then resume.
+    auto s = j.prune(0);
+    CHECK(s.read_ok);
+    CHECK(j.journal_batch_count() == 1); // rebased to the one row (r1) actually on disk
+    CHECK(j.persist(one("r2", "armed")) == 1); // no longer refused
+    CHECK(j.journal_batch_count() == 2);
+}
+
+TEST_CASE("journal persist: a negative gauge stays bricked while prune scans keep failing "
+          "(#2303 UP-1 / chaos)",
+          "[guardian][journal][persist]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    j.set_size_gauges_for_test(/*count=*/-3, /*bytes=*/-3); // simulate an over-subtraction bug
+
+    // Recovery is ONLY via a successful prune rebase (UP-1). While the scan chronically fails,
+    // the negative gauge is never walked back and writes stay refused - bricked, but BOUNDED
+    // (records defer to RAM staging, drops counted) rather than the old unbounded fail-open.
+    j.inject_read_failures_for_test(2);
+    CHECK(j.persist(one("x1", "armed")) == 0); // still refused
+    auto f1 = j.prune(0);
+    CHECK_FALSE(f1.read_ok); // scan failed -> no rebase
+    CHECK(j.persist(one("x2", "armed")) == 0); // still bricked
+    auto f2 = j.prune(0);
+    CHECK_FALSE(f2.read_ok);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1); // nothing written while bricked (only r1)
+
+    // The FIRST successful scan rebases and unbricks - no latched-bad state.
+    auto ok = j.prune(0);
+    CHECK(ok.read_ok);
+    CHECK(j.journal_batch_count() == 1);
+    CHECK(j.persist(one("r2", "armed")) == 1); // recovered
 }

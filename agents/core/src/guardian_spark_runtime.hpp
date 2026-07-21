@@ -277,6 +277,13 @@ public:
     [[nodiscard]] std::uint64_t journal_clock_rejected() const noexcept {
         return journal_clock_rejected_.load(std::memory_order_relaxed);
     }
+    /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
+    /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
+    /// first Unknown of an episode emits a health event. Non-zero means at least one rule is
+    /// persistently errored - the count is the number of ticks NOT flooded onto the wire.
+    [[nodiscard]] std::uint64_t unhealthy_suppressed() const noexcept {
+        return unhealthy_suppressed_.load(std::memory_order_relaxed);
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -473,6 +480,9 @@ private:
     // re-enter drain() (it would self-deadlock on this mutex); none does.
     std::mutex drain_mu_;
     std::atomic<std::uint64_t> send_exceptions_{0}; ///< drain sends that threw (item 4 hardening)
+    std::atomic<std::uint64_t> unhealthy_suppressed_{0}; ///< repeat Unknown evals whose guard.unhealthy
+                                                         ///< was edge-suppressed (rule stuck errored;
+                                                         ///< NOT re-minted every ~5s convergence tick). M1.
 };
 
 } // namespace yuzu::agent

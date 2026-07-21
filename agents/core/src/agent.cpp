@@ -46,6 +46,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
@@ -87,6 +88,15 @@ namespace {
 namespace pb = ::yuzu::agent::v1;
 namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
+
+// #2303 sec-L. The daily-sync scheduler (ADR-0016) persists last-hash / need_full state in this
+// kv_store namespace, keyed the same way plugin storage is (by the plugin's own declared name).
+// It MUST be a reserved plugin name, or a native plugin could claim it and forge/clear the sync
+// state to force or suppress a daily push. The static_assert binds this constant to
+// kReservedPluginNames so the two cannot drift; both kv_store call sites use it.
+constexpr std::string_view kSyncKvNamespace = "__sync__";
+static_assert(is_reserved_plugin_name(kSyncKvNamespace),
+              "kSyncKvNamespace must be a reserved plugin name (plugin_loader.hpp)");
 
 #if defined(_WIN32)
 constexpr const char* kAgentOs = "windows";
@@ -1810,12 +1820,12 @@ public:
                                    sync_stop_.load(std::memory_order_acquire);
                         };
                         auto kv_get = [this](const std::string& key) -> std::string {
-                            auto v = kv_store_ ? kv_store_->get("__sync__", key) : std::nullopt;
+                            auto v = kv_store_ ? kv_store_->get(kSyncKvNamespace, key) : std::nullopt;
                             return v ? *v : std::string{};
                         };
                         auto kv_set = [this](const std::string& key, const std::string& value) {
                             if (kv_store_)
-                                kv_store_->set("__sync__", key, value);
+                                kv_store_->set(kSyncKvNamespace, key, value);
                         };
                         auto sender =
                             [this, &sync_stub](
@@ -2001,6 +2011,13 @@ public:
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
                                 emit_guardian_journal_heartbeat_tags(tags, guardian_->journal_stats());
+                                // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
+                                // edge-emitted and each suppressed repeat is counted, so the
+                                // suppression is observable (not silent). Sparse: non-zero only.
+                                // Key pinned in guardian_health_heartbeat.hpp (drift-proofs the
+                                // #2298 server-side rollup reader).
+                                emit_guardian_health_heartbeat_tags(tags,
+                                                                    guardian_->unhealthy_suppressed());
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —

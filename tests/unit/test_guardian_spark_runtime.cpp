@@ -454,6 +454,108 @@ TEST_CASE("a configured capacity below two is floored so a recovery pair can nev
     REQUIRE(rt->pending_initial(key).empty());
 }
 
+TEST_CASE("Unknown flood guard: repeat errored evals emit one health(false), count the rest (M1)",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    // First errored eval -> exactly one guard.unhealthy on the wire; nothing suppressed yet.
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // The convergence priority lane re-visits a rule still owing a verdict every tick. Three
+    // more errored re-evals must produce NO new wire entries - each is counted instead, so a
+    // rule stuck errored can't flood the fleet's health-event ingest.
+    for (int i = 0; i < 3; ++i)
+        rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+    REQUIRE_FALSE(rt->pending_initial(key).empty()); // still Unknown -> still owes a verdict
+
+    // Recovery emits guard.healthy (+ the compliant edge) and re-arms the edge: the NEXT
+    // Unknown emits a fresh health(false), and the suppression counter is untouched by it.
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto recovered = drain_all(*rt);
+    // Precisely: recovery MUST emit a guard.healthy (Health domain, healthy=true), not merely
+    // "some entry" - a regression that dropped health(true) on recovery would leave the health
+    // stream stuck errored forever (qa Gate-3 SHOULD).
+    REQUIRE(std::any_of(recovered.begin(), recovered.end(), [](const OutboxEntry& e) {
+        return e.domain == OutboxDomain::Health && e.healthy;
+    }));
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+}
+
+TEST_CASE("Unknown edge rejected at outbox cap is retried, never counted as suppressed (M1)",
+          "[spark][runtime]") {
+    // Metrics-honesty invariant: unhealthy_suppressed_ counts only COMMITTED repeat-Unknowns,
+    // never an edge the outbox rejected (that edge is re-attempted, not suppressed). Guards the
+    // counter's placement AFTER the accept-check + COMMIT against a future refactor that hoists it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor
+    auto rt = make_rt(r, b, cfg);
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/false), true); // drifts
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/false), true); // drifts
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc", /*present=*/true), true);
+
+    // Fill the outbox with two drifts (no slot left).
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    // Edge Unknown for rc while the outbox is full: its single health(false) entry is rejected
+    // (both-or-neither), so nothing commits, rc stays pending, and NOTHING is counted suppressed -
+    // the edge was not delivered and will be retried, so counting it would over-report.
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(kc, EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+    REQUIRE(rt->pending_initial(kc) == std::vector<std::string>{"rc"});
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // Drain frees a slot; the STILL-first Unknown re-attempts as a fresh edge and lands.
+    drain_all(*rt);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    REQUIRE(drain_all(*rt).size() == 1);      // the edge health(false) finally delivered, not lost
+    REQUIRE(rt->unhealthy_suppressed() == 0); // still an edge, never a suppression
+}
+
+TEST_CASE("Unknown flood guard: two rules on one key each count suppression independently (M1)",
+          "[spark][runtime]") {
+    // The counter increments PER RULE inside the per-key eval loop, not once per key. A refactor
+    // that hoisted the increment outside the loop would silently under-count a multi-rule key
+    // (qa Gate-3 SHOULD). Two rules share one spark_key; both go Unknown together.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2", /*present=*/true), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    // First pass: both rules edge -> two health(false) on the wire, nothing suppressed.
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(drain_all(*rt).size() == 2);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+
+    // Second pass: both rules repeat -> no wire entries, +2 suppressed (one per rule, not one
+    // per key).
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 2);
+}
+
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -1220,6 +1322,44 @@ TEST_CASE("page_into_window prunes an expired batch before replaying (boot barri
     CHECK(lc[0].event_id == "e-new");
 }
 
+TEST_CASE("page_into_window pages NOTHING when the boot prune's scan fails (#2303 C4)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    // Both recent (neither ages out), so ONLY the count cap can evict - and only a prune whose
+    // scan succeeds can apply it.
+    write_batch("lc:aaa:000000000000", 1'700'000'000'000, "e-older");
+    write_batch("lc:bbb:000000000000", 1'700'000'001'000, "e-newer");
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/1,
+                                               /*max_bytes=*/std::size_t(-1), 100);
+
+    // The boot barrier's scan fails. Latching only on read_ok (M5) already kept the barrier
+    // un-latched, but the pass used to FALL THROUGH and replay anyway - handing the runtime
+    // exactly the over-cap candidates a good prune would have evicted, on the one pass the
+    // barrier exists to protect.
+    rig.journal->inject_read_failures_for_test(1);
+    const auto blocked = rig.journal->page_into_window(*rig.rt, 1'700'000'050'000LL);
+    CHECK(blocked.records_paged == 0);
+    CHECK(blocked.batches_paged == 0);
+    CHECK(drain_lifecycle(*rig.rt).empty());
+    CHECK(rig.journal->prune_failures() == 1); // counted, not silent
+
+    // Self-correcting: the failure latched nothing. The next pass prunes cleanly, applies the
+    // count cap, and replays only the survivor.
+    const auto ok = rig.journal->page_into_window(*rig.rt, 1'700'000'110'000LL);
+    CHECK(rig.journal->batches_pruned() == 1);
+    CHECK(ok.records_paged == 1);
+    auto lc2 = drain_lifecycle(*rig.rt);
+    REQUIRE(lc2.size() == 1);
+    CHECK(lc2[0].event_id == "e-newer"); // the oldest was evicted by the cap, never replayed
+}
+
 TEST_CASE("page_into_window stops enqueuing once request_stop is signalled (stop-race gate)",
           "[spark][runtime][journal]") {
     PageRig rig;
@@ -1423,5 +1563,16 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     stop.store(true, std::memory_order_relaxed);
     for (auto& w : workers)
         w.join();
-    SUCCEED("no data race across concurrent persist/page/prune/drain");
+
+    // Beyond race-freedom (TSan): the running-counter gauges (#2303) must stay ACCOUNTING-correct
+    // under the real concurrent persist/prune interleaving, not just data-race-free. A final
+    // settle prune (prune ignores stopping_, so it still runs) rebases to on-disk truth; the
+    // gauges must then exactly equal what namespace_size sees on disk - proving no lost update
+    // and no drift accumulated across the concurrent run.
+    rig.journal->prune(1'700'000'900'000);
+    auto sz = rig.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(sz.has_value());
+    CHECK(rig.journal->journal_batch_count() == sz->count);
+    CHECK(rig.journal->journal_bytes() == sz->bytes);
+    CHECK(rig.journal->gauge_underflow() == 0); // never fell into the fail-open underflow window
 }
