@@ -438,6 +438,10 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
             // Shutdown mid-classification: the eviction itself is already committed and counted;
             // only the best-effort sent/unsent split of the REMAINING keys is skipped, one KvStore
             // read each (C0 #2298 - keeps the drain-worker join prompt on a large evict set).
+            // The remainder is left unclassified, so evicted_sent_unacked_ +
+            // evicted_without_send_evidence_ can under-count batches_pruned_ after a
+            // shutdown. In-memory counters only - no durable evidence is lost - but an
+            // operator comparing them across a restart should expect the gap.
             if (stopping_.load(std::memory_order_acquire))
                 break;
             // Best-effort classification: a live entry may age out before its batch key exists,
@@ -468,24 +472,33 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // Sent-label GC: drop any sent:<...> whose batch no longer survives - an evicted batch's
     // label, or an orphan from a crash between the pop-after-send label write and eviction.
     if (auto sent = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+        // The gate above covered ENTERING this block; a stop can still land during the list
+        // itself, and each remaining step is another KvStore round trip (#2298 Sol review).
+        if (stopping_.load(std::memory_order_acquire))
+            return stats;
         std::vector<std::string> stale;
         for (const auto& s : *sent)
             if (!survivors.count(journal_batch_key_from_sent_key(s.key)))
                 stale.push_back(s.key);
-        if (!stale.empty())
+        if (!stale.empty() && !stopping_.load(std::memory_order_acquire))
             stats.sent_labels_gc =
                 static_cast<std::size_t>(kv_->del_keys(kJournalNamespace, stale));
     }
 
+    if (stopping_.load(std::memory_order_acquire))
+        return stats; // do not START the quarantine scan
+
     // Bound the quarantine set (drop oldest-by-key; corrupt batches have no trusted ts_ms).
     if (auto q = kv_->list_entries(kJournalNamespace, kQuarantineKeyPrefix)) {
-        if (q->size() > max_quarantine_) {
+        if (q->size() > max_quarantine_ && !stopping_.load(std::memory_order_acquire)) {
             std::vector<std::string> drop;
             const std::size_t excess = q->size() - max_quarantine_;
             for (std::size_t i = 0; i < excess; ++i)
                 drop.push_back((*q)[i].key); // list_entries is key-sorted
             // Count + warn the shed (review UP-7 / sre): a fleet quietly discarding over-cap
             // corrupt batches was previously invisible - an operator needs to see quarantine churn.
+            if (stopping_.load(std::memory_order_acquire))
+                return stats; // last gate before the final delete
             const int dropped = kv_->del_keys(kJournalNamespace, drop);
             if (dropped > 0) {
                 quarantine_capacity_evicted_.fetch_add(static_cast<std::uint64_t>(dropped),
