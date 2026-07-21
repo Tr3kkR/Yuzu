@@ -19,6 +19,8 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -181,6 +183,19 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
                                               .merge_stderr = false,
                                               .stop_after_max_lines = true});
 
+    // Surface degraded `log show` runs to operators: the sentinel row + rc are
+    // honest but only visible by parsing returned rows, so a hung/failed/
+    // truncated shell-out would otherwise be silent in the agent log.
+    if (result.timed_out || !result.tool_ran || result.exit_code != 0 || result.output_truncated) {
+        spdlog::warn("event_logs errors: macOS 'log show' {} (timed_out={}, tool_ran={}, "
+                     "exit_code={}, output_truncated={})",
+                     result.timed_out         ? "timed out"
+                     : !result.tool_ran       ? "unavailable"
+                     : result.exit_code != 0  ? "failed"
+                                              : "output truncated",
+                     result.timed_out, result.tool_ran, result.exit_code, result.output_truncated);
+    }
+
     // decide_log_show_output is the single source of truth for the
     // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
     // calls it and emits whatever it returns.
@@ -291,6 +306,19 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                                               .max_lines = static_cast<std::size_t>(count),
                                               .merge_stderr = false,
                                               .stop_after_max_lines = true});
+
+    // Surface degraded `log show` runs to operators: the sentinel row + rc are
+    // honest but only visible by parsing returned rows, so a hung/failed/
+    // truncated shell-out would otherwise be silent in the agent log.
+    if (result.timed_out || !result.tool_ran || result.exit_code != 0 || result.output_truncated) {
+        spdlog::warn("event_logs query: macOS 'log show' {} (timed_out={}, tool_ran={}, "
+                     "exit_code={}, output_truncated={})",
+                     result.timed_out         ? "timed out"
+                     : !result.tool_ran       ? "unavailable"
+                     : result.exit_code != 0  ? "failed"
+                                              : "output truncated",
+                     result.timed_out, result.tool_ran, result.exit_code, result.output_truncated);
+    }
 
     // decide_log_show_output is the single source of truth for the
     // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
