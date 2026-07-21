@@ -355,8 +355,30 @@ The journal also moved to `shared_ptr`, which DELETES the declaration-order depe
 first round documented as load-bearing. Section 24's invariant is kept, since the
 "never take mtx_" half still stands, but the ordering half is no longer correctness-critical.
 
-### Still not proven
+### Cutover gaps closed after the review
 
-The `WorkerHostileMutex` abort is wired and its predicate is tested, but the abort itself is
-not exercised - that needs a subprocess death-test harness this suite does not have. Treat
-it as a backstop, not as a licence to reason loosely about what runs on the worker thread.
+All three items the Sol review left open are now covered.
+
+- **The `WorkerHostileMutex` abort is proven.** A forked-child death test installs a send that
+  takes `mtx_` from the worker thread and asserts the child dies by `SIGABRT`. Proven
+  load-bearing by mutation: stub the guard and the child DEADLOCKS exactly as the production
+  bug would, and the test goes red. The parent polls with a deadline rather than blocking in
+  `waitpid`, because the failure under test IS a hang. Skips cleanly where the guard is
+  compiled out (release without sanitizers), since there the violation deadlocks instead.
+- **Production boot order is tested.** `wire_spark_engine()` before `start_local()` - what
+  agent.cpp actually does, and the reverse of what every prior test including the shared
+  fixture did. The worker's immediate first-cycle maintenance now races the pre-network
+  re-arm on one KvStore mutex; the test asserts neither starves the other.
+- **The send is exercised with real `Retain` semantics.** `StreamLikeSink` mirrors
+  `send_guardian_outbox_entry` (absent stream or failed write -> `Retain`), driving a full
+  link-down/backlog/reconnect cycle and a mid-drain link drop. This pins that a `Retain`
+  reports `truncated == false`, so a down link does not put the worker in a hot re-drain
+  loop - invisible to an always-Sent sink.
+
+That last test also corrected a misconception of mine rather than a defect: it initially
+asserted exactly-once delivery and failed at 15 sends for 12 distinct events. The durable
+journal is AT-LEAST-ONCE on purpose - it replays on every reconnect and the server
+de-duplicates on the `event_id` PK, counting
+`yuzu_server_guardian_events_redelivered_total`, which the metrics manual documents as normal
+after an outage and explicitly not a loss signal. Changing the code to satisfy the original
+assertion would have broken replay.
