@@ -718,3 +718,81 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
 }
 
 #endif // !_WIN32
+
+TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
+          "[spark][guardian][reconcile][journal][boot]") {
+    // Every other test here (and SparkReconcileFixture itself) calls start_local() BEFORE
+    // wire_spark_engine(). Production does the reverse - agent.cpp:969-1001 wires first and
+    // documents it as a header contract - so the order that actually ships was untested
+    // (#2298 Sol review).
+    //
+    // It matters because of C0: wire_spark_engine() start()s the drain worker, whose first
+    // cycle runs IMMEDIATELY and does journal maintenance against the KvStore. start_local()
+    // then loads cached rules and re-arms them from the SAME single-mutex KvStore. If that
+    // contention delayed or broke the pre-network re-arm, it would mean enforcement gaps at
+    // boot on every endpoint after the prefer_spark flip.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+
+    // Phase 1: an engine that persists cached rules AND a durable journal, then goes away.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Retain; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        for (int i = 0; i < 5; ++i)
+            *p.add_rules() = make_service_rule("r" + std::to_string(i));
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        engine.journal_maintenance_tick(); // force the pending records durable
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // Phase 2: a fresh boot in PRODUCTION order over that same store.
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    // WIRE FIRST - the worker starts here and immediately begins journal maintenance.
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    // ...and only THEN the pre-network re-arm, racing that maintenance on one KvStore.
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(engine.start_local().has_value());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // The re-arm must not have been starved by the boot maintenance scan. The KvStore busy
+    // timeout is 5 s, so anything approaching it means the two are serialising badly.
+    CHECK(elapsed < std::chrono::seconds(2));
+    CHECK(engine.rule_count() == 5); // every cached rule came back
+
+    // And the journal side still did its work rather than being crowded out.
+    auto* journal = engine.lifecycle_journal_for_test();
+    REQUIRE(journal != nullptr);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (journal->pages() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(journal->pages() >= 1);
+
+    engine.stop();
+    spark_engine.stop();
+}
