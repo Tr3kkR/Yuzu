@@ -229,14 +229,17 @@ used as-is — they aren't renames, so they create no split-brain.
     the durable journal with **no wire/contract change** — the durable journal is the
     standing target.
 
-    **Superseded (2026-07-21):** only the struck-through delivery-guarantee framing
-    above is superseded - the rest of this decision (append-only log, bounded
-    ring-buffer, HMAC-deferred, durability-agnostic event-sink) stands as designed and
-    built. The delivered journal narrowed the guarantee to crash-durable,
-    duplicate-tolerant, bounded-retry redelivery, not true at-least-once (no server
-    batch-ack). Delete-only-after-server-ack was never built; deletion is
-    retention-driven instead, and an entry that ages out unacknowledged is a rare,
-    counted loss, not silent. See [Reconnect replay
+    **Superseded (2026-07-21):** this is a documentation correction, not a behaviour
+    change - delete-only-after-server-ack was never actually built this way; only the
+    struck-through delivery-guarantee framing above was ever wrong. The rest of this
+    decision (append-only log, bounded ring-buffer, HMAC-deferred, durability-agnostic
+    event-sink) stands as designed and built. The delivered journal's guarantee is
+    crash-durable, duplicate-tolerant, bounded-retry redelivery, not true at-least-once
+    (no server batch-ack); deletion is retention-driven instead, and an entry that ages
+    out unacknowledged is a rare, counted loss, not silent. The "N dropped" ring-buffer
+    marker referenced above has the same live-visibility gap as that counter - no
+    dashboard/REST/MCP surface exposes either today (tracked #2298). See [Reconnect
+    replay
     traffic](user-manual/guaranteed-state.md#reconnect-replay-traffic-durable-lifecycle-journal)
     and the `yuzu_server_guardian_events_redelivered_total` row in [Guardian
     metrics](user-manual/metrics.md#guardian-metrics) for the shipped characterization.
