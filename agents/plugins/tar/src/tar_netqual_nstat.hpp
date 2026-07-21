@@ -23,7 +23,10 @@
  * (start/stop/running/drain/dropped/kernel_dropped/stalled/method_name) but is
  * NOT a `ProcStreamCollector` subclass — the drained event type is a tcp 4-tuple
  * open/close (`NstatFlowEvent`), not a `ProcEvent`, so the base interface (fixed
- * to `std::vector<ProcEvent>`) doesn't fit. `EventRing<T>` is generic, so the
+ * to `std::vector<ProcEvent>`) doesn't fit. This is the documented streaming-
+ * source exception in `docs/tar-implementer.md` §8.1 — the same reason
+ * `ImageStreamCollector` is a sibling interface, not a subclass: the contract,
+ * not the base class, is the invariant. `EventRing<T>` is generic, so the
  * lifecycle ring is `EventRing<NstatFlowEvent>` — the SAME backpressure idiom,
  * reused, not forked. `snapshot_quality()` is the one extra verb the streaming
  * contract has no room for: a live-table read (no drain) that answers the
@@ -73,15 +76,29 @@ namespace yuzu::tar {
 // ── Transcribed nstat wire structs (memo §1/§6) ────────────────────────────
 //
 // Plain fixed-width-int PODs, natural alignment (no #pragma pack — matches how
-// the kernel struct itself is declared; static_asserts below pin the sizes we
-// depend on so a future edit that introduces padding is caught at compile
-// time). Deliberately independent of any system <sys/socket.h> `sockaddr`
-// type: the wire bytes are always Darwin's layout regardless of the host this
-// decoder runs on (a portable unit test on Linux must decode the SAME bytes a
-// macOS kernel produced), so addresses are read by hand from a raw 128-byte
-// blob (`SockaddrBlob`) at the known Darwin `sockaddr_in`/`sockaddr_in6`
-// offsets — see nstat_decode_sockaddr() in the .cpp.
+// the kernel struct itself is declared; static_asserts below pin the sizes AND
+// the offsets we depend on so a future edit that reorders a field or
+// introduces padding is caught at compile time). Deliberately independent of
+// any system <sys/socket.h> `sockaddr` type: the wire bytes are always
+// Darwin's layout regardless of the host this decoder runs on (a portable unit
+// test on Linux must decode the SAME bytes a macOS kernel produced), so
+// addresses are read by hand from the 28-byte sockaddr union (`SockaddrBlob`)
+// at the known Darwin `sockaddr_in`/`sockaddr_in6` offsets — see
+// nstat_decode_sockaddr() in the .cpp.
 namespace nstat_raw {
+
+// Every struct and every static_assert below is transcribed field-for-field
+// from XNU `bsd/net/ntstat.h` (__NSTAT_REVISION__ 9, Ventura tag
+// xnu-8792.41.9 — the macOS 13.3 deployment floor). The `offsetof`/`sizeof`
+// asserts are the compile-time cross-check the review asked for: because that
+// header is XNU-private (absent from the macOS SDK) it cannot be #included
+// here, so instead every offset we actually read is pinned to the value the
+// real layout produces. A future edit that reorders a field, changes a width,
+// or introduces padding fails the build rather than silently misdecoding a
+// kernel datagram. The natural-alignment layout (no #pragma pack) mirrors how
+// the kernel declares these structs; the kernel's explicit
+// `__attribute__((aligned(8)))` on post-header fields is a no-op here because
+// each is already at an 8-aligned offset.
 
 struct NstatMsgHdr {
     std::uint64_t context{0};
@@ -91,18 +108,33 @@ struct NstatMsgHdr {
 };
 static_assert(sizeof(NstatMsgHdr) == 16);
 
-/// Raw sockaddr storage — big enough for sockaddr_in/sockaddr_in6 on Darwin
-/// (both well under 128 bytes). Never interpreted via a system sockaddr type;
-/// see nstat_decode_sockaddr().
-struct SockaddrBlob {
-    std::uint8_t bytes[128]{};
+/// Raw sockaddr storage — exactly the size of Darwin's
+/// `union { sockaddr_in; sockaddr_in6; }` (28 bytes: sockaddr_in6 is the
+/// larger arm). Never interpreted via a system sockaddr type; the wire bytes
+/// are always Darwin's layout regardless of the host running this decoder, so
+/// addresses are read by hand at the known Darwin offsets — see
+/// nstat_decode_sockaddr(). The 28-byte size is load-bearing: it sets the
+/// offset of every TcpDescriptor field after `local`/`remote`.
+struct alignas(4) SockaddrBlob {
+    std::uint8_t bytes[28]{};
 };
+static_assert(sizeof(SockaddrBlob) == 28);
 
+/// nstat_msg_add_all_srcs — the ADD_ALL_SRCS subscription request. All five
+/// fields after the header are REQUIRED; a truncated request is rejected by
+/// the kernel. `filter`/`events`/`target_pid`/`target_uuid` are left zero
+/// (subscribe to every source for the provider, no event push — we poll via
+/// QUERY_SRC); `provider` selects the source class.
 struct MsgAddAllSrcs {
     NstatMsgHdr hdr;
-    std::uint64_t provider{0};
+    std::uint64_t filter{0};
+    std::uint64_t events{0};
+    std::uint32_t provider{0};
+    std::int32_t target_pid{0};
+    std::uint8_t target_uuid[16]{};
 };
-static_assert(sizeof(MsgAddAllSrcs) == 24);
+static_assert(sizeof(MsgAddAllSrcs) == 56);
+static_assert(offsetof(MsgAddAllSrcs, provider) == 32);
 
 struct MsgGetSrcDesc {
     NstatMsgHdr hdr;
@@ -116,12 +148,18 @@ struct MsgQuerySrc {
 };
 static_assert(sizeof(MsgQuerySrc) == 24);
 
+/// nstat_msg_src_added. Field ORDER and WIDTH matter: `srcref` (u64) precedes
+/// `provider` (u32) + 4 reserved bytes — the reverse of a naive
+/// {provider, srcref} transcription, which would misread both.
 struct MsgSrcAdded {
     NstatMsgHdr hdr;
-    std::uint64_t provider{0};
     std::uint64_t srcref{0};
+    std::uint32_t provider{0};
+    std::uint8_t reserved[4]{};
 };
 static_assert(sizeof(MsgSrcAdded) == 32);
+static_assert(offsetof(MsgSrcAdded, srcref) == 16);
+static_assert(offsetof(MsgSrcAdded, provider) == 24);
 
 struct MsgSrcRemoved {
     NstatMsgHdr hdr;
@@ -129,20 +167,38 @@ struct MsgSrcRemoved {
 };
 static_assert(sizeof(MsgSrcRemoved) == 24);
 
-/// Fixed header of a SRC_DESC message; the provider-specific descriptor
-/// (TcpDescriptor for NSTAT_PROVIDER_TCP) follows immediately in the datagram.
+/// Fixed header of a SRC_DESC message (nstat_msg_src_description_header); the
+/// provider-specific descriptor (TcpDescriptor for the TCP providers) follows
+/// immediately in the datagram. `event_flags` sits between `srcref` and
+/// `provider` — omitting it (as the pre-remediation layout did) shifts
+/// `provider` and every following byte.
 struct MsgSrcDescHeader {
     NstatMsgHdr hdr;
     std::uint64_t srcref{0};
-    std::uint64_t provider{0};
+    std::uint64_t event_flags{0};
+    std::uint32_t provider{0};
+    std::uint8_t reserved[4]{};
 };
-static_assert(sizeof(MsgSrcDescHeader) == 32);
+static_assert(sizeof(MsgSrcDescHeader) == 40);
+static_assert(offsetof(MsgSrcDescHeader, provider) == 32);
 
-/// nstat_tcp_descriptor (TCP-provider SRC_DESC payload). `pname`/`epname` are
-/// NUL-padded C strings, not necessarily NUL-terminated if truncated at 64.
+/// nstat_tcp_descriptor (TCP-provider SRC_DESC payload) at the macOS 13.3
+/// layout. `local`/`remote` are the sockaddr union (28 bytes each), NOT
+/// 128-byte blobs, and they sit AFTER the counter/pid block, not before it.
+/// `pname` is a NUL-padded C string (not necessarily NUL-terminated at 64).
+/// There is no `epname` and no `uid` at this OS floor (both were added in
+/// later releases, after every field we read); the runtime length floor-check
+/// tolerates the larger later-OS descriptor because those additions are all
+/// past `pname` — see nstat_length_matches_expected().
 struct TcpDescriptor {
-    SockaddrBlob local;
-    SockaddrBlob remote;
+    std::uint64_t upid{0};
+    std::uint64_t eupid{0};
+    std::uint64_t start_timestamp{0};
+    std::uint64_t timestamp{0};
+    std::uint64_t rx_transfer_size{0};
+    std::uint64_t tx_transfer_size{0};
+    std::uint64_t activity_start{0};   // activity_bitmap_t.start
+    std::uint64_t activity_bitmap[2]{}; // activity_bitmap_t.bitmap (128-bit)
     std::uint32_t ifindex{0};
     std::uint32_t state{0};
     std::uint32_t sndbufsize{0};
@@ -154,20 +210,43 @@ struct TcpDescriptor {
     std::uint32_t txcwindow{0};
     std::uint32_t traffic_class{0};
     std::uint32_t traffic_mgt_flags{0};
-    std::int32_t pid{0};
+    std::uint32_t pid{0};
+    std::uint32_t epid{0};
+    SockaddrBlob local;
+    SockaddrBlob remote;
+    char cc_algo[16]{};
     char pname[64]{};
-    std::int32_t epid{0};
-    char epname[64]{};
-    std::uint32_t uid{0};
+    std::uint8_t uuid[16]{};
+    std::uint8_t euuid[16]{};
+    std::uint8_t vuuid[16]{};
+    std::uint8_t fuuid[16]{};
+    std::uint32_t conn_status{0}; // tcp_conn_status union (4 bytes on our arches)
+    std::uint32_t ifnet_properties{0};
+    std::uint8_t fallback_mode{0};
+    std::uint8_t reserved[3]{};
 };
-static_assert(sizeof(TcpDescriptor) == 440);
+static_assert(sizeof(TcpDescriptor) == 336);
+static_assert(offsetof(TcpDescriptor, pid) == 116);
+static_assert(offsetof(TcpDescriptor, epid) == 120);
+static_assert(offsetof(TcpDescriptor, local) == 124);
+static_assert(offsetof(TcpDescriptor, remote) == 152);
+static_assert(offsetof(TcpDescriptor, pname) == 196);
 
-/// nstat_counts, embedded in a SRC_COUNTS message.
+/// nstat_counts, embedded in a SRC_COUNTS message. All ten u64 counters come
+/// FIRST (base rx/tx, then cell/wifi/wired rx/tx), then the eight u32 counters
+/// — the pre-remediation layout interleaved them, which read every field past
+/// the first 32 bytes from the wrong offset while still summing to 112.
 struct Counts {
     std::uint64_t rxpackets{0};
     std::uint64_t rxbytes{0};
     std::uint64_t txpackets{0};
     std::uint64_t txbytes{0};
+    std::uint64_t cell_rxbytes{0};
+    std::uint64_t cell_txbytes{0};
+    std::uint64_t wifi_rxbytes{0};
+    std::uint64_t wifi_txbytes{0};
+    std::uint64_t wired_rxbytes{0};
+    std::uint64_t wired_txbytes{0};
     std::uint32_t rxduplicatebytes{0};
     std::uint32_t rxoutoforderbytes{0};
     std::uint32_t txretransmit{0};
@@ -176,43 +255,46 @@ struct Counts {
     std::uint32_t min_rtt{0};
     std::uint32_t avg_rtt{0};
     std::uint32_t var_rtt{0};
-    std::uint64_t cell_rxbytes{0};
-    std::uint64_t cell_txbytes{0};
-    std::uint64_t wifi_rxbytes{0};
-    std::uint64_t wifi_txbytes{0};
-    std::uint64_t wired_rxbytes{0};
-    std::uint64_t wired_txbytes{0};
 };
 static_assert(sizeof(Counts) == 112);
+static_assert(offsetof(Counts, txpackets) == 16);
+static_assert(offsetof(Counts, txretransmit) == 88);
+static_assert(offsetof(Counts, avg_rtt) == 104);
 
+/// nstat_msg_src_counts — like the SRC_DESC header, `event_flags` sits between
+/// `srcref` and the embedded counts.
 struct MsgSrcCounts {
     NstatMsgHdr hdr;
     std::uint64_t srcref{0};
+    std::uint64_t event_flags{0};
     Counts counts;
 };
-static_assert(sizeof(MsgSrcCounts) == 136);
+static_assert(sizeof(MsgSrcCounts) == 144);
+static_assert(offsetof(MsgSrcCounts, counts) == 32);
 
 } // namespace nstat_raw
 
-// ── Message type / provider constants (memo §1) ────────────────────────────
-// Sequential low-value request codes + high-value (10000+) response/notify
-// codes — the standard ntstat.h numbering scheme.
-inline constexpr std::uint32_t kNstatMsgAddAllSrcs = 2;
-inline constexpr std::uint32_t kNstatMsgQuerySrc = 4;
-inline constexpr std::uint32_t kNstatMsgGetSrcDesc = 5;
-inline constexpr std::uint32_t kNstatMsgSrcAdded = 10001;
-inline constexpr std::uint32_t kNstatMsgSrcRemoved = 10002;
-inline constexpr std::uint32_t kNstatMsgSrcDesc = 10003;
-inline constexpr std::uint32_t kNstatMsgSrcCounts = 10004;
-inline constexpr std::uint32_t kNstatMsgError = 10501;
+// ── Message type / provider constants ──────────────────────────────────────
+// Values are the literal `enum` members of XNU `bsd/net/ntstat.h`
+// (__NSTAT_REVISION__ 9, Ventura tag xnu-8792.41.9): request codes live in the
+// 100x band, async response/notify codes in the 1000x band, and the two
+// control replies (SUCCESS/ERROR) are 0/1 — NOT a sequential-from-2 scheme.
+inline constexpr std::uint32_t kNstatMsgError = 1;         // NSTAT_MSG_TYPE_ERROR
+inline constexpr std::uint32_t kNstatMsgAddAllSrcs = 1002; // NSTAT_MSG_TYPE_ADD_ALL_SRCS
+inline constexpr std::uint32_t kNstatMsgQuerySrc = 1004;   // NSTAT_MSG_TYPE_QUERY_SRC
+inline constexpr std::uint32_t kNstatMsgGetSrcDesc = 1005; // NSTAT_MSG_TYPE_GET_SRC_DESC
+inline constexpr std::uint32_t kNstatMsgSrcAdded = 10001;  // NSTAT_MSG_TYPE_SRC_ADDED
+inline constexpr std::uint32_t kNstatMsgSrcRemoved = 10002; // NSTAT_MSG_TYPE_SRC_REMOVED
+inline constexpr std::uint32_t kNstatMsgSrcDesc = 10003;   // NSTAT_MSG_TYPE_SRC_DESC
+inline constexpr std::uint32_t kNstatMsgSrcCounts = 10004; // NSTAT_MSG_TYPE_SRC_COUNTS
 
 /// TCP_KERNEL (legacy) and TCP (modern alias, aka TCP_USERLAND) provider ids.
 /// start() subscribes to BOTH (memo §1: "NSTAT_PROVIDER_TCP / ..._TCP_KERNEL")
 /// since which one a given kernel expects is itself part of the layout risk;
 /// subscribing to an id a kernel doesn't recognize is harmless (it simply
 /// yields no sources for that id).
-inline constexpr std::uint64_t kNstatProviderTcpKernel = 2;
-inline constexpr std::uint64_t kNstatProviderTcp = 3;
+inline constexpr std::uint32_t kNstatProviderTcpKernel = 2; // NSTAT_PROVIDER_TCP_KERNEL
+inline constexpr std::uint32_t kNstatProviderTcp = 3;       // NSTAT_PROVIDER_TCP_USERLAND
 
 /// Darwin AF_INET / AF_INET6 values as they appear in the wire `sockaddr`
 /// family byte — Darwin's AF_INET6 (30) differs from Linux's (10), and the
@@ -270,8 +352,7 @@ struct DecodedTcpDesc {
     std::string remote_addr;  ///< raw — bucketed downstream by remote_bucket(), never persisted as-is
     int remote_port{0};
     std::uint32_t pid{0};
-    std::string process_name; ///< epname if set, else pname; "" if both empty
-    std::uint32_t uid{0};
+    std::string process_name; ///< pname; "" if empty (the macOS 13.3 tcp descriptor has no epname/uid)
 };
 /// PURE. Decodes a SRC_DESC message whose embedded provider is
 /// kNstatProviderTcp/kNstatProviderTcpKernel into a DecodedTcpDesc. Returns
@@ -332,7 +413,6 @@ struct FlowState {
     std::string process_name;
     bool has_desc{false};   ///< a SRC_DESC has been applied — identity fields valid
     bool has_counts{false}; ///< a SRC_COUNTS has been applied at least once — quality fields valid
-    bool open_emitted{false}; ///< the lifecycle "open" NstatFlowEvent has already been pushed
     std::int64_t rtt_us{0};
     std::int64_t rtt_var_us{0};
     std::uint64_t txpackets_cum{0};    ///< latest known cumulative tx packets (segs_out proxy)

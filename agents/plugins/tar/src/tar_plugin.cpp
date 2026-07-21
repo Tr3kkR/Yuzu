@@ -1989,7 +1989,9 @@ private:
         // netqual capture method (ADR-0020) — the method actually in effect:
         // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
         // active), "estats_pending" (Windows, gate not yet tested — or netqual
-        // off), "none" (Windows after the ACCESS_DENIED latch, macOS). Emitted
+        // off), "nstat" (macOS when the kctl client is live and system-wide),
+        // "none" (Windows after the ACCESS_DENIED latch; macOS unprivileged,
+        // layout-mismatch, or client down). Emitted
         // UNCONDITIONALLY (key-always-present contract, same as the process/
         // module keys above) so an operator can tell "netqual is on but the
         // agent can't collect" apart from "netqual is off".

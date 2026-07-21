@@ -166,7 +166,8 @@ TEST_CASE("TAR schema: accepted_capture_methods_for_os is OS-specific (#540)",
     CHECK_FALSE(contains(win_ok, "procfs"));
 
     auto mac_ok = accepted_capture_methods_for_os("tcp", "macos");
-    CHECK(contains(mac_ok, "proc_pidfdinfo"));
+    CHECK(contains(mac_ok, "proc_pidfdinfo")); // fallback/seed poll
+    CHECK(contains(mac_ok, "nstat"));          // primary tcp-lifecycle source (roadmap 2.2)
     CHECK_FALSE(contains(mac_ok, "iphlpapi"));
 
     // An unknown OS yields an empty accept-list (everything rejected, fail-safe).

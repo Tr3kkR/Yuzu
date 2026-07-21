@@ -35,8 +35,8 @@ std::vector<std::byte> concat(std::vector<std::byte> a, const std::vector<std::b
     return a;
 }
 
-/// Darwin sockaddr_in layout within the 128-byte blob: sa_family at byte[1],
-/// port big-endian at bytes[2:4], address at bytes[4:8] — mirrors
+/// Darwin sockaddr_in layout within the 28-byte sockaddr union: sa_family at
+/// byte[1], port big-endian at bytes[2:4], address at bytes[4:8] — mirrors
 /// nstat_decode_sockaddr() in the .cpp (never a system sockaddr type).
 SockaddrBlob make_v4(std::array<std::uint8_t, 4> addr, std::uint16_t port) {
     SockaddrBlob b{};
@@ -78,6 +78,18 @@ void set_cstr(char* dst, std::size_t cap, const char* s) {
     if (n > cap)
         n = cap;
     std::memcpy(dst, s, n);
+}
+
+/// Writes `value` little-endian at absolute byte `offset` in `buf`, growing it
+/// if needed. Used by the "golden byte" tests below to lay a message out at the
+/// literal XNU offsets — decoding those proves WIRE compatibility, independent
+/// of our own struct definitions (which the fixture-based tests reuse).
+template <typename T>
+void put_le(std::vector<std::byte>& buf, std::size_t offset, T value) {
+    if (buf.size() < offset + sizeof(T))
+        buf.resize(offset + sizeof(T));
+    for (std::size_t i = 0; i < sizeof(T); ++i)
+        buf[offset + i] = static_cast<std::byte>((value >> (8 * i)) & 0xFF);
 }
 
 /// Builds a full SRC_DESC datagram (fixed header + TCP descriptor) with a
@@ -235,7 +247,6 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes an IPv4 flow", "[tar][netqual][nsta
     desc.remote = make_v4({93, 184, 216, 34}, 443);
     desc.pid = 4321;
     set_cstr(desc.pname, sizeof(desc.pname), "testproc");
-    desc.uid = 501;
 
     auto raw = build_src_desc_msg(0x99, kNstatProviderTcp, desc);
     auto decoded = nstat_decode_tcp_src_desc(raw);
@@ -248,23 +259,11 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes an IPv4 flow", "[tar][netqual][nsta
     REQUIRE(decoded->remote_port == 443);
     REQUIRE(decoded->pid == 4321);
     REQUIRE(decoded->process_name == "testproc");
-    REQUIRE(decoded->uid == 501);
 }
 
-TEST_CASE("nstat_decode_tcp_src_desc prefers epname over pname", "[tar][netqual][nstat]") {
-    TcpDescriptor desc{};
-    desc.local = make_v4({10, 0, 0, 5}, 12345);
-    desc.remote = make_v4({8, 8, 8, 8}, 53);
-    set_cstr(desc.pname, sizeof(desc.pname), "login-shell");
-    set_cstr(desc.epname, sizeof(desc.epname), "curl");
-
-    auto decoded = nstat_decode_tcp_src_desc(build_src_desc_msg(1, kNstatProviderTcp, desc));
-    REQUIRE(decoded.has_value());
-    REQUIRE(decoded->process_name == "curl");
-}
-
-TEST_CASE("nstat_decode_tcp_src_desc falls back to pname when epname is empty",
+TEST_CASE("nstat_decode_tcp_src_desc decodes the pname process identity",
           "[tar][netqual][nstat]") {
+    // The macOS 13.3 tcp descriptor carries only pname (no epname/uid).
     TcpDescriptor desc{};
     desc.local = make_v4({10, 0, 0, 5}, 1);
     desc.remote = make_v4({10, 0, 0, 6}, 2);
@@ -417,6 +416,95 @@ TEST_CASE("nstat_apply_counts updates FlowState's cumulative counters",
     REQUIRE(flow.txretransmit_prev_snapshot == 0);
 }
 
+// ── Golden wire-layout bytes (XNU absolute offsets) ─────────────────────────
+// These build message buffers at the LITERAL byte offsets XNU's
+// bsd/net/ntstat.h produces (revision 9 / macOS 13.3) — NOT via our own
+// nstat_raw structs. They fail if a decoder reads a field from the wrong
+// offset even when our struct definition happens to agree with itself, which
+// is the exact false-confidence gap a struct-derived fixture cannot catch.
+
+TEST_CASE("golden: SRC_ADDED reads srcref@16 and provider@24 (field order + width)",
+          "[tar][netqual][nstat]") {
+    std::vector<std::byte> buf(sizeof(MsgSrcAdded), std::byte{0});
+    put_le<std::uint32_t>(buf, 8, kNstatMsgSrcAdded);            // hdr.type @8
+    put_le<std::uint16_t>(buf, 12, sizeof(MsgSrcAdded));          // hdr.length @12
+    put_le<std::uint64_t>(buf, 16, 0xCAFEF00DDEADBEEFULL);        // srcref @16 (u64)
+    put_le<std::uint32_t>(buf, 24, kNstatProviderTcp);            // provider @24 (u32)
+
+    auto decoded = nstat_decode_src_added(buf);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->srcref == 0xCAFEF00DDEADBEEFULL);
+    REQUIRE(decoded->provider == kNstatProviderTcp);
+}
+
+TEST_CASE("golden: SRC_COUNTS reads the u32 counters after all ten u64 counters",
+          "[tar][netqual][nstat]") {
+    // counts starts at 32; txpackets is counts+16=48; the u32 block begins at
+    // counts+80=112, so txretransmit=counts+88=120, avg_rtt=counts+104=136,
+    // var_rtt=counts+108=140. A struct that interleaved u32s earlier (the
+    // pre-remediation bug) would read these from ~counts+32 and get garbage.
+    std::vector<std::byte> buf(sizeof(MsgSrcCounts), std::byte{0});
+    put_le<std::uint32_t>(buf, 8, kNstatMsgSrcCounts);
+    put_le<std::uint16_t>(buf, 12, sizeof(MsgSrcCounts));
+    put_le<std::uint64_t>(buf, 16, 77);   // srcref @16
+    put_le<std::uint64_t>(buf, 48, 1000); // counts.txpackets @48
+    put_le<std::uint32_t>(buf, 120, 12);  // counts.txretransmit @120
+    put_le<std::uint32_t>(buf, 136, 25000); // counts.avg_rtt @136
+    put_le<std::uint32_t>(buf, 140, 500);   // counts.var_rtt @140
+
+    auto decoded = nstat_decode_src_counts(buf);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->srcref == 77);
+    REQUIRE(decoded->txpackets == 1000);
+    REQUIRE(decoded->txretransmit == 12);
+    REQUIRE(decoded->avg_rtt == 25000);
+    REQUIRE(decoded->var_rtt == 500);
+}
+
+TEST_CASE("golden: SRC_DESC reads pid@156, local@164, pname@236 (post-13.3-prefix)",
+          "[tar][netqual][nstat]") {
+    // header is 40 bytes; descriptor starts at 40. Within the descriptor:
+    // pid=+116=156, local(sockaddr union)=+124=164, pname=+196=236.
+    const std::size_t total = sizeof(MsgSrcDescHeader) + sizeof(TcpDescriptor); // 376
+    std::vector<std::byte> buf(total, std::byte{0});
+    put_le<std::uint32_t>(buf, 8, kNstatMsgSrcDesc);       // hdr.type @8
+    put_le<std::uint16_t>(buf, 12, static_cast<std::uint16_t>(total)); // hdr.length @12
+    put_le<std::uint64_t>(buf, 16, 0xABCD);                // srcref @16
+    put_le<std::uint32_t>(buf, 32, kNstatProviderTcp);     // provider @32
+    put_le<std::uint32_t>(buf, 156, 4321);                 // descriptor.pid @156
+    // descriptor.local sockaddr_in @164: sa_len@164, family@165, port@166..167,
+    // addr@168..171.
+    buf[164] = std::byte{16};
+    buf[165] = std::byte{kNstatAfInet};
+    buf[166] = std::byte{static_cast<std::uint8_t>(8443 >> 8)};
+    buf[167] = std::byte{static_cast<std::uint8_t>(8443 & 0xFF)};
+    buf[168] = std::byte{127};
+    buf[171] = std::byte{1};
+    // descriptor.remote sockaddr_in @192.
+    buf[192] = std::byte{16};
+    buf[193] = std::byte{kNstatAfInet};
+    buf[194] = std::byte{static_cast<std::uint8_t>(443 >> 8)};
+    buf[195] = std::byte{static_cast<std::uint8_t>(443 & 0xFF)};
+    buf[196 + 0] = std::byte{93}; // remote addr starts at 192+4=196
+    buf[196 + 1] = std::byte{184};
+    buf[196 + 2] = std::byte{216};
+    buf[196 + 3] = std::byte{34};
+    // descriptor.pname @236.
+    const char* pname = "goldenproc";
+    for (std::size_t i = 0; pname[i]; ++i)
+        buf[236 + i] = static_cast<std::byte>(pname[i]);
+
+    auto decoded = nstat_decode_tcp_src_desc(buf);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->srcref == 0xABCD);
+    REQUIRE(decoded->pid == 4321);
+    REQUIRE(decoded->local_addr == "127.0.0.1");
+    REQUIRE(decoded->local_port == 8443);
+    REQUIRE(decoded->remote_addr == "93.184.216.34");
+    REQUIRE(decoded->remote_port == 443);
+    REQUIRE(decoded->process_name == "goldenproc");
+}
+
 // ── Quality-sample mapping — SIGNAL DISCIPLINE invariants ──────────────────
 
 TEST_CASE("nstat_build_quality_sample copies rtt_us as an IDENTITY, not scaled",
@@ -528,7 +616,6 @@ TEST_CASE("nstat_build_open_event carries the flow identity from the descriptor"
     desc.remote_port = 443;
     desc.pid = 999;
     desc.process_name = "safari";
-    desc.uid = 501;
 
     NstatFlowEvent ev = nstat_build_open_event(1'700'000'000, desc);
     REQUIRE(ev.ts_unix == 1'700'000'000);

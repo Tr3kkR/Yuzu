@@ -34,9 +34,15 @@ bool nstat_length_matches_expected(std::uint32_t type, std::uint16_t length) noe
     case kNstatMsgSrcCounts:
         return length == sizeof(nstat_raw::MsgSrcCounts);
     case kNstatMsgSrcDesc:
-        // Variable: header + provider-specific descriptor. We only ever
-        // decode the TCP provider's descriptor, so the floor is header + the
-        // TCP descriptor size; a shorter declared length can never be ours.
+        // Variable-length: header + provider-specific descriptor. A FLOOR
+        // check (>=), not an exact one, is deliberate and forward-compatible:
+        // Apple grew nstat_tcp_descriptor after macOS 13.3 (adding fields past
+        // `pname`, e.g. persona_id/uid), so a newer kernel sends a LARGER
+        // descriptor. Every field we decode lives in the stable 13.3 prefix
+        // (srcref/pid/local/remote/pname), so a longer descriptor still decodes
+        // correctly; requiring an exact size would fail-closed on every macOS
+        // release newer than the floor. The decoders additionally bounds-check
+        // the actual buffer, so a `true` here is necessary, not sufficient.
         return length >= sizeof(nstat_raw::MsgSrcDescHeader) + sizeof(nstat_raw::TcpDescriptor);
     default:
         return true; // a type we don't validate has nothing of ours to check
@@ -198,14 +204,11 @@ std::optional<DecodedTcpDesc> nstat_decode_tcp_src_desc(std::span<const std::byt
     out.local_port = local->port;
     out.remote_addr = remote->addr;
     out.remote_port = remote->port;
-    out.pid = desc.pid > 0 ? static_cast<std::uint32_t>(desc.pid) : 0u;
-    // Prefer the effective process (post-exec via a helper, e.g. a login
-    // shell launching a browser) over the reporting process, mirroring what
-    // `nettop` surfaces — TODO(hardware-verify): confirm epname is populated
-    // in the common case and pname is the right fallback, not the reverse.
-    std::string epname = cstr_from_fixed(desc.epname, sizeof(desc.epname));
-    out.process_name = !epname.empty() ? epname : cstr_from_fixed(desc.pname, sizeof(desc.pname));
-    out.uid = desc.uid;
+    out.pid = desc.pid;
+    // The macOS 13.3 tcp descriptor carries only `pname` (the reporting
+    // process); there is no effective-process name field at this OS floor, so
+    // this is the single available process identity.
+    out.process_name = cstr_from_fixed(desc.pname, sizeof(desc.pname));
     return out;
 }
 
@@ -361,7 +364,8 @@ constexpr std::int64_t kNstatIdleFallbackSeconds = 3600;
 constexpr auto kNstatQueryInterval = std::chrono::seconds(2);
 
 // recv() buffer: comfortably larger than the largest message we decode
-// (sizeof(MsgSrcDescHeader) + sizeof(TcpDescriptor) == 472 bytes).
+// (sizeof(MsgSrcDescHeader) + sizeof(TcpDescriptor) == 376 bytes at the 13.3
+// floor; a later-OS descriptor is larger but still far under this).
 constexpr std::size_t kNstatRecvBufSize = 8192;
 
 // UP-2 flow-table bound. The kernel table is normally self-limiting (SRC_REMOVED
@@ -805,10 +809,12 @@ bool NstatClient::start() {
         return false;
     }
 
-    // Subscribe both known TCP provider ids (memo §1) — harmless if one is
-    // invalid for this kernel; the flow table is keyed purely by srcref, not
-    // by which provider id "won", so nothing downstream depends on this
-    // succeeding for both.
+    // Subscribe both known TCP provider ids — harmless if one is invalid for
+    // this kernel; the flow table is keyed purely by srcref, not by which
+    // provider id "won", so nothing downstream depends on this succeeding for
+    // both. The zero-init leaves filter/events/target_pid/target_uuid all 0:
+    // subscribe to every source of the provider (root scopes it system-wide),
+    // no async event push — counts come from the QUERY_SRC poll loop.
     nstat_raw::MsgAddAllSrcs add_tcp{};
     add_tcp.hdr.type = kNstatMsgAddAllSrcs;
     add_tcp.hdr.length = static_cast<std::uint16_t>(sizeof(add_tcp));
