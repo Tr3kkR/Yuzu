@@ -339,6 +339,16 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     std::vector<Live> live;
     live.reserve(rows->size());
     for (auto& row : *rows) {
+        // Shutdown mid-scan: this loop issues one rename_key per UNPARSEABLE row, so on a
+        // corrupted journal it can be up to hard_max_batches_ KvStore writes, each able to
+        // block on the 5 s busy timeout. Bailing here is what makes the post-request_stop()
+        // exit bounded (#2298 governance sec-M2): GuardianEngine::stop() holds mtx_ across
+        // the drain-worker join, so every second spent here blocks dispatch(), journal_stats()
+        // and the heartbeat too. Nothing is lost - the gauges were rebased to the scanned
+        // reality above, each completed rename already paired with its own fetch_sub, and the
+        // next boot re-scans.
+        if (stopping_.load(std::memory_order_acquire))
+            return stats;
         auto parsed = parse_journal_batch(row.value);
         if (!parsed) {
             // Unparseable → move aside atomically so replay never re-parses it.
@@ -383,6 +393,14 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
             total_bytes -= l.bytes;
         }
     }
+
+    // Shutdown immediately before the pass's heaviest write: del_keys is one transaction over
+    // the whole evict set and is the single longest KvStore call prune makes (#2298 governance
+    // cs-2 - the stopping_ gates must PRECEDE the heavy calls, not merely straddle them).
+    // Skipping it retains the batches, which is the safe direction for an audit journal; the
+    // gauges already reflect on-disk reality via the rebase, so nothing is left inconsistent.
+    if (stopping_.load(std::memory_order_acquire))
+        return stats;
 
     if (!evict.empty()) {
         // del_keys is one all-or-nothing transaction: a 0 return with a non-empty evict list is
@@ -528,6 +546,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                           // pass retry, and expired rows are skipped below regardless.
         boot_pruned_ = true;
     }
+
+    // Re-check after the boot-prune barrier above: that barrier runs a FULL prune pass, so a
+    // stop can arrive while it is in flight, and this list_entries is page's own heaviest read
+    // (#2298 governance cs-2).
+    if (stopping_.load(std::memory_order_acquire))
+        return stats;
 
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
     if (!rows)
