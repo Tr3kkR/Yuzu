@@ -100,6 +100,11 @@ inline constexpr std::chrono::milliseconds kGuardianJournalPruneInterval{120'000
 /// hitting this bound, so steady-state throughput is unchanged.
 inline constexpr std::size_t kGuardianDrainBudget = 512;
 
+/// Wall-clock companion to kGuardianDrainBudget. 512 entries bounds the COUNT but not the
+/// TIME: at a pathological seconds-per-send it is still minutes, and the worker may be
+/// holding up GuardianEngine::stop()'s join for all of it.
+inline constexpr std::chrono::milliseconds kGuardianDrainMaxWall{2'000};
+
 /// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
 /// positional parameters so the two same-typed intervals cannot be transposed at a call
 /// site, and so a test can name only what it overrides:
@@ -108,13 +113,19 @@ inline constexpr std::size_t kGuardianDrainBudget = 512;
 /// Namespace-scope, not nested: a default argument cannot require a nested class's default
 /// member initializers before the enclosing class is complete.
 struct GuardianMaintenanceConfig {
-    /// BORROWED and may be null (no maintenance runs). Must outlive the worker; the owner
-    /// guarantees that by joining it first - see the worker's JOURNAL MAINTENANCE note and
-    /// GuardianEngine's member declaration order.
-    GuardianLifecycleJournal* journal{nullptr};
+    /// SHARED, may be null (no maintenance runs). A shared_ptr rather than a raw borrow so
+    /// the worker's dependency on the journal is expressed in the type system: previously
+    /// correctness rested on GuardianEngine declaring the journal before the worker, an
+    /// unenforceable ordering nothing would have caught if reordered (#2298 governance A4).
+    /// One allocation, and the whole class of failure goes away.
+    std::shared_ptr<GuardianLifecycleJournal> journal{};
     std::chrono::milliseconds page_interval{kGuardianJournalPageInterval};
     std::chrono::milliseconds prune_interval{kGuardianJournalPruneInterval};
     std::size_t drain_budget{kGuardianDrainBudget};
+    /// Wall-clock cap on one drain pass. A COUNT bound is not a safety bound - one
+    /// slow-but-succeeding send makes an N-entry pass arbitrarily long while
+    /// GuardianEngine::stop() waits on our join (#2298 Sol review).
+    std::chrono::milliseconds drain_max_wall{kGuardianDrainMaxWall};
 };
 
 /// Which maintenance passes to run this cycle. The CALLER owns cadence - the worker loop
@@ -164,13 +175,6 @@ public:
     /// the force flag are observed by the loop's first cycle.
     void notify();
 
-    /// The worker thread's id while running, else a default-constructed id. Exists so
-    /// GuardianEngine can ASSERT that its mtx_ is never taken on this thread - see the
-    /// class doc's central constraint. Lock-free; safe from any thread.
-    [[nodiscard]] std::thread::id worker_thread_id() const noexcept {
-        return worker_id_.load(std::memory_order_acquire);
-    }
-
     /// Deterministic test seam (also the worker thread's own loop body): run
     /// ONE drain pass synchronously on the caller's thread, UNBOUNDED. Does NOT firewall
     /// exceptions - the worker thread's loop() does (so a test can still observe a
@@ -209,9 +213,9 @@ private:
     [[nodiscard]] bool stop_requested() const noexcept {
         return sig_->stopping.load(std::memory_order_acquire);
     }
-    /// One drain pass bounded by `drain_budget_`. Returns true if it hit the bound,
-    /// meaning entries remain and the loop should re-drain WITHOUT waiting.
-    [[nodiscard]] bool drain_bounded();
+    /// One drain pass under the configured count / wall-clock / stop-predicate limits.
+    /// `truncated` means entries remain and the loop should re-drain WITHOUT waiting.
+    [[nodiscard]] GuardianSparkRuntime::DrainOutcome drain_bounded();
 
     /// Heap sync state shared by the worker thread AND the waker (a
     /// std::function copied into the runtime) - see the class doc for why a
@@ -238,7 +242,18 @@ private:
     /// Seeded TRUE so the first cycle replays the journal at boot without waiting out
     /// kDefaultPageInterval.
     std::atomic<bool> force_page_{true};
-    std::atomic<std::thread::id> worker_id_{};
 };
+
+/// True IFF the calling thread is inside a GuardianOutboxDrainWorker::loop().
+///
+/// This is how GuardianEngine enforces "the drain worker must never take mtx_" (see the
+/// class doc's central constraint). It is a THREAD-LOCAL role marker rather than a pointer
+/// comparison against the worker object on purpose: an engine-side pointer to the worker
+/// would have to be read before the engine's own mutex is held - an unsynchronised
+/// cross-thread read - and during wiring rollback that pointer can be dangling while the
+/// worker is torn down. A thread-local answers the same question while touching no other
+/// object's lifetime at all (#2298 Sol review, which caught the pointer version as a
+/// data race and a potential use-after-free in the very device meant to prevent a hang).
+[[nodiscard]] YUZU_EXPORT bool on_guardian_drain_worker_thread() noexcept;
 
 } // namespace yuzu::agent
