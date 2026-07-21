@@ -39,6 +39,7 @@
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
+#include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
@@ -706,6 +707,16 @@ public:
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
                           "(a stalled watcher)", "gauge");
+        // Guardian durable lifecycle-journal fleet rollup (#2298 gate 3). Registered from
+        // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
+        // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
+        // no HELP, or with HELP that drifts from what the rollup actually computes.
+        // Unlabelled by design; all 22 are ABSENT until some agent's journal reports.
+        // Read the type-honesty note on kGuardianJournalMetrics before writing an alert:
+        // most source values latch on a bare `> 0` - see that note for why that is the
+        // chosen form for the loss counters and why increase() is not.
+        for (const auto& m : detail::kGuardianJournalMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
