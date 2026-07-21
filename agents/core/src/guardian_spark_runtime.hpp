@@ -227,16 +227,40 @@ public:
     /// live wake-on-enqueue) is wired at rung 7; this is the mechanism. Returns the
     /// number SENT (not removed - a coalesced head counts as sent but is not popped).
     ///
-    /// `max_entries` bounds ONE pass; 0 means unbounded (the historical behaviour).
-    /// Bounding exists because the caller's thread may carry OTHER periodic work
-    /// (C0 #2298: the drain worker also runs journal retention). Unbounded, a slow
-    /// stream drains the whole window - up to 4096 lifecycle entries - head-of-line
-    /// blocking that work for as long as it takes; on a slow link that starves
-    /// retention until the journal hits its write ceiling and DROPS audit records.
-    /// A caller that bounds a pass should re-drain immediately while the return value
-    /// reaches the bound, instead of waiting for its next wake.
-    std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send,
-                      std::size_t max_entries = 0);
+    /// `limits` bounds ONE pass. Bounding exists because the caller's thread may carry
+    /// OTHER periodic work (C0 #2298: the drain worker also runs journal retention).
+    /// Unbounded, a slow stream drains the whole window - up to 4096 lifecycle entries -
+    /// head-of-line blocking that work; on a slow link that starves retention until the
+    /// journal hits its write ceiling and DROPS audit records. A caller that bounds a pass
+    /// should re-drain immediately while `truncated` comes back true.
+    struct DrainLimits {
+        /// 0 = unbounded (the historical behaviour).
+        std::size_t max_entries{0};
+        /// Wall-clock cap on one pass, checked between sends. 0 = unbounded. A COUNT bound
+        /// alone is not a safety bound: one slow-but-succeeding send makes an N-entry pass
+        /// arbitrarily long, and the caller may be holding up a join (#2298 Sol review).
+        std::chrono::milliseconds max_wall{0};
+        /// Checked BEFORE every send. Lets a caller stop starting new sends the moment
+        /// shutdown is requested rather than at the end of a whole bounded pass. The
+        /// in-flight send is not interruptible; no further one begins.
+        std::function<bool()> should_stop{};
+        /// Fraction of `max_entries` reserved for the compliance/health outbox so a busy
+        /// lifecycle log cannot consume the entire pass. Unused lifecycle allowance rolls
+        /// over, so this costs nothing when lifecycle is quiet. Load-bearing: draining
+        /// lifecycle first with a SHARED budget silently recreated the detection blackout
+        /// that Gate 4 UP-3 removed - compliance simply never ran (#2298 Sol review).
+        std::size_t compliance_reserve_num{1};
+        std::size_t compliance_reserve_den{2};
+    };
+    struct DrainOutcome {
+        std::size_t sent{0};
+        /// A limit cut the pass short (count, wall-clock, or should_stop) and entries may
+        /// remain. The caller should re-drain without waiting rather than sleep.
+        bool truncated{false};
+    };
+    std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
+    DrainOutcome drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
+                               const DrainLimits& limits);
 
     // --- Durable lifecycle journal - staging seam (item 7 PR-Ag) ------------
     // Staging lives HERE (co-located with lifecycle_log_ under outbox_mu_) because

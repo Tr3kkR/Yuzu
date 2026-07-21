@@ -604,24 +604,37 @@ namespace {
 // item 4), then re-lock and pop the head ONLY if it is still the entry we sent. A
 // coalesce/drop during the unlocked window replaces or removes it; pop_front_if(event_id)
 // then no-ops and the current head is handled on the next pass.
+struct DrainPassLimits {
+    std::size_t budget{0};                            ///< decremented per successful send
+    std::chrono::steady_clock::time_point deadline{}; ///< zero-valued when unbounded
+    bool has_deadline{false};
+    const std::function<bool()>* should_stop{nullptr};
+};
+
 template <typename Log>
 std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
                                const std::function<SendResult(const OutboxEntry&)>& send,
                                std::atomic<std::uint64_t>& send_exceptions,
-                               std::size_t& budget) {
+                               DrainPassLimits& lim, bool& truncated) {
     std::size_t sent = 0;
-    // `budget` is SHARED across the two logs of one drain() pass and decremented per
-    // successful send, so a bound means "N entries this pass" regardless of which log
-    // they came from - the lifecycle log cannot consume a whole pass and leave the
-    // compliance outbox its own fresh allowance.
-    while (budget > 0) {
+    while (true) {
         OutboxEntry entry;
         {
             std::lock_guard<std::mutex> ob{mu};
             std::optional<OutboxEntry> front = log.front_copy();
             if (!front)
-                return sent; // drained
+                return sent; // drained - NOT truncated, whatever the budget says
             entry = std::move(*front);
+        }
+        // Limits are evaluated only once an entry is known to exist, and always BEFORE the
+        // send: the point is to avoid STARTING work, since an in-flight send cannot be
+        // interrupted and the caller may be holding a lock across a thread join
+        // (#2298 Sol review). Checking them earlier would report a drained log as truncated.
+        if (lim.budget == 0 ||
+            (lim.has_deadline && std::chrono::steady_clock::now() >= lim.deadline) ||
+            (lim.should_stop && *lim.should_stop && (*lim.should_stop)())) {
+            truncated = true;
+            return sent;
         }
         SendResult r = SendResult::Retain;
         try {
@@ -648,18 +661,12 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
             log.pop_front_if(entry.event_id); // remove IFF unchanged during the unlocked send
         }
         ++sent;
-        --budget;
+        --lim.budget;
     }
-    return sent; // budget exhausted mid-log: the caller re-drains without waiting
 }
 } // namespace
 
-std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send,
-                                        std::size_t max_entries) {
-    // Single-drainer: the send runs with outbox_mu_ released, so two concurrent drainers
-    // could both peek+send the same head (duplicate delivery). drain_mu_ serialises them
-    // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
-    std::lock_guard<std::mutex> dg{drain_mu_};
+std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
     // Drain lifecycle (audit) BEFORE compliance/health so a rule's "armed" precedes its
     // first drift on the wire in the common case (stream up, both drain fully). This is
     // BEST-EFFORT ordering, NOT a hard gate: an earlier version gated compliance on the
@@ -670,11 +677,62 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
     // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
     // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
-    std::size_t budget =
-        max_entries == 0 ? std::numeric_limits<std::size_t>::max() : max_entries;
-    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, budget);
-    sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_, budget);
-    return sent;
+    DrainLimits unbounded;
+    return drain_bounded(send, unbounded).sent;
+}
+
+GuardianSparkRuntime::DrainOutcome
+GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
+                                    const DrainLimits& limits) {
+    std::lock_guard<std::mutex> dg{drain_mu_};
+    DrainOutcome out;
+
+    const bool unbounded = limits.max_entries == 0;
+    const std::size_t total =
+        unbounded ? std::numeric_limits<std::size_t>::max() : limits.max_entries;
+
+    // Reserve a share for compliance/health BEFORE lifecycle runs. Draining lifecycle first
+    // out of one shared budget means a busy lifecycle log can consume the entire pass and
+    // compliance never runs at all - which is the detection blackout the comment above says
+    // was removed for exactly that reason (Gate 4 UP-3), reintroduced in bounded form.
+    // Unused lifecycle allowance rolls over below, so this costs nothing when lifecycle is
+    // quiet, and the overall cap is still `total`.
+    std::size_t reserve = 0;
+    if (!unbounded && limits.compliance_reserve_den > 0) {
+        reserve = total / limits.compliance_reserve_den * limits.compliance_reserve_num;
+        if (reserve > total)
+            reserve = total;
+    }
+
+    DrainPassLimits lim;
+    lim.budget = total - reserve;
+    lim.should_stop = limits.should_stop ? &limits.should_stop : nullptr;
+    if (limits.max_wall.count() > 0) {
+        lim.has_deadline = true;
+        lim.deadline = std::chrono::steady_clock::now() + limits.max_wall;
+    }
+
+    bool lifecycle_truncated = false;
+    out.sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, lim,
+                                 lifecycle_truncated);
+    // Hand the compliance pass its reserve PLUS whatever lifecycle did not use.
+    lim.budget += reserve;
+    bool compliance_truncated = false;
+    out.sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_, lim,
+                                  compliance_truncated);
+
+    // Give any STILL-unused allowance back to lifecycle. Without this the transfer is
+    // one-directional and the reserve becomes a hard cap on lifecycle even when compliance
+    // is completely idle - which at a small budget throttles audit delivery for no benefit.
+    bool lifecycle_retry_truncated = false;
+    const bool retried = lifecycle_truncated && lim.budget > 0;
+    if (retried)
+        out.sent += drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, lim,
+                                      lifecycle_retry_truncated);
+
+    out.truncated =
+        compliance_truncated || (retried ? lifecycle_retry_truncated : lifecycle_truncated);
+    return out;
 }
 
 void GuardianSparkRuntime::begin_stop() {
