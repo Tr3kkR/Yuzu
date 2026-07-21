@@ -4,6 +4,7 @@
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
+#include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "scope_engine.hpp"
 #include "web_utils.hpp"
 
@@ -763,6 +764,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          sink_state->cv.notify_one();
                      });
                  std::string captured_exec_id = exec_id;
+                 // UP-1: adopt any pending engine QuotaSlot into this
+                 // stream's resource-releaser so the concurrency reservation
+                 // survives for the stream's actual lifetime instead of
+                 // releasing early at post-routing (see is_streaming_path /
+                 // adopt_quota_slot_into_stream in principal_quota_gate.hpp).
                  res.set_chunked_content_provider(
                      "text/event-stream",
                      [sink_state](size_t offset, httplib::DataSink& s) -> bool {
@@ -808,11 +814,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          (void)offset;
                          return true;
                      },
-                     [sink_state, bus, captured_exec_id](bool /*success*/) {
-                         sink_state->closed.store(true);
-                         sink_state->cv.notify_all();
-                         bus->unsubscribe(captured_exec_id, sink_state->sub_id);
-                     });
+                     detail::adopt_quota_slot_into_stream(
+                         [sink_state, bus, captured_exec_id](bool /*success*/) {
+                             sink_state->closed.store(true);
+                             sink_state->cv.notify_all();
+                             bus->unsubscribe(captured_exec_id, sink_state->sub_id);
+                         }));
              });
 
     // GET /fragments/schedules -- schedule list HTMX fragment

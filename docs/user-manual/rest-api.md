@@ -198,6 +198,23 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 
 The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
 
+**Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).** REST traffic from an **engine principal** session (`principal_kind=="engine"`, username `engine:<slug>`) is subject to a per-principal cap enforced at the server's single pre-routing chokepoint — before the request reaches any route handler. Two independent dimensions are checked: an in-flight **concurrency** cap and a per-principal token-bucket **rate** cap (see `docs/user-manual/engine-principals.md` for the operator-facing tuning guide). Exhausting either dimension returns `429` with the standard A4 envelope plus an HTTP `Retry-After` header (whole seconds, rounded up from `retry_after_ms`):
+
+```json
+{
+  "error": {
+    "code": 429,
+    "message": "per-principal rate limit exceeded",
+    "correlation_id": "req-18f2a1c3d-2a",
+    "retry_after_ms": 150,
+    "remediation": "retry after retry_after_ms; reduce request rate"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`retry_after_ms` is honest per dimension: a rate rejection carries the token bucket's actual refill time, a concurrency rejection carries a fixed short backoff (250ms) since there is no natural "when will a slot free up" estimate. Streaming/SSE endpoints (`GET /api/v1/events`, `GET /events`, `GET /sse/executions/{id}`) take a concurrency slot held for the stream's lifetime (released when the stream ends), plus the rate debit — the same two caps as any other engine request (UP-1; an earlier revision of this primitive released the slot early at routing hand-off and treated streaming as rate-only, which left an engine principal able to open an unbounded number of concurrent streams — that gap is closed). This gate applies **only** to engine-principal sessions; human, device-agent, and anonymous traffic is unaffected. It is enforced **per server process** — a multi-replica deployment's effective ceiling is `configured_cap x replica_count`, not the configured cap alone (each replica enforces independently; not a fleet-wide cap). A quota rejection is metric-only (`yuzu_server_principal_quota_exhausted_total{side,limit}`, see `docs/user-manual/metrics.md`) — it does not write an audit row (see `docs/user-manual/audit-log.md`); every admitted request also increments the companion `yuzu_server_principal_quota_admits_total{side}` counter.
+
 > **⚠ Breaking wire-shape change (upgrade note).** Many of those legacy `/api/v1` errors were previously emitted as **`{"error":"<string>"}`** (the single-arg `error_json`) or the older nested `{"error":{"code","message"}}`. They are now uniformly the nested A4 object above. A client that read `error` as a *string* (`String(body.error)`, `body.error.startsWith(...)`) will break — `error` is always an **object** on these paths now. Migrate to `body.error.code` / `body.error.message`. See `docs/user-manual/upgrading.md`.
 
 ---

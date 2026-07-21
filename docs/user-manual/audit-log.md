@@ -57,6 +57,26 @@ required.
 > do not alert on `mcp.query_responses` denials as errors on a scoped multi-operator
 > deployment.
 
+> **Per-principal quota-cap rejections (PR 4.4, ADR-1005 class engine
+> principals) are deliberately NOT audited.** When an **engine principal**
+> (`principal_kind=="engine"`, username `engine:<slug>`) exceeds its
+> per-principal concurrency or rate cap, the server's pre-routing chokepoint
+> returns `429` (REST A4 envelope / MCP JSON-RPC `-32010`, both transports —
+> see `docs/user-manual/rest-api.md` and `docs/user-manual/mcp.md`) and
+> increments `yuzu_server_principal_quota_exhausted_total{side,limit}`
+> (`docs/user-manual/metrics.md`) — it writes **no** audit row. This is a
+> deliberate fail-visibility choice, not an oversight: a quota rejection is a
+> high-frequency, pre-handler operational event — an engine principal running
+> hot against its own cap, expected under normal steady-state load — not a
+> forensically interesting action against a resource. Auditing every
+> rejection would flood `audit.db` under a busy or misconfigured engine
+> principal with no compliance benefit; the counter (SIEM-routable,
+> `absent()`-safe pre-seeded series) is the intended observability surface.
+> Compare with `yuzu_onbehalf_rejected_total` and `yuzu_auth_lockout_blocked_
+> total` (see `docs/observability-conventions.md`), which follow the same
+> metric-is-the-signal / no-per-rejection-audit-row pattern for the same
+> anti-flood reason.
+
 | Action | Target type | When |
 |---|---|---|
 | `auth.login` | Session | Operator logs in via the dashboard or API |

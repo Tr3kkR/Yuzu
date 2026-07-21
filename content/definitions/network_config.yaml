@@ -266,7 +266,10 @@ metadata:
     DnsGetCacheDataTable from dnsapi.dll and returns cached entries
     with record type (A, AAAA, CNAME, PTR, MX, SRV). On Linux reads
     resolvectl cache or falls back to systemd-resolve statistics. On
-    macOS invokes dscacheutil -cachedump.
+    macOS the OS does not expose resolver-cache contents to userspace
+    (dscacheutil -cachedump is defunct on modern macOS), so a single
+    dns_cache|unsupported sentinel is returned — a permanent capability
+    gap, not a transient failure.
   tags: [network, dns, diagnostics, security]
 
 spec:

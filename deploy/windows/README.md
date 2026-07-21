@@ -89,10 +89,15 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   `_temp` directory and checkout/build outputs. PostgreSQL's executable and
   disposable data paths are also excluded. Provisioning verifies every `_temp`
   path with Defender's own `MpCmdRun.exe -CheckExclusion`. It deliberately does
-  not exempt user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper
-  routes native `TEMP`/`TMP` and MSYS2 `TMPDIR` into that runner's own `_temp`;
-  the CI telemetry start step repeats those exports so the fix applies before
-  the next planned runner restart too.
+  not exempt the whole of user/system `%TEMP%` or `D:\ci` — only the scoped
+  `C:\Windows\Temp\yuzu*` wildcard, for tests that run in a LOCAL SYSTEM context
+  (`yuzu_test_kv_SYSTEM`, guardian, …) whose `TEMP` the per-runner `_temp`
+  routing below cannot reach. The pin wrapper routes native `TEMP`/`TMP` and
+  MSYS2 `TMPDIR` into that runner's own `_temp`; the CI telemetry start step
+  repeats those exports so the fix applies before the next planned runner
+  restart too. A daily `Yuzu-CI-Temp-Sweep` scheduled task purges
+  `C:\Windows\Temp\yuzu*` entries older than 1 day so the SYSTEM-context leak
+  cannot re-bloat the NTFS directory index.
 
 ## `toolchain-manifest.json`
 

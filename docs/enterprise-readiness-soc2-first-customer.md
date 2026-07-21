@@ -78,6 +78,19 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 
 - SSO configuration records, role assignment exports, access review sign-offs, and sampled auth logs.
 
+**Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
+principals (ADR-1005 class) are already least-privilege by construction —
+default-deny RBAC resolution, structurally barred from admin/built-in/
+wildcard roles (see the `engine_principal_store.*` row in `CLAUDE.md`) — and
+PR 4.4 adds the complementary resource-bounding control: a per-principal
+in-flight concurrency cap and request-rate cap enforced at the server's
+single pre-routing chokepoint, so a compromised or malfunctioning engine
+principal cannot exhaust server capacity via unbounded concurrent or
+high-rate requests. Credit this pairing (least-privilege identity +
+bounded-resource machine credential) as a CC6.6 control for any privileged/
+machine-identity access review. See `docs/user-manual/engine-principals.md`
+"Per-principal quota cap" for the operator-facing reference.
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security

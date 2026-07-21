@@ -191,6 +191,7 @@ agent_test_exe = executable(
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
+    'unit/test_interaction_parsers.cpp',
     'unit/test_hardware_disks_macos.cpp',
   ),
   include_directories: [
@@ -200,6 +201,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
+    include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
     include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
@@ -446,6 +448,9 @@ if build_server
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
+      'unit/server/test_principal_quota.cpp', # PR 4.4 per-principal quota cap primitive
+      'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)
+      'unit/server/test_principal_quota_chokepoint.cpp', # PR 4.4 chokepoint wiring coverage
       'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-1005 PR 1.1 gRPC end-to-end enforcement
       'unit/server/test_principal_class.cpp', # ADR-1005 PR 1.2 actor-class label
       'unit/server/test_insecure_tls_gate.cpp',
@@ -454,6 +459,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
@@ -547,29 +553,35 @@ if build_server
   # hidden ([.]), so the shards partition the visible case set with nothing
   # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
   # meson runs the entries in parallel, so suite wall time is max(shards),
-  # and each shard gets its own budget. ~[pg] keeps 600s (its Windows worst
-  # case is ~231s). [pg] gets 900s: the 600 assumed per-agent Postgres
-  # (#2094) had removed cross-job contention, but it is NOT yet provisioned on
-  # Wee Tam, and at full durability every [pg] case's CREATE DATABASE ...
-  # TEMPLATE + DROP DATABASE WITH (FORCE) is fsync-bound — ~20x costlier on
-  # Windows — so the [pg] shard hit exactly-600s TIMEOUTs on 2026-07-14
-  # (Fail:0, killed at the cap). The durable fix is durability-off on the
-  # disposable CI clusters (fsync/synchronous_commit/full_page_writes;
-  # scripts/ci/ensure-postgres.sh + deploy/windows/Provision-Windows-Runner.ps1)
-  # + finishing the #2094 per-agent provisioning; once both land on Wee Tam
-  # this returns to 600. A real hang is still bounded by the job-level timeouts
-  # (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2 cleanup/sweep listener
-  # (test_pg_template_cleanup.cpp) fires in both shards — idempotent,
-  # harmless without a DSN. Constraints the shards must keep:
+  # and each shard gets its own budget. Both budgets are sized for the *contended*
+  # Wee Tam box, not per-op cost: ~[pg] = 600s (quiet Windows ~231s), [pg] = 900s.
+  #
+  # HISTORY / do-not-regress: [pg] was raised 600->900 on 2026-07-14 when the
+  # fsync-bound CREATE DATABASE ... TEMPLATE + DROP DATABASE WITH (FORCE) (~20x
+  # costlier on Windows) hit exactly-600s TIMEOUTs. The two fixes that pattern
+  # blamed have since LANDED and are verified live on Wee Tam (2026-07-21):
+  # per-agent Postgres (#2094; 4 clusters :5433-:5436) AND durability-off
+  # (fsync/synchronous_commit/full_page_writes; scripts/ci/ensure-postgres.sh +
+  # deploy/windows/Provision-Windows-Runner.ps1). Do NOT "return [pg] to 600":
+  # the residual is NOT Postgres durability — it is box-wide concurrency
+  # contention. Wee Tam runs 4 CCD-pinned runners on ONE host; affinity partitions
+  # cores but not DRAM bandwidth, the shared disk, or the Defender minifilter, so
+  # every heavy suite's wall time scales with how many Windows jobs share the box
+  # (measured server ~[pg]: c0 289s -> c4 603s; [pg] up to 816s at c4). The real
+  # fix is the Test-phase concurrency gate in ci.yml (scripts/ci/with-test-slot.sh
+  # caps concurrent heavy Windows test phases per box), NOT a bigger budget —
+  # raising a number just moves the cliff. A real hang is still bounded by the
+  # job-level timeouts (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2
+  # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in both shards —
+  # idempotent, harmless without a DSN. Constraints the shards must keep:
   #   - only tag-filter specs may appear in args (flake-retry.py strips
   #     positional tag specs before an isolated case retry — Catch2 ORs
   #     positional specs);
   #   - neither entry name may be a substring of the other (flake-retry maps
   #     meson-junit names by longest substring match).
-  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the
-  # first move is the durability/per-agent fix above (attack the cost), then
-  # split or rebalance — raising the number is only the transitional net it is
-  # here for [pg] until durability-off + per-agent Postgres land on Wee Tam.
+  # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
+  # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
+  # then split or rebalance — raising the number is the last resort, not the first.
   test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
   test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
 endif
