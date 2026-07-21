@@ -528,7 +528,8 @@ if build_server
       # are not part of that wire-contract change, so a rung-2 hoist sweeping only spark
       # would leave the 22 yuzu.guardian_journal_* literals behind while this comment
       # still read as though it covered them. Both key families must move together; the
-      # journal side is tracked on #2298's cutover-gate list. Concrete target when it
+      # journal side must be added to #2298's cutover-gate list (not yet filed there as of
+      # this commit). Concrete target when it
       # happens: a hand-written header carried by proto/meson.build's
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.

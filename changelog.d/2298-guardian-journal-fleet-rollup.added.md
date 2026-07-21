@@ -26,7 +26,8 @@
 
   Two meta-signals sit outside that table and publish on every sweep **including
   at zero**: `yuzu_fleet_guardian_journal_reporting` (the coverage denominator -
-  `0` while agents are connected means the telemetry pipeline is dark, otherwise
+  `0` while agents are connected means either the telemetry path is dark or
+  nothing has been journalled anywhere since restart; without it that state is
   indistinguishable from a healthy quiet fleet) and `..._tag_rejected` (values
   that failed the forged-value parse, which would otherwise be a silent drop). No
   alert rules are enabled: no sound alerting form exists over an unlabelled fleet

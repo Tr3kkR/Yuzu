@@ -712,9 +712,10 @@ public:
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
         // no HELP, or with HELP that drifts from what the rollup actually computes.
         // Unlabelled by design; all 22 are ABSENT until some agent's journal reports.
-        // Read the type-honesty note on kGuardianJournalMetrics before writing an alert:
-        // most source values latch on a bare `> 0` - see that note for why that is the
-        // chosen form for the loss counters and why increase() is not.
+        // Read the type-honesty note on kGuardianJournalMetrics before writing an
+        // alert: no sound alerting form exists over these fleet sums yet (neither
+        // increase() nor bare `> 0` survives a churning population), so the 22 are
+        // MONITOR-ONLY until a per-agent axis lands (#2083-class; see the note).
         for (const auto& m : detail::kGuardianJournalMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
         // The two meta-signals are NOT in that table (it is pinned 1:1 to the agent's

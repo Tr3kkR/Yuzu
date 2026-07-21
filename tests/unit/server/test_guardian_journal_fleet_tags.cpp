@@ -6,7 +6,7 @@
  * heartbeat tag keys rather than including the agent's writer header, because server
  * production code must not gain an upward dependency on an agent private header (the
  * constraint is recorded in tests/meson.build). This file is what makes that safe: it
- * is the ONLY place both sides meet, and it binds them three ways -
+ * is the ONLY place both sides meet, and it binds them four ways -
  *
  *  - STRUCTURAL: sizeof(GuardianJournalStats) pins the field count to the table row
  *    count, so adding a counter without a fleet gauge is a COMPILE error.
@@ -15,6 +15,9 @@
  *    signal silently reports nothing).
  *  - READER -> WRITER: every table row must have been emitted (else that gauge is
  *    permanently absent - a typo in the table looks exactly like a healthy fleet).
+ *  - FIELD -> KEY (the one the key-set checks cannot make): every emitted key carries
+ *    its OWN field's value, so swapping two values in the emitter is caught. Without
+ *    it the emitted key SET is unchanged and all three checks above still pass.
  *
  * Plus the sparse-emit contract (a quiescent journal ships NO tags, which is what
  * makes absent-not-zero honest), the mechanical tag->gauge name rule, and the

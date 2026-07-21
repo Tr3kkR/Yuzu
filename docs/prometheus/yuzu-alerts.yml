@@ -855,14 +855,20 @@ groups:
   # notifies once per absent->present transition rather than continuously, which is the
   # closest to correct available today. One documented refinement to evaluate at enable
   # time, not adopted here because nothing ships enabled: OR-ing in a rise detector,
-  # `((X - X offset 15m) > 0)`, would additionally catch "a second agent also broke",
-  # because the fleet sum only ever RISES on a real report - churn and staleness lower
-  # it, never raise it. It is blind to first appearance on its own (the offset side is
-  # absent), which is why it complements rather than replaces the form below. It is still NOT sufficient to enable: it cannot
+  # `((X - X offset 15m) > 0)`, would additionally catch a rise in an ALREADY-PRESENT
+  # series (a second agent breaking, or the same agent losing more), which the form
+  # below cannot see. It is NOT churn-immune, and an earlier draft of this note wrongly
+  # claimed it was: an agent RE-ENTERING the staleness window after a >15m absence
+  # (reconnect, partition heal, laptop wake) raises the sum by its whole latched value
+  # with no new loss, so it fires on reconnection churn - increase()'s disease, just
+  # narrower. It is also blind to first appearance on its own (the offset side is
+  # absent), so it complements rather than replaces the form below. Neither form can
+  # ATTRIBUTE a rise - second agent vs same agent losing more vs reconnection churn -
+  # because there is no per-agent axis to separate on. It is still NOT sufficient to enable: it cannot
   # distinguish "a second agent also broke" from "same agent, still broken", because
   # there is no per-agent axis to separate on. Closing that needs the per-agent delta
   # plus a server-owned monotonic counter - #2083 is the spark-scoped tracker, and the
-  # journal side rides #2298's cutover-gate list.
+  # journal side belongs on #2298's cutover-gate list and is not yet filed there.
   #
   # UNTIL BOTH REASONS CLEAR THESE ARE MONITOR-ONLY: graph them, review them in
   # post-incident analysis, do not page on them.
@@ -882,8 +888,9 @@ groups:
   # trust boundary - one forged or buggy agent can set any of these, and suppression
   # (an agent that simply stops emitting) is indistinguishable from health - so a
   # warning routes to a ticket, never a page. An agent leaving the 90s staleness window
-  # RESOLVES these without the underlying loss having healed, and a SERVER restart
-  # rebuilds the series within one sweep and re-notifies an already-known incident. The
+  # RESOLVES these without the underlying loss having healed, and a server outage longer
+  # than the 15m offset window re-notifies an already-known incident on recovery (a
+  # short restart is suppressed by the offset, not re-notified). The
   # alert is the signal; the audit trail is the evidence.
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are

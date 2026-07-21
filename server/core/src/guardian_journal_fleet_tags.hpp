@@ -128,7 +128,8 @@ struct GuardianJournalMetric {
 /// cannot tell "a second agent also broke" from "same agent, still broken", because
 /// there is no per-agent axis to separate on. That needs a per-agent delta plus a
 /// server-owned monotonic counter (#2083 is the spark-scoped tracker; the journal side
-/// rides #2298's cutover-gate list). Until then these are MONITOR-ONLY: graph them,
+/// belongs on #2298's cutover-gate list, and is not yet filed there). Until then these
+/// are MONITOR-ONLY: graph them,
 /// review them, do not page on them.
 ///
 /// None of the three live-depth gauges is alertable either. `_pending` drains on a
