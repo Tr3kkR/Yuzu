@@ -43,8 +43,10 @@
 /// sweep thread stalled" and "the heartbeat path broke" all render identically as 22
 /// absent families - maximally reassuring exactly when nothing is being observed
 /// (governance Gate-4 UP-9). `..._reporting` is the coverage denominator, and
-/// `absent(..._reporting)` or `..._reporting == 0 while yuzu_fleet_agents_healthy > 0`
-/// is the blackout check, symmetric to the spark family's own signal-gone rule. An
+/// `..._reporting == 0 while yuzu_fleet_agents_healthy > 0` is the blackout check -
+/// but ONLY once Guardian is actually deployed fleet-wide, because the sparse writer
+/// means 0 also reads as "nothing journalled yet" (see its HELP). `..._tag_rejected`
+/// carries no such condition. An
 /// earlier revision of this header argued no denominator was needed because it would
 /// itself be absent on a healthy fleet; that reasoning only held while the journal was
 /// inert, and it is wrong post-cutover.
@@ -234,7 +236,8 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "Fleet sum of journalled records newly enqueued into the replay window. Activity "
      "signal for how much backlog is being re-delivered"},
     {"yuzu.guardian_journal_sent_labels", "yuzu_fleet_guardian_journal_sent_labels",
-     "Fleet sum of sent-labels written, in BATCHES (best-effort delivery evidence). NOT a "
+     "Fleet sum of sent-labels written, in BATCHES of up to 256 records (best-effort "
+     "delivery evidence). NOT a "
      "valid denominator for the eviction counters despite the matching unit: labels are "
      "counted in the CURRENT agent process, while evictions cover batches written up to "
      "the 7-day retention window earlier across a churning fleet, so after a restart the "

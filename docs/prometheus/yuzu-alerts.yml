@@ -866,8 +866,9 @@ groups:
   #
   # NEITHER FORM CAN ATTRIBUTE A RISE. "A second agent also broke", "the same agent lost
   # more" and "an agent reconnected" are indistinguishable, because there is no
-  # per-agent axis to separate on. That, not the expression shape, is what keeps this
-  # group from being enable-ready. Closing it needs the per-agent delta plus a
+  # per-agent axis to separate on. That is REASON 2 in concrete form: it is why the loss
+  # rules stay disabled even once the cutover clears REASON 1, and it is separate again
+  # from prerequisites (a)-(d) below. Closing it needs the per-agent delta plus a
   # server-owned monotonic counter - #2083 is the spark-scoped tracker, and the journal
   # side belongs on #2298's cutover-gate list and is not yet filed there.
   #
@@ -897,13 +898,16 @@ groups:
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
   # published on EVERY sweep including at 0, unlike the 22 counters. They are the only
   # rules here that CAN be sound, because they are server-owned counts rather than fleet
-  # sums of agent monotonics - but TelemetryDark is sound only once Guardian is actually
-  # deployed fleet-wide (its 0 also means "nothing journalled yet" - see its
+  # sums of agent monotonics. They differ from each other: TagRejected is
+  # unconditionally sound, while TelemetryDark is sound only once Guardian is actually
+  # deployed fleet-wide, because its 0 also means "nothing journalled yet" (see its
   # description below).
   #
   # - name: yuzu-guardian-journal
   #   rules:
-  #     # ---- Pipeline health (sound once Guardian is deployed) ---------------------
+  #     # ---- Pipeline health ---------------------------------------------------------
+  #     # These two differ: TagRejected is unconditionally sound; TelemetryDark is sound
+  #     # only once Guardian is deployed, because its 0 also means "nothing journalled yet".
   #     - alert: YuzuGuardianJournalTelemetryDark
   #       expr: |
   #         yuzu_fleet_guardian_journal_reporting == 0
@@ -950,8 +954,8 @@ groups:
   #         summary: "Guardian lifecycle batches aged out with no send evidence"
   #         description: >-
   #           Journal BATCHES (up to 256 records each) aged out with no evidence their
-  #           records were transmitted - lifecycle audit records were likely lost
-  #           between endpoint and server. Treat as a TICKET TO INVESTIGATE, not an
+  #           records were transmitted - which SUGGESTS lifecycle audit records were
+  #           lost between endpoint and server, but does not establish it. Treat as a TICKET TO INVESTIGATE, not an
   #           incident-register entry: classification is BEST-EFFORT, so a crash
   #           between the send and the sent-label write counts a sent batch as
   #           no-evidence, and a mass reboot or OTA manufactures a large benign step
