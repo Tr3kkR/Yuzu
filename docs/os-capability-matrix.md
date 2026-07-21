@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-18._
+_Last hand-updated: 2026-07-21._
 
 ## Matrix
 
@@ -43,6 +43,10 @@ _Last hand-updated: 2026-07-18._
 | **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`, Windows); macOS now emits an honest `arp\|not_available` sentinel (real route-sysctl collector still 🔜); Linux `/proc/net/arp` 🔜 |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ | `network_config/dns_cache` (`DnsGetCacheDataTable`) |
 | **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
+| **Digital-signature verification** (`filesystem.get_signature`) | ✅ | ⛔ | ✅ | Win: WinVerifyTrust (Authenticode: valid/invalid/unsigned/untrusted) in `filesystem_plugin.cpp`. macOS: `codesign --verify --deep --strict` mapped to valid/unsigned/invalid/unknown by `classify_codesign_result` in `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` (macOS `valid` = seal integrity, not Gatekeeper/notarization trust). Linux emits platform-unsupported |
+| **File version info** (`filesystem.get_version_info`) | ✅ | ⛔ | ✅ | Win: `GetFileVersionInfoW`/`VerQueryValueW` (VS_FIXEDFILEINFO + string table) in `filesystem_plugin.cpp`. macOS: CFBundleShortVersionString/CFBundleVersion from the bundle Info.plist via `plutil -extract`, mapped by `classify_plutil_extract` in `filesystem_macos_sig.hpp` (binary + XML plists; `version_status\|not_available` when absent). Linux emits platform-unsupported |
+| **Certificate store — login-keychain read** (`certificates.list`/`details` `store=login`/`all`) | ⛔ | ⛔ | ✅ | macOS-specific: reads the console user's login keychain via `launchctl asuser <uid> sudo -n -u <user> security find-certificate` (root-only; see `docs/agent-privilege-model.md`), built by `build_login_keychain_read_command` in `agents/shared/macos_console_user.hpp`, invoked from `agents/plugins/certificates/src/certificates_plugin.cpp`. Windows machine stores (CryptoAPI) and Linux `/etc/ssl/certs` have no per-user login-keychain equivalent for this hop |
+| **Certificate delete — verified / SIP-aware** (`certificates.delete`) | ✅ | ✅ | ✅ | Win: CryptoAPI store delete; Linux: remove matching PEM under `/etc/ssl/certs`. macOS: `security delete-certificate` on `System.keychain` then a re-enumeration that reports `deleted` only on a positively-proven absence (`classify_delete_verdict` in `agents/shared/macos_console_user.hpp`); `store=root` rejected (SystemRootCertificates.keychain is SIP-sealed) in `certificates_plugin.cpp` |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate

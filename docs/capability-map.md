@@ -467,7 +467,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.8 Certificate Inventory (Get/Delete) :white_check_mark: `T2`
 
-`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: security find-certificate.
+`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: `security find-certificate` over System.keychain and SystemRootCertificates.keychain, plus the current console user's login keychain via a `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
 
 ### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
@@ -513,11 +513,11 @@ Not implemented. Modify allow/block lists on endpoint security products.
 
 ### 10.8 Digital Signature Verification :white_check_mark: `T2`
 
-`filesystem` plugin `get_signature` action. Windows: Authenticode verification via WinVerifyTrust — reports signature status (valid, invalid, unsigned, untrusted), signer name, and timestamp. Linux/macOS: returns platform-unsupported status.
+`filesystem` plugin `get_signature` action. Windows: Authenticode verification via WinVerifyTrust — reports signature status (valid, invalid, unsigned, untrusted), signer name, and timestamp. macOS: runs `codesign --verify --deep --strict` and reports an honest macOS status (`valid` = intact seal, `unsigned`, `invalid` = a proven broken seal / bad requirement / corrupt sealed resource, `unknown` = trust/policy/notarization failure or unrecognised diagnostic) — a different vocabulary from Authenticode, since codesign/Gatekeeper model trust differently than WinVerifyTrust; `valid` attests seal integrity, not Gatekeeper/notarization trust. Linux: returns platform-unsupported status.
 
 ### 10.9 File Version Info :white_check_mark: `T2`
 
-`get_version_info` action in `filesystem` plugin. Windows: GetFileVersionInfoW/VerQueryValueW for VS_FIXEDFILEINFO + string table. Returns file_version, product_version, company_name, file_description, etc. Returns platform-unsupported on Linux/macOS.
+`get_version_info` action in `filesystem` plugin. Windows: GetFileVersionInfoW/VerQueryValueW for VS_FIXEDFILEINFO + string table. Returns file_version, product_version, company_name, file_description, etc. macOS: reads CFBundleShortVersionString and CFBundleVersion from an app bundle's Info.plist via `plutil -extract` (handles both binary and XML plists), reporting `version_status|not_available` when the target carries no Info.plist or version keys rather than failing. Returns platform-unsupported on Linux.
 
 ### 10.10 File Content Search and Replace :white_check_mark: `T2`
 

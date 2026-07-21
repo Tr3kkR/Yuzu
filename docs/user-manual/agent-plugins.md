@@ -484,6 +484,25 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 > are unaffected; rename or symlink an unusually-named cert to a plain path
 > if it must appear in the inventory.
 
+> **Note (macOS store selection):** `list` and `details` accept a `store`
+> parameter to scope the search: `System`
+> (`/Library/Keychains/System.keychain`), `root`
+> (`SystemRootCertificates.keychain`), `login` (the current console user's
+> login keychain), or `all` (the default — System and root, plus login when a
+> console user is present). The `login` store is read from the console user's
+> per-user session via a `launchctl asuser <uid> sudo -n -u <user> security
+> find-certificate` hop, because the LaunchDaemon has no login keychain of its
+> own; with nobody logged in at the console it returns
+> `not_available|no console session`. `delete` accepts only `MY`/`System`
+> (both target `System.keychain`, matching prior behaviour); `root` is
+> rejected as unsupported (SystemRootCertificates.keychain is sealed by System
+> Integrity Protection and cannot be modified), and `login`/`all`/any other
+> value are rejected rather than deleting from an unintended store. A macOS
+> `delete` re-enumerates the target keychain afterward and reports
+> `status|deleted` only on a positively-proven absence — a failed delete
+> command, a certificate still present, or a keychain that could not be
+> re-read all yield `error|<message>` instead of a false success.
+
 ### ioc
 
 | | |
@@ -541,7 +560,8 @@ Plugins for file and directory operations.
 | `create_temp_dir` | Create a temporary directory and return its path. |
 | `read` | Read a text file with line-number offsets (max 100 MB, binary detection, paginated). |
 | `get_acl` | Return the file or directory ACL permissions. On Windows, returns the SDDL security descriptor. On Linux/macOS, returns POSIX permission bits and owner/group. Parameters: `path` (required). |
-| `get_signature` | Check the Authenticode digital signature of a file (Windows only). Returns signer, timestamp, and trust status. On Linux/macOS, returns unsigned status. Parameters: `path` (required). |
+| `get_signature` | Check the code signature of a file or app bundle. On Windows, verifies the Authenticode signature and returns signer, timestamp, and trust status. On macOS, runs `codesign --verify --deep --strict` and returns a macOS signature status (`valid`, `unsigned`, `invalid`, `unknown`); note macOS `valid` attests seal integrity, **not** Gatekeeper/notarization trust — a well-formed but untrusted or un-notarized signature returns `unknown`, not `invalid`. On Linux, returns platform-unsupported. Parameters: `path` (required). |
+| `get_version_info` | Extract version information from an executable or app bundle. On Windows, reads the PE version resource (FileVersion, ProductVersion, CompanyName, FileDescription, etc.). On macOS, reads CFBundleShortVersionString and CFBundleVersion from the bundle's Info.plist via `plutil` (handles both binary and XML plists); `path` may be a `.app` directory or an `Info.plist` file directly, and a target with no Info.plist or version keys returns `version_status|not_available` rather than an error. On Linux, returns platform-unsupported. Parameters: `path` (required). |
 | `find_by_hash` | Search a directory tree for files matching a SHA-256 hash. Useful for threat hunting and file integrity verification. Parameters: `hash` (required, SHA-256 hex string), `path` (required, directory to search). |
 
 ### disk_space
