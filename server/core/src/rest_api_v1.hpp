@@ -64,6 +64,14 @@ class SoftwareInventoryStore;
 // use the MEMBER threaded via set_engine_principal_store. Forward-declared;
 // the .cpp includes engine_principal_store.hpp.
 class EnginePrincipalStore;
+// Periodic Access Reviews (SOC 2 CC6.2). AccessReviewStore is the campaign
+// persistence (open/attest/close); DirectorySync is optional read-model
+// enrichment (user email best-effort). Both forward-declared (pointer-only in
+// register_routes); the .cpp includes access_review_store.hpp /
+// directory_sync.hpp. AuthDB is already forward-declared by the
+// <yuzu/server/auth.hpp> include above.
+class AccessReviewStore;
+class DirectorySync;
 }
 
 #include <httplib.h>
@@ -290,7 +298,17 @@ public:
         // optional dep; nullptr leaves the assign/unassign routes answering
         // 503 (list still works if rbac_store is wired — it doesn't need
         // this store).
-        EnginePrincipalStore* engine_principal_store = nullptr);
+        EnginePrincipalStore* engine_principal_store = nullptr,
+        // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
+        // read-model deps `build_access_review` needs. Trailing optional deps;
+        // `access_review_store == nullptr` leaves the whole /api/v1/access-reviews
+        // family answering 503. `auth_db`/`directory_sync` are REQUIRED/OPTIONAL
+        // respectively per access_review_model.hpp's own contract (auth_db unset
+        // fails the export; directory_sync unset just degrades user email
+        // enrichment) — `rbac_store`/`engine_principal_store`/`token_store` above
+        // double as the other three read-model deps, so no new params for those.
+        AccessReviewStore* access_review_store = nullptr, AuthDB* auth_db = nullptr,
+        DirectorySync* directory_sync = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -342,7 +360,11 @@ public:
         // param. COEXISTENCE (4.2→4.3 rebase): the 4.3 lifecycle routes use the
         // `engine_principal_store_` MEMBER (set via set_engine_principal_store);
         // server.cpp wires BOTH. Follow-up: unify onto the member.
-        EnginePrincipalStore* engine_principal_store = nullptr);
+        EnginePrincipalStore* engine_principal_store = nullptr,
+        // Periodic Access Reviews (SOC 2 CC6.2) — see the production overload's
+        // doc comment above; identical trailing-optional-dep contract.
+        AccessReviewStore* access_review_store = nullptr, AuthDB* auth_db = nullptr,
+        DirectorySync* directory_sync = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

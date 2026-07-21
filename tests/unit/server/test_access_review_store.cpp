@@ -1,0 +1,432 @@
+/**
+ * test_access_review_store.cpp — `AccessReviewStore` (Periodic Access
+ * Reviews, SOC 2 CC6.2 campaign persistence).
+ *
+ * Covers:
+ *  - R3 freeze-at-open: `open_campaign` inserts every frozen grant as a
+ *    `decision='pending'` row, in one call.
+ *  - `record_attestation` transitions a pending row and upserts in place on
+ *    a re-attest (no duplicate row).
+ *  - the closed-campaign guard: a write into a closed campaign is rejected.
+ *  - the `not_found: ` prefix contract on attestation/get/close.
+ *  - fail-closed construction, both the migration-drift case (a live but
+ *    unmigratable database) and the fresh/unreachable-pool case that needs
+ *    no live database at all (mirrors `test_engine_principal_store.cpp`'s
+ *    two fail-closed cases).
+ *  - persistence: a campaign's evidence survives a fresh pool/store
+ *    reconnect against the SAME database — this store deliberately has NO
+ *    prune method (unlike the /auto pre-flight/deployment 14-day prune);
+ *    closed campaigns are permanent SOC 2 evidence, so there is no expiry
+ *    path to exercise, only durability.
+ *  - `list_campaigns`: returns opened campaigns newest-first (governance
+ *    hardening round, H-2), empty when none.
+ *
+ * Born-on-Postgres store (ADR-0012 §1, authoritative/fail-hard). PG-gated:
+ * skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken
+ * (test_helpers.hpp skip-vs-fail contract). Store-behaviour cases use the
+ * pre-migrated PgTestTemplate variant (docs/postgres-store-playbook.md step
+ * 7); the two fail-closed cases use YUZU_REQUIRE_PG_DB / no gate at all, per
+ * the plain-migration-test carve-out documented on that macro.
+ */
+
+#include "access_review_store.hpp"
+
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include "../test_helpers.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
+
+#include <chrono>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+using yuzu::server::AccessReviewStore;
+using yuzu::server::GrantRef;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
+
+namespace {
+
+yuzu::test::PgTestTemplate access_review_store_tpl{
+    "accrevstore", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        AccessReviewStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("access_review_store template: store failed to migrate");
+    }};
+
+std::vector<GrantRef> three_grants() {
+    return {
+        GrantRef{"user", "alice", "Admin", R"({"display_name":"alice"})"},
+        GrantRef{"group", "eng", "Reader", R"({"display_name":"eng"})"},
+        GrantRef{"engine", "engine:svc", "Writer", R"({"display_name":"svc"})"},
+    };
+}
+
+} // namespace
+
+// ── Construction fail-closed ────────────────────────────────────────────────
+
+// ADR-0012 §1: construction is fail-CLOSED — a reachable database whose
+// schema can't migrate leaves the store !is_open() (server.cpp wires this to
+// startup_failed_). Force it by pre-seeding the schema with a conflicting
+// table and no schema_meta row, so the migration runner's drift guard
+// refuses. Mirrors test_engine_principal_store.cpp's equivalent test.
+TEST_CASE("AccessReviewStore reports !is_open on a migration failure",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA access_review_store")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(),
+                          "CREATE TABLE access_review_store.access_review_campaign (bogus int)")};
+        REQUIRE(t.ok());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    CHECK_FALSE(store.is_open());
+}
+
+// No live database needed at all — a malformed conninfo never connects
+// (PgPool::valid() is false, acquire() never attempts a connection). Mirrors
+// test_engine_principal_store.cpp's StoreUnreachable section. Also proves
+// EVERY mutator/reader surfaces the closed store rather than silently
+// no-opping or crashing.
+TEST_CASE("AccessReviewStore reports !is_open on an unreachable pool, and every method fails "
+          "closed",
+          "[access_review][store]") {
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    AccessReviewStore store{pool};
+    CHECK_FALSE(store.is_open());
+
+    CHECK_FALSE(store.open_campaign("t", "admin", {}).has_value());
+    CHECK_FALSE(store.record_attestation("x", "user", "a", "R", "attested", "r", "").has_value());
+    CHECK_FALSE(store.get_campaign("x").has_value());
+    CHECK_FALSE(store.close_campaign("x", "admin").has_value());
+}
+
+// ── Freeze-at-open (R3) ──────────────────────────────────────────────────────
+
+TEST_CASE("open_campaign freezes the full population as pending rows (R3)",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Q3 Review", "admin", three_grants());
+    REQUIRE(open_res.has_value());
+    CHECK_FALSE(open_res->empty());
+
+    auto view_res = store.get_campaign(*open_res);
+    REQUIRE(view_res.has_value());
+    CHECK(view_res->campaign.campaign_id == *open_res);
+    CHECK(view_res->campaign.title == "Q3 Review");
+    CHECK(view_res->campaign.status == "open");
+    CHECK(view_res->campaign.created_by == "admin");
+    CHECK(view_res->campaign.closed_by.empty());
+    CHECK(view_res->campaign.closed_at_ms == 0);
+    REQUIRE(view_res->attestations.size() == 3);
+    CHECK(view_res->pending_count == 3);
+    for (const auto& a : view_res->attestations) {
+        CHECK(a.decision == "pending");
+        CHECK(a.reviewer.empty());
+        CHECK(a.decided_at_ms == 0);
+    }
+}
+
+TEST_CASE("open_campaign with an empty population still opens a campaign (zero pending rows)",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Empty", "admin", {});
+    REQUIRE(open_res.has_value());
+    auto view_res = store.get_campaign(*open_res);
+    REQUIRE(view_res.has_value());
+    CHECK(view_res->attestations.empty());
+    CHECK(view_res->pending_count == 0);
+}
+
+// ── record_attestation: transition + upsert ─────────────────────────────────
+
+TEST_CASE("record_attestation transitions a pending row and upserts in place on re-attest",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("R1", "admin", three_grants());
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto rec1 = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "ok");
+    REQUIRE(rec1.has_value());
+
+    auto view1 = store.get_campaign(cid);
+    REQUIRE(view1.has_value());
+    CHECK(view1->pending_count == 2);
+    bool found_attested = false;
+    for (const auto& a : view1->attestations) {
+        if (a.principal_type == "user" && a.principal_id == "alice" && a.role_name == "Admin") {
+            found_attested = true;
+            CHECK(a.decision == "attested");
+            CHECK(a.reviewer == "carol");
+            CHECK(a.justification == "ok");
+            CHECK(a.decided_at_ms > 0);
+        }
+    }
+    CHECK(found_attested);
+
+    // Re-attest the SAME grant with a different decision: overwrites in
+    // place — still exactly one row for this (campaign, principal, role).
+    auto rec2 =
+        store.record_attestation(cid, "user", "alice", "Admin", "flagged_revoke", "dave", "stale");
+    REQUIRE(rec2.has_value());
+    auto view2 = store.get_campaign(cid);
+    REQUIRE(view2.has_value());
+    CHECK(view2->attestations.size() == 3); // no new row added
+    int matches = 0;
+    for (const auto& a : view2->attestations) {
+        if (a.principal_type == "user" && a.principal_id == "alice" && a.role_name == "Admin") {
+            ++matches;
+            CHECK(a.decision == "flagged_revoke");
+            CHECK(a.reviewer == "dave");
+            CHECK(a.justification == "stale");
+        }
+    }
+    CHECK(matches == 1);
+    CHECK(view2->pending_count == 2); // unchanged — still one non-pending row
+}
+
+TEST_CASE("record_attestation rejects a decision outside {attested,flagged_revoke}",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Bad decision", "admin", three_grants());
+    REQUIRE(open_res.has_value());
+
+    auto rec = store.record_attestation(*open_res, "user", "alice", "Admin", "pending", "carol",
+                                        "");
+    REQUIRE_FALSE(rec.has_value());
+    // Not the not_found: prefix — this is a caller-input validation failure,
+    // rejected before any query runs.
+    CHECK_FALSE(rec.error().starts_with("not_found:"));
+}
+
+// ── Closed-campaign guard ────────────────────────────────────────────────────
+
+TEST_CASE("record_attestation rejects a write into a closed campaign",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Closed test", "admin", three_grants());
+    REQUIRE(open_res.has_value());
+    const auto cid = *open_res;
+
+    auto close_res = store.close_campaign(cid, "admin");
+    REQUIRE(close_res.has_value());
+
+    auto rec = store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "");
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error().starts_with("not_found:"));
+
+    // Evidence unchanged: the campaign still shows the row as pending — a
+    // rejected write must never partially land.
+    auto view = store.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->pending_count == 3);
+}
+
+// ── not_found: prefix contract ──────────────────────────────────────────────
+
+TEST_CASE("not_found: mapping on attestation/get/close for a bogus campaign_id",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto att = store.record_attestation("bogus-campaign-id", "user", "alice", "Admin", "attested",
+                                        "carol", "");
+    REQUIRE_FALSE(att.has_value());
+    CHECK(att.error().starts_with("not_found:"));
+
+    auto get = store.get_campaign("bogus-campaign-id");
+    REQUIRE_FALSE(get.has_value());
+    CHECK(get.error().starts_with("not_found:"));
+
+    auto close = store.close_campaign("bogus-campaign-id", "admin");
+    REQUIRE_FALSE(close.has_value());
+    CHECK(close.error().starts_with("not_found:"));
+}
+
+TEST_CASE("record_attestation on a grant never in the frozen population is not_found",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Narrow", "admin", three_grants());
+    REQUIRE(open_res.has_value());
+
+    // A real, open campaign — but this (principal, role) tuple was never in
+    // the frozen population.
+    auto rec = store.record_attestation(*open_res, "user", "nobody", "NoSuchRole", "attested",
+                                        "carol", "");
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error().starts_with("not_found:"));
+}
+
+TEST_CASE("close_campaign is idempotent-rejecting: closing twice returns not_found",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Double close", "admin", {});
+    REQUIRE(open_res.has_value());
+    REQUIRE(store.close_campaign(*open_res, "admin").has_value());
+
+    auto second = store.close_campaign(*open_res, "admin");
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error().starts_with("not_found:"));
+}
+
+// ── Persistence — no prune ──────────────────────────────────────────────────
+
+TEST_CASE("campaign evidence persists across a fresh store/connection — there is no prune path "
+          "to exercise, only durability",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    std::string cid;
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        AccessReviewStore store{pool};
+        REQUIRE(store.is_open());
+        auto open_res = store.open_campaign("Durable", "admin", three_grants());
+        REQUIRE(open_res.has_value());
+        cid = *open_res;
+        REQUIRE(store.record_attestation(cid, "user", "alice", "Admin", "attested", "carol", "")
+                   .has_value());
+    } // pool/store fully torn down here
+
+    // A FRESH pool + store instance against the SAME database — this is what
+    // distinguishes "durable Postgres state" from "an in-process cache".
+    // AccessReviewStore deliberately has no prune method (unlike the /auto
+    // pre-flight/deployment runs' 14-day prune) — a closed-or-open campaign's
+    // evidence is meant to persist indefinitely, so there is no expiry to
+    // exercise here.
+    PgPool pool2{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store2{pool2};
+    REQUIRE(store2.is_open());
+    auto view = store2.get_campaign(cid);
+    REQUIRE(view.has_value());
+    CHECK(view->campaign.title == "Durable");
+    CHECK(view->pending_count == 2);
+    bool found_attested = false;
+    for (const auto& a : view->attestations)
+        if (a.decision == "attested")
+            found_attested = true;
+    CHECK(found_attested);
+}
+
+// ── list_campaigns ───────────────────────────────────────────────────────────
+
+TEST_CASE("list_campaigns: empty when no campaign has ever been opened",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto list_res = store.list_campaigns();
+    REQUIRE(list_res.has_value()); // a genuine empty result, never unexpected
+    CHECK(list_res->empty());
+}
+
+TEST_CASE("list_campaigns: returns every opened campaign's metadata, newest-first",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_a = store.open_campaign("Campaign A", "admin", {});
+    REQUIRE(open_a.has_value());
+    // The store orders strictly by `created_at_ms` with no secondary sort key
+    // (access_review_store.cpp) — force a distinct millisecond timestamp per
+    // open so "newest-first" order is unambiguous, not a race against the
+    // clock's own resolution.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    auto open_b = store.open_campaign("Campaign B", "admin", {});
+    REQUIRE(open_b.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    auto open_c = store.open_campaign("Campaign C", "admin", three_grants());
+    REQUIRE(open_c.has_value());
+
+    auto list_res = store.list_campaigns();
+    REQUIRE(list_res.has_value());
+    REQUIRE(list_res->size() == 3);
+    // Newest-first: C, B, A.
+    CHECK((*list_res)[0].campaign_id == *open_c);
+    CHECK((*list_res)[0].title == "Campaign C");
+    CHECK((*list_res)[1].campaign_id == *open_b);
+    CHECK((*list_res)[1].title == "Campaign B");
+    CHECK((*list_res)[2].campaign_id == *open_a);
+    CHECK((*list_res)[2].title == "Campaign A");
+
+    // list_campaigns is metadata-only — it does NOT return attestation rows
+    // (get_campaign is the surface for those); every listed row's status
+    // reflects the fresh-open state.
+    for (const auto& c : *list_res) {
+        CHECK(c.status == "open");
+        CHECK(c.created_by == "admin");
+        CHECK(c.closed_by.empty());
+        CHECK(c.closed_at_ms == 0);
+    }
+}
+
+TEST_CASE("list_campaigns: a closed campaign's metadata still appears (list is not filtered by "
+          "status)",
+          "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Will be closed", "admin", {});
+    REQUIRE(open_res.has_value());
+    REQUIRE(store.close_campaign(*open_res, "admin").has_value());
+
+    auto list_res = store.list_campaigns();
+    REQUIRE(list_res.has_value());
+    REQUIRE(list_res->size() == 1);
+    CHECK((*list_res)[0].campaign_id == *open_res);
+    CHECK((*list_res)[0].status == "closed");
+    CHECK((*list_res)[0].closed_by == "admin");
+    CHECK((*list_res)[0].closed_at_ms > 0);
+}

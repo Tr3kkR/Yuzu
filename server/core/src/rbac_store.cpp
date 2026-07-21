@@ -317,7 +317,15 @@ void RbacStore::seed_defaults() {
     // `perm_fn(..., "Push")` on a non-Guardian securable do not silently
     // succeed against a seeded allow. Only the Guardian REST handlers
     // consult Push; grant it explicitly per role and per type.
-    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push"};
+    //
+    // "Attest" is Periodic-Access-Review-specific (SOC 2 CC6.2) — recording a
+    // reviewer's attested/flagged-revoke decision on an access-review
+    // campaign row. Same treatment as Push: a first-class operation in the
+    // catalogue, but deliberately EXCLUDED from `crud_ops` so the
+    // Administrator/ITServiceOwner/Viewer cross-type loops below never widen
+    // it onto an unrelated securable — it is granted explicitly, only on
+    // AuditLog, only to Administrator and the new Reviewer role.
+    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"};
     const char* crud_ops[] = {"Read", "Write", "Execute", "Delete", "Approve"};
     for (auto* o : ops) {
         sqlite3_stmt* s = nullptr;
@@ -344,6 +352,11 @@ void RbacStore::seed_defaults() {
         {"ApiTokenManager", "Create, revoke, and manage API tokens for programmatic access"},
         {"ITServiceOwner", "Admin control over devices tagged with the same IT Service"},
         {"Viewer", "Read-only access to operational data"},
+        // Periodic Access Reviews (SOC 2 CC6.2): a reviewer who can read the
+        // audit trail and record attestation decisions on an access-review
+        // campaign, without holding any of Administrator's broader write
+        // access. AuditLog:Read + AuditLog:Attest only — see the grants below.
+        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"},
     };
     for (auto& [name, desc] : roles) {
         sqlite3_stmt* s = nullptr;
@@ -379,6 +392,14 @@ void RbacStore::seed_defaults() {
     sqlite3_exec(
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'GuaranteedState', 'Push', 'allow');",
+        nullptr, nullptr, nullptr);
+    // Administrator: Attest on AuditLog (Periodic Access Reviews, SOC 2
+    // CC6.2) — same targeted-grant treatment as the Push grant above; Attest
+    // is deliberately excluded from `crud_ops` so it is never seeded
+    // cross-type by the loop.
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'AuditLog', 'Attest', 'allow');",
         nullptr, nullptr, nullptr);
 
     // PlatformEngineer: full CRUD on definitions, sets, and read on related types
@@ -648,6 +669,19 @@ void RbacStore::seed_defaults() {
         sqlite3_step(s);
         sqlite3_finalize(s);
     }
+
+    // Reviewer (Periodic Access Reviews, SOC 2 CC6.2): AuditLog:Read (browse
+    // the evidence trail) + AuditLog:Attest (record a decision on a campaign
+    // row). Deliberately NOT crud_ops — a reviewer must not gain Write/
+    // Delete/Approve on AuditLog, only the ability to read and attest.
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AuditLog', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AuditLog', 'Attest', 'allow');",
+        nullptr, nullptr, nullptr);
 }
 
 void RbacStore::load_enabled_flag() {
@@ -844,6 +878,63 @@ std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_
     return result;
 }
 
+std::expected<std::vector<Permission>, std::string>
+RbacStore::get_role_permissions_checked(const std::string& role_name) const {
+    std::shared_lock lock(mtx_);
+    std::vector<Permission> result;
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT role_name, securable_type, operation, effect "
+            "FROM role_permissions WHERE role_name = ? ORDER BY securable_type, operation;",
+            -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        Permission p;
+        p.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        p.securable_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        p.operation = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
+        p.effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3));
+        result.push_back(std::move(p));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return result;
+}
+
+std::expected<std::vector<Permission>, std::string>
+RbacStore::list_all_role_permissions_checked() const {
+    std::shared_lock lock(mtx_);
+    std::vector<Permission> result;
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT role_name, securable_type, operation, effect "
+            "FROM role_permissions ORDER BY role_name, securable_type, operation;",
+            -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        Permission p;
+        p.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        p.securable_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        p.operation = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
+        p.effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3));
+        result.push_back(std::move(p));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return result;
+}
+
 std::expected<void, std::string> RbacStore::set_permission(const Permission& perm) {
     if (perm.effect != "allow" && perm.effect != "deny")
         return std::unexpected("effect must be 'allow' or 'deny'");
@@ -914,6 +1005,61 @@ std::vector<PrincipalRole> RbacStore::get_principal_roles(const std::string& pri
         result.push_back(std::move(pr));
     }
     sqlite3_finalize(s);
+    return result;
+}
+
+std::expected<std::vector<PrincipalRole>, std::string>
+RbacStore::get_principal_roles_checked(const std::string& principal_type,
+                                       const std::string& principal_id) const {
+    std::shared_lock lock(mtx_);
+    std::vector<PrincipalRole> result;
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT principal_type, principal_id, role_name FROM principal_roles "
+                           "WHERE principal_type = ? AND principal_id = ? ORDER BY role_name;",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, principal_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        PrincipalRole pr;
+        pr.principal_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        pr.principal_id = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        pr.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
+        result.push_back(std::move(pr));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return result;
+}
+
+std::expected<std::vector<PrincipalRole>, std::string>
+RbacStore::list_all_principal_roles_checked() const {
+    std::shared_lock lock(mtx_);
+    std::vector<PrincipalRole> result;
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT principal_type, principal_id, role_name FROM principal_roles "
+                           "ORDER BY principal_type, principal_id, role_name;",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        PrincipalRole pr;
+        pr.principal_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        pr.principal_id = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        pr.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
+        result.push_back(std::move(pr));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
     return result;
 }
 
@@ -1090,6 +1236,34 @@ std::vector<RbacGroup> RbacStore::list_groups() const {
         result.push_back(std::move(g));
     }
     sqlite3_finalize(s);
+    return result;
+}
+
+std::expected<std::vector<RbacGroup>, std::string> RbacStore::list_groups_checked() const {
+    std::shared_lock lock(mtx_);
+    std::vector<RbacGroup> result;
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT name, description, source, external_id, created_at FROM groups ORDER BY name;",
+            -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        RbacGroup g;
+        g.name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        g.description = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        g.source = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
+        auto* eid = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3));
+        g.external_id = eid ? eid : "";
+        g.created_at = sqlite3_column_int64(s.get(), 4);
+        result.push_back(std::move(g));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
     return result;
 }
 

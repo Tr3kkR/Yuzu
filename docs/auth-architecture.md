@@ -1482,9 +1482,214 @@ discovery documents), `server/core/src/scim_routes.{hpp,cpp}` (HTTP routes).
 Tests: `tests/unit/server/test_scim_store.cpp`,
 `test_scim_json.cpp`, `test_scim_routes.cpp`.
 
+## Periodic access reviews (SOC 2 CC6.2)
+
+A fleet-wide access-review capability across all three RBAC principal types
+— **user**, **group**, and **engine** — closing the "Periodic access
+reviews with manager/security attestation" CC6.2 gap. Two independent
+pieces: a stateless **export** (the current grant population, for a quick
+spot-check or an offline CSV pull) and a durable **attestation campaign**
+(freeze the population, have reviewers sign off on each grant, keep the
+evidence forever).
+
+### Export model
+
+`GET /api/v1/access-reviews/export` (`AuditLog:Read`) builds one row per
+principal via the pure read-model `access_review_model.hpp`
+(`build_access_review`). For **all three** principal types uniformly it
+reads the principal's **direct** role grants and expands each to its
+permission set — deliberately **not**
+`RbacStore::get_effective_permissions(username)`, which is user-keyed and
+would silently mis-resolve if called with a group name (it would look up
+`principal_type='user' AND principal_id=<group name>`, never the group's own
+grants). A consequence: a user row lists only that user's own direct
+grants — group-inherited access is not flattened onto the user row, it
+appears on the **group's own row** instead. A reviewer must read both a
+user's row and the rows of every group they belong to for the complete
+picture; a future "resolved effective access" column is a tracked follow-up.
+
+**Grant-table-driven completeness (UP-1).** The export's SPINE is the grant
+table, not any roster. `build_access_review` reads **every**
+`(principal_type, principal_id, role_name)` row on record via
+`RbacStore::list_all_principal_roles_checked()` — one bulk read — and groups
+it by principal; the users/groups/engine-principal rosters are still read,
+but only to *enrich* a grant-table row with display metadata. Two
+consequences that change what the export means and what it shows:
+
+- **A principal with zero role grants produces no row.** This narrows the
+  export's scope on purpose: it answers "who currently has access", not
+  "who exists" — a dormant local account or a never-assigned engine
+  principal is out of scope for a CC6.2 review because there is nothing on
+  it to review.
+- **A grant belonging to a principal that matches nothing in any roster is
+  now surfaced, never silently dropped.** A since-deleted user, a stale
+  IdP-provisioned row, or an OIDC/SSO principal minted outside every roster
+  (e.g. `oidc:<iss>#<sub>`) still holds a live grant if one exists on
+  record — that row is emitted with `display_name = principal_id`,
+  `source = "orphan"`, `lifecycle_state = "unknown"` rather than being
+  silently omitted. The prior design walked the three rosters and asked
+  RBAC per member; a grant belonging to a principal outside every roster
+  was a silent false negative in exactly the evidence CC6.2 exists to
+  produce. Orphan/stale grants are exactly the kind of finding a periodic
+  access review is supposed to catch — a reviewer should expect to see
+  `source="orphan"` rows and treat them as a `flagged_revoke` candidate by
+  default unless the principal is independently known-good.
+
+**Non-atomic, best-effort cross-substrate read.** The grant population this
+export (and every campaign freeze) computes is a **point-in-time
+best-effort cut** across two substrates — `RbacStore`/`EnginePrincipalStore`/
+`AccessReviewStore` on PostgreSQL and `AuthDB` on SQLite — not a
+transactional snapshot: there is no cross-database transaction spanning the
+several bulk reads `build_access_review` issues, so a grant or user change
+that lands mid-read may or may not be reflected in the result. This is an
+accepted property, not a defect — the alternative (a distributed
+transaction across two storage engines) is out of scope for this feature.
+The **freeze itself**, once the population is computed, is atomic: `open_campaign`
+inserts the campaign row and every frozen attestation row in **one**
+PostgreSQL transaction (see "Attestation campaign model" below) — the
+non-atomicity is confined to *assembling* the population, not to persisting
+it once assembled.
+
+**Fail-loud, never a silent partial export (R1).** `build_access_review`
+returns `std::unexpected` on the FIRST read failure it hits across users,
+groups, engine principals, API tokens, and every per-principal role/
+permission read — never a partial `vector`. A compliance export that
+silently drops rows on a transient read failure is worse than one that
+fails loudly: a partial grant set that reads as "the complete list" is a
+false negative in exactly the evidence this feature exists to produce. The
+REST route maps a `build_access_review` failure to `503`, not a 200 with
+fewer rows.
+
+`last_activity_ms`/`last_activity_kind` and `owner_or_email` are
+best-effort enrichment (`ApiTokenStore` for an engine row's most recent
+credential use; `DirectorySync` for a user's email) — a missing enrichment
+source degrades that one field, it does not fail the export. **Known
+scoping, stated plainly rather than silently shipped:** every user row's
+`last_activity_kind` is `"n/a"` today (`AuthDB` has no read accessor for
+last-login yet — a noted follow-up, not a bug); `source="scim"` is
+forward-compat and not yet populated by any write path.
+
+### Attestation campaign model
+
+`POST /api/v1/access-reviews` (`AuditLog:Attest`) expands the export into
+one `GrantRef` per `(principal, role)` pair and calls
+`AccessReviewStore::open_campaign`, which — in **one transaction** — inserts
+the campaign row and one `decision='pending'` attestation row per frozen
+grant. This is the **freeze-at-open completeness property**: every grant
+that existed the instant the campaign opened has a reviewable row, and that
+is a provable invariant, not a hope. A grant created after `open_campaign`
+returns is simply out of scope for *this* campaign (it will appear in the
+next one); a grant revoked afterward is **still reviewable here** — the row
+is frozen, not re-derived from live state — because "who had access, on
+this date, and did a reviewer sign off on it" is exactly the question CC6.2
+evidence must answer, and a campaign that quietly dropped a since-revoked
+grant would erase that history.
+
+Reviewers record a decision via `POST /api/v1/access-reviews/{id}/attestations`
+(`AuditLog:Attest`): `attested` (still appropriate) or `flagged_revoke`
+(should be revoked). **`flag ≠ revoke`.** `flagged_revoke` records evidence
+only — no RBAC or `EnginePrincipalStore` mutation happens on this path.
+Acting on the flag (unassigning the role, revoking the engine principal,
+etc.) is a separate, explicit operator action performed after reading the
+evidence, on the ordinary RBAC/engine-principal write surface. This
+deliberately keeps the access-review surface (`AuditLog:Attest`) from
+becoming a second, less-audited path to a real authorization change — every
+actual grant/revoke still goes through its own gated, individually-audited
+route.
+
+`POST /api/v1/access-reviews/{id}/close` (`AuditLog:Attest`) closes a
+campaign without requiring every attestation to be decided — an incomplete
+review is itself a fact the evidence should show (partial coverage), not
+something the route silently forces to completion by auto-attesting the
+remainder.
+
+`GET /api/v1/access-reviews` (`AuditLog:Read`) lists every campaign's
+metadata (not its attestations — `GET /api/v1/access-reviews/{id}` for
+those), newest-first, capped at the most recent 500 — the surface an
+auditor needs to prove reviews ran on cadence without already knowing a
+`campaign_id` out-of-band.
+
+### Store
+
+`AccessReviewStore` (`server/core/src/access_review_store.{hpp,cpp}`,
+schema `access_review_store`) is a born-on-Postgres store (ADR-0006) with
+**authoritative/fail-hard** posture per ADR-0012 §1 — construction is
+fail-**closed** (a reachable database whose schema can't migrate leaves
+`!is_open()`, which `server.cpp` wires to `startup_failed_`, same as
+`EnginePrincipalStore`), and every mutator/completeness-reader returns a
+typed `std::expected`. Two tables: `access_review_campaign` (one row per
+opened campaign) and `access_review_attestation` (one row per frozen
+`(campaign, principal_type, principal_id, role_name)` grant — the PK is the
+full 4-tuple, so a decision can only ever be recorded against a grant that
+was actually in the frozen population; an unknown tuple never matches, and
+`record_attestation`/`get_campaign`/`close_campaign` signal that with a
+machine-checkable `"not_found: "`-prefixed error the REST/MCP layers map to
+`404`/`kInvalidParams`, distinct from a genuine `503`/`kInternalError` read
+or write failure). **Deliberately no prune method** — unlike the `/auto`
+pre-flight/deployment runs (operational scratch state, 14-day-pruned), a
+closed access-review campaign **is** the compliance evidence; it persists
+indefinitely. Any future retention policy is an explicit, separately-
+reviewed decision, never a default cadence inherited from an unrelated
+store.
+
+### #2225 — why this is a global gate, not `authorize_list_read`
+
+Every new list/fan-out read of **per-agent** data must use the ADR-0017
+`authorize_list_read` admit-then-filter chokepoint (see "Authentication,
+RBAC..." in the routed-concerns table). Access-review export/campaign-open/
+campaign-list are list reads too, but every one of them is deliberately
+gated on the **global** `AuditLog:Read`/`AuditLog:Attest` instead — a
+considered exception, not an oversight:
+
+- The confinement model exists to stop a management-group-scoped operator
+  from seeing agents/devices outside their scope. **A grant/role assignment
+  is not scoped to a management group at all** — RBAC role assignments are
+  fleet-wide facts about a principal, so there is no per-agent boundary to
+  admit-then-filter against in the first place.
+- Even if a confinement filter were bolted on (e.g. "only show grants for
+  principals who touch devices in my groups"), the result would be
+  **useless as CC6.2 evidence**: an auditor/reviewer certifying the access
+  posture of the organization must see the *complete* grant population, not
+  one operator's confined slice of it. A partial certification is not a
+  certification.
+- Access review is therefore intentionally **admin/auditor-only and
+  unconfined by design**. The seeded `Reviewer` role (`AuditLog:Read` +
+  `AuditLog:Attest` only — no Write/Delete/Approve/Push on `AuditLog`) is
+  the least-privilege way to grant this: an organization can appoint a
+  dedicated reviewer without also granting full `Administrator` access
+  (separation of duties), mirroring the existing `GET
+  /api/v1/audit/auth-sample` precedent (also gated `AuditLog:Read`, not
+  admin-only).
+
+### RBAC additions
+
+- New operation **`AuditLog:Attest`** on the existing `AuditLog` securable
+  — "Attest" is Periodic-Access-Review-specific: recording a reviewer
+  decision on a frozen grant. It is granted only to `Administrator` and the
+  new `Reviewer` role, never blanket-granted to every role that already
+  holds `AuditLog:Read`.
+- New seeded system role **`Reviewer`** — `AuditLog:Read` + `AuditLog:Attest`
+  only (7 built-in roles total: Administrator, PlatformEngineer, Operator,
+  ApiTokenManager, ITServiceOwner, Viewer, Reviewer).
+
+### MCP twins
+
+`export_access_review`, `open_access_review`, `record_attestation`,
+`get_access_review`, `list_access_reviews`, `close_access_review` — JSON
+only (CSV stays a REST-only presentation of the same export).
+`record_attestation` carries `destructiveHint:true` — a second call for the
+same `(campaign_id, principal_type, principal_id, role_name)` **overwrites**
+the prior reviewer's decision, reviewer, and justification (an UPSERT with
+no retained history of the earlier decision); every other twin is
+`destructiveHint:false` (`export_access_review`/`get_access_review`/
+`list_access_reviews` are additionally `readOnlyHint:true`; `open_access_review`/
+`close_access_review` mutate campaign evidence but never a live access
+grant). See `docs/mcp-server.md` and `docs/user-manual/mcp.md`
+"Available Tools".
+
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
+- 7 roles, 21 securable types, 7 operations (`Read`/`Write`/`Execute`/`Delete`/`Approve`/`Push`/`Attest`), per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 

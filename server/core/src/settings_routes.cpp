@@ -4,11 +4,15 @@
 
 #include "settings_routes.hpp"
 
+#include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
+#include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
+#include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
@@ -1111,6 +1115,363 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             "</form>"
             "<div class=\"feedback\" id=\"engine-principal-feedback\"></div>";
 
+    return html;
+}
+
+namespace {
+
+/// Format an epoch-milliseconds timestamp for display; 0 -> "n/a" (matches
+/// AccessReviewRow::last_activity_ms / AccessReviewAttestationRow::
+/// decided_at_ms's "0 = unknown/not yet" convention).
+std::string ar_fmt_epoch_ms(int64_t epoch_ms) {
+    if (epoch_ms == 0)
+        return "n/a";
+    auto tt = static_cast<std::time_t>(epoch_ms / 1000);
+    std::tm tm_buf{};
+#ifdef _WIN32
+    gmtime_s(&tm_buf, &tt);
+#else
+    gmtime_r(&tt, &tm_buf);
+#endif
+    char buf[32]{};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
+    return std::string(buf) + " UTC";
+}
+
+/// The self-contained JS helper block for the Access Reviews fragment's
+/// write actions. Emitted ONCE, inside the top-level fragment
+/// (render_access_review_fragment) — the campaign sub-fragment is always
+/// swapped as a DESCENDANT of that fragment's DOM (see #ar-campaign below),
+/// so these globals stay available across every `arLoadCampaign` refresh
+/// without re-declaring them. htmx re-executes inline <script> tags found in
+/// swapped content (`allowScriptTags` default true — see static_js_bundle.cpp),
+/// but redeclaring `function` statements is itself harmless in JS, so a
+/// double-load (e.g. re-selecting the Settings nav item) is not a bug either
+/// way.
+///
+/// Deliberately plain `fetch()`, not `hx-post` — the target REST endpoints
+/// (rest_api_v1.cpp) parse a JSON body (`nlohmann::json::parse(req.body)`,
+/// no bundled json-enc extension), while htmx's native form/attribute
+/// submission serializes `application/x-www-form-urlencoded` and would 400
+/// "invalid JSON". Same reasoning + precedent as the Engine Principals
+/// fragment's data-engine-action forms above. Also CSP-safe: a plain
+/// `onclick="arFoo(this)"` attribute (allowed by `unsafe-inline`), never
+/// `hx-on` (blocked — compiles via `new Function()`, `unsafe-eval` is not
+/// granted).
+const char* const kAccessReviewScript = R"JS(
+<script>
+function arFeedback(msg, isError) {
+  var fb = document.getElementById('ar-feedback');
+  if (!fb) return;
+  fb.textContent = msg;
+  fb.style.color = isError ? '#f85149' : '#3fb950';
+}
+function arPost(url, body, onSuccess) {
+  fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  }).then(function (r) {
+    return r.text().then(function (t) {
+      var data = {};
+      try { data = JSON.parse(t); } catch (e) {}
+      if (!r.ok) {
+        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        arFeedback(msg, true);
+        return;
+      }
+      arFeedback('Done.', false);
+      if (onSuccess) onSuccess(data);
+    });
+  }).catch(function () {
+    arFeedback('Network error — the action may not have applied', true);
+  });
+}
+function arLoadCampaign(id) {
+  htmx.ajax('GET', '/fragments/settings/access-reviews/campaign?id=' + encodeURIComponent(id),
+            {target: '#ar-campaign', swap: 'innerHTML'});
+}
+function arOpenCampaign(form) {
+  var title = (form.elements['title'].value || '').trim();
+  if (!title) return false;
+  arPost('/api/v1/access-reviews', {title: title}, function (data) {
+    if (data && data.campaign_id) arLoadCampaign(data.campaign_id);
+  });
+  return false;
+}
+function arAttest(btn) {
+  var d = btn.dataset;
+  if (d.decision === 'flagged_revoke' &&
+      !window.confirm('Flag ' + d.principalType + ' "' + d.principalId + '" role "' + d.roleName +
+                       '" for revocation? This records evidence only — it does NOT revoke the grant.')) {
+    return;
+  }
+  var row = btn.closest('tr');
+  var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
+    principal_type: d.principalType,
+    principal_id: d.principalId,
+    role_name: d.roleName,
+    decision: d.decision,
+    justification: justEl ? justEl.value : ''
+  }, function () { arLoadCampaign(d.campaignId); });
+}
+function arCloseCampaign(btn) {
+  var id = btn.dataset.campaignId;
+  if (!window.confirm('Close review campaign ' + id + '? An incomplete review can still be closed.'))
+    return;
+  arPost('/api/v1/access-reviews/' + encodeURIComponent(id) + '/close', null,
+         function () { arLoadCampaign(id); });
+}
+</script>
+)JS";
+
+} // namespace
+
+std::string SettingsRoutes::render_access_review_fragment(const httplib::Request& req) {
+    // Periodic Access Reviews (SOC 2 CC6.2). This dashboard fragment is a
+    // CONVENIENCE surface only — GET /api/v1/access-reviews/export and the
+    // full /api/v1/access-reviews* campaign lifecycle (rest_api_v1.cpp) plus
+    // their MCP twins are the ADR-1005 API-parity surface; the write
+    // controls below call those same REST routes directly (see
+    // kAccessReviewScript) rather than duplicating AccessReviewStore writes
+    // in this file.
+    // NOTE: deliberately no outer `<div id="access-review-section">` wrapper
+    // here — that id belongs to the STATIC shell div in settings_ui.cpp
+    // (hx-swap="innerHTML" target); this fragment's output becomes that
+    // div's inner content, mirroring render_api_tokens_fragment's convention.
+    std::string html;
+    html += kAccessReviewScript;
+    html += "<div class=\"feedback\" id=\"ar-feedback\"></div>";
+
+    html += "<div style=\"margin-bottom:0.75rem\">"
+            "<a class=\"btn btn-secondary\" style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
+            "href=\"/api/v1/access-reviews/export?format=csv\">Download CSV</a>"
+            "</div>";
+
+    auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+    auto rows_res = build_access_review(auth_db, rbac_store_, engine_principal_store_,
+                                        api_token_store_, directory_sync_);
+
+    html += "<table class=\"user-table\">"
+            "<thead><tr><th>Principal</th><th>Roles</th><th>Perms</th>"
+            "<th>Last activity</th><th>Classification</th><th>Lifecycle</th><th>Source</th>"
+            "</tr></thead><tbody>";
+
+    if (!rows_res.has_value()) {
+        // Mirrors render_api_tokens_fragment's read-failure posture (ADR-0012
+        // §1): surface the failure rather than render an empty table that
+        // could be misread as "zero grants exist" — a false negative in
+        // exactly the evidence this feature exists to produce.
+        html += "<tr><td colspan=\"7\" style=\"color:#f85149\">Access review data unavailable (" +
+                html_escape(rows_res.error()) + ") — please retry.</td></tr></tbody></table>";
+        return html;
+    }
+
+    const auto& rows = *rows_res;
+    if (rows.empty()) {
+        html += "<tr><td colspan=\"7\" style=\"color:#484f58\">No principals found</td></tr>";
+    } else {
+        // Render-capped so a large RBAC population can't emit an unbounded
+        // HTML fragment (mirrors inventory_ui.cpp's kDeviceRenderCap
+        // pattern) — the CSV export above is the authoritative full-set
+        // evidence surface, not this table.
+        constexpr std::size_t kAccessReviewRenderCap = 1000;
+        const std::size_t total = rows.size();
+        const std::size_t shown = total > kAccessReviewRenderCap ? kAccessReviewRenderCap : total;
+        for (std::size_t i = 0; i < shown; ++i) {
+            const auto& r = rows[i];
+            std::string roles_joined;
+            for (std::size_t j = 0; j < r.roles.size(); ++j) {
+                if (j)
+                    roles_joined += ", ";
+                roles_joined += r.roles[j];
+            }
+            std::string principal_label =
+                r.display_name.empty() ? r.principal_id : r.display_name;
+            std::string last_activity = r.last_activity_ms == 0
+                                            ? "n/a"
+                                            : ar_fmt_epoch_ms(r.last_activity_ms) + " (" +
+                                                  r.last_activity_kind + ")";
+
+            html += "<tr><td><span class=\"role-badge\">" + html_escape(r.principal_type) +
+                    "</span> " + html_escape(principal_label);
+            if (!r.owner_or_email.empty()) {
+                html += "<br><span style=\"font-size:0.7rem;color:"
+                        "var(--mds-color-theme-text-tertiary)\">" +
+                        html_escape(r.owner_or_email) + "</span>";
+            }
+            html += "</td>"
+                    "<td style=\"font-size:0.8rem\">" +
+                    html_escape(roles_joined) +
+                    "</td>"
+                    "<td>" +
+                    std::to_string(r.effective_permission_count) +
+                    "</td>"
+                    "<td style=\"font-size:0.75rem\">" +
+                    html_escape(last_activity) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(r.classification) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(r.lifecycle_state) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(r.source) +
+                    "</td></tr>";
+        }
+        html += "</tbody></table>";
+        if (total > kAccessReviewRenderCap) {
+            html += "<div style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.3rem\">Showing " +
+                    std::to_string(shown) + " of " + std::to_string(total) +
+                    " principals — the CSV export above has the complete evidence set.</div>";
+        }
+    }
+    if (rows.empty())
+        html += "</tbody></table>";
+
+    // Open-review-campaign control — probed against a throwaway response so
+    // a read-only auditor gets an honest omission rather than a swallowed
+    // 403 (mirrors dex_routes.cpp's can_execute pattern). The probe is
+    // against the SAME securable:operation the REST POST route itself
+    // gates (AuditLog:Attest).
+    httplib::Response probe;
+    bool can_attest = perm_fn_(req, probe, "AuditLog", "Attest");
+
+    if (can_attest) {
+        html += "<form onsubmit=\"return arOpenCampaign(this)\" "
+                "style=\"display:flex;gap:0.5rem;align-items:flex-end;margin-top:1rem\">"
+                "<div class=\"mini-field\" style=\"flex:1\">"
+                "<label>Campaign title</label>"
+                "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
+                "required>"
+                "</div>"
+                "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
+                "</form>";
+    }
+
+    std::string campaign_id = req.has_param("campaign_id") ? req.get_param_value("campaign_id") : "";
+    html += render_access_review_campaign_fragment(req, campaign_id);
+
+    return html;
+}
+
+std::string
+SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& req,
+                                                        const std::string& campaign_id) {
+    std::string html = "<div id=\"ar-campaign\">";
+    if (campaign_id.empty()) {
+        html += "</div>";
+        return html;
+    }
+
+    if (!access_review_store_ || !access_review_store_->is_open()) {
+        html += "<div style=\"color:#f85149\">Access review campaign store unavailable — "
+                "please retry.</div></div>";
+        return html;
+    }
+
+    auto view_res = access_review_store_->get_campaign(campaign_id);
+    if (!view_res.has_value()) {
+        // Covers both the store's machine-checkable "not_found: ..." (unknown
+        // campaign id) and a genuine read failure — either way, an honest
+        // notice rather than a blank panel.
+        html += "<div style=\"color:#f85149\">" + html_escape(view_res.error()) + "</div></div>";
+        return html;
+    }
+    const auto& view = *view_res;
+
+    httplib::Response probe;
+    bool can_attest = perm_fn_(req, probe, "AuditLog", "Attest");
+    bool is_open_campaign = view.campaign.status == "open";
+
+    html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
+            " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
+            "\">" + html_escape(view.campaign.status) + "</span></h4>";
+    html += "<div style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
+            "margin-bottom:0.5rem\">" +
+            std::to_string(view.pending_count) + " pending of " +
+            std::to_string(view.attestations.size()) + " grant(s) reviewed — opened by " +
+            html_escape(view.campaign.created_by);
+    if (!view.campaign.closed_by.empty()) {
+        html += ", closed by " + html_escape(view.campaign.closed_by);
+    }
+    html += "</div>";
+
+    if (can_attest && is_open_campaign) {
+        html += "<button class=\"btn btn-secondary\" "
+                "style=\"padding:0.3rem 0.8rem;font-size:0.75rem;margin-bottom:0.5rem\" "
+                "data-campaign-id=\"" +
+                html_escape(campaign_id) + "\" onclick=\"arCloseCampaign(this)\">Close campaign</button>";
+    }
+
+    html += "<table class=\"user-table\"><thead><tr><th>Principal</th><th>Role</th>"
+            "<th>Decision</th><th>Reviewer</th><th>Decided</th>";
+    if (can_attest)
+        html += "<th>Justification</th><th></th>";
+    html += "</tr></thead><tbody>";
+
+    if (view.attestations.empty()) {
+        html += "<tr><td colspan=\"" + std::to_string(can_attest ? 7 : 5) +
+                "\" style=\"color:#484f58\">No frozen grants in this campaign</td></tr>";
+    } else {
+        for (const auto& a : view.attestations) {
+            bool pending = a.decision == "pending";
+            std::string decision_cls = pending || a.decision == "flagged_revoke" ? "role-user"
+                                                                                  : "role-admin";
+            html += "<tr><td><span class=\"role-badge\">" + html_escape(a.principal_type) +
+                    "</span> " + html_escape(a.principal_id) +
+                    "</td>"
+                    "<td>" +
+                    html_escape(a.role_name) +
+                    "</td>"
+                    "<td><span class=\"role-badge " +
+                    decision_cls + "\">" + html_escape(a.decision) +
+                    "</span></td>"
+                    "<td>" +
+                    (a.reviewer.empty() ? "—" : html_escape(a.reviewer)) +
+                    "</td>"
+                    "<td style=\"font-size:0.75rem\">" +
+                    ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
+            if (can_attest) {
+                html += "<td>";
+                if (pending && is_open_campaign) {
+                    html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
+                            "style=\"width:110px;font-size:0.7rem\">";
+                } else {
+                    html += a.justification.empty() ? "—" : html_escape(a.justification);
+                }
+                html += "</td><td>";
+                if (pending && is_open_campaign) {
+                    html += "<button class=\"btn btn-primary\" "
+                            "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                            "data-campaign-id=\"" +
+                            html_escape(campaign_id) + "\" data-principal-type=\"" +
+                            html_escape(a.principal_type) + "\" data-principal-id=\"" +
+                            html_escape(a.principal_id) + "\" data-role-name=\"" +
+                            html_escape(a.role_name) +
+                            "\" data-decision=\"attested\" "
+                            "onclick=\"arAttest(this)\">Attest</button> "
+                            "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                            "data-campaign-id=\"" +
+                            html_escape(campaign_id) + "\" data-principal-type=\"" +
+                            html_escape(a.principal_type) + "\" data-principal-id=\"" +
+                            html_escape(a.principal_id) + "\" data-role-name=\"" +
+                            html_escape(a.role_name) +
+                            "\" data-decision=\"flagged_revoke\" "
+                            "onclick=\"arAttest(this)\">Flag for revocation (records evidence; "
+                            "does not revoke)</button>";
+                }
+                html += "</td>";
+            }
+            html += "</tr>";
+        }
+    }
+    html += "</tbody></table></div>";
     return html;
 }
 
@@ -2758,6 +3119,34 @@ void SettingsRoutes::register_routes(
                  if (!admin_fn_(req, res))
                      return;
                  res.set_content(render_engine_principals_fragment(), "text/html; charset=utf-8");
+             });
+
+    // Periodic Access Reviews (SOC 2 CC6.2) — Settings convenience surface.
+    // Gated on AuditLog:Read (matches the REST export/get routes); the
+    // fragment renderer itself probes AuditLog:Attest to decide whether to
+    // show the write controls (open/attest/flag/close) — see
+    // render_access_review_fragment()'s doc comment. The REST endpoints
+    // under /api/v1/access-reviews* (rest_api_v1.cpp) and their MCP twins
+    // are the ADR-1005 API-parity surface this fragment is a convenience
+    // layer over, not a replacement for.
+    sink.Get("/fragments/settings/access-reviews",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "AuditLog", "Read"))
+                     return;
+                 res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
+             });
+
+    // Campaign-view sub-fragment — used both for the `?campaign_id=` deep
+    // link (e.g. an auditor following an access_review.campaign_opened
+    // audit-log row to its target_id) and for the JS-driven refresh after
+    // an attest/flag/close action (arLoadCampaign in kAccessReviewScript).
+    sink.Get("/fragments/settings/access-reviews/campaign",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "AuditLog", "Read"))
+                     return;
+                 std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+                 res.set_content(render_access_review_campaign_fragment(req, id),
+                                 "text/html; charset=utf-8");
              });
 
     sink.Get("/fragments/settings/management-groups",

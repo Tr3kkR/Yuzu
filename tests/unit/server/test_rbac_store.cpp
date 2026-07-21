@@ -79,18 +79,20 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
     RbacStore store(":memory:");
     auto ops = store.list_operations();
     // Read, Write, Execute, Delete, Approve, Push (Push added for Guardian
-    // distribute-rules-to-fleet operation; design v1.1 §9.2).
-    REQUIRE(ops.size() == 6);
+    // distribute-rules-to-fleet operation; design v1.1 §9.2), Attest (added
+    // for Periodic Access Reviews, SOC 2 CC6.2 — AuditLog:Attest sign-off).
+    REQUIRE(ops.size() == 7);
 }
 
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
     // 21 types * 5 CRUD ops = 105 permissions, plus a single targeted Push
-    // grant on GuaranteedState = 106 permissions total. Push is deliberately
-    // NOT cross-seeded on non-Guardian securables — see the rationale in
-    // rbac_store.cpp seed_defaults(). (21st type: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 106);
+    // grant on GuaranteedState (= 106), plus a single AuditLog:Attest grant
+    // (Periodic Access Reviews, CC6.2) = 107 permissions total. Push and Attest
+    // are deliberately NOT cross-seeded on other securables — see the rationale
+    // in rbac_store.cpp seed_defaults(). (21st type: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 107);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 

@@ -31,6 +31,9 @@
 namespace yuzu::server {
 
 struct Config;
+class RbacStore;
+class AccessReviewStore;
+class DirectorySync;
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -68,6 +71,31 @@ public:
     void set_engine_principal_store(EnginePrincipalStore* store) {
         engine_principal_store_ = store;
     }
+
+    /// Inject the RBAC store (nullable — same deferred-wiring pattern as
+    /// `set_engine_principal_store` above; server.cpp wiring is a separate
+    /// follow-up task). Required by `access_review_model::build_access_review`
+    /// for the Access Reviews Settings fragment (SOC 2 CC6.2); while unset,
+    /// that fragment renders its "data unavailable" notice instead of
+    /// crashing (build_access_review returns `std::unexpected` on a null/
+    /// closed RbacStore — see access_review_model.hpp).
+    void set_rbac_store(RbacStore* store) { rbac_store_ = store; }
+
+    /// Inject the Access Review campaign store (nullable, same deferred-
+    /// wiring pattern). Backs the campaign-view sub-fragment
+    /// (`render_access_review_campaign_fragment`) — while unset, that
+    /// fragment renders a "store unavailable" notice. The fragment's write
+    /// actions (open/attest/close) do NOT go through this pointer — they
+    /// call the REST endpoints in rest_api_v1.cpp directly (the ADR-1005
+    /// API-parity surface), so this pointer is read-only-path use only.
+    void set_access_review_store(AccessReviewStore* store) { access_review_store_ = store; }
+
+    /// Inject DirectorySync for the access-review read-model's optional
+    /// user-email enrichment (nullable — see access_review_model.hpp's
+    /// "optional enrichment" contract; a null pointer degrades only the
+    /// `owner_or_email` field, never fails the export). Same deferred-wiring
+    /// pattern as the setters above.
+    void set_access_review_directory_sync(DirectorySync* dirsync) { directory_sync_ = dirsync; }
 
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
@@ -185,6 +213,29 @@ private:
     /// `engine_principal_store_` renders an inert "not configured" panel.
     std::string render_engine_principals_fragment();
 
+    /// Render the Access Reviews Settings fragment (SOC 2 CC6.2) — a
+    /// CONVENIENCE dashboard surface only; the REST endpoints under
+    /// `/api/v1/access-reviews*` (rest_api_v1.cpp) and their MCP twins are
+    /// the ADR-1005 API-parity surface. Shows the current cross-principal
+    /// grant export (`access_review_model::build_access_review`) + a CSV
+    /// download link; an operator holding `AuditLog:Attest` additionally
+    /// sees the "open review campaign" control (probed via a throwaway
+    /// `httplib::Response`, mirroring `dex_routes.cpp`'s `can_execute`
+    /// pattern — never gates the whole route on Attest, since a read-only
+    /// auditor must still see the table). `req` is needed for that probe.
+    std::string render_access_review_fragment(const httplib::Request& req);
+
+    /// Render one review campaign's evidentiary state (metadata + frozen
+    /// attestation rows) as a sub-fragment — used both for the initial
+    /// `?id=` deep link and for the JS-driven refresh after an attest/flag/
+    /// close action. Gated by the caller on `AuditLog:Read` (matches the
+    /// REST `GET /api/v1/access-reviews/{id}` gate); per-row Attest/Flag
+    /// buttons and the Close-campaign button are additionally probed against
+    /// `AuditLog:Attest` inside this function, same pattern as the top-level
+    /// fragment above. Empty `campaign_id` renders an empty container.
+    std::string render_access_review_campaign_fragment(const httplib::Request& req,
+                                                        const std::string& campaign_id);
+
     // -- Dependency pointers (stored by register_routes) -----------------------
 
     AuthFn auth_fn_;
@@ -199,6 +250,12 @@ private:
     // Nullable — see set_engine_principal_store(). Non-owning; lifetime is
     // server.cpp's, which outlives this object.
     EnginePrincipalStore* engine_principal_store_{nullptr};
+    // Nullable — see set_rbac_store() / set_access_review_store() /
+    // set_access_review_directory_sync(). Non-owning; lifetime is
+    // server.cpp's, which outlives this object.
+    RbacStore* rbac_store_{nullptr};
+    AccessReviewStore* access_review_store_{nullptr};
+    DirectorySync* directory_sync_{nullptr};
     ManagementGroupStore* mgmt_group_store_{};
     TagStore* tag_store_{};
     UpdateRegistry* update_registry_{};
