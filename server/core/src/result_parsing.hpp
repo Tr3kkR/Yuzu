@@ -71,41 +71,23 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
 
 // -- Pipe-delimited field splitting -------------------------------------------
 
-/// Count the run of consecutive '\' bytes immediately preceding position @p p.
-inline size_t backslash_run_length(const std::string& s, size_t p) {
-    size_t n = 0;
-    while (n < p && s[p - 1 - n] == '\\') ++n;
-    return n;
-}
-
-/// Find the next real (unescaped) '|' starting at @p pos. Returns npos if not
-/// found. A '|' is a real field separator iff it is preceded by an EVEN
-/// number of consecutive backslashes (including zero) -- an odd run means
-/// the last of those backslashes escapes this pipe as literal data. This is
-/// the parity counterpart to escape_pipes (sdk/include/yuzu/string_utils.hpp),
-/// which doubles every literal '\' before escaping '|', so a value with no
-/// backslashes behaves exactly as before (zero preceding backslashes is even).
+/// Find the next unescaped '|' starting at @p pos. Returns npos if not found.
 inline size_t find_unescaped_pipe(const std::string& s, size_t pos) {
     while (pos < s.size()) {
         auto p = s.find('|', pos);
         if (p == std::string::npos) return std::string::npos;
-        if (backslash_run_length(s, p) % 2 != 0) { pos = p + 1; continue; }
+        if (p > 0 && s[p - 1] == '\\') { pos = p + 1; continue; }
         return p;
     }
     return std::string::npos;
 }
 
-/// Undo escape_pipes: collapse "\\" -> "\" and "\|" -> "|", leaving any other
-/// byte (including a lone '\' not part of an escape pair) untouched.
+/// Remove backslash-escaping from pipe characters: "foo\|bar" → "foo|bar".
 inline std::string unescape_pipes(const std::string& s) {
     std::string out;
     out.reserve(s.size());
     for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 1 < s.size() && (s[i + 1] == '\\' || s[i + 1] == '|')) {
-            out += s[i + 1];
-            ++i;
-            continue;
-        }
+        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|') continue;
         out += s[i];
     }
     return out;

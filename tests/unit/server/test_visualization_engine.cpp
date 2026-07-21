@@ -18,13 +18,10 @@
 #include "response_store.hpp"
 #include "visualization_engine.hpp"
 
-#include <yuzu/string_utils.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
 
-#include <format>
 #include <string>
 #include <vector>
 
@@ -364,77 +361,4 @@ TEST_CASE("VisualizationEngine: unknown plugin falls back to default 2-column sc
         got[j["labels"][i].get<std::string>()] = j["series"][0]["data"][i].get<double>();
     CHECK(got["alpha"] == 3);
     CHECK(got["beta"] == 1);
-}
-
-// ── result_parsing.hpp escape/unescape round-trip (BR-007) ─────────────────
-//
-// Exercises the REAL server decoder (find_unescaped_pipe / unescape_pipes /
-// split_fields) against the REAL SDK encoder (yuzu::util::safe_output_field),
-// not a mirror -- proving the grammar is genuinely reversible end to end,
-// including a value ending in a single literal backslash (the case that
-// used to be lossily folded to '/' before it could corrupt a certificate DN).
-
-TEST_CASE("result_parsing: a trailing backslash round-trips through the real decoder",
-          "[result_parsing][pipes]") {
-    std::string original = "CN=example.com\\";
-    std::string encoded = yuzu::util::safe_output_field(original);
-    std::string line = encoded + "|next";
-
-    auto sep = find_unescaped_pipe(line, 0);
-    REQUIRE(sep != std::string::npos);
-    CHECK(unescape_pipes(line.substr(0, sep)) == original);
-    CHECK(unescape_pipes(line.substr(sep + 1)) == "next");
-}
-
-TEST_CASE("result_parsing: a literal backslash-pipe round-trips through the real decoder",
-          "[result_parsing][pipes]") {
-    std::string original = "contains \\| inside";
-    std::string encoded = yuzu::util::safe_output_field(original);
-    std::string line = encoded + "|next";
-
-    auto sep = find_unescaped_pipe(line, 0);
-    REQUIRE(sep != std::string::npos);
-    CHECK(unescape_pipes(line.substr(0, sep)) == original);
-    CHECK(unescape_pipes(line.substr(sep + 1)) == "next");
-}
-
-TEST_CASE("result_parsing: a bare double pipe round-trips through the real decoder",
-          "[result_parsing][pipes]") {
-    std::string original = "||";
-    std::string encoded = yuzu::util::safe_output_field(original);
-    std::string line = encoded + "|next";
-
-    auto sep = find_unescaped_pipe(line, 0);
-    REQUIRE(sep != std::string::npos);
-    CHECK(unescape_pipes(line.substr(0, sep)) == original);
-    CHECK(unescape_pipes(line.substr(sep + 1)) == "next");
-}
-
-TEST_CASE("result_parsing: split_fields recovers an 8-field row with a trailing-backslash "
-          "DN field intact",
-          "[result_parsing][pipes]") {
-    // Mirrors certificates_plugin.cpp's CertRecord::to_row() (BR-07): a DN
-    // ending in a literal backslash must decode back to exactly 8 columns,
-    // not corrupt the field and shift every column after it.
-    std::string row = std::format(
-        "{}|{}|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field("CN=example.com\\"),
-        yuzu::util::safe_output_field("CN=Example CA\\"),
-        "5A1F4258CB5026DCA9C6FB7702EDA6933AF351CB", "2026-07-20", "2027-07-20",
-        yuzu::util::safe_output_field("B7AC9DB9CAF6ADDB"), "System.keychain",
-        yuzu::util::safe_output_field("Digital Signature"));
-
-    // "no_such_plugin" resolves to the default 2-column schema, which takes
-    // split_fields' generic "split on every real pipe" path -- the same
-    // path certificates_plugin.cpp's row (8 columns, no special-cased
-    // arity) actually goes through.
-    auto fields = split_fields("no_such_plugin", row);
-    REQUIRE(fields.size() == 8);
-    CHECK(fields[0] == "CN=example.com\\");
-    CHECK(fields[1] == "CN=Example CA\\");
-    CHECK(fields[2] == "5A1F4258CB5026DCA9C6FB7702EDA6933AF351CB");
-    CHECK(fields[3] == "2026-07-20");
-    CHECK(fields[4] == "2027-07-20");
-    CHECK(fields[5] == "B7AC9DB9CAF6ADDB");
-    CHECK(fields[6] == "System.keychain");
-    CHECK(fields[7] == "Digital Signature");
 }

@@ -71,23 +71,12 @@ inline std::string sanitize_utf8(const std::string& s) {
     return out;
 }
 
-/// Escape a value for a pipe-delimited output field, reversibly.
-///
-/// Backslash is the escape character, so every literal backslash is doubled
-/// FIRST ('\' -> '\\'), then every literal pipe is escaped ('|' -> '\|').
-/// Order matters: escaping backslashes before pipes means the '\' that
-/// escape_pipes itself inserts ahead of a '|' is never mistaken for input
-/// data, so the server's parity-based unescaper (an EVEN run of backslashes
-/// before a '|' is a real separator, an ODD run means the '|' is escaped
-/// data) can invert this unambiguously — no input byte sequence collides
-/// with another's encoding.
+/// Escape pipe characters in output values.
 inline std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
-        if (c == '\\')
-            out += "\\\\";
-        else if (c == '|')
+        if (c == '|')
             out += "\\|";
         else
             out += c;
@@ -95,17 +84,31 @@ inline std::string escape_pipes(std::string_view s) {
     return out;
 }
 
-/// Escape a value for a pipe-delimited output field: reversibly escape '\'
-/// and '|' (see escape_pipes), then fold CR/LF to spaces so untrusted
-/// endpoint data cannot inject rows. CR/LF folding is lossy by design —
-/// newlines are the row separator and carry no escape representation in
-/// this grammar — but '\' and '|' now round-trip exactly through the
-/// server's parity-based unescaper, including a value that ends in a
-/// literal backslash.
+/// Escape a value for a pipe-delimited output field, safely.
+///
+/// The shared server decoder (server/core/src/result_parsing.hpp) only knows
+/// how to undo a single backslash before a pipe ("\|" -> "|"); it treats any
+/// other backslash, including a doubled one, as literal data. Making this
+/// function fully reversible would require changing that shared decoder,
+/// which would silently corrupt '\\' values already emitted by every other
+/// producer on the wire. So this is intentionally LOSSY on literal
+/// backslashes: a literal '\' folds to '/' before pipe-escaping, and CR/LF
+/// fold to spaces (newlines are the row separator and have no escape
+/// representation in this grammar). A fully reversible escape grammar is
+/// deferred to a versioned protocol migration that updates the decoder and
+/// every producer together.
 inline std::string safe_output_field(std::string_view value) {
-    std::string out = escape_pipes(value);
-    for (char& ch : out) { if (ch == '\r' || ch == '\n') ch = ' '; }
-    return out;
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '\\')
+            out += '/';
+        else if (ch == '\r' || ch == '\n')
+            out += ' ';
+        else
+            out += ch;
+    }
+    return escape_pipes(out);
 }
 
 /// Sanitize input: only allow alphanumeric, spaces, dots, hyphens, underscores,
