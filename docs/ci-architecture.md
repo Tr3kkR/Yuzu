@@ -196,6 +196,29 @@ user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper routes native
 `TEMP`/`TMP` and MSYS2 `TMPDIR` into the matching per-runner `_temp`; the CI
 telemetry start step exports the same values for already-running listeners.
 
+### Windows test-phase concurrency gate
+
+Wee Tam's 4 runners are CCD-pinned, but affinity partitions only **cores** — not
+DRAM bandwidth, the disk, or the Defender minifilter. So when several Windows jobs
+run their **test** phase at the same time, the heavy unit-test suites
+(`server ~[pg]`/`[pg]`, `agent`, `tar`) slow roughly linearly and hit their meson
+timeouts: per-runner telemetry (`ci_test_suites`) measured `server ~[pg]` at
+c0≈289 s → c2≈467 s → c4≈603 s — a **guaranteed** timeout once ≥4 test phases
+overlap, and a 22–25 % timeout rate on the `server ~[pg]`/`tar` suites overall.
+Big Tam (Linux) scales **flat** under the identical 4-on-one-box topology — cheap
+`fork()`/VFS/page-cache and no AV minifilter keep per-op cost low — so it needs no
+gate.
+
+`ci.yml`'s Windows **Test** step therefore wraps the run in
+[`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
+`flock` gate (a killed job releases its slot via OS fd-close, so a timeout never
+leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
+**build** phase stays 4-wide) — and passes `--num-processes 2` so meson's own
+fan-out can't pile the two ~400–600 s server shards onto one CCD+cluster. The slot
+count is the first knob to revisit (→3) once per-op cost is cut (Defender `%TEMP%`
+exclusion, RAM-disk data dirs). Full diagnosis: the `tests/meson.build`
+server-shard comment.
+
 ### Persistent runner-local test history
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
