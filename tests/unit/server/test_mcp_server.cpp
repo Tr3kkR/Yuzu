@@ -717,6 +717,14 @@ struct McpTestServer {
     std::string mock_username{"test-user"};
     yuzu::server::auth::Role mock_role{yuzu::server::auth::Role::admin};
 
+    /// Engine-principal deny-belt (PR 4.3 §9): defaults MATCH
+    /// yuzu::server::auth::Session's own field defaults ("human"/"local"), so
+    /// leaving these untouched is a no-op for every pre-existing test. A test
+    /// exercising the belt sets one (or both) to the engine-classed value —
+    /// `deny_if_engine_session()` in mcp_server.cpp trips on EITHER key alone.
+    std::string mock_principal_kind{"human"};
+    std::string mock_auth_source{"local"};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
     yuzu::server::mcp::McpServer::HandlerFn get_handler;    // 2f: GET /mcp/v1/
@@ -799,6 +807,8 @@ private:
             s.username = mock_username;
             s.role = mock_role;
             s.mcp_tier = mock_tier;
+            s.principal_kind = mock_principal_kind;
+            s.auth_source = mock_auth_source;
             return s;
         };
 
@@ -1598,6 +1608,118 @@ TEST_CASE("MCP A4: shared tier-denied error carries a correlation id (#1470)",
     // parity with the REST sibling (Gate-4 consistency N2).
     REQUIRE(denied["error"]["data"].contains("retry_after_ms"));
     CHECK(denied["error"]["data"]["retry_after_ms"].is_null());
+}
+
+// ── Engine-principal MCP deny-belt (PR 4.3 §9, sec-HIGH regression guard) ──
+//
+// This round hardened ALL 9 engine-principal MCP tools to call
+// `deny_if_engine_session()` — including the 3 read tools
+// (list_engine_principals / get_engine_principal / audit_engine_no_admin)
+// which previously did NOT belt-check and were the actual regression. An
+// engine-classed session (principal_kind=="engine" OR auth_source==
+// "engine_token" — either key alone is sufficient, mirrored from the REST
+// §9 deny-belt tests in test_engine_principal_lifecycle.cpp) must be denied
+// on every one of the 9 tools, not just the mutating ones.
+//
+// No engine_principal_store/engine_credential_store is wired here: every
+// handler runs deny_if_engine_session() BEFORE its own store-availability
+// check (verified by reading mcp_server.cpp), so the JSON-RPC denial is
+// reached — and asserted — with none of the store plumbing this file would
+// otherwise need. tier defaults to "" (start() with no arg), which
+// tier_allows() treats as "not an MCP token -> allow everything, defer to
+// RBAC" — i.e. this reproduces a human-login-shaped session that happens to
+// carry an engine-classed principal_kind/auth_source, exactly the shape the
+// belt exists to catch.
+namespace {
+/// The 9 engine-principal lifecycle tool names (kToolSecurity entries in
+/// mcp_server.cpp), each dispatched with an empty `arguments` object — every
+/// handler's deny_if_engine_session() call runs before any argument parsing,
+/// so the shape of `arguments` cannot matter to this assertion.
+const std::vector<std::string> kEngineLifecycleTools = {
+    "create_engine_principal",  "list_engine_principals",
+    "get_engine_principal",     "revoke_engine_principal",
+    "mint_engine_credential",   "rotate_engine_credential",
+    "confirm_engine_rotation",  "transfer_engine_principal_owner",
+    "audit_engine_no_admin",
+};
+
+/// Dispatches `tool_name` with an empty arguments object and asserts the
+/// JSON-RPC response is the §9 deny-belt's own error — a kTierDenied A4
+/// error carrying the exact denial message, not a store result (which would
+/// prove nothing: a nullptr store also 503s, but that's the WRONG reason to
+/// pass).
+void assert_engine_deny_belt_denies(McpTestServer& ts, const std::string& tool_name, int id) {
+    INFO("tool_name = " << tool_name);
+    nlohmann::json req{{"jsonrpc", "2.0"},
+                       {"method", "tools/call"},
+                       {"id", id},
+                       {"params", {{"name", tool_name}, {"arguments", nlohmann::json::object()}}}};
+    auto res = ts.call(req.dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(body["error"]["message"] ==
+         "engine-classed sessions may not call engine-principal lifecycle tools");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["remediation"] == "use a human admin credential");
+
+    // The belt's own audit row, distinct from the tool's normal success/failure
+    // audit action: "mcp.<tool_name>|denied", detail "engine-classed session on
+    // lifecycle surface" (mcp_server.cpp's deny_if_engine_session()).
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp." + tool_name + "|denied");
+    CHECK(ts.audit_details.back() == "engine-classed session on lifecycle surface");
+}
+} // namespace
+
+TEST_CASE("MCP engine-principal deny-belt: principal_kind==\"engine\" is denied on "
+          "all 9 lifecycle tools",
+          "[mcp][integration][engine_principal][deny_belt]") {
+    McpTestServer ts;
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "local"; // deliberately NOT engine_token — principal_kind alone
+                                   // must be enough to trip the belt (mirrors the REST
+                                   // §9 "principal_kind key" test)
+    ts.start();                   // empty tier -> tier_allows() defers to RBAC (mock always-allow)
+
+    int id = 1;
+    for (const auto& tool : kEngineLifecycleTools) {
+        assert_engine_deny_belt_denies(ts, tool, id++);
+    }
+}
+
+TEST_CASE("MCP engine-principal deny-belt: auth_source==\"engine_token\" is denied "
+          "on all 9 lifecycle tools",
+          "[mcp][integration][engine_principal][deny_belt]") {
+    McpTestServer ts;
+    ts.mock_principal_kind = "human"; // deliberately human-shaped principal_kind —
+                                      // auth_source alone must ALSO trip the belt
+                                      // (mirrors the REST §9 "auth_source key" test)
+    ts.mock_auth_source = "engine_token";
+    ts.start();
+
+    int id = 1;
+    for (const auto& tool : kEngineLifecycleTools) {
+        assert_engine_deny_belt_denies(ts, tool, id++);
+    }
+}
+
+TEST_CASE("MCP engine-principal deny-belt: the 3 read tools regressed this round "
+          "are individually covered (list/get/audit_no_admin)",
+          "[mcp][integration][engine_principal][deny_belt]") {
+    // Narrower, explicit companion to the two loop-based tests above — calls
+    // out by name the three read tools the governance review flagged as
+    // having NOT belt-checked before this round, so a future revert of just
+    // those three handlers still fails a test that names them directly
+    // rather than only failing inside a loop.
+    McpTestServer ts;
+    ts.mock_principal_kind = "engine";
+    ts.start();
+
+    assert_engine_deny_belt_denies(ts, "list_engine_principals", 1);
+    assert_engine_deny_belt_denies(ts, "get_engine_principal", 2);
+    assert_engine_deny_belt_denies(ts, "audit_engine_no_admin", 3);
 }
 
 TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit parity",

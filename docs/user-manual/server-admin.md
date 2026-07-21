@@ -186,6 +186,53 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — macOS antivirus posture is now probed, not asserted
+
+The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`
+without reading anything, and its third-party checks grepped for the wrong
+process name. Visible after upgrading agents:
+
+1. **`av|XProtect|<state>` is now a real probe** of the XProtect definition
+   bundle: `active` comes with a new `xprotect_version|<n>` row; `unknown`
+   means the bundle was unreadable (never assumed active). Third-party EDR/AV
+   detected via endpoint-security system extensions emit an additional
+   `edr|<bundle id>|<version>` row each. Integrations keying on the old
+   always-present `av|XProtect|active` row should treat `unknown` as a signal
+   to investigate, not as product-absent.
+2. **The `status` action on macOS returns real XProtect data** (definition
+   version, freshness, Remediator/MRT versions) instead of
+   `status|not_available`. A new darwin-only definition
+   `security.antivirus.xprotect_status` exposes it; being a new id, it seeds
+   on upgraded installs at next boot (unlike edited descriptions, which reach
+   fresh installs only — the amended `security.antivirus.products` text lands
+   there alone).
+3. **Mixed-fleet blend during rollout:** agents not yet upgraded keep emitting
+   the hardcoded XProtect row and process-grep results. Not a server bug; the
+   presence of an `xprotect_version` row identifies an upgraded agent.
+### vNEXT — macOS firewall `state` now reports the Application Firewall (backend key changed)
+
+The `firewall` plugin's macOS `state` action previously reported the pf packet
+filter — which is off by default and unrelated to the Application Firewall a
+Mac admin means — so a Mac with the real firewall on could read `disabled`.
+Three things are visible after upgrading agents:
+
+1. **The `backend` row value changes from `pf` to `appfirewall`**, and `state`
+   now reflects `socketfilterfw --getglobalstate`. Integrations keying on
+   `backend|pf` or treating `state` as pf state must switch to the new rows.
+   Two additive rows appear: `mode|block_all` (only when block-all is set) and
+   `pf|<state>` (the demoted pf signal; `unknown` on agents not running as
+   root). `state|unknown` means the check was unreadable — never assumed safe.
+2. **Mixed-fleet blend during rollout:** agents not yet upgraded keep emitting
+   `backend|pf` + pf-based `state`. Expect both shapes side by side until the
+   fleet is fully upgraded — not a server bug; the `backend` row disambiguates
+   per device.
+3. **Existing installs keep the old definition description.** Bundled
+   definitions seed insert-or-skip by id at boot, so the corrected
+   `security.firewall.state` description (v1.1.0) lands on fresh installs
+   only; upgraded fleets get the corrected *behavior* regardless. To refresh
+   the text, delete `security.firewall.state` and re-import it via
+   `POST /api/instructions/import` — do not edit it in the dashboard YAML
+   editor, which drops the definition's `spec.visualization` on save.
 ### vNEXT — API/MCP bearer tokens invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030) (breaking)
 
 The API/MCP bearer-token store moves from SQLite (`api-tokens.db`) to the PostgreSQL substrate as
@@ -1324,6 +1371,16 @@ exhaustion), a hard-exit handler is installed instead: the agent exits promptly
 on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
 the handler is the posture that stays killable.)
+
+**Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
+`RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
+rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`;
+against a *permanently* wedged target (a dead NFS mount, a hung service query) that would
+otherwise restart-loop every 10s forever. Instead, after 5 restarts within 300s systemd
+puts the unit into `failed` and stops retrying (the device goes dark rather than looping
+silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
+once the wedged target is resolved. Alert on the `failed` state; the old restart-forever
+behaviour hid a crash-looping agent.
 
 **Installation:**
 

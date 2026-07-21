@@ -883,6 +883,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 |---|---|---|---|---|---|
 | `security.antivirus.products` | products | Q | WLM | *(none)* | name:string, state:string |
 | `security.antivirus.defender_status` | defender | Q | W | *(none)* | realtime_protection:string, definition_version:string, last_update:string |
+| `security.antivirus.xprotect_status` | status | Q | M | *(none)* | definition_version:string, last_update:string, remediator_version:string, mrt_version:string |
 | `security.firewall.state` | state | Q | WLM | *(none)* | profile_or_backend:string, state:string |
 | `security.firewall.rules` | rules | Q | WLM | *(none)* | rule_name:string, enabled:string, direction:string, action:string |
 | `security.certificates.list` | list | Q | WLM | store:string, expiring_within_days:int32 | subject:string, issuer:string, thumbprint:string, not_after:string |

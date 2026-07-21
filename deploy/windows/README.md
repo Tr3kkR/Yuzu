@@ -13,7 +13,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 |---|---|
 | `Provision-Windows-Runner.ps1` | Installs the pinned toolchain, sets machine env (incl. the gateway + shared-cache contracts), emits `toolchain-manifest.json`. |
 | `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest (every required tool present, every contract env set). Run at provision time **and** as a registration/preflight gate. |
-| `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache via `RUNNER_TOOL_CACHE`. |
+| `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache and selects that runner's persistent telemetry DB. |
 
 ## Standing up a new box
 
@@ -77,6 +77,22 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   `CCACHE_DIR=D:\ci\ccache`. Set in each runner's `.env` (durable) and exported
   by the wrapper. The vcpkg binary cache is content-addressed → concurrent writes
   across runners are safe.
+- **Persistent CI telemetry.** Each runner owns
+  `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. Provisioning initializes
+  all four databases; the pin wrapper exports the matching path as
+  `YUZU_TEST_DB`, and `ci.yml` records every Windows MSVC job, Meson suite
+  duration/timeout and recovered known flake. The files sit outside the checkout
+  and are never shared between agents, so history survives branch/build cleanup
+  without adding SQLite writer contention between CCDs.
+- **Defender CI exclusions.** Provisioning preserves Wee Tam's four exact runner
+  work-root exclusions (`D:\ci\work-0` … `work-3`), which cover each runner's
+  `_temp` directory and checkout/build outputs. PostgreSQL's executable and
+  disposable data paths are also excluded. Provisioning verifies every `_temp`
+  path with Defender's own `MpCmdRun.exe -CheckExclusion`. It deliberately does
+  not exempt user/system `%TEMP%` or the whole `D:\ci` tree. The pin wrapper
+  routes native `TEMP`/`TMP` and MSYS2 `TMPDIR` into that runner's own `_temp`;
+  the CI telemetry start step repeats those exports so the fix applies before
+  the next planned runner restart too.
 
 ## `toolchain-manifest.json`
 
@@ -94,6 +110,10 @@ verified by `Assert-Toolchain.ps1`:
              "YUZU_ESCRIPT": "...erts-*\\bin\\escript.exe",
              "YUZU_REBAR3": "C:\\tools\\rebar3\\rebar3",
              "YUZU_TEST_POSTGRES_DSN": "postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test" },
+  "telemetry": {
+    "root": "D:\\ci\\test-runs",
+    "databases": ["D:\\ci\\test-runs\\yuzu-weetam-windows-0\\test-runs.db", "..."]
+  },
   "tools": [ { "name": "vcpkg", "path": "C:\\vcpkg\\vcpkg.exe", "version": "...", "required": true }, ... ]
 }
 ```

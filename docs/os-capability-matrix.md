@@ -15,7 +15,7 @@ this doc as the interim, not the destination.
 
 Legend: ✅ Full · 🟡 Partial · 🔜 Planned/spike · ⛔ None
 
-_Last hand-updated: 2026-07-13._
+_Last hand-updated: 2026-07-16._
 
 ## Matrix
 
@@ -43,6 +43,8 @@ _Last hand-updated: 2026-07-13._
 | **Live device snapshot — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`); no-op note elsewhere |
 | **Live device snapshot — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ (OS exposes no resolver-cache contents; `dscacheutil -cachedump` defunct on macOS 26) | `network_config/dns_cache` (`DnsGetCacheDataTable` on Windows; macOS returns a `dns_cache\|unsupported` sentinel, no shell-out — see `darwin-compat.md`) |
 | **Live device snapshot — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX. Device page "Get live info" Disk space card. |
+| **Antivirus posture** (`antivirus` plugin: `products` + `status`) | ✅ SecurityCenter2 products + Defender status | 🟡 process/dir detection only (ClamAV/CrowdStrike/Sophos), no `status` leg | ✅ `products`: XProtect.bundle version probe (`unknown` when unreadable) + endpoint-security system extensions (`systemextensionsctl`, unprivileged) + process fallback; `status`: XProtect definition version + bundle mtime + Remediator/MRT versions | `agents/plugins/antivirus/src/antivirus_plugin.cpp` per-OS legs; pure parsers `antivirus_parsers.hpp` (tested every host) |
+| **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `netsh advfirewall` | ✅ backend autodetect (firewalld / ufw / iptables) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 
 > The **network row's Windows cell is 🟡 as of 2026-06-15**: the agent now emits
 > device throughput (`GetIfTable2`) and a system-wide interval retransmit rate
