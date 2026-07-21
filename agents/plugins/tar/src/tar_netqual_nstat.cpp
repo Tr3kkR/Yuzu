@@ -468,12 +468,15 @@ struct NstatClient::Impl {
     bool sub_tcp_rejected{false};
     bool sub_tcp_kernel_rejected{false};
 
-    // UP-2: consecutive fixed-size decode failures (reader thread only). A real
-    // transcription/layout mismatch fails EVERY message of that type, so it
-    // trips the threshold immediately; a one-off truncated/garbled datagram
-    // resets on the next good decode and does not permanently disable nstat for
-    // the whole session. Reset to 0 on any successful SRC_DESC/SRC_COUNTS decode.
-    int decode_fail_streak{0};
+    // UP-2: consecutive fixed-size decode failures, tracked PER MESSAGE TYPE
+    // (reader thread only). A real layout mismatch fails every message of that
+    // type, so its streak trips the threshold; a one-off garbled datagram resets
+    // on the next good decode of the SAME type. Per-type (not one shared
+    // counter) so a partial-ABI mismatch that fails only SRC_DESC still latches
+    // even while healthy SRC_COUNTS keep arriving (Gate-7 review) — a good
+    // SRC_COUNTS must not paper over a descriptor that never decodes.
+    int decode_fail_streak_desc{0};
+    int decode_fail_streak_counts{0};
 
     std::mutex query_cv_mu;
     std::condition_variable query_cv;
@@ -659,26 +662,28 @@ struct NstatClient::Impl {
                 // the provider filter, and it means our transcription disagrees
                 // with this kernel's descriptor size — fail to the inert state.
                 if (!nstat_length_matches_expected(hdr->type, hdr->length)) {
-                    // UP-2: latch permanent only after a run of failures. A real
-                    // TcpDescriptor-layout mismatch fails every SRC_DESC, so the
-                    // streak trips fast; a lone garbled datagram resets on the
-                    // next good decode and does not disable nstat for the session.
-                    if (++decode_fail_streak >= kNstatMaxDecodeFailStreak) {
+                    // UP-2: latch permanent only after a run of SRC_DESC
+                    // failures. A real TcpDescriptor-layout mismatch fails every
+                    // SRC_DESC, so its own streak trips fast; a lone garbled
+                    // datagram resets on the next good SRC_DESC. Per-type, so
+                    // healthy SRC_COUNTS can't paper over a descriptor that
+                    // never decodes (Gate-7 review).
+                    if (++decode_fail_streak_desc >= kNstatMaxDecodeFailStreak) {
                         spdlog::warn("TAR: nstat SRC_DESC decode mismatch x{} — transcribed "
                                      "TcpDescriptor disagrees with this kernel; disabling the "
                                      "nstat client",
-                                     decode_fail_streak);
+                                     decode_fail_streak_desc);
                         layout_mismatch->store(true, std::memory_order_relaxed);
                         stop_requested.store(true, std::memory_order_relaxed);
                     } else {
                         spdlog::debug("TAR: nstat SRC_DESC decode mismatch ({}/{}) — tolerating as a "
                                       "possible one-off garbled datagram",
-                                      decode_fail_streak, kNstatMaxDecodeFailStreak);
+                                      decode_fail_streak_desc, kNstatMaxDecodeFailStreak);
                     }
                 }
                 return;
             }
-            decode_fail_streak = 0; // a good decode clears the run
+            decode_fail_streak_desc = 0; // a good SRC_DESC clears its own run
             bool first_desc = false;
             {
                 std::lock_guard<std::mutex> lk(flows_mu);
@@ -712,22 +717,23 @@ struct NstatClient::Impl {
             auto counts = nstat_decode_src_counts(raw);
             if (!counts) {
                 if (!nstat_length_matches_expected(hdr->type, hdr->length)) {
-                    // UP-2: same consecutive-failure gate as the SRC_DESC path.
-                    if (++decode_fail_streak >= kNstatMaxDecodeFailStreak) {
+                    // UP-2: same consecutive-failure gate as the SRC_DESC path,
+                    // on its own SRC_COUNTS streak.
+                    if (++decode_fail_streak_counts >= kNstatMaxDecodeFailStreak) {
                         spdlog::warn("TAR: nstat SRC_COUNTS decode mismatch x{} — transcribed "
                                      "Counts disagrees with this kernel; disabling the nstat client",
-                                     decode_fail_streak);
+                                     decode_fail_streak_counts);
                         layout_mismatch->store(true, std::memory_order_relaxed);
                         stop_requested.store(true, std::memory_order_relaxed);
                     } else {
                         spdlog::debug("TAR: nstat SRC_COUNTS decode mismatch ({}/{}) — tolerating as "
                                       "a possible one-off garbled datagram",
-                                      decode_fail_streak, kNstatMaxDecodeFailStreak);
+                                      decode_fail_streak_counts, kNstatMaxDecodeFailStreak);
                     }
                 }
                 return;
             }
-            decode_fail_streak = 0; // a good decode clears the run
+            decode_fail_streak_counts = 0; // a good SRC_COUNTS clears its own run
             {
                 std::lock_guard<std::mutex> lk(flows_mu);
                 auto it = flows.find(counts->srcref);

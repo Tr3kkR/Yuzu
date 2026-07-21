@@ -150,49 +150,11 @@ int run_command_status(const std::string& cmd) {
 
 /**
  * Result of run_command_capture(): the captured output plus the process
- * exit code, from a single popen/pclose round trip.
+ * exit code, from a single run_bounded_subprocess round trip.
  */
 struct CommandResult {
     std::string output;
     int exit_code = -1;
-};
-
-/**
- * Move-only RAII owner for a popen() FILE* pipe. Guarantees pclose() runs
- * exactly once — including if an exception (e.g. std::string allocation
- * failure while accumulating output) unwinds through the owning scope —
- * and surfaces pclose()'s raw wait-status return to the caller.
- */
-class PopenPipe {
-public:
-    explicit PopenPipe(FILE* pipe) noexcept : pipe_(pipe) {}
-    PopenPipe(const PopenPipe&) = delete;
-    PopenPipe& operator=(const PopenPipe&) = delete;
-    PopenPipe(PopenPipe&& other) noexcept : pipe_(other.pipe_) { other.pipe_ = nullptr; }
-    PopenPipe& operator=(PopenPipe&& other) noexcept {
-        if (this != &other) {
-            close();
-            pipe_ = other.pipe_;
-            other.pipe_ = nullptr;
-        }
-        return *this;
-    }
-    ~PopenPipe() { close(); }
-
-    FILE* get() const noexcept { return pipe_; }
-    explicit operator bool() const noexcept { return pipe_ != nullptr; }
-
-    // Closes the pipe now if still open and returns pclose()'s wait status
-    // (or -1 if already closed / never open). Safe to call more than once.
-    int close() noexcept {
-        if (!pipe_) return -1;
-        int status = pclose(pipe_);
-        pipe_ = nullptr;
-        return status;
-    }
-
-private:
-    FILE* pipe_;
 };
 
 /**
