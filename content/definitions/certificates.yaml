@@ -14,7 +14,7 @@ kind: InstructionDefinition
 metadata:
   id: security.certificates.list
   displayName: List Certificates
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Enumerate certificates in system certificate stores. On Windows this
     queries the CryptoAPI stores (MY, ROOT, CA, Trust). On Linux it parses
@@ -119,7 +119,7 @@ kind: InstructionDefinition
 metadata:
   id: security.certificates.details
   displayName: Certificate Details
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Retrieve full details for a specific certificate identified by its
     SHA-1 thumbprint. Searches all available certificate stores on the
@@ -203,7 +203,7 @@ kind: InstructionDefinition
 metadata:
   id: security.certificates.delete
   displayName: Delete Certificate
-  version: 1.0.0
+  version: 1.1.0
   description: >
     Delete a certificate from a system store by SHA-1 thumbprint. On
     Windows this targets a specific named store (defaults to MY). On
@@ -258,14 +258,16 @@ spec:
       - name: status
         type: string
         description: >
-          A successful macOS delete emits status|deleted. store=root is
-          rejected outright with certificates|unsupported|MESSAGE (sealed
-          by System Integrity Protection). Every other macOS rejection or
-          failure -- an unsupported store, a failed delete command, or a
-          post-delete verification that still finds the certificate or
-          could not re-read the keychain -- emits error|MESSAGE. Windows
-          and Linux always emit status|deleted, status|delete_failed, or
-          status|not_found.
+          A successful macOS delete emits status|deleted; a delete targeting
+          a certificate already provably absent from the keychain emits
+          status|not_found (rc 0), matching the Windows/Linux contract for an
+          absent cert. store=root is rejected with error|MESSAGE
+          (SystemRootCertificates.keychain is sealed by System Integrity
+          Protection). Every other macOS rejection or failure -- an
+          unsupported store, a failed delete command, or a post-delete
+          verification that still finds the certificate or could not re-read
+          the keychain -- also emits error|MESSAGE. Windows and Linux always
+          emit status|deleted, status|delete_failed, or status|not_found.
 
   readablePayload: "Delete certificate ${thumbprint} from store ${store}"
 

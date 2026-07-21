@@ -19,6 +19,10 @@
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
 
+#include "certificates_macos_parsers.hpp" // pure parse/validate/classify/verdict helpers (shared with the unit test)
+
+#include <spdlog/spdlog.h> // degraded-subprocess WARN (SRE S1 observability)
+
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -63,19 +67,18 @@
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
 #endif
 
+// The pure parse/validate/classify/verdict helpers this file shares with
+// tests/unit/test_certificates_macos.cpp live in yuzu::certificates_macos
+// (certificates_macos_parsers.hpp). Pulled into scope here -- including for
+// the CertificatesPlugin::execute() methods further down, which are outside
+// the anonymous namespace below -- so the many call sites read exactly as they
+// did when these functions were file-local, with no per-call qualification.
+using namespace yuzu::certificates_macos;
+
 namespace {
 
 // ── Input validation ────────────────────────────────────────────────────────
-
-bool is_valid_thumbprint(std::string_view s) {
-    if (s.size() != 40)
-        return false;
-    for (char c : s) {
-        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
-            return false;
-    }
-    return true;
-}
+// is_valid_thumbprint / expires_within_days moved to certificates_macos_parsers.hpp.
 
 bool is_safe_path(std::string_view s) {
     for (char c : s) {
@@ -148,34 +151,8 @@ struct CertRecord {
 };
 
 // ── Expiry filtering helper ──────────────────────────────────────────────────
-
-/**
- * Returns true if the certificate expires within the given number of days.
- * If days <= 0, all certificates pass the filter.
- * The not_after string is expected to be in YYYY-MM-DD format.
- */
-bool expires_within_days(const std::string& not_after, int days) {
-    if (days <= 0)
-        return true;
-    if (not_after.size() < 10)
-        return true; // can't parse, include it
-
-    std::tm tm{};
-    tm.tm_year = std::atoi(not_after.substr(0, 4).c_str()) - 1900;
-    tm.tm_mon = std::atoi(not_after.substr(5, 2).c_str()) - 1;
-    tm.tm_mday = std::atoi(not_after.substr(8, 2).c_str());
-    tm.tm_isdst = -1;
-
-    std::time_t expiry = std::mktime(&tm);
-    if (expiry == static_cast<std::time_t>(-1))
-        return true;
-
-    auto now = std::time(nullptr);
-    auto diff_seconds = std::difftime(expiry, now);
-    auto diff_days = diff_seconds / 86400.0;
-
-    return diff_days <= static_cast<double>(days);
-}
+// expires_within_days moved to certificates_macos_parsers.hpp (shared with the
+// unit test and used by the Windows/Linux paths below too).
 
 // ── Windows implementation ───────────────────────────────────────────────────
 
@@ -651,102 +628,30 @@ struct CheckedCommandResult {
 };
 
 CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
-                                         const yuzu::agent::SubprocessOptions& opts) {
+                                         const yuzu::agent::SubprocessOptions& opts,
+                                         std::string_view operation) {
     auto result = yuzu::agent::run_bounded_subprocess(argv, opts);
+    // SRE S1 observability: a deadline kill or capture-cap truncation still
+    // produces an honest sentinel row + rc downstream, but that is only
+    // visible by parsing the emitted output -- a degraded keychain read/parse
+    // would otherwise be silent in the agent log. Surface it, matching
+    // event_logs_plugin.cpp's `log show` WARN pattern.
+    if (result.timed_out || result.output_truncated) {
+        spdlog::warn("certificates: {} {} (timed_out={}, output_truncated={})", operation,
+                     result.timed_out ? "timed out" : "output truncated", result.timed_out,
+                     result.output_truncated);
+    }
     CheckedCommandResult out;
     out.output = std::move(result.output);
     if (result.tool_ran)
         out.exit_code = result.exit_code;
-    out.ok = result.tool_ran && !result.timed_out && !result.output_truncated &&
-             result.exit_code == 0;
+    out.ok = is_usable_capture(result.tool_ran, result.timed_out, result.output_truncated,
+                               result.exit_code);
     return out;
 }
 
-/**
- * Clamp `per_call_cap` to whatever remains of the whole-action budget
- * (`action_deadline`) so a later subprocess can never receive its own full,
- * independent deadline regardless of how much of the action budget is
- * already spent (fix-round finding FP-CERTS-03: `action_deadline` was
- * previously created only after console-user resolution had already run,
- * and every keychain-level `security` read still got the full
- * kKeychainReadDeadline unconditionally -- stacking up to roughly 100s of
- * real wall time behind a nominal 60s budget). Returns
- * std::chrono::milliseconds::zero() once the action budget is already
- * exhausted; callers MUST treat zero as "the budget is spent, do not even
- * attempt this subprocess" rather than issuing a call with a near-zero
- * deadline that spawns a child only to kill it almost immediately.
- */
-std::chrono::milliseconds clamp_to_action_budget(
-    std::chrono::steady_clock::time_point action_deadline,
-    std::chrono::milliseconds per_call_cap) {
-    auto remaining = action_deadline - std::chrono::steady_clock::now();
-    if (remaining <= std::chrono::steady_clock::duration::zero())
-        return std::chrono::milliseconds::zero();
-    auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
-    return remaining_ms < per_call_cap ? remaining_ms : per_call_cap;
-}
-
-/**
- * Parses LibreSSL/OpenSSL's NATIVE ASN1_TIME_print date format -- the only
- * format /usr/bin/openssl can produce on this host: LibreSSL 3.3.6 rejects
- * `-dateopt iso_8601` outright (exit 1, "unknown option -dateopt" -- see
- * this file's macOS banner / BR-02). Native format is e.g.
- * "Jul 20 19:06:44 2026 GMT" or "Jan  1 00:00:00 2025 GMT" -- a
- * single-digit day is space-padded to width 2, so the run of whitespace
- * between month and day varies by one character; tokenizing on whitespace
- * (rather than fixed-width substring slicing) handles both shapes without
- * a special case. Returns "(unknown)" for anything that doesn't match the
- * expected shape -- never a fabricated date.
- */
-std::string parse_openssl_native_date(std::string_view value) {
-    static constexpr std::array<std::string_view, 12> kMonths = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-
-    std::istringstream iss{std::string{value}};
-    std::string mon, day, time_of_day, year;
-    if (!(iss >> mon >> day >> time_of_day >> year))
-        return "(unknown)";
-
-    int month_num = 0;
-    for (std::size_t i = 0; i < kMonths.size(); ++i) {
-        if (mon == kMonths[i]) {
-            month_num = static_cast<int>(i) + 1;
-            break;
-        }
-    }
-    if (month_num == 0)
-        return "(unknown)";
-
-    if (day.empty() || day.size() > 2)
-        return "(unknown)";
-    for (char c : day) {
-        if (c < '0' || c > '9')
-            return "(unknown)";
-    }
-    if (year.size() != 4)
-        return "(unknown)";
-    for (char c : year) {
-        if (c < '0' || c > '9')
-            return "(unknown)";
-    }
-
-    int day_num = std::atoi(day.c_str());
-    if (day_num < 1 || day_num > 31)
-        return "(unknown)";
-
-    return std::format("{}-{:02d}-{:02d}", year, month_num, day_num);
-}
-
-/// Strip leading ASCII spaces/tabs. Used both for openssl's oneline
-/// "label=<one leading space>value" fields and for the variably-indented
-/// lines inside a `-text` dump.
-std::string strip_leading_blank(std::string s) {
-    std::size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
-        ++i;
-    s.erase(0, i);
-    return s;
-}
+// clamp_to_action_budget, parse_openssl_native_date and strip_leading_blank
+// moved to certificates_macos_parsers.hpp (shared with the unit test).
 
 // `deadline` is the CALLER's already-clamped budget for this one openssl
 // call (see clamp_to_action_budget) -- never the raw kCertParseDeadline
@@ -799,6 +704,15 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
          "-startdate", "-enddate", "-serial", "-fingerprint", "-sha1", "-text"},
         yuzu::agent::SubprocessOptions{.deadline = deadline});
 
+    // SRE S1 observability: this is the one certificate-reading call site that
+    // goes through run_bounded_subprocess directly (not run_bounded_checked),
+    // so surface a degraded openssl parse here too, matching that wrapper's WARN.
+    if (result.timed_out || result.output_truncated) {
+        spdlog::warn("certificates: openssl x509 parse {} (timed_out={}, output_truncated={})",
+                     result.timed_out ? "timed out" : "output truncated", result.timed_out,
+                     result.output_truncated);
+    }
+
     // A killed or capture-capped run's output is only a PARTIAL prefix of
     // the real dump -- it may have captured subject/issuer but been cut
     // off before serial/fingerprint/Key Usage, which would silently shift
@@ -812,80 +726,21 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     // through -- e.g. openssl prints a plausible preamble then exits
     // nonzero -- so trusting the captured text without checking the exit
     // status would risk misreporting a failure as valid certificate data.
-    if (!result.tool_ran || result.timed_out || result.output_truncated ||
-        result.exit_code != 0)
+    if (!is_usable_capture(result.tool_ran, result.timed_out, result.output_truncated,
+                           result.exit_code))
         return rec;
 
-    std::istringstream iss(result.output);
-
-    // Reads the next line if present. Used for the fixed six-field
-    // preamble below, one call per -subject/-issuer/-startdate/-enddate/
-    // -serial/-fingerprint flag in that EXACT argv order -- so each call
-    // can only ever see the ONE line openssl generated for that specific
-    // flag, never a line from -text's dump further down the stream. A
-    // hostile subject/issuer containing literal "subject="/"serial="/
-    // "X509v3 Key Usage:"/... text cannot be picked up as a DIFFERENT
-    // field: it can only ever land inside the one line already reserved
-    // for its own field (openssl's oneline printer also hex-escapes any
-    // raw control byte -- e.g. a literal newline -- as `\XX`, so a hostile
-    // value can never fabricate an extra LINE either; verified empirically
-    // against this host's /usr/bin/openssl).
-    auto next_line = [&]() -> std::string {
-        std::string line;
-        return std::getline(iss, line) ? line : std::string{};
-    };
-
-    if (auto line = next_line(); line.starts_with("subject="))
-        rec.subject = strip_leading_blank(line.substr(8));
-    if (auto line = next_line(); line.starts_with("issuer="))
-        rec.issuer = strip_leading_blank(line.substr(7));
-    if (auto line = next_line(); line.starts_with("notBefore="))
-        rec.not_before = parse_openssl_native_date(line.substr(10));
-    if (auto line = next_line(); line.starts_with("notAfter="))
-        rec.not_after = parse_openssl_native_date(line.substr(9));
-    if (auto line = next_line(); line.starts_with("serial="))
-        rec.serial = line.substr(7);
-    if (auto line = next_line();
-        line.starts_with("SHA1 Fingerprint=") || line.starts_with("sha1 Fingerprint=")) {
-        auto hex = line.substr(line.find('=') + 1);
-        std::string clean;
-        clean.reserve(hex.size());
-        for (char c : hex) {
-            if (c != ':')
-                clean += c;
-        }
-        if (!clean.empty())
-            rec.thumbprint = clean;
-    }
-
-    // Remaining lines are the -text dump. The "X509v3 Key Usage:" header
-    // (present only when the extension exists) is a fixed label openssl
-    // itself generates -- never derived from certificate content -- and
-    // always precedes its value on the NEXT line, indented one level
-    // deeper, regardless of whether the extension is marked `critical`
-    // (verified empirically: both shapes end with either "critical" or a
-    // bare trailing space on the header line). Any OTHER line in the dump
-    // that happens to CONTAIN a hostile subject/issuer's text (e.g.
-    // "        Issuer: CN=X509v3 Key Usage: fake") still starts with
-    // openssl's own "Issuer:"/"Subject:" label after trimming, never with
-    // "X509v3 Key Usage:" itself, so a forged match is not reachable
-    // through DN content.
-    std::string line;
-    while (std::getline(iss, line)) {
-        auto trimmed = strip_leading_blank(line);
-        if (!trimmed.starts_with("X509v3 Key Usage:"))
-            continue;
-        std::string usage_line;
-        if (std::getline(iss, usage_line)) {
-            usage_line = strip_leading_blank(usage_line);
-            while (!usage_line.empty() &&
-                   (usage_line.back() == '\r' || usage_line.back() == '\n'))
-                usage_line.pop_back();
-            if (!usage_line.empty())
-                rec.key_usage = usage_line;
-        }
-        break;
-    }
+    // Positional field parsing lives in the shared, unit-tested
+    // parse_openssl_combined_output (certificates_macos_parsers.hpp); rec keeps
+    // the store this keychain read set and adopts the parsed identity fields.
+    auto parsed = parse_openssl_combined_output(result.output);
+    rec.subject = std::move(parsed.subject);
+    rec.issuer = std::move(parsed.issuer);
+    rec.not_before = std::move(parsed.not_before);
+    rec.not_after = std::move(parsed.not_after);
+    rec.serial = std::move(parsed.serial);
+    rec.thumbprint = std::move(parsed.thumbprint);
+    rec.key_usage = std::move(parsed.key_usage);
 
     return rec;
 }
@@ -929,7 +784,8 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
         return std::nullopt;
     auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
                                            yuzu::agent::SubprocessOptions{
-                                               .deadline = stat_deadline});
+                                               .deadline = stat_deadline},
+                                           "console-user stat /dev/console");
     auto username =
         yuzu::macos::parse_console_user_output(stat_result.ok ? stat_result.output : std::string{});
     if (yuzu::macos::is_no_console_user(username))
@@ -945,7 +801,8 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
         return std::nullopt;
     auto id_result = run_bounded_checked({"/usr/bin/id", "-u", username},
                                          yuzu::agent::SubprocessOptions{
-                                             .deadline = id_deadline});
+                                             .deadline = id_deadline},
+                                         "console-user id -u");
     // parse_console_user_output is a plain leading/trailing-whitespace trim
     // (see its own doc comment) -- reused here for `id -u`'s output too
     // (fix-round finding FP-CERTS-01): run_bounded_subprocess's `.output`
@@ -979,32 +836,8 @@ std::string canonical_thumbprint(std::string_view s) {
     return out;
 }
 
-// The three possible outcomes of comparing one parsed certificate block's
-// thumbprint against a search needle (details_cert_macos / delete's
-// keychain_contains_thumbprint). kInconclusive is the fix-round finding
-// FP-CERTS-02's core distinction: parse_pem_block_macos falls back to the
-// literal "(unknown)" sentinel whenever its own openssl call was
-// killed/capped/failed (never a fabricated identity), and a block whose
-// identity could not be established might BE the certificate being
-// searched for -- a caller must never fold that into a clean "not this
-// one", the same way it must never fold "the read itself failed" into
-// "not this one".
-enum class BlockIdentityOutcome { kMatch, kNoMatch, kInconclusive };
-
-/**
- * Pure per-block classification: does `parsed_thumbprint` match `needle`,
- * definitively not match, or is the block's identity simply unknown (not a
- * validated 40-hex-char thumbprint)? Shared by details_cert_macos's
- * per-keychain scan and keychain_contains_thumbprint's post-delete verify
- * scan so the two searches can never drift on this decision.
- */
-BlockIdentityOutcome classify_block_identity(std::string_view parsed_thumbprint,
-                                              std::string_view needle) {
-    if (!is_valid_thumbprint(parsed_thumbprint))
-        return BlockIdentityOutcome::kInconclusive;
-    return parsed_thumbprint == needle ? BlockIdentityOutcome::kMatch
-                                        : BlockIdentityOutcome::kNoMatch;
-}
+// BlockIdentityOutcome / classify_block_identity moved to
+// certificates_macos_parsers.hpp (shared with the unit test).
 
 /**
  * Enumerate one keychain's PEM blocks and emit rows for it, filtered by
@@ -1078,7 +911,8 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
             auto sys_result = run_bounded_checked(
                 {"/usr/bin/security", "find-certificate", "-a", "-p",
                  yuzu::macos::system_keychain_path()},
-                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                "System.keychain read");
             if (sys_result.ok) {
                 if (!emit_keychain_rows_macos(ctx, sys_result.output, "System.keychain",
                                               expiring_days, action_deadline)) {
@@ -1099,7 +933,8 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
             auto root_result = run_bounded_checked(
                 {"/usr/bin/security", "find-certificate", "-a", "-p",
                  yuzu::macos::root_keychain_path()},
-                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                "SystemRootCertificates.keychain read");
             if (root_result.ok) {
                 if (!emit_keychain_rows_macos(ctx, root_result.output,
                                               "SystemRootCertificates.keychain", expiring_days,
@@ -1144,7 +979,8 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                 // element" shape script_exec_plugin.cpp's bash action uses.
                 auto login_result = run_bounded_checked(
                     {"/bin/sh", "-c", cmd},
-                    yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                    yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                    "login keychain read");
                 if (login_result.ok) {
                     if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
                                                   expiring_days, action_deadline)) {
@@ -1239,7 +1075,8 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
             auto sys_result = run_bounded_checked(
                 {"/usr/bin/security", "find-certificate", "-a", "-p",
                  yuzu::macos::system_keychain_path()},
-                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                "System.keychain read");
             if (!sys_result.ok) {
                 read_failed = true;
                 failure_reason = "System.keychain read failed";
@@ -1269,7 +1106,8 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
             auto root_result = run_bounded_checked(
                 {"/usr/bin/security", "find-certificate", "-a", "-p",
                  yuzu::macos::root_keychain_path()},
-                yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                "SystemRootCertificates.keychain read");
             if (!root_result.ok) {
                 if (!read_failed) {
                     read_failed = true;
@@ -1314,7 +1152,8 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 // clean multi-element argv.
                 auto login_result = run_bounded_checked(
                     {"/bin/sh", "-c", cmd},
-                    yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+                    yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                    "login keychain read");
                 if (!login_result.ok) {
                     if (!read_failed) {
                         read_failed = true;
@@ -1364,14 +1203,20 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
  * (locked, missing, permission denied, a `security` failure, ...) --
  * delete_cert_macos() treats that as the unreadable-keychain verdict,
  * never "absent": a verification read that could not run proves nothing
- * about the outcome. ALSO returns std::nullopt if any enumerated block
- * fails to yield a validated 40-hex-character thumbprint
- * (parse_pem_block_macos falls back to a literal "(unknown)" on a
- * per-record openssl/temp-file failure) -- a block whose identity can't be
- * established could BE the certificate being searched for, so an
- * inconclusive scan must be treated the same as a scan that could not read
- * the keychain at all, never silently skipped as "not a match". Reuses
- * run_bounded_checked + the same PEM-enumeration path as list/details
+ * about the outcome. An UNRELATED unparseable block (parse_pem_block_macos
+ * falls back to the literal "(unknown)" on a per-record openssl/temp-file
+ * failure -- classify_block_identity reports kInconclusive) does NOT abort
+ * the proof (UP-5): openssl could not turn it into a cert, so it can never be
+ * a positive match for the needle, and aborting on it made a genuinely
+ * successful delete report failure (kVerifyUnreadable) whenever the keychain
+ * also held any unrelated malformed cert. Such blocks are skipped and the
+ * scan continues; only a definitive match returns `true`, and a keychain that
+ * was fully read AND fully scanned within budget with no match returns
+ * `false` (provably absent). The fail-safe is preserved for the cases that
+ * genuinely prove nothing -- a `security` read failure, or a cap/deadline-
+ * truncated scan -- which still return std::nullopt (see fold_presence_scan),
+ * so an unread/partly-read keychain is never reported as a clean "deleted".
+ * Reuses run_bounded_checked + the same PEM-enumeration path as list/details
  * rather than adding a second certificate-reading mechanism.
  *
  * `action_deadline` is the CALLER's whole-action budget (fix-round finding
@@ -1395,54 +1240,36 @@ std::optional<bool> keychain_contains_thumbprint(
     }
     auto result = run_bounded_checked(
         {"/usr/bin/security", "find-certificate", "-a", "-p", keychain_path},
-        yuzu::agent::SubprocessOptions{.deadline = read_deadline});
+        yuzu::agent::SubprocessOptions{.deadline = read_deadline}, "keychain verify read");
     if (!result.ok)
         return std::nullopt;
 
+    // Accumulate each block's identity outcome and hand the final verdict to
+    // the shared, unit-tested fold_presence_scan. A definitive match
+    // short-circuits (no need to parse the rest); an unrelated unparseable
+    // block (kInconclusive) is collected and skipped rather than aborting the
+    // proof (UP-5, see the function comment). A cap/deadline-truncated scan
+    // is passed as scan_complete=false so fold_presence_scan yields the honest
+    // std::nullopt -- an incomplete scan can never positively prove absence.
+    std::vector<BlockIdentityOutcome> outcomes;
     std::size_t parsed = 0;
     for (const auto& block : split_pem_blocks(result.output)) {
         auto parse_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
         if (parsed >= kMaxCertsPerKeychain || parse_deadline <= std::chrono::milliseconds::zero()) {
-            // Budget/cap spent before reaching a conclusive answer -- an
-            // incomplete scan must be treated the same as a scan that
-            // could not read the keychain at all (see the comment above):
-            // it can never positively prove absence.
-            return std::nullopt;
+            return fold_presence_scan(outcomes, /*scan_complete=*/false);
         }
         ++parsed;
         auto rec = parse_pem_block_macos(block, "", parse_deadline);
-        switch (classify_block_identity(rec.thumbprint, canonical_needle)) {
-        case BlockIdentityOutcome::kMatch:
+        auto outcome = classify_block_identity(rec.thumbprint, canonical_needle);
+        if (outcome == BlockIdentityOutcome::kMatch)
             return true;
-        case BlockIdentityOutcome::kInconclusive:
-            return std::nullopt;
-        case BlockIdentityOutcome::kNoMatch:
-            break;
-        }
+        outcomes.push_back(outcome);
     }
-    return false;
+    return fold_presence_scan(outcomes, /*scan_complete=*/true);
 }
 
-/**
- * Pure decision (adversarial-review finding K-4): given the tri-state
- * result of a pre-delete presence check (keychain_contains_thumbprint --
- * true = present, false = POSITIVELY proven absent via a successful
- * re-enumeration that did not find it, std::nullopt = the keychain could
- * not be conclusively read/parsed), should delete_cert_macos report
- * `status|not_found` and skip the destructive `security delete-certificate`
- * call entirely?
- *
- * Only a definitive `false` qualifies. `true` obviously must fall through
- * to the delete attempt, and -- just as importantly -- so must
- * std::nullopt: an unreadable/inconclusive presence check proves nothing
- * about whether the certificate is actually there, so it must never be
- * masked as "not found". Symmetric with classify_delete_verdict's own
- * std::nullopt handling (macos_console_user.hpp) for exactly the same
- * reason.
- */
-bool is_provably_absent_macos(std::optional<bool> presence) {
-    return presence.has_value() && !*presence;
-}
+// is_provably_absent_macos moved to certificates_macos_parsers.hpp (shared
+// with the unit test).
 
 bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                        std::string_view store) {
@@ -1465,8 +1292,13 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // details), so the delete-specific sealed-root rejection has to happen
     // here, not there.
     if (store == "root") {
+        // error| prefix for convention consistency (SHOULD-3): every other
+        // delete rejection in this function emits `error|<msg>`, so the
+        // sealed-root case does too rather than a bespoke
+        // `certificates|unsupported|` grammar a downstream consumer would have
+        // to special-case.
         ctx.write_output(
-            "certificates|unsupported|SystemRootCertificates.keychain is sealed on this macOS "
+            "error|SystemRootCertificates.keychain is sealed on this macOS "
             "version (System Integrity Protection) and cannot be modified");
         return false;
     }
@@ -1547,7 +1379,8 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // `.output` for the error message below.
     auto delete_result = run_bounded_checked(
         {"/usr/bin/security", "delete-certificate", "-Z", needle, *target},
-        yuzu::agent::SubprocessOptions{.deadline = delete_deadline, .merge_stderr = true});
+        yuzu::agent::SubprocessOptions{.deadline = delete_deadline, .merge_stderr = true},
+        "delete-certificate");
 
     // Only re-enumerate to verify when the delete command itself exited 0
     // -- a nonzero/abnormal exit is already a terminal failure, and

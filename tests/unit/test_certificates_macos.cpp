@@ -13,45 +13,29 @@
  *
  * The shell-injection-guard vectors (is_valid_username / is_valid_uid /
  * build_login_keychain_read_command) are the load-bearing ones: every value
- * this header validates ends up interpolated into a bounded-subprocess
- * argv/command line in certificates_plugin.cpp, so "rejects an unsafe value"
- * here is a direct proxy for "never runs an attacker-influenced command."
+ * macos_console_user.hpp validates ends up interpolated into a
+ * bounded-subprocess argv/command line in certificates_plugin.cpp, so
+ * "rejects an unsafe value" here is a direct proxy for "never runs an
+ * attacker-influenced command."
  *
- * The BR-02/BR-03/BR-07 section further down (parse_openssl_native_date,
- * expires_within_days, parse_openssl_combined_output, CertRecord-equivalent
- * row escaping) replicates the corresponding logic from
- * certificates_plugin.cpp -- that file builds to a `shared_library` plugin
- * with everything in an anonymous namespace, so it cannot be linked directly
- * into this test binary. Same "helpers copied into the test file's own
- * anonymous namespace" pattern as test_filesystem_actions.cpp /
- * test_filesystem_read.cpp; kept in sync manually with the production
- * versions.
- *
- * A fix-round section further down still replicates four small pure
- * decisions added while closing review findings FP-CERTS-01/02/03/05: the
- * capture-usability gate (nonzero-exit rejection), the tri-state per-block
- * identity classifier the details/delete-verify scans now share, and the
- * action-budget deadline clamp -- each proportionate, targeted coverage for
- * a NEW pure decision point rather than an attempt to unit-test the
- * surrounding subprocess/timing-dependent control flow (list/details'
- * cap-and-deadline loop, resolve_console_user's uid trimming), which would
- * need an injectable subprocess seam this package's owned files do not
- * provide.
- *
- * A further section closes two adversarial-review findings on the delete
- * path (K-4/K-7): is_provably_absent_macos -- the pure tri-state-presence
- * -> not_found decision delete_cert_macos now runs BEFORE ever issuing the
- * destructive `security delete-certificate` call -- is replicated the same
- * way as every other pure decision above. The K-7 row-escaping vectors don't
- * replicate anything (there's no new pure function to replicate): they
- * exercise the REAL yuzu::util::safe_output_field against the exact two
- * `std::format` templates delete_cert_macos's error paths use, the same
- * "prove the real SDK function neutralizes a hostile value in situ" pattern
- * as the to_row() vectors further down.
+ * Gate-7 FIX A: the pure parse/validate/classify/verdict helpers the
+ * BR-02/BR-03 and fix-round sections exercise (parse_openssl_native_date,
+ * expires_within_days, parse_openssl_combined_output, is_valid_thumbprint,
+ * is_usable_capture, classify_block_identity, is_provably_absent_macos,
+ * clamp_to_action_budget, fold_presence_scan) are NO LONGER hand-copied into
+ * this file. They now come from certificates_macos_parsers.hpp -- the SAME
+ * header certificates_plugin.cpp includes -- so a production change can never
+ * silently drift from the vectors meant to protect it. Only FakeCertFields
+ * (the CertRecord::to_row replica for the BR-07/K-7 row-escaping vectors)
+ * stays test-local: it exercises the REAL yuzu::util::safe_output_field
+ * against the exact std::format templates the plugin uses, so it is not a
+ * drift-prone copy of a pure function but an in-situ proof of the real SDK
+ * function's behaviour.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <certificates_macos_parsers.hpp> // Gate-7 FIX A: the SHARED pure helpers (no longer replicated)
 #include <macos_console_user.hpp>
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field -- the REAL SDK function, not replicated (BR-07)
 
@@ -64,98 +48,25 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace yuzu::macos;
+// Gate-7 FIX A: the pure parse/validate/classify/verdict helpers below now
+// live in certificates_macos_parsers.hpp (included above) and are pulled into
+// scope here -- no longer hand-copied into this file.
+using namespace yuzu::certificates_macos;
 
-// ── Replicated from certificates_plugin.cpp (see file banner) ──────────────
+// ── Test-local fixture (NOT a replicated pure function) ────────────────────
 
 namespace {
 
-/// Replica of certificates_plugin.cpp's expires_within_days -- UNCHANGED by
-/// this package's fix (the bug it closes is upstream, in what not_after
-/// gets populated with -- see parse_openssl_native_date below); replicated
-/// here so the acceptance criterion "a cert expiring far beyond `days` is
-/// EXCLUDED" is exercised against this exact, real logic rather than
-/// asserted only by code review.
-bool expires_within_days(const std::string& not_after, int days) {
-    if (days <= 0)
-        return true;
-    if (not_after.size() < 10)
-        return true; // can't parse, include it
-
-    std::tm tm{};
-    tm.tm_year = std::atoi(not_after.substr(0, 4).c_str()) - 1900;
-    tm.tm_mon = std::atoi(not_after.substr(5, 2).c_str()) - 1;
-    tm.tm_mday = std::atoi(not_after.substr(8, 2).c_str());
-    tm.tm_isdst = -1;
-
-    std::time_t expiry = std::mktime(&tm);
-    if (expiry == static_cast<std::time_t>(-1))
-        return true;
-
-    auto now = std::time(nullptr);
-    auto diff_seconds = std::difftime(expiry, now);
-    auto diff_days = diff_seconds / 86400.0;
-
-    return diff_days <= static_cast<double>(days);
-}
-
-/// Replica of parse_pem_block_macos's date parser (BR-02): LibreSSL 3.3.6's
-/// NATIVE ASN1_TIME_print format ("Jul 20 19:06:44 2026 GMT" / "Jan  1
-/// 00:00:00 2025 GMT") -> "YYYY-MM-DD", never `-dateopt iso_8601` (this
-/// host's /usr/bin/openssl rejects that option outright, exit 1).
-std::string parse_openssl_native_date(std::string_view value) {
-    static constexpr std::array<std::string_view, 12> kMonths = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-
-    std::istringstream iss{std::string{value}};
-    std::string mon, day, time_of_day, year;
-    if (!(iss >> mon >> day >> time_of_day >> year))
-        return "(unknown)";
-
-    int month_num = 0;
-    for (std::size_t i = 0; i < kMonths.size(); ++i) {
-        if (mon == kMonths[i]) {
-            month_num = static_cast<int>(i) + 1;
-            break;
-        }
-    }
-    if (month_num == 0)
-        return "(unknown)";
-
-    if (day.empty() || day.size() > 2)
-        return "(unknown)";
-    for (char c : day) {
-        if (c < '0' || c > '9')
-            return "(unknown)";
-    }
-    if (year.size() != 4)
-        return "(unknown)";
-    for (char c : year) {
-        if (c < '0' || c > '9')
-            return "(unknown)";
-    }
-
-    int day_num = std::atoi(day.c_str());
-    if (day_num < 1 || day_num > 31)
-        return "(unknown)";
-
-    return std::format("{}-{:02d}-{:02d}", year, month_num, day_num);
-}
-
-/// Replica of parse_pem_block_macos's strip_leading_blank.
-std::string strip_leading_blank(std::string s) {
-    std::size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t'))
-        ++i;
-    s.erase(0, i);
-    return s;
-}
-
-/// Replica of CertRecord -- the 8 pipe-delimited row fields
-/// parse_pem_block_macos populates, plus a to_row() that calls the REAL
-/// (not replicated) yuzu::util::safe_output_field, matching
-/// certificates_plugin.cpp's CertRecord::to_row() field-for-field (BR-07).
+/// A stand-in for certificates_plugin.cpp's CertRecord holding the 8
+/// pipe-delimited row fields, plus a to_row() that calls the REAL (not
+/// replicated) yuzu::util::safe_output_field, matching CertRecord::to_row()
+/// field-for-field (BR-07). This stays test-local deliberately: CertRecord is
+/// defined inside the plugin's anonymous namespace and is not a pure parser,
+/// and to_row()'s escaping is the REAL SDK function -- so these vectors prove
+/// the plugin's row grammar in situ rather than re-testing a copied algorithm.
 struct FakeCertFields {
     std::string subject = "(unknown)";
     std::string issuer = "(unknown)";
@@ -173,131 +84,6 @@ struct FakeCertFields {
                            yuzu::util::safe_output_field(key_usage));
     }
 };
-
-/// Replica of parse_pem_block_macos's PARSING logic only (everything from
-/// `std::istringstream iss(result.output)` onward) -- the temp-file-write
-/// and run_bounded_subprocess() call are deliberately NOT replicated (a
-/// unit test must never fork a real openssl); this takes the subprocess's
-/// captured stdout directly as a fixture string, exactly the boundary
-/// certificates_plugin.cpp itself injects at (`result.output`).
-FakeCertFields parse_openssl_combined_output(const std::string& openssl_output) {
-    FakeCertFields rec;
-
-    std::istringstream iss(openssl_output);
-    auto next_line = [&]() -> std::string {
-        std::string line;
-        return std::getline(iss, line) ? line : std::string{};
-    };
-
-    if (auto line = next_line(); line.starts_with("subject="))
-        rec.subject = strip_leading_blank(line.substr(8));
-    if (auto line = next_line(); line.starts_with("issuer="))
-        rec.issuer = strip_leading_blank(line.substr(7));
-    if (auto line = next_line(); line.starts_with("notBefore="))
-        rec.not_before = parse_openssl_native_date(line.substr(10));
-    if (auto line = next_line(); line.starts_with("notAfter="))
-        rec.not_after = parse_openssl_native_date(line.substr(9));
-    if (auto line = next_line(); line.starts_with("serial="))
-        rec.serial = line.substr(7);
-    if (auto line = next_line();
-        line.starts_with("SHA1 Fingerprint=") || line.starts_with("sha1 Fingerprint=")) {
-        auto hex = line.substr(line.find('=') + 1);
-        std::string clean;
-        clean.reserve(hex.size());
-        for (char c : hex) {
-            if (c != ':')
-                clean += c;
-        }
-        if (!clean.empty())
-            rec.thumbprint = clean;
-    }
-
-    std::string line;
-    while (std::getline(iss, line)) {
-        auto trimmed = strip_leading_blank(line);
-        if (!trimmed.starts_with("X509v3 Key Usage:"))
-            continue;
-        std::string usage_line;
-        if (std::getline(iss, usage_line)) {
-            usage_line = strip_leading_blank(usage_line);
-            while (!usage_line.empty() &&
-                   (usage_line.back() == '\r' || usage_line.back() == '\n'))
-                usage_line.pop_back();
-            if (!usage_line.empty())
-                rec.key_usage = usage_line;
-        }
-        break;
-    }
-
-    return rec;
-}
-
-/// Replica of certificates_plugin.cpp's parse_pem_block_macos capture-
-/// usability gate (BR-03; nonzero-exit rejection added for fix-round
-/// finding FP-CERTS-05). Takes the four SubprocessResult fields the real
-/// gate reads rather than a SubprocessResult itself -- agent-core's real
-/// type is not reachable from a plugin-side unit test (same boundary this
-/// whole file is written against).
-bool is_usable_capture(bool tool_ran, bool timed_out, bool output_truncated, int exit_code) {
-    return tool_ran && !timed_out && !output_truncated && exit_code == 0;
-}
-
-/// Replica of certificates_plugin.cpp's is_valid_thumbprint (40 hex chars).
-bool is_valid_thumbprint(std::string_view s) {
-    if (s.size() != 40)
-        return false;
-    for (char c : s) {
-        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
-            return false;
-    }
-    return true;
-}
-
-/// Replica of certificates_plugin.cpp's BlockIdentityOutcome /
-/// classify_block_identity (fix-round finding FP-CERTS-02): the tri-state
-/// decision details_cert_macos's per-keychain scan and delete's
-/// keychain_contains_thumbprint both now share, so a thumbprint that
-/// couldn't be established (the "(unknown)" sentinel from a failed/
-/// timed-out per-cert openssl parse) is never folded into a clean
-/// "not this one".
-enum class BlockIdentityOutcome { kMatch, kNoMatch, kInconclusive };
-
-BlockIdentityOutcome classify_block_identity(std::string_view parsed_thumbprint,
-                                              std::string_view needle) {
-    if (!is_valid_thumbprint(parsed_thumbprint))
-        return BlockIdentityOutcome::kInconclusive;
-    return parsed_thumbprint == needle ? BlockIdentityOutcome::kMatch
-                                        : BlockIdentityOutcome::kNoMatch;
-}
-
-/// Replica of certificates_plugin.cpp's is_provably_absent_macos
-/// (adversarial-review finding K-4): the pure decision that gates whether
-/// delete_cert_macos reports `status|not_found` and skips the destructive
-/// `security delete-certificate` call entirely, rather than running it
-/// against an already-absent thumbprint and reporting a generic
-/// kCommandFailed `error|delete failed ...`. Only a definitive `false`
-/// (a successful re-enumeration that positively did not find the
-/// thumbprint) qualifies -- `true` (present) and std::nullopt (the presence
-/// check itself was inconclusive/unreadable) must both fall through to the
-/// real delete attempt, exactly like classify_delete_verdict's own
-/// std::nullopt handling for the post-delete verify.
-bool is_provably_absent_macos(std::optional<bool> presence) {
-    return presence.has_value() && !*presence;
-}
-
-/// Replica of certificates_plugin.cpp's clamp_to_action_budget (fix-round
-/// finding FP-CERTS-03): clamps a per-subprocess deadline cap to whatever
-/// remains of a whole-action budget, returning zero (never negative) once
-/// the budget is exhausted.
-std::chrono::milliseconds clamp_to_action_budget(
-    std::chrono::steady_clock::time_point action_deadline,
-    std::chrono::milliseconds per_call_cap) {
-    auto remaining = action_deadline - std::chrono::steady_clock::now();
-    if (remaining <= std::chrono::steady_clock::duration::zero())
-        return std::chrono::milliseconds::zero();
-    auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
-    return remaining_ms < per_call_cap ? remaining_ms : per_call_cap;
-}
 
 } // namespace
 
@@ -543,6 +329,30 @@ TEST_CASE("resolve_delete_keychain_path: unsupported stores are rejected, "
     CHECK_FALSE(resolve_delete_keychain_path("bogus").has_value());
 }
 
+// ── sealed-root delete rejection grammar (Gate-7 FIX B / SHOULD-3) ───────────
+//
+// delete_cert_macos rejects store=root before ever shelling out
+// (SystemRootCertificates.keychain is sealed by SIP). That rejection now uses
+// the same `error|<msg>` grammar every OTHER delete rejection in the function
+// uses, rather than the bespoke `certificates|unsupported|<msg>` prefix it
+// carried before -- so a downstream consumer of this pipe-delimited output has
+// one rejection grammar to parse, not two. The message is a fixed literal with
+// no interpolation (no pure function to share), so this asserts the exact
+// string the plugin emits, mirroring the K-7 vectors' in-situ style.
+
+TEST_CASE("sealed-root delete rejection uses the shared error| grammar, not a bespoke prefix",
+         "[certificates][macos]") {
+    // The verbatim literal delete_cert_macos emits for store=root.
+    const std::string sealed_root_message =
+        "error|SystemRootCertificates.keychain is sealed on this macOS "
+        "version (System Integrity Protection) and cannot be modified";
+
+    // FIX B: the convention-consistent error| prefix, never the old bespoke
+    // certificates|unsupported| grammar.
+    CHECK(sealed_root_message.starts_with("error|"));
+    CHECK(sealed_root_message.find("certificates|unsupported|") == std::string::npos);
+}
+
 // ── build_login_keychain_read_command (shell-injection guard) ───────────────
 
 TEST_CASE("build_login_keychain_read_command: caller already root -- no outer sudo hop",
@@ -732,6 +542,65 @@ TEST_CASE("classify_block_identity: an empty thumbprint is inconclusive",
          "[certificates][macos]") {
     CHECK(classify_block_identity("", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") ==
          BlockIdentityOutcome::kInconclusive);
+}
+
+// ── fold_presence_scan (Gate-7 FIX C / UP-5) ────────────────────────────────
+//
+// keychain_contains_thumbprint's post-delete verify previously returned
+// std::nullopt on the FIRST unparseable (kInconclusive) block, so a genuinely
+// successful delete in a keychain that ALSO held any unrelated malformed cert
+// reported failure (kVerifyUnreadable). fold_presence_scan is the shared pure
+// decision that now folds the per-block outcomes of an absence-proving scan:
+// an unrelated unparseable block no longer aborts the proof, while a genuine
+// read failure / cap-or-deadline-truncated scan (passed as scan_complete=false)
+// still yields std::nullopt so an unread/partly-read keychain is never
+// reported as a clean "deleted".
+
+TEST_CASE("fold_presence_scan: absence proven despite an unrelated unparseable block",
+         "[certificates][macos]") {
+    // The exact UP-5 regression: a fully-read, fully-scanned keychain whose
+    // only anomaly is an UNRELATED cert openssl could not parse
+    // (kInconclusive). No block matches the needle, so the certificate is
+    // provably ABSENT -- the unparseable block must NOT force the inconclusive
+    // std::nullopt that previously reported a clean delete as unverified.
+    std::vector<BlockIdentityOutcome> outcomes = {BlockIdentityOutcome::kNoMatch,
+                                                  BlockIdentityOutcome::kInconclusive,
+                                                  BlockIdentityOutcome::kNoMatch};
+    auto result = fold_presence_scan(outcomes, /*scan_complete=*/true);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(*result); // false == provably absent
+}
+
+TEST_CASE("fold_presence_scan: a matching block proves the certificate is still present",
+         "[certificates][macos]") {
+    std::vector<BlockIdentityOutcome> outcomes = {BlockIdentityOutcome::kNoMatch,
+                                                  BlockIdentityOutcome::kMatch};
+    auto result = fold_presence_scan(outcomes, /*scan_complete=*/true);
+    REQUIRE(result.has_value());
+    CHECK(*result); // true == present
+    // A match is decisive even when the scan was cut short.
+    auto partial = fold_presence_scan(outcomes, /*scan_complete=*/false);
+    REQUIRE(partial.has_value());
+    CHECK(*partial);
+}
+
+TEST_CASE("fold_presence_scan: an incomplete scan with no match is inconclusive, never a false "
+         "'absent'",
+         "[certificates][macos]") {
+    // The fail-safe: a cap/deadline-truncated scan (scan_complete=false) that
+    // found no match proves nothing -- the unscanned tail could hold the
+    // needle -- so it must stay std::nullopt (kVerifyUnreadable downstream),
+    // never fold into a clean "deleted".
+    std::vector<BlockIdentityOutcome> outcomes = {BlockIdentityOutcome::kNoMatch,
+                                                  BlockIdentityOutcome::kInconclusive};
+    CHECK_FALSE(fold_presence_scan(outcomes, /*scan_complete=*/false).has_value());
+}
+
+TEST_CASE("fold_presence_scan: an empty, fully-scanned keychain proves absence",
+         "[certificates][macos]") {
+    auto result = fold_presence_scan({}, /*scan_complete=*/true);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(*result);
 }
 
 // ── clamp_to_action_budget (fix-round finding FP-CERTS-03) ──────────────────
