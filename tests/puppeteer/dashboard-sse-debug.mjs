@@ -171,7 +171,7 @@ async function main() {
 
   if (inputSelector.selector) {
     const input = await page.$(inputSelector.selector);
-    await input.click({ clickCount: 3 });
+    await input.click({ count: 3 });
     await input.type('os_info os_name');
 
     // Find and click Send

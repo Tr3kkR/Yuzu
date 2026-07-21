@@ -1,5 +1,7 @@
 #include "guardian_outbox_drain_worker.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <chrono>
 
 namespace yuzu::agent {
@@ -33,16 +35,24 @@ void GuardianOutboxDrainWorker::start() {
 }
 
 void GuardianOutboxDrainWorker::stop() {
+    bool first_stop = false;
     {
         std::lock_guard<std::mutex> lk{sig_->mu};
-        if (sig_->stopping)
-            return;
-        sig_->stopping = true;
+        if (!sig_->stopping) {
+            sig_->stopping = true;
+            first_stop = true;
+        }
     }
-    // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
-    // already taken by an in-flight enqueue stays safe (still-alive Signal).
-    rt_.set_outbox_enqueue_waker({});
-    sig_->cv.notify_all();
+    if (first_stop) {
+        // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
+        // already taken by an in-flight enqueue stays safe (still-alive Signal).
+        rt_.set_outbox_enqueue_waker({});
+        sig_->cv.notify_all();
+    }
+    // The join is OUTSIDE the first_stop guard and keyed on joinable(), not on the
+    // stopping flag: if a prior stop() threw after setting stopping but before joining
+    // (e.g. from ~GuardianOutboxDrainWorker re-entry), a joinable thread would otherwise
+    // reach ~std::thread and terminate. Always attempt the join while joinable (Fable).
     if (thread_.joinable())
         thread_.join();
 }
@@ -60,7 +70,24 @@ void GuardianOutboxDrainWorker::loop() {
                 return;
             seen = sig_->gen;
         }
-        drain_once();
+        // Firewall the drain pass: this is a bare worker thread and the drain path
+        // allocates (front_copy copies an OutboxEntry, pop_front_if builds a Key) plus
+        // the injected send. A bad_alloc escaping here would terminate the whole agent
+        // daemon (the #2037 class). Count it, log the first, keep looping - nothing was
+        // popped, so entries stay buffered and the periodic backstop re-attempts once
+        // memory recovers. (item 4 hardening / Fable.)
+        try {
+            drain_once();
+        } catch (...) {
+            const auto n = drain_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                try {
+                    spdlog::error("Guardian drain worker: drain pass threw (firewalled; agent "
+                                  "survives, entries retained). Further occurrences counted only.");
+                } catch (...) {
+                }
+            }
+        }
     }
 }
 
