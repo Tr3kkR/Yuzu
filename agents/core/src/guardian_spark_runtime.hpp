@@ -226,7 +226,17 @@ public:
     /// blocks enqueuers/heartbeat. The drain trigger (sink publication + reconnect +
     /// live wake-on-enqueue) is wired at rung 7; this is the mechanism. Returns the
     /// number SENT (not removed - a coalesced head counts as sent but is not popped).
-    std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
+    ///
+    /// `max_entries` bounds ONE pass; 0 means unbounded (the historical behaviour).
+    /// Bounding exists because the caller's thread may carry OTHER periodic work
+    /// (C0 #2298: the drain worker also runs journal retention). Unbounded, a slow
+    /// stream drains the whole window - up to 4096 lifecycle entries - head-of-line
+    /// blocking that work for as long as it takes; on a slow link that starves
+    /// retention until the journal hits its write ceiling and DROPS audit records.
+    /// A caller that bounds a pass should re-drain immediately while the return value
+    /// reaches the bound, instead of waiting for its next wake.
+    std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send,
+                      std::size_t max_entries = 0);
 
     // --- Durable lifecycle journal - staging seam (item 7 PR-Ag) ------------
     // Staging lives HERE (co-located with lifecycle_log_ under outbox_mu_) because

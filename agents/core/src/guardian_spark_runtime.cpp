@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <limits>
 #include <optional>
 #include <random>
 #include <set>
@@ -606,9 +607,14 @@ namespace {
 template <typename Log>
 std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
                                const std::function<SendResult(const OutboxEntry&)>& send,
-                               std::atomic<std::uint64_t>& send_exceptions) {
+                               std::atomic<std::uint64_t>& send_exceptions,
+                               std::size_t& budget) {
     std::size_t sent = 0;
-    while (true) {
+    // `budget` is SHARED across the two logs of one drain() pass and decremented per
+    // successful send, so a bound means "N entries this pass" regardless of which log
+    // they came from - the lifecycle log cannot consume a whole pass and leave the
+    // compliance outbox its own fresh allowance.
+    while (budget > 0) {
         OutboxEntry entry;
         {
             std::lock_guard<std::mutex> ob{mu};
@@ -642,11 +648,14 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
             log.pop_front_if(entry.event_id); // remove IFF unchanged during the unlocked send
         }
         ++sent;
+        --budget;
     }
+    return sent; // budget exhausted mid-log: the caller re-drains without waiting
 }
 } // namespace
 
-std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
+std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send,
+                                        std::size_t max_entries) {
     // Single-drainer: the send runs with outbox_mu_ released, so two concurrent drainers
     // could both peek+send the same head (duplicate delivery). drain_mu_ serialises them
     // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
@@ -661,8 +670,10 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
     // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
     // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
-    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_);
-    sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_);
+    std::size_t budget =
+        max_entries == 0 ? std::numeric_limits<std::size_t>::max() : max_entries;
+    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, budget);
+    sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_, budget);
     return sent;
 }
 
