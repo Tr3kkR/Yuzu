@@ -354,7 +354,11 @@ public:
     std::vector<DexDayCrashCount> dex_crashes_by_day(const std::string& since = "") const;
     // Whole-catalogue rollup: every obs_type present in the window, with count +
     // blast radius — the overview's "all signals" panel. One GROUP BY pass.
-    std::vector<DexSignalCount> dex_signal_summary(const std::string& since = "") const;
+    // `platform` narrows to one OS's own signals (empty = the all-OS composite,
+    // unchanged) — the Catalogue's single-OS filter uses this so a family's score
+    // is honest for the selected OS instead of borrowing the all-fleet rollup.
+    std::vector<DexSignalCount> dex_signal_summary(const std::string& since = "",
+                                                    const std::string& platform = "") const;
     // Boot performance (os.boot, metric = ms; rows with metric<=0 excluded).
     DexBootStats dex_boot_stats(const std::string& since = "") const;
     std::vector<DexDeviceBoot> dex_slowest_boots(const std::string& since = "",

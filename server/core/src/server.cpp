@@ -10290,6 +10290,14 @@ private:
                         // (G4 UP-1; pre-existing here, fixed with the sibling).
                         if (os.starts_with("win"))
                             ++f.windows_online;
+                        // Per-OS online denominators (#1746) — same coverage-honest
+                        // count as windows_online, so the Catalogue's single-OS
+                        // filter can score a family against THAT OS's own fleet.
+                        if (os.starts_with("lin"))
+                            ++f.linux_online;
+                        if (os.starts_with("darwin") || os.starts_with("macos"))
+                            ++f.macos_online; // prefix, like win/lin — keep in
+                                              // step with the store's write canon
                         // Distinct connected OS tokens → the Catalogue's "All
                         // connected" coverage scope (render normalises darwin→macos).
                         if (!os.empty() && std::find(f.connected_os.begin(),

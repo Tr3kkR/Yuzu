@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -316,7 +317,8 @@ void GuaranteedStateStore::create_tables() {
             -- hung APP's file version, canonicalized agent-side to the same dotted
             -- quad procperf emits, so (subject, version) is ONE identity across
             -- crashes and perf. NOT NULL DEFAULT '' — pre-{8} rows and any signal
-            -- without a version (services, non-Windows crashes, packaged apps) read
+            -- without a version (services, Linux crashes, unversioned/packaged
+            -- apps; macOS crash/hang now carry one) read
             -- as the single "unknown version" bucket. Append-only ALTER: a fresh DB
             -- runs {7} then {8}; an upgrading DB runs only {8}.
             ALTER TABLE guardian_observations
@@ -1026,7 +1028,21 @@ GuaranteedStateStore::project_observation_locked(const GuaranteedStateEventRow& 
     std::string component = field("component");
     if (component.empty())
         component = field("faulting_module");
-    const std::string platform = field("platform");
+    // Canonicalize platform at write (same UP-4 never-trust-the-agent posture as
+    // version below): the per-OS catalogue lens filters on exact `platform = ?`,
+    // so a non-canonical token from a buggy/hostile agent ("Darwin", "Windows")
+    // would silently drop that device's observations out of every single-OS lens
+    // while keeping them in "all". Mirror the DexFleet FleetFn normalization so
+    // the numerator (observations) and denominator (online counts) agree.
+    std::string platform = field("platform");
+    for (auto& c : platform)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (platform.starts_with("win"))
+        platform = "windows";
+    else if (platform.starts_with("lin"))
+        platform = "linux";
+    else if (platform.starts_with("darwin") || platform.starts_with("macos"))
+        platform = "macos"; // prefix, like win/lin: "darwin 24.0" must not escape the lens
     // Per-version stability (slice 2b). RE-CANONICALIZE server-side (UP-4): never
     // trust the agent's string — a hostile/buggy/non-Windows agent could ship a
     // non-canonical or malicious value (e.g. "<script>…") within the 256-byte
@@ -1324,7 +1340,7 @@ GuaranteedStateStore::dex_crashes_by_day(const std::string& since) const {
 }
 
 std::vector<DexSignalCount>
-GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
+GuaranteedStateStore::dex_signal_summary(const std::string& since, const std::string& platform) const {
     std::shared_lock lock(mtx_);
     std::vector<DexSignalCount> out;
     if (!db_)
@@ -1332,17 +1348,26 @@ GuaranteedStateStore::dex_signal_summary(const std::string& since) const {
     // The whole-catalogue rollup: one row per obs_type present in the window.
     // Fully generic — a catalogue signal added agent-side appears here with NO
     // server change (the projection writes it, this GROUP BY surfaces it).
-    const char* sql = R"(
+    // `platform` (#1746) narrows the rollup to one OS's own observations — empty
+    // (the default) keeps the all-OS composite exactly as before this parameter
+    // existed.
+    std::string sql = R"(
         SELECT obs_type, COUNT(*), COUNT(DISTINCT agent_id), MAX(observed_at)
         FROM guardian_observations
         WHERE observed_at >= ?1
+    )";
+    if (!platform.empty())
+        sql += " AND platform = ?2";
+    sql += R"(
         GROUP BY obs_type
         ORDER BY COUNT(*) DESC, obs_type ASC
     )";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (!platform.empty())
+        sqlite3_bind_text(st.get(), 2, platform.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexSignalCount c;
         c.obs_type = col_text(st.get(), 0);

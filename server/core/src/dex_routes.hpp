@@ -45,9 +45,12 @@ struct GuardianObservationRow;
 class HttpRouteSink;
 
 /// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
-/// registry (NOT the crash store). `windows_online` is the coverage-honest
-/// denominator (only the OS with a crash collector today); `total_online` is
-/// context. A struct (not a registry dep) keeps render pure + testable.
+/// registry (NOT the crash store). `windows_online` remains the established
+/// headline crash-rate denominator (and the "all" catalogue lens's denominator,
+/// kept for continuity); macOS and Linux crash/reliability collectors now exist
+/// too, and the per-OS counters below denominate the catalogue's single-OS
+/// lenses. `total_online` is context. A struct (not a registry dep) keeps
+/// render pure + testable.
 struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
@@ -60,6 +63,14 @@ struct DexFleet {
     /// build the experience distribution AND groups by os for the segment breakdown.
     /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
     std::vector<std::pair<std::string, std::string>> connected_agents;
+    /// Per-OS online-agent denominators (#1746) — the same coverage-honest count as
+    /// windows_online, split by platform, so the Catalogue's single-OS filter can
+    /// score a family against THAT OS's own online count instead of borrowing
+    /// windows_online. APPENDED here (not alongside windows_online) so the many
+    /// positional aggregate initializers of this struct across the test suite keep
+    /// compiling unchanged — trailing members default-init to 0.
+    int64_t linux_online{0};
+    int64_t macos_online{0};
 };
 
 /// One display family of the server-side signal catalogue. PUBLIC since F1:
