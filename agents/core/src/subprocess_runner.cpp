@@ -673,10 +673,13 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
 
     // A clean stop_after_max_lines stop kills the child by our own request
     // once it had already produced everything the caller asked for -- that
-    // is a success, not a failure, so it gets a real exit_code rather than
-    // the signal-death -1 sentinel (which callers would otherwise read as
-    // "log show exited with an error").
-    if (line_cap_stop && !result.timed_out)
+    // is a success, not a failure, so the SIGKILL we sent must not surface as
+    // a failure. But only overwrite the signal-death -1 sentinel: if the child
+    // had already exited NATURALLY with a real status before our kill landed
+    // (try_reap() stored WEXITSTATUS), that status is the truth -- clobbering a
+    // genuine nonzero exit to 0 would report a failed tool as SUCCESS, exactly
+    // the error-honesty violation this runner exists to prevent.
+    if (line_cap_stop && !result.timed_out && result.exit_code == -1)
         result.exit_code = 0;
 
     return result;

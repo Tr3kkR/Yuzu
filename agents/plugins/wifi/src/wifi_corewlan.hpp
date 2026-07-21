@@ -31,9 +31,11 @@ namespace yuzu::wifi {
 struct WifiConnection {
     bool power_on = false;        // Wi-Fi radio powered on
     bool associated = false;      // joined to a network (has a live channel)
-    bool ssid_available = false;  // false → withheld by Location Services, NOT "hidden"
+    bool ssid_available = false;  // false → name unavailable (usually Location
+                                  // Services withholding on 14+; also a hidden
+                                  // SSID or non-UTF8 name — indistinguishable here)
     std::string ssid;             // valid only when ssid_available
-    std::string bssid;            // empty when withheld / not associated
+    std::string bssid;            // empty when name unavailable / not associated
     int rssi = 0;                 // dBm; 0 when not associated
     int channel = 0;              // 0 when not associated
     std::string security;         // human-readable; empty when unknown
@@ -43,8 +45,9 @@ struct WifiConnection {
 // Formats the macOS `connected` action output line from a WifiConnection.
 // Single source of truth for the record contract, in the established macOS field
 // order: SSID | RSSI | Security | BSSID | Channel. An associated link whose SSID
-// is withheld by Location Services reports "<ssid-withheld>" (an honest
-// connection), never a false "Not connected". Pure — unit-tested cross-platform.
+// name is unavailable (usually Location Services withholding on 14+, sometimes a
+// hidden SSID) reports "<ssid-withheld>" (an honest connection), never a false
+// "Not connected". Pure — unit-tested cross-platform.
 inline std::string format_connected_record(const WifiConnection& c) {
     if (!c.associated)
         return "connected|none|Not connected|0|none|none";

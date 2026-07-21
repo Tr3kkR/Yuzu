@@ -41,10 +41,10 @@
  *   - agents/plugins/script_exec/src/script_exec_plugin.cpp (run_process_posix)
  *   - agents/plugins/content_dist/src/content_dist_plugin.cpp (safe_execute)
  *   - agents/core/src/trigger_engine.cpp (query_service_status, macOS popen)
- *   - agents/plugins/filesystem/src/filesystem_plugin.cpp (compute_hash_unix,
- *     its own raw pipe()+fork() hash-helper)
- * The remaining popen() call sites scattered across agents/plugins/* (most
- * single-shot `popen(cmd, "r")` info-gathering plugins) are not yet
+ * (filesystem_plugin.cpp's compute_hash_unix no longer forks directly -- it
+ * now routes through the shared bounded runner, which is the first site above.)
+ * The remaining popen() call sites scattered across the plugin directories
+ * (most single-shot `popen(cmd, "r")` info-gathering plugins) are not yet
  * covered; any of them can still race a locked launcher's window until they
  * are migrated too. The Linux branch of trigger_engine.cpp's
  * query_service_status has its own, separate popen() call and is not

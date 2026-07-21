@@ -447,9 +447,14 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
         break;
     case yuzu::interaction::DialogOutcome::not_reachable:
         // No GUI session / TCC denial / osascript failure — honest status,
-        // never a fabricated button. Rides the new `status` result column.
+        // never a fabricated button. Rides the new `status` result column AND
+        // returns terminal FAILURE so a generic success/failure consumer (the
+        // executions drawer, retry/automation logic) does not read a dialog
+        // that was never shown as SUCCESS. This matches the sibling actions
+        // notify/input/survey, which already return 1 for the identical
+        // undeliverable-session condition.
         ctx.write_output("status|not_reachable");
-        break;
+        return 1;
     }
     return 0;
 }

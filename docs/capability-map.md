@@ -433,9 +433,9 @@ pf packet filter demoted to a secondary row; `rules` lists pf rules.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
-`bitlocker` plugin (Windows).
-
-> **Gap:** No Linux LUKS coverage. (macOS FileVault status now covered via the `bitlocker` plugin.)
+`bitlocker` plugin (cross-platform): Windows BitLocker (`manage-bde`), Linux
+LUKS (`list_luks_volumes`), and macOS FileVault (`fdesetup` + per-APFS-volume
+`diskutil apfs list`) — all three dispatched from the plugin's `state` action.
 
 ### 9.4 Vulnerability Scanning :large_orange_diamond: `T1`
 
@@ -1258,13 +1258,13 @@ Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with pe
 | wol | Y | Y | Y | Network |
 | discovery | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
-| msi_packages | Y | - | - | Software |
+| msi_packages | Y | - | Y | Software |
 | windows_updates | Y | - | - | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
 | antivirus | Y | Y | Y | Security |
 | firewall | Y | Y | Y | Security |
-| bitlocker | Y | - | - | Security |
+| bitlocker | Y | Y | Y | Security |
 | event_logs | Y | Y | Y | Security |
 | vuln_scan | Y | Y | Y | Security |
 | ioc | Y | Y | Y | Security |

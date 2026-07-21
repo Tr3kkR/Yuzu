@@ -47,6 +47,9 @@
 #endif
 
 #ifdef __APPLE__
+#include <chrono>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+
 #include "services_macos_launchd.hpp" // pure launchctl print-disabled parser (C-1.12)
 #endif
 
@@ -252,24 +255,17 @@ struct ServiceInfo {
 // the child process never blocks writing into a full pipe) -- just not kept.
 constexpr std::size_t kMaxServiceRows = 512;
 
-// Read the full stdout of a command via popen into a string, bounded so a
-// runaway/adversarial `launchctl print-disabled` can't grow this unbounded.
-// Pure I/O helper (not part of services_macos_launchd.hpp, which stays
-// popen-free) -- reused nowhere else, kept file-local like run_command_exit.
+// Read the full stdout of a command into a string, via the bounded,
+// fork-lock-covered runner rather than a raw, deadline-less popen (K-7/CDX-07).
+// `/bin/sh -c` preserves the shell semantics popen used (the callers rely on
+// `2>/dev/null`); the runner's own ~1 MiB sanity cap bounds a runaway/
+// adversarial `launchctl list`/`print-disabled`. Pure I/O helper (not part of
+// services_macos_launchd.hpp, which stays subprocess-free).
 std::string slurp_command_output(const char* cmd) {
-    std::string out;
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe{popen(cmd, "r"), &pclose};
-    if (!pipe)
-        return out;
-    static constexpr std::size_t kMaxOutputBytes = 2 * 1024 * 1024; // 2 MiB sanity cap
-    std::array<char, 4096> buf{};
-    size_t n;
-    while ((n = fread(buf.data(), 1, buf.size(), pipe.get())) > 0) {
-        if (out.size() < kMaxOutputBytes) {
-            out.append(buf.data(), std::min(n, kMaxOutputBytes - out.size()));
-        }
-    }
-    return out;
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    return res.output;
 }
 
 // total_seen (out) receives the number of services that passed all filters
@@ -278,21 +274,34 @@ std::string slurp_command_output(const char* cmd) {
 std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t& total_seen) {
     total_seen = 0;
     std::vector<ServiceInfo> services;
-    FILE* pipe = popen("launchctl list 2>/dev/null", "r");
-    if (!pipe)
-        return services;
+    // Bounded + fork-lock-covered read (K-7/CDX-07): the whole `launchctl list`
+    // output is slurped through the shared runner, then parsed line-by-line
+    // exactly as the previous inline popen/fgets loop did.
+    const std::string listing = slurp_command_output("launchctl list 2>/dev/null");
 
-    std::array<char, 1024> buf{};
-    // Skip header
-    if (fgets(buf.data(), static_cast<int>(buf.size()), pipe) == nullptr) {
-        pclose(pipe);
-        return services;
-    }
+    std::size_t line_pos = 0;
+    bool header_skipped = false;
+    auto next_line = [&](std::string& out) -> bool {
+        if (line_pos >= listing.size())
+            return false;
+        auto nl = listing.find('\n', line_pos);
+        if (nl == std::string::npos) {
+            out = listing.substr(line_pos);
+            line_pos = listing.size();
+        } else {
+            out = listing.substr(line_pos, nl - line_pos);
+            line_pos = nl + 1;
+        }
+        while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+            out.pop_back();
+        return true;
+    };
 
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line{buf.data()};
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-            line.pop_back();
+    std::string line;
+    while (next_line(line)) {
+        if (!header_skipped) { // first line is the "PID\tStatus\tLabel" header
+            header_skipped = true;
+            continue;
         }
         if (line.empty())
             continue;
@@ -332,13 +341,12 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
         // a truncated inventory from a complete one.
         ++total_seen;
 
-        // Row cap: keep draining the pipe (loop continues) but stop storing
-        // once the cap is hit, so the child never blocks on a full pipe.
+        // Row cap: the full listing is already in memory (bounded by the
+        // runner's sanity cap); simply stop storing once the cap is hit.
         if (services.size() < kMaxServiceRows) {
             services.push_back(std::move(si));
         }
     }
-    pclose(pipe);
 
     // P15 (verified): ONE bulk `launchctl print-disabled system` call for the
     // enabled/disabled map of ALL services, joined below -- NOT an N+1

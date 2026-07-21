@@ -44,6 +44,7 @@ struct LiveHarness {
     bool allow_execute = true;
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: flip to throw a bad_alloc-class fault from audit_fn
+    std::string device_os;     // K-4: lookup_fn returns a DeviceRow with this os when non-empty
 
     LiveHarness() {
         auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -58,7 +59,14 @@ struct LiveHarness {
             return op == "Execute" ? allow_execute : true;
         };
         auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
-        auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
+        auto lookup = [this](const std::string& id) -> std::optional<DeviceRow> {
+            if (device_os.empty())
+                return std::nullopt; // default: exercise the content-sniff fallback
+            DeviceRow d;
+            d.agent_id = id;
+            d.os = device_os;
+            return d;
+        };
         auto dispatch = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& ids, const std::string&,
                                const std::unordered_map<std::string, std::string>&)
@@ -429,6 +437,34 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         CHECK(r->body.find("automatic") != std::string::npos); // startup, from f[4]
         CHECK(r->body.find("disabled") != std::string::npos);
         CHECK(r->body.find("1 run") != std::string::npos); // only the running row counted
+    }
+    SECTION("services Windows 5-field with an all-digit display name: OS-authoritative, not PID-sniffed (K-4)") {
+        // A Windows service whose display name is purely numeric (e.g. "3389")
+        // would trip the content-sniff heuristic into the macOS branch and drop
+        // the display name. With the agent's OS known to be Windows, the display
+        // name must render.
+        LiveHarness h;
+        h.device_os = "windows";
+        h.fake_rows = {{"a-1", 1, "svc|TermService|3389|Running|Automatic", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("3389") != std::string::npos);   // display name rendered, not dropped
+        CHECK(r->body.find("Running") != std::string::npos); // status from f[3]
+        CHECK(r->body.find("1 run") != std::string::npos);
+    }
+    SECTION("services macOS 5-field: OS-authoritative keeps PID out of the name column (K-4)") {
+        // The mirror case: OS known to be darwin, a numeric pid must not become
+        // the display name even though the sniff would also have got this right.
+        LiveHarness h;
+        h.device_os = "darwin";
+        h.fake_rows = {{"a-1", 1, "svc|com.apple.mdworker|1234|running|automatic", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("com.apple.mdworker") != std::string::npos);
+        CHECK(r->body.find("1234") == std::string::npos);   // PID never the display name
+        CHECK(r->body.find("automatic") != std::string::npos);
     }
     SECTION("services Linux 4-field svc|name|status|desc: State shows status") {
         LiveHarness h;

@@ -330,6 +330,7 @@ bool nstat_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts
 
 #include <spdlog/spdlog.h>
 
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/kern_control.h>
 #include <sys/socket.h>
@@ -350,6 +351,32 @@ bool nstat_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts
 namespace yuzu::tar {
 
 namespace {
+
+// Minimal single-owner fd holder for the kctl socket during start(): the fd
+// has exactly one owner at all times (docs/cpp-conventions.md), so it lives in
+// this guard from socket() until it is released into the Impl. Without it, a
+// throw between connect() and `impl->fd = fd` (e.g. bad_alloc in make_unique)
+// would leak the connected socket for the process lifetime. Same idiom as
+// UniqueFd in subprocess_runner.cpp, kept local to avoid a cross-module dep.
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd) noexcept : fd_(fd) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ~ScopedFd() {
+        if (fd_ >= 0)
+            ::close(fd_);
+    }
+    int get() const noexcept { return fd_; }
+    int release() noexcept {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
+private:
+    int fd_{-1};
+};
 
 // No liveness heartbeat exists for nstat (unlike an explicit "session ended"
 // callback), so — mirroring the ES idle-fallback rationale — size this well
@@ -708,7 +735,14 @@ struct NstatClient::Impl {
                     kernel_dropped->fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                break; // 0 = orderly close (our own stop()); other errno = fatal
+                // 0 = orderly close (our own stop()); other errno = fatal. Latch
+                // stop_requested on the fatal path so the sibling query thread
+                // stops re-issuing QUERY_SRC on the now-dead socket (every other
+                // self-death path sets this; a bare break left the query loop
+                // waking forever until plugin shutdown).
+                if (n < 0)
+                    stop_requested.store(true, std::memory_order_relaxed);
+                break;
             }
             if (stop_requested.load(std::memory_order_relaxed))
                 break;
@@ -778,19 +812,32 @@ bool NstatClient::start() {
     layout_mismatch_.store(false, std::memory_order_relaxed); // a fresh start gets a fresh chance
     flow_table_size_.store(0, std::memory_order_relaxed);     // fresh impl_ starts with an empty table
 
-    const int fd = ::socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-    if (fd < 0) {
+    // Own the fd in a ScopedFd from creation: every early return below closes
+    // it automatically, and it stays owned across the throwing make_unique<Impl>
+    // until released into impl->fd (K-14 — no leak on a bad_alloc there).
+    ScopedFd sock(::socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL));
+    if (sock.get() < 0) {
         spdlog::warn("TAR: nstat socket() failed: {} — falling back to the poll",
+                     std::strerror(errno));
+        return false;
+    }
+
+    // FD_CLOEXEC so a bounded-runner child (or any exec elsewhere in the agent)
+    // does not inherit this long-lived kctl socket (K-10/CDX-09) — mirrors the
+    // runner's own pipe-fd discipline. Not atomic with socket() on Darwin (no
+    // SOCK_CLOEXEC for PF_SYSTEM), so set it immediately and FAIL CLOSED to the
+    // poll if it cannot be set rather than leak the descriptor across execs.
+    if (::fcntl(sock.get(), F_SETFD, FD_CLOEXEC) < 0) {
+        spdlog::warn("TAR: nstat fcntl(FD_CLOEXEC) failed: {} — falling back to the poll",
                      std::strerror(errno));
         return false;
     }
 
     struct ctl_info ci {};
     ::strlcpy(ci.ctl_name, "com.apple.network.statistics", sizeof(ci.ctl_name));
-    if (::ioctl(fd, CTLIOCGINFO, &ci) < 0) {
+    if (::ioctl(sock.get(), CTLIOCGINFO, &ci) < 0) {
         spdlog::warn("TAR: nstat CTLIOCGINFO failed: {} — falling back to the poll",
                      std::strerror(errno));
-        ::close(fd);
         return false;
     }
 
@@ -800,10 +847,9 @@ bool NstatClient::start() {
     sc.ss_sysaddr = AF_SYS_CONTROL;
     sc.sc_id = ci.ctl_id;
     sc.sc_unit = 0;
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&sc), sizeof(sc)) < 0) {
+    if (::connect(sock.get(), reinterpret_cast<struct sockaddr*>(&sc), sizeof(sc)) < 0) {
         spdlog::warn("TAR: nstat connect() failed: {} — falling back to the poll",
                      std::strerror(errno));
-        ::close(fd);
         return false;
     }
 
@@ -816,7 +862,7 @@ bool NstatClient::start() {
 
     auto impl = std::make_unique<Impl>(&ring_, &kernel_dropped_, &last_event_ts_, &layout_mismatch_,
                                        &running_, &flow_reaped_, &flow_table_size_);
-    impl->fd = fd;
+    impl->fd = sock.release(); // ownership transfers to Impl (~Impl closes it)
     Impl* raw = impl.get();
     impl_ = std::move(impl);
 
@@ -951,7 +997,11 @@ std::vector<TcpQualitySample> NstatClient::snapshot_quality() const {
     // impl_ while this function is reading it. See client_mu_'s doc comment
     // (tar_netqual_nstat.hpp) for the ordering argument.
     std::lock_guard<std::mutex> lk(client_mu_);
-    if (!running_.load(std::memory_order_relaxed))
+    // Acquire (not relaxed): start() publishes impl_ then stores running_=true
+    // with release, so an acquire load here orders the impl_ read below after
+    // that publish. The class advertises concurrent-call safety, so don't rely
+    // only on client_mu_ to provide the ordering.
+    if (!running_.load(std::memory_order_acquire))
         return {};
     std::vector<TcpQualitySample> out;
     std::lock_guard<std::mutex> flk(impl_->flows_mu);

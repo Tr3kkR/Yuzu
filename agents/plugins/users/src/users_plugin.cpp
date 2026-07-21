@@ -15,6 +15,12 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
+
+#ifndef _WIN32
+#include <chrono>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#endif
 
 #include <array>
 #include <cstdio>
@@ -74,28 +80,43 @@ bool is_safe_identifier(std::string_view s) {
 
 // ── subprocess helper (all platforms) ──────────────────────────────────────
 
+#ifndef _WIN32
+// Per-call wall-clock bound for the local account tools (dscl/last/lastlog/
+// who/w). Generous enough never to fire in practice, short enough that a
+// wedged tool cannot pin the instruction worker indefinitely.
+constexpr std::chrono::seconds kUsersCmdDeadline{20};
+#endif
+
 std::string run_command(const char* cmd) {
+#ifdef _WIN32
     std::string result;
     std::array<char, 256> buf{};
-#ifdef _WIN32
     FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-#ifdef _WIN32
     _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
     return result;
+#else
+    // Route through the bounded, fork-lock-covered runner instead of a raw,
+    // deadline-less popen (K-7/CDX-07). `/bin/sh -c` preserves the shell
+    // semantics popen used (these commands use `2>/dev/null` redirects and a
+    // `| tail` pipe), so the returned stdout blob is byte-identical — now with
+    // a hard deadline, an output cap, and the global fork-lock.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kUsersCmdDeadline});
+    std::string result = res.output;
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+        result.pop_back();
+    }
+    return result;
+#endif
 }
 
 #ifdef _WIN32
@@ -588,9 +609,15 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // honestly; other platforms keep the original 5-field
             // local_user|username|enabled|last_logon|description form. The
             // field is tri-state ("true"/"false"/"unknown"), not boolean.
+            // safe_output_field on desc: a directory RealName can carry an
+            // embedded CR/LF (multi-valued/malformed) or a literal '|', either
+            // of which would inject an extra output row or shift columns
+            // (K-11/CDX-10). Matches the certificates/event_logs row-safety
+            // discipline on the same branch.
             ctx.write_output(std::format("local_user|{}|{}|{}|{}|{}", user,
                                          enabled ? "true" : "false", last_logon,
-                                         desc.empty() ? "-" : desc, console_state));
+                                         desc.empty() ? "-" : yuzu::util::safe_output_field(desc),
+                                         console_state));
         }
     }
 

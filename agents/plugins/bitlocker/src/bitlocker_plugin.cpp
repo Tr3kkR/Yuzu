@@ -16,33 +16,53 @@
 #include <string>
 #include <string_view>
 
+#ifndef _WIN32
+#include <chrono>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#endif
+
 #ifdef __APPLE__
 #include "bitlocker_macos_apfs.hpp"
 #endif
 
 namespace {
 
+#ifndef _WIN32
+// A generous per-call wall-clock bound for the local disk-encryption tools
+// (fdesetup/diskutil/lsblk/cryptsetup). Long enough never to fire in practice,
+// short enough that a wedged tool cannot pin the instruction worker forever.
+constexpr std::chrono::seconds kBitlockerCmdDeadline{20};
+#endif
+
 std::string run_command(const char* cmd) {
+#ifdef _WIN32
     std::string result;
     std::array<char, 256> buf{};
-#ifdef _WIN32
     FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-#ifdef _WIN32
     _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
+#else
+    // Route through the bounded, fork-lock-covered runner instead of a raw,
+    // deadline-less popen (K-7/CDX-07). `/bin/sh -c` preserves the exact shell
+    // semantics popen used (the commands rely on `2>/dev/null` redirects), so
+    // the returned stdout blob is byte-identical to the old path — only now it
+    // carries a hard deadline, an output cap, and the global fork-lock. stderr
+    // already goes to /dev/null (merge_stderr=false), matching the commands.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kBitlockerCmdDeadline});
+    std::string result = res.output;
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    return result;
+#endif
 }
 
 #ifdef _WIN32

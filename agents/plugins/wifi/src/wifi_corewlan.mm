@@ -97,13 +97,16 @@ bool corewlan_current_connection(WifiConnection& out) {
             out.security = security_to_string(iface.security);
 
             // Treat the SSID as available only if we actually decoded a
-            // non-empty name: iface.ssid is nil when withheld/unassociated, and
-            // UTF8String yields nil (→ empty) for a non-UTF8 SSID. Either way an
-            // empty result must fall back to the "<ssid-withheld>" marker rather
-            // than emit a blank SSID field.
+            // non-empty name. iface.ssid is nil in more than one case and we
+            // CANNOT distinguish them from here: Location-Services withholding
+            // (the common case for a background daemon on 14+), a legitimately
+            // joined hidden SSID, or a non-UTF8 SSID (UTF8String → nil → empty).
+            // Any of them falls back to the "<ssid-withheld>" marker rather than
+            // emitting a blank field — the marker means "name unavailable", and
+            // Location Services is the usual but not the only reason.
             out.ssid = to_std(iface.ssid);
             out.ssid_available = !out.ssid.empty();
-            out.bssid = to_std(iface.bssid); // nil → empty when withheld
+            out.bssid = to_std(iface.bssid); // nil → empty when name unavailable
         }
 
         return true;

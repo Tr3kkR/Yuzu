@@ -184,6 +184,38 @@ TEST_CASE("run_bounded_subprocess tells a real exit-127 apart from a spawn failu
     CHECK(result.exit_code == 127);
 }
 
+TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_after_max_lines fixup (K-5)",
+          "[subprocess][deadline][macos][linux]") {
+    // The child prints exactly max_lines lines and THEN exits nonzero on its
+    // own, before any kill. try_reap() records the real WEXITSTATUS; the
+    // line-cap completion fixup must NOT overwrite a genuine status with 0
+    // (that would report a failed tool as SUCCESS -- the exact honesty
+    // violation the runner exists to prevent). Only the -1 signal-death
+    // sentinel may be rewritten to 0.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/bin/sh", "-c", "printf 'a\\nb\\n'; exit 3"},
+        SubprocessOptions{.deadline = 5000ms, .max_lines = 2, .stop_after_max_lines = true});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    CHECK(result.exit_code == 3); // NOT clobbered to 0
+}
+
+TEST_CASE("run_bounded_subprocess: stop_after_max_lines still maps a signal-killed cap-stop to success 0",
+          "[subprocess][deadline][macos][linux]") {
+    // The complementary case the K-5 guard must preserve: a child that keeps
+    // producing lines past the cap and is KILLED by the runner (never exits
+    // naturally) has the -1 signal sentinel, which the fixup legitimately
+    // rewrites to a clean success 0 (the caller got the N lines it asked for).
+    SubprocessResult result = run_bounded_subprocess(
+        {"/bin/sh", "-c", "while :; do printf 'x\\n'; done"},
+        SubprocessOptions{.deadline = 5000ms, .max_lines = 3, .stop_after_max_lines = true});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    CHECK(result.exit_code == 0); // signal-death sentinel -> clean bounded success
+}
+
 TEST_CASE("run_bounded_subprocess honors a cooperative cancel request against a genuinely running child",
           "[subprocess][deadline][macos][linux]") {
     // request_subprocess_cancel is a single process-wide flag -- never let

@@ -41,9 +41,12 @@ static constexpr const char* kInstallLocation = "InstallLocation";
 #elif defined(__APPLE__)
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
+
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
 
 #include "msi_packages_macos.hpp"
 #endif
@@ -106,22 +109,18 @@ std::string get_product_info(const char* product_code, const char* property) {
 // Internal newlines are preserved — callers that need per-line data (pkgutil
 // output) parse those via the pure helpers in msi_packages_macos.hpp.
 std::string run_command(const std::string& cmd) {
-    std::string result;
-    // RAII pipe: a std::bad_alloc on the append below must not leak the pipe
-    // (fd + zombie child) the way a bare popen/pclose pair would.
-    std::unique_ptr<FILE, int (*)(FILE*)> pipe{popen(cmd.c_str(), "r"), &pclose};
-    if (!pipe)
-        return result;
-    static constexpr std::size_t kMaxOutputBytes = 2 * 1024 * 1024; // 2 MiB sanity cap
-    std::array<char, 512> buf{};
-    size_t n;
-    while ((n = fread(buf.data(), 1, buf.size(), pipe.get())) > 0) {
-        // Keep draining the pipe even once the cap is hit, so the child never
-        // blocks writing into a full pipe; just stop growing the buffer.
-        if (result.size() < kMaxOutputBytes) {
-            result.append(buf.data(), std::min(n, kMaxOutputBytes - result.size()));
-        }
-    }
+    // Route through the bounded, fork-lock-covered runner instead of a raw,
+    // deadline-less popen (K-7/CDX-07). This matters most here: `list` issues up
+    // to 500 sequential `pkgutil --pkg-info` calls, so a single wedged receipt
+    // read could otherwise pin the instruction worker for the whole loop. Each
+    // call now carries a hard per-call deadline. `/bin/sh -c` preserves the
+    // shell semantics popen used (the commands rely on `2>/dev/null`), so the
+    // returned stdout blob is byte-identical; internal newlines are preserved
+    // for the pure per-line parsers in msi_packages_macos.hpp.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{15}});
+    std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
