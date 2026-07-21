@@ -59,6 +59,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Current User](#current-user)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
+  - [Engine Principals](#engine-principals)
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [Internal CA](#internal-ca)
@@ -711,6 +712,280 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Engine Principals
+
+Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
+
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`Security:Read` / `AuditLog:Read`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+
+**Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
+
+**`{id}` convention:** on every route below (`GET /{id}`, `DELETE /{id}`, the `credentials`/`credentials/rotate`/`credentials/confirm`/`transfer-owner` sub-resources), `{id}` is the **full** `principal_id`, i.e. `engine:<slug>` (e.g. `GET /api/v1/engine-principals/engine:vuln-uce`) — none of these routes prepend the `engine:` prefix themselves. This is the opposite convention from the `.../{id}/roles` role-assignment sub-resource documented later in this file, where `{id}` is the **bare slug** and the server reconstructs the full id internally — don't assume the two sections share one convention.
+
+#### `POST /api/v1/engine-principals`
+
+Create a new engine-principal identity. `principal_id` is derived server-side as `"engine:" + slug` — the reserved `engine:` namespace.
+
+**Permission:** `Security:Write`
+
+**Request body:**
+
+```json
+{
+  "slug": "vuln-uce",
+  "display_name": "Vuln UCE",
+  "owner_username": "alice",
+  "classification": "internal",
+  "justification": "First-party vulnerability-management use-case engine module"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `slug` | string | Yes | 1-128 chars; becomes `principal_id = "engine:" + slug`. |
+| `display_name` | string | No | UI/audit label. |
+| `owner_username` | string | Yes | Must reference an existing user (FK-validated before the row is written). |
+| `classification` | string | Yes | Exactly `"internal"` or `"external"` — required at creation, no default and no silent fallback. |
+| `justification` | string | Yes | Grant justification, feeds periodic access review. Rejected empty (store-level check, `400` — `justification cannot be empty`). |
+
+`display_name` is accepted but **not actually enforced non-empty by the REST route or the store** — an empty/omitted `display_name` is persisted as-is; contrast with the `create_engine_principal` MCP tool, which additionally rejects an empty `display_name` at the tool layer (see `docs/user-manual/mcp.md`).
+
+**Validation errors (`400`):**
+
+| Condition | Response |
+|---|---|
+| `slug` empty | `400` — `slug is required` |
+| `slug` longer than 128 chars | `400` — `invalid_input_length: slug exceeds 128 chars` |
+| `slug` contains characters outside `[a-z0-9._-]` | `400` — store validation error (`principal_id slug may only contain lowercase letters, digits, '.', '_', '-'`) |
+| `owner_username` empty or does not reference an existing user | `400` — `owner_username must reference an existing user` |
+| `classification` missing or not `internal`/`external` | `400` — store validation error |
+| `justification` empty | `400` — store validation error (`justification cannot be empty`) |
+
+**Response (201):**
+
+```json
+{
+  "data": { "principal_id": "engine:vuln-uce" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/engine-principals`
+
+List every engine principal (all lifecycle states), with each principal's active-credential count.
+
+**Permission:** `Security:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "principal_id": "engine:vuln-uce",
+      "display_name": "Vuln UCE",
+      "owner_username": "alice",
+      "classification": "internal",
+      "lifecycle_state": "active",
+      "created_at": 1710849600,
+      "active_credential_count": 1
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 1 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `503` — engine-principal store not open (see Storage failure above). A transient read failure on an open store returns an empty list rather than an error — this route does not otherwise fail.
+
+---
+
+#### `GET /api/v1/engine-principals/{id}`
+
+Get one engine principal's full identity row plus its active credentials (token id, name, timestamps, rotation group, overlap-expiry — never the raw secret; `token_hash` stays masked). `active_credentials` here is an **array** of credential objects — contrast with the list route above (`active_credential_count`, an integer) and with the MCP `get_engine_principal` twin, whose `active_credentials` field is an integer count under the same field name (see `docs/user-manual/mcp.md`).
+
+**Permission:** `Security:Read`
+
+**Errors:** `404` — engine principal not found. `503` — engine-principal store unavailable (not open, or the read itself failed).
+
+---
+
+#### `DELETE /api/v1/engine-principals/{id}`
+
+Terminal, irreversible revoke. Every active credential is revoked **first**, then the identity's `lifecycle_state` flips to `revoked` — a caller can never observe a revoked identity with a still-valid credential. Idempotent in the sense that calling this on an already-revoked principal still returns `200` success (never an error) — but it is **not** audit-idempotent: a repeat call **re-emits** a fresh `engine_principal.revoke` success audit row each time, recording the repeat operator action (with `credentials_revoked=0` on the repeat, since there is nothing left to revoke), not just the original revoke.
+
+**Permission:** `Security:Write`
+
+**Request body (optional):**
+
+```json
+{ "superseded_by": "engine:vuln-uce-2" }
+```
+
+`superseded_by` is an optional successor-principal id recorded on this row for audit-trail continuity — recovery from a compromised or retired principal mints a fresh successor principal rather than un-revoking this one.
+
+**Response:**
+
+```json
+{
+  "data": { "revoked": true, "credentials_revoked": 1 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live.
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/credentials`
+
+Mint the **first** credential for an engine principal. The raw secret is returned exactly once in this response — capture it immediately; it cannot be retrieved again, only rotated (below) or revoked. A second call against a principal that already has an active credential returns `409` — use the rotate route once a credential exists.
+
+**Permission:** `Security:Write`
+
+**Request body (optional):**
+
+```json
+{ "ttl_days": 90 }
+```
+
+`ttl_days` defaults to `90` and must be between `1` and `90` (`400` otherwise — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
+
+**Response (201):** headers carry `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache` so a shared proxy or browser history never retains the secret.
+
+```json
+{
+  "data": { "token": "yzt_...", "token_id": "...", "expires_at": 1760000000 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
+
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`).
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/credentials/rotate`
+
+Overlap-pair rotation (design doc §7): mints a successor credential while the existing (predecessor) credential stays valid for an overlap window — at most **two** active credentials per principal during the overlap. The raw successor secret is returned exactly once per **reveal** (see below for the grace-window exception). MFA step-up runs on **every** call to this route, including an idempotent re-serve — a rotate call is never exempt from step-up just because it returns a secret the caller already saw.
+
+**Permission:** `Security:Write`
+
+**Request body (optional):**
+
+```json
+{ "overlap_secs": 604800 }
+```
+
+`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor.
+
+**Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
+
+**Response:** same no-store headers as the mint route; the `data` object adds `overlap_expires_at` (the epoch at which the predecessor is auto-revoked) alongside `token`, `token_id`, and `expires_at`.
+
+**No `404` path:** unlike `credentials` (mint) and `transfer-owner`, this route never looks up `{id}` via a `get()` call before acting — it drives the rotation state machine straight off the principal's active credential rows. An unknown or revoked `{id}` therefore does **not** 404.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
+| Overlap window would outlive the predecessor's or the successor's own expiry | `400` |
+| Exactly one active credential exists, but the engine-principal referent it would mint a successor against is unknown or revoked | `400` — `engine principal not found or revoked` |
+| Two active credentials exist but are not a recognized rotation pair (predecessor/successor linkage broken) | `400` — resolve via revoke, not rotate |
+| More than two active credentials exist for this principal | `400` — resolve manually before rotating |
+| A rotation already in flight, initiated by a **different** operator | `409` — a second operator cannot touch an in-flight rotation they didn't start |
+| Grace window elapsed with no confirm | `409` — `grace window elapsed; confirm or revoke` |
+| No active credential found for this principal to rotate | `503` — **not** `400`/`404`. Deliberately conflated with a transient read failure: the internal read that finds "no active credential" cannot be told apart from a silently-failed read, so a genuine "nothing to rotate" is classified as retryable (503) rather than a definitive client error — treating it as 400 could otherwise mislead a caller into minting a redundant second credential during what was actually a transient outage. |
+| A non-engine-kind active credential is present for this principal (defensive check) | `503` |
+| Advisory-lock acquire failure, CSPRNG failure, the engine-referent check itself being unreachable, or a mint/stamp write that did not persist | `503` — retryable store failure |
+| MFA step-up not satisfied | `401` |
+| Missing `Security:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/credentials/confirm`
+
+Explicit maker-checker confirmation that a rotation's successor secret has been received and installed by its consumer. This is a **separate attestation** from the `rotate` reveal above — it is never inferred from a successful rotate call. On success, the predecessor credential is revoked and the successor becomes the principal's sole active credential (closing the overlap window early, ahead of the auto-revoke sweep).
+
+**Permission:** `Security:Write`
+
+**Response:**
+
+```json
+{
+  "data": { "confirmed": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` call before acting — there is no `404` path here either.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Confirm attempted by a **different** operator than the one who initiated the rotation | `409` — `rotation in progress by a different operator` |
+| The in-memory grace-cache entry needed to resolve the initiating operator is gone (process restart, or the rotation already resolved) | `409` — `rotation confirmation unavailable — retry via rotate or fall back to revoke` |
+| No in-flight rotation exists for this principal (zero, one, or an unrecognized pair of active credentials) | `503` — **not** `400`. Same ambiguity-avoidance rationale as `credentials/rotate` above: the internal read can't distinguish "genuinely nothing in flight" from a silently-failed read, so this is classified retryable rather than a definitive client error. In practice there is effectively **no reachable `400`** on this route from a well-formed call — the only 400-mapped store messages (`principal_id required`, `requesting_user required`) are internal invariants a normal REST call can't trigger. |
+| A non-engine-kind active credential is present for this principal (defensive check) | `503` |
+| Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
+| MFA step-up not satisfied | `401` |
+| Missing `Security:Write`, or the caller's own session is engine-classed | `403` |
+
+---
+
+#### `POST /api/v1/engine-principals/{id}/transfer-owner`
+
+Reassign the named responsible owner of an active engine principal. Admin-forced — deliberately does **not** depend on the outgoing owner's cooperation (an account under termination-for-cause cannot use engine-principal ownership as a lever to stall its own deprovisioning).
+
+**Permission:** `Security:Write`
+
+**Request body:**
+
+```json
+{ "new_owner": "bob" }
+```
+
+`new_owner` must reference an existing user (FK-validated).
+
+**Response:**
+
+```json
+{
+  "data": { "transferred": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `400` — `new_owner must reference an existing user`. `404` — engine principal not found. `409` — engine principal is not active. `503` — the transfer call itself failed.
+
+---
+
+#### `GET /api/v1/engine-principals/audit/no-admin`
+
+Auditor-runnable, independent proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — not merely a claim about the write-path guard. Resolves each engine principal's actual role assignments and effective permissions against the live RBAC reference tables and reports any violation: a literal `admin`/`Administrator` role grant, any role flagged `is_system`, or a granted securable × operation set whose size reaches the full cross-product (functionally admin-equivalent even under a custom, non-system role name).
+
+**Permission:** `AuditLog:Read` — deliberately **not** `Security`, since this is a read-only evidentiary query, not part of the write-path bar it verifies; a read-only auditor role can run it without holding engine-principal write access.
+
+**Response:**
+
+```json
+{
+  "data": { "ok": true, "violations": [] },
+  "meta": { "api_version": "v1" }
+}
+```
+
+An empty `violations` array with `ok:true` is the positive evidence. A non-empty `violations` array (each entry carrying `principal_id`, `role`, and `reason` — `admin_role` / `system_role` / `wildcard_grant`) indicates the write-path guard was bypassed (data corruption, direct DB write, or a code regression) and should be treated as a security incident.
+
+**Error (503):** `rbac reference data unavailable — cannot verify` — the RBAC reference tables (`securable_types`/`operations`) could not be resolved, so the wildcard-grant bound cannot be computed. This is a fail-**closed** result: treat it as "unable to verify," never as "clean."
 
 ---
 
@@ -1758,8 +2033,11 @@ Query audit events.
 Pseudo-random **sample** of authentication-surface audit events over an optional
 time window — for SOC 2 **CC7.2** sampled-evidence export (auditor pulls a
 representative sample of auth activity rather than the full log). Scoped to the
-`auth.`, `mfa.`, and `session.` action prefixes (logins, MFA, session
-revocation, lockout, admin-gate denials, etc.). Rows are returned in random
+`auth.`, `mfa.`, `session.`, **and `engine_principal.`** action prefixes (logins,
+MFA, session revocation, lockout, admin-gate denials, and every engine-principal
+lifecycle/credential/audit event, since engine-principal identities are
+themselves authentication-surface — a distinct principal class alongside human
+users, not general application activity). Rows are returned in random
 order so a bounded `limit` is a sample across the window, not just the latest N.
 
 > **Sampling caveat (read before using as formal evidence).** The sample is
@@ -5872,7 +6150,7 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-The following 13 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
+The following 19 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
 
 - `POST /api/v1/tokens` (mint API token)
 - `DELETE /api/v1/tokens/{id}` (revoke API token)
@@ -5887,6 +6165,12 @@ The following 13 endpoints return `401` with an MFA step-up envelope when the ca
 - `POST /api/settings/users/{username}/role` (change user role)
 - `POST /api/v1/engine-principals/{id}/roles` (assign a fleet-wide role to an engine principal)
 - `DELETE /api/v1/engine-principals/{id}/roles/{role}` (unassign a fleet-wide role from an engine principal)
+- `POST /api/v1/engine-principals` (create an engine principal)
+- `DELETE /api/v1/engine-principals/{id}` (revoke an engine principal)
+- `POST /api/v1/engine-principals/{id}/credentials` (mint the first credential)
+- `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
+- `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
+- `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
 
 For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate under `--mfa-enforcement=optional`, but is **gated** (re-SSO) under `required` (or `admin-only` for an admin) — symmetric with a local user being forced to enrol.
 

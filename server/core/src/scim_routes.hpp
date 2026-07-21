@@ -51,6 +51,7 @@
 namespace yuzu::server {
 
 class AuditStore;
+class EnginePrincipalStore;
 struct Config;
 
 /// Testable core of the `--scim-enable` fail-closed boot guard (SOC 2 CC6.2,
@@ -76,11 +77,13 @@ public:
     /// `YUZU_SCIM_ADMIN_GROUP`) — empty means no SCIM group ever promotes to
     /// admin (see `recompute_scim_user_role`).
     void register_routes(httplib::Server& svr, ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                         AuditStore* audit_store, std::string scim_admin_group = {});
+                         AuditStore* audit_store, std::string scim_admin_group = {},
+                         EnginePrincipalStore* engine_principal_store = nullptr);
 
     /// Testable overload — register against an in-process sink (no socket).
     void register_routes(HttpRouteSink& sink, ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                         AuditStore* audit_store, std::string scim_admin_group = {});
+                         AuditStore* audit_store, std::string scim_admin_group = {},
+                         EnginePrincipalStore* engine_principal_store = nullptr);
 };
 
 } // namespace yuzu::server

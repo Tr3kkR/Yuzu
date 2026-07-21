@@ -19,6 +19,12 @@ If you discover a security vulnerability in Yuzu, please report it responsibly:
    - Potential impact
    - Suggested fix (if any)
 
+Public GitHub issues carrying the `security` label are for **hardening, defense-in-depth, and
+reliability work only** — an exploitable vulnerability always goes through private reporting
+above, never a public issue (`docs/agents/issue-standard.md`, section 6). Tracker automation
+never closes a `security`-labelled issue; a human verifies the fix against the current `dev`
+branch first.
+
 ## Response
 
 - We aim to acknowledge reports within 48 hours
