@@ -1683,9 +1683,17 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i) {
             const auto raw = get_view(gj_keys[i]);
             // An ABSENT tag is the sparse writer's "nothing to report" and is not a
-            // rejection; only a PRESENT value that fails the parse counts as one. The
-            // parse returns nullopt for both, so the emptiness test is what separates
-            // them - do not collapse these two branches.
+            // rejection; a PRESENT value that fails the parse is. The parse returns
+            // nullopt for both, so the emptiness test is what separates them - do not
+            // collapse these two branches.
+            //
+            // ONE GAP, ACCEPTED: get_view returns an empty view for a missing key AND
+            // for a key present with an empty value, so an agent shipping
+            // `"yuzu.guardian_journal_stage_dropped": ""` lands here and is counted as
+            // neither reporting nor rejected. Closing it needs a find()-based presence
+            // test. Not worth it: an empty value buys a hostile agent exactly what
+            // omitting the tag buys (invisible either way), so it opens no evasion the
+            // heartbeat trust boundary does not already concede.
             if (raw.empty())
                 continue;
             if (auto v = parse_guardian_journal_count(raw)) {

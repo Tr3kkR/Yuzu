@@ -843,15 +843,22 @@ groups:
   #   bare `> 0` - correct for ONE agent (a should-stay-0 monotonic that self-clears on
   #     that agent's restart), WRONG for the fleet sum. The set "some agent, ever,
   #     tripped this since its last restart" only grows as fleet-days accumulate and
-  #     only shrinks when that SPECIFIC agent restarts. At 10k agents with weeks-long
-  #     uptimes P(sum > 0) -> 1: the rule fires within hours of cutover, never clears,
+  #     only shrinks when that SPECIFIC agent restarts or leaves the 90s staleness
+  #     window. At 10k agents with weeks-long uptimes P(sum > 0) -> 1 for any counter
+  #     with a non-zero per-agent-week trip rate - and several here have known benign
+  #     trip modes - so the rule fires within hours of cutover, never clears,
   #     and the operator silences the group - losing the signal entirely. An earlier
   #     draft of this file shipped bare `> 0` here; that was wrong and is why the rules
   #     below use the rising-edge form instead.
   #
   # THE RULES BELOW USE A RISING EDGE: `(X > 0) unless (X offset 15m > 0)`. That
   # notifies once per absent->present transition rather than continuously, which is the
-  # closest to correct available today. It is still NOT sufficient to enable: it cannot
+  # closest to correct available today. One documented refinement to evaluate at enable
+  # time, not adopted here because nothing ships enabled: OR-ing in a rise detector,
+  # `((X - X offset 15m) > 0)`, would additionally catch "a second agent also broke",
+  # because the fleet sum only ever RISES on a real report - churn and staleness lower
+  # it, never raise it. It is blind to first appearance on its own (the offset side is
+  # absent), which is why it complements rather than replaces the form below. It is still NOT sufficient to enable: it cannot
   # distinguish "a second agent also broke" from "same agent, still broken", because
   # there is no per-agent axis to separate on. Closing that needs the per-agent delta
   # plus a server-owned monotonic counter - #2083 is the spark-scoped tracker, and the
@@ -898,10 +905,13 @@ groups:
   #         summary: "No agent is reporting Guardian journal telemetry"
   #         description: >-
   #           Agents are connected but none carried a parseable
-  #           yuzu.guardian_journal_* tag for 15m. Post-cutover this means the journal
-  #           telemetry pipeline is dark - which otherwise looks exactly like a healthy
-  #           quiet fleet, since the 22 counters are absent-not-zero. Expected to fire
-  #           continuously BEFORE the cutover; do not enable this rule until after it.
+  #           yuzu.guardian_journal_* tag for 15m. READ THIS CAREFULLY: the writer is
+  #           SPARSE, so _reporting counts agents with a NON-ZERO counter, not agents
+  #           whose journal works. 0 therefore means EITHER the telemetry path is dark
+  #           OR nothing has been journalled anywhere since restart - a live journal on
+  #           a fleet with no deployed Guardian rules reads 0 legitimately. Enabling
+  #           this rule presumes Guardian is actually deployed fleet-wide. Expected to
+  #           fire continuously BEFORE the cutover; do not enable it until after.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-telemetry-dark"
   #     - alert: YuzuGuardianJournalTagRejected
   #       expr: |

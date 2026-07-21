@@ -131,10 +131,12 @@ struct GuardianJournalMetric {
 /// rides #2298's cutover-gate list). Until then these are MONITOR-ONLY: graph them,
 /// review them, do not page on them.
 ///
-/// Of the three live-depth gauges only `_pending` is even a candidate (it drains on a
-/// healthy agent, though its fleet SUM is non-zero at scale for the same reason as
-/// above); `_bytes` and `_batch_count` sit non-zero on any working journal between
-/// retention passes and are capacity watch signals, never alert conditions.
+/// None of the three live-depth gauges is alertable either. `_pending` drains on a
+/// healthy AGENT, but the published series is the fleet SUM, which at scale is non-zero
+/// essentially always - so it fails for the same reason as the loss counters, not a
+/// different one. `_bytes` and `_batch_count` sit non-zero on any working journal
+/// between retention passes. All three are capacity/backlog watch signals, never alert
+/// conditions.
 ///
 /// ADR-1005 exception ledger, 2026-07-14 class-level entry: a `/metrics`-only fleet
 /// gauge family is observability, not capability, so it carries no REST/MCP twin
@@ -161,10 +163,12 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "LOSS channel; also the fleet's clock-health canary, since a journal timestamp that "
      "cannot be trusted is not admissible evidence"},
     {"yuzu.guardian_journal_pending", "yuzu_fleet_guardian_journal_pending",
-     "Fleet sum of records staged but not yet persisted. A LIVE DEPTH gauge, not "
-     "cumulative - it falls when the backlog drains, so a bare `> 0 for: 15m` is a valid "
-     "alert. Sustained depth is the leading indicator of the stage_dropped loss that "
-     "follows when the reserve overflows"},
+     "Fleet sum of records staged but not yet persisted. A LIVE DEPTH gauge per agent - "
+     "it drains as the backlog clears - but what is PUBLISHED is the fleet SUM, which at "
+     "10k agents is non-zero essentially always, so `> 0` fires permanently on a healthy "
+     "fleet and is NOT a valid alert. MONITOR-ONLY like the rest of this family. "
+     "Sustained depth is the leading indicator of the stage_dropped loss that follows "
+     "when the reserve overflows"},
     // ── Persist ──────────────────────────────────────────────────────────────────
     {"yuzu.guardian_journal_batches_written", "yuzu_fleet_guardian_journal_batches_written",
      "Fleet sum of journal batches successfully persisted, in BATCHES. A cumulative "
@@ -284,10 +288,13 @@ inline constexpr const char* kGuardianJournalReportingGauge =
 inline constexpr const char* kGuardianJournalReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_journal_* tag - the coverage denominator for the whole family. "
-    "Published every sweep INCLUDING 0, unlike the 22 counters, so it can be alerted "
-    "on: 0 here while yuzu_fleet_agents_healthy > 0 means the journal telemetry "
-    "pipeline is dark (every agent pre-cutover, all aged out, or the reporting path "
-    "broke) - which is otherwise indistinguishable from a healthy quiet fleet";
+    "Published every sweep INCLUDING 0, unlike the 22 counters. READ 0 CAREFULLY: "
+    "because the writer is SPARSE (a 0 counter emits no tag), this counts agents with "
+    "at least one NON-ZERO counter, not agents whose journal pipeline is working. So 0 "
+    "means EITHER the telemetry path is dark (pre-cutover, all aged out, reporting "
+    "broke) OR nothing has been journalled anywhere since restart - a live journal on "
+    "a fleet with no deployed Guardian rules reads 0 legitimately. It narrows the "
+    "overloaded absence of the 22 counters; it does not resolve it";
 
 /// Journal tags that were PRESENT on a heartbeat but failed the forged-value parse.
 inline constexpr const char* kGuardianJournalTagRejectedGauge =
