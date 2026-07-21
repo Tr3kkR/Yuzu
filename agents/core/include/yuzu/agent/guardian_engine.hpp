@@ -287,34 +287,39 @@ private:
     KvStore* kv_;
     std::string agent_id_;
 
-    /// A std::mutex that ASSERTS it is never locked on the Guardian drain-worker thread.
+    /// A std::mutex that ABORTS if it is ever locked on the Guardian drain-worker thread.
     ///
     /// GuardianEngine::stop() holds mtx_ across its whole body AND joins the drain worker
     /// inside it, so any mtx_ acquisition from that worker is a lock-vs-join deadlock -
     /// a hung agent shutdown, fleet-wide. Everything the worker runs (journal prune/page,
     /// and the INJECTED send, which is an arbitrary std::function supplied by agent.cpp)
     /// must therefore stay off this lock. That was previously a review-only invariant
-    /// recorded in comments; here it fails a debug/sanitizer test instead (#2298
-    /// governance A2). BasicLockable, so every `std::lock_guard lock(mtx_)` site is
-    /// unchanged by CTAD.
+    /// recorded in comments; here it fails loudly instead (#2298 governance A2).
+    /// BasicLockable, so every `std::lock_guard lock(mtx_)` site is unchanged by CTAD.
+    ///
+    /// Holds NO reference to the worker: it asks a thread-local role marker
+    /// (on_guardian_drain_worker_thread()) instead. A pointer to the worker would have to
+    /// be read here BEFORE mu_ is held - an unsynchronised cross-thread read - and wiring
+    /// rollback can destroy the worker while another thread holds that pointer, which made
+    /// the safety device itself a use-after-free (#2298 Sol review).
+    ///
+    /// Aborts rather than asserts: `assert` is a no-op under NDEBUG, so a release build
+    /// with sanitizers would have logged the violation and then walked into the deadlock.
     class WorkerHostileMutex {
     public:
         void lock() {
-            assert_not_worker_thread();
+            abort_if_worker_thread();
             mu_.lock();
         }
         bool try_lock() {
-            assert_not_worker_thread();
+            abort_if_worker_thread();
             return mu_.try_lock();
         }
         void unlock() { mu_.unlock(); }
-        /// Set once the drain worker exists; compared against the calling thread.
-        void set_worker(const GuardianOutboxDrainWorker* w) noexcept { worker_ = w; }
 
     private:
-        void assert_not_worker_thread() const noexcept;
+        static void abort_if_worker_thread() noexcept;
         std::mutex mu_;
-        const GuardianOutboxDrainWorker* worker_{nullptr};
     };
 
     mutable WorkerHostileMutex mtx_;
@@ -418,13 +423,13 @@ private:
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
     /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.
     ///
-    /// DECLARATION ORDER IS LOAD-BEARING (C0 #2298): the drain worker holds a RAW pointer to
-    /// this journal - for the send-wrap's mark_batch_sent AND for its prune/page maintenance
-    /// pass - so the worker must be joined while the journal is still alive. Declaring the
-    /// journal BEFORE spark_drain_worker_ makes reverse-order destruction do that on its own
-    /// (~GuardianOutboxDrainWorker joins), instead of resting solely on every teardown path
-    /// remembering to call stop() first. Do not reorder these two.
-    std::unique_ptr<GuardianLifecycleJournal> lifecycle_journal_;
+    /// SHARED with the drain worker, which uses it for both the send-wrap's mark_batch_sent
+    /// and its prune/page maintenance pass. A shared_ptr rather than a unique_ptr + raw
+    /// borrow because that borrow made correctness depend on this member being declared
+    /// before spark_drain_worker_ - an ordering nothing would catch if changed
+    /// (#2298 governance A4). The declaration order below is still the tidy one, but it is
+    /// no longer load-bearing.
+    std::shared_ptr<GuardianLifecycleJournal> lifecycle_journal_;
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

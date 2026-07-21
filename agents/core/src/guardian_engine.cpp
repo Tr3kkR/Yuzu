@@ -46,7 +46,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cassert>
+#include <cstdlib>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -338,21 +338,35 @@ void GuardianEngine::stop() {
     started_ = false;
 }
 
-void GuardianEngine::WorkerHostileMutex::assert_not_worker_thread() const noexcept {
-    // Debug/sanitizer builds only: in a release build this compiles away, so the
-    // production hot path pays nothing for an invariant that CI proves.
-#if !defined(NDEBUG) || defined(__SANITIZE_THREAD__) || defined(YUZU_FORCE_WORKER_MUTEX_ASSERT)
-    if (worker_ && worker_->worker_thread_id() == std::this_thread::get_id()) {
-        // Not an exception: this is called from lock(), reached under noexcept paths, and
-        // the bug it catches is a deadlock we must not merely report and then enter.
-        try {
-            spdlog::critical("Guardian: the drain worker took GuardianEngine::mtx_ - this "
-                             "deadlocks against stop(), which holds mtx_ while joining that "
-                             "worker. See guardian_outbox_drain_worker.hpp (#2298).");
-        } catch (...) {
-        }
-        assert(false && "Guardian drain worker must never take GuardianEngine::mtx_");
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#    define YUZU_WORKER_MUTEX_GUARD 1
+#  endif
+#endif
+#if !defined(NDEBUG) || defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__) || \
+    defined(YUZU_FORCE_WORKER_MUTEX_GUARD)
+#  define YUZU_WORKER_MUTEX_GUARD 1
+#endif
+
+void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
+#ifdef YUZU_WORKER_MUTEX_GUARD
+    // Enabled in debug AND in any sanitizer build, on every compiler we ship: GCC defines
+    // __SANITIZE_THREAD__/__SANITIZE_ADDRESS__, Clang answers __has_feature. A release build
+    // without sanitizers compiles this away entirely, so the production hot path pays
+    // nothing for an invariant CI proves.
+    if (!on_guardian_drain_worker_thread())
+        return;
+    try {
+        spdlog::critical("Guardian: the drain worker took GuardianEngine::mtx_ - this "
+                         "deadlocks against stop(), which holds mtx_ while joining that "
+                         "worker. Aborting rather than hanging. See "
+                         "guardian_outbox_drain_worker.hpp (#2298).");
+    } catch (...) {
     }
+    // Deliberately std::abort, not assert: assert is a no-op under NDEBUG, which would have
+    // meant a sanitizer-enabled release build logged this and then deadlocked anyway. A
+    // crash with this message is strictly better than a fleet of hung agents.
+    std::abort();
 #endif
 }
 
@@ -1159,7 +1173,7 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // The durable journal is engine-owned and borrows kv_ (may be null → it durably
         // writes nothing). Constructed whenever spark is wired; persist stays gated on
         // prefer_spark_ in persist_lifecycle_journal_locked, so it is inert at 7.7a.
-        lifecycle_journal_ = std::make_unique<GuardianLifecycleJournal>(kv_);
+        lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
 
         auto id = engine->register_consumer("guardian-spark",
                                             GuardianSparkRuntime::make_handler(spark_runtime_));
@@ -1178,12 +1192,12 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
         // batch key → no-op.
         //
-        // Captures the journal POINTER, not `this` (C0 #2298): the wrap runs on the drain-worker
+        // Captures the journal HANDLE, not `this` (C0 #2298): the wrap runs on the drain-worker
         // thread, and re-reading the lifecycle_journal_ member from there would be an unlocked
         // read of engine state - and taking mtx_ to read it safely would deadlock against
-        // stop(), which joins this worker while holding mtx_. The pointer is resolved here,
-        // once, and the worker is joined before the journal is destroyed (member order below).
-        auto* journal = lifecycle_journal_.get();
+        // stop(), which joins this worker while holding mtx_. Resolved here, once, and held by
+        // shared_ptr so the wrap cannot outlive what it points at.
+        auto journal = lifecycle_journal_; // shared: the wrap keeps it alive on its own
         auto journaled_send = [journal, send = std::move(send)](const OutboxEntry& e) -> SendResult {
             const SendResult r = send(e);
             if (r == SendResult::Sent && e.journal_last_in_batch && !e.journal_batch_key.empty() &&
@@ -1203,10 +1217,6 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
             test_periodic_bound_ms_ > 0 ? test_periodic_bound_ms_
                                         : GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs,
             maint);
-        // Arm the debug/sanitizer assertion that no mtx_ acquisition ever happens on the
-        // worker thread. Cleared in rollback and left set for the engine's lifetime
-        // otherwise - the worker is joined before it or the mutex is destroyed.
-        mtx_.set_worker(spark_drain_worker_.get());
         // Start the convergence + drain machinery ONLY when spark is the ACTIVE
         // detection backend (prefer_spark_). At prefer_spark_=false (rung 7.7a: spark
         // wired but legacy authoritative) no rule ever places on spark, so the outbox
@@ -1249,7 +1259,6 @@ void GuardianEngine::rollback_spark_wiring_locked(SparkEngine* engine, bool regi
         lifecycle_journal_->request_stop();
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
-    mtx_.set_worker(nullptr); // the worker is joined and about to be destroyed
     spark_drain_worker_.reset();
     if (spark_scheduler_)
         spark_scheduler_->stop();
