@@ -338,16 +338,6 @@ void GuardianEngine::stop() {
     started_ = false;
 }
 
-#if defined(__has_feature)
-#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
-#    define YUZU_WORKER_MUTEX_GUARD 1
-#  endif
-#endif
-#if !defined(NDEBUG) || defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__) || \
-    defined(YUZU_FORCE_WORKER_MUTEX_GUARD)
-#  define YUZU_WORKER_MUTEX_GUARD 1
-#endif
-
 void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
 #ifdef YUZU_WORKER_MUTEX_GUARD
     // Enabled in debug AND in any sanitizer build, on every compiler we ship: GCC defines

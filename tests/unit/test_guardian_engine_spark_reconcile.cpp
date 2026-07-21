@@ -21,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -30,6 +31,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -608,3 +614,107 @@ TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertnes
     engine.stop();
     spark_engine.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Death test: the drain worker taking GuardianEngine::mtx_ must ABORT, not hang.
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+
+TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
+          "[spark][guardian][reconcile][journal][death]") {
+    // The invariant under test is the one that hangs a fleet: GuardianEngine::stop() holds
+    // mtx_ across its whole body AND joins the drain worker inside it, so an mtx_ acquisition
+    // on that worker deadlocks agent shutdown. WorkerHostileMutex is supposed to turn that
+    // into a loud crash. Until now that abort was wired and its predicate was tested, but the
+    // abort itself never executed - so this proves the actual failure mode, in a subprocess,
+    // because a passing run necessarily kills the process it happens in.
+    //
+    // The hostile call is placed in the INJECTED SEND, deliberately: that is the real
+    // exposure (an arbitrary std::function supplied from agent.cpp), not the journal pointer
+    // the first hardening round guarded.
+    if constexpr (!yuzu::agent::worker_mutex_guard_enabled()) {
+        SUCCEED("WorkerHostileMutex is compiled out in this build; nothing to prove");
+        return;
+    }
+
+    // fork() WITHOUT exec. Safe here because Catch2 runs test cases sequentially and this one
+    // starts no threads before forking, so no other thread can hold a libc lock at fork time.
+    // The child is short-lived and aborts; it never returns to the harness.
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+
+    if (pid == 0) {
+        // ---- child ----
+        // Hand SIGABRT back to the default handler first. Catch2 installs its own fatal-signal
+        // handler, which would intercept the abort, print a spurious "FAILED ... SIGABRT" from
+        // the child into the parent's output, and make a PASSING run look like a failure.
+        // With SIG_DFL the child dies silently and the parent observes the signal, which is
+        // the whole assertion.
+        ::signal(SIGABRT, SIG_DFL);
+
+        auto opened = KvStore::open(unique_kv_path());
+        if (!opened)
+            ::_exit(90); // distinct codes so the parent can tell setup failure from no-abort
+        KvStore kv{std::move(*opened)};
+
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        if (!spark_engine.register_mechanism(SparkType::Service, std::move(mech)))
+            ::_exit(91);
+        spark_engine.start();
+
+        GuardianEngine engine{&kv, "agent-death", /*prefer_spark=*/true};
+        if (!engine.start_local())
+            ::_exit(92);
+
+        // The send runs ON the worker thread and reaches for mtx_ via journal_stats().
+        engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                                 [&engine](const OutboxEntry&) {
+                                     (void)engine.journal_stats(); // takes mtx_ -> must abort
+                                     return SendResult::Sent;
+                                 });
+        if (engine.spark_availability() != GuardianEngine::SparkAvailability::Available)
+            ::_exit(93);
+
+        // Arm a rule so an "armed" lifecycle entry enters the outbox and the worker drains it
+        // through the hostile send.
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_service_rule("r1");
+        (void)yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+
+        // If the guard works we never get here - the worker aborts the whole process. Give it
+        // a bounded window, then report "no abort" with a distinct code.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        ::_exit(94);
+    }
+
+    // ---- parent ----
+    // Poll rather than blocking in waitpid: if the guard has regressed, the child DEADLOCKS
+    // (that being the bug) and a blocking wait would hang the whole suite instead of failing.
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(r == 0); // -1 would be a wait error, not a still-running child
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited: the worker took mtx_ and DEADLOCKED instead of aborting - "
+             "exactly the fleet-wide shutdown hang WorkerHostileMutex exists to prevent");
+    }
+
+    INFO("child exit code (if it exited normally): " << (WIFEXITED(status) ? WEXITSTATUS(status)
+                                                                          : -1));
+    REQUIRE(WIFSIGNALED(status));            // died by signal, not a clean exit
+    CHECK(WTERMSIG(status) == SIGABRT);      // and specifically via std::abort()
+}
+
+#endif // !_WIN32

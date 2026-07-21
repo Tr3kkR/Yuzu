@@ -72,6 +72,29 @@ enum class SendResult;
 
 namespace yuzu::agent {
 
+// Whether GuardianEngine::WorkerHostileMutex actually ENFORCES (aborts) rather than
+// compiling away. Defined here, not in the .cpp, so a test can skip instead of hanging on a
+// build where the guard is absent: without it a violating worker deadlocks, which to a test
+// harness is indistinguishable from a hang.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#    define YUZU_WORKER_MUTEX_GUARD 1
+#  endif
+#endif
+#if !defined(NDEBUG) || defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__) || \
+    defined(YUZU_FORCE_WORKER_MUTEX_GUARD)
+#  define YUZU_WORKER_MUTEX_GUARD 1
+#endif
+
+/// True iff taking GuardianEngine::mtx_ on the drain-worker thread aborts the process.
+[[nodiscard]] constexpr bool worker_mutex_guard_enabled() noexcept {
+#ifdef YUZU_WORKER_MUTEX_GUARD
+    return true;
+#else
+    return false;
+#endif
+}
+
 /// Result of dispatching a `__guard__` command. The caller (agent.cpp)
 /// converts this into a CommandResponse on the bidi stream.
 struct GuardianDispatchResult {
