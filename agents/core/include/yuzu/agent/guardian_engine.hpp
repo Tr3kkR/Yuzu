@@ -135,17 +135,19 @@ public:
     /// to drain a buffered-events queue over the command stream.
     void sync_with_server();
 
-    /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7
-    /// PR-Ag). Two-phase (rev-4.1 #6): PHASE 1 under mtx_ retries any persist a prior
-    /// write left pending - this is what makes a failed write self-heal with NO new
-    /// push/reconnect (Sol BLOCKER-4); PHASE 2 (off mtx_) will page + prune (C4/C5).
+    /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7 PR-Ag).
+    /// SINGLE-PHASE since C0 (#2298 gate 1): under mtx_, retry any persist a prior write left
+    /// pending - this is what makes a failed write self-heal with NO new push/reconnect (Sol
+    /// BLOCKER-4). Retention prune + replay paging (the old off-mtx_ phase 2) moved to the
+    /// drain worker so neither can stall the heartbeat on a contended KvStore.
     /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
     void journal_maintenance_tick();
 
-    /// Replay the durable lifecycle journal into the send window (item 7 PR-Ag). Captures the
-    /// runtime + journal under mtx_ (brief), then pages OFF mtx_ (KvStore + paging-mutex +
-    /// outbox_mu_, never mtx_). prefer_spark_-gated; a no-op after stop() and while stopping.
-    /// Called from the reconnect hook (after set_event_sink) and the maintenance tick.
+    /// Ask for a prompt durable-journal replay into the send window (item 7 PR-Ag). Since C0
+    /// (#2298 gate 1) this KICKS the drain worker rather than paging inline: it takes mtx_
+    /// briefly, then notifies. The reconnect thread therefore never touches the KvStore.
+    /// prefer_spark_-gated; a no-op after stop() and before the worker is wired.
+    /// Called from the reconnect hook, after set_event_sink.
     void page_journal();
 
     /// A snapshot of the durable-journal integrity + activity counters (item 7 PR-Ag §8),
@@ -347,12 +349,11 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
-    /// Journal maintenance/page/final-flush exceptions swallowed to keep the bare heartbeat
-    /// thread + the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4).
+    /// Journal persist / final-flush exceptions swallowed to keep the bare heartbeat thread +
+    /// the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4). Since C0
+    /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
+    /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
-    /// Heartbeat-tick counter (mtx_-guarded): retention prune runs every Nth tick, not every
-    /// heartbeat, to bound the per-tick full-journal read on the heartbeat thread (review N1).
-    std::uint64_t journal_tick_count_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
@@ -362,15 +363,19 @@ private:
     std::shared_ptr<GuardianStateReader> spark_reader_;
     std::shared_ptr<GuardianSparkEngineBackend> spark_backend_;
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
-    std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
-    std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
     /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
-    /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated. LIFETIME (review
-    /// N4): the drain-worker send-wrap captures this; declared after spark_drain_worker_ it is
-    /// destroyed FIRST, so its safety rests on stop() joining the drain worker before any member
-    /// destruction (~GuardianEngine calls stop()). That join is the load-bearing guarantee.
+    /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.
+    ///
+    /// DECLARATION ORDER IS LOAD-BEARING (C0 #2298): the drain worker holds a RAW pointer to
+    /// this journal - for the send-wrap's mark_batch_sent AND for its prune/page maintenance
+    /// pass - so the worker must be joined while the journal is still alive. Declaring the
+    /// journal BEFORE spark_drain_worker_ makes reverse-order destruction do that on its own
+    /// (~GuardianOutboxDrainWorker joins), instead of resting solely on every teardown path
+    /// remembering to call stop() first. Do not reorder these two.
     std::unique_ptr<GuardianLifecycleJournal> lifecycle_journal_;
+    std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
+    std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the

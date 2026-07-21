@@ -336,12 +336,6 @@ void GuardianEngine::stop() {
     started_ = false;
 }
 
-static std::int64_t journal_now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 void GuardianEngine::persist_lifecycle_journal_locked() {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
     // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
@@ -374,67 +368,42 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
 }
 
 void GuardianEngine::journal_maintenance_tick() {
-    std::shared_ptr<GuardianSparkRuntime> rt;
-    GuardianLifecycleJournal* journal = nullptr;
-    bool do_prune = false;
-    {
-        // PHASE 1 (under mtx_): retry any persist a prior write left pending, so a failed
-        // write self-heals on the heartbeat with NO new push/reconnect (Sol BLOCKER-4), and
-        // capture the runtime + journal for the off-mtx_ phase 2. A no-op after stop().
-        std::lock_guard lock(mtx_);
-        if (stopped_ || !prefer_spark_)
-            return;
-        // FIREWALLED: this runs on the BARE heartbeat thread (no top-level handler), so a
-        // bad_alloc from the persist path must be swallowed + counted, never std::terminate
-        // (review B4a). Phase 1 is firewalled separately from phase 2 so a phase-1 throw does
-        // not skip prune/page.
-        try {
-            persist_lifecycle_journal_locked();
-        } catch (...) {
-            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
-        }
-        rt = spark_runtime_;
-        journal = lifecycle_journal_.get();
-        // N1: prune (a full-journal read) every Nth tick, not every heartbeat. The page-side
-        // boot barrier still guarantees a prune-before-first-page; retention's day/1000/32 MiB
-        // caps tolerate the coarser cadence.
-        do_prune = (++journal_tick_count_ % 4) == 0;
-    }
-    // PHASE 2 (OFF mtx_): periodic retention + replay. Bounded by the token bucket + per-pass
-    // cap; page_into_window observes the component stopping_ gate, so a late page never mutates
-    // the window after stop() joined the drain worker (rev-4.1 #6/#7). Firewalled (B4a).
-    if (rt && journal) {
-        try {
-            if (do_prune)
-                journal->prune(journal_now_ms());
-            journal->page_into_window(*rt, journal_now_ms());
-        } catch (...) {
-            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
-        }
+    // ONE phase since C0 (#2298 gate 1): retry any persist a prior write left pending, so a
+    // failed write self-heals on the heartbeat with NO new push/reconnect (Sol BLOCKER-4).
+    // Retention prune + replay paging - the two KvStore-bound full-journal passes that used to
+    // run here off-mtx_ as phase 2 - now run on the drain worker, so a contended or oversized
+    // journal can no longer stall the heartbeat into false staleness. A no-op after stop().
+    //
+    // No worker kick after a successful persist: paging is already MORE frequent than before
+    // (the worker's 5 s backstop vs this 30 s tick), so a kick would add an mtx_ -> Signal.mu
+    // lock edge on the heartbeat path for latency the backstop already bounds more tightly.
+    std::lock_guard lock(mtx_);
+    if (stopped_ || !prefer_spark_)
+        return;
+    // FIREWALLED: this runs on the BARE heartbeat thread (no top-level handler), so a
+    // bad_alloc from the persist path must be swallowed + counted, never std::terminate
+    // (review B4a).
+    try {
+        persist_lifecycle_journal_locked();
+    } catch (...) {
+        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 void GuardianEngine::page_journal() {
-    std::shared_ptr<GuardianSparkRuntime> rt;
-    GuardianLifecycleJournal* journal = nullptr;
-    {
-        std::lock_guard lock(mtx_);
-        if (stopped_ || !prefer_spark_)
-            return;
-        rt = spark_runtime_;
-        journal = lifecycle_journal_.get();
-    }
-    // Firewalled: page_journal is called from the reconnect hook on the run-loop thread and must
-    // not std::terminate on a bad_alloc (review B4a). The rt shared_ptr + the raw journal pointer
-    // captured under mtx_ stay valid off-lock because the run-loop + heartbeat threads are joined
-    // before ~GuardianEngine destroys these members (review M2/N4).
-    if (rt && journal) {
-        try {
-            journal->page_into_window(*rt, journal_now_ms());
-        } catch (...) {
-            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
+    // C0 (#2298 gate 1): a KICK, not a page. The reconnect hook runs on the run-loop thread;
+    // paging there meant a full journal scan (up to a 5 s KvStore busy timeout per call) inline
+    // on the path that has just re-established the stream. Now the drain worker runs the pass
+    // and this only wakes it, so replay stays PROMPT (no waiting out the 5 s backstop) without
+    // the reconnect thread ever touching the KvStore.
+    //
+    // Lock order mtx_ -> Signal.mu is safe and non-invertible: the worker thread NEVER takes
+    // mtx_ (that is exactly why it is handed a pre-resolved journal pointer), so the
+    // stop()-holds-mtx_-while-joining-the-worker shape cannot deadlock against this.
+    std::lock_guard lock(mtx_);
+    if (stopped_ || !prefer_spark_ || !spark_drain_worker_)
+        return;
+    spark_drain_worker_->notify();
 }
 
 GuardianJournalStats GuardianEngine::journal_stats() const {
@@ -465,7 +434,13 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
         s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
     }
-    s.maint_exceptions = journal_maint_exceptions_.load(std::memory_order_relaxed);
+    // Fold in the drain worker's maintenance firewall (C0 #2298): prune/page throws used to be
+    // counted on journal_maint_exceptions_ from the heartbeat tick. They are now counted on the
+    // worker, but must keep surfacing under the SAME operator-facing tag - an operator watching
+    // guardian_journal_maint_exceptions would otherwise see the counter go silently dead.
+    s.maint_exceptions = journal_maint_exceptions_.load(std::memory_order_relaxed) +
+                         (spark_drain_worker_ ? spark_drain_worker_->journal_maint_exception_count()
+                                              : 0);
     return s;
 }
 
@@ -1172,18 +1147,27 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
 
         spark_scheduler_ = std::make_unique<ConvergenceScheduler>(*spark_runtime_);
         // Wrap the send so that after a PAGED batch's LAST entry is delivered, its best-effort
-        // sent-label is written (item 7 PR-Ag). The wrap runs on the drain-worker thread, which
-        // stop() joins before teardown, so capturing `this` + lifecycle_journal_ is safe (see
-        // the drain-worker doc). Live / compliance / health entries carry no batch key → no-op.
-        auto journaled_send = [this, send = std::move(send)](const OutboxEntry& e) -> SendResult {
+        // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
+        // batch key → no-op.
+        //
+        // Captures the journal POINTER, not `this` (C0 #2298): the wrap runs on the drain-worker
+        // thread, and re-reading the lifecycle_journal_ member from there would be an unlocked
+        // read of engine state - and taking mtx_ to read it safely would deadlock against
+        // stop(), which joins this worker while holding mtx_. The pointer is resolved here,
+        // once, and the worker is joined before the journal is destroyed (member order below).
+        auto* journal = lifecycle_journal_.get();
+        auto journaled_send = [journal, send = std::move(send)](const OutboxEntry& e) -> SendResult {
             const SendResult r = send(e);
             if (r == SendResult::Sent && e.journal_last_in_batch && !e.journal_batch_key.empty() &&
-                lifecycle_journal_)
-                lifecycle_journal_->mark_batch_sent(e.journal_batch_key);
+                journal)
+                journal->mark_batch_sent(e.journal_batch_key);
             return r;
         };
+        // The same pointer also drives the worker's journal-maintenance pass (prune + page),
+        // relocated off the heartbeat / reconnect threads by C0.
         spark_drain_worker_ = std::make_unique<GuardianOutboxDrainWorker>(
-            *spark_runtime_, std::move(journaled_send));
+            *spark_runtime_, std::move(journaled_send),
+            GuardianOutboxDrainWorker::kDefaultPeriodicBoundMs, journal);
         // Start the convergence + drain machinery ONLY when spark is the ACTIVE
         // detection backend (prefer_spark_). At prefer_spark_=false (rung 7.7a: spark
         // wired but legacy authoritative) no rule ever places on spark, so the outbox
