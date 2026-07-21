@@ -42,14 +42,19 @@
 /// journal is quiet", "no agent has been upgraded yet", "every agent aged out", "the
 /// sweep thread stalled" and "the heartbeat path broke" all render identically as 22
 /// absent families - maximally reassuring exactly when nothing is being observed
-/// (governance Gate-4 UP-9). `..._reporting` is the coverage denominator, and
-/// `..._reporting == 0 while yuzu_fleet_agents_healthy > 0` is the blackout check -
-/// but ONLY once Guardian is actually deployed fleet-wide, because the sparse writer
-/// means 0 also reads as "nothing journalled yet" (see its HELP). `..._tag_rejected`
-/// carries no such condition. An
-/// earlier revision of this header argued no denominator was needed because it would
-/// itself be absent on a healthy fleet; that reasoning only held while the journal was
-/// inert, and it is wrong post-cutover.
+/// (governance Gate-4 UP-9). `..._reporting` is the coverage denominator, and there are
+/// TWO blackout checks over it, with different preconditions - keep both:
+///   - `absent(..._reporting)` is UNCONDITIONAL. These meta-signals publish every
+///     sweep, so an absent series means the rollup is not running at all. This is the
+///     only one of the two that covers a STALLED SWEEP, where the series is absent
+///     rather than 0. Symmetric to the spark family's own YuzuSparkFleetSignalGone.
+///   - `..._reporting == 0 while yuzu_fleet_agents_healthy > 0` is CONDITIONAL on
+///     Guardian actually being deployed fleet-wide, because the sparse writer means 0
+///     also reads as "nothing journalled yet" (see its HELP).
+/// `..._tag_rejected` carries no condition either way. An earlier revision of this
+/// header argued no denominator was needed because it would itself be absent on a
+/// healthy fleet; that reasoning only held while the journal was inert, and it is wrong
+/// post-cutover.
 ///
 /// ── NOT HERE YET ─────────────────────────────────────────────────────────────────
 /// `gauge_underflow` (GuardianLifecycleJournal::gauge_underflow()) is deliberately

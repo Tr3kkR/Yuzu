@@ -623,7 +623,8 @@ still broken". Closing that needs a per-agent delta plus a server-owned monotoni
 counter (`#2083` tracks the spark side; the journal side belongs on `#2298`'s
 cutover-gate list and is not yet filed there).
 
-**Two meta-signals are the exception: `_tag_rejected` is alertable as-is, `_reporting` subject to one condition.**
+**Two meta-signals are the exception:** `_tag_rejected` is alertable as-is;
+`_reporting` is alertable subject to one condition.
 `yuzu_fleet_guardian_journal_reporting` and `..._tag_rejected` are server-owned counts
 published on **every** sweep including at `0`, unlike the 22. `_reporting == 0` while
 `yuzu_fleet_agents_healthy > 0` narrows the pipeline-dark question - without it, "the

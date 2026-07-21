@@ -955,7 +955,8 @@ groups:
   #         description: >-
   #           Journal BATCHES (up to 256 records each) aged out with no evidence their
   #           records were transmitted - which SUGGESTS lifecycle audit records were
-  #           lost between endpoint and server, but does not establish it. Treat as a TICKET TO INVESTIGATE, not an
+  #           lost between endpoint and server, but does not establish it. Treat as a
+  #           TICKET TO INVESTIGATE, not an
   #           incident-register entry: classification is BEST-EFFORT, so a crash
   #           between the send and the sent-label write counts a sent batch as
   #           no-evidence, and a mass reboot or OTA manufactures a large benign step

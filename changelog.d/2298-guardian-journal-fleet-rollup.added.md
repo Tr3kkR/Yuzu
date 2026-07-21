@@ -6,8 +6,9 @@
   heartbeat, so a lost lifecycle audit record was invisible to `/metrics` and to
   any evidence automation that scrapes it. The most important of them,
   `yuzu_fleet_guardian_journal_evicted_no_send_evidence`, counts journal batches
-  that aged out with no evidence their records were ever transmitted - a CC7.3
-  integrity gap.
+  that aged out with no evidence their records were ever transmitted - a potential
+  CC7.3 integrity gap (the classification is best-effort, so a rise suggests loss
+  rather than establishing it).
 
   The families follow the fleet-rollup **absent-not-zero** convention: the agent
   emits a journal tag only when the counter is non-zero, so a healthy, quiescent,
