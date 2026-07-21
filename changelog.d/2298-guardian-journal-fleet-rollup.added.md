@@ -11,10 +11,10 @@
   rather than establishing it).
 
   The families follow the fleet-rollup **absent-not-zero** convention: the agent
-  emits a journal tag only when the counter is non-zero, so a healthy, quiescent,
-  or inert fleet reports nothing and every family is absent rather than a
-  fabricated `0` - a flatline zero on a loss counter would read as "checked,
-  nothing lost" on a fleet whose journal is not even running. Values are
+  emits a journal tag only when the counter is non-zero, and the server publishes a
+  family only if some retained agent reported it, so an absent family means "no
+  retained agent currently reports a non-zero value" rather than a fabricated `0`.
+  A flatline zero would read as "checked, nothing lost" when nothing was checked. Values are
   hostile-input parsed (garbage, negative, overlong and implausible all mean "did
   not report", never `0`), so no single agent can destroy a fleet sum with an
   overflowing or implausible magnitude. A forged-but-plausible value from an
@@ -28,11 +28,13 @@
   Two meta-signals sit outside that table and publish on every sweep **including
   at zero**: `yuzu_fleet_guardian_journal_reporting` (the coverage denominator -
   `0` while agents are connected means either the telemetry path is dark or
-  nothing has been journalled anywhere since restart; without it that state is
-  indistinguishable from a healthy quiet fleet) and `..._tag_rejected` (values
+  nothing has been journalled anywhere since restart; note neither meta-signal
+  detects a stalled sweep, since they are never cleared and retain their last
+  value) and `..._tag_rejected` (values
   that failed the forged-value parse, which would otherwise be a silent drop). No
   alert rules are enabled: no sound alerting form exists over an unlabelled fleet
-  sum of per-agent cumulative counters, so the reviewed group in
+  sum of per-agent cumulative counters that can distinguish a new increment from a
+  returning agent, so the reviewed group in
   `docs/prometheus/yuzu-alerts.yml` ships commented out and the 22 counters are
   monitor-only. See
   [metrics.md → Guardian journal fleet gauges](docs/user-manual/metrics.md).

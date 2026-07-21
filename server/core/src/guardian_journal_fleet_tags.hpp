@@ -29,32 +29,31 @@
 /// agent-controlled label anywhere - so no cardinality exposure at all (contrast the
 /// `os`-labelled families, which need an allowlist).
 ///
-/// ── ABSENT, NEVER A FABRICATED ZERO ──────────────────────────────────────────────
-/// The writer is SPARSE: a 0 counter ships no tag. So a healthy, quiescent, or inert
-/// (`prefer_spark=false`) fleet emits NO journal tags, and every family here is
-/// correctly ABSENT rather than a flatline 0 - a flatline 0 would read as "checked,
-/// nothing lost" on a fleet where the journal is not even running
-/// (docs/observability-conventions.md, the fleet-rollup absent-not-zero rule).
-/// `AgentHealthStore::recompute_metrics` therefore `clear_gauge_family()`s all 22 at
-/// the top of every sweep and re-emits only those some agent reported this cycle.
-/// That leaves absence overloaded, which is why the two META-SIGNALS below are NOT in
-/// the table and are published UNCONDITIONALLY, including at 0: without them, "the
-/// journal is quiet", "no agent has been upgraded yet", "every agent aged out", "the
-/// sweep thread stalled" and "the heartbeat path broke" all render identically as 22
-/// absent families - maximally reassuring exactly when nothing is being observed
-/// (governance Gate-4 UP-9). `..._reporting` is the coverage denominator, and there are
-/// TWO blackout checks over it, with different preconditions - keep both:
-///   - `absent(..._reporting)` is UNCONDITIONAL. These meta-signals publish every
-///     sweep, so an absent series means the rollup is not running at all. This is the
-///     only one of the two that covers a STALLED SWEEP, where the series is absent
-///     rather than 0. Symmetric to the spark family's own YuzuSparkFleetSignalGone.
-///   - `..._reporting == 0 while yuzu_fleet_agents_healthy > 0` is CONDITIONAL on
-///     Guardian actually being deployed fleet-wide, because the sparse writer means 0
-///     also reads as "nothing journalled yet" (see its HELP).
-/// `..._tag_rejected` carries no condition either way. An earlier revision of this
-/// header argued no denominator was needed because it would itself be absent on a
-/// healthy fleet; that reasoning only held while the journal was inert, and it is wrong
-/// post-cutover.
+/// ── WHAT ABSENCE MEANS, MECHANICALLY ─────────────────────────────────────────────
+/// This section states the emission MECHANICS only. It deliberately does not tell the
+/// reader what a value or an absence PROVES about fleet health - six review rounds of
+/// this file each produced exactly one wrong interpretive claim, so the interpretation
+/// now belongs to whoever enables these at the cutover, with a live journal to test
+/// readings against.
+///
+/// The writer is SPARSE: a counter that is 0 ships no tag.
+/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 22 at the top of
+/// every sweep and re-publishes only those at least one retained agent reported this
+/// cycle. So an absent family means exactly: NO RETAINED AGENT CURRENTLY REPORTS A
+/// NON-ZERO VALUE for it. It does NOT establish that the journal is healthy, quiescent,
+/// or inert - a working journal with no lifecycle event since restart emits nothing,
+/// and a healthy agent that wrote one batch keeps `..._batches_written` non-zero for
+/// its whole process lifetime.
+///
+/// The two META-SIGNALS below are NOT in the table and are published on every completed
+/// sweep INCLUDING at 0, so they are never absent once a sweep has completed. That is
+/// their point (a 0 from a server-owned count is a measurement, not a fabricated zero)
+/// and also their limit: because they are never cleared, `MetricsRegistry` retains the
+/// last value indefinitely, so NEITHER `absent(..._reporting)` NOR `..._reporting == 0`
+/// detects a STALLED sweep - a stall freezes the previous sample in place. Use
+/// `yuzu_server_reaper_sweep_duration_seconds` for sweep liveness. An earlier revision
+/// of this header claimed `absent()` covered a stall; it does not, and the comment at
+/// the publish site in agent_registry.cpp ("never goes stale") is exactly why.
 ///
 /// ── NOT HERE YET ─────────────────────────────────────────────────────────────────
 /// `gauge_underflow` (GuardianLifecycleJournal::gauge_underflow()) is deliberately
@@ -110,8 +109,11 @@ struct GuardianJournalMetric {
 /// sum, cleared and rebuilt, never monotonic: it drops when an agent ages out or
 /// restarts, and a family nobody reports goes absent.
 ///
-/// NO SOUND ALERTING FORM EXISTS OVER THIS SHAPE YET. Three were evaluated; all three
-/// fail, each for a different reason (governance Gate-4 unhappy-path + Gate-6 sre):
+/// NO SOUND CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. That is the
+/// precise claim: an unlabelled fleet SUM cannot tell a new per-agent increment from
+/// a returning agent, because the information needed to separate them is already lost
+/// by the time it is summed. Three forms were evaluated; all three fail, each for a
+/// different reason (governance Gate-4 unhappy-path + Gate-6 sre):
 ///   - increase()/rate(): a fleet sum over a CHURNING population is not a valid
 ///     counter. An agent ageing out or restarting reads as a counter reset and
 ///     manufactures a phantom increment; and a series that first APPEARS at a
@@ -122,11 +124,14 @@ struct GuardianJournalMetric {
 ///     has no earlier 0 to diff against. Identical first-loss blind spot, different
 ///     cause.
 ///   - bare `> 0`: sound PER AGENT (a should-stay-0 monotonic that self-clears when
-///     that agent restarts) but NOT over the unlabelled fleet SUM. The set "some
-///     agent, ever, tripped this since its last restart" only grows as fleet-days
-///     accumulate and only shrinks when that SPECIFIC agent restarts, so at 10k
-///     agents with weeks-long uptimes P(sum > 0) -> 1: the rule would fire within
-///     hours of cutover and never clear, and the operator would silence the group.
+///     that agent restarts). Over the fleet SUM it remains a true predicate, but a
+///     much weaker one than it looks: it says "at least one currently retained agent
+///     reports a historical non-zero value", not "something just happened". The set it
+///     tests only grows as fleet-days accumulate and only shrinks when that SPECIFIC
+///     agent restarts or ages out, so at 10k agents with weeks-long uptimes it is
+///     effectively always true: the rule would fire within hours of cutover and never
+///     clear, and the operator would silence the group. It also cannot re-notify on a
+///     later event, and cannot name the endpoint.
 ///
 /// So the alert group in docs/prometheus/yuzu-alerts.yml stays COMMENTED OUT - and not
 /// only because the journal is inert until the prefer_spark cutover. The interim form
@@ -154,7 +159,7 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
     {"yuzu.guardian_journal_stage_dropped", "yuzu_fleet_guardian_journal_stage_dropped",
      "Fleet sum of lifecycle records dropped at staging - the pending reserve overflowed "
      "under sustained write failure. A LOSS channel: these records never reached the "
-     "journal, so the audit trail has a hole. MONITOR-ONLY: no sound alert form exists "
+     "journal. MONITOR-ONLY: no sound alert form exists "
      "over an unlabelled fleet sum of per-agent cumulative counters - increase() fakes "
      "increments on agent churn and misses a first report, and bare > 0 never clears at "
      "fleet scale. Graph it; do not page on it"},
@@ -181,16 +186,14 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
     {"yuzu.guardian_journal_batches_written", "yuzu_fleet_guardian_journal_batches_written",
      "Fleet sum of journal batches successfully persisted, in BATCHES of up to 256 "
      "records. A cumulative "
-     "process-lifetime count, so its presence means some agent's journal HAS WRITTEN since "
-     "that agent last restarted - not that it is writing now. It is a WEAK liveness "
-     "discriminator and fails in BOTH directions: a rolling reboot resets it to 0 so a "
-     "healthy journal reads absent, and a journal running with every write failing also "
-     "reads absent. Use ..._reporting for coverage instead"},
+     "process-lifetime count: non-zero means that agent's journal has persisted at least "
+     "one batch since it last restarted. It resets to 0 on agent restart, and a journal "
+     "whose every write fails never sets it, so do not read it as liveness"},
     {"yuzu.guardian_journal_write_failures", "yuzu_fleet_guardian_journal_write_failures",
      "Fleet sum of failed journal batch writes. Records stay staged and retry, so this is "
-     "not itself loss - but sustained failure fills the pending reserve and becomes "
-     "stage_dropped, so it is the earliest warning in this family. MONITOR-ONLY - see "
-     "the alerting note; neither increase() nor bare > 0 is sound over a fleet sum"},
+     "not itself loss. Sustained failure fills the pending reserve, after which staging "
+     "overflow increments stage_dropped. It leads stage_dropped on THAT path only - other "
+     "loss counters (field/clock rejection, capacity refusal) can move without it"},
     {"yuzu.guardian_journal_key_collisions", "yuzu_fleet_guardian_journal_key_collisions",
      "Fleet sum of journal batch key collisions. Should stay 0 in correct operation; any "
      "value is an accounting or id-generation bug surfacing, so investigate rather than "
@@ -222,10 +225,9 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
     {"yuzu.guardian_journal_write_capacity_rejected",
      "yuzu_fleet_guardian_journal_write_capacity_rejected",
      "Fleet sum of new batches REFUSED because the journal is at its byte/count cap "
-     "(UP-1). A LOSS channel and the terminal state of a prune/retention failure: the "
-     "endpoint is producing lifecycle records it cannot store. MONITOR-ONLY - see the "
-     "alerting note; neither increase() nor bare > 0 is sound over a fleet sum. NOTE the "
-     "unit is BATCHES, each holding up to 256 records"},
+     "(UP-1). NOT itself loss: the refused batch stays staged and the maintenance tick "
+     "retries it after a later prune frees capacity, so records are lost only if staging "
+     "then overflows (see stage_dropped). Counts BATCHES, each up to 256 records"},
     {"yuzu.guardian_journal_bytes", "yuzu_fleet_guardian_journal_bytes",
      "Fleet sum of live on-disk journal size in bytes. A LIVE gauge, not cumulative. "
      "Capacity signal: per-endpoint it is bounded by the journal's own cap, so a fleet "

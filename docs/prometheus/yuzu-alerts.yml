@@ -991,9 +991,9 @@ groups:
   #         summary: "Guardian journal batch writes are failing"
   #         description: >-
   #           Records stay staged and retry, so this is not itself loss - but sustained
-  #           failure fills the pending reserve and becomes _stage_dropped. This is the
-  #           EARLIEST warning in the family: it is the one to catch before the loss
-  #           counters move.
+  #           failure fills the pending reserve, after which staging overflow increments
+  #           _stage_dropped. It leads _stage_dropped on THAT path only; field/clock
+  #           rejection and capacity refusal move loss counters without it.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-write-failures"
   #     - alert: YuzuGuardianJournalCapacityRefusal
   #       expr: |
@@ -1005,9 +1005,10 @@ groups:
   #       annotations:
   #         summary: "Guardian journal refusing writes at its capacity cap"
   #         description: >-
-  #           An endpoint is producing lifecycle records it cannot store - the terminal
-  #           state of a prune/retention failure. Check _prune_failures and the
-  #           _bytes/_batch_count capacity gauges.
+  #           The journal refused a batch at its cap. NOT itself loss - the batch stays
+  #           staged and the tick retries it once a prune frees capacity; loss only
+  #           follows if staging then overflows (_stage_dropped). Check _prune_failures
+  #           and the _bytes/_batch_count capacity gauges.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-capacity"
   #     - alert: YuzuGuardianJournalForensicLoss
   #       expr: |

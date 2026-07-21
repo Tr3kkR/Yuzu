@@ -582,20 +582,22 @@ question is *"did any endpoint lose a lifecycle record"* - a flat sum answers th
 a percentile obscures it. One consequence worth having: no agent-controlled label
 means no cardinality exposure at all.
 
-**Absent is the healthy steady state, and it is not zero.** The agent emits a journal
-tag **only when the counter is non-zero**, so a healthy, quiescent, or inert fleet
-ships no journal tags and *every* family below is **absent**. That is deliberate: a
-flatline `0` on, say, `_evicted_no_send_evidence` would read as "checked, no audit
-records lost" on a fleet whose journal is not even running. All families are
-`clear_gauge_family()`'d and re-emitted each sweep (the same idiom as the net and spark
-rollups). `_batches_written` is a **weak** liveness hint only - it is cumulative, so
-its presence means some agent's journal has written since that agent last restarted,
-and it fails in both directions (a rolling reboot resets it to 0; a journal running
-with every write failing never sets it). Use `_reporting` for coverage. If the whole
-family is absent, the journal is inert everywhere.
+**What absence means, mechanically.** The agent emits a journal tag **only when the
+counter is non-zero**, and every family is cleared and re-published each sweep. So an
+absent family means exactly one thing: *no retained agent currently reports a non-zero
+value for it.* It does **not** establish that the journal is healthy, quiescent, or
+inert - a working journal that has seen no Guardian lifecycle event since restart emits
+nothing at all, and conversely a healthy agent that wrote one batch keeps
+`_batches_written` non-zero for its whole process lifetime. What the rollup avoids is
+publishing a fabricated `0` for a family nobody reported, which would read as "checked,
+nothing lost" when nothing was checked.
 
-**These are `gauge`-typed fleet sums, and no sound alerting form exists over them
-yet.** Each series is recomputed every sweep: cleared, summed over the currently
+This page deliberately stops there. It tells you what each gauge counts and when it is
+emitted, not what a reading proves about fleet health - the interpretation belongs with
+whoever enables alerting at the `prefer_spark` cutover, against a live journal.
+
+**These are `gauge`-typed fleet sums, and no sound churn-robust *new-increment* alert
+exists over them.** Each series is recomputed every sweep: cleared, summed over the currently
 reporting agents, re-published. Three candidate forms were evaluated and all three
 fail:
 
@@ -607,7 +609,9 @@ fail:
 - **`delta()`** - needs two samples inside the window, so an absent -> non-zero series
   has no earlier `0` to diff against. Same first-loss blind spot, different cause.
 - **Bare `> 0`** - correct for a *single* agent (a should-stay-0 monotonic that clears
-  when that agent restarts), wrong for the fleet sum. The set "some agent, ever,
+  when that agent restarts). Over the fleet sum it stays a true predicate but a much
+  weaker one than it looks: it says "at least one retained agent reports a historical
+  non-zero value", not "something just happened". The set "some agent, ever,
   tripped this since its last restart" only grows as fleet-days accumulate and only
   shrinks when that specific agent restarts, so at 10k agents with weeks-long uptimes
   it is non-zero essentially always: the rule would fire within hours and never clear,
@@ -623,20 +627,23 @@ still broken". Closing that needs a per-agent delta plus a server-owned monotoni
 counter (`#2083` tracks the spark side; the journal side belongs on `#2298`'s
 cutover-gate list and is not yet filed there).
 
-**Two meta-signals are the exception:** `_tag_rejected` is alertable as-is;
-`_reporting` is alertable subject to one condition.
-`yuzu_fleet_guardian_journal_reporting` and `..._tag_rejected` are server-owned counts
-published on **every** sweep including at `0`, unlike the 22. `_reporting == 0` while
-`yuzu_fleet_agents_healthy > 0` narrows the pipeline-dark question - without it, "the
-journal is quiet", "no agent has been upgraded", "every agent aged out" and "the
-reporting path broke" all look identical, because the 22 are absent-not-zero. It does
-not fully resolve it: since the writer is sparse, `_reporting` counts agents with a
-non-zero counter, so a live journal with nothing yet journalled also reads `0`.
+**Two meta-signals are the exception.** `yuzu_fleet_guardian_journal_reporting` and
+`..._tag_rejected` are server-owned counts published on **every completed sweep,
+including at `0`**, unlike the 22. Two consequences, and the second is easy to miss:
+
+- `_reporting == 0` while `yuzu_fleet_agents_healthy > 0` narrows the pipeline-dark
+  question - but only once Guardian is actually deployed, since the sparse writer means
+  `0` also covers "nothing has been journalled anywhere since restart".
+- Because they are never cleared, the registry retains their last value indefinitely, so
+  **neither their absence nor a `0` detects a stalled sweep** - a stall freezes the
+  previous sample in place. Use `yuzu_server_reaper_sweep_duration_seconds` for sweep
+  liveness.
 
 **Two caveats that apply however you consume these.** An agent ageing out of the 90 s
-staleness window drops its counters from the fleet sum without the underlying loss
-having healed, and a server restart rebuilds the series within one sweep. Treat the
-metric as a signal and the audit trail as the evidence.
+staleness window drops its counters from the fleet sum without the underlying loss having
+healed. After a server restart the series rebuild as agents heartbeat back in, which takes
+longer than one sweep (the sweep is 15 s; agent heartbeats are slower). Treat the metric
+as a signal and the audit trail as the evidence.
 
 **Known limitations - read before citing these as assurance.** The signal is
 *self-reported by the endpoint whose audit trail is in question*. Fabrication is
@@ -656,20 +663,20 @@ window later that is population churn, not a new incident.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed under sustained write failure. A **loss** channel: the audit trail has a hole. Monitor-only |
+| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed under sustained write failure. A **loss** channel - these records never reached the journal. Monitor-only |
 | `yuzu_fleet_guardian_journal_stage_failures` | gauge | Fleet sum of disarm records that could not be built post-teardown. A **loss** channel: the lifecycle end of a rule is unrecorded |
 | `yuzu_fleet_guardian_journal_field_rejected` | gauge | Fleet sum of records kept out by a field failing validation (embedded NUL, oversized, non-UTF-8). A **loss** channel and a malformed-input signal |
 | `yuzu_fleet_guardian_journal_clock_rejected` | gauge | Fleet sum of records kept out by a skewed clock (timestamp ≤ 0). A **loss** channel, and the fleet's clock-health canary - a journal timestamp that cannot be trusted is not admissible evidence |
 | `yuzu_fleet_guardian_journal_pending` | gauge | Fleet sum of records staged but **not yet persisted**. A **live depth** gauge *per agent* - it drains as the backlog clears - but what is published is the fleet **sum**, which at 10k agents is non-zero essentially always, so `> 0` fires permanently on a healthy fleet and is **not** a valid alert. Monitor-only, like the rest of the family. Sustained depth is the leading indicator of the `_stage_dropped` loss that follows when the reserve overflows |
-| `yuzu_fleet_guardian_journal_batches_written` | gauge | Fleet sum of batches successfully persisted. A cumulative process-lifetime count, so its presence means some agent's journal **has written since that agent last restarted** - not that it is writing now. A **weak** discriminator that fails in both directions: a rolling reboot resets it to 0 so a healthy journal reads absent, and a journal running with every write failing also reads absent. Use `_reporting` for coverage instead. Absent fleet-wide is consistent with the journal being inert everywhere (expected while `prefer_spark` is off) but does **not** prove it healthy. Unit is **batches** of up to 256 records |
-| `yuzu_fleet_guardian_journal_write_failures` | gauge | Fleet sum of failed batch writes. Records stay staged and retry, so this is not itself loss - but sustained failure fills the pending reserve and becomes `_stage_dropped`, so it is the **earliest signal in the family** - the one to watch before the loss counters move. Monitor-only |
+| `yuzu_fleet_guardian_journal_batches_written` | gauge | Fleet sum of batches successfully persisted. A cumulative process-lifetime count: non-zero means that agent's journal has persisted at least one batch since it last restarted. It resets to 0 on agent restart, and a journal whose every write fails never sets it, so do not read it as liveness. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_write_failures` | gauge | Fleet sum of failed batch writes. Records stay staged and retry, so this is not itself loss - sustained failure fills the pending reserve, after which staging overflow increments `_stage_dropped`. It leads `_stage_dropped` **on that path only** - field/clock rejection and capacity refusal move loss counters without it |
 | `yuzu_fleet_guardian_journal_key_collisions` | gauge | Fleet sum of batch key collisions. Should stay 0; any value is an accounting or id-generation bug surfacing - investigate, do not threshold |
 | `yuzu_fleet_guardian_journal_quarantined` | gauge | Fleet sum of batches moved aside as unreadable/corrupt. Degrade-don't-destroy: the batch is preserved for forensics but its records are **not** replayed, so `> 0` means the server is missing lifecycle evidence that still exists on the endpoint. Unit is **batches** of up to 256 records |
 | `yuzu_fleet_guardian_journal_quarantine_failures` | gauge | Fleet sum of quarantine attempts that themselves failed - strictly worse than `_quarantined`: the corrupt batch could not even be set aside, so it may be re-hit every maintenance tick |
 | `yuzu_fleet_guardian_journal_quarantine_capacity_evicted` | gauge | Fleet sum of quarantined batches shed at the quarantine cap. **Terminal loss** - forensic evidence that had been preserved is now gone. Unit is **batches** of up to 256 records |
 | `yuzu_fleet_guardian_journal_pruned` | gauge | Fleet sum of batches deleted by retention (routine disposal evidence). Expected non-zero on a working fleet; read it as **activity context** for the failure counters beside it, not as a denominator and not as an alert. Unit is **batches** of up to 256 records |
 | `yuzu_fleet_guardian_journal_prune_failures` | gauge | Fleet sum of retention prune failures. Retention not running means the journal grows toward its byte/count cap, where new writes start being refused - see `_write_capacity_rejected` |
-| `yuzu_fleet_guardian_journal_write_capacity_rejected` | gauge | Fleet sum of new batches **refused** because the journal is at its byte/count cap. A **loss** channel and the terminal state of a prune/retention failure: the endpoint is producing lifecycle records it cannot store. Monitor-only. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_write_capacity_rejected` | gauge | Fleet sum of new batches **refused** because the journal is at its byte/count cap. **Not itself loss**: the refused batch stays staged and the maintenance tick retries it once a later prune frees capacity. Records are lost only if staging then overflows - see `_stage_dropped`. Unit is **batches** of up to 256 records |
 | `yuzu_fleet_guardian_journal_bytes` | gauge | Fleet sum of live on-disk journal size in bytes. A **live** gauge. Capacity signal - a value climbing toward (agents × per-endpoint cap) predicts `_write_capacity_rejected` |
 | `yuzu_fleet_guardian_journal_batch_count` | gauge | Fleet sum of live batch count. A **live** gauge - the count-cap twin of `_bytes`; either ceiling alone can start refusing writes |
 | `yuzu_fleet_guardian_journal_pages` | gauge | Fleet sum of replay paging passes. Activity, not health - the denominator that tells you replay is running at all |
