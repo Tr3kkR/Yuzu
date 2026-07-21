@@ -1,5 +1,6 @@
 #include "guardian_outbox_drain_worker.hpp"
 
+#include "guardian_joined_thread_role.hpp"
 #include "guardian_lifecycle_journal.hpp"
 
 #include <spdlog/spdlog.h>
@@ -9,19 +10,23 @@
 namespace yuzu::agent {
 
 namespace {
+/// The one instance of the joined-thread flag (see guardian_joined_thread_role.hpp for
+/// why it must not be a header-inline thread_local).
+thread_local bool tl_guardian_joined_thread = false;
+
 /// Wall clock in ms - the journal's retention basis (batch ts_ms is system_clock).
 /// Deliberately NOT steady_clock: prune compares against persisted timestamps that
 /// survive a reboot. The maintenance CADENCE below uses steady_clock instead, so a
 /// wall-clock step cannot make maintenance either stall or spin.
-/// Set for the duration of loop(); see on_guardian_drain_worker_thread().
-thread_local bool tl_on_drain_worker_thread = false;
-
 std::int64_t journal_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 } // namespace
+
+void set_guardian_joined_thread(bool on) noexcept { tl_guardian_joined_thread = on; }
+bool on_guardian_joined_thread() noexcept { return tl_guardian_joined_thread; }
 
 GuardianOutboxDrainWorker::GuardianOutboxDrainWorker(GuardianSparkRuntime& rt, SendFn send,
                                                      std::uint64_t periodic_bound_ms,
@@ -115,21 +120,18 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         maint_.journal->prune(journal_now_ms());
     if (ops.page) {
         result.page_attempted = true;
-        result.records_paged = maint_.journal->page_into_window(rt_, journal_now_ms()).records_paged;
+        const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms());
+        result.records_paged = stats.records_paged;
+        result.headroom_blocked = stats.headroom_blocked;
     }
     return result;
 }
 
-bool on_guardian_drain_worker_thread() noexcept { return tl_on_drain_worker_thread; }
-
 void GuardianOutboxDrainWorker::loop() {
-    // Marks THIS thread for the duration of the loop. Cleared on every exit path, including
-    // an exception escaping loop() (which nothing should do - every pass is firewalled - but
-    // the marker must not outlive the role even then).
-    struct RoleMarker {
-        RoleMarker() noexcept { tl_on_drain_worker_thread = true; }
-        ~RoleMarker() { tl_on_drain_worker_thread = false; }
-    } role_marker;
+    // GuardianEngine::stop() joins this thread while holding mtx_, so mtx_ must never be
+    // taken here - including from the INJECTED send. The marker is what makes that abort
+    // instead of deadlock; the scheduler's lanes carry it for the same reason.
+    const GuardianJoinedThreadRole role_marker;
     // The cadence timers are LOCALS, not members: nothing outside this thread can read
     // or write them, so the public maintenance_once() seam carries no timer state and
     // cannot race the worker no matter which thread a test calls it from.
@@ -244,12 +246,20 @@ void GuardianOutboxDrainWorker::loop() {
 
         // Reconnect refill: while disconnected the send window is normally FULL, so the
         // kick's page finds no headroom and places nothing. The drain that follows empties
-        // the window - and without this, the journal backlog would then sit untouched until
-        // the next cadence tick, up to a full page_interval after the link came back
-        // (#2298 Sol review). Re-arm only when a page actually ran, placed nothing, and the
-        // drain then freed space: that is exactly the no-headroom case, not a general
-        // per-drain rescan.
-        if (page_result.page_attempted && page_result.records_paged == 0 && drained > 0)
+        // the window - and without this the journal backlog would sit untouched until the
+        // next cadence tick, up to a full page_interval after the link came back
+        // (#2298 Sol review).
+        //
+        // The condition is deliberately narrow, because a loose one reintroduces the very
+        // scan amplification the cadence exists to prevent (#2298 Gate 4 UP-2, which is
+        // exactly what the first version of this re-arm did): "records_paged == 0" is ALSO
+        // true in the benign steady state where every candidate is already a window member,
+        // and "drained > 0" is true for any compliance/health send that has nothing to do
+        // with lifecycle window space. Together those made a routine event stream re-arm on
+        // every cycle. Requiring headroom_blocked - a candidate the window could not fit -
+        // plus headroom actually existing NOW means we only re-attempt when a real backlog
+        // is waiting and the drain genuinely made room for it.
+        if (page_result.headroom_blocked && drained > 0 && rt_.lifecycle_headroom() > 0)
             force_page_.store(true, std::memory_order_release);
     }
 }

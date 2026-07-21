@@ -32,6 +32,7 @@
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_joined_thread_role.hpp"
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
 #include "guardian_outbox_drain_worker.hpp"
@@ -344,13 +345,13 @@ void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
     // __SANITIZE_THREAD__/__SANITIZE_ADDRESS__, Clang answers __has_feature. A release build
     // without sanitizers compiles this away entirely, so the production hot path pays
     // nothing for an invariant CI proves.
-    if (!on_guardian_drain_worker_thread())
+    if (!on_guardian_joined_thread())
         return;
     try {
-        spdlog::critical("Guardian: the drain worker took GuardianEngine::mtx_ - this "
-                         "deadlocks against stop(), which holds mtx_ while joining that "
-                         "worker. Aborting rather than hanging. See "
-                         "guardian_outbox_drain_worker.hpp (#2298).");
+        spdlog::critical("Guardian: a worker thread that stop() joins took GuardianEngine::"
+                         "mtx_ - this deadlocks against stop(), which holds mtx_ while joining "
+                         "it. Aborting rather than hanging. See "
+                         "guardian_joined_thread_role.hpp (#2298).");
     } catch (...) {
     }
     // Deliberately std::abort, not assert: assert is a no-op under NDEBUG, which would have
@@ -466,13 +467,16 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
         s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
     }
-    // Fold in the drain worker's maintenance firewall (C0 #2298): prune/page throws used to be
-    // counted on journal_maint_exceptions_ from the heartbeat tick. They are now counted on the
-    // worker, but must keep surfacing under the SAME operator-facing tag - an operator watching
-    // guardian_journal_maint_exceptions would otherwise see the counter go silently dead.
-    s.maint_exceptions = journal_maint_exceptions_.load(std::memory_order_relaxed) +
-                         (spark_drain_worker_ ? spark_drain_worker_->journal_maint_exception_count()
-                                              : 0);
+    // Fold in every firewalled Guardian background throw (C0 #2298): prune/page used to be
+    // counted here from the heartbeat tick and are now counted on the drain worker, and the
+    // convergence lanes gained a firewall in Gate 4. All three surface under the SAME
+    // operator-facing tag - a counter that exists but reaches no heartbeat is not
+    // observability, and an operator watching this tag must not see it go silently dead
+    // just because the work moved threads.
+    s.maint_exceptions =
+        journal_maint_exceptions_.load(std::memory_order_relaxed) +
+        (spark_drain_worker_ ? spark_drain_worker_->journal_maint_exception_count() : 0) +
+        (spark_scheduler_ ? spark_scheduler_->sweep_exception_count() : 0);
     return s;
 }
 

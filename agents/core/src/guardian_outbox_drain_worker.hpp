@@ -36,9 +36,10 @@
  * GuardianEngine::mtx_ - see the central constraint below. That applies to
  * EVERY path on this thread, the injected send included; `send` is in fact the
  * easiest place to reintroduce the deadlock, because it is an arbitrary
- * std::function supplied from agent.cpp. GuardianEngine asserts against this in
- * debug/sanitizer builds via worker_thread_id(), so a violation fails a test
- * rather than hanging a fleet.
+ * std::function supplied from agent.cpp. GuardianEngine aborts on this in
+ * debug/sanitizer builds via the thread-local marker in
+ * guardian_joined_thread_role.hpp, so a violation crashes loudly rather than
+ * hanging a fleet.
  *
  * JOURNAL MAINTENANCE (C0, #2298 gate 1): this worker also runs the durable
  * lifecycle journal's retention prune + replay paging, which used to run inline
@@ -51,9 +52,8 @@
  * THE CENTRAL CONSTRAINT: maintenance must NEVER take the GuardianEngine mtx_.
  * GuardianEngine::stop() holds mtx_ across its whole body AND joins this worker
  * inside it, so an mtx_ acquisition on this thread is a lock-vs-join deadlock.
- * That is why the journal arrives as a pre-resolved raw pointer captured at
- * construction (engine-owned, set once during wiring, never reassigned while the
- * worker runs) rather than being re-read off the engine under its lock - the same
+ * That is why the journal arrives as a pre-resolved shared_ptr captured at
+ * construction rather than being re-read off the engine under its lock - the same
  * shape as the enqueue-waker capturing only a shared Signal, never `this`.
  * Shutdown is coordinated purely by atomics: the journal's own stopping_ gate
  * (set FIRST in engine::stop()) plus this worker's stopping flag.
@@ -142,6 +142,10 @@ struct GuardianMaintenanceOps {
 struct GuardianMaintenanceResult {
     bool page_attempted{false};   ///< a paging pass was requested and ran
     std::size_t records_paged{0}; ///< net-new records placed in the send window
+    /// The pass had a candidate it could not place because the send window was FULL. Only
+    /// this - never "records_paged == 0" - justifies re-attempting outside the cadence
+    /// (#2298 Gate 4 UP-2).
+    bool headroom_blocked{false};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {
@@ -175,8 +179,8 @@ public:
     /// the force flag are observed by the loop's first cycle.
     void notify();
 
-    /// Deterministic test seam (also the worker thread's own loop body): run
-    /// ONE drain pass synchronously on the caller's thread, UNBOUNDED. Does NOT firewall
+    /// Deterministic test seam: run ONE drain pass synchronously on the caller's thread,
+    /// UNBOUNDED. (The loop body itself uses the bounded private drain_bounded().) Does NOT firewall
     /// exceptions - the worker thread's loop() does (so a test can still observe a
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
@@ -244,16 +248,5 @@ private:
     std::atomic<bool> force_page_{true};
 };
 
-/// True IFF the calling thread is inside a GuardianOutboxDrainWorker::loop().
-///
-/// This is how GuardianEngine enforces "the drain worker must never take mtx_" (see the
-/// class doc's central constraint). It is a THREAD-LOCAL role marker rather than a pointer
-/// comparison against the worker object on purpose: an engine-side pointer to the worker
-/// would have to be read before the engine's own mutex is held - an unsynchronised
-/// cross-thread read - and during wiring rollback that pointer can be dangling while the
-/// worker is torn down. A thread-local answers the same question while touching no other
-/// object's lifetime at all (#2298 Sol review, which caught the pointer version as a
-/// data race and a potential use-after-free in the very device meant to prevent a hang).
-[[nodiscard]] YUZU_EXPORT bool on_guardian_drain_worker_thread() noexcept;
 
 } // namespace yuzu::agent

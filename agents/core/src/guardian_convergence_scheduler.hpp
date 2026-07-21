@@ -41,9 +41,11 @@
 
 #include "guardian_spark_runtime.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -96,10 +98,29 @@ private:
 
     void lane_loop(SparkType type, std::uint64_t cadence_ms, std::uint64_t rng_offset);
     void priority_loop();
+    /// Run `fn` (one lane sweep) with a catch-all firewall, counting and logging the first
+    /// throw. These are BARE threads with no top-level handler, so an escaping bad_alloc
+    /// terminates the whole agent daemon - the #2037 class of defect the drain worker was
+    /// firewalled against and these lanes, identically exposed, were not (#2298 Gate 4).
+    void firewalled_sweep(const std::function<void()>& fn);
     [[nodiscard]] std::chrono::milliseconds jittered(std::uint64_t base_ms, std::mt19937& rng) const;
 
     GuardianSparkRuntime& rt_;
     Config cfg_;
+    /// Firewalled lane-sweep throws. Lock-free; mirrors the drain worker's counter.
+    std::atomic<std::uint64_t> sweep_exceptions_{0};
+
+public:
+    /// Cumulative convergence-sweep passes that threw and were firewalled. A counter nobody
+    /// can read is not observability: this is folded into the operator-facing
+    /// `yuzu.guardian_journal_maint_exceptions` tag by GuardianEngine::journal_stats(),
+    /// alongside the heartbeat's and the drain worker's, so one number answers "did any
+    /// Guardian background pass fail?". Lock-free.
+    [[nodiscard]] std::uint64_t sweep_exception_count() const noexcept {
+        return sweep_exceptions_.load(std::memory_order_relaxed);
+    }
+
+private:
     std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::vector<std::thread> threads_;

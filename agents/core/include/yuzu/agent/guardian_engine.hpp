@@ -22,6 +22,7 @@
 #include <yuzu/plugin.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -86,7 +87,7 @@ namespace yuzu::agent {
 #  define YUZU_WORKER_MUTEX_GUARD 1
 #endif
 
-/// True iff taking GuardianEngine::mtx_ on the drain-worker thread aborts the process.
+/// True iff taking GuardianEngine::mtx_ on a thread stop() joins aborts the process.
 [[nodiscard]] constexpr bool worker_mutex_guard_enabled() noexcept {
 #ifdef YUZU_WORKER_MUTEX_GUARD
     return true;
@@ -310,10 +311,11 @@ private:
     KvStore* kv_;
     std::string agent_id_;
 
-    /// A std::mutex that ABORTS if it is ever locked on the Guardian drain-worker thread.
+    /// A std::mutex that ABORTS if locked on any thread GuardianEngine::stop() joins.
     ///
-    /// GuardianEngine::stop() holds mtx_ across its whole body AND joins the drain worker
-    /// inside it, so any mtx_ acquisition from that worker is a lock-vs-join deadlock -
+    /// GuardianEngine::stop() holds mtx_ across its whole body AND joins BOTH the
+    /// ConvergenceScheduler lanes and the drain worker inside it, so any mtx_ acquisition
+    /// from any of them is a lock-vs-join deadlock -
     /// a hung agent shutdown, fleet-wide. Everything the worker runs (journal prune/page,
     /// and the INJECTED send, which is an arbitrary std::function supplied by agent.cpp)
     /// must therefore stay off this lock. That was previously a review-only invariant
