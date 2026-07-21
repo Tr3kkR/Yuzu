@@ -815,3 +815,117 @@ groups:
   #           population is gone (mass agent outage, gateway partition) or the server
   #           sweep stopped. Correlate with yuzu_fleet_net_*/agent-online gauges before
   #           reading this as a spark problem.
+
+  # ── yuzu-guardian-journal - DISABLED until the prefer_spark cutover (#2298 gate 3) ──
+  # The durable lifecycle-audit journal is INERT while prefer_spark is off: every
+  # yuzu_fleet_guardian_journal_* counter is provably 0 in production, so an enabled
+  # rule here can only fire on a FORGED heartbeat (same reason the spark group above
+  # is commented out at rung 1). Uncomment at the cutover, per-alert, after the soak -
+  # and expect to tune: no fleet-scale operating data exists yet, so any counter that
+  # proves noisy in practice gets a threshold or a downgrade, not deletion.
+  #
+  # FORM: bare `> 0`, NOT increase(). These are per-sweep recomputed fleet SUMS over a
+  # churning agent population (see the spark preamble above): increase() reads an
+  # agent ageing out or restarting as a counter reset and manufactures a phantom
+  # spike, and a series that first APPEARS at a non-zero value registers no increase,
+  # missing a one-off loss entirely. Bare `> 0` has neither failure mode because the
+  # writer is SPARSE - a series exists only while some agent holds a non-zero counter.
+  # It LATCHES both ways: fires until every contributing agent restarts, and does not
+  # re-notify on further losses while firing (watch the value, not just the alert).
+  # Deliberate for integrity signals; increment-grade alerting needs the per-agent
+  # delta + server-owned counter (#2083, not built).
+  #
+  # SEVERITY: warning throughout. Values are agent-self-reported inside the heartbeat
+  # trust boundary - one forged or buggy agent can set any of these, so a warning
+  # routes to a ticket, not a page. Escalate per fleet policy on scale or spread.
+  # An agent leaving the 90s staleness window RESOLVES these alerts without the loss
+  # having healed - the alert is the signal, the audit trail is the evidence.
+  #
+  # - name: yuzu-guardian-journal
+  #   rules:
+  #     - alert: YuzuGuardianJournalIntegrityGap
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_evicted_no_send_evidence > 0
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian lifecycle records lost with no send evidence"
+  #         description: >-
+  #           Journal batches aged out with no evidence their records were ever
+  #           transmitted - lifecycle audit records were silently lost between
+  #           endpoint and server (CC7.3). Treat as an incident: identify the
+  #           reporting agents via their heartbeat tags, investigate, then restart
+  #           them to re-arm the latch. The value does not re-notify while firing.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-integrity-gap"
+  #     - alert: YuzuGuardianJournalRecordsDropped
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_stage_dropped > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian lifecycle records dropped at staging"
+  #         description: >-
+  #           The pending reserve overflowed under sustained write failure - records
+  #           never reached the journal; the audit trail has a hole. Correlate with
+  #           _write_failures and _pending on the same agents.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-stage-dropped"
+  #     - alert: YuzuGuardianJournalCapacityRefusal
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_write_capacity_rejected > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal refusing writes at its capacity cap"
+  #         description: >-
+  #           An endpoint is producing lifecycle records it cannot store - the
+  #           terminal state of a prune/retention failure. Check _prune_failures and
+  #           the _bytes/_batch_count capacity gauges.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-capacity"
+  #     - alert: YuzuGuardianJournalForensicLoss
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_quarantine_capacity_evicted > 0
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Quarantined Guardian journal batches shed at the quarantine cap"
+  #         description: >-
+  #           Terminal loss: corrupt batches preserved for forensics have been
+  #           deleted to respect the quarantine bound (UP-7). Investigate the
+  #           corruption source before more evidence is shed.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-quarantine"
+  #     - alert: YuzuGuardianJournalAccountingBug
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_key_collisions > 0
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal batch key collisions"
+  #         description: >-
+  #           Should stay 0 in correct operation; any value is an accounting or
+  #           id-generation bug surfacing. Investigate - do not threshold.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-key-collisions"
+  #     - alert: YuzuGuardianJournalBacklog
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_pending > 0
+  #       for: 15m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal staging backlog not draining"
+  #         description: >-
+  #           Records staged but not persisted for 15m - a live depth gauge, so this
+  #           is a current condition, not a latch. Sustained depth is the leading
+  #           indicator of _stage_dropped loss. Check _write_failures on the agents.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-backlog"
+  #
+  # The remaining should-stay-0 counters (_stage_failures, _field_rejected,
+  # _clock_rejected, _quarantined, _quarantine_failures, _prune_failures,
+  # _maint_exceptions) take the identical shape - bare `> 0`, for: 5m, warning -
+  # added per-counter at enable time if the soak shows them quiet enough to be
+  # actionable. _bytes and _batch_count get NO alert: they are non-zero on any
+  # working journal between retention passes (capacity watch, not alert conditions).
+  # The activity counters (_batches_written, _pruned, _pages, _records_paged,
+  # _sent_labels, _evicted_sent_unacked) are denominators and monitor-only.
