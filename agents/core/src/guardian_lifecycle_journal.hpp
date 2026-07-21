@@ -10,9 +10,18 @@
  * contrast, already borrows the agent-owned KvStore (kv_) with a proven
  * member-destruction-order guarantee - this component makes the same borrow.
  *
- * C2 delivers persist() only; paging + retention (C4/C5) layer on later. NOT
- * thread-safe on its own: the engine calls into it only under its own mtx_, and
- * KvStore serialises its single connection.
+ * C2 delivers persist() only; paging + retention (C4/C5) layer on later.
+ *
+ * CONCURRENCY (updated #2303): NOT a general thread-safe object, but it does run
+ * under a specific, bounded concurrency in production - persist() executes on the
+ * engine mtx_ (heartbeat retry / apply_rules flush / stop-flush) while prune() and
+ * page_into_window() run OFF mtx_, serialised against each other by paging_mutex_.
+ * That safe overlap rests on: the size gauges being atomic RMW running counters
+ * (no lost update across persist-vs-prune), KvStore serialising its single
+ * connection, batch_seq_ being written only by the single persist caller
+ * (boot_nonce_ is fixed in the ctor, immutable thereafter), and the seed's
+ * absolute store running once in the ctor before publication. Do NOT add a
+ * second persist caller or a non-RMW gauge write.
  */
 
 #include "guardian_journal_format.hpp"
@@ -22,6 +31,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -182,18 +192,38 @@ public:
     [[nodiscard]] std::uint64_t write_capacity_rejected() const noexcept {
         return write_capacity_rejected_.load(std::memory_order_relaxed);
     }
+    // A gauge observed NEGATIVE at the write-ceiling check (#2303 UP-2 / Sol). The size is then
+    // untrusted, so persist() fails CLOSED (refuses the write, defers to RAM staging) until a
+    // prune rebase restores it - and increments this. Correct operation never goes negative, so
+    // any non-zero here is a real accounting bug surfacing, not silently admitted on a clamp.
+    //
+    // OBSERVABILITY GAP (untracked prerequisite, CUTOVER-GATED): unlike its sibling
+    // write_capacity_rejected, this counter is NOT in GuardianJournalStats / the heartbeat emit
+    // AT ALL yet - so a negative-gauge brick is currently only locally counted. Worse, the
+    // journal_batch_count gauge CLAMPS a negative to 0, i.e. reads as a healthy EMPTY journal,
+    // so the brick is camouflaged on the primary gauge (governance UP-4). Adding this field to
+    // the heartbeat (mirror write_capacity_rejected: struct field + journal_stats() + emit) must
+    // land WITH the prefer_spark cutover, not after; only THEN does its server-side fleet rollup
+    // ride #2298 gate 3. Harmless while inert (prefer_spark=false).
+    [[nodiscard]] std::uint64_t gauge_underflow() const noexcept {
+        return gauge_underflow_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::uint64_t quarantine_capacity_evicted() const noexcept {
         return quarantine_capacity_evicted_.load(std::memory_order_relaxed);
     }
-    // Current-size GAUGES (not cumulative): set exactly by each prune scan, incremented by
-    // persist on a durable write. An operator watches these to see growth BEFORE a chronic
-    // prune failure exhausts the shared kv_store.db (sre review). Approximate before the first
-    // prune of a process (a restart re-establishes them from the boot-prune scan).
+    // Current-size GAUGES (not cumulative): maintained as a RUNNING COUNTER - persist
+    // fetch_adds on a durable write; prune rebases to the scanned on-disk reality and
+    // fetch_subs what it removes (#2303 gauge-race fix). They are signed internally so a
+    // rebase can walk a conservative fail-closed boot seed back DOWN, and clamped to >=0 at
+    // read so no residual accounting bug can present as a negative or (post-cast) huge size.
+    // An operator watches these to see growth BEFORE a chronic prune failure exhausts the
+    // shared kv_store.db (sre review). Approximate between prune scans; a restart re-seeds
+    // them from the boot size-probe.
     [[nodiscard]] std::uint64_t journal_bytes() const noexcept {
-        return journal_bytes_.load(std::memory_order_relaxed);
+        return clamp_nonneg(journal_bytes_.load(std::memory_order_relaxed));
     }
     [[nodiscard]] std::uint64_t journal_batch_count() const noexcept {
-        return journal_batch_count_.load(std::memory_order_relaxed);
+        return clamp_nonneg(journal_batch_count_.load(std::memory_order_relaxed));
     }
 
     /// TEST-ONLY: force the next `n` batch writes to fail (as if KvStore returned
@@ -232,6 +262,34 @@ public:
         inject_fail_reads_.store(n, std::memory_order_relaxed);
     }
 
+    /// TEST-ONLY: overwrite the size gauges directly, to stage a state the production
+    /// paths reach only via a rare boot condition - e.g. the fail-closed boot seed that
+    /// pins them at the hard ceiling. Used to prove a later successful prune REBASES them
+    /// back to on-disk reality (the failed-boot recovery the rebase-as-delta scheme must
+    /// preserve). No production caller.
+    void set_size_gauges_for_test(std::int64_t count, std::int64_t bytes) noexcept {
+        journal_batch_count_.store(count, std::memory_order_relaxed);
+        journal_bytes_.store(bytes, std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: run `hook` inside prune_locked_ immediately AFTER the scan succeeds and
+    /// the gauge is rebased, but BEFORE the removal accounting - the exact window a
+    /// concurrent persist() would land in. Lets a single-threaded test drive the
+    /// scan/insert/publish interleaving deterministically to prove prune does NOT clobber a
+    /// concurrent insert's gauge increment (#2303 gauge-race). No production caller.
+    void set_post_scan_hook_for_test(std::function<void()> hook) {
+        post_scan_hook_ = std::move(hook);
+    }
+
+    /// TEST-ONLY: run `hook` inside prune_locked_ BEFORE `list_entries` (between the pre_count
+    /// snapshot and the scan). This is the window where a concurrent persist's row IS seen by
+    /// the scan AND carries its own fetch_add - the transient DOUBLE-count. Proves it self-heals
+    /// to the true on-disk size (over-count only, ceiling tightens). Complements the post-scan
+    /// hook (persist AFTER the rebase). #2303 UP-3. No production caller.
+    void set_pre_scan_hook_for_test(std::function<void()> hook) {
+        pre_scan_hook_ = std::move(hook);
+    }
+
     /// TEST-ONLY: force the next `n` retention DELETES (del_keys of the evict set) to report a
     /// 0/failure return, exercising the M4 delete-failure fail-safe (prune_failures increments,
     /// survivors' sent-labels are left intact and retried). No production caller.
@@ -240,10 +298,22 @@ public:
     }
 
 private:
+    /// Clamp a signed running-counter gauge to a non-negative size. A correct accounting
+    /// never goes negative; this only defends a residual bug from presenting as a huge size
+    /// once cast to unsigned (and keeps the ceiling check monotonic).
+    static constexpr std::uint64_t clamp_nonneg(std::int64_t v) noexcept {
+        return v > 0 ? static_cast<std::uint64_t>(v) : 0;
+    }
+
     /// The retention/quarantine body, serialised by paging_mutex_ against page_into_window
     /// (review round 2 MINOR-1). prune() is the public wrapper that takes the mutex; the
     /// boot-prune barrier inside page_into_window calls this directly (it already holds it).
     JournalPruneStats prune_locked_(std::int64_t now_ms);
+
+    /// Seed the size gauges from the journal already on disk so the write-side ceiling is
+    /// honest from this process's FIRST write, not only after a successful prune (#2303 C1).
+    /// Called from the ctor; fails CLOSED (assume-at-ceiling) if the journal cannot be sized.
+    void seed_size_gauges_();
 
     KvStore* kv_;                ///< BORROWED; outlives this (agent owns it)
     std::string boot_nonce_;     ///< random, fixed at construction - batch-key uniqueness across restarts
@@ -262,8 +332,17 @@ private:
     std::atomic<std::uint64_t> evicted_without_send_evidence_{0}; ///< aged out with NO sent-label (alert)
     std::atomic<std::uint64_t> write_capacity_rejected_{0};       ///< new batch refused: journal at cap (UP-1)
     std::atomic<std::uint64_t> quarantine_capacity_evicted_{0};   ///< over-cap quarantined batches shed (UP-7)
-    std::atomic<std::uint64_t> journal_bytes_{0};                 ///< current live journal size estimate (gauge)
-    std::atomic<std::uint64_t> journal_batch_count_{0};           ///< current live batch count (gauge)
+    // Size gauges are SIGNED running counters (#2303 gauge-race fix): persist fetch_adds,
+    // prune rebases (fetch_add of scanned-actual minus count-at-scan-start) then fetch_subs
+    // removals - all RMW so a concurrent persist increment is never lost to an absolute
+    // store. Signed so a fail-closed boot seed at the ceiling can be walked back down; read
+    // through clamp_nonneg().
+    std::atomic<std::int64_t> journal_bytes_{0};                 ///< current live journal size estimate (gauge)
+    std::atomic<std::int64_t> journal_batch_count_{0};           ///< current live batch count (gauge)
+    std::atomic<std::uint64_t> gauge_underflow_{0};              ///< ceiling check saw a negative gauge (UP-2)
+    std::atomic<bool> size_seeded_{false};              ///< seed_size_gauges_ call-once guard (UP-7)
+    std::function<void()> post_scan_hook_;              ///< test-only prune interleaving seam (null in prod)
+    std::function<void()> pre_scan_hook_;               ///< test-only pre-list_entries interleaving seam (UP-3)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
     std::atomic<int> inject_fail_reads_{0};             ///< test-only: force the next N prune scans to fail

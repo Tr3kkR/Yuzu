@@ -1322,6 +1322,44 @@ TEST_CASE("page_into_window prunes an expired batch before replaying (boot barri
     CHECK(lc[0].event_id == "e-new");
 }
 
+TEST_CASE("page_into_window pages NOTHING when the boot prune's scan fails (#2303 C4)",
+          "[spark][runtime][journal]") {
+    PageRig rig;
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    // Both recent (neither ages out), so ONLY the count cap can evict - and only a prune whose
+    // scan succeeds can apply it.
+    write_batch("lc:aaa:000000000000", 1'700'000'000'000, "e-older");
+    write_batch("lc:bbb:000000000000", 1'700'000'001'000, "e-newer");
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/1,
+                                               /*max_bytes=*/std::size_t(-1), 100);
+
+    // The boot barrier's scan fails. Latching only on read_ok (M5) already kept the barrier
+    // un-latched, but the pass used to FALL THROUGH and replay anyway - handing the runtime
+    // exactly the over-cap candidates a good prune would have evicted, on the one pass the
+    // barrier exists to protect.
+    rig.journal->inject_read_failures_for_test(1);
+    const auto blocked = rig.journal->page_into_window(*rig.rt, 1'700'000'050'000LL);
+    CHECK(blocked.records_paged == 0);
+    CHECK(blocked.batches_paged == 0);
+    CHECK(drain_lifecycle(*rig.rt).empty());
+    CHECK(rig.journal->prune_failures() == 1); // counted, not silent
+
+    // Self-correcting: the failure latched nothing. The next pass prunes cleanly, applies the
+    // count cap, and replays only the survivor.
+    const auto ok = rig.journal->page_into_window(*rig.rt, 1'700'000'110'000LL);
+    CHECK(rig.journal->batches_pruned() == 1);
+    CHECK(ok.records_paged == 1);
+    auto lc2 = drain_lifecycle(*rig.rt);
+    REQUIRE(lc2.size() == 1);
+    CHECK(lc2[0].event_id == "e-newer"); // the oldest was evicted by the cap, never replayed
+}
+
 TEST_CASE("page_into_window stops enqueuing once request_stop is signalled (stop-race gate)",
           "[spark][runtime][journal]") {
     PageRig rig;
@@ -1525,5 +1563,16 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     stop.store(true, std::memory_order_relaxed);
     for (auto& w : workers)
         w.join();
-    SUCCEED("no data race across concurrent persist/page/prune/drain");
+
+    // Beyond race-freedom (TSan): the running-counter gauges (#2303) must stay ACCOUNTING-correct
+    // under the real concurrent persist/prune interleaving, not just data-race-free. A final
+    // settle prune (prune ignores stopping_, so it still runs) rebases to on-disk truth; the
+    // gauges must then exactly equal what namespace_size sees on disk - proving no lost update
+    // and no drift accumulated across the concurrent run.
+    rig.journal->prune(1'700'000'900'000);
+    auto sz = rig.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(sz.has_value());
+    CHECK(rig.journal->journal_batch_count() == sz->count);
+    CHECK(rig.journal->journal_bytes() == sz->bytes);
+    CHECK(rig.journal->gauge_underflow() == 0); // never fell into the fail-open underflow window
 }
