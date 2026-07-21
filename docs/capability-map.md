@@ -419,7 +419,11 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 ### 9.1 Antivirus Status and Product Detection :white_check_mark: `T1`
 
-`antivirus` plugin (cross-platform).
+`antivirus` plugin (cross-platform). macOS `products` probes the XProtect
+definition bundle (version row; `unknown` when unreadable, never assumed
+active) and enumerates endpoint-security system extensions for third-party
+EDR/AV; macOS `status` reports XProtect definition version/freshness plus
+Remediator/MRT engine versions (`security.antivirus.xprotect_status`).
 
 ### 9.2 Firewall Status and Rule Enumeration :white_check_mark: `T1`
 
@@ -639,7 +643,7 @@ Not implemented. P2P caching to reduce WAN bandwidth. Requires agent mesh networ
 
 ### 14.2 Announcement Dialog :white_check_mark: `T2`
 
-`interaction` plugin with `message_box` action. Modal message box with configurable buttons (ok, okcancel, yesno). Returns user response.
+`interaction` plugin with `message_box` action. Modal message box with configurable buttons (ok, okcancel, yesno). Returns the user's button in `response`. On macOS the agent is a GUI-less root LaunchDaemon: when no desktop session can be reached it reports `status|not_reachable` honestly (never a fabricated `response|ok`). Delivering a dialog to the logged-in user's session is a deferred per-session helper.
 
 ### 14.3 Question / Confirmation Dialog :white_check_mark: `T2`
 

@@ -56,6 +56,24 @@ enum class AssertionKind {
     ServiceStopped, ///< service-stopped: desired Stopped
 };
 
+/// The guard_type wire token ("file" | "registry" | "service") for an assertion kind.
+/// Health and Lifecycle events derive guard_type from the assertion this way; the
+/// Compliance path carries it inside GuardDrift instead. Matches the "registry" |
+/// "file" | "service" vocabulary GuardDrift::guard_type uses.
+[[nodiscard]] constexpr const char* guard_type_for(AssertionKind k) noexcept {
+    switch (k) {
+    case AssertionKind::FileExists:
+    case AssertionKind::FileHashEquals:
+        return "file";
+    case AssertionKind::RegistryEquals:
+        return "registry";
+    case AssertionKind::ServiceRunning:
+    case AssertionKind::ServiceStopped:
+        return "service";
+    }
+    return "unknown";
+}
+
 struct RuleAssertion {
     AssertionKind kind{AssertionKind::FileExists};
     std::string rule_id;
@@ -151,6 +169,12 @@ struct EvalOutcome {
     bool recovered{false};      ///< this Known outcome is the FIRST after an Unknown gap; the runtime
                                 ///< also emits guard.healthy so the health stream leaves the errored
                                 ///< state even when the verdict itself is Silent (systemd steady-compliant)
+    bool unhealthy_edge{false}; ///< iff status == Unhealthy: this is the FIRST Unknown of an errored
+                                ///< episode (in_unknown was false going in). The runtime emits
+                                ///< guard.unhealthy ONLY on this edge; a repeat Unknown while already
+                                ///< errored is suppressed + counted, so a rule stuck Unknown (unreadable
+                                ///< file, EACCES hive, unqueryable service) does not re-mint a fresh
+                                ///< health event on every ~5s convergence re-eval (M1 flood guard).
 };
 
 /// Evaluate a file rule against a tri-state read. Returns Emit / Silent / Unhealthy.

@@ -44,7 +44,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -79,6 +81,19 @@ struct OutboxEntry {
 
     std::string lifecycle_kind;  ///< Lifecycle payload: "armed" | "disarmed" | "errored"
 
+    // Health + Lifecycle carry the guard identity explicitly (the Compliance domain
+    // carries both inside `drift`). Empty on Compliance entries. Without these the
+    // wire event's guard_type/rule_name were blank on every health/lifecycle event.
+    std::string guard_type;      ///< Health/Lifecycle: "file" | "registry" | "service"
+    std::string rule_name;       ///< Health/Lifecycle: human-readable rule name
+
+    // Journal-replay provenance (item 7 PR-Ag): set ONLY on Lifecycle entries PAGED back
+    // from the durable journal, so the send path can write the batch's sent-label after its
+    // LAST entry sends. Empty/false on live + compliance/health entries. NOT wire fields -
+    // guardian_outbox_entry_to_event ignores them, so they never change the server compare.
+    std::string journal_batch_key;     ///< the durable batch this replayed entry came from ("" if live)
+    bool journal_last_in_batch{false}; ///< this is that batch's LAST entry - write sent:<key> on send
+
     static OutboxEntry compliance(std::string rule_id, std::uint64_t generation,
                                   std::string event_id, std::int64_t enqueued_ns, GuardDrift drift) {
         OutboxEntry e;
@@ -91,7 +106,8 @@ struct OutboxEntry {
         return e;
     }
     static OutboxEntry health(std::string rule_id, std::uint64_t generation, std::string event_id,
-                              std::int64_t enqueued_ns, bool healthy, std::string detail) {
+                              std::int64_t enqueued_ns, bool healthy, std::string detail,
+                              std::string guard_type = {}, std::string rule_name = {}) {
         OutboxEntry e;
         e.domain = OutboxDomain::Health;
         e.rule_id = std::move(rule_id);
@@ -100,10 +116,13 @@ struct OutboxEntry {
         e.enqueued_ns = enqueued_ns;
         e.healthy = healthy;
         e.health_detail = std::move(detail);
+        e.guard_type = std::move(guard_type);
+        e.rule_name = std::move(rule_name);
         return e;
     }
     static OutboxEntry lifecycle(std::string rule_id, std::uint64_t generation, std::string event_id,
-                                 std::int64_t enqueued_ns, std::string kind) {
+                                 std::int64_t enqueued_ns, std::string kind,
+                                 std::string guard_type = {}, std::string rule_name = {}) {
         OutboxEntry e;
         e.domain = OutboxDomain::Lifecycle;
         e.rule_id = std::move(rule_id);
@@ -111,6 +130,8 @@ struct OutboxEntry {
         e.event_id = std::move(event_id);
         e.enqueued_ns = enqueued_ns;
         e.lifecycle_kind = std::move(kind);
+        e.guard_type = std::move(guard_type);
+        e.rule_name = std::move(rule_name);
         return e;
     }
 };
@@ -187,9 +208,12 @@ public:
         return true;
     }
 
-    /// Send buffered entries in FIFO order. `send` is invoked as
-    /// `SendResult send(const OutboxEntry&)`; a Sent entry is removed, a Retain (or
-    /// a thrown exception) is kept and stops the drain. Returns the number sent.
+    /// TEST-ONLY (unit tests of the coalesce/FIFO/purge semantics with an inline send).
+    /// Production drains via GuardianSparkRuntime::drain, which uses front_copy/
+    /// pop_front_if with outbox_mu_ RELEASED across the send - do NOT call this from the
+    /// runtime under outbox_mu_, it reintroduces the head-of-line stall item 4 removed.
+    /// Send buffered entries in FIFO order; a Sent entry is removed, a Retain (or a
+    /// thrown exception) is kept and stops the drain. Returns the number sent.
     template <typename SendFn>
     std::size_t drain(SendFn&& send) {
         std::size_t sent = 0;
@@ -208,6 +232,28 @@ public:
             ++sent;
         }
         return sent;
+    }
+
+    /// Peek a COPY of the head (nullopt if empty). For the runtime's unlock-during-send
+    /// drain: copy the head under outbox_mu_, RELEASE it, send (network I/O off-lock),
+    /// re-acquire, then pop_front_if(). Keeps a stalled gRPC Write() off outbox_mu_ so it
+    /// cannot block evaluate_key's emit / arm-disarm enqueue / heartbeat (item 4).
+    [[nodiscard]] std::optional<OutboxEntry> front_copy() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front();
+    }
+
+    /// Pop the head IFF it is STILL the entry with `event_id` - i.e. a coalesce (which
+    /// replaces the node in place with a fresh event_id) or a drop_rule/purge_stale
+    /// during the unlocked send did not replace/remove it. Returns true iff popped.
+    /// event_id is globally unique per enqueue, so it pins the exact sent entry.
+    bool pop_front_if(std::string_view event_id) {
+        if (pending_.empty() || pending_.front().event_id != event_id)
+            return false;
+        index_.erase(Key{pending_.front().domain, pending_.front().rule_id});
+        pending_.pop_front();
+        return true;
     }
 
     /// Drop every pending entry for a rule (used on disable / withdraw).
@@ -289,6 +335,8 @@ public:
         return true;
     }
 
+    /// TEST-ONLY (see GuardianOutbox::drain's note): production drains via
+    /// GuardianSparkRuntime::drain with outbox_mu_ released across the send.
     /// Send in FIFO order; a Sent entry is removed, a Retain (or a throw) stops
     /// the drain and keeps the head - identical send contract to GuardianOutbox.
     template <typename SendFn>
@@ -310,9 +358,71 @@ public:
         return sent;
     }
 
+    /// Peek/pop primitives for the runtime's unlock-during-send drain (see
+    /// GuardianOutbox::front_copy/pop_front_if). This log coalesces nothing, so a
+    /// pop_front_if mismatch here means only a successful send already removed the head.
+    [[nodiscard]] std::optional<OutboxEntry> front_copy() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front();
+    }
+    bool pop_front_if(std::string_view event_id) {
+        if (pending_.empty() || pending_.front().event_id != event_id)
+            return false;
+        pending_.pop_front();
+        return true;
+    }
+
     [[nodiscard]] std::size_t size() const { return pending_.size(); }
     [[nodiscard]] bool empty() const { return pending_.empty(); }
     [[nodiscard]] std::uint64_t backpressure_drops() const { return backpressure_drops_; }
+
+    /// Journal-replay support (item 7 PR-Ag): is `event_id` already buffered? The loader
+    /// scans the window to skip re-paging an entry already present (membership = window
+    /// scan, no allocating set). O(size); the window is bounded.
+    [[nodiscard]] bool contains(std::string_view event_id) const {
+        for (const auto& e : pending_)
+            if (e.event_id == event_id)
+                return true;
+        return false;
+    }
+    /// Journal-replay support (item 7 PR-Ag): build a membership set of the currently-buffered
+    /// event_ids in ONE O(size) pass, so the loader can test a whole batch's records in O(1)
+    /// each instead of re-scanning the window per record - which is O(records x window) and, on
+    /// the heartbeat/run-loop thread, can starve heartbeats under a large backlog (review
+    /// UP-12 / perf P-2). The returned views ALIAS this log's entries: valid only while the
+    /// caller holds the runtime's outbox_mu_ and does not erase from the log. enqueue()/push_back
+    /// keeps std::list nodes (and their string storage) stable, so pages appended after this
+    /// call do not invalidate the views - they simply are not in the (pre-batch) set, which is
+    /// correct because a batch's own records carry distinct event_ids.
+    [[nodiscard]] std::unordered_set<std::string_view> event_id_set() const {
+        std::unordered_set<std::string_view> ids;
+        ids.reserve(pending_.size());
+        for (const auto& e : pending_)
+            ids.insert(e.event_id);
+        return ids;
+    }
+    /// Free slots before the capacity cap - the loader pages a batch only when the window
+    /// has >= the batch's size of headroom (else it defers the batch to a later pass).
+    [[nodiscard]] std::size_t headroom() const {
+        return capacity_ > pending_.size() ? capacity_ - pending_.size() : 0;
+    }
+
+    /// Back-fill journal provenance onto still-buffered LIVE entries (item 7 PR-Ag M3): for each
+    /// entry whose event_id belongs to a just-persisted batch, stamp the batch key and mark ONLY
+    /// the batch's LAST record last-in-batch, so a live send writes the sent-label instead of the
+    /// batch later ageing out counted evicted_without_send_evidence. The window drains FIFO, so
+    /// the last-in-batch entry sends after the earlier ones and the label is never premature.
+    void stamp_provenance(const std::string& batch_key,
+                          const std::unordered_set<std::string>& event_ids,
+                          const std::string& last_event_id) {
+        for (auto& e : pending_) {
+            if (event_ids.count(e.event_id)) {
+                e.journal_batch_key = batch_key;
+                e.journal_last_in_batch = (e.event_id == last_event_id);
+            }
+        }
+    }
 
 private:
     std::size_t capacity_;

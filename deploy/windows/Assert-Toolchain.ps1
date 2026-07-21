@@ -53,6 +53,26 @@ foreach($k in $m.env.PSObject.Properties.Name){
   }
 }
 
+Write-Host "`n-- persistent CI telemetry --"
+if($m.telemetry -and $m.telemetry.databases){
+  foreach($db in $m.telemetry.databases){
+    if($db -and (Test-Path -LiteralPath $db)){
+      Write-Host ("  [OK]   {0}" -f $db) -ForegroundColor Green
+    } else {
+      Write-Host ("  [MISS] {0} — re-run provisioning" -f ($db ?? '<unset>')) -ForegroundColor Red
+      $fail++
+    }
+  }
+  $liveDb = [Environment]::GetEnvironmentVariable('YUZU_TEST_DB','Process')
+  if($liveDb){ Write-Host ("  active runner DB: {0}" -f $liveDb) -ForegroundColor Green }
+  else { Write-Host "  active runner DB: not in this shell (wrapper sets it per runner)" -ForegroundColor Yellow }
+} else {
+  # Rollout-compatible for a manifest generated before schema v3 landed: the
+  # ci-telemetry start step still initializes this runner's DB. Re-running the
+  # provisioner upgrades the manifest and turns all four paths into hard checks.
+  Write-Host "  [warn] manifest predates telemetry inventory — re-run provisioning" -ForegroundColor Yellow
+}
+
 # MSYS2 coreutils must be reachable the way the CI bash scripts use them
 # (full path); this is the `head: command not found` regression guard.
 $bash = ($m.tools | Where-Object name -eq 'msys2_bash').path
