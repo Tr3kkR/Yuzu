@@ -1150,3 +1150,38 @@ TEST_CASE("REAL AgentHealthStore: a stale agent's journal counters leave the fle
         has_unlabelled_series(out, "yuzu_fleet_guardian_journal_evicted_no_send_evidence"));
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 0.0);
 }
+
+TEST_CASE("REAL AgentHealthStore: one agent mixing parseable and rejected journal tags",
+          "[guardian][journal][rollup][real]") {
+    // Gate-3 re-run (quality-engineer): every prior case gave an agent EITHER good tags
+    // or bad ones, so the interaction of the two meta-signals on a SINGLE agent was
+    // untested - and they are computed from the same loop pass. Also covers the
+    // over-long token through the STORE (previously parser-level only): the 10-digit
+    // length gate runs before the plausibility ceiling, so an 11-digit value is refused
+    // unread rather than by the ceiling.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_journal_batches_written"] = "40";       // parseable
+    tags["yuzu.guardian_journal_pruned"] = "9";                 // parseable
+    tags["yuzu.guardian_journal_stage_dropped"] = "999999999999"; // 12 digits: length gate
+    tags["yuzu.guardian_journal_write_failures"] = "1000000001";  // 10 digits: ceiling
+    tags["yuzu.guardian_journal_pages"] = "not-a-number";         // malformed
+    store.upsert("mixed", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    // The parseable half lands in its own gauges...
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_batches_written") == 40.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_pruned") == 9.0);
+    // ...the rejected half leaves its families ABSENT and is counted instead.
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_journal_stage_dropped"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_journal_write_failures"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_journal_pages"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_tag_rejected") == 3.0);
+    // One agent, and it DID report something parseable, so it counts once toward
+    // coverage even though three of its five journal tags were refused.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 1.0);
+}

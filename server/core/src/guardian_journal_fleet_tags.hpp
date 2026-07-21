@@ -307,15 +307,32 @@ inline constexpr const char* kGuardianJournalTagRejectedHelp =
 /// key-count or value-length cap; tracked as the heartbeat-tag ingest-bound
 /// follow-up). This cap keeps the scan out of the sweep, and is not a claim that the
 /// ingest DoS is closed.
-// The length gate below is 10 because kMaxPlausibleGuardianJournalCount is 10 digits.
-// Raising the ceiling without widening the gate would silently truncate legitimate
-// values at the gate instead of at the documented ceiling, so bind the two.
-static_assert(kMaxPlausibleGuardianJournalCount < 10'000'000'000ULL,
-              "the length gate in parse_guardian_journal_count is 10 digits - widen it "
-              "if the plausibility ceiling grows past 10 digits");
+/// Max digits accepted before the value is rejected unread. Checked FIRST in the parse
+/// so an implausible token is refused in O(1) without being scanned.
+inline constexpr std::size_t kMaxJournalTokenDigits = 10;
+
+namespace detail_pow10 {
+inline constexpr unsigned long long pow10(std::size_t n) {
+    unsigned long long v = 1;
+    for (std::size_t i = 0; i < n; ++i)
+        v *= 10ULL;
+    return v;
+}
+} // namespace detail_pow10
+
+// Bind the digit gate to the plausibility ceiling in BOTH directions. Raising the
+// ceiling past the gate would silently truncate legitimate values at the gate rather
+// than at the documented ceiling; lowering the gate below the ceiling does the same
+// thing from the other side. The one-directional version of this assert guarded only
+// the first case (governance Gate-3 cpp-safety re-run).
+static_assert(kMaxPlausibleGuardianJournalCount <
+                  detail_pow10::pow10(kMaxJournalTokenDigits),
+              "kMaxPlausibleGuardianJournalCount no longer fits in kMaxJournalTokenDigits "
+              "digits - the length gate in parse_guardian_journal_count would reject "
+              "legitimate values before the ceiling ever applies. Adjust both together.");
 
 inline std::optional<double> parse_guardian_journal_count(std::string_view s) {
-    if (s.empty() || s.size() > 10)
+    if (s.empty() || s.size() > kMaxJournalTokenDigits)
         return std::nullopt;
     unsigned long long v = 0;
     const char* begin = s.data();
