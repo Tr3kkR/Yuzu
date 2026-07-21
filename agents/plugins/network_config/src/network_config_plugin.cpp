@@ -27,6 +27,17 @@
 #include <fstream>
 #endif
 
+#if defined(__APPLE__)
+// SIOCGIFMEDIA is a native BSD socket ioctl (libc + kernel headers only, no
+// framework link) used to read a real adapter link speed for do_adapters().
+#include <net/if.h>
+#include <net/if_media.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/sockio.h>
+#include <unistd.h>
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -66,6 +77,133 @@ std::string run_command(const char* cmd) {
         result.pop_back();
     }
     return result;
+}
+#endif
+
+#if defined(__APPLE__)
+// Real link speed via SIOCGIFMEDIA (a single ioctl on a throwaway datagram
+// socket — no framework). Only Ethernet media subtypes are decoded to a
+// numeric Mbps; Wi-Fi, virtual interfaces, or an ioctl failure/inactive link
+// report the honest 0 (unknown) rather than a fabricated number.
+int mac_link_speed_mbps(const std::string& name) {
+    // Non-copyable scope owner for the throwaway datagram socket (RAII —
+    // no manual close() on any exit path, including future early returns).
+    struct SocketGuard {
+        int fd;
+        explicit SocketGuard(int f) : fd(f) {}
+        ~SocketGuard() {
+            if (fd >= 0)
+                ::close(fd);
+        }
+        SocketGuard(const SocketGuard&) = delete;
+        SocketGuard& operator=(const SocketGuard&) = delete;
+    };
+
+    SocketGuard socket_guard{::socket(AF_INET, SOCK_DGRAM, 0)};
+    if (socket_guard.fd < 0)
+        return 0;
+    struct ifmediareq ifmr {};
+    std::snprintf(ifmr.ifm_name, sizeof(ifmr.ifm_name), "%s", name.c_str());
+    const int rc = ::ioctl(socket_guard.fd, SIOCGIFMEDIA, &ifmr);
+    if (rc != 0)
+        return 0;
+    if (!(ifmr.ifm_status & IFM_AVALID) || !(ifmr.ifm_status & IFM_ACTIVE))
+        return 0;
+    if (IFM_TYPE(ifmr.ifm_active) != IFM_ETHER)
+        return 0;
+    // Every Ethernet subtype whose Mbps figure is documented directly by the
+    // Darwin if_media.h constant name is grouped here — the ioctl already
+    // paid for the lookup, so decoding the rest of the speed-explicit
+    // subtypes is a constant-time win. Genuinely speed-ambiguous types
+    // (IFM_OTHER, IFM_AUTO, HomePNA, etc.) fall through to the honest 0.
+    switch (IFM_SUBTYPE(ifmr.ifm_active)) {
+    case IFM_10_T:
+        return 10;
+    case IFM_100_TX:
+    case IFM_100_T4:
+    case IFM_100_T2:
+    case IFM_100_T:
+        return 100;
+    case IFM_1000_T:
+    case IFM_1000_SX:
+    case IFM_1000_LX:
+    case IFM_1000_CX:
+    case IFM_1000_CX_SGMII:
+    case IFM_1000_KX:
+        return 1000;
+    case IFM_2500_T:
+    case IFM_2500_SX:
+    case IFM_2500_KX:
+    case IFM_2500_X:
+        return 2500;
+    case IFM_5000_T:
+    case IFM_5000_KR:
+    case IFM_5000_KR_S:
+    case IFM_5000_KR1:
+        return 5000;
+    case IFM_10G_T:
+    case IFM_10G_SR:
+    case IFM_10G_LR:
+    case IFM_10G_CX4:
+    case IFM_10G_KX4:
+    case IFM_10G_KR:
+    case IFM_10G_CR1:
+    case IFM_10G_ER:
+    case IFM_10G_TWINAX:
+    case IFM_10G_TWINAX_LONG:
+    case IFM_10G_LRM:
+    case IFM_10G_AOC:
+        return 10000;
+    case IFM_20G_KR2:
+        return 20000;
+    case IFM_25G_CR:
+    case IFM_25G_KR:
+    case IFM_25G_SR:
+    case IFM_25G_LR:
+    case IFM_25G_T:
+    case IFM_25G_CR_S:
+    case IFM_25G_CR1:
+    case IFM_25G_KR_S:
+    case IFM_25G_KR1:
+    case IFM_25G_ACC:
+    case IFM_25G_AOC:
+        return 25000;
+    case IFM_40G_CR4:
+    case IFM_40G_SR4:
+    case IFM_40G_LR4:
+    case IFM_40G_KR4:
+    case IFM_40G_XLPPI:
+    case IFM_40G_XLAUI:
+    case IFM_40G_ER4:
+        return 40000;
+    case IFM_50G_CR2:
+    case IFM_50G_KR2:
+    case IFM_50G_SR:
+    case IFM_50G_LR:
+    case IFM_50G_FR:
+    case IFM_50G_CP:
+    case IFM_50G_KR_PAM4:
+        return 50000;
+    case IFM_56G_R4:
+        return 56000;
+    case IFM_100G_CR4:
+    case IFM_100G_SR4:
+    case IFM_100G_KR4:
+    case IFM_100G_LR4:
+    case IFM_100G_CP2:
+    case IFM_100G_SR2:
+    case IFM_100G_DR:
+    case IFM_100G_KR2_PAM4:
+    case IFM_100G_CAUI2:
+    case IFM_100G_CAUI4:
+    case IFM_100G_AUI2:
+    case IFM_100G_AUI4:
+    case IFM_100G_CR_PAM4:
+    case IFM_100G_KR_PAM4:
+        return 100000;
+    default:
+        return 0; // unrecognised subtype — honest unknown, never fabricated
+    }
 }
 #endif
 
@@ -201,7 +339,8 @@ int do_adapters(yuzu::CommandContext& ctx) {
             if (!line.empty() && line[0] != '\t' && line[0] != ' ') {
                 // New adapter — emit previous
                 if (!first && !current_name.empty()) {
-                    ctx.write_output(std::format("adapter|{}|{}|0|{}", current_name, mac, status));
+                    ctx.write_output(std::format("adapter|{}|{}|{}|{}", current_name, mac,
+                                                 mac_link_speed_mbps(current_name), status));
                 }
                 first = false;
                 auto colon = line.find(':');
@@ -227,7 +366,8 @@ int do_adapters(yuzu::CommandContext& ctx) {
             }
         }
         if (!current_name.empty()) {
-            ctx.write_output(std::format("adapter|{}|{}|0|{}", current_name, mac, status));
+            ctx.write_output(std::format("adapter|{}|{}|{}|{}", current_name, mac,
+                                         mac_link_speed_mbps(current_name), status));
         }
     }
 #endif
@@ -563,7 +703,9 @@ public:
 private:
     // arp|iface|ip|mac|type — the host ARP / IPv6-neighbour table. Windows reads the
     // kernel neighbour cache via GetIpNetTable2(AF_UNSPEC); Linux/macOS are not yet
-    // implemented (the live ARP panel renders an honest "not available" note there).
+    // implemented and emit the `arp|not_available` sentinel so the server-side
+    // device_routes/device_ui coupling renders an honest "not available on this
+    // platform" note instead of a fabricated empty table or a reported error.
     // Mirrors the proven enumeration in tar_arp_collector.cpp (reimplemented here —
     // the TAR plugin internals aren't linked into network_config).
     static int do_arp(yuzu::CommandContext& ctx) {
@@ -625,11 +767,15 @@ private:
         // RAII owner: FreeMibTable runs on every scope exit, including an exception
         // thrown by std::format / write_output between here and the end of the loop
         // (a manual FreeMibTable would leak the kernel table on that path).
-        // Aggregate with a destructor only (a user-declared ctor would disqualify the
-        // {table} brace-init); it's a named local, never copied.
+        // Non-copyable: a copy would duplicate `t` and both destructors would call
+        // FreeMibTable on the same kernel table pointer (double-free). Mirrors
+        // SocketGuard above (~:91-100).
         struct MibTableGuard {
             PMIB_IPNET_TABLE2 t;
+            explicit MibTableGuard(PMIB_IPNET_TABLE2 tbl) : t(tbl) {}
             ~MibTableGuard() { if (t) FreeMibTable(t); }
+            MibTableGuard(const MibTableGuard&) = delete;
+            MibTableGuard& operator=(const MibTableGuard&) = delete;
         } table_guard{table};
         ULONG emitted = 0;
         for (ULONG i = 0; i < table->NumEntries && emitted < kArpEntryCap; ++i) {
@@ -646,8 +792,12 @@ private:
         return 0; // ~MibTableGuard frees the table on every path
 
 #else
-        ctx.write_output("error|arp not available on this platform");
-        return 1;
+        // Honest sentinel, not an error: the ARP table simply isn't implemented
+        // here yet. device_routes.cpp's arp parser requires >=5 pipe fields, so
+        // this 2-field line is dropped automatically and renders the empty-state
+        // note rather than a bogus row.
+        ctx.write_output("arp|not_available");
+        return 0;
 #endif
     }
 

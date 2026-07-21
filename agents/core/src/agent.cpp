@@ -18,6 +18,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/metrics.hpp>
@@ -2618,6 +2619,7 @@ public:
                         // version of this very comment asserting something the tree contradicts.)
                         startup_failed_ = true;
                         stop_requested_.store(true, std::memory_order_release);
+                        yuzu::agent::request_subprocess_cancel(true);
                         break;
                     } catch (...) {
                         spdlog::critical("could not re-create the command dispatch thread pool on "
@@ -2642,6 +2644,7 @@ public:
                         // version of this very comment asserting something the tree contradicts.)
                         startup_failed_ = true;
                         stop_requested_.store(true, std::memory_order_release);
+                        yuzu::agent::request_subprocess_cancel(true);
                         break;
                     }
 
@@ -2665,6 +2668,7 @@ public:
 
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
+        yuzu::agent::request_subprocess_cancel(true);
         heartbeat_stop_.store(true, std::memory_order_release);
         // Cancel the Subscribe stream FIRST. The Guardian drift workers and the DEX
         // observer both emit through emit_guardian_event(), whose synchronous gRPC
@@ -2980,6 +2984,7 @@ private:
     // agent and break the across-reconnect warm-snapshot continuity (PR 10).
     void quiesce_run_workers() noexcept {
         stop_requested_.store(true, std::memory_order_release);
+        yuzu::agent::request_subprocess_cancel(true);
         heartbeat_stop_.store(true, std::memory_order_release);
         if (auto u = updater())
             u->stop();

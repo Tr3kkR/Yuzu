@@ -10,7 +10,9 @@
  *   "enumerate_keys"   — List subkeys.
  *   "enumerate_values" — List values in a key.
  *
- * Windows-only. Returns error on Linux/macOS.
+ * Windows-only. Reports registry|unsupported|... on Linux/macOS (no
+ * equivalent surface there — see the macOS parity notes for the flagged
+ * product decision).
  */
 
 #include <yuzu/plugin.hpp>
@@ -36,6 +38,19 @@
 namespace {
 
 YuzuPluginContext* g_ctx = nullptr;
+
+// Strip pipe/newline/CR from a value echoed back into the pipe-delimited
+// protocol so a hostile action string cannot inject synthetic fields or rows
+// (e.g. an action containing '|' forging an extra column). Platform-agnostic;
+// used by the unknown-action error paths on every platform.
+std::string sanitize_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+    }
+    return out;
+}
 
 #ifdef _WIN32
 // to_wide / from_wide now come from the shared agents/shared/win_str.hpp
@@ -88,8 +103,46 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 #ifndef _WIN32
-        ctx.write_output("error|registry not available on this platform");
-        return 1;
+        (void)params;
+        // Validate against the full known action set FIRST, independent of
+        // platform support, so a misspelled/unknown action (e.g. "get_vaule")
+        // is never silently recorded as terminal SUCCESS.
+        static constexpr std::string_view kMutatingActions[] = {
+            "set_value", "delete_value", "delete_key"};
+        static constexpr std::string_view kReadActions[] = {
+            "get_value", "key_exists", "enumerate_keys", "enumerate_values",
+            "get_user_value"};
+        bool is_mutator = false;
+        for (auto a : kMutatingActions) {
+            if (action == a) { is_mutator = true; break; }
+        }
+        bool is_reader = false;
+        if (!is_mutator) {
+            for (auto a : kReadActions) {
+                if (action == a) { is_reader = true; break; }
+            }
+        }
+        if (!is_mutator && !is_reader) {
+            ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
+            return 1;
+        }
+
+#if defined(__APPLE__)
+        // macOS-specific honest sentinel (points at the real macOS alternative).
+        ctx.write_output("registry|unsupported|Windows registry has no macOS equivalent; use defaults/plists");
+#else
+        // Linux/other: platform-neutral honest sentinel — do NOT name macOS
+        // tools (defaults/plists) on a Linux agent.
+        ctx.write_output("registry|unsupported|Windows registry is not available on this platform");
+#endif
+        // set_value/delete_value/delete_key are STATE-CHANGING (write/delete)
+        // actions. On non-Windows they never touch anything, so reporting
+        // rc=0 (terminal SUCCESS) would be a false success for a security-
+        // relevant write/delete that did not happen (BR-03). Read-only
+        // actions (get_value, key_exists, enumerate_*, get_user_value)
+        // honestly determined "unsupported" and may keep rc=0 -- a read
+        // correctly reporting unavailability is itself a successful read.
+        return is_mutator ? 1 : 0;
 #else
         if (action == "get_value")        return do_get_value(ctx, params);
         if (action == "set_value")        return do_set_value(ctx, params);
@@ -99,7 +152,7 @@ public:
         if (action == "enumerate_keys")   return do_enumerate_keys(ctx, params);
         if (action == "enumerate_values") return do_enumerate_values(ctx, params);
         if (action == "get_user_value")   return do_get_user_value(ctx, params);
-        ctx.write_output(std::format("error|unknown action: {}", action));
+        ctx.write_output(std::format("error|unknown action: {}", sanitize_field(action)));
         return 1;
 #endif
     }

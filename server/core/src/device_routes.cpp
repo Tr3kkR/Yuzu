@@ -185,23 +185,37 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
         return body;
     }
 
-    if (kind == "services") { // Windows: svc|name|display|status|startup; Linux: svc|name|status|desc
+    if (kind == "services") { // Windows: svc|name|display|status|startup; Linux: svc|name|status|desc; macOS: svc|label|pid|status|startup
         std::vector<LiveService> rows;
         int running = 0;
         for (const auto& l : lines) {
             if (!l.starts_with("svc|")) continue;
             auto f = pipe_fields(l);
             LiveService s;
-            if (f.size() >= 5) { // Windows: svc|name|display|status|startup
-                s.name = f[1]; s.display = f[2]; s.status = f[3]; s.startup = f[4];
+            if (f.size() >= 5) {
+                // Two distinct 5-field shapes share this arity: Windows
+                // svc|name|display|status|startup and macOS (C-1.12, P10 fix)
+                // svc|label|pid|status|startup. Disambiguate on the pid column
+                // exactly as the 4-field branch below does for the legacy
+                // macOS shape, so a macOS row's PID is never rendered as the
+                // display name. A stopped launchd service reports pid "-"
+                // (services_plugin.cpp), not a number, so the sentinel counts
+                // as macOS too -- purely-numeric OR "-".
+                const bool macos = f[2] == "-" || (!f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
+                    return std::isdigit(ch) != 0;
+                }));
+                s.name = f[1];
+                if (macos) { s.status = f[3]; s.startup = f[4]; }               // svc|label|pid|status|startup
+                else { s.display = f[2]; s.status = f[3]; s.startup = f[4]; }   // svc|name|display|status|startup
             } else if (f.size() == 4) {
                 // Two distinct 4-field shapes share this arity: Linux svc|name|status|description
-                // and macOS svc|label|pid|status. Disambiguate on the numeric pid column so the
-                // macOS State cell shows the status, not the PID (consistency B1).
+                // and macOS svc|label|pid|status. Disambiguate on the pid column so the macOS
+                // State cell shows the status, not the PID (consistency B1). A stopped launchd
+                // service reports pid "-", not a number, so the sentinel counts as macOS too.
                 s.name = f[1];
-                const bool macos = !f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
+                const bool macos = f[2] == "-" || (!f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
                     return std::isdigit(ch) != 0;
-                });
+                }));
                 if (macos) { s.status = f[3]; }            // svc|label|pid|status
                 else { s.status = f[2]; s.display = f[3]; } // svc|name|status|description
             } else {
