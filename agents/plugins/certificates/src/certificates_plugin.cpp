@@ -1423,6 +1423,27 @@ std::optional<bool> keychain_contains_thumbprint(
     return false;
 }
 
+/**
+ * Pure decision (adversarial-review finding K-4): given the tri-state
+ * result of a pre-delete presence check (keychain_contains_thumbprint --
+ * true = present, false = POSITIVELY proven absent via a successful
+ * re-enumeration that did not find it, std::nullopt = the keychain could
+ * not be conclusively read/parsed), should delete_cert_macos report
+ * `status|not_found` and skip the destructive `security delete-certificate`
+ * call entirely?
+ *
+ * Only a definitive `false` qualifies. `true` obviously must fall through
+ * to the delete attempt, and -- just as importantly -- so must
+ * std::nullopt: an unreadable/inconclusive presence check proves nothing
+ * about whether the certificate is actually there, so it must never be
+ * masked as "not found". Symmetric with classify_delete_verdict's own
+ * std::nullopt handling (macos_console_user.hpp) for exactly the same
+ * reason.
+ */
+bool is_provably_absent_macos(std::optional<bool> presence) {
+    return presence.has_value() && !*presence;
+}
+
 bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                        std::string_view store) {
     // Validate thumbprint is hex-only to prevent command injection.
@@ -1463,21 +1484,48 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // keychain the caller didn't ask for.
     auto target = yuzu::macos::resolve_delete_keychain_path(store);
     if (!target) {
-        ctx.write_output(std::format("error|store '{}' is not supported for delete", store));
+        // store is caller-supplied free text (the cross-platform dispatcher
+        // passes the raw `store` param straight through) -- safe_output_field
+        // it (K-7) so a hostile value containing '|' or embedded CR/LF can
+        // never inject an extra column/row into this pipe/newline-delimited
+        // output, same as CertRecord::to_row() above.
+        ctx.write_output(std::format("error|store '{}' is not supported for delete",
+                                     yuzu::util::safe_output_field(store)));
         return false;
     }
 
     auto needle = canonical_thumbprint(thumbprint);
 
-    // Whole-action budget (BR-03) covering BOTH the delete command AND its
-    // post-delete verify read, same pattern as list/details_cert_macos
-    // (fix-round finding FP-CERTS-R3: before this, the verify read computed
-    // its own fresh kCertActionBudget window independent of what the delete
-    // call above it had already spent, letting the pair run to roughly 75s
-    // worst case). Every subprocess this action runs clamps to it via
+    // Whole-action budget (BR-03) covering the pre-delete presence check
+    // (K-4, below), the delete command, AND its post-delete verify read,
+    // same pattern as list/details_cert_macos (fix-round finding
+    // FP-CERTS-R3: before this, the verify read computed its own fresh
+    // kCertActionBudget window independent of what the delete call above it
+    // had already spent, letting the pair run to roughly 75s worst case).
+    // Every subprocess this action runs clamps to it via
     // clamp_to_action_budget rather than receiving its own full, unclamped
     // deadline.
     const auto action_deadline = std::chrono::steady_clock::now() + kCertActionBudget;
+
+    // K-4: prove the thumbprint is present (or absent) BEFORE ever running
+    // the destructive delete. Without this, deleting an ABSENT thumbprint
+    // hits `security delete-certificate`'s own exit-1 "not found" path,
+    // which the code below reports as a generic kCommandFailed
+    // `error|delete failed ...` -- inconsistent with Windows/Linux (and
+    // this macOS action's own pre-change behaviour), which report
+    // `status|not_found` rc 0 for an absent cert. Idempotent "ensure-absent"
+    // remediation depends on that contract. Reuses the SAME
+    // keychain_contains_thumbprint helper the post-delete verify below
+    // already trusts, clamped to the same action_deadline budget, so this
+    // pre-check can never itself blow the whole-action budget unaccounted
+    // for. See is_provably_absent_macos for why only a definitive `false`
+    // (never std::nullopt) takes the not_found branch.
+    auto pre_delete_presence = keychain_contains_thumbprint(*target, needle, action_deadline);
+    if (is_provably_absent_macos(pre_delete_presence)) {
+        ctx.write_output("status|not_found");
+        return true;
+    }
+
     auto delete_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
     if (delete_deadline <= std::chrono::milliseconds::zero()) {
         // Defensive only -- action_deadline is set immediately above, so a
@@ -1523,8 +1571,14 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
     switch (yuzu::macos::classify_delete_verdict(delete_result.exit_code, still_present)) {
     case yuzu::macos::DeleteVerdict::kCommandFailed:
-        ctx.write_output(std::format("error|delete failed (exit {}): {}",
-                                     delete_result.exit_code, delete_result.output));
+        // delete_result.output is `security`'s captured stderr (merge_stderr
+        // = true above) -- raw, attacker-influenceable diagnostic text that
+        // typically ends with its own trailing newline and can span multiple
+        // lines. safe_output_field it (K-7) so it can never inject an extra
+        // pipe-delimited column or newline-delimited row into this output,
+        // same as the store field above and CertRecord::to_row().
+        ctx.write_output(std::format("error|delete failed (exit {}): {}", delete_result.exit_code,
+                                     yuzu::util::safe_output_field(delete_result.output)));
         return false;
     case yuzu::macos::DeleteVerdict::kVerifyUnreadable:
         // rc==0 alone is never sufficient: the keychain could not be

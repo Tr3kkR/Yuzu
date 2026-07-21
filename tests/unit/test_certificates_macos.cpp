@@ -37,6 +37,17 @@
  * cap-and-deadline loop, resolve_console_user's uid trimming), which would
  * need an injectable subprocess seam this package's owned files do not
  * provide.
+ *
+ * A further section closes two adversarial-review findings on the delete
+ * path (K-4/K-7): is_provably_absent_macos -- the pure tri-state-presence
+ * -> not_found decision delete_cert_macos now runs BEFORE ever issuing the
+ * destructive `security delete-certificate` call -- is replicated the same
+ * way as every other pure decision above. The K-7 row-escaping vectors don't
+ * replicate anything (there's no new pure function to replicate): they
+ * exercise the REAL yuzu::util::safe_output_field against the exact two
+ * `std::format` templates delete_cert_macos's error paths use, the same
+ * "prove the real SDK function neutralizes a hostile value in situ" pattern
+ * as the to_row() vectors further down.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -257,6 +268,21 @@ BlockIdentityOutcome classify_block_identity(std::string_view parsed_thumbprint,
         return BlockIdentityOutcome::kInconclusive;
     return parsed_thumbprint == needle ? BlockIdentityOutcome::kMatch
                                         : BlockIdentityOutcome::kNoMatch;
+}
+
+/// Replica of certificates_plugin.cpp's is_provably_absent_macos
+/// (adversarial-review finding K-4): the pure decision that gates whether
+/// delete_cert_macos reports `status|not_found` and skips the destructive
+/// `security delete-certificate` call entirely, rather than running it
+/// against an already-absent thumbprint and reporting a generic
+/// kCommandFailed `error|delete failed ...`. Only a definitive `false`
+/// (a successful re-enumeration that positively did not find the
+/// thumbprint) qualifies -- `true` (present) and std::nullopt (the presence
+/// check itself was inconclusive/unreadable) must both fall through to the
+/// real delete attempt, exactly like classify_delete_verdict's own
+/// std::nullopt handling for the post-delete verify.
+bool is_provably_absent_macos(std::optional<bool> presence) {
+    return presence.has_value() && !*presence;
 }
 
 /// Replica of certificates_plugin.cpp's clamp_to_action_budget (fix-round
@@ -607,6 +633,40 @@ TEST_CASE("classify_delete_verdict: rc==0 but the certificate is still present -
 TEST_CASE("classify_delete_verdict: rc==0 and the certificate is proven absent -> kDeleted",
          "[certificates][macos]") {
     CHECK(classify_delete_verdict(0, false) == DeleteVerdict::kDeleted);
+}
+
+// ── is_provably_absent_macos (adversarial-review finding K-4) ───────────────
+//
+// delete_cert_macos's pre-delete presence check, factored out as a pure
+// decision so it is exercised here with fixture std::optional<bool> inputs --
+// no `security` subprocess, no real keychain, matching classify_delete_verdict
+// above. Cross-platform consistency requires an absent thumbprint to report
+// `status|not_found` (rc 0), the same contract Windows/Linux (and this
+// macOS action's own pre-change behaviour) already honour; idempotent
+// "ensure-absent" remediation depends on it.
+
+TEST_CASE("is_provably_absent_macos: a definitive absent verdict (false) reports not_found",
+         "[certificates][macos]") {
+    CHECK(is_provably_absent_macos(false));
+}
+
+TEST_CASE("is_provably_absent_macos: a present thumbprint (true) falls through to the real "
+         "delete attempt",
+         "[certificates][macos]") {
+    CHECK_FALSE(is_provably_absent_macos(true));
+}
+
+TEST_CASE("is_provably_absent_macos: an inconclusive/unreadable presence check (std::nullopt) "
+         "must NEVER be masked as not_found",
+         "[certificates][macos]") {
+    // The K-4 finding's explicit guardrail: if the pre-delete presence
+    // check itself could not conclusively read/parse the keychain (locked,
+    // permission denied, an inconclusive block identity, action-budget
+    // exhaustion, ...), that proves nothing about whether the certificate
+    // is actually there -- it must fall through to the real delete attempt
+    // (and whatever honest error that produces), never be silently
+    // reported as "not found".
+    CHECK_FALSE(is_provably_absent_macos(std::nullopt));
 }
 
 // ── is_usable_capture (fix-round finding FP-CERTS-05) ────────────────────────
@@ -1068,4 +1128,65 @@ TEST_CASE("to_row: thumbprint/not_before/not_after/store are never escaped",
     CHECK(row.find(rec.not_before) != std::string::npos);
     CHECK(row.find(rec.not_after) != std::string::npos);
     CHECK(row.find(rec.store) != std::string::npos);
+}
+
+// ── delete-path error-row escaping (adversarial-review finding K-7) ─────────
+//
+// delete_cert_macos's two error-formatting call sites interpolate raw,
+// attacker-influenceable text -- the caller-supplied `store` param (an
+// unrecognized/unsupported store is rejected via `error|store '{}' is not
+// supported for delete`) and `security delete-certificate`'s own captured,
+// merged stderr (`error|delete failed (exit {}): {}`) -- directly into
+// pipe/newline-delimited output. Neither replicates a NEW pure function (the
+// fix is simply wrapping the interpolated value in the REAL
+// yuzu::util::safe_output_field, already proven above for CertRecord's
+// fields); these vectors instead exercise that real function against the
+// EXACT two std::format templates certificates_plugin.cpp now uses, proving
+// a hostile value can no longer inject an extra column/row into either.
+
+TEST_CASE("K-7: the unsupported-store error message neutralizes a hostile store value",
+         "[certificates][macos]") {
+    // Mirrors delete_cert_macos's `error|store '{}' is not supported for
+    // delete` format string verbatim, with safe_output_field applied to the
+    // interpolated store value exactly as the fixed code now does.
+    const std::string hostile_store = "evil|injected\r\nstatus|deleted";
+    auto message = std::format("error|store '{}' is not supported for delete",
+                               yuzu::util::safe_output_field(hostile_store));
+
+    CHECK(message.find('\r') == std::string::npos);
+    CHECK(message.find('\n') == std::string::npos);
+
+    // Exactly one unescaped '|' -- the literal "error|" prefix's own
+    // separator. Every '|' the hostile store contributed must have been
+    // escaped (preceded by '\'), so it can no longer be mistaken for a
+    // column boundary by a caller splitting this line on a bare '|'.
+    std::size_t bare_pipes = 0;
+    for (std::size_t i = 0; i < message.size(); ++i) {
+        if (message[i] == '|' && (i == 0 || message[i - 1] != '\\'))
+            ++bare_pipes;
+    }
+    CHECK(bare_pipes == 1);
+}
+
+TEST_CASE("K-7: the delete-failed error message neutralizes hostile multi-line stderr",
+         "[certificates][macos]") {
+    // Mirrors delete_cert_macos's `error|delete failed (exit {}): {}` format
+    // string verbatim. delete_result.output is `security`'s captured,
+    // merged stderr (merge_stderr=true) -- it typically ends with its own
+    // trailing newline and can span multiple lines, and is never trusted to
+    // be free of '|' either.
+    const std::string hostile_stderr =
+        "security: SecKeychainItemDelete: permission denied\nstatus|deleted\n";
+    auto message = std::format("error|delete failed (exit {}): {}", 1,
+                               yuzu::util::safe_output_field(hostile_stderr));
+
+    CHECK(message.find('\r') == std::string::npos);
+    CHECK(message.find('\n') == std::string::npos);
+
+    std::size_t bare_pipes = 0;
+    for (std::size_t i = 0; i < message.size(); ++i) {
+        if (message[i] == '|' && (i == 0 || message[i - 1] != '\\'))
+            ++bare_pipes;
+    }
+    CHECK(bare_pipes == 1); // only the literal "error|" prefix's own separator
 }

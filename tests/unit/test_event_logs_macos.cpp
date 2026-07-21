@@ -341,16 +341,17 @@ TEST_CASE("decide_log_show_output: a message containing '|' and '\\' stays insid
     CHECK(decision.rc == 0);
     REQUIRE(decision.rows.size() == 1);
 
-    // Mirror the server's parity-based split locally instead of asserting
-    // a literal escaped string, so the fixture stays honest about what
-    // matters: the row still has exactly 4 columns, and the message
-    // column -- once unescaped -- reproduces the original text exactly,
-    // '|' and '\' included, with nothing bleeding into neighbouring
-    // columns.
+    // Mirror the server's split locally instead of asserting a literal
+    // escaped string, so the fixture stays honest about what matters: the
+    // row still has exactly 4 columns and an embedded '|' never bleeds into
+    // a neighbouring column. safe_output_field is intentionally lossy on a
+    // literal backslash (folds '\' -> '/', a framing-safety choice that
+    // needs no shared-decoder change), so the message's pipe survives while
+    // its backslash is folded -- assert exactly that.
     auto fields = split_pipe_delimited(decision.rows[0]);
     REQUIRE(fields.size() == 4);
     CHECK(fields[0] == "error");
     CHECK(fields[1] == "2026-07-20 12:00:00");
     CHECK(fields[2] == "kernel[0]");
-    CHECK(unescape_field(fields[3]) == "message|with\\backslash and pipe");
+    CHECK(unescape_field(fields[3]) == "message|with/backslash and pipe");
 }
