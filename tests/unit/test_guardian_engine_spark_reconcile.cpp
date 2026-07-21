@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -27,6 +28,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -513,11 +515,21 @@ TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left 
     CHECK_FALSE(rows->empty()); // durable after stop's final flush
 }
 
-TEST_CASE("prefer_spark=true: page_journal runs a paging pass", "[spark][guardian][reconcile][journal]") {
+TEST_CASE("prefer_spark=true: page_journal kicks the drain worker into a paging pass",
+          "[spark][guardian][reconcile][journal]") {
+    // C0 (#2298 gate 1): page_journal no longer pages INLINE on the caller's (reconnect)
+    // thread - it wakes the drain worker, which runs the pass. Same observable replay, minus
+    // a full KvStore scan on the thread that has just re-established the stream.
     SparkReconcileFixture f;
-    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 0);
+    auto* journal = f.engine->lifecycle_journal_for_test();
+    const auto before = journal->pages();
     f.engine->page_journal();
-    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 1); // it paged (not gated out)
+    // Bounded well BELOW the worker's 5 s periodic backstop, so a pass observed here is the
+    // kick doing its job, not the backstop that would have happened anyway.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (journal->pages() == before && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(journal->pages() > before); // the kick produced a pass (not gated out)
 }
 
 TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal untouched)",
