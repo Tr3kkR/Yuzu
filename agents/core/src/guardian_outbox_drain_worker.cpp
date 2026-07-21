@@ -11,8 +11,8 @@ namespace yuzu::agent {
 namespace {
 /// Wall clock in ms - the journal's retention basis (batch ts_ms is system_clock).
 /// Deliberately NOT steady_clock: prune compares against persisted timestamps that
-/// survive a reboot. The prune CADENCE below uses steady_clock instead, so a wall-clock
-/// step cannot make maintenance either stall or spin.
+/// survive a reboot. The maintenance CADENCE below uses steady_clock instead, so a
+/// wall-clock step cannot make maintenance either stall or spin.
 std::int64_t journal_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -22,18 +22,16 @@ std::int64_t journal_now_ms() {
 
 GuardianOutboxDrainWorker::GuardianOutboxDrainWorker(GuardianSparkRuntime& rt, SendFn send,
                                                      std::uint64_t periodic_bound_ms,
-                                                     GuardianLifecycleJournal* journal,
-                                                     std::uint64_t prune_interval_ms)
-    : rt_(rt), send_(std::move(send)), periodic_bound_ms_(periodic_bound_ms), journal_(journal),
-      prune_interval_ms_(prune_interval_ms), sig_(std::make_shared<Signal>()),
-      last_prune_(std::chrono::steady_clock::now()) {}
+                                                     GuardianMaintenanceConfig maintenance)
+    : rt_(rt), send_(std::move(send)), periodic_bound_ms_(periodic_bound_ms),
+      maint_(maintenance), sig_(std::make_shared<Signal>()) {}
 
 GuardianOutboxDrainWorker::~GuardianOutboxDrainWorker() { stop(); }
 
 void GuardianOutboxDrainWorker::start() {
     {
         std::lock_guard<std::mutex> lk{sig_->mu};
-        if (started_ || sig_->stopping)
+        if (started_ || sig_->stopping.load(std::memory_order_acquire))
             return;
         started_ = true;
     }
@@ -54,9 +52,12 @@ void GuardianOutboxDrainWorker::start() {
 void GuardianOutboxDrainWorker::stop() {
     bool first_stop = false;
     {
+        // Stored UNDER the mutex even though the flag is atomic: a waiter evaluating the
+        // wait_for predicate holds `mu`, so this ordering is what makes a lost wakeup
+        // impossible. The atomicity exists for the lock-free stop_requested() reads.
         std::lock_guard<std::mutex> lk{sig_->mu};
-        if (!sig_->stopping) {
-            sig_->stopping = true;
+        if (!sig_->stopping.load(std::memory_order_relaxed)) {
+            sig_->stopping.store(true, std::memory_order_release);
             first_stop = true;
         }
     }
@@ -77,95 +78,143 @@ void GuardianOutboxDrainWorker::stop() {
 void GuardianOutboxDrainWorker::notify() {
     {
         std::lock_guard<std::mutex> lk{sig_->mu};
-        if (sig_->stopping)
+        if (sig_->stopping.load(std::memory_order_acquire))
             return;
+        // Force a page on the next cycle: without this the reconnect kick would only
+        // wake the worker, and the page cadence could still defer the replay by up to
+        // kDefaultPageInterval - exactly the promptness the kick exists to provide.
+        force_page_.store(true, std::memory_order_release);
         ++sig_->gen;
     }
     sig_->cv.notify_all();
 }
 
-bool GuardianOutboxDrainWorker::stop_requested() const {
-    std::lock_guard<std::mutex> lk{sig_->mu};
-    return sig_->stopping;
-}
-
 void GuardianOutboxDrainWorker::drain_once() { rt_.drain(send_); }
 
-bool GuardianOutboxDrainWorker::maintenance_once() {
-    if (!journal_)
-        return false;
-    // NOTE: no engine mtx_ anywhere on this path, by construction - see the class doc.
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last_prune_ >= std::chrono::milliseconds(prune_interval_ms_)) {
-        // Stamp BEFORE the pass: a prune that throws or is cut short by stopping_ must not
-        // make every subsequent wake retry it (that would reinstate the per-wake full scan
-        // this cadence exists to avoid). The next interval retries it normally.
-        last_prune_ = now;
-        journal_->prune(journal_now_ms());
+bool GuardianOutboxDrainWorker::drain_bounded() {
+    const std::size_t budget = maint_.drain_budget;
+    if (budget == 0) {
+        rt_.drain(send_);
+        return false; // unbounded by configuration: nothing is ever left behind
     }
-    return journal_->page_into_window(rt_, journal_now_ms()).records_paged > 0;
+    return rt_.drain(send_, budget) >= budget;
+}
+
+GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMaintenanceOps ops) {
+    GuardianMaintenanceResult result;
+    if (!maint_.journal)
+        return result;
+    // NOTE: no engine mtx_ anywhere on this path, by construction - see the class doc.
+    if (ops.prune)
+        maint_.journal->prune(journal_now_ms());
+    if (ops.page) {
+        result.page_attempted = true;
+        result.records_paged = maint_.journal->page_into_window(rt_, journal_now_ms()).records_paged;
+    }
+    return result;
 }
 
 void GuardianOutboxDrainWorker::loop() {
+    worker_id_.store(std::this_thread::get_id(), std::memory_order_release);
+    // The cadence timers are LOCALS, not members: nothing outside this thread can read
+    // or write them, so the public maintenance_once() seam carries no timer state and
+    // cannot race the worker no matter which thread a test calls it from.
+    auto last_prune = std::chrono::steady_clock::now();
+    auto last_page = std::chrono::steady_clock::now();
     std::uint64_t seen = 0;
-    while (true) {
-        {
-            std::unique_lock<std::mutex> lk{sig_->mu};
-            sig_->cv.wait_for(lk, std::chrono::milliseconds(periodic_bound_ms_),
-                              [this, seen] { return sig_->stopping || sig_->gen != seen; });
-            if (sig_->stopping)
-                return;
-            seen = sig_->gen;
-        }
-        // Firewall the drain pass: this is a bare worker thread and the drain path
-        // allocates (front_copy copies an OutboxEntry, pop_front_if builds a Key) plus
-        // the injected send. A bad_alloc escaping here would terminate the whole agent
-        // daemon (the #2037 class). Count it, log the first, keep looping - nothing was
-        // popped, so entries stay buffered and the periodic backstop re-attempts once
-        // memory recovers. (item 4 hardening / Fable.)
-        const auto firewalled_drain = [this] {
-            try {
-                drain_once();
-            } catch (...) {
-                const auto n = drain_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (n == 1) {
-                    try {
-                        spdlog::error(
-                            "Guardian drain worker: drain pass threw (firewalled; agent "
-                            "survives, entries retained). Further occurrences counted only.");
-                    } catch (...) {
-                    }
-                }
-            }
-        };
-        firewalled_drain();
+    // The FIRST cycle runs WITHOUT waiting: force_page_ is seeded true for the boot journal
+    // replay, and making that replay sit behind a full periodic bound - or, worse, behind
+    // whenever the first outbox enqueue happens to arrive - contradicts the point of seeding
+    // it. Nothing here takes the engine mtx_, so running concurrently with the remainder of
+    // wire_spark_engine is safe.
+    bool skip_wait = true;
 
-        // Journal maintenance (C0 #2298 gate 1): retention prune (time-cadenced) + replay
-        // paging, relocated here off the heartbeat and reconnect threads. Firewalled
-        // SEPARATELY from the drain pass in both directions - a maintenance throw must not
-        // suppress draining, and a drain throw must not suppress retention - mirroring how
-        // the heartbeat tick firewalled its two phases independently.
-        if (stop_requested())
-            return; // stop() is already waiting on the join; start no new KvStore work
-        bool paged = false;
+    const auto firewalled_drain = [this, &skip_wait] {
         try {
-            paged = maintenance_once();
+            // A truncated pass re-arms the next cycle to run WITHOUT waiting, so bounding a
+            // drain costs latency only when there is nothing left to ship.
+            skip_wait = drain_bounded();
         } catch (...) {
-            const auto n = journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
+            skip_wait = false;
+            const auto n = drain_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (n == 1) {
                 try {
-                    spdlog::error("Guardian drain worker: journal maintenance pass threw "
-                                  "(firewalled; agent survives, journal retained). Further "
-                                  "occurrences counted only.");
+                    spdlog::error("Guardian drain worker: drain pass threw (firewalled; agent "
+                                  "survives, entries retained). Further occurrences counted only.");
                 } catch (...) {
                 }
             }
         }
-        // try_page_batch does NOT fire the enqueue waker, so records paged above would
-        // otherwise sit in the window until the next wake. Drain again in the SAME pass.
-        if (paged)
-            firewalled_drain();
+    };
+
+    while (true) {
+        if (!skip_wait) {
+            std::unique_lock<std::mutex> lk{sig_->mu};
+            sig_->cv.wait_for(lk, std::chrono::milliseconds(periodic_bound_ms_), [this, seen] {
+                return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
+            });
+            if (sig_->stopping.load(std::memory_order_acquire))
+                break;
+            seen = sig_->gen;
+        } else if (stop_requested()) {
+            break; // neither the boot cycle nor a truncated drain may outlive a stop request
+        }
+        // Re-armed below ONLY by a truncated drain; every other cycle waits.
+        skip_wait = false;
+
+        // MAINTENANCE FIRST, then ONE drain (C0 #2298 + governance f-1/f-3).
+        //
+        // Order matters: paging places entries in the send window, and try_page_batch
+        // does NOT fire the enqueue waker, so running maintenance ahead of the drain
+        // ships anything it paged in the SAME cycle. The previous shape (drain, then
+        // maintenance, then a second conditional drain) needed that extra drain and ran
+        // it un-gated after stop() was already blocked in join().
+        //
+        // Both passes are cadence-gated on steady_clock, NOT on wake count: this worker
+        // wakes on every outbox enqueue, so gating on wakes would tie a full-journal
+        // scan to the event rate. An enqueue wake therefore finds maintenance not due
+        // and proceeds straight to the drain, which is what keeps live-event latency at
+        // the pre-C0 level.
+        const auto now = std::chrono::steady_clock::now();
+        GuardianMaintenanceOps ops;
+        if (force_page_.exchange(false, std::memory_order_acq_rel) ||
+            now - last_page >= maint_.page_interval) {
+            ops.page = true;
+            last_page = now;
+        }
+        if (now - last_prune >= maint_.prune_interval) {
+            ops.prune = true;
+            last_prune = now;
+        }
+        // Stamped BEFORE the pass in both cases above: a pass that throws or is cut
+        // short by the journal's stopping_ gate must not make every subsequent wake
+        // retry it, which would reinstate the per-wake scan the cadence exists to avoid.
+
+        if ((ops.prune || ops.page) && !stop_requested()) {
+            // Firewalled SEPARATELY from the drain pass, in both directions, so neither
+            // failure domain can starve the other - mirroring how the heartbeat tick
+            // firewalled its two phases independently.
+            try {
+                maintenance_once(ops);
+            } catch (...) {
+                const auto n =
+                    journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n == 1) {
+                    try {
+                        spdlog::error("Guardian drain worker: journal maintenance pass threw "
+                                      "(firewalled; agent survives, journal retained). Further "
+                                      "occurrences counted only.");
+                    } catch (...) {
+                    }
+                }
+            }
+        }
+
+        if (stop_requested())
+            break;
+        firewalled_drain();
     }
+    worker_id_.store(std::thread::id{}, std::memory_order_release);
 }
 
 } // namespace yuzu::agent

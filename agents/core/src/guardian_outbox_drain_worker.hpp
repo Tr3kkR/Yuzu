@@ -32,6 +32,14 @@
  * self-containment. Document this distinction at the call site if it becomes
  * non-obvious.
  *
+ * WITH ONE ABSOLUTE EXCEPTION: whatever `send` captures, it must never take
+ * GuardianEngine::mtx_ - see the central constraint below. That applies to
+ * EVERY path on this thread, the injected send included; `send` is in fact the
+ * easiest place to reintroduce the deadlock, because it is an arbitrary
+ * std::function supplied from agent.cpp. GuardianEngine asserts against this in
+ * debug/sanitizer builds via worker_thread_id(), so a violation fails a test
+ * rather than hanging a fleet.
+ *
  * JOURNAL MAINTENANCE (C0, #2298 gate 1): this worker also runs the durable
  * lifecycle journal's retention prune + replay paging, which used to run inline
  * on the heartbeat thread (journal_maintenance_tick phase 2) and the reconnect /
@@ -69,6 +77,62 @@ namespace yuzu::agent {
 
 class GuardianLifecycleJournal;
 
+/// Journal REPLAY-PAGE cadence. Load-bearing (#2298 governance f-1/A1): a paging pass is
+/// a full `list_entries` + parse + `validate_record` sweep of the journal, and
+/// JournalPagingBucket charges a token only when a batch pages NET-NEW work. So when the
+/// send window already holds every candidate - the normal state while the link is down and
+/// the backlog is retained - the bucket never throttles and every wake rescans the whole
+/// journal. Since the drain worker wakes on EVERY outbox enqueue, "page on every wake" is
+/// unbounded scan cost driven by the event rate. 30 s restores exactly the pre-C0 rate (one
+/// page per heartbeat tick); the reconnect kick still forces an immediate page, so replay
+/// promptness is unaffected.
+inline constexpr std::chrono::milliseconds kGuardianJournalPageInterval{30'000};
+
+/// Retention-prune cadence. TIME-based for the same reason, and additionally because the
+/// heartbeat's old "every 4th tick" rule was only safe while a tick WAS a fixed 30 s.
+/// ~2 min preserves that effective cadence (4 x 30 s) without depending on a tick count.
+inline constexpr std::chrono::milliseconds kGuardianJournalPruneInterval{120'000};
+
+/// Entries shipped per drain pass before the worker re-checks its other work. Unbounded, a
+/// slow stream drains the whole 4096-entry window - at 20 ms/send that is ~82 s of
+/// head-of-line blocking - which post-C0 would starve journal retention until the write
+/// ceiling DROPS audit records (#2298 governance f-3). The worker re-drains immediately on
+/// hitting this bound, so steady-state throughput is unchanged.
+inline constexpr std::size_t kGuardianDrainBudget = 512;
+
+/// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
+/// positional parameters so the two same-typed intervals cannot be transposed at a call
+/// site, and so a test can name only what it overrides:
+/// `{.journal = j, .prune_interval = 0ms}`.
+///
+/// Namespace-scope, not nested: a default argument cannot require a nested class's default
+/// member initializers before the enclosing class is complete.
+struct GuardianMaintenanceConfig {
+    /// BORROWED and may be null (no maintenance runs). Must outlive the worker; the owner
+    /// guarantees that by joining it first - see the worker's JOURNAL MAINTENANCE note and
+    /// GuardianEngine's member declaration order.
+    GuardianLifecycleJournal* journal{nullptr};
+    std::chrono::milliseconds page_interval{kGuardianJournalPageInterval};
+    std::chrono::milliseconds prune_interval{kGuardianJournalPruneInterval};
+    std::size_t drain_budget{kGuardianDrainBudget};
+};
+
+/// Which maintenance passes to run this cycle. The CALLER owns cadence - the worker loop
+/// keeps its timers as locals, so the worker holds no cross-thread timer state and
+/// maintenance_once() is a pure function of its argument.
+struct GuardianMaintenanceOps {
+    bool prune{false};
+    bool page{false};
+};
+
+/// Outcome of one maintenance pass. Deliberately NOT JournalPageStats: keeping the journal
+/// a forward declaration here holds the dependency direction to worker -> journal without
+/// dragging the audit component into this header.
+struct GuardianMaintenanceResult {
+    bool page_attempted{false};   ///< a paging pass was requested and ran
+    std::size_t records_paged{0}; ///< net-new records placed in the send window
+};
+
 class YUZU_EXPORT GuardianOutboxDrainWorker {
 public:
     using SendFn = std::function<SendResult(const OutboxEntry&)>;
@@ -78,20 +142,9 @@ public:
     /// still bounds staleness in the pathological case).
     static constexpr std::uint64_t kDefaultPeriodicBoundMs = 5'000;
 
-    /// Retention-prune cadence. TIME-based, not wake-based: this worker wakes on
-    /// every outbox enqueue, so an "every Nth wake" rule (what the heartbeat tick
-    /// used, where a wake WAS a fixed 30 s) would scan the whole journal far too
-    /// often under an event burst. ~2 min preserves the old effective cadence
-    /// (4 x 30 s heartbeats) while decoupling it from wake frequency.
-    static constexpr std::uint64_t kDefaultPruneIntervalMs = 120'000;
-
-    /// `journal` is BORROWED and may be null (no maintenance runs). It must outlive
-    /// this worker; the owner guarantees that by joining here first - see the
-    /// class doc's JOURNAL MAINTENANCE note and GuardianEngine's member order.
     GuardianOutboxDrainWorker(GuardianSparkRuntime& rt, SendFn send,
                               std::uint64_t periodic_bound_ms = kDefaultPeriodicBoundMs,
-                              GuardianLifecycleJournal* journal = nullptr,
-                              std::uint64_t prune_interval_ms = kDefaultPruneIntervalMs);
+                              GuardianMaintenanceConfig maintenance = GuardianMaintenanceConfig{});
     ~GuardianOutboxDrainWorker();
     GuardianOutboxDrainWorker(const GuardianOutboxDrainWorker&) = delete;
     GuardianOutboxDrainWorker& operator=(const GuardianOutboxDrainWorker&) = delete;
@@ -103,28 +156,33 @@ public:
     /// full periodic bound (the CV wake is immediate).
     void stop();
 
-    /// Wake the worker NOW rather than waiting out the periodic bound. Used by the
-    /// reconnect hook so a freshly-connected stream gets its journal replay promptly
-    /// (C0 #2298: the reconnect thread kicks, it no longer pages inline). A no-op
-    /// after stop(). Safe to call before start(): the bumped generation is observed
-    /// by the loop's first wait predicate.
+    /// Wake the worker NOW, and force the next cycle to page regardless of the page
+    /// cadence. Used by the reconnect hook so a freshly-connected stream gets its
+    /// journal replay promptly (C0 #2298: the reconnect thread kicks, it no longer pages
+    /// inline). The force is what keeps kDefaultPageInterval from delaying reconnect
+    /// replay. A no-op after stop(). Safe before start(): both the bumped generation and
+    /// the force flag are observed by the loop's first cycle.
     void notify();
 
+    /// The worker thread's id while running, else a default-constructed id. Exists so
+    /// GuardianEngine can ASSERT that its mtx_ is never taken on this thread - see the
+    /// class doc's central constraint. Lock-free; safe from any thread.
+    [[nodiscard]] std::thread::id worker_thread_id() const noexcept {
+        return worker_id_.load(std::memory_order_acquire);
+    }
+
     /// Deterministic test seam (also the worker thread's own loop body): run
-    /// ONE drain pass synchronously on the caller's thread. Does NOT firewall
+    /// ONE drain pass synchronously on the caller's thread, UNBOUNDED. Does NOT firewall
     /// exceptions - the worker thread's loop() does (so a test can still observe a
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
 
-    /// Deterministic test seam (also the worker thread's own loop body): run ONE
-    /// journal-maintenance pass - a retention prune if `prune_interval_ms` has
-    /// elapsed since the last one, then a replay page - synchronously on the caller's
-    /// thread. Returns true if the pass paged net-new records into the send window,
-    /// meaning the caller should drain again (try_page_batch does NOT wake this
-    /// worker). A no-op with no journal. Does NOT firewall exceptions - loop() does.
-    /// NOT thread-safe against the worker thread (the prune timer is plain state):
-    /// call it from the worker thread, or with the worker not started.
-    bool maintenance_once();
+    /// Deterministic test seam (also the worker thread's own loop body): run the
+    /// maintenance passes named by `ops` synchronously on the caller's thread. Holds no
+    /// timer state of its own, so unlike a cadence-owning variant it is safe to call
+    /// from any thread. A no-op with no journal. Does NOT firewall exceptions - loop()
+    /// does.
+    GuardianMaintenanceResult maintenance_once(GuardianMaintenanceOps ops);
 
     /// Cumulative count of drain passes that threw and were firewalled by loop().
     /// A nonzero value means the drain path hit an exception (bad_alloc under memory
@@ -144,8 +202,16 @@ public:
 
 private:
     void loop();
-    /// True once stop() has been requested. Takes the Signal mutex (uncontended).
-    [[nodiscard]] bool stop_requested() const;
+    /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
+    /// the one check loop() makes outside a try, and taking a mutex here would let
+    /// std::system_error escape the bare worker thread and terminate the agent (the
+    /// #2037 class of defect).
+    [[nodiscard]] bool stop_requested() const noexcept {
+        return sig_->stopping.load(std::memory_order_acquire);
+    }
+    /// One drain pass bounded by `drain_budget_`. Returns true if it hit the bound,
+    /// meaning entries remain and the loop should re-drain WITHOUT waiting.
+    [[nodiscard]] bool drain_bounded();
 
     /// Heap sync state shared by the worker thread AND the waker (a
     /// std::function copied into the runtime) - see the class doc for why a
@@ -153,26 +219,26 @@ private:
     struct Signal {
         std::mutex mu;
         std::condition_variable cv;
-        bool stopping{false};
+        /// Write-once-true. ATOMIC so stop_requested() needs no lock (see above); still
+        /// STORED under `mu` so a waiter inside wait_for cannot miss the transition.
+        std::atomic<bool> stopping{false};
         std::uint64_t gen{0}; ///< bumped by the waker; the loop waits on a change
     };
 
     GuardianSparkRuntime& rt_;
     SendFn send_;
     std::uint64_t periodic_bound_ms_;
-    /// BORROWED, may be null. Pre-resolved at construction precisely so the worker
-    /// thread never re-reads it off the engine under mtx_ (see the class doc).
-    GuardianLifecycleJournal* journal_;
-    std::uint64_t prune_interval_ms_;
+    GuardianMaintenanceConfig maint_;
     std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::thread thread_;
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
-    /// Worker-thread-only (or pre-start): last prune's steady_clock stamp. Seeded at
-    /// CONSTRUCTION, not epoch, so the first maintenance pass does not immediately
-    /// re-prune what page_into_window's boot barrier is about to prune anyway.
-    std::chrono::steady_clock::time_point last_prune_;
+    /// Set by notify(), cleared by the loop: force ONE page irrespective of cadence.
+    /// Seeded TRUE so the first cycle replays the journal at boot without waiting out
+    /// kDefaultPageInterval.
+    std::atomic<bool> force_page_{true};
+    std::atomic<std::thread::id> worker_id_{};
 };
 
 } // namespace yuzu::agent
