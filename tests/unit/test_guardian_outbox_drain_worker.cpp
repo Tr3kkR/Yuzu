@@ -5,6 +5,7 @@
 
 #include "guardian_outbox_drain_worker.hpp"
 
+#include "guardian_joined_thread_role.hpp"
 #include "guardian_lifecycle_journal.hpp"
 
 #include <yuzu/agent/kv_store.hpp>
@@ -94,14 +95,15 @@ bool spin_until(std::function<bool()> pred, std::chrono::milliseconds timeout = 
 struct JournalRig {
     yuzu::test::TempDbFile db{"yuzu_test_drainmaint-"};
     std::unique_ptr<KvStore> kv;
+    std::shared_ptr<FakeReader> reader; ///< kept so a test can flip verdicts (compliance traffic)
     std::shared_ptr<GuardianSparkRuntime> rt;
     std::shared_ptr<GuardianLifecycleJournal> journal;
     JournalRig() {
         auto r = KvStore::open(db.path);
         REQUIRE(r.has_value());
         kv = std::make_unique<KvStore>(std::move(*r));
-        rt = std::make_shared<GuardianSparkRuntime>(std::make_shared<FakeReader>(),
-                                                    std::make_shared<FakeBackend>());
+        reader = std::make_shared<FakeReader>();
+        rt = std::make_shared<GuardianSparkRuntime>(reader, std::make_shared<FakeBackend>());
         journal = std::make_shared<GuardianLifecycleJournal>(kv.get());
     }
     /// Persist one record as its own durable batch (one persist call = one batch key),
@@ -597,18 +599,19 @@ TEST_CASE("the drain-worker role marker is set on that thread and nowhere else",
           "[spark][guardian][drain][maint]") {
     // This is what GuardianEngine::WorkerHostileMutex consults to abort rather than deadlock
     // if the worker ever takes mtx_ (#2298 A2, reworked after Sol found the earlier
-    // pointer-based mechanism was itself a data race and a potential UAF). A true death test
-    // needs a subprocess harness this suite does not have, so what is proven here is the
-    // PREDICATE the abort keys off: true on the worker thread, false everywhere else.
+    // pointer-based mechanism was itself a data race and a potential UAF). The abort ITSELF is
+    // proven by the forked-child death test in test_guardian_engine_spark_reconcile.cpp; what
+    // this covers is the PREDICATE it keys off - true on a joined worker thread, false
+    // elsewhere - which that death test cannot isolate.
     JournalRig rig;
-    CHECK_FALSE(on_guardian_drain_worker_thread()); // the test thread is not the worker
+    CHECK_FALSE(on_guardian_joined_thread()); // the test thread is not the worker
 
     std::atomic<bool> marker_inside{false};
     std::atomic<bool> observed{false};
     auto observing_send = [&](const OutboxEntry&) -> SendResult {
         // The INJECTED send is exactly the exposure the marker exists for: an arbitrary
-        // std::function supplied by agent.cpp, running here on the worker thread.
-        marker_inside.store(on_guardian_drain_worker_thread());
+        // std::function supplied by agent.cpp, running here on a thread stop() joins.
+        marker_inside.store(on_guardian_joined_thread());
         observed.store(true);
         return SendResult::Sent;
     };
@@ -619,7 +622,7 @@ TEST_CASE("the drain-worker role marker is set on that thread and nowhere else",
     CHECK(spin_until([&] { return observed.load(); }));
     CHECK(marker_inside.load());
     worker.stop();
-    CHECK_FALSE(on_guardian_drain_worker_thread()); // still false here after the join
+    CHECK_FALSE(on_guardian_joined_thread()); // still false here after the join
 }
 
 TEST_CASE("a bounded drain truncates, reports it, and later passes finish the backlog",
@@ -834,4 +837,73 @@ TEST_CASE("a mid-drain link drop retains the head and resumes without loss",
     std::lock_guard<std::mutex> lk{sink.mu};
     std::set<std::string> unique(sink.sent_ids.begin(), sink.sent_ids.end());
     CHECK(unique.size() == 10); // nothing lost, nothing duplicated across the outage
+}
+
+TEST_CASE("a jammed lifecycle head plus live compliance traffic does not re-arm the page",
+          "[spark][guardian][drain][maint]") {
+    // Regression guard for #2298 Gate 4 UP-2, caused BY the reconnect-refill fix. The old
+    // re-arm keyed on "a page ran and placed nothing, and the drain sent something", and both
+    // halves are true in a reachable, benign state that has nothing to do with a full window:
+    //
+    //   - a lifecycle head that cannot send (Retain) jams the lifecycle log, so the batches
+    //     the boot page placed STAY window members and every later page legitimately adds 0;
+    //   - compliance/health drains independently (failure isolation, Gate 4 UP-3), so the
+    //     drain is non-empty every cycle.
+    //
+    // That re-armed the force flag on every cycle and restored the per-wake full-journal scan
+    // the 30 s cadence exists to prevent. The fix requires headroom_blocked - a candidate the
+    // window genuinely could not fit.
+    JournalRig rig;
+    rig.persist("r1");
+    rig.persist("r2");
+
+    // Lifecycle jams; everything else flows.
+    std::atomic<int> compliance_sent{0};
+    auto split_sink = [&](const OutboxEntry& e) -> SendResult {
+        if (e.domain == OutboxDomain::Lifecycle)
+            return SendResult::Retain; // head retained: the window never drains
+        compliance_sent.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    // A 200 ms page cadence against a 2 ms wake bound: cadence alone allows ~5 pages/second,
+    // while a per-cycle re-arm allows hundreds. That gap is what makes this load-bearing.
+    GuardianOutboxDrainWorker worker(*rig.rt, split_sink, /*periodic_bound_ms=*/2,
+                                     {.journal = rig.journal,
+                                      .page_interval = 200ms,
+                                      .prune_interval = 1h});
+    worker.start();
+    CHECK(spin_until([&] { return rig.journal->pages() >= 1; })); // boot page places both
+
+    // Real compliance traffic: a rule on /a whose observed state FLIPS every evaluation, so
+    // each one is a genuine verdict edge and emits. (Evaluating a key with no rule, or with a
+    // stable verdict, emits nothing - and then `drained` is 0 and the buggy condition never
+    // fires, which is how an earlier version of this test passed against the bug.)
+    REQUIRE(rig.rt->attach_rule("cmp", file_spec("/a"), file_exists_rule("cmp"), true));
+    const auto until = std::chrono::steady_clock::now() + 1s;
+    int n = 0;
+    while (std::chrono::steady_clock::now() < until) {
+        // Dense enough that EVERY worker cycle has something to drain. The buggy re-arm
+        // required drained > 0 on the very cycle a page ran, so sparse traffic breaks the
+        // chain by luck and hides the bug.
+        for (int i = 0; i < 8; ++i) {
+            rig.reader->file = read_known(FileSnapshot{.exists = (n % 2 == 0)});
+            rig.rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
+            ++n;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    worker.stop();
+
+    const auto pages = rig.journal->pages();
+    INFO("pages=" << pages << " compliance_sent=" << compliance_sent.load() << " evals=" << n);
+    // ~1 s at a 200 ms cadence: a handful. Generous ceiling so this fails on the BUG, not on
+    // scheduling jitter - the buggy condition produced pages on essentially every cycle.
+    // MEASURED, not guessed: with the fix this is a stable 5 (1 s at a 200 ms cadence, plus
+    // the boot page); with the buggy condition it was 9-11 across repeated runs, because each
+    // cadence page re-armed exactly one extra page whose drain then found nothing, breaking
+    // the chain. 7 sits in that gap. Note the amplification is ~2x and self-limiting rather
+    // than the unbounded event-rate loop it was first reported as - the extra cycle runs
+    // microseconds later, so there is nothing left for it to drain.
+    CHECK(pages <= 7);
 }
