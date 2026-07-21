@@ -561,7 +561,12 @@ metadata:
     `codesign --verify --deep --strict` and reports an honest macOS
     signature status (valid, unsigned, invalid, unknown) — a different
     vocabulary from Authenticode, since codesign/Gatekeeper model trust
-    differently than WinVerifyTrust. Returns error on Linux.
+    differently than WinVerifyTrust. On macOS, `valid` means the code
+    signature's seal is INTACT (integrity: the binary/bundle is unmodified
+    since signing) — it does NOT mean the signer is trusted, notarized, or
+    accepted by Gatekeeper; an ad-hoc or self-signed binary reports `valid`.
+    This is a weaker assurance than the Windows `valid`, which also validates
+    the certificate chain to a trusted root. Returns error on Linux.
   tags: [filesystem, security, compliance, authenticode, codesign]
 
 spec:
@@ -595,6 +600,12 @@ spec:
     columns:
       - name: signature_status
         type: string
+        description: >
+          Signature verdict. On Windows: valid/unsigned/distrusted/untrusted
+          (Authenticode chain trust). On macOS: valid/unsigned/invalid/unknown
+          — here `valid` means the code signature's seal is intact
+          (INTEGRITY only: unmodified since signing), NOT that the code is
+          trusted or notarized; an ad-hoc/self-signed binary reports `valid`.
 
   readablePayload: "Check code signature of ${path}"
 
@@ -700,7 +711,7 @@ kind: InstructionDefinition
 metadata:
   id: device.filesystem.get_version_info
   displayName: Get File Version Info
-  version: 0.4.0
+  version: 0.5.0
   description: >
     Extract version information from an executable or app bundle. On
     Windows, reads the PE version resource (FileVersion, ProductVersion,

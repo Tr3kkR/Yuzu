@@ -38,8 +38,11 @@
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -74,18 +77,14 @@
 #pragma comment(lib, "version.lib")
 #else
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
-#include <mutex>
-#include <yuzu/agent/fork_lock.hpp> // yuzu::agent::global_fork_lock (BR-001)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (#2273)
 #endif
 
 #ifdef __APPLE__
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (#2273)
-#include "filesystem_macos_sig.hpp"         // yuzu::filesystem_macos classifiers
+#include "filesystem_macos_sig.hpp" // yuzu::filesystem_macos classifiers
 #endif
 
 namespace {
@@ -248,91 +247,72 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
 #else
 
 std::string compute_hash_unix(const std::string& path, std::string_view algorithm) {
-    // Use execvp-based approach to avoid shell injection via path
+    // Route the hash through the shared bounded runner rather than a raw
+    // fork/exec/pipe/waitpid here. The runner (yuzu_agent_core) owns the
+    // BR-001 fork/pipe serialization lock, exec's argv[0] as an ABSOLUTE
+    // path (no PATH search, no shell), enforces a hard wall-clock deadline
+    // that SIGKILLs+reaps a wedged child (FIFO, stalled network mount, huge
+    // adversarial file), and polls the process-wide shutdown-cancel latch --
+    // none of which the old blocking `while(read>0)` drain + `waitpid(.,0)`
+    // could do. This is called per file inside do_find_by_hash's directory
+    // walk, so a single stalled hash must never wedge agent shutdown.
 
-    // BR-001: serialize pipe-creation-through-fork against every other
-    // fork/popen launcher in the agent (see fork_lock.hpp's contract) --
-    // held from here through fork() below; every early return in between
-    // releases it via this lock's destructor.
-    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
-
-    int pipe_fd[2];
-    if (pipe(pipe_fd) != 0)
-        return {};
-
-    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC on
-    // both pipe ends before the lock is released, so a concurrent locked
-    // launcher forking in the unlock->close window can never inherit a live,
-    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
-    // failed pipe() above rather than silently forking with a leaky fd.
-    if (fcntl(pipe_fd[0], F_SETFD, FD_CLOEXEC) == -1 ||
-        fcntl(pipe_fd[1], F_SETFD, FD_CLOEXEC) == -1) {
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        return {};
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
-        return {};
-    }
-
-    if (pid == 0) {
-        // Child: inherits fork_pipe_lock already locked -- NEVER lock,
-        // unlock, or otherwise touch it (see fork_lock.hpp's contract). Safe
-        // because this branch never returns through a normal C++ path -- it
-        // always _exit()s or execs below.
-        close(pipe_fd[0]);
-        dup2(pipe_fd[1], STDOUT_FILENO);
-        close(pipe_fd[1]);
-
-        // Absolute paths only: no PATH search in the async-signal-safe child
-        // (matches subprocess_runner.cpp's BR-003 execv rationale).
+    // Resolve the hash tool's ABSOLUTE path. macOS ships shasum at a fixed
+    // location; Linux coreutils live in /usr/bin on glibc distros but in
+    // /bin on Alpine/musl/busybox, so probe both and use whichever is
+    // executable instead of hard-coding one (which regressed such endpoints).
+    std::vector<std::string> argv;
 #ifdef __APPLE__
-        if (algorithm == "sha1") {
-            execl("/usr/bin/shasum", "shasum", "-a", "1", path.c_str(), nullptr);
-        } else {
-            execl("/usr/bin/shasum", "shasum", "-a", "256", path.c_str(), nullptr);
-        }
+    argv = {"/usr/bin/shasum", "-a", (algorithm == "sha1" ? std::string{"1"} : std::string{"256"}),
+            path};
 #else
-        if (algorithm == "sha1") {
-            execl("/usr/bin/sha1sum", "sha1sum", path.c_str(), nullptr);
-        } else {
-            execl("/usr/bin/sha256sum", "sha256sum", path.c_str(), nullptr);
+    const char* candidates[2];
+    if (algorithm == "sha1") {
+        candidates[0] = "/usr/bin/sha1sum";
+        candidates[1] = "/bin/sha1sum";
+    } else {
+        candidates[0] = "/usr/bin/sha256sum";
+        candidates[1] = "/bin/sha256sum";
+    }
+    std::string tool;
+    for (const char* candidate : candidates) {
+        if (access(candidate, X_OK) == 0) {
+            tool = candidate;
+            break;
         }
+    }
+    if (tool.empty())
+        return {}; // no coreutils hash tool present -> honest failure (empty)
+    argv = {tool, path};
 #endif
-        _exit(127);
+
+    // Deadline is generous enough for a legitimately large file
+    // (kMaxHashFileSize is 10 GB) while still bounding a truly wedged read;
+    // shutdown-cancel is honored regardless of its length via the runner's
+    // cancel latch, so this is only the hard backstop.
+    auto run = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(300)});
+
+    // Surface a hung/truncated hash tool to operators (sre S1) -- otherwise a
+    // wedged shasum/sha256sum is silent, visible only as an empty-hash error.
+    if (run.timed_out || run.output_truncated) {
+        spdlog::warn("filesystem file_hash: {} on '{}' (timed_out={}, output_truncated={})",
+                     run.timed_out ? "timed out" : "output truncated", path, run.timed_out,
+                     run.output_truncated);
+        return {};
     }
+    if (!run.tool_ran || run.exit_code != 0)
+        return {};
 
-    // Parent: fork() has returned and this is not the child branch --
-    // release the pipe-creation lock now (see fork_lock.hpp's contract).
-    fork_pipe_lock.unlock();
-
-    close(pipe_fd[1]);
-
-    std::string result;
-    std::array<char, 256> buf{};
-    ssize_t n;
-    while ((n = read(pipe_fd[0], buf.data(), buf.size())) > 0) {
-        result.append(buf.data(), static_cast<size_t>(n));
-    }
-    close(pipe_fd[0]);
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-
-    // Output format: "HASH  filename" or "HASH filename"
-    auto space = result.find(' ');
-    if (space != std::string::npos) {
-        return result.substr(0, space);
-    }
-    return result;
+    // Output format: "HASH  filename" or "HASH filename" -- take the leading
+    // hex digest (identical output contract to the previous raw-fork parse).
+    std::string_view out{run.output};
+    while (!out.empty() && (out.front() == '\n' || out.front() == '\r' || out.front() == ' '))
+        out.remove_prefix(1);
+    auto space = out.find_first_of(" \t\r\n");
+    if (space != std::string_view::npos)
+        return std::string{out.substr(0, space)};
+    return std::string{out};
 }
 
 #endif
@@ -457,20 +437,6 @@ std::string select_info_plist(const std::string& validated, std::string_view bas
     }
 
     return validate_path(candidate, base_dir);
-}
-
-// plutil hands back the plist value verbatim -- an untrusted Info.plist can
-// embed a pipe or a CR/LF into CFBundleShortVersionString/CFBundleVersion,
-// which would otherwise corrupt the pipe-delimited output framing (read as
-// extra columns/rows downstream). Escape pipes and fold line breaks to
-// spaces before the value ever reaches write_output.
-std::string safe_output_field(std::string_view value) {
-    auto out = yuzu::util::escape_pipes(value);
-    for (char& ch : out) {
-        if (ch == '\r' || ch == '\n')
-            ch = ' ';
-    }
-    return out;
 }
 #endif // __APPLE__
 
@@ -1129,6 +1095,17 @@ private:
             {"/usr/bin/codesign", "--verify", "--deep", "--strict", validated},
             yuzu::agent::SubprocessOptions{.merge_stderr = true});
 
+        // sre S1: surface a hung/truncated codesign to operators -- the
+        // unknown verdict below is honest but indistinguishable from a
+        // genuine unknown without this, so a wedged tool would otherwise be
+        // silent in the agent log.
+        if (run.timed_out || run.output_truncated) {
+            spdlog::warn("filesystem get_signature: codesign {} on '{}' (timed_out={}, "
+                         "output_truncated={})",
+                         run.timed_out ? "timed out" : "output truncated", validated, run.timed_out,
+                         run.output_truncated);
+        }
+
         // PLAN-02: a codesign killed at the deadline can still have
         // tool_ran=true, a nonzero exit_code, and partial stderr diagnostics
         // captured before the SIGKILL -- classify_codesign_result would read
@@ -1380,6 +1357,22 @@ private:
             {"/usr/bin/plutil", "-extract", "CFBundleVersion", "raw", "-o", "-", info_plist},
             yuzu::agent::SubprocessOptions{});
 
+        // sre S1: surface a hung/truncated plutil to operators -- either run
+        // going honest-absent below is indistinguishable from a genuinely
+        // absent key without this, so a wedged tool would otherwise be silent.
+        if (short_ver_run.timed_out || short_ver_run.output_truncated) {
+            spdlog::warn("filesystem get_version_info: plutil CFBundleShortVersionString {} on "
+                         "'{}' (timed_out={}, output_truncated={})",
+                         short_ver_run.timed_out ? "timed out" : "output truncated", info_plist,
+                         short_ver_run.timed_out, short_ver_run.output_truncated);
+        }
+        if (build_ver_run.timed_out || build_ver_run.output_truncated) {
+            spdlog::warn("filesystem get_version_info: plutil CFBundleVersion {} on '{}' "
+                         "(timed_out={}, output_truncated={})",
+                         build_ver_run.timed_out ? "timed out" : "output truncated", info_plist,
+                         build_ver_run.timed_out, build_ver_run.output_truncated);
+        }
+
         // PLAN-02: a plutil run killed at the deadline, or one whose capture
         // hit the 1MB output_truncated cap, is honest-absent, never handed
         // to classify_plutil_extract (which would otherwise trust a partial
@@ -1400,12 +1393,20 @@ private:
             return 0;
         }
 
+        // plutil hands back the plist value verbatim -- an untrusted
+        // Info.plist can embed a pipe, a backslash, or a CR/LF into
+        // CFBundleShortVersionString/CFBundleVersion, which would otherwise
+        // corrupt the pipe-delimited output framing. yuzu::util::safe_output_field
+        // is the SDK-canonical escape: it folds a literal '\' to '/' (the
+        // shared server decoder only undoes "\|", so a raw backslash would
+        // survive as ambiguous data), folds CR/LF to spaces, and escapes
+        // pipes -- stronger than an inline pipe+CRLF-only escape.
         if (short_ver.available)
             ctx.write_output(
-                std::format("product_version|{}", safe_output_field(short_ver.value)));
+                std::format("product_version|{}", yuzu::util::safe_output_field(short_ver.value)));
         if (build_ver.available)
             ctx.write_output(
-                std::format("file_version|{}", safe_output_field(build_ver.value)));
+                std::format("file_version|{}", yuzu::util::safe_output_field(build_ver.value)));
 
         return 0;
 #else

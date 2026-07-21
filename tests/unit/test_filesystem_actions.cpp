@@ -24,9 +24,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-// yuzu::util::escape_pipes -- used by the safe_output_field replica below
-// (do_get_version_info macOS output-framing fix, already linked into this
-// test binary via yuzu_sdk_dep; see test_string_utils.cpp for precedent).
+// yuzu::util::safe_output_field -- do_get_version_info now calls the SDK
+// helper directly (no plugin-local copy), so the output-framing tests below
+// exercise that exact function rather than a replica (already linked into
+// this test binary via yuzu_sdk_dep; see test_string_utils.cpp for precedent).
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
@@ -287,21 +288,6 @@ yuzu::filesystem_macos::PlutilExtractResult version_field_for(bool timed_out,
     if (timed_out || output_truncated)
         return {};
     return yuzu::filesystem_macos::classify_plutil_extract(tool_ran, exit_code, output);
-}
-
-// ── Replicated: safe_output_field (do_get_version_info macOS output framing)
-// A raw plist value is interpolated into a pipe-delimited output line --
-// escape embedded pipes and fold CR/LF to spaces before it ever reaches
-// write_output, so an untrusted Info.plist value cannot inject extra
-// columns/rows into the response.
-
-std::string safe_output_field(std::string_view value) {
-    auto out = yuzu::util::escape_pipes(value);
-    for (char& ch : out) {
-        if (ch == '\r' || ch == '\n')
-            ch = ' ';
-    }
-    return out;
 }
 
 } // namespace
@@ -1310,20 +1296,22 @@ TEST_CASE("BR-008: a truncated plutil capture is honest-absent despite a clean e
     CHECK(result.available == false);
 }
 
-// ── safe_output_field (do_get_version_info macOS output framing) ───────────
+// ── yuzu::util::safe_output_field (do_get_version_info macOS output framing)
 // A raw CFBundleShortVersionString/CFBundleVersion value is interpolated
 // into a pipe-delimited output line -- an untrusted Info.plist must not be
-// able to inject extra columns (via `|`) or extra rows (via embedded
-// CR/LF) into the response.
+// able to inject extra columns (via `|`), extra rows (via embedded CR/LF),
+// or ambiguous data (via a literal backslash the shared decoder can't undo).
+// do_get_version_info now calls the SDK helper directly (SHOULD-1), so these
+// tests exercise that exact function.
 
 TEST_CASE("SafeOutputField: a plain version string passes through unchanged",
           "[filesystem][output_framing]") {
-    CHECK(safe_output_field("1.2.3") == "1.2.3");
+    CHECK(yuzu::util::safe_output_field("1.2.3") == "1.2.3");
 }
 
 TEST_CASE("SafeOutputField: an embedded pipe is escaped, not left as a column separator",
           "[filesystem][output_framing]") {
-    auto out = safe_output_field("1.0\nversion_status|not_available");
+    auto out = yuzu::util::safe_output_field("1.0\nversion_status|not_available");
     CHECK(out.find('\n') == std::string::npos);
     // The literal '|' must be escaped (\|), never a bare delimiter.
     CHECK(out.find("status|not_available") == std::string::npos);
@@ -1331,8 +1319,18 @@ TEST_CASE("SafeOutputField: an embedded pipe is escaped, not left as a column se
 
 TEST_CASE("SafeOutputField: embedded CR/LF is folded to spaces, not left as a row break",
           "[filesystem][output_framing]") {
-    auto out = safe_output_field("1.0\r\nfile_version|9.9.9");
+    auto out = yuzu::util::safe_output_field("1.0\r\nfile_version|9.9.9");
     CHECK(out.find('\r') == std::string::npos);
     CHECK(out.find('\n') == std::string::npos);
     CHECK(out == "1.0  file_version\\|9.9.9");
+}
+
+TEST_CASE("SafeOutputField: a literal backslash folds to '/' (SDK helper, stronger than the "
+          "old plugin-local copy)",
+          "[filesystem][output_framing]") {
+    // The shared server decoder only undoes "\|"; a raw backslash would
+    // otherwise survive as ambiguous data. The SDK helper folds it to '/'.
+    // This is exactly the behaviour the removed plugin-local safe_output_field
+    // LACKED, and the reason do_get_version_info now uses the SDK one.
+    CHECK(yuzu::util::safe_output_field("1.0\\beta") == "1.0/beta");
 }

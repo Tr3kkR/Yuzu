@@ -98,6 +98,16 @@ inline SignatureStatus classify_codesign_result(bool tool_ran, int exit_code,
     if (!tool_ran)
         return SignatureStatus::unknown;
 
+    // HONEST SEMANTICS: on macOS `valid` means the code signature's SEAL is
+    // intact -- `codesign --verify --deep --strict` exited 0, proving the
+    // Mach-O/bundle has not been modified since it was signed. It does NOT
+    // mean the signer is trusted, notarized, or accepted by Gatekeeper: an
+    // ad-hoc or self-signed binary passes this check. This is a WEAKER
+    // assurance than Windows WinVerifyTrust's `valid`, which additionally
+    // validates the Authenticode certificate chain up to a trusted root.
+    // Establishing trust/notarization would require spctl (Gatekeeper
+    // assessment), deliberately out of scope here -- so `valid` is reported
+    // as integrity-only, never as a trust verdict.
     if (exit_code == 0)
         return SignatureStatus::valid;
 
