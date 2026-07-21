@@ -1,0 +1,1 @@
+- Flagged the frozen `docs/guardian-mvp-contract.md` Guardian journal decisions (item 11, G6) as superseded by the shipped "Option A" characterization (crash-durable, duplicate-tolerant, bounded-retry, not true at-least-once), with a pointer to `docs/user-manual/guaranteed-state.md`'s corrected wording, so the frozen record no longer conflicts with the live docs.

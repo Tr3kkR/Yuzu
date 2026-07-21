@@ -229,6 +229,14 @@ used as-is — they aren't renames, so they create no split-brain.
     the durable journal with **no wire/contract change** — the durable journal is the
     standing target.
 
+    **Superseded (2026-07-21):** the delivered journal narrowed this to "Option A" -
+    crash-durable, duplicate-tolerant, bounded-retry redelivery, not true at-least-once
+    (no server batch-ack). Delete-only-after-server-ack was never built; deletion is
+    retention-driven instead, and an entry that ages out unacknowledged is a rare,
+    counted loss, not silent. See `docs/user-manual/guaranteed-state.md`'s "Reconnect
+    replay traffic" section and the `yuzu_server_guardian_events_redelivered_total` row
+    in `docs/user-manual/metrics.md` for the shipped characterization.
+
 ## 5. Deltas / amendments to `yuzu-guardian-design-v1.1.md`
 
 - **§6/§7 (DSL & wire):** the agent enforces from **typed proto structured blocks**,
@@ -416,6 +424,10 @@ use the `frontend-design` plugin** (product UI, not marketing). Page pattern:
   `event_id`, ring-buffer bound, HMAC deferred PR 12). The G2 event-sink is
   durability-agnostic → in-memory queue allowed for the first demo, durable journal
   swaps in with no contract change. Decision 9 already closed the reconnect half.
+  **Superseded (2026-07-21):** delivered as "Option A" - crash-durable,
+  duplicate-tolerant, bounded-retry, not true at-least-once; see Decision 11 above and
+  `docs/user-manual/guaranteed-state.md`'s "Reconnect replay traffic" section for the
+  shipped characterization.
 - **N2 — status reporting cadence (RESOLVED: transition-only + heartbeat liveness).**
   Rich `GuaranteedStateStatus` is sent at sync/reconnect then **only on transition** — no
   periodic resend (network-kind). Liveness/staleness derives from the **Heartbeat**, not
