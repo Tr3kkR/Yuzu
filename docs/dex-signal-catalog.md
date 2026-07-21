@@ -44,6 +44,7 @@ projection (`guardian_observations`), and in the dashboard:
 | `symbolic` | Human name for reason | `ACCESS_VIOLATION`, `WIFI_DISCONNECT` |
 | `component` | Secondary entity | `ntdll.dll` (faulting module), NIC description, MAC |
 | `metric` | Numeric payload where the signal IS a number | boot duration ms |
+| `version` | Failing app's version on crash/hang signals, canonicalised to the 4-group quad by `yuzu::util::canon_version` — Windows WER `AppVersion`, macOS `.ips` `app_version` / `bundleInfo.CFBundleShortVersionString`; `""` = the shared unknown bucket (Linux; unversioned binaries) | `3.2.1.0` |
 
 `process.crashed` additionally dual-emits the legacy slice-1 keys
 (`process`/`exception_code`/`faulting_module`) for the PR #1311 transition;
