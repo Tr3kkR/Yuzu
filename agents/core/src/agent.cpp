@@ -2118,15 +2118,24 @@ public:
 #endif
                             }
 
-                            // Slice 4a: device network-quality facts (Linux
-                            // netlink TCP_INFO + /proc/net/dev throughput) — the
-                            // ONLY channel for the fleet net gauges + /network
+                            // Slice 4a: device network-quality facts — the ONLY
+                            // channel for the fleet net gauges + /network
                             // Overview, same as the perf tags above. Gated like
                             // perf; this is aggregate device telemetry with NO
                             // per-destination data (that warehouse tier + its
-                            // own opt-in are a later slice). Off Linux the sample
-                            // is all-invalid, so no tags ship (absent, not zero).
-                            if (!cfg_.dex_disable) {
+                            // own opt-in are a later slice). Per-platform
+                            // coverage: Linux ships RTT + retransmit +
+                            // throughput (netlink TCP_INFO + /proc/net/dev);
+                            // Windows ships throughput + retransmit
+                            // (GetIfTable2 + GetTcpStatisticsEx, RTT deferred);
+                            // macOS ships throughput only (NET_RT_IFLIST2,
+                            // retransmit + RTT deferred); other platforms are
+                            // all-invalid, so no tags ship (absent, not zero).
+                            // Same containment as the perf block above: a throw
+                            // here (bad_alloc sizing the routing buffer,
+                            // std::format) must not unwind out of the heartbeat
+                            // thread. Swallow; the tags are omitted this cycle.
+                            if (!cfg_.dex_disable) try {
                                 const auto net_cur = netq::read_net_counters();
                                 const auto ns =
                                     netq::sample_net_quality(hb_prev_net, net_cur);
@@ -2158,6 +2167,11 @@ public:
                                 if (ns.throughput_valid)
                                     tags["yuzu.net_throughput_bps"] =
                                         std::format("{:.0f}", ns.throughput_bps);
+                            } catch (...) {
+                                // Omitted this cycle; next heartbeat retries.
+                                // catch (...) like the perf/spark blocks: the
+                                // heartbeat thread has no top-level handler, so
+                                // anything narrower risks std::terminate.
                             }
 
                             // SparkEngine fleet telemetry (ADR-0021 Stage-2 rung 1 —
