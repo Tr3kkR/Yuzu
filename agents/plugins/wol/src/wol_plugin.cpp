@@ -294,10 +294,20 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
         count = 3;
     }
 
-    // Build ping command
+    // Build ping command.
+    // The per-reply timeout flag differs across ping implementations:
+    //   Windows  `-w <ms>`  — per-reply timeout in milliseconds.
+    //   Linux    `-W <sec>` — per-reply timeout in seconds (iputils).
+    //   macOS/BSD `-W <ms>` — per-reply timeout in milliseconds; the whole-run
+    //                         deadline is `-t <sec>`. Passing `-W 2` on Darwin
+    //                         means "wait 2 ms", an instant timeout that reports
+    //                         a live host as unreachable. Use `-t <sec>` instead.
+    // (Mirrors discovery_plugin.cpp's ping_host three-way branch.)
     std::string cmd;
 #ifdef _WIN32
     cmd = std::format("ping -n {} -w 2000 {} 2>&1", count, host);
+#elif defined(__APPLE__)
+    cmd = std::format("ping -c {} -t 2 {} 2>&1", count, host);
 #else
     cmd = std::format("ping -c {} -W 2 {} 2>&1", count, host);
 #endif
