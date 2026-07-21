@@ -717,3 +717,121 @@ TEST_CASE("a prune failure does not swallow a forced reconnect page",
     CHECK(spin_until([&] { return sink.count() >= 1; }));
     worker.stop();
 }
+
+// A send shaped like the PRODUCTION one (agent.cpp send_guardian_outbox_entry): writes to a
+// stream that may be absent, and reports Retain - not an exception, not a drop - whenever the
+// link is down or the write fails. Every other test here uses an always-Sent sink, which never
+// exercises head-retention, the backlog it builds, or the drain-stops-at-the-head behaviour
+// that Retain triggers (#2298 Sol review).
+struct StreamLikeSink {
+    std::mutex mu;
+    bool stream_up{false};       ///< nullptr guardian_sink_stream_ equivalent
+    bool write_fails{false};     ///< Write() returning false equivalent
+    std::vector<std::string> sent_ids;
+
+    SendResult operator()(const OutboxEntry& e) {
+        std::lock_guard<std::mutex> lk{mu};
+        if (!stream_up || write_fails)
+            return SendResult::Retain; // keep the head and stop this pass
+        sent_ids.push_back(e.event_id);
+        return SendResult::Sent;
+    }
+    std::size_t count() {
+        std::lock_guard<std::mutex> lk{mu};
+        return sent_ids.size();
+    }
+    void set_stream(bool up) {
+        std::lock_guard<std::mutex> lk{mu};
+        stream_up = up;
+    }
+};
+
+TEST_CASE("a link-down/reconnect cycle with REAL Retain semantics loses nothing",
+          "[spark][guardian][drain][maint]") {
+    // The end-to-end shape C0 has to survive at cutover: entries pile up while the link is
+    // down (send Retains, journal persists), then the link returns and the reconnect kick has
+    // to get the whole backlog moving - including the case Sol raised, where the send window
+    // is already full so the kick's page places nothing and only the drain frees room.
+    JournalRig rig;
+    StreamLikeSink sink; // starts with the stream DOWN
+
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/20,
+                                     {.journal = rig.journal,
+                                      // Small drain budget so the backlog needs several
+                                      // truncated passes, exercising the re-drain path.
+                                      .drain_budget = 3});
+    worker.start();
+
+    // Link DOWN: arm rules, and persist their staged records durably the way the heartbeat's
+    // retry-persist would.
+    for (int i = 0; i < 12; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+    {
+        auto pending = rig.rt->snapshot_pending();
+        if (!pending.empty()) {
+            std::vector<PersistedBatch> batches;
+            const std::size_t written = rig.journal->persist(pending, &batches);
+            if (written > 0)
+                rig.rt->erase_persisted_prefix(written);
+        }
+    }
+    std::this_thread::sleep_for(100ms); // several wakes, all Retaining
+    CHECK(sink.count() == 0);           // nothing shipped while the link was down
+
+    // Link UP + the reconnect kick.
+    sink.set_stream(true);
+    worker.notify();
+
+    // Everything must arrive, without needing a second kick.
+    CHECK(spin_until([&] { return sink.count() >= 12; }, 10s));
+    worker.stop();
+
+    std::lock_guard<std::mutex> lk{sink.mu};
+    const std::set<std::string> unique(sink.sent_ids.begin(), sink.sent_ids.end());
+    // NO LOSS is the assertion. Deliberately NOT exactly-once: the durable journal is
+    // AT-LEAST-ONCE by design - it replays on every reconnect, and an entry that was already
+    // sent and popped from the window before the replay pass gets re-sent. The server
+    // de-duplicates on the event_id primary key and counts it as
+    // yuzu_server_guardian_events_redelivered_total, which docs/user-manual/metrics.md
+    // documents as expected after an outage and explicitly NOT a loss signal. An earlier
+    // draft of this test asserted exactly-once and failed - the assertion was wrong, not the
+    // code, and pinning the real contract here is the point.
+    CHECK(unique.size() == 12);          // every distinct event arrived
+    CHECK(sink.sent_ids.size() >= 12);   // redelivery is permitted, loss is not
+}
+
+TEST_CASE("a mid-drain link drop retains the head and resumes without loss",
+          "[spark][guardian][drain][maint]") {
+    // Retain is not a failure - it means "keep the head, stop this pass". A link that drops
+    // PART WAY through a backlog must therefore leave the remainder intact and resume from
+    // exactly where it stopped once the stream returns.
+    JournalRig rig;
+    StreamLikeSink sink;
+    sink.set_stream(true);
+
+    for (int i = 0; i < 10; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+
+    // Ship a few, then drop the link mid-backlog.
+    GuardianSparkRuntime::DrainLimits limits;
+    limits.max_entries = 4;
+    const auto first = rig.rt->drain_bounded(std::ref(sink), limits);
+    CHECK(first.sent == 4);
+
+    sink.set_stream(false);
+    const auto during_outage = rig.rt->drain_bounded(std::ref(sink), limits);
+    CHECK(during_outage.sent == 0);        // the head is retained, not consumed
+    CHECK_FALSE(during_outage.truncated);  // Retain is not a limit hit - do NOT hot-loop
+
+    sink.set_stream(true);
+    rig.rt->drain(std::ref(sink)); // unbounded catch-up
+    CHECK(sink.count() == 10);
+
+    std::lock_guard<std::mutex> lk{sink.mu};
+    std::set<std::string> unique(sink.sent_ids.begin(), sink.sent_ids.end());
+    CHECK(unique.size() == 10); // nothing lost, nothing duplicated across the outage
+}
