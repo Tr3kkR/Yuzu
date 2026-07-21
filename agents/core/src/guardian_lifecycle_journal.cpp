@@ -282,6 +282,13 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     if (!kv_)
         return stats;
 
+    // Shutdown began: a prune pass is a full-journal scan plus one KvStore read per evicted key,
+    // each able to block on the 5 s busy timeout. Bail BEFORE starting so the drain-worker join
+    // in GuardianEngine::stop() is not held up by retention work nobody will observe (C0 #2298).
+    // read_ok stays false, so the page-side boot barrier does NOT latch on a stop-aborted pass.
+    if (stopping_.load(std::memory_order_acquire))
+        return stats;
+
     if (inject_fail_reads_.load(std::memory_order_relaxed) > 0) { // test-only injected read fault
         inject_fail_reads_.fetch_sub(1, std::memory_order_relaxed);
         prune_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -410,6 +417,11 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         journal_batch_count_.fetch_sub(static_cast<std::int64_t>(n), std::memory_order_relaxed);
         journal_bytes_.fetch_sub(evicted_bytes, std::memory_order_relaxed);
         for (const auto& key : evict) {
+            // Shutdown mid-classification: the eviction itself is already committed and counted;
+            // only the best-effort sent/unsent split of the REMAINING keys is skipped, one KvStore
+            // read each (C0 #2298 - keeps the drain-worker join prompt on a large evict set).
+            if (stopping_.load(std::memory_order_acquire))
+                break;
             // Best-effort classification: a live entry may age out before its batch key exists,
             // so absence of a sent-label != "never sent".
             if (kv_->exists(kJournalNamespace, journal_sent_key_from_batch_key(key)))
@@ -428,6 +440,12 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     for (const auto& l : live)
         if (!evicted_set.count(l.key))
             survivors.insert(l.key);
+
+    // Shutdown: skip the two remaining housekeeping scans (label GC + quarantine bounding). Both
+    // are best-effort and idempotent - the next boot's prune redoes them - and each is another
+    // full list_entries + del_keys against a possibly-contended KvStore (C0 #2298).
+    if (stopping_.load(std::memory_order_acquire))
+        return stats;
 
     // Sent-label GC: drop any sent:<...> whose batch no longer survives - an evicted batch's
     // label, or an orphan from a crash between the pop-after-send label write and eviction.
@@ -467,6 +485,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                                                            std::int64_t now_ms) {
     JournalPageStats stats;
     if (!kv_)
+        return stats;
+    // Shutdown began: page nothing at all. The mid-loop gate below already stops the window
+    // mutation; checking here (and BEFORE paging_mutex_, so we never queue behind an in-flight
+    // prune) also skips the boot-prune barrier's full scan and the candidate-build rename pass,
+    // so a stop during maintenance does not delay the drain-worker join (C0 #2298).
+    if (stopping_.load(std::memory_order_acquire))
         return stats;
     std::lock_guard<std::mutex> pg{paging_mutex_};
 
@@ -521,6 +545,11 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     const std::int64_t min_ts =
         now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
     for (auto& row : *rows) {
+        // Shutdown mid-scan: this loop can issue one rename_key per corrupt row, so bail rather
+        // than finish quarantining a large journal (C0 #2298). Nothing has been paged yet, so
+        // returning here mutates no window and counts no pass; the next boot re-scans.
+        if (stopping_.load(std::memory_order_acquire))
+            return stats;
         auto b = parse_journal_batch(row.value);
         if (!b)
             continue; // unparseable: prune quarantines it (runs before page via the barrier + tick)

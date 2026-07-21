@@ -129,7 +129,9 @@ public:
     /// sent-labels whose batch no longer survives. `now_ms` is the wall clock in ms
     /// (a parameter so age eviction is testable). Fail-safe: a read error counts
     /// prune_failures and returns, never throws, never fatal. Runs off mtx_ (KvStore
-    /// serialises itself); wired into the tick phase-2 + a boot barrier in C5.
+    /// serialises itself); wired into the drain worker's maintenance pass (C0 #2298) + a
+    /// boot barrier inside page_into_window. Honors request_stop() early and between the
+    /// per-evicted-key reads, so a stop never waits out a full retention pass.
     JournalPruneStats prune(std::int64_t now_ms);
 
     /// Replay the durable journal into `rt`'s send window (design §5; item 7 PR-Ag C5).
@@ -150,6 +152,9 @@ public:
     /// Signal that shutdown has begun: a concurrent page_into_window pass observes this
     /// between batches and stops enqueuing, so a late page never mutates the send window
     /// after stop() joins the drain worker (rev-4.1 #7 stop-race gate). Idempotent, lock-free.
+    /// C0 (#2298) widened the gate: BOTH prune and page also check it on entry and at each
+    /// remaining KvStore-loop boundary, because both now run ON the drain-worker thread that
+    /// GuardianEngine::stop() joins - an unchecked full pass would become join latency.
     void request_stop() noexcept { stopping_.store(true, std::memory_order_release); }
 
     // Integrity counters (design §2 loss table). Lock-free.
