@@ -750,18 +750,14 @@ private:
         }
 
 #elif defined(__APPLE__)
-        auto result = run_command("dscacheutil -cachedump -entries 2>/dev/null");
-        if (!result.empty()) {
-            std::istringstream ss(result);
-            std::string line;
-            while (std::getline(ss, line)) {
-                if (!line.empty()) {
-                    ctx.write_output(std::format("cache_entry|{}", line));
-                }
-            }
-        } else {
-            ctx.write_output("dns_cache|not_available");
-        }
+        // macOS does not expose resolver-cache CONTENTS to userspace. dscacheutil
+        // -cachedump was gutted years ago: on macOS 26 it prints "Unable to get
+        // details from the cache node" to stderr and exits 0 (see darwin-compat).
+        // So there is nothing to shell out to — it can only ever fail. This is a
+        // permanent OS capability gap, not a transient failure, so report it as
+        // such rather than the ambiguous not_available (which invites a pointless
+        // retry and reads like a query that might succeed next time).
+        ctx.write_output("dns_cache|unsupported|macOS does not expose DNS resolver cache contents");
 #endif
         return 0;
     }

@@ -1,11 +1,18 @@
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
 #include "spark_key_rule_index.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 
@@ -28,21 +35,6 @@ std::string make_boot_nonce() {
     return s;
 }
 
-/// Generic scope-exit guard: runs `fn` in its destructor unless `committed` was
-/// set. Used by attach_rule() to unwind a mid-construction exception (Sol rung-7.5
-/// review finding 1): without it, a bad_alloc from a map/set insertion AFTER
-/// backend_->arm() has already succeeded would leave a LIVE SparkEngine
-/// subscription that no rule_id tracks - spark_armed_rule_count() reports it
-/// nowhere, but the mechanism keeps watching it forever.
-struct ScopeExit {
-    std::function<void()> fn;
-    bool committed{false};
-    ~ScopeExit() {
-        if (!committed && fn)
-            fn();
-    }
-};
-
 } // namespace
 
 GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
@@ -57,7 +49,11 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
       boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
-      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {}
+      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {
+    // Reserve the staging vector ONCE - never from rule count. push_back then never
+    // reallocates, which is what makes stage_pending_locked's noexcept contract real.
+    pending_journal_.reserve(kMaxPendingJournalRecords);
+}
 
 GuardianSparkRuntime::~GuardianSparkRuntime() {
     // No in-flight pass can be running: a pass keeps the runtime alive through the
@@ -98,6 +94,10 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         detach_rule_locked(rule_id);
 
         const std::uint64_t gen = ++gen_counter_;
+        // Capture the lifecycle metadata before `assertion` is moved into rg below;
+        // the "armed" audit entry (and any prior "disarmed" from detach above) needs it.
+        const std::string rule_name = assertion.rule_name;
+        const char* guard_type = guard_type_for(assertion.kind);
         auto rg = std::make_shared<RuleGeneration>();
         rg->generation = gen;
         rg->active = true;
@@ -105,62 +105,69 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         rg->assertion = std::move(assertion);
         rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
 
-        const bool arm_edge = index_->add(key, rule_id);
-        // `pk` is declared BEFORE `rollback` so it is destroyed AFTER it
-        // (reverse construction order): `rollback`'s destructor lambda
-        // references `pk` by reference, so `pk` must still be alive when
-        // that destructor runs.
+        // `pk`/`sub`/`armed_here` are declared BEFORE `rollback` so they outlive its
+        // destructor (reverse construction order): the rollback lambda reads them by
+        // reference. ONE rollback is installed BEFORE index_->add and backend_->arm, so a
+        // GUARDIAN-side throw - the index add, or any map/set insertion after arm()
+        // RETURNED a subscription (armed_here=true) - unwinds every Guardian-side mutation
+        // and disarms that subscription. The prior code assigned the rollback only AFTER
+        // arm() and per-branch, so a throwing arm() (or a throwing rollback-closure
+        // assignment after the arm) leaked the subscription and left a ghost index entry
+        // that corrupted a future sibling attach. Every undo is a safe no-op if its
+        // mutation never ran, and GuardianRollback's destructor is terminate-safe.
+        // SCOPE LIMIT (Sol B4): if backend_->arm() itself THROWS after partially mutating
+        // SparkEngine (a bad_alloc inside arm_impl, no subscription returned), armed_here
+        // stays false and this rollback cannot clean the engine's partial state - that is
+        // a SparkEngine strong-guarantee gap tracked separately as a PR-2 flip blocker.
+        // (Fable rung-7.7b M3; extends Sol rung-7.5 finding 1.)
         std::shared_ptr<PerKey> pk;
-        // Unwinds EVERY mutation below unless committed - covers any throw
-        // between here and the end of the locked block (map/set insertion
-        // bad_alloc, etc.) so a mid-construction exception cannot leave a
-        // live, untracked SparkEngine subscription, nor a stale rules_/
-        // pending_initial entry with no corresponding key/subscription (Sol
-        // rung-7.5 review finding 1). `rules_.erase`/`pending_initial.erase`
-        // are safe no-ops if those inserts never ran.
-        ScopeExit rollback;
-        if (arm_edge) {
-            auto armed = backend_->arm(spec);
-            if (!armed) {
-                index_->remove_rule(rule_id); // undo: an un-armed key must not linger
-                return std::unexpected(armed.error());
+        std::uint64_t sub = 0;
+        bool armed_here = false;
+        GuardianRollback rollback;
+        rollback.fn = [this, rule_id, key, &sub, &armed_here, &pk] {
+            index_->remove_rule(rule_id); // no-op if add() never ran or threw clean
+            if (armed_here) {
+                // THIS attach created the watcher (0->1 edge under registry_mu_, so it is
+                // the sole rule on the key): tear the new subscription + PerKey down.
+                keys_.erase(key); // no-op if the new PerKey was not yet emplaced
+                backend_->disarm(sub);
             }
-            const std::uint64_t sub = *armed;
-            rollback.fn = [this, rule_id, key, sub, &pk] {
-                const auto vacated = index_->remove_rule(rule_id);
-                keys_.erase(key);
-                if (vacated)
-                    backend_->disarm(sub);
-                rules_.erase(rule_id);
-                if (pk)
-                    pk->pending_initial.erase(rule_id);
-            };
+            rules_.erase(rule_id); // no-op if not yet inserted
+            if (pk)
+                pk->pending_initial.erase(rule_id);
+        };
+
+        const bool arm_edge = index_->add(key, rule_id);
+        if (arm_edge) {
+            auto armed = backend_->arm(spec); // may THROW -> rollback undoes the index add
+            if (!armed)
+                return std::unexpected(armed.error()); // rollback undoes the index add
+            sub = *armed;
+            armed_here = true; // from here a throw also disarms the watcher
             pk = std::make_shared<PerKey>();
             pk->spec = spec;
             pk->subscription = sub;
             keys_.emplace(key, pk);
         } else {
-            pk = keys_.at(key); // an existing shared watcher for this key
-            rollback.fn = [this, rule_id, &pk] {
-                index_->remove_rule(rule_id);
-                rules_.erase(rule_id);
-                if (pk)
-                    pk->pending_initial.erase(rule_id);
-            };
+            pk = keys_.at(key); // an existing shared watcher for this key (armed_here stays false)
         }
 
         rules_.insert_or_assign(rule_id, std::move(rg));
         pk->pending_initial.insert(rule_id);
-        // Audit-on-arm (rung 7, finding 8): a successful arm - spark or legacy -
-        // must not go unaudited. Failure here is counted, never rolls back the
-        // arm itself (the audit trail must not compromise real detection
-        // capability); see enqueue_lifecycle_locked's doc.
-        enqueue_lifecycle_locked(rule_id, gen, "armed");
-        // waker/outbox_waker are copied BEFORE commit: if either copy itself
-        // throws, rollback still runs rather than reporting an exception on
-        // an already-committed arm (Sol rung-7.5 review finding 1).
+        // Copy the wakers (throwing std::function copies) BEFORE the lifecycle enqueue so
+        // a throw here rolls back with NO audit entry yet. The lifecycle log is
+        // append-only and never purged (guardian_outbox.hpp), so a phantom "armed"
+        // enqueued before a throwing waker copy would be permanent evidence of an arm
+        // that actually rolled back (Sol/Fable SHOULD, rung 7.7b).
         waker = pending_initial_waker_;   // copy; call after releasing registry_mu_
         outbox_waker = outbox_enqueue_waker_;
+        // Audit-on-arm (rung 7, finding 8): a successful arm - spark or legacy - must not
+        // go unaudited. Failure here is counted, never rolls back the arm itself (the
+        // audit trail must not compromise real detection capability); see
+        // enqueue_lifecycle_locked's doc. This is the LAST potentially-throwing step, and
+        // it is all-or-nothing (std::list::push_back is strong), so only the noexcept
+        // commit below follows a successful enqueue.
+        enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
         rollback.committed = true;
         new_gen = gen;
     }
@@ -205,6 +212,9 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
     const auto rit = rules_.find(rule_id);
     const bool known = (rit != rules_.end());
     const std::uint64_t gen = known ? rit->second->generation : 0;
+    // Capture the lifecycle metadata before rules_.erase below drops the generation.
+    const std::string rule_name = known ? rit->second->assertion.rule_name : std::string{};
+    const char* guard_type = known ? guard_type_for(rit->second->assertion.kind) : "";
     const auto key_opt = index_->key_for_rule(rule_id); // capture BEFORE removal
     if (known)
         rit->second->active = false; // in-flight evals will not commit
@@ -215,8 +225,12 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         std::lock_guard<std::mutex> ob{outbox_mu_};
         outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
     }
-    if (known)
-        enqueue_lifecycle_locked(rule_id, gen, "disarmed");
+    // Disarm the shared watcher BEFORE the "disarmed" audit enqueue. enqueue_lifecycle_locked
+    // allocates; in the OLD order a throw there left the watcher ARMED while the rule was
+    // already gone from the index - a leaked OS watcher + keys_/index_ desync that breaks a
+    // future same-key re-attach (keys_.emplace no-ops on the stale key) (Gate 2 security
+    // LOW). A throw AFTER the disarm merely loses the audit entry; audit-after-teardown is
+    // the correct causal order anyway.
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
@@ -228,6 +242,8 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         if (kit != keys_.end())
             kit->second->pending_initial.erase(rule_id);
     }
+    if (known)
+        enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
 }
 
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
@@ -352,6 +368,11 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
                 enqueued_any = true;
 
             rg->eval = std::move(scratch); // COMMIT
+            // M1: a committed repeat Unknown (already errored, so build_entries emitted
+            // nothing) is counted here so the edge-suppression is observable, never silent
+            // (Option-A: every loss/suppression channel is a counted metric).
+            if (out.status == EvalStatus::Unhealthy && !out.unhealthy_edge)
+                unhealthy_suppressed_.fetch_add(1, std::memory_order_relaxed);
             // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
             // Unknown does not (it still owes a real verdict).
             if (out.status != EvalStatus::Unhealthy)
@@ -399,17 +420,28 @@ std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneratio
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
     const std::string& rid = gen.assertion.rule_id;
+    // Health entries carry guard_type/rule_name explicitly (the compliance path carries
+    // both inside out.drift). Derived from the assertion, not a spec (#2237 item 4).
+    const char* gtype = guard_type_for(gen.assertion.kind);
+    const std::string& rname = gen.assertion.rule_name;
     std::vector<OutboxEntry> v;
     if (out.recovered) // Unknown -> Known: clear the health stream's errored state first
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
-                                        /*healthy=*/true, {}));
+                                        /*healthy=*/true, {}, gtype, rname));
     if (out.status == EvalStatus::Emit)
         v.push_back(OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms, agent_id),
                                             ns, out.drift));
-    else if (out.status == EvalStatus::Unhealthy)
+    else if (out.status == EvalStatus::Unhealthy && out.unhealthy_edge)
+        // EDGE ONLY (M1): the first Unknown of an errored episode mints one guard.unhealthy.
+        // A repeat Unknown while already errored produces NO entry here (the caller counts it
+        // via unhealthy_suppressed_) - convergence re-evaluates a stuck rule every ~5s to catch
+        // recovery, but must not re-mint a fresh health event each tick (fleet ingest flood).
+        // NOTE: the emitted health_detail is this episode's FIRST read-error string; a reason
+        // that changes across suppressed re-evals while still Unknown (EACCES -> ENODEV) is not
+        // re-surfaced until recovery starts a new episode. Accepted trade for the flood fix.
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
-                                        /*healthy=*/false, out.health_detail));
-    // Silent + !recovered -> empty (nothing to publish).
+                                        /*healthy=*/false, out.health_detail, gtype, rname));
+    // Silent, a suppressed repeat-Unknown, + !recovered -> empty (nothing to publish).
     return v;
 }
 
@@ -424,24 +456,213 @@ std::string GuardianSparkRuntime::make_event_id(const std::string& rule_id, std:
 
 bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
                                                     std::uint64_t generation,
-                                                    const std::string& kind) {
+                                                    const std::string& kind,
+                                                    const std::string& guard_type,
+                                                    const std::string& rule_name) {
     // Called from attach_rule/detach_rule_locked - never on the detached-post-
     // read path - so calling agent_id_fn_() directly (not pre-snapshotted) is
     // safe here, unlike evaluate_key's read path.
-    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const auto wall = std::chrono::system_clock::now().time_since_epoch(); // noexcept arithmetic
     const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
     const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall).count();
-    const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
-    auto entry = OutboxEntry::lifecycle(rule_id, generation, make_event_id(rule_id, ms, agent_id),
-                                        ns, kind);
+
+    if (kind == "armed") {
+        // ARM: every throwing op here PROPAGATES, so attach_rule's GuardianRollback undoes the
+        // arm and nothing is staged (no phantom). The event_id is minted ONCE and shared by the
+        // window entry + the durable record (rev-4.1 #4). The window enqueue is the LAST throwing
+        // op before the caller's noexcept commit; the journal push after it is noexcept.
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        const std::string event_id = make_event_id(rule_id, ms, agent_id);
+        auto entry =
+            OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+        std::shared_ptr<JournalRecord> record =
+            build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing, rolls back arm
+        stage_pending_locked(std::move(record));                        // noexcept
+        return accepted;
+    }
+
+    // DISARM: the teardown already happened, so NO throw may propagate (it would break the
+    // caller mid-teardown). Firewall the WHOLE construction: agent_id, the event_id mint, the
+    // OutboxEntry, and the record all allocate, and a bad_alloc in ANY of them post-teardown is
+    // the reachable journal_stage_failures loss channel (rev-4.1 #5 / review B3). Then stage the
+    // durable record FIRST so a best-effort window-enqueue throw cannot lose a real disarm.
+    OutboxEntry entry;
+    std::shared_ptr<JournalRecord> record;
+    try {
+        const std::string agent_id = agent_id_fn_ ? agent_id_fn_() : std::string{};
+        const std::string event_id = make_event_id(rule_id, ms, agent_id);
+        entry =
+            OutboxEntry::lifecycle(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+        record = build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
+    } catch (...) {
+        journal_stage_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false; // nothing built, nothing to stage or enqueue
+    }
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    return lifecycle_log_.enqueue(std::move(entry));
+    stage_pending_locked(std::move(record)); // durable disarm staged first (noexcept)
+    try {
+        return lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
+    } catch (...) {
+        return false; // window enqueue failed post-teardown; the durable record already stands
+    }
 }
 
-std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
+std::shared_ptr<JournalRecord> GuardianSparkRuntime::build_journal_record(
+    const std::string& rule_id, std::uint64_t generation, const std::string& event_id,
+    std::int64_t enqueued_ns, const std::string& kind, const std::string& guard_type,
+    const std::string& rule_name) {
+    auto jr = std::make_shared<JournalRecord>(
+        JournalRecord{.rule_id = rule_id, .generation = generation, .event_id = event_id,
+                      .enqueued_ns = enqueued_ns, .kind = kind, .guard_type = guard_type,
+                      .rule_name = rule_name});
+    switch (validate_record(*jr)) {
+    case JournalReject::None:
+        return jr;
+    case JournalReject::SkewedClock:
+        journal_clock_rejected_.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    default: // EmbeddedNul / Oversized / InvalidUtf8 - a field the journal cannot carry byte-exact
+        journal_field_rejected_.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+}
+
+void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> record) noexcept {
+    // #2303 K6. The noexcept below is only real because the ctor's reserve() means push_back
+    // never reallocates. That is an invariant of a DIFFERENT function, so assert it here where
+    // it is relied on - if a future edit drops or shrinks the reserve, a debug build trips
+    // immediately instead of a release build calling std::terminate on an OOM realloc.
+    assert(pending_journal_.capacity() >= kMaxPendingJournalRecords &&
+           "pending_journal_ reserve is what makes stage_pending_locked's noexcept real");
+    if (!record)
+        return; // rejected at build - sent live, never journaled
+    if (pending_journal_.size() >= kMaxPendingJournalRecords) {
+        pending_journal_.erase(pending_journal_.begin()); // drop oldest; O(n) only under sustained failure
+        journal_stage_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Reserve is fixed at construction, so this never reallocates and shared_ptr move is
+    // noexcept - the push cannot throw (the enclosing noexcept documents + enforces it).
+    pending_journal_.push_back(std::move(record));
+}
+
+std::vector<std::shared_ptr<const JournalRecord>> GuardianSparkRuntime::snapshot_pending() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    std::size_t sent = outbox_.drain(send);
-    sent += lifecycle_log_.drain(send);
+    return {pending_journal_.begin(), pending_journal_.end()};
+}
+
+void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n) {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    n = std::min(n, pending_journal_.size());
+    pending_journal_.erase(pending_journal_.begin(),
+                           pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+std::size_t GuardianSparkRuntime::pending_journal_depth() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return pending_journal_.size();
+}
+
+std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+    if (entries.empty())
+        return 0;
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    // Headroom gate (design §5): page the batch only if it fits whole; else leave it for a
+    // later pass once the window drains (never a partial page that splits a batch).
+    if (lifecycle_log_.headroom() < entries.size())
+        return 0;
+    std::size_t added = 0;
+    // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
+    // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
+    // starve heartbeats under a large backlog (review UP-12 / perf P-2). The batch's records
+    // carry distinct event_ids, so a static pre-batch set is correct here.
+    const auto present = lifecycle_log_.event_id_set();
+    for (auto& e : entries) {
+        if (!present.count(e.event_id)) // O(1) membership: skip a re-page of an entry in the window
+            if (lifecycle_log_.enqueue(std::move(e)))
+                ++added;
+    }
+    return added;
+}
+
+void GuardianSparkRuntime::backfill_batch_provenance(const std::string& batch_key,
+                                                     const std::vector<std::string>& event_ids,
+                                                     const std::string& last_event_id) {
+    if (event_ids.empty())
+        return;
+    const std::unordered_set<std::string> ids(event_ids.begin(), event_ids.end());
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    lifecycle_log_.stamp_provenance(batch_key, ids, last_event_id);
+}
+
+namespace {
+// Drain one log with outbox_mu_ RELEASED across each send: copy the head under the
+// lock, unlock, send (the gRPC Write - previously run UNDER outbox_mu_, so a stalled
+// write blocked every evaluate_key emit / arm-disarm enqueue / heartbeat behind it -
+// item 4), then re-lock and pop the head ONLY if it is still the entry we sent. A
+// coalesce/drop during the unlocked window replaces or removes it; pop_front_if(event_id)
+// then no-ops and the current head is handled on the next pass.
+template <typename Log>
+std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
+                               const std::function<SendResult(const OutboxEntry&)>& send,
+                               std::atomic<std::uint64_t>& send_exceptions) {
+    std::size_t sent = 0;
+    while (true) {
+        OutboxEntry entry;
+        {
+            std::lock_guard<std::mutex> ob{mu};
+            std::optional<OutboxEntry> front = log.front_copy();
+            if (!front)
+                return sent; // drained
+            entry = std::move(*front);
+        }
+        SendResult r = SendResult::Retain;
+        try {
+            r = send(entry); // outbox_mu_ RELEASED here
+        } catch (...) {
+            // A send throw is treated as stream-down (keep the head, stop), BUT unlike a
+            // Retain it can be entry-specific (an un-serializable entry jamming the head
+            // forever). Count it + log the first so a permanent jam is visible, not
+            // silent (Fable). The head is retained either way.
+            const auto n = send_exceptions.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                try {
+                    spdlog::error("Guardian drain: send threw (head retained; may be a "
+                                  "permanently-unsendable entry). Further occurrences counted only.");
+                } catch (...) {
+                }
+            }
+            return sent;
+        }
+        if (r != SendResult::Sent)
+            return sent; // Retain: keep the head, stop
+        {
+            std::lock_guard<std::mutex> ob{mu};
+            log.pop_front_if(entry.event_id); // remove IFF unchanged during the unlocked send
+        }
+        ++sent;
+    }
+}
+} // namespace
+
+std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
+    // Single-drainer: the send runs with outbox_mu_ released, so two concurrent drainers
+    // could both peek+send the same head (duplicate delivery). drain_mu_ serialises them
+    // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
+    std::lock_guard<std::mutex> dg{drain_mu_};
+    // Drain lifecycle (audit) BEFORE compliance/health so a rule's "armed" precedes its
+    // first drift on the wire in the common case (stream up, both drain fully). This is
+    // BEST-EFFORT ordering, NOT a hard gate: an earlier version gated compliance on the
+    // lifecycle log being empty, but that let a lifecycle head that could not send (a
+    // persistent send throw) block ALL compliance/health for the agent indefinitely - a
+    // detection blackout, far worse than the narrow ordering blip it prevented (Gate 4
+    // UP-3). Both logs now drain every pass; failure isolation beats strict ordering.
+    // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
+    // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
+    // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
+    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_);
+    sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_);
     return sent;
 }
 

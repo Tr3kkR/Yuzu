@@ -312,4 +312,49 @@ EnginePrincipalStore::transfer_owner(const std::string& principal_id,
     return PQntuples(res.get()) > 0;
 }
 
+std::vector<EnginePrincipalRow> EnginePrincipalStore::list_all(bool include_revoked) const {
+    std::vector<EnginePrincipalRow> rows;
+    if (!open_)
+        return rows;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("{}: list_all denied (lease acquire failed/timed out) — returning empty",
+                    kStoreName);
+        return rows;
+    }
+    std::string sql = std::string("SELECT ") + kCols +
+                      " FROM engine_principal_store.engine_principals ";
+    if (!include_revoked)
+        sql += "WHERE lifecycle_state='active' ";
+    sql += "ORDER BY created_at";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("{}: list_all denied (query failed, status={}) — returning empty",
+                    kStoreName, static_cast<int>(res.status()));
+        return rows;
+    }
+    int n = PQntuples(res.get());
+    rows.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        rows.push_back(read_row(res.get(), i));
+    return rows;
+}
+
+std::optional<std::size_t>
+EnginePrincipalStore::count_active_owned_by(const std::string& owner_username) const {
+    if (!open_)
+        return std::nullopt; // cannot verify → caller fails closed
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*) FROM engine_principal_store.engine_principals "
+        "WHERE owner_username=$1 AND lifecycle_state='active'",
+        std::vector<std::string>{owner_username});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return static_cast<std::size_t>(to_i64(col(res.get(), 0, 0)));
+}
+
 } // namespace yuzu::server

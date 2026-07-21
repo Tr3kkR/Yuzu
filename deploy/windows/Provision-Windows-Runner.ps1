@@ -116,6 +116,39 @@ Step 'Python + Meson + Ninja + PyYAML' {
   } else { throw 'python not found after install' }
 }
 
+Step 'Persistent per-runner CI telemetry databases' {
+  $py = (Get-Command python -EA SilentlyContinue).Source
+  $testDbScript = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..')) 'scripts\test\test_db.py'
+  if(-not $py){ throw 'python is required to initialize CI telemetry' }
+  if(-not (Test-Path $testDbScript)){ throw "test DB schema tool missing at $testDbScript" }
+  $oldDb = $env:YUZU_TEST_DB
+  try {
+    for($n=0; $n -lt $RunnerCount; $n++){
+      $runnerName = "yuzu-weetam-windows-$n"
+      $db = Join-Path (Join-Path "$CacheRoot\test-runs" $runnerName) 'test-runs.db'
+      New-Item -ItemType Directory -Force (Split-Path $db) | Out-Null
+      $env:YUZU_TEST_DB = $db
+      & $py $testDbScript init
+      if($LASTEXITCODE -ne 0){ throw "test-runs.db initialization failed for $runnerName at $db" }
+      Write-Host "$runnerName telemetry: $db"
+    }
+  } finally {
+    if($null -eq $oldDb){ Remove-Item Env:\YUZU_TEST_DB -EA SilentlyContinue }
+    else { $env:YUZU_TEST_DB = $oldDb }
+  }
+}
+
+Step 'Deploy versioned runner control scripts' {
+  $controlRoot = Split-Path $ManifestPath
+  New-Item -ItemType Directory -Force $controlRoot | Out-Null
+  foreach($name in @('Start-PinnedRunner.ps1','Assert-Toolchain.ps1')){
+    $source = Join-Path $PSScriptRoot $name
+    if(-not (Test-Path $source)){ throw "runner control script missing at $source" }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $controlRoot $name) -Force
+  }
+  "runner control scripts deployed to $controlRoot"
+}
+
 Step 'Git + CMake' {
   if(-not (Get-Command git   -EA SilentlyContinue)){ WG -id 'Git.Git' }
   if(-not (Get-Command cmake -EA SilentlyContinue)){ WG -id 'Kitware.CMake' }
@@ -338,7 +371,7 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   }
 }
 
-Step 'Windows Defender exclusions for Postgres (CI [pg]-shard perf, #2167)' {
+Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   # THE dominant [pg]-shard cost on Windows: Postgres has no fork(), so it
   # CreateProcess()es a fresh postgres.exe backend PER CONNECTION, and Defender
   # scans that binary on every spawn. Measured 570 ms/connection unexcluded vs
@@ -358,12 +391,43 @@ Step 'Windows Defender exclusions for Postgres (CI [pg]-shard perf, #2167)' {
     Write-Warning "pgbin not found - skipping the postgres.exe Defender exclusion; the [pg]-shard perf fix this step exists for is NOT applied on this runner"
   }
   $paths = @()
+  # Each registered runner's work root contains both its GitHub RUNNER_TEMP
+  # (`_temp`) and its checkout/build outputs. Wee Tam already carries these
+  # four exact exclusions; codify them so reprovisioning cannot silently lose
+  # the setting and reintroduce real-time scanning on every object/temp write.
+  # Deliberately do NOT exclude user/system %TEMP% or all of D:\ci.
+  $runnerWorkPaths = @(for($n=0; $n -lt $RunnerCount; $n++){
+    Join-Path $CacheRoot "work-$n"
+  })
+  New-Item -ItemType Directory -Force $runnerWorkPaths | Out-Null
+  $paths += $runnerWorkPaths
   if($pgbin){
     $paths += $pgbin                                          # bin dir: postgres.exe not scanned on launch
     $paths += (Join-Path (Split-Path $pgbin -Parent) 'data')  # agent-0 cluster data dir
   }
   $paths += (Join-Path $CacheRoot 'pg')                       # per-agent cluster data dirs (D:\ci\pg\agent-*)
   foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
+  $activeExclusions = @((Get-MpPreference).ExclusionPath)
+  $missingWorkPaths = @($runnerWorkPaths | Where-Object { $activeExclusions -notcontains $_ })
+  if($missingWorkPaths.Count -gt 0){
+    throw "Defender runner-work exclusions did not apply: $($missingWorkPaths -join ', ')"
+  }
+  # Validate the effective child paths with Defender itself. A parent folder
+  # exclusion is recursive, but this catches policy-merging or path-resolution
+  # surprises that a Get-MpPreference string comparison would miss.
+  $mpCmdRun = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -EA SilentlyContinue |
+    Sort-Object LastWriteTime | Select-Object -Last 1
+  if(-not $mpCmdRun){ throw 'MpCmdRun.exe not found — cannot validate runner temp exclusions' }
+  $failedTempPaths = @()
+  foreach($runnerWorkPath in $runnerWorkPaths){
+    $runnerTemp = Join-Path $runnerWorkPath '_temp'
+    New-Item -ItemType Directory -Force $runnerTemp | Out-Null
+    & $mpCmdRun.FullName -CheckExclusion -Path $runnerTemp | Out-Host
+    if($LASTEXITCODE -ne 0){ $failedTempPaths += $runnerTemp }
+  }
+  if($failedTempPaths.Count -gt 0){
+    throw "Defender runner-temp exclusions are ineffective: $($failedTempPaths -join ', ')"
+  }
   $procExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(skipped - pgbin not found)' }
   "Defender exclusions added: process=$procExcl; paths=" + ($paths -join ', ')
 }
@@ -432,6 +496,12 @@ Step "emit toolchain manifest -> $ManifestPath" {
       YUZU_ESCRIPT=[Environment]::GetEnvironmentVariable('YUZU_ESCRIPT','Machine')
       YUZU_REBAR3=[Environment]::GetEnvironmentVariable('YUZU_REBAR3','Machine')
       YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:$PostgresPort/yuzu_test"
+    }
+    telemetry = [ordered]@{
+      root="$CacheRoot\test-runs"
+      databases=@(for($n=0; $n -lt $RunnerCount; $n++){
+        Join-Path (Join-Path "$CacheRoot\test-runs" "yuzu-weetam-windows-$n") 'test-runs.db'
+      })
     }
     tools     = $tools
   }

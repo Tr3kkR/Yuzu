@@ -22,7 +22,7 @@ async function main() {
 
   // Send "help"
   console.log('[1] Sending "help"...');
-  await page.click('#instr-input', { clickCount: 3 });
+  await page.click('#instr-input', { count: 3 });
   await page.type('#instr-input', 'help');
   await page.click('#btn-send');
   await sleep(2000);
@@ -31,7 +31,7 @@ async function main() {
 
   // Now send a real command — should clear help rows
   console.log('[2] Sending "os_info os_name"...');
-  await page.click('#instr-input', { clickCount: 3 });
+  await page.click('#instr-input', { count: 3 });
   await page.type('#instr-input', 'os_info os_name');
   await page.click('#btn-send');
   await sleep(3000);
