@@ -907,3 +907,105 @@ TEST_CASE("a jammed lifecycle head plus live compliance traffic does not re-arm 
     // microseconds later, so there is nothing left for it to drain.
     CHECK(pages <= 7);
 }
+
+// ---------------------------------------------------------------------------
+// Gate 5 chaos scenarios promoted to P0 (in-process; see the chaos design in
+// docs/guardian-c0-thread-reloc-design.md).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("CH-3: the drain bound holds against a SLOW-but-succeeding send",
+          "[spark][guardian][drain][maint][chaos]") {
+    // The largest untested surface C0 created. Every existing drain test uses a send that
+    // returns instantly, or throws, or Retains - none exercises the case the wall-clock cap
+    // exists for: sends that all SUCCEED but are individually slow, making a count-bounded
+    // pass arbitrarily long while stop() waits on the join.
+    JournalRig rig;
+    for (int i = 0; i < 60; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+
+    std::atomic<int> sends{0};
+    auto slow_send = [&](const OutboxEntry&) -> SendResult {
+        sends.fetch_add(1);
+        std::this_thread::sleep_for(20ms); // slow, but succeeding
+        return SendResult::Sent;
+    };
+
+    GuardianSparkRuntime::DrainLimits limits;
+    limits.max_entries = 1000;  // deliberately NOT the binding constraint
+    limits.max_wall = 150ms;    // this is
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto out = rig.rt->drain_bounded(slow_send, limits);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    CHECK(out.truncated); // the wall clock cut it short, so the caller re-drains
+    // Bound + at most one in-flight send: the deadline is checked BEFORE each send and an
+    // in-flight one cannot be interrupted.
+    CHECK(elapsed < 150ms + 20ms + 100ms);
+    CHECK(sends.load() < 60); // it did NOT run the whole backlog
+}
+
+TEST_CASE("CH-3b: the compliance reserve survives pathological denominators",
+          "[spark][guardian][drain][maint][chaos]") {
+    // den == 0 is a divide-by-zero if the guard is ever dropped; den > max_entries used to
+    // floor the reserve to nothing (Gate 4 UP-8).
+    for (const std::size_t den : {std::size_t{0}, std::size_t{1}, std::size_t{8},
+                                  std::size_t{1000}}) {
+        JournalRig rig;
+        for (int i = 0; i < 6; ++i) {
+            const auto rid = "r" + std::to_string(i);
+            rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+        }
+        rig.rt->evaluate_key(spark_key(file_spec("/p" + std::string("r0"))),
+                             EvalReason::Convergence);
+
+        CollectingSink sink;
+        GuardianSparkRuntime::DrainLimits limits;
+        limits.max_entries = 4;
+        limits.compliance_reserve_den = den;
+        INFO("compliance_reserve_den = " << den);
+        const auto out = rig.rt->drain_bounded(std::ref(sink), limits); // must not crash
+        CHECK(out.sent <= 4);                                          // the overall cap holds
+    }
+}
+
+TEST_CASE("CH-1: a slow send does not make stop() additionally run a full maintenance pass",
+          "[spark][guardian][drain][maint][chaos]") {
+    // UP-1's unbounded in-flight send is PRE-EXISTING (stop() already held mtx_ across the
+    // join before C0) and no bound in this change can interrupt a blocked syscall - so this
+    // deliberately does NOT assert that stop() beats a blocked send, which would hang the
+    // suite on a known-open issue. What it does assert is C0's own contribution: once the
+    // in-flight send returns, the join completes promptly rather than paying for a full
+    // maintenance pass on a large journal first.
+    JournalRig rig;
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/10'000,
+                                               /*max_bytes=*/static_cast<std::size_t>(-1),
+                                               /*max_quarantine=*/100);
+    for (int i = 0; i < 200; ++i) // a journal big enough that a full pass is measurable
+        rig.persist("seed" + std::to_string(i));
+
+    std::atomic<bool> in_send{false};
+    auto slow_send = [&](const OutboxEntry&) -> SendResult {
+        in_send.store(true);
+        std::this_thread::sleep_for(200ms);
+        return SendResult::Sent;
+    };
+
+    GuardianOutboxDrainWorker worker(*rig.rt, slow_send, /*periodic_bound_ms=*/1,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,   // maintenance every cycle
+                                      .prune_interval = 0ms});
+    worker.start();
+    CHECK(spin_until([&] { return in_send.load(); }, 10s));
+
+    // Stop while a send is in flight AND maintenance is running every cycle.
+    const auto t0 = std::chrono::steady_clock::now();
+    rig.journal->request_stop(); // production order: signal the journal, then join
+    worker.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    // Generous: one in-flight 200 ms send plus prompt teardown. If the stopping_ gates were
+    // removed, the join would additionally absorb full prune+page scans over 200 batches.
+    CHECK(elapsed < 3s);
+}
