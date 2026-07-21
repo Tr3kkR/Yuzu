@@ -395,12 +395,18 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   # (`_temp`) and its checkout/build outputs. Wee Tam already carries these
   # four exact exclusions; codify them so reprovisioning cannot silently lose
   # the setting and reintroduce real-time scanning on every object/temp write.
-  # Deliberately do NOT exclude user/system %TEMP% or all of D:\ci.
+  # Deliberately do NOT exclude all of user/system %TEMP% or D:\ci — only the
+  # scoped yuzu* wildcard below. LOCAL SYSTEM-context tests (yuzu_test_kv_SYSTEM,
+  # guardian, ...) resolve TEMP to C:\Windows\Temp, which Start-PinnedRunner.ps1's
+  # per-runner _temp routing cannot reach (it sets TEMP on the Nathan runner
+  # process, not the SYSTEM child), so those leaked SQLite .db/-wal/-shm temp
+  # files were being real-time-scanned. Narrow yuzu* prefix, never the whole dir.
   $runnerWorkPaths = @(for($n=0; $n -lt $RunnerCount; $n++){
     Join-Path $CacheRoot "work-$n"
   })
   New-Item -ItemType Directory -Force $runnerWorkPaths | Out-Null
   $paths += $runnerWorkPaths
+  $paths += 'C:\Windows\Temp\yuzu*'                           # SYSTEM-context test temp (see note above)
   if($pgbin){
     $paths += $pgbin                                          # bin dir: postgres.exe not scanned on launch
     $paths += (Join-Path (Split-Path $pgbin -Parent) 'data')  # agent-0 cluster data dir
@@ -430,6 +436,26 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   }
   $procExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(skipped - pgbin not found)' }
   "Defender exclusions added: process=$procExcl; paths=" + ($paths -join ', ')
+}
+
+Step 'Scheduled sweep of leaked C:\Windows\Temp\yuzu* (NTFS dir-index hygiene)' {
+  # Companion to the C:\Windows\Temp\yuzu* Defender exclusion above. That stops
+  # the SCAN cost, but the leaked SYSTEM-context test temp still ACCUMULATES
+  # there (18k+ entries observed 2026-07) — an unbounded directory bloats the
+  # NTFS index so every later create in C:\Windows\Temp is slower. A daily sweep
+  # keeps it bounded. Only entries older than 1 day are removed, so an in-flight
+  # job's temp is never touched. Where-Object uses the property-comparison form
+  # (no $_) so the whole command survives -Command string quoting untouched.
+  $taskName = 'Yuzu-CI-Temp-Sweep'
+  $sweep = "Get-ChildItem C:\Windows\Temp\yuzu* -Force -EA SilentlyContinue | " +
+           "Where-Object LastWriteTime -lt (Get-Date).AddDays(-1) | " +
+           "Remove-Item -Recurse -Force -EA SilentlyContinue"
+  $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                 -Argument ('-NoProfile -NonInteractive -Command "' + $sweep + '"')
+  $trigger   = New-ScheduledTaskTrigger -Daily -At 4am
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+  "registered scheduled task '$taskName' (daily 04:00; purge C:\Windows\Temp\yuzu* older than 1 day)"
 }
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {
