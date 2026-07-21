@@ -255,6 +255,8 @@ used as-is — they aren't renames, so they create no split-brain.
   (`string`) — also fixes the existing `get_status` binary-in-string issue.
   **Also add `string event_id` to `GuaranteedStateEvent`** (agent-generated, stable
   across retries) — required for G6's at-least-once dedup; the proto had no event id (N1).
+  The dedup mechanism itself is unchanged; the "at-least-once" delivery-guarantee framing
+  was later narrowed - see the Decision 11 superseded-note above.
 - **New — status storage:** the design folded "fleet aggregation" into PR 4 but
   specified **no status storage**. This contract adds the `guaranteed_state_agent_rule_status`
   table + push-status reporting + real `/status` aggregation + staleness.
