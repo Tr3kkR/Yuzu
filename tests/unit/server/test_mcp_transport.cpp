@@ -8,6 +8,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string_view>
+
 using namespace yuzu::server::mcp::transport;
 
 TEST_CASE("MCP transport: protocol version support set", "[mcp][transport]") {
@@ -70,20 +72,38 @@ TEST_CASE("MCP transport: the Accept comma-split honours RFC-9110 quoted-strings
     // parameter value is part of that value, not a range separator — splitting on
     // it naively would hand an SSE stream to a client that asked for JSON, purely
     // because the token appeared inside a quoted string it controls.
-    CHECK_FALSE(accept_wants_sse(R"(application/json;x=",text/event-stream,")"));
-    CHECK_FALSE(accept_wants_sse(R"(application/json;x="a,text/event-stream")"));
+    //
+    // Every input is hoisted into a named `std::string_view` rather than written
+    // inline in the CHECK macro. These headers contain commas inside raw-string
+    // literals, and MSVC's default (non-conformant) preprocessor is not
+    // raw-string-aware: it splits the macro argument on those commas, handing the
+    // compiler garbage tokens (`error C2065: 'text' undeclared`). GCC/Clang parse
+    // it fine, which is why this only broke on the Windows leg. A named local takes
+    // the comma out of the macro argument entirely, so it is portable.
+    constexpr std::string_view kQuotedCommaBeforeType = R"(application/json;x=",text/event-stream,")";
+    constexpr std::string_view kQuotedCommaInValue = R"(application/json;x="a,text/event-stream")";
     // A quoted-pair (\") does not end the quoted-string, so the comma after it is
-    // still inside the value.
-    CHECK_FALSE(accept_wants_sse(R"(application/json;x="a\",text/event-stream,b")"));
+    // still inside the value. Written as an ESCAPED normal string, not a raw string:
+    // the specific MSVC preprocessor defect that broke this test is a `\"` INSIDE a raw
+    // string literal (it is the only line here that hard-errored), so this input avoids
+    // a raw string entirely. The bytes are identical to R"(application/json;x="a\",...b")".
+    constexpr std::string_view kQuotedPair = "application/json;x=\"a\\\",text/event-stream,b\"";
     // Unterminated quote: the rest of the header is swallowed into one range, which
     // then fails the whole-type compare. Fail-closed is the only safe direction for
     // a parse ambiguity on a security-relevant gate.
-    CHECK_FALSE(accept_wants_sse(R"(application/json;x=",text/event-stream)"));
+    constexpr std::string_view kUnterminatedQuote = R"(application/json;x=",text/event-stream)";
+    CHECK_FALSE(accept_wants_sse(kQuotedCommaBeforeType));
+    CHECK_FALSE(accept_wants_sse(kQuotedCommaInValue));
+    CHECK_FALSE(accept_wants_sse(kQuotedPair));
+    CHECK_FALSE(accept_wants_sse(kUnterminatedQuote));
 
     // A genuine SSE opt-in still matches even when a LATER range carries a quoted
     // comma — the fix must not make the header un-parseable in the honest case.
-    CHECK(accept_wants_sse(R"(text/event-stream, application/json;x="a,b")"));
-    CHECK(accept_wants_sse(R"(application/json;x="a,b", text/event-stream)"));
+    constexpr std::string_view kSseFirstThenQuotedComma = R"(text/event-stream, application/json;x="a,b")";
+    constexpr std::string_view kQuotedCommaThenSse = R"(application/json;x="a,b", text/event-stream)";
     // …including when the SSE range itself carries a quoted parameter.
-    CHECK(accept_wants_sse(R"(text/event-stream;note=",json,")"));
+    constexpr std::string_view kSseWithQuotedParam = R"(text/event-stream;note=",json,")";
+    CHECK(accept_wants_sse(kSseFirstThenQuotedComma));
+    CHECK(accept_wants_sse(kQuotedCommaThenSse));
+    CHECK(accept_wants_sse(kSseWithQuotedParam));
 }
