@@ -164,6 +164,12 @@ struct GuardianMaintenanceResult {
     /// The pass did nothing because the paging rate-limiter had no token; see
     /// JournalPageStats::deferred_no_token. A forced page must be re-armed on this.
     bool deferred_no_token{false};
+    /// Candidates skipped because they already carry a durable sent-label - per-pass and
+    /// diagnostic. No cumulative counter and no heartbeat tag, so do not cite it as
+    /// fleet-visible evidence (#2345 Gate 8).
+    std::size_t skipped_already_sent{0};
+    /// The sent-label scan failed and the pass fell back to re-offering everything.
+    bool sent_scan_failed{false};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {

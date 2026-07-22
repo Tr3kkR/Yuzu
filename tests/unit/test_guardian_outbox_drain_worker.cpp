@@ -1772,3 +1772,34 @@ TEST_CASE("CH-10: a delivered batch is not re-offered on the ordinary cadence pa
     CHECK(forced.records_paged == 2);
     CHECK(forced.skipped_already_sent == 0);
 }
+
+TEST_CASE("CH-11: a failed sent-label scan falls back to re-offering, and says so",
+          "[spark][guardian][journal][chaos]") {
+    // Skipping delivered batches depends on reading the sent-labels. If that read fails the
+    // pass must fall back to re-offering everything - redelivery is free, a wrongly-skipped
+    // batch is lost - and it must SAY so, because an agent whose scan fails every pass
+    // silently returns to the fleet-wide redelivery floor this change exists to remove.
+    // RED before the fallback is counted: sent_scan_failed stays false and the counter is 0.
+    JournalRig rig;
+    constexpr std::int64_t kT = 1'700'000'000'000;
+    rig.persist_batch("a", 2);
+    REQUIRE(rig.journal->page_into_window(*rig.rt, kT).records_paged == 2);
+
+    GuardianSparkRuntime::DrainLimits lim;
+    lim.compliance_reserve_num = 0;
+    lim.compliance_reserve_den = 0;
+    rig.rt->drain_bounded([](const OutboxEntry&) { return SendResult::Sent; }, lim);
+    auto rows = rig.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    rig.journal->mark_batch_sent(rows->front().key);
+    // Precondition: with a WORKING scan this batch is skipped. Without it the assertions below
+    // could not tell the fallback from an ordinary miss.
+    REQUIRE(rig.journal->page_into_window(*rig.rt, kT + 30'000).skipped_already_sent == 1);
+
+    rig.journal->inject_sent_scan_failures_for_test(1);
+    const auto degraded = rig.journal->page_into_window(*rig.rt, kT + 60'000);
+    CHECK(degraded.sent_scan_failed);
+    CHECK(rig.journal->sent_scan_failures() == 1);
+    CHECK(degraded.skipped_already_sent == 0); // skipped nothing...
+    CHECK(degraded.records_paged == 2);        // ...and re-offered, the safe direction
+}

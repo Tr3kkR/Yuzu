@@ -115,10 +115,15 @@ struct JournalPageStats {
     /// this much room exists; re-arming on any headroom at all meant a 1-slot opening
     /// retriggered a full journal scan for a batch needing 256 (#2345).
     std::size_t min_blocked_headroom{0};
-    /// Candidates skipped because they already carry a durable sent-label. Only a FORCED pass
-    /// (boot, reconnect) re-offers those, so in steady state this counts the redundant
-    /// redelivery that is no longer being generated.
+    /// Candidates skipped because they already carry a durable sent-label - in steady state,
+    /// the redundant redelivery that is no longer being generated. PER-PASS and diagnostic:
+    /// it is surfaced through GuardianMaintenanceResult for tests and callers, but has no
+    /// cumulative counter or heartbeat tag, so do not cite it as fleet-visible evidence.
     std::size_t skipped_already_sent{0};
+    /// The sent-label scan failed, so this pass could not skip anything and fell back to
+    /// re-offering everything. Counted because that fallback is invisible otherwise: an agent
+    /// whose scan fails every pass silently returns to the old redelivery floor (#2345 Gate 8).
+    bool sent_scan_failed{false};
 };
 
 /// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the
@@ -172,18 +177,23 @@ public:
     /// any candidate (the prune-before-page barrier). Reads unexpired batches (fallible),
     /// orders them by (ts_ms, key), and for each - rate-limited by a process-lifetime token
     /// bucket charged ONLY for net-new work - reconstructs wire-identical entries (with
-    /// replay provenance) and pages them via rt.try_page_batch. Re-send-all: nothing is
-    /// permanently skipped (membership is a window scan; retention is the only deletion).
+    /// replay provenance) and pages them via rt.try_page_batch. A batch carrying a durable
+    /// sent-label is SKIPPED unless `replay_sent` - so an ordinary pass no longer re-offers what
+    /// has already been delivered, and a labelled batch is permanently skipped until a forced
+    /// pass or retention.
     /// Takes KvStore.mu_ then outbox_mu_ SEQUENTIALLY, never nested, never the engine mtx_.
     /// `replay_sent` re-offers batches that already carry a durable sent-label. FALSE on the
-    /// ordinary cadence pass and TRUE on a forced one (boot, reconnect) - see the note on
-    /// re-send-all in guardian_journal_format.hpp.
+    /// ordinary cadence pass and TRUE on a forced one. Forced means every path that sets the
+    /// worker's force_page_: boot replay, the reconnect kick, AND the headroom-refill re-arm,
+    /// which fires during backlog recovery - enumerating only the first two was wrong in three
+    /// places (#2345 Gate 8).
     JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms,
                                       bool replay_sent = false);
 
     /// Write the (best-effort) sent-label for a batch - called from the send path after the
     /// batch's LAST paged entry is delivered. Presence classifies eviction (sent-unacked vs
-    /// no-send-evidence); it never gates re-paging or deletion.
+    /// no-send-evidence) AND, since #2345 round 8, gates re-paging: page_into_window skips a
+    /// labelled batch on any non-forced pass. It still never gates deletion.
     void mark_batch_sent(const std::string& batch_key);
 
     /// Signal that shutdown has begun: a concurrent page_into_window pass observes this
@@ -218,6 +228,10 @@ public:
     /// read failure is invisible and replay silently does nothing (#2345 Gate 6 SRE).
     [[nodiscard]] std::uint64_t page_read_failures() const noexcept {
         return page_read_failures_.load(std::memory_order_relaxed);
+    }
+    /// Passes whose sent-label scan failed, so the pass re-offered already-delivered batches.
+    [[nodiscard]] std::uint64_t sent_scan_failures() const noexcept {
+        return sent_scan_failures_.load(std::memory_order_relaxed);
     }
     /// Retention passes that skipped age eviction due to an implausible forward clock jump.
     [[nodiscard]] std::uint64_t clock_jump_skips() const noexcept {
@@ -318,6 +332,13 @@ public:
     /// page_into_window) to fail. Deliberately a separate counter from the prune-side
     /// injection: the point of page_read_failures() is that the two scans fail independently,
     /// so a test that conflated them could not observe the difference. No production caller.
+    /// TEST-ONLY: force the next `n` SENT-LABEL scans to fail. Distinct from
+    /// inject_page_read_failures_for_test, which fails the candidate scan and returns before
+    /// the label read is ever reached - so without this the fallback branch is unreachable
+    /// from any test (#2345 Gate 8 QE).
+    void inject_sent_scan_failures_for_test(int n) noexcept {
+        inject_fail_sent_scans_.store(n, std::memory_order_relaxed);
+    }
     void inject_page_read_failures_for_test(int n) noexcept {
         inject_fail_page_reads_.store(n, std::memory_order_relaxed);
     }
@@ -427,6 +448,8 @@ private:
     /// forward. Nonzero means an endpoint's clock moved; it is NOT an error in itself.
     std::atomic<std::uint64_t> clock_jump_skips_{0};
     std::atomic<std::uint64_t> page_read_failures_{0};
+    std::atomic<std::uint64_t> sent_scan_failures_{0};
+    std::atomic<int> inject_fail_sent_scans_{0}; ///< test-only: fail the next N label scans
     /// Fair-rotation cursor (review B2): the last-CONSIDERED (ts_ms, key). Each pass resumes at
     /// the first candidate strictly greater and wraps, so the never-sent tail is reached instead
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT

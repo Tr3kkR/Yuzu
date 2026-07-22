@@ -832,8 +832,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     //
     // The durable sent-label already records delivery; it simply was not consulted here (it is
     // read only by prune's eviction classifier). Consult it, and re-offer a labelled batch ONLY
-    // on a FORCED pass - boot and reconnect, which are exactly the events after which an
-    // in-flight send may have been lost. The safety net is kept where it can pay and removed
+    // on a FORCED pass. Forced is every path that sets the worker's force_page_: boot replay,
+    // the reconnect kick, and the headroom-refill re-arm during backlog recovery. The safety net is kept where it can pay and removed
     // where it cannot: a steady stream that returned Sent is not made safer by re-sending the
     // same batch ten seconds later.
     //
@@ -843,14 +843,25 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // is the honest boundary of at-least-once here.
     std::unordered_set<std::string> sent_labels;
     if (!replay_sent) {
-        if (auto labels = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+        std::optional<std::vector<KvRow>> labels;
+        if (inject_fail_sent_scans_.load(std::memory_order_relaxed) > 0) { // test-only fault
+            inject_fail_sent_scans_.fetch_sub(1, std::memory_order_relaxed);
+        } else if (auto rows_ok = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+            labels = std::move(*rows_ok);
+        }
+        if (labels) {
             sent_labels.reserve(labels->size());
             for (auto& row : *labels)
                 sent_labels.insert(std::move(row.key));
+        } else {
+            // A read failure leaves the set empty, which skips nothing and re-offers everything
+            // - the pre-#2345-round-8 behaviour, and the safe direction, since redelivery is
+            // free and a wrongly-skipped batch is lost. COUNTED, because otherwise an agent
+            // whose scan fails every pass silently reverts to the old fleet-wide redelivery
+            // floor with no signal at all, which is the exact cost this change removed.
+            stats.sent_scan_failed = true;
+            sent_scan_failures_.fetch_add(1, std::memory_order_relaxed);
         }
-        // A read failure here is NOT fatal and must not silently re-enable re-send-all: an
-        // empty set would make every labelled batch look unsent. Treat the pass as if it were
-        // forced - the old behaviour - rather than pretending nothing was delivered.
     }
 
     const std::size_t limit = std::min<std::size_t>(cands.size(), kJournalPageMaxBatchesPerPass);

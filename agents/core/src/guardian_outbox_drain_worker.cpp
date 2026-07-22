@@ -148,6 +148,8 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         result.headroom_blocked = stats.headroom_blocked;
         result.min_blocked_headroom = stats.min_blocked_headroom;
         result.deferred_no_token = stats.deferred_no_token;
+        result.skipped_already_sent = stats.skipped_already_sent;
+        result.sent_scan_failed = stats.sent_scan_failed;
     }
     return result;
 }
