@@ -52,6 +52,7 @@
 #include "guardian_outbox.hpp"
 #include "guardian_rule_eval.hpp"
 
+#include <algorithm> // (std::min) in drop_oldest_pending_for_test
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -310,7 +311,8 @@ public:
     /// had no coverage. No production caller.
     void drop_oldest_pending_for_test(std::size_t n) {
         std::lock_guard<std::mutex> ob{outbox_mu_};
-        n = std::min(n, pending_journal_.size());
+        // (std::min), not std::min: MSVC's min() macro would clobber it in a windows.h TU.
+        n = (std::min)(n, pending_journal_.size());
         pending_journal_.erase(pending_journal_.begin(),
                                pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
         journal_stage_dropped_.fetch_add(n, std::memory_order_relaxed);

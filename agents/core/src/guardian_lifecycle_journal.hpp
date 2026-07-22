@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -84,7 +85,8 @@ private:
             return;
         }
         if (now_ms > last_ms_) {
-            tokens_ = std::min(burst_, tokens_ + refill_per_sec_ *
+            // (std::min), not std::min: MSVC's min() macro would clobber it in a windows.h TU.
+            tokens_ = (std::min)(burst_, tokens_ + refill_per_sec_ *
                                                      static_cast<double>(now_ms - last_ms_) / 1000.0);
             last_ms_ = now_ms;
         }
