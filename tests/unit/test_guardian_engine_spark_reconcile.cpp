@@ -29,6 +29,8 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <atomic>
+#include <condition_variable>
 #include <thread>
 #include <vector>
 
@@ -794,5 +796,88 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     CHECK(journal->pages() >= 1);
 
     engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins the drain worker",
+          "[spark][guardian][reconcile][journal][chaos]") {
+    // stop() joins the drain worker, and that join is a blocking wait on a send that may be
+    // blackholed. A persist placed only AFTER the join never runs if a supervisor's stop
+    // timeout or an operator kill lands in that window, and the staged records are destroyed -
+    // real loss of an audit record, not the at-least-once redelivery the design guarantees.
+    //
+    // The observable has to be taken WHILE the join is still blocked; asserting after stop()
+    // returns cannot tell the two orderings apart, because the post-join flush persists the
+    // same record either way. RED with the pre-join persist removed: the journal is still
+    // empty on disk at the moment the join is stuck.
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+
+    std::mutex send_mu;
+    std::condition_variable send_cv;
+    bool in_send = false;   ///< the worker is parked inside a send
+    bool release = false;   ///< test lets it finish
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [&](const OutboxEntry&) {
+                                 std::unique_lock<std::mutex> lk{send_mu};
+                                 in_send = true;
+                                 send_cv.notify_all();
+                                 send_cv.wait(lk, [&] { return release; });
+                                 return SendResult::Sent;
+                             });
+
+    // One injected write failure leaves the armed rule's record PENDING rather than durable,
+    // so what reaches disk later is attributable to a stop()-path persist and nothing else.
+    engine.lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    gpb::GuaranteedStatePush push;
+    push.set_full_sync(true);
+    *push.add_rules() = make_service_rule("r1");
+    engine.apply_rules(push);
+    REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
+
+    {   // Park the worker inside a send, so the join below cannot complete.
+        std::unique_lock<std::mutex> lk{send_mu};
+        REQUIRE(send_cv.wait_for(lk, std::chrono::seconds(10), [&] { return in_send; }));
+    }
+
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper{[&] {
+        engine.stop();
+        stop_returned.store(true, std::memory_order_release);
+    }};
+
+    // The assertion: the record reaches disk while stop() is still stuck in the join.
+    bool durable_during_join = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto rows = kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+        if (rows.has_value() && !rows->empty()) {
+            // Confirm the join really is still outstanding, so this cannot pass by observing
+            // the POST-join flush of a stop() that had already returned.
+            durable_during_join = !stop_returned.load(std::memory_order_acquire);
+            break;
+        }
+        if (stop_returned.load(std::memory_order_acquire))
+            break; // stop() finished with nothing on disk: the pre-join persist did not happen
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(durable_during_join);
+
+    {
+        std::lock_guard<std::mutex> lk{send_mu};
+        release = true;
+    }
+    send_cv.notify_all();
+    stopper.join();
     spark_engine.stop();
 }

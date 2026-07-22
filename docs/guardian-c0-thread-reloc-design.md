@@ -574,9 +574,13 @@ Whichever PR flips `prefer_spark` MUST also:
     fleet-wide snapshot restore means ~161 GB over ~35 minutes with every agent's boot burst
     landing in the same cycle. Phase-jitter `last_page`/`last_prune` by U[0,interval), and treat
     the sustained figure as a hard gate pending the deferred server ack.
-13. **Test the loop-death firewall and the pre-join persist** (Gate 3 QE). Both are untested
-    today: deleting the pre-join `persist_lifecycle_journal_locked()` call leaves the suite
-    green, and nothing can make `loop()`'s own tail throw. Both need a seam.
+13. **Test the loop-death firewall** (Gate 3 QE). Nothing can currently make `loop()`'s own
+    tail throw, so the top-level catch and its counter are unexercised; this needs a seam.
+    ~~and the pre-join persist~~ - **the pre-join persist half is DONE (round 7)**: a test parks
+    the drain worker inside a blocked send, calls `stop()` on another thread, and asserts the
+    pending record reaches disk *while the join is still outstanding*. Asserting after `stop()`
+    returns cannot distinguish the two orderings, because the post-join flush persists the same
+    record either way - which is why deleting the call used to leave the suite green.
 14. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
    Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
    is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
