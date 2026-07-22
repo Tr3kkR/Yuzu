@@ -490,7 +490,14 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // - bounded by the per-pass batch cap and the paging rate limiter, and the server de-dupes
     // on event_id.
     const bool pacing = skip_age || age_candidates > age_evictions;
-    last_age_cutoff_ = pacing ? std::numeric_limits<std::int64_t>::min() : min_ts;
+    // Publish the CONSERVATIVE cutoff first and tighten it only once the delete below has
+    // actually happened (#2345 round 7, Sol). Committing min_ts here and then failing the
+    // delete stranded the rows it named: still present on disk, but classified expired by
+    // replay, so neither shipped nor removed until some later pass succeeded. Repeated
+    // failures alternated stranded and replayable passes while inflating a counter documented
+    // to mean the endpoint's clock moved. INT64_MIN means "nothing is too old to replay",
+    // which errs toward redelivery - free, since the server de-dupes on event_id.
+    last_age_cutoff_ = std::numeric_limits<std::int64_t>::min();
     pruned_cutoff_valid_ = true;
     // Hold the "already declined" latch for as long as this anomaly is still being worked off,
     // not merely for the pass after the decline. Clearing it on the first accepting pass made a
@@ -536,6 +543,11 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         }
         batches_pruned_.fetch_add(static_cast<std::uint64_t>(n), std::memory_order_relaxed);
         stats.evicted = static_cast<std::size_t>(n);
+        // The delete happened, so the rows this cutoff would exclude from replay are genuinely
+        // gone. Only a pass with no expired backlog left may tighten it; while one is being
+        // worked off, replay must keep considering everything (see `pacing` above).
+        if (!pacing)
+            last_age_cutoff_ = min_ts;
         // Evicted keys left the lc: namespace: subtract them from the rebased gauge (RMW).
         // Count uses `n` (RETURNING rows), bytes uses evicted_bytes (the whole evict set): the
         // two bases match ONLY because n == evict.size() here. del_keys rolls back on any
@@ -899,7 +911,14 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 stats.min_blocked_headroom = outcome.required;
         }
         if (outcome.added > 0) {
-            page_bucket_.take(); // charge a token ONLY for net-new work
+            // Charge BEFORE the break, deliberately. This pass is allowed to place one batch
+            // over an empty bucket, and charging for it takes the balance negative, which is
+            // simply the debt for work already done: two batches placed cost two tokens, so
+            // the next pass waits proportionally longer. Charging only when a token was in
+            // hand would hand out one free batch per pass and roughly double the steady-state
+            // replay rate the bucket exists to bound (#2345 round 7 - proposed as a fix, and
+            // rejected on that arithmetic).
+            page_bucket_.take();
             ++stats.batches_paged;
             stats.records_paged += outcome.added;
             if (!have_token)

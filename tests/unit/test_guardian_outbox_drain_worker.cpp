@@ -1619,3 +1619,69 @@ TEST_CASE("a batch repeating an event_id is sized by its distinct records",
     CHECK(stats.records_paged == 1); // one distinct record placed in the one free slot
     CHECK_FALSE(stats.headroom_blocked);
 }
+
+TEST_CASE("CH-8: a backward clock step does not freeze replay while retention keeps deleting",
+          "[spark][guardian][journal][chaos]") {
+    // The paging rate limiter refilled only when now_ms exceeded its last reading, so a
+    // backward step - a VM restored from an old snapshot, an NTP correction - parked replay
+    // for the whole size of the step. Retention's count and byte ceilings are clock-free and
+    // kept deleting throughout. Replay stopped with deletion continuing is the unsent-loss
+    // shape this journal exists to prevent, and it was the one case the bucket's own
+    // "DELAYS, never skips" comment did not cover.
+    // RED before the fix: still deferred_no_token an hour of new-clock time later.
+    JournalRig rig;
+    constexpr std::int64_t kT = 1'700'000'000'000;
+    for (int i = 0; i < 12; ++i)
+        rig.persist_batch("b" + std::to_string(i), 1);
+
+    // Spend the startup burst so the bucket, not the burst, governs the next pass.
+    bool exhausted = false;
+    for (int i = 0; i < 20 && !exhausted; ++i)
+        exhausted = rig.journal->page_into_window(*rig.rt, kT).deferred_no_token;
+    REQUIRE(exhausted);
+
+    // The clock steps BACK an hour, then advances normally on the new reading. Re-baselining
+    // costs the one pass that observes the step - it grants no tokens, so the pacing bound is
+    // untouched - and replay must resume immediately after on the new clock. Five passes at
+    // 20 s is 100 s of new-clock time; the unfixed code needs the full hour to elapse before
+    // it refills at all, so it is still deferred here.
+    constexpr std::int64_t kBack = kT - 3'600'000;
+    bool resumed = false;
+    std::size_t paged = 0;
+    for (int i = 1; i <= 5 && !resumed; ++i) {
+        const auto st = rig.journal->page_into_window(*rig.rt, kBack + i * 20'000);
+        resumed = !st.deferred_no_token;
+        paged += st.records_paged;
+    }
+    CHECK(resumed); // replay resumed on the new baseline, not an hour later
+    CHECK(paged > 0);
+}
+
+TEST_CASE("CH-9: a failed retention delete does not strand the rows it meant to remove",
+          "[spark][guardian][journal][chaos]") {
+    // The replay cutoff was published before the delete that justified it. When the delete
+    // then failed, the rows were still on disk but replay classified them expired: neither
+    // shipped nor removed until some later pass happened to succeed, while a counter
+    // documented to mean "this endpoint's clock moved" kept incrementing.
+    // RED before the fix: records_paged == 0 - the rows are present and unreachable.
+    JournalRig rig;
+    const std::int64_t kT = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    REQUIRE(rig.journal->page_into_window(*rig.rt, kT).records_paged == 0); // latch the barrier
+    for (int i = 0; i < 3; ++i)
+        rig.persist_batch("b" + std::to_string(i), 1);
+
+    constexpr std::int64_t kEightDays = 8LL * 86400 * 1000;
+    REQUIRE(rig.journal->prune(kT).evicted == 0);                 // baseline the clock
+    REQUIRE(rig.journal->prune(kT + kEightDays).evicted == 0);    // the jump itself: declined
+
+    // The accepting pass tries to delete and the store refuses.
+    rig.journal->inject_delete_failures_for_test(1);
+    const auto failed = rig.journal->prune(kT + kEightDays + 1000);
+    CHECK(failed.evicted == 0);
+
+    // The rows survived the failure, so replay must still be able to reach them.
+    const auto paged = rig.journal->page_into_window(*rig.rt, kT + kEightDays + 2000);
+    CHECK(paged.records_paged == 3);
+}

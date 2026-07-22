@@ -45,11 +45,12 @@ namespace yuzu::agent {
 class KvStore;
 class GuardianSparkRuntime;
 
-/// A monotonic token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT
-/// reset on reconnect, so a flapping agent cannot replay its whole backlog on every
-/// reconnect. It DELAYS, never skips - a batch the bucket defers pages on a later pass, and
-/// retention (not the bucket) is the only deletion path, so nothing is lost. now_ms is
-/// passed in, so the pacing is deterministic + testable.
+/// A token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT reset on
+/// reconnect, so a flapping agent cannot replay its whole backlog on every reconnect. It
+/// DELAYS, never skips - a batch the bucket defers pages on a later pass, and retention (not
+/// the bucket) is the only deletion path. That holds only because refill() re-baselines on a
+/// BACKWARD clock step rather than waiting the step out; see the note there. now_ms is passed
+/// in, so the pacing is deterministic + testable.
 class YUZU_EXPORT JournalPagingBucket {
 public:
     JournalPagingBucket(double refill_per_sec, double burst)
@@ -67,6 +68,18 @@ public:
 private:
     void refill(std::int64_t now_ms) {
         if (last_ms_ == 0) {
+            last_ms_ = now_ms;
+            return;
+        }
+        // Clock stepped BACKWARD: re-baseline instead of waiting for wall time to climb back
+        // (#2345 round 7, Sol). Refilling only on now_ms > last_ms_ meant a backward step froze
+        // replay for the whole size of the step - hours, after a VM snapshot restore or an NTP
+        // correction - while retention's count and byte ceilings, which are clock-free, kept
+        // deleting on schedule. Replay stopped with deletion continuing is precisely the unsent
+        // loss this journal exists to prevent, and it is the one case the "DELAYS, never skips"
+        // note above did not hold for. Re-baselining grants no tokens, so the pacing bound is
+        // unchanged; it only stops the deferral from becoming unbounded.
+        if (now_ms < last_ms_) {
             last_ms_ = now_ms;
             return;
         }
