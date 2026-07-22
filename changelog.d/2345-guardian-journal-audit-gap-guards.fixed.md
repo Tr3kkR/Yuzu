@@ -1,8 +1,10 @@
 - **Guardian's durable audit journal no longer loses records to a wall-clock jump or to its own
   size accounting.** (Dormant with the rest of the Guardian journal machinery until the Spark
-  detection path becomes authoritative, so no currently-released agent changes behaviour.) Three
+  detection path becomes authoritative, so no currently-released agent changes behaviour.) Four
   distinct ways a durably-written lifecycle record could be deleted without ever reaching the
-  server are closed. (1) Retention is anchored to the wall clock, so one forward jump past the
+  server are closed or bounded - the clock channel is bounded and reported rather than
+  eliminated, because a clock that genuinely moved and stays moved really has put the data past
+  retention. (1) Retention is anchored to the wall clock, so one forward jump past the
   retention window - a VM restored from an old snapshot, a bad NTP correction - marked every
   batch expired at once and deleted the whole trail in a single transaction; the first such jump
   is now declined once and reported (`yuzu.guardian_journal_clock_jump_skips`), and age eviction is

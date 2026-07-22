@@ -403,10 +403,20 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     const bool skip_age = (would_wipe || big_step) && !age_wipe_declined_;
     if (skip_age) {
         clock_jump_skips_.fetch_add(1, std::memory_order_relaxed);
-        spdlog::warn("Guardian journal: this retention pass would age out the ENTIRE journal "
-                     "({} batches; clock moved {} ms since the last pass); skipping AGE eviction "
-                     "once so a clock anomaly cannot delete the audit trail wholesale",
-                     live.size(), now_ms - last_prune_now_ms_);
+        // The delta is meaningless on the FIRST pass of a process - last_prune_now_ms_ is still
+        // zero, so it would print the whole Unix epoch as "the clock moved", in exactly the
+        // restarted-VM scenario this detection was redesigned to catch (Gate 8 advisor).
+        if (last_prune_now_ms_ == 0)
+            spdlog::warn("Guardian journal: the first retention pass after start would age out "
+                         "the ENTIRE journal ({} batches); skipping AGE eviction once so a clock "
+                         "anomaly cannot delete the audit trail wholesale",
+                         live.size());
+        else
+            spdlog::warn("Guardian journal: this retention pass would age out the ENTIRE journal "
+                         "({} batches; clock moved {} ms since the last pass); skipping AGE "
+                         "eviction once so a clock anomaly cannot delete the audit trail "
+                         "wholesale",
+                         live.size(), now_ms - last_prune_now_ms_);
     }
     last_prune_now_ms_ = now_ms;
     std::size_t total_bytes = 0;
