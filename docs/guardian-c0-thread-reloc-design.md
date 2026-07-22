@@ -408,7 +408,7 @@ supposedly closed.
 - **The headroom precheck reintroduced B2 starvation.** It `break`'d before `page_cursor_`
   advanced, so an oversized head batch pinned the rotation and smaller newer batches never
   paged. Now `continue` with the cursor advanced. Paging a newer batch ahead of an older
-  blocked one was verified tolerable against the server rather than assumed.
+  blocked one was ARGUED tolerable against the server's ingest semantics (dedup compares immutable fields only on an event_id collision; lifecycle events do not update the compliance census; queries order by event timestamp, not arrival) - no test exercises cross-batch inversion end to end, so this is a code-reading argument, not evidence rather than assumed.
 - **The refill re-arm reintroduced UP-2 amplification.** `lifecycle_headroom() > 0` fired when
   one slot opened for a batch needing up to 256, so `force_page_` re-armed every cycle and each
   forced page is a full journal scan. It now requires room for the smallest actually-blocked
@@ -441,6 +441,22 @@ that fixed it. Bind doc claims to executable checks wherever possible; treat the
 checklist to be executed, not a record of intent.
 
 ---
+
+## Retention differs deliberately from every other store (Gate 8 security/consistency)
+
+The Guardian lifecycle journal is now the ONLY wall-clock expiry site in the codebase with a
+clock-anomaly guard or a per-pass eviction cap. Every sibling - `audit_store`, `response_store`,
+`result_set_store`, `preflight_run_store`, `deployment_run_store`, `guaranteed_state_store`'s TTL
+on the server's copy of these same lifecycle events, and agent-side `tar_aggregator` - issues a
+single uncapped `DELETE ... WHERE expires_at < now`.
+
+That asymmetry is deliberate for the server stores: they run on an NTP-managed host, they are
+backed up, and their clock is not one an endpoint controls. It is LESS comfortable for
+`tar_aggregator`, which is agent-side and shares exactly the clock this guard exists for, and for
+`audit_store`, which holds SOC 2 evidence. Neither is in this change's scope, and neither should
+be quietly assumed safe because this doc mentions them - they are recorded here so the next
+person to touch endpoint retention finds the asymmetry stated rather than inferring that nobody
+noticed. Follow-ups are filed separately.
 
 ## REQUIRED at the `prefer_spark` flip (Gate 6 enterprise-readiness)
 
@@ -491,14 +507,14 @@ Whichever PR flips `prefer_spark` MUST also:
    64 MiB), not at the ~900 measured so far (Gate 6 sre): a full scan already exceeded one
    second at 900, so the pass duration - not `kGuardianMinRefillInterval` - is what actually
    paces chained forced pages during a large-backlog recovery.
-8. **Persist pending lifecycle records BEFORE the drain-worker join**, or record an explicit
-   risk acceptance (Gate 6 compliance, CC7.2/PI1.1). `GuardianEngine::stop()` joins the worker
-   (a blocking wait on a possibly-blackholed send) and only afterwards runs
-   `persist_lifecycle_journal_locked()`. If the join is slow and the process is then hard-killed
-   - operator `kill -9`, a supervisor's stop timeout - the in-memory pending records are never
-   written. That is real loss of an audit record, not the at-least-once redelivery the design
-   otherwise guarantees, and it is the one loss channel in this area that dormancy hides rather
-   than removes.
+8. ~~Persist pending lifecycle records BEFORE the drain-worker join~~ - **DONE in round 5**,
+   not deferred. Gate 6 compliance and Gate 8 security both declined the "or risk-accept"
+   framing this item originally offered, on the grounds that the fix has no ordering dependency
+   on the join and the loss it prevents is real destruction of an audit record rather than the
+   at-least-once redelivery the design otherwise guarantees. `GuardianEngine::stop()` now
+   persists before signalling the workers as well as after them; the post-join flush stays,
+   because `persist()` erases the durably-written prefix so a record can never land under two
+   keys. They were right that offering the two as equals was the error.
 9. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
    Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
    is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
