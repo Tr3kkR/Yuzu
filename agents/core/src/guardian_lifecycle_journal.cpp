@@ -485,9 +485,10 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // paced deletion buy anything at all: without it, replay skips exactly the batches retention
     // is about to delete and the pacing would only slow the deletion, shipping nothing
     // (#2345 Gate 8 S3/UP5-3). It does not make delivery likely - deletion still outruns replay
-    // about five to one at the current cap and refill rate (#2364) - it makes it possible. It costs a bounded burst of redelivery, since sent-but-
-    // expired batches become candidates too - bounded by the per-pass batch cap and the paging
-    // rate limiter, and the server de-dupes on event_id.
+    // about five to one at the current cap and refill rate (#2364) - it makes it possible. It
+    // costs a bounded burst of redelivery, since sent-but-expired batches become candidates too
+    // - bounded by the per-pass batch cap and the paging rate limiter, and the server de-dupes
+    // on event_id.
     const bool pacing = skip_age || age_candidates > age_evictions;
     last_age_cutoff_ = pacing ? std::numeric_limits<std::int64_t>::min() : min_ts;
     pruned_cutoff_valid_ = true;
@@ -495,8 +496,8 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // not merely for the pass after the decline. Clearing it on the first accepting pass made a
     // large backlog re-trip the guard on alternate passes: it still converged, but at half rate
     // and while incrementing a counter documented to mean "this endpoint's clock moved", which
-    // would have an operator chasing a second anomaly that never happened. It clears once a
-    // pass finds nothing expired, so the guard is armed again for the NEXT real anomaly.
+    // would have an operator chasing a second anomaly that never happened.
+    //
     // Hold the latch only while an anomaly BACKLOG is still being worked off - which is what
     // `pacing` already means. Setting it from `age_candidates > 0` disarmed the guard after any
     // pass that aged out even one batch, and a live agent past its retention horizon has such a

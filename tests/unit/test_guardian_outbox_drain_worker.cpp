@@ -1429,8 +1429,9 @@ TEST_CASE("a fully-windowed batch is never read as blocked by the paging pre-che
           "[spark][guardian][journal][chaos]") {
     // The journal's own pre-check sized a candidate by its RAW entry count, which is the exact
     // accounting error try_page_batch was fixed for, surviving one layer up. A batch already
-    // fully in the send window was then reported blocked on a phantom shortage and fed the
-    // starvation machinery. RED before the fix: headroom_blocked is true.
+    // fully in the send window was then reported blocked on a phantom shortage, which the
+    // worker's refill re-arm reads as "a backlog is waiting on drain progress" when there is
+    // no backlog at all. RED before the fix: headroom_blocked is true.
     constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
     JournalRig rig{kBig + 8};
     rig.persist_batch("b", kBig);
