@@ -556,7 +556,7 @@ enforcement-posture table.
 | `yuzu_server_guardian_events_total` | gauge | Guardian events currently persisted in the store (post-reap). |
 | `yuzu_server_guardian_events_written_total` | counter | Cumulative Guardian events ever written (pre-reap). Exposed as TYPE `counter` via `describe()`; the value is read from the store each scrape and set through the gauge API (the `Counter` type has no `set()`), and resets to the store's current total on restart. |
 | `yuzu_server_guardian_events_dropped_total` | counter | Cumulative Guardian events dropped at ingest on an `event_id` PK/UNIQUE conflict where the incoming payload **MISMATCHES** the stored row — a forged-id pre-claim (#1360), or an agent `event_seq_` reset / clock skew carrying a *different* event. Benign idempotent redeliveries (matching payload) are **not** counted here; they are on `yuzu_server_guardian_events_redelivered_total`. `> 0` therefore distinguishes "no drift observed" from "drift silently discarded" **and** flags a possible forged-id campaign — a CC7.3 evidence signal; investigate a sustained climb, don't just widen the threshold. Exposed as TYPE `counter`, but **resets on server restart** (in-memory atomic), so alert on `increase(...[1h])` over a window. The bundled `YuzuGuardianEventsDropped` alert fires at **> 5 / 1h**: because reconnect churn no longer lands here, this is a low, security-relevant threshold, not a reconnect-baseline knob (see `docs/prometheus/yuzu-alerts.yml`). |
-| `yuzu_server_guardian_events_redelivered_total` | counter | Cumulative **idempotent redeliveries** at ingest — an `event_id` PK conflict where the incoming payload **matches** the stored row across every immutable agent-supplied field. This is the durable agent lifecycle journal's expected at-least-once retry (it re-sends on every reconnect): the event is not re-written, the DEX observers are not re-fired, and the compliance signal is untouched. **High is normal after an agent outage/reconnect — it is NOT a loss signal** (that is `..._events_dropped_total`). Exposed as TYPE `counter`; resets on server restart. |
+| `yuzu_server_guardian_events_redelivered_total` | counter | Cumulative **idempotent redeliveries** at ingest — an `event_id` PK conflict where the incoming payload **matches** the stored row across every immutable agent-supplied field. This is the durable agent lifecycle journal's expected crash-durable, duplicate-tolerant, bounded-retry redelivery (it re-sends on every reconnect) - not a guarantee of eventual delivery: an un-acked record that ages out of the 7-day retention window is a rare, counted loss, not silent - counted by `yuzu.guardian_journal_evicted_no_send_evidence`, an agent heartbeat `status_tag` (not itself a Prometheus series scraped here). That counter is in-memory only and resets on agent restart, so it is not a durable audit trail, and today there is no dashboard, REST, or MCP surface exposing it at all, per-agent or fleet-wide (tracked under #2298; see [Reconnect replay traffic](guaranteed-state.md#reconnect-replay-traffic-durable-lifecycle-journal) for the full network-flows picture). The event is not re-written, the DEX observers are not re-fired, and the compliance signal is untouched. **High is normal after an agent outage/reconnect — it is NOT a loss signal** (that is `..._events_dropped_total`). Exposed as TYPE `counter`; resets on server restart. |
 | `yuzu_server_guardian_events_ingest_errors_total` | counter | Cumulative **operational** Guardian ingest faults — a failed `BEGIN`/`prepare`/`INSERT`/`COMMIT`, or a redelivery-compare `SELECT` that could not run (NOMEM/IOERR). A sustained rate means the ingest machinery is broken and event_id conflicts are going **unclassified**, so a genuine forged-id collision can escape `..._events_dropped_total` — hence the bundled `YuzuGuardianIngestErrors` alert (`increase(...[15m]) > 0`). Excludes malformed embedded-NUL input (rejected at the boundary; attacker-drivable, so kept off this operational signal). Resets on server restart. |
 | `yuzu_server_guardian_events_reaped_total` | counter | Cumulative Guardian event rows deleted by the retention reaper (disposal evidence). Exposed as TYPE `counter` (store-read value set via the gauge API, like the other `_total` counters here). |
 | `yuzu_server_guardian_event_store_duration_seconds{status}` | histogram | Server-side latency of `insert_event_classified` (the classify+store SQLite operation) for one Guardian event, split by outcome `status` (`inserted`/`redelivered`/`conflict`/`error`). Only `redelivered`/`conflict` execute the redelivery byte-compare; `inserted` does projection+commit - so read the series per-status, not as an aggregate. Covers the direct-Subscribe and gateway-proxied ingest paths. Custom buckets `0.1ms-10s` (sub-ms SQLite resolution + the seconds tail for Postgres / lock contention). Born at server start (all four status series present on `/metrics` from boot). This is a **validation** signal for the planned off-write-path compare (#2298) - it confirms a benchmarked gain survives real traffic; it is **not** the go/no-go decision, which needs a controlled concurrent benchmark (an aggregate histogram can't attribute latency to compare-CPU vs lock-wait vs transaction work). |
@@ -566,6 +566,105 @@ enforcement-posture table.
 | `yuzu_server_guardian_observations_reaped_total` | counter | Cumulative DEX observation rows deleted by the retention reaper (disposal evidence for the behavioral-PII projection). Exposed as TYPE `counter` (store-read value set via the gauge API, like `events_written_total`). |
 
 Broader Guardian metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
+
+### Guardian journal fleet gauges
+
+Published on every fleet-health sweep (~15 s), fed from the
+`yuzu.guardian_journal_*` heartbeat tags. These roll the **durable lifecycle-audit
+journal**'s per-agent integrity counters up fleet-wide, so a lost Guardian lifecycle
+record is visible on `/metrics` (and to any evidence automation that scrapes it)
+instead of only in
+one endpoint's heartbeat.
+
+**All series are unlabelled.** Unlike `yuzu_fleet_net_*` / `yuzu_fleet_spark_*`, there
+is no `os` or `stat` split: these are integrity and loss signals, where the fleet
+question is *"did any endpoint lose a lifecycle record"* - a flat sum answers that and
+a percentile obscures it. One consequence worth having: no agent-controlled label
+means no cardinality exposure at all.
+
+**What absence means, mechanically.** The agent emits a journal tag **only when the
+counter is non-zero**, and every family is cleared and re-published each sweep. So an
+absent family means: *no retained agent's latest heartbeat carried a value for it that
+passed the forged-value parse.* Both edges matter and both are pinned by tests - a
+non-conforming agent's explicit `"0"` parses and **publishes** the family at `0`, while
+a rejected non-zero value (over the plausibility ceiling, say) leaves it **absent** and
+increments `_tag_rejected`. What the rollup avoids is publishing a fabricated `0` for a
+family nobody reported, which would read as "checked, nothing lost" when nothing was
+checked.
+
+This page deliberately stops there. It tells you what each gauge counts and when it is
+emitted, not what a reading proves about fleet health - the interpretation belongs with
+whoever enables alerting at the `prefer_spark` cutover, against a live journal.
+
+**These are `gauge`-typed fleet sums, and they are monitor-only.** No churn-robust
+*new-increment* alert exists over an unlabelled fleet sum of per-agent cumulative
+counters: the sum cannot tell a new increment from a returning agent. The full analysis
+- why `increase()`/`rate()`, `delta()` and bare `> 0` each fail, what the rising-edge
+template does and does not buy, and the enable-time prerequisites - is stated once, in
+the `yuzu-guardian-journal` preamble in `docs/prometheus/yuzu-alerts.yml`, alongside the
+disabled templates themselves. Graph these, review them after an incident, do not page
+on them.
+
+**Two meta-signals are the exception.** `yuzu_fleet_guardian_journal_reporting` and
+`..._tag_rejected` are server-owned counts published on **every completed sweep,
+including at `0`**, unlike the 22. Two consequences, and the second is easy to miss:
+
+- `_reporting == 0` while `yuzu_fleet_agents_healthy > 0` narrows the pipeline-dark
+  question - but only once Guardian is actually deployed, since the sparse writer means
+  `0` also covers "nothing has been journalled anywhere since restart".
+- Because they are never cleared, the registry retains their last value indefinitely, so
+  **neither their absence nor a `0` detects a stalled sweep** - a stall freezes the
+  previous sample in place. Use `yuzu_server_reaper_sweep_duration_seconds` for sweep
+  liveness.
+
+**Two caveats that apply however you consume these.** An agent ageing out of the 90 s
+staleness window drops its counters from the fleet sum without the underlying loss having
+healed. After a server restart the series rebuild as agents heartbeat back in, which takes
+longer than one sweep (the sweep is 15 s; the agent heartbeat interval defaults to 30 s). Treat the metric
+as a signal and the audit trail as the evidence.
+
+**Known limitations - read before citing these as assurance.** The signal is
+*self-reported by the endpoint whose audit trail is in question*. Fabrication is
+possible (a forged plausible value from an enrolled agent sets the gauge) and so is
+suppression (an agent that simply stops emitting is indistinguishable from a healthy
+quiet one). The series are unlabelled, so a raised value cannot name the affected
+endpoints, and no operator surface exposes per-agent `yuzu.guardian_journal_*` tags
+today - building one is a prerequisite for enabling any alert here. Treat this as a
+best-effort compensating indicator, not independent evidence of audit-trail
+completeness.
+
+**Timing after cutover.** The journal keeps 7 days of batches, so the eviction counters
+(`_evicted_*`) are structurally silent for roughly the first week after `prefer_spark`
+flips - absence in that window is guaranteed rather than evidentiary. After it, a mass
+reboot or OTA can produce a large step in `_evicted_no_send_evidence` about a retention
+window later that is population churn, not a new incident.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed under sustained write failure. A **loss** channel - these records never reached the journal. Monitor-only |
+| `yuzu_fleet_guardian_journal_stage_failures` | gauge | Fleet sum of disarm records that could not be built post-teardown. A **loss** channel: the lifecycle end of a rule is unrecorded |
+| `yuzu_fleet_guardian_journal_field_rejected` | gauge | Fleet sum of records kept out by a field failing validation (embedded NUL, oversized, non-UTF-8). A **loss** channel and a malformed-input signal |
+| `yuzu_fleet_guardian_journal_clock_rejected` | gauge | Fleet sum of records kept out by a skewed clock (timestamp ≤ 0). A **loss** channel, and the fleet's clock-health canary - a journal timestamp that cannot be trusted is not admissible evidence |
+| `yuzu_fleet_guardian_journal_pending` | gauge | Fleet sum of records staged but **not yet persisted**. A **live depth** gauge *per agent* - it drains as the backlog clears - but what is published is the fleet **sum**, which at 10k agents is non-zero essentially always, so `> 0` fires permanently on a healthy fleet and is **not** a valid alert. Monitor-only, like the rest of the family. Sustained depth is the leading indicator of the `_stage_dropped` loss that follows when the reserve overflows |
+| `yuzu_fleet_guardian_journal_batches_written` | gauge | Fleet sum of batches successfully persisted. A cumulative process-lifetime count: non-zero means that agent's journal has persisted at least one batch since it last restarted. It resets to 0 on agent restart, and a journal whose every write fails never sets it, so do not read it as liveness. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_write_failures` | gauge | Fleet sum of failed batch writes. Records stay staged and retry, so this is not itself loss - sustained failure fills the pending reserve, after which staging overflow increments `_stage_dropped`. It leads `_stage_dropped` **on that path only**: `_field_rejected` and `_clock_rejected` move without it, and the capacity-refusal path can reach `_stage_dropped` without a single write failure |
+| `yuzu_fleet_guardian_journal_key_collisions` | gauge | Fleet sum of batch key collisions. Should stay 0; any value is an accounting or id-generation bug surfacing - investigate, do not threshold |
+| `yuzu_fleet_guardian_journal_quarantined` | gauge | Fleet sum of batches moved aside as unreadable/corrupt. Degrade-don't-destroy: the batch is preserved for forensics but its records are **not** replayed, so `> 0` means the server is missing lifecycle evidence that still exists on the endpoint. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_quarantine_failures` | gauge | Fleet sum of quarantine attempts that themselves failed - strictly worse than `_quarantined`: the corrupt batch could not even be set aside, so it may be re-hit every maintenance tick |
+| `yuzu_fleet_guardian_journal_quarantine_capacity_evicted` | gauge | Fleet sum of quarantined batches shed at the quarantine cap. **Terminal loss** - forensic evidence that had been preserved is now gone. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_pruned` | gauge | Fleet sum of batches deleted by retention (routine disposal evidence). Expected non-zero on a working fleet; read it as **activity context** for the failure counters beside it, not as a denominator and not as an alert. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_prune_failures` | gauge | Fleet sum of retention prune failures. Retention not running means the journal grows toward its byte/count cap, where new writes start being refused - see `_write_capacity_rejected` |
+| `yuzu_fleet_guardian_journal_write_capacity_rejected` | gauge | Fleet sum of new batches **refused** because the journal is at its byte/count cap. **Not itself loss**: the refused batch stays staged and the maintenance tick retries it once a later prune frees capacity. Records are lost only if staging then overflows - see `_stage_dropped`. Unit is **batches** of up to 256 records |
+| `yuzu_fleet_guardian_journal_bytes` | gauge | Fleet sum of live on-disk journal size in bytes. A **live** gauge. Capacity signal - a value climbing toward (agents × per-endpoint cap) predicts `_write_capacity_rejected` |
+| `yuzu_fleet_guardian_journal_batch_count` | gauge | Fleet sum of live batch count. A **live** gauge - the count-cap twin of `_bytes`; either ceiling alone can start refusing writes |
+| `yuzu_fleet_guardian_journal_pages` | gauge | Fleet sum of replay paging passes. Activity, not health - the denominator that tells you replay is running at all |
+| `yuzu_fleet_guardian_journal_records_paged` | gauge | Fleet sum of journalled records newly enqueued into the replay window. Activity signal for how much backlog is being re-delivered |
+| `yuzu_fleet_guardian_journal_sent_labels` | gauge | Fleet sum of sent-labels written, in **batches** (best-effort delivery evidence). **Not** a valid denominator for the eviction counters despite the matching unit: labels are counted in the current agent process, while evictions cover batches written up to 7 days earlier across a churning fleet, so after a restart the numerator can exceed it. Read as activity, never as a rate base |
+| `yuzu_fleet_guardian_journal_evicted_sent_unacked` | gauge | Fleet sum of **batches** aged out of the journal **with** a sent-label but no ack (each batch holds up to 256 records). **Monitor, do not page**: their records were sent and are very likely stored server-side; only the ack did not come back. Read against its no-evidence sibling |
+| `yuzu_fleet_guardian_journal_evicted_no_send_evidence` | gauge | Fleet sum of **batches** aged out with **no** sent-label - no evidence their records were ever transmitted (each batch holds up to 256 records, so this understates the record count). This is the **integrity-gap** counter: `> 0` suggests lifecycle audit records were lost between endpoint and server. A CC7.3-relevant evidence signal. Treat a rise as a **ticket to investigate**, not an incident-register entry: classification is **best-effort** (a crash between the send and the sent-label write counts a sent batch as no-evidence), so a mass reboot or OTA manufactures a large benign step about a retention window later. Do not escalate until agent-side corroboration or magnitude analysis rules out that artifact class. Monitor-only |
+| `yuzu_fleet_guardian_journal_maint_exceptions` | gauge | Fleet sum of exceptions swallowed by the journal maintenance tick (page/flush). Swallowed so maintenance cannot kill the agent - which is exactly why they must be visible here: a climbing value means maintenance is failing silently and the counters beside it are **understating** reality |
+| `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 22 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 22; it does not resolve it |
+| `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 
 ## NVD CVE sync metrics
 
