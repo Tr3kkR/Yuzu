@@ -92,19 +92,51 @@ bool spin_until(std::function<bool()> pred, std::chrono::milliseconds timeout = 
 // A real KvStore + durable journal alongside the runtime, for the C0 (#2298)
 // maintenance-on-the-worker cases: prune + page now run HERE, not on the
 // heartbeat / reconnect threads.
+/// Wall clock in ms, matching the journal's retention basis. Tests that page need a
+/// now_ms consistent with the ts_ms the rig persists.
+inline std::int64_t journal_now_ms_for_test() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 struct JournalRig {
     yuzu::test::TempDbFile db{"yuzu_test_drainmaint-"};
     std::unique_ptr<KvStore> kv;
     std::shared_ptr<FakeReader> reader; ///< kept so a test can flip verdicts (compliance traffic)
     std::shared_ptr<GuardianSparkRuntime> rt;
     std::shared_ptr<GuardianLifecycleJournal> journal;
-    JournalRig() {
+    /// `outbox_capacity` 0 = the production default. A SMALL window is what makes the
+    /// headroom branch reachable at all - at the default 4096 a handful of test entries can
+    /// never exhaust it, which is exactly why the first refill test proved nothing (#2345).
+    explicit JournalRig(std::size_t outbox_capacity = 0) {
         auto r = KvStore::open(db.path);
         REQUIRE(r.has_value());
         kv = std::make_unique<KvStore>(std::move(*r));
         reader = std::make_shared<FakeReader>();
-        rt = std::make_shared<GuardianSparkRuntime>(reader, std::make_shared<FakeBackend>());
+        if (outbox_capacity > 0) {
+            GuardianSparkRuntime::Config cfg;
+            cfg.outbox_capacity = outbox_capacity;
+            rt = std::make_shared<GuardianSparkRuntime>(reader, std::make_shared<FakeBackend>(),
+                                                        cfg, RuntimeClock{});
+        } else {
+            rt = std::make_shared<GuardianSparkRuntime>(reader, std::make_shared<FakeBackend>());
+        }
         journal = std::make_shared<GuardianLifecycleJournal>(kv.get());
+    }
+
+    /// Persist ONE durable batch containing `n` records - the multi-entry shape the headroom
+    /// gate actually keys off (it is all-or-nothing per batch).
+    void persist_batch(const std::string& tag, std::size_t n) {
+        std::vector<std::shared_ptr<const JournalRecord>> pending;
+        pending.reserve(n);
+        for (std::size_t i = 0; i < n; ++i)
+            pending.push_back(std::make_shared<const JournalRecord>(JournalRecord{
+                .rule_id = tag + "-" + std::to_string(i), .generation = 1,
+                .event_id = "e-" + tag + "-" + std::to_string(i),
+                .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                .guard_type = "file", .rule_name = "n"}));
+        REQUIRE(journal->persist(pending) == n);
     }
     /// Persist one record as its own durable batch (one persist call = one batch key),
     /// WITHOUT going through the runtime - so the only way it can reach the send window
@@ -957,8 +989,13 @@ TEST_CASE("CH-3b: the compliance reserve survives pathological denominators",
             const auto rid = "r" + std::to_string(i);
             rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
         }
-        rig.rt->evaluate_key(spark_key(file_spec("/p" + std::string("r0"))),
-                             EvalReason::Convergence);
+        // Attach a rule to the key BEFORE evaluating it, and flip its observed state so the
+        // evaluation is a real verdict edge. Evaluating an unattached key emits nothing, so
+        // the compliance entry the reserve is supposed to protect never existed and the
+        // assertion below was vacuous (#2345 minor).
+        REQUIRE(rig.rt->attach_rule("cmp", file_spec("/cmp"), file_exists_rule("cmp"), true));
+        rig.reader->file = read_known(FileSnapshot{.exists = false});
+        rig.rt->evaluate_key(spark_key(file_spec("/cmp")), EvalReason::Convergence);
 
         CollectingSink sink;
         GuardianSparkRuntime::DrainLimits limits;
@@ -966,7 +1003,17 @@ TEST_CASE("CH-3b: the compliance reserve survives pathological denominators",
         limits.compliance_reserve_den = den;
         INFO("compliance_reserve_den = " << den);
         const auto out = rig.rt->drain_bounded(std::ref(sink), limits); // must not crash
-        CHECK(out.sent <= 4);                                          // the overall cap holds
+        CHECK(out.sent <= 4); // the overall cap holds
+        // The DISCRIMINATING observable: with a sane denominator a compliance entry actually
+        // ships. `out.sent <= 4` alone was true even when compliance shipped nothing.
+        if (den > 0 && den <= 8) {
+            bool saw_compliance = false;
+            std::lock_guard<std::mutex> lk{sink.mu};
+            for (const auto& e : sink.sent)
+                if (e.domain != OutboxDomain::Lifecycle)
+                    saw_compliance = true;
+            CHECK(saw_compliance);
+        }
     }
 }
 
@@ -1008,4 +1055,112 @@ TEST_CASE("CH-1: a slow send does not make stop() additionally run a full mainte
     // Generous: one in-flight 200 ms send plus prompt teardown. If the stopping_ gates were
     // removed, the join would additionally absorb full prune+page scans over 200 batches.
     CHECK(elapsed < 3s);
+}
+
+// ---------------------------------------------------------------------------
+// Round 4 (#2345 review): lane fairness under the WALL bound, and the
+// headroom/refill contract. Each asserts the mechanism's own observable.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("R4: a wall-bound lifecycle drain still lets compliance start",
+          "[spark][guardian][drain][maint][r4]") {
+    // The count reserve added earlier is DEAD under wall pressure: drain_log_unlocked checks
+    // the deadline BEFORE the budget, so once lifecycle consumes the shared wall, compliance
+    // returns on entry and never spends its reserved slots. That is the Gate-4 UP-3 detection
+    // blackout reached through the other limit (#2345 important-1).
+    JournalRig rig;
+    // A deep lifecycle backlog whose sends are slow enough to eat the whole wall.
+    for (int i = 0; i < 40; ++i) {
+        const auto rid = "lc" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+    // ...and real compliance traffic queued behind it.
+    REQUIRE(rig.rt->attach_rule("cmp", file_spec("/a"), file_exists_rule("cmp"), true));
+    for (int i = 0; i < 4; ++i) {
+        rig.reader->file = read_known(FileSnapshot{.exists = (i % 2 == 0)});
+        rig.rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
+    }
+
+    std::atomic<int> lifecycle_sent{0}, compliance_sent{0};
+    auto slow_split = [&](const OutboxEntry& e) -> SendResult {
+        std::this_thread::sleep_for(15ms); // slow but succeeding
+        if (e.domain == OutboxDomain::Lifecycle)
+            lifecycle_sent.fetch_add(1);
+        else
+            compliance_sent.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    GuardianSparkRuntime::DrainLimits limits;
+    limits.max_entries = 1000;  // NOT the binding constraint
+    limits.max_wall = 120ms;    // this is: ~8 slow sends fit in the whole pass
+    rig.rt->drain_bounded(slow_split, limits);
+
+    INFO("lifecycle_sent=" << lifecycle_sent.load()
+                           << " compliance_sent=" << compliance_sent.load());
+    // The observable: compliance got at least one attempt. Without a per-lane wall slice
+    // lifecycle consumes the entire deadline and this is 0.
+    CHECK(compliance_sent.load() >= 1);
+}
+
+TEST_CASE("R4: an oversized head batch does not defer smaller newer batches",
+          "[spark][guardian][drain][maint][r4]") {
+    // The headroom miss `break`s before page_cursor_ advances, so an oversized head batch pins
+    // the rotation and newer smaller batches never page - the B2 starvation class the cursor
+    // exists to prevent, reintroduced by the headroom precheck (#2345 minor / head-of-line).
+    JournalRig rig{/*outbox_capacity=*/16}; // small window so headroom genuinely binds
+    rig.persist_batch("big", 12);           // oldest, large
+    rig.persist_batch("small", 2);          // newer, would fit
+
+    // Occupy most of the window so only the small batch can fit.
+    for (int i = 0; i < 8; ++i) {
+        const auto rid = "live" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    INFO("records_paged=" << stats.records_paged
+                          << " headroom_blocked=" << stats.headroom_blocked);
+    // The observable: the small batch got through despite the big one being blocked.
+    CHECK(stats.records_paged >= 2);
+}
+
+TEST_CASE("R4: a refill re-arm does not wait out the periodic bound",
+          "[spark][guardian][drain][maint][r4]") {
+    // The re-arm sets force_page_ but neither skip_wait nor the signal generation, so an
+    // untruncated drain sleeps the FULL periodic bound before acting on it. Existing reconnect
+    // tests use a 20 ms bound, which masks the production 5 s latency (#2345 / Sol).
+    //
+    // The arrangement matters: the window must be genuinely too small for the pending BATCH,
+    // not merely occupied. A first draft of this test forced a page that was never
+    // headroom-blocked and passed for an unrelated reason - the same hollow-test failure this
+    // round exists to stop repeating.
+    JournalRig rig{/*outbox_capacity=*/8};
+    rig.persist_batch("b", 6); // one 6-entry batch: needs 6 free slots, all-or-nothing
+
+    StreamLikeSink sink;
+    sink.set_stream(false); // link DOWN: sends Retain, so the window cannot drain
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/3'600'000,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h,
+                                      .prune_interval = 1h});
+    worker.start();
+    // Occupy 4 of 8 slots with live entries, leaving headroom 4 < the 6-entry batch.
+    for (int i = 0; i < 4; ++i) {
+        const auto rid = "live" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+    CHECK(spin_until([&] { return rig.journal->pages() >= 1; }));
+    const auto pages_before = rig.journal->pages();
+
+    // Link returns. The NEXT cycle pages (blocked: headroom 4 < 6), then its drain ships the
+    // 4 live entries and frees room - which is precisely when the refill re-arm should fire.
+    sink.set_stream(true);
+    worker.notify();
+    CHECK(spin_until([&] { return sink.count() >= 4; }, 10s)); // the drain freed the room
+
+    // The observable: a FURTHER page happens off the re-arm alone. No second notify() here -
+    // if the re-arm does not itself wake the loop, this waits the hour-long bound and fails.
+    CHECK(spin_until([&] { return rig.journal->pages() > pages_before + 1; }, 10s));
+    worker.stop();
 }
