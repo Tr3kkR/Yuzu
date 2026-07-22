@@ -319,6 +319,20 @@ void GuardianEngine::stop() {
     // post-join window (rev-4.1 #7 stop-race gate).
     if (lifecycle_journal_)
         lifecycle_journal_->request_stop();
+    // Persist BEFORE the joins, not only after (#2345 Gate 8 security + Gate 6 compliance).
+    // stop() joins the drain worker below, and that join is a blocking wait on a send that may
+    // be blackholed. If a supervisor's stop timeout or an operator kill lands in that window,
+    // a persist placed only after the join never runs and the staged records are gone - real
+    // destruction of an audit record, not the at-least-once redelivery this design otherwise
+    // guarantees. Nothing about persisting orders on the join, so it costs only its own bounded
+    // KvStore write to do it first. The post-join flush stays: it catches anything the worker
+    // staged while it was winding down, and re-running is safe because persist() erases the
+    // durably-written prefix, so a record is never written under two keys.
+    try {
+        persist_lifecycle_journal_locked();
+    } catch (...) {
+        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (spark_runtime_)
         spark_runtime_->begin_stop();
     if (spark_scheduler_)
@@ -326,10 +340,11 @@ void GuardianEngine::stop() {
     if (spark_drain_worker_)
         spark_drain_worker_->stop();
     stop_all_guards_locked();
-    // Final flush: persist any records a prior failed write left pending, before shutdown;
-    // there is no maintenance tick after stop(). Bounded + circuit-broken (worst case one
-    // KvStore 5 s busy-timeout). FIREWALLED: stop() is reached from the (implicitly noexcept)
-    // ~GuardianEngine destructor, so a throw here would std::terminate (review B4a).
+    // Final flush: anything staged while the workers wound down, plus any records a prior
+    // failed write left pending; there is no maintenance tick after stop(). Bounded +
+    // circuit-broken (worst case one KvStore 5 s busy-timeout). FIREWALLED: stop() is reached
+    // from the (implicitly noexcept) ~GuardianEngine destructor, so a throw here would
+    // std::terminate (review B4a).
     try {
         persist_lifecycle_journal_locked();
     } catch (...) {
