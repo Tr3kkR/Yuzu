@@ -1645,3 +1645,34 @@ TEST_CASE("erase_persisted_prefix identifies the prefix it wrote, not an index",
     CHECK(left[0]->rule_id == "r4");
     CHECK(left[1]->rule_id == "r5");
 }
+
+TEST_CASE("erase_persisted_prefix erases nothing when drops already exceeded the prefix",
+          "[spark][runtime][journal][chaos]") {
+    // The far end of the same seam, and the dangerous one. If MORE records were dropped from
+    // the front than persist durably wrote, the whole persisted prefix is already gone and
+    // there is nothing left to erase. Without the early return, `n -= dropped_since` wraps a
+    // size_t to an enormous value, std::min clamps it to the buffer size, and the erase takes
+    // the ENTIRE remaining staging buffer - every record staged but never written. That is
+    // silent audit-record destruction, and it is worst exactly when it is most likely: staging
+    // only overflows when persist is already failing.
+    // RED before the fix: pending_journal_depth() == 0 - everything still waiting is destroyed.
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(rt->attach_rule("r" + std::to_string(i), file_spec("/p" + std::to_string(i)),
+                                file_exists_rule("r" + std::to_string(i)), true));
+
+    const auto snap = rt->snapshot_pending();
+    const auto drops = snap.drops_at_snapshot;
+    REQUIRE(snap.records.size() == 6);
+
+    // persist committed 3 (r0..r2). Meanwhile FIVE overflow drops took r0..r4 off the front -
+    // strictly more than the prefix that was written.
+    rt->drop_oldest_pending_for_test(5);
+    REQUIRE(rt->pending_journal_depth() == 1); // only r5 is left, and it was never persisted
+
+    rt->erase_persisted_prefix(3, drops);
+    REQUIRE(rt->pending_journal_depth() == 1); // untouched: nothing of the prefix remained
+    const auto left = rt->snapshot_pending().records;
+    REQUIRE(left.size() == 1);
+    CHECK(left[0]->rule_id == "r5"); // the never-persisted record survives to be retried
+}

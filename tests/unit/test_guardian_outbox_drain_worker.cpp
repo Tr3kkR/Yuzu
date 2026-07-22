@@ -107,9 +107,13 @@ struct JournalRig {
     std::shared_ptr<FakeReader> reader; ///< kept so a test can flip verdicts (compliance traffic)
     std::shared_ptr<GuardianSparkRuntime> rt;
     std::shared_ptr<GuardianLifecycleJournal> journal;
-    /// `outbox_capacity` 0 = the production default. A SMALL window is what makes the
-    /// headroom branch reachable at all - at the default 4096 a handful of test entries can
-    /// never exhaust it, which is exactly why the first refill test proved nothing (#2345).
+    /// `outbox_capacity` 0 = the production default (4096). NOTE: the lifecycle window is
+    /// FLOORED at kMaxJournalEntriesPerBatch, so any smaller value is clamped UP to 256 and
+    /// logs that it did. Passing a small number therefore does NOT make the headroom branch
+    /// reachable - a test that needs headroom to bind must fill the window to near its real
+    /// capacity and REQUIRE the headroom it expects. Getting this wrong is not a loud failure:
+    /// it silently makes the test vacuous, which is how the head-of-line guard below spent a
+    /// round asserting nothing (#2345 Gate 4 consistency).
     explicit JournalRig(std::size_t outbox_capacity = 0) {
         auto r = KvStore::open(db.path);
         REQUIRE(r.has_value());
@@ -1135,21 +1139,36 @@ TEST_CASE("R4: an oversized head batch does not defer smaller newer batches",
     // The headroom miss `break`s before page_cursor_ advances, so an oversized head batch pins
     // the rotation and newer smaller batches never page - the B2 starvation class the cursor
     // exists to prevent, reintroduced by the headroom precheck (#2345 minor / head-of-line).
-    JournalRig rig{/*outbox_capacity=*/16}; // small window so headroom genuinely binds
-    rig.persist_batch("big", 12);           // oldest, large
-    rig.persist_batch("small", 2);          // newer, would fit
+    //
+    // This test was HOLLOW for a round. It asked for a 16-entry window, but the window is
+    // floored at kMaxJournalEntriesPerBatch, so it silently got 256 - nothing was ever
+    // headroom-blocked, the branch under test never ran, and `records_paged >= 2` passed
+    // because BOTH batches paged. It now fills the window against its real capacity and
+    // asserts the blocking itself, not a number both outcomes satisfy.
+    JournalRig rig{/*outbox_capacity=*/1}; // clamped UP to the floor: exactly one max batch
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    REQUIRE(cap == kMaxJournalEntriesPerBatch); // the floor, not the requested size
 
-    // Occupy most of the window so only the small batch can fit.
-    for (int i = 0; i < 8; ++i) {
-        const auto rid = "live" + std::to_string(i);
-        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
-    }
+    rig.persist_batch("big", 12);  // oldest, large
+    rig.persist_batch("small", 2); // newer, would fit
+
+    // Leave room for the SMALL batch but not the big one.
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i < cap - 3; ++i)
+        fill.push_back(OutboxEntry::lifecycle("live", 1, "live-" + std::to_string(i),
+                                              1'700'000'000'000'000'000, "armed", "file", "n"));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap - 3);
+    REQUIRE(rig.rt->lifecycle_headroom() == 3); // deterministic: 3 >= 2 but 3 < 12
 
     const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
     INFO("records_paged=" << stats.records_paged
-                          << " headroom_blocked=" << stats.headroom_blocked);
-    // The observable: the small batch got through despite the big one being blocked.
-    CHECK(stats.records_paged >= 2);
+                          << " headroom_blocked=" << stats.headroom_blocked
+                          << " min_blocked=" << stats.min_blocked_headroom);
+    // The branch's OWN observables: the big batch was blocked and said what it needed...
+    CHECK(stats.headroom_blocked);
+    CHECK(stats.min_blocked_headroom == 12);
+    // ...and the cursor advanced past it so the smaller NEWER batch still got through.
+    CHECK(stats.records_paged == 2);
 }
 
 TEST_CASE("R4: a refill re-arm does not wait out the periodic bound",
