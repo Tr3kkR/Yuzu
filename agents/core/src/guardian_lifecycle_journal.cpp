@@ -812,6 +812,13 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // Advance the cursor for EVERY considered batch (paged or a free member / headroom-defer
         // skip), so an already-windowed head cannot pin the rotation.
         page_cursor_ = std::pair{c.ts_ms, c.key};
+        // Clear the aging boost the moment this batch is no longer blocked - whether it paged
+        // or turned out to be fully windowed already. Clearing only on added > 0 left a
+        // fully-windowed starved batch pinning `start` to itself on EVERY later pass, which
+        // silently converts the boost from a fairness fix into the rotation starvation it was
+        // built to prevent.
+        if (!outcome.blocked_for_headroom && starved_ && starved_->second == c.key)
+            starved_.reset();
         if (outcome.blocked_for_headroom) {
             // The window shrank between the pre-check and the locked attempt. Without this the
             // pass would report "nothing to do" and the caller's refill re-arm would never
@@ -821,8 +828,6 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 stats.min_blocked_headroom = outcome.required;
         }
         if (outcome.added > 0) {
-            if (starved_ && starved_->second == c.key)
-                starved_.reset(); // it got through: stop holding the rotation for it
             page_bucket_.take(); // charge a token ONLY for net-new work
             ++stats.batches_paged;
             stats.records_paged += outcome.added;
