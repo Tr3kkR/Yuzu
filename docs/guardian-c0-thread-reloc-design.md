@@ -518,6 +518,14 @@ retention, which shares the endpoint clock this guard exists for). The remaining
 sites are recorded in #2360 rather than filed individually, since they share one fix pattern and
 a lower stake.
 
+## Governance record
+
+Verdicts, findings and their disposition for the review rounds on this branch live in
+`docs/guardian-c0-governance-ledger.md`. Standing rule from that run: **no commit may cite a gate
+number that is not independently recorded there.** Two earlier rounds cited "Gate 8"/"Gate 8b"
+with no verdict anywhere in the tree, which Gate 6 compliance classified as a CC7.2 traceability
+failure - a reader could confirm only that the author said they ran.
+
 ## REQUIRED at the `prefer_spark` flip (Gate 6 enterprise-readiness)
 
 Everything in this change that relocates journal maintenance is DORMANT until the Spark
