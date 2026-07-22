@@ -27,6 +27,7 @@ curl -s 'http://localhost:8080/metrics'
 yuzu_http_requests_total{method="GET",status="200",principal_class="human"} 1542
 yuzu_http_requests_total{method="POST",status="200",principal_class="agent"} 87
 yuzu_http_requests_total{method="GET",status="404",principal_class="none"} 12
+yuzu_http_requests_total{method="POST",status="200",principal_class="engine"} 34
 
 # HELP yuzu_command_duration_seconds Command execution latency in seconds
 # TYPE yuzu_command_duration_seconds histogram
@@ -223,7 +224,7 @@ Metrics carry a standard set of labels for filtering and grouping in queries.
 | `status` | HTTP status code or outcome | `200`, `500`, `success`, `failure` |
 | `os` | Agent operating system | `windows`, `linux`, `darwin` |
 | `arch` | Agent CPU architecture | `x64`, `arm64` |
-| `principal_class` | Credential presentation class on HTTP request counts (closed set; `engine` reserved for ADR-1005 engine principals). Traffic-shape only — never an authorization signal. | `human`, `agent`, `none` |
+| `principal_class` | Actor class on HTTP request counts (closed set, ADR-1005). `human`/`agent`/`none` classify by credential presentation (traffic shape); `engine` classifies the RESOLVED session (a resolved engine-principal request) — see `docs/observability-conventions.md` for the hybrid-basis contract. Never an authorization signal. As of PR 4.5, `agent` no longer includes engine-principal traffic — a panel/alert summing `agent` across the 4.5 deploy boundary shows a step-down that is a reclassification artifact, not a traffic change. | `human`, `agent`, `none`, `engine` |
 
 ## On-behalf-of rejection metric (ADR-1005)
 

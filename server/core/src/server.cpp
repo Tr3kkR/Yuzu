@@ -362,10 +362,10 @@ public:
         // startup, matching yuzu_onbehalf_rejected_total below). method/status
         // are NOT closed sets, so a single representative GET/200 point per
         // class is the seed — not a cross-product, which would be unbounded.
-        // "engine" is deliberately excluded: it is Phase-4-reserved and never
-        // emitted today (principal_class.hpp), so pre-seeding it now would
-        // advertise a series that cannot occur until that phase ships.
-        for (auto pc : {"human", "agent", "none"}) {
+        // "engine" is now included (PR 4.5 — principal_class_resolved makes it
+        // live, emitted for a resolved engine-principal session): the closed
+        // set is human/agent/none/engine and every value gets its 0-point.
+        for (auto pc : {"human", "agent", "none", "engine"}) {
             metrics_.counter("yuzu_http_requests_total",
                              {{"method", "GET"}, {"status", "200"}, {"principal_class", pc}});
         }
@@ -390,8 +390,8 @@ public:
         // an attack signal. side="operator" is dormant until Phase 5
         // (delegation debits the operator side); it is pre-seeded anyway,
         // deliberately, because it is a real documented QuotaSide dimension
-        // (unlike the withheld principal_class="engine" pre-seed above,
-        // which is reserved but not yet a live enum value).
+        // (same reasoning as the principal_class="engine" pre-seed above,
+        // which is now a live enum value as of PR 4.5).
         metrics_.describe("yuzu_server_principal_quota_exhausted_total",
                           "Per-principal quota-cap exhaustions by side and limit dimension",
                           "counter");
@@ -5412,6 +5412,22 @@ private:
             // comment.
             detail::tls_quota_slot().reset();
 
+            // principal_class metric (PR 4.5) — defensive reset at the TOP of
+            // pre-routing, before all early returns, mirroring the quota
+            // slot reset immediately above. Set true further down, right
+            // after session resolution, when the RESOLVED session is an
+            // engine principal; read at the post-routing metric emission.
+            // The PRIMARY clear is the post-routing handler's
+            // EngineClassStashClear scope guard, which fires on every exit
+            // from that lambda (incl. throw) — including the requests
+            // httplib rejects BEFORE pre-routing ever runs (malformed
+            // request line, URI too long, bad Range), which never reach
+            // this reset. This one is defense-in-depth for requests that
+            // DO make it through pre-routing. See principal_class.hpp's
+            // detail::tls_engine_principal() doc comment for the full
+            // contract.
+            detail::tls_engine_principal() = false;
+
             // Lightweight probes — always allowed, no auth, no rate limit.
             // /health and /api/health are included here (governance Gate 7,
             // unhappy-path UP-1) so monitoring integrations behind a NAT or
@@ -5572,6 +5588,19 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // principal_class metric (PR 4.5) — stash whether this RESOLVED
+            // session is an engine principal, for the post-routing metric
+            // emission (principal_class.hpp's principal_class_resolved).
+            // INDEPENDENT of the quota-gate outcome below: a 429'd engine
+            // request still classifies as "engine" — the traffic shape was
+            // still engine-shaped even though it got rejected. Session::is_engine()
+            // is the canonical predicate, mirroring the sibling belts in
+            // principal_quota_gate.hpp's apply_engine_quota_gate (also
+            // mcp_server.cpp's deny_if_engine_session / rest_api_v1.cpp's
+            // deny_engine_session) so a future engine auth path can't
+            // silently miss one copy.
+            detail::tls_engine_principal() = session->is_engine();
+
             // Per-principal quota cap (PR 4.4, ADR-1005 class engine
             // principals) — THE single pre-routing chokepoint gate (#2225
             // ADR-0017); no separate route, no bypass. Runs AFTER session
@@ -5635,6 +5664,28 @@ private:
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
         web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
                                                                        httplib::Response& res) {
+            // principal_class metric (PR 4.5) — clear the engine-class stash on EVERY
+            // exit from this handler, via a guard whose destructor runs AFTER the
+            // metric emission below (never clears before the read — cf. the reset
+            // ordering) AND even if that emission throws. Load-bearing, not just
+            // hygiene: httplib runs post-routing for requests it rejects BEFORE
+            // pre-routing (malformed request line->400, URI>8K->414, bad Range->416;
+            // httplib.h write_response_core), which never hit the top-of-pre-routing
+            // reset — so a leaked `true` from a post-routing throw would mislabel the
+            // next such parse-error response on the same keep-alive worker as
+            // "engine". (governance unhappy-path F1/F2.)
+            //
+            // ORDERING IS LOAD-BEARING: this guard MUST remain the FIRST local
+            // declared in this lambda. C++ destroys locals in reverse
+            // construction order, so being declared first makes it destruct
+            // LAST — after the metric emission reads the stash below. Declaring
+            // any local before it would move its destructor ahead of the read
+            // and clear the stash too early (the exact reset-before-read hazard
+            // this design avoids). Do not add a local above this line.
+            struct EngineClassStashClear {
+                ~EngineClassStashClear() { detail::tls_engine_principal() = false; }
+            } engine_class_stash_clear;
+
             // Per-principal quota (PR 4.4) — release the concurrency slot
             // (if any) admitted for this request at pre-routing. A no-op for
             // denied/streaming/non-engine requests, which never stash one.
@@ -5668,14 +5719,17 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
-            // principal_class: bounded presentation-level actor class (ADR-1005,
-            // execution-plan PR 1.2) — human / agent / none today, engine reserved for
-            // Phase 4. See principal_class.hpp for the classification contract.
+            // principal_class: bounded actor class (ADR-1005, execution-plan
+            // PR 1.2) — human / agent / none / engine. "engine" is live as of
+            // PR 4.5: principal_class_resolved reads the stash set by the
+            // pre-routing chokepoint from the RESOLVED session, falling back
+            // to presentation-based principal_class_of otherwise. See
+            // principal_class.hpp for the full hybrid-basis contract.
             metrics_
                 .counter("yuzu_http_requests_total",
                          {{"method", req.method},
                           {"status", std::to_string(res.status)},
-                          {"principal_class", std::string(principal_class_of(req))}})
+                          {"principal_class", std::string(principal_class_resolved(req))}})
                 .increment();
         });
 

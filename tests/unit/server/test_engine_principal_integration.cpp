@@ -807,3 +807,45 @@ TEST_CASE("make_audit_event — engine session stamps principal_class=='engine' 
     // make_audit_event suite — unaffected by this fix, since the re-stamp only
     // fires when the resolved session's principal_kind == "engine".
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. Session::is_engine() — the two-predicate engine-session discriminator
+//    (governance round: this was the one untested inline copy, at the
+//    principal_class stash site in server.cpp's pre-routing chokepoint).
+//    Plain struct, no store/fixture needed.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Session::is_engine() — all four predicate-branch combinations",
+          "[engine_principal][session]") {
+    auth::Session s;
+
+    SECTION("principal_kind==engine, auth_source==engine_token -> true (both predicates)") {
+        s.principal_kind = "engine";
+        s.auth_source = "engine_token";
+        CHECK(s.is_engine());
+    }
+
+    SECTION("principal_kind==engine, auth_source==local -> true (kind alone)") {
+        s.principal_kind = "engine";
+        s.auth_source = "local";
+        CHECK(s.is_engine());
+    }
+
+    SECTION("principal_kind==human, auth_source==engine_token -> true (source alone)") {
+        s.principal_kind = "human";
+        s.auth_source = "engine_token";
+        CHECK(s.is_engine());
+    }
+
+    SECTION("principal_kind==human, auth_source==local -> false (neither)") {
+        s.principal_kind = "human";
+        s.auth_source = "local";
+        CHECK_FALSE(s.is_engine());
+    }
+
+    SECTION("principal_kind==human, auth_source==password -> false (neither, non-default source)") {
+        s.principal_kind = "human";
+        s.auth_source = "password";
+        CHECK_FALSE(s.is_engine());
+    }
+}

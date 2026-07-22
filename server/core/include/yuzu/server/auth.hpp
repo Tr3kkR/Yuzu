@@ -75,6 +75,15 @@ struct Session {
     /// discriminator the Phase-4/5 self-target destruction guard (§9) keys on —
     /// never infer principal kind from the shape of `username`.
     std::string principal_kind{"human"};
+
+    /// True iff this session authenticates as an ADR-0031 engine principal.
+    /// The canonical engine-session discriminator (mirrors the belts in
+    /// rest_api_v1.cpp deny_engine_session / mcp_server.cpp
+    /// deny_if_engine_session / principal_quota_gate.hpp apply_engine_quota_gate).
+    [[nodiscard]] bool is_engine() const {
+        return principal_kind == "engine" || auth_source == "engine_token";
+    }
+
     /// Timestamp of the most recent successful MFA proof on this session
     /// (login completion or step-up). Default-constructed sentinel means
     /// "no MFA proof yet". Compared against
