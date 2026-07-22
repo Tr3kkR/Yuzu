@@ -573,7 +573,10 @@ crashes, the OOM-killer) are **shipped** — see the Linux collector section abo
   (route a′); the gateway forwards `GuaranteedStateEvent` opaquely.
 - The projection (`guardian_observations`, migration {7}) is written **inside
   the event transaction** — duplicate `event_id` rolls back both (at-least-once
-  dedup), and the reaper deletes projection rows in lockstep with events.
+  dedup - the dedup-by-`event_id` mechanism itself, not the lifecycle journal's
+  overall delivery guarantee; see `docs/user-manual/guaranteed-state.md`'s
+  "Reconnect replay traffic" section for that), and the reaper deletes
+  projection rows in lockstep with events.
 - Observations are facts, not alerts: severity is uniformly `info`; DEX applies
   its own framing and ignores Guardian severity.
 - The headline dashboard rate stays **crash-free devices** (crash-scoped);
