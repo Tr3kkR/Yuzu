@@ -8,12 +8,14 @@
 //    in every test-database name; the threshold is far beyond a server-
 //    suite job's lifetime, so a live concurrent suite on the shared
 //    instance can never be swept.
-//  - testRunEnded: drop this process's template databases while libpq's TLS
+//  - testRunEnded: drop this process's template databases AND the shared-DB +
+//    TRUNCATE fixtures' per-file clones (SharedPgDbRegistry) while libpq's TLS
 //    stack is still alive. The Registry static dtor is only a backstop: its
 //    __cxa_atexit slot is claimed when the first [pg] fixture runs, so on
 //    Catch2-filtered runs OpenSSL's own atexit cleanup can land AFTER it
 //    and the exit-time PQconnectdb fails (see PgTestTemplate::drop_all_built
-//    in test_helpers.hpp).
+//    in test_helpers.hpp). The shared-DB clones would hit the same window in a
+//    function-local static's dtor, so they register for this same drop.
 //
 // The TEST_CASEs below are the regression net the 2091 review asked for: a
 // change that no-ops the drop paths, breaks the shared-key replay
@@ -51,7 +53,10 @@ public:
     }
 
     void testRunEnded(Catch::TestRunStats const& /*stats*/) override {
+        // Both drops run here (not in a static dtor) while libpq's TLS stack is
+        // alive: templates AND the shared-DB+TRUNCATE fixtures' per-file clones.
         yuzu::test::PgTestTemplate::drop_all_built();
+        yuzu::test::SharedPgDbRegistry::drop_all_shared();
     }
 };
 

@@ -49,6 +49,74 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
         throw std::runtime_error("swinv template: store failed to migrate");
 }};
 
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per test. Each
+// per-test clone/pool opens several backends, and on Windows Postgres is
+// EXEC_BACKEND (a fresh postgres.exe per connection) — the dominant [pg]-shard
+// cost. Behaviour-preserving: identical store calls and CHECKs; only the DB
+// provisioning/isolation substrate changes. Built lazily; the clone is dropped
+// at testRunEnded (keep_until_run_end), never in a static destructor.
+//
+// CARVE-OUTS keep their own per-test database and are NOT converted: tests that
+// DROP SCHEMA / rewind public.schema_meta / DROP COLUMN to force a degrade or
+// re-migration would poison a shared DB for every later test (TRUNCATE cannot
+// undo DDL, and schema_meta lives in `public`, surviving a schema drop). Those
+// stay on YUZU_REQUIRE_PG_DB_TPL (clone) or YUZU_REQUIRE_PG_DB (fresh).
+struct SwinvShared {
+    yuzu::test::PostgresTestDb db{swinv_tpl};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SwinvShared() {
+        REQUIRE(db.available());
+        REQUIRE(pool.valid());
+        db.keep_until_run_end();
+    }
+};
+SwinvShared& swinv_shared() {
+    static SwinvShared s;
+    return s;
+}
+
+// Restore the shared DB to its fresh-clone state: TRUNCATE every data table and
+// re-seed the catalog_rollup_meta singleton. Migration v4 seeds id=1 with
+// refreshed_at=0 ("building"); a bare TRUNCATE would drop that row and break the
+// pre-refresh reads (the catalogue tests), so re-insert it. public.schema_meta
+// is deliberately untouched — the clone stays migrated, so the per-test store
+// ctor finds the schema current and skips migration (a cheap SELECT, no new
+// backend).
+void swinv_reset() {
+    auto lease = swinv_shared().pool.acquire();
+    REQUIRE(lease);
+    auto trunc = pg::exec_params(
+        lease.get(),
+        "TRUNCATE software_inventory_store.installed_software, "
+        "software_inventory_store.inventory_state, software_inventory_store.catalog_rollup, "
+        "software_inventory_store.version_rollup, software_inventory_store.catalog_rollup_meta "
+        "RESTART IDENTITY CASCADE",
+        std::vector<std::string>{});
+    REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+    auto seed = pg::exec_params(
+        lease.get(),
+        "INSERT INTO software_inventory_store.catalog_rollup_meta "
+        "(id, refreshed_at, total_titles, total_devices) VALUES (1, 0, 0, 0) "
+        "ON CONFLICT (id) DO NOTHING",
+        std::vector<std::string>{});
+    REQUIRE(seed.status() == PGRES_COMMAND_OK);
+}
+
+// Preamble for a convertible test: same skip contract as YUZU_REQUIRE_PG_DB_TPL,
+// then TRUNCATE-reset the shared DB and bind `pool` (reference to the persistent
+// pool) + `store` (fresh; the ctor's migration check is a no-op on the already-
+// migrated clone, opening no new backend). `pool` is [[maybe_unused]] — most
+// tests only touch `store`.
+#define SWINV_SHARED(store, pool)                                                              \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                           \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                        \
+    }                                                                                          \
+    swinv_reset();                                                                             \
+    [[maybe_unused]] PgPool& pool = swinv_shared().pool;                                       \
+    SoftwareInventoryStore store{pool};                                                        \
+    REQUIRE(store.is_open())
+
 // THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the agent
 // computes the SAME hash for the SAME input (see tests/unit/test_inventory_sync.cpp
 // — identical constant). If the agent's and server's canonicalisation ever drift
@@ -100,11 +168,7 @@ TEST_CASE("SoftwareInventoryStore canonical_hash is the cross-pinned value",
 }
 
 TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_inventory]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"},
                                        {"Firefox", "120", "Mozilla", ""}};
@@ -166,11 +230,7 @@ TEST_CASE("SoftwareInventoryStore hash-skip ingest round-trip", "[pg][software_i
 
 TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
           "[pg][software_inventory][seam]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     const std::string blob = blob1("Chrome", "119", "Google", "2026-01-01");
     const std::string h =
@@ -226,11 +286,7 @@ TEST_CASE("ingest_inventory_report drives the seam + fills need_full",
 
 TEST_CASE("blob contract v2: 12-field entry round-trips through store and ingest seam",
           "[pg][software_inventory][v2]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     const SoftwareEntry e = full_v2_entry();
 
@@ -288,11 +344,7 @@ TEST_CASE("blob contract v2: a v1 4-field blob still ingests — fields 5-12 emp
     // over those empties (so the OLD agent's v1 claimed hash will keep
     // mismatching → the documented bounded ~2-RPC/day loop until agent upgrade,
     // never an error loop, never corruption).
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     const std::string v1_hash = "1111111111111111111111111111111111111111111111111111111111111111";
     agentpb::InventoryReport rep;
@@ -407,11 +459,7 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     // straddles the 1024-byte cap must be truncated on the codepoint boundary, NOT
     // mid-sequence — otherwise the INSERT into the UTF8 TEXT column is rejected by
     // PostgreSQL (22021) → kError → need_full, never storing. The row must STORE.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     // name = 1023 'a' + 'é' (0xC3 0xA9) = 1025 bytes; record = name|1|| (0x1F fields,
     // 0x1E terminator; octal \037=0x1F \036=0x1E to avoid greedy \x hex escapes).
@@ -437,11 +485,7 @@ TEST_CASE("ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches
     // replace it with U+FFFD (EF BF BD) IDENTICALLY to the agent's clamp_field, so the
     // row STORES and the server-recomputed hash equals what the real agent (which
     // scrubs before hashing) would have sent.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     // The hash the agent would compute AFTER its own identical scrub of 0xE9.
     const std::string agent_hash = SoftwareInventoryStore::canonical_hash(
@@ -484,11 +528,7 @@ TEST_CASE("ingest scrub: PG-strict edge-branch parity vector (UP-IN1 drift guard
         "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" + "\xc3\xa9" + "\xf0\x9f\x98\x80" +
         "\xef\xbf\xbd";
 
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     // The hash the agent would compute after its identical scrub.
     const std::string agent_hash =
@@ -587,11 +627,7 @@ TEST_CASE("ingest rejects a report carrying too many sources (map-cardinality ca
     // Defense-in-depth (fjarvis LOW): the framework wires a small fixed number of
     // sources; an implausibly large content_hashes/plugin_data map is malformed or
     // abusive and the whole report is rejected (no per-source processing, no rows).
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     SECTION("content_hashes map over cap → rejected") {
         agentpb::InventoryReport rep;
@@ -624,11 +660,7 @@ TEST_CASE("batched insert round-trips a large set, array metacharacters, and emp
     // exercise it against a real backend: bulk correctness, the text[] literal
     // escaping (to_text_array — unit-tested in test_pg_array.cpp, end-to-end
     // here), and the empty-entries skip.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     SECTION("the documented max (kMaxEntries) inserts via one unnest() and reads back complete") {
         // 20 000 rows — the kMaxEntries cap, i.e. the largest payload the ingest
@@ -715,11 +747,7 @@ TEST_CASE("read-degrade bumps yuzu_inventory_read_degrade_total by reason (#1675
 TEST_CASE("count_stale_agents keys on server receipt time, immune to agent collected_at skew "
           "(#1685)",
           "[pg][software_inventory]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                                  std::chrono::system_clock::now().time_since_epoch())
@@ -774,11 +802,7 @@ TEST_CASE("ingest_inventory_report records the ingest-duration histogram by phas
     // Drives the seam with a LIVE registry (the other seam tests pass nullptr) and
     // asserts the histogram fires once per phase: a full payload → phase=full, a
     // hash-only follow-up → phase=hash_only.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
     yuzu::MetricsRegistry metrics;
 
     const std::string blob = blob1("Chrome", "119", "Google", "2026-01-01");
@@ -986,11 +1010,7 @@ TEST_CASE("delete_agent removes both the child rows and the parent state row",
     // Verify both halves: the child rows are gone (get returns an empty VALUE, not
     // nullopt) AND the parent state row is gone (a hash-only follow-up sees a cold
     // cache → kNeedFull, not kTouched on a stale parent).
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", "2026-01-01"},
                                        {"Firefox", "120", "Mozilla", ""}};
@@ -1040,11 +1060,7 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
     // Gov F1: the /inventory dashboard's fleet aggregates (software_catalog /
     // software_versions) had no store-level coverage — the GROUP BY SQL, the
     // most-installed ordering, the name filter, and the cap were stubbed at the route.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     // 3 devices: Google Chrome on all 3 (versions 126 ×2, 125 ×1); 7-Zip on 1.
     using Rows = std::vector<SoftwareEntry>;
@@ -1128,11 +1144,7 @@ TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before 
     // Before any refresh_catalog_rollup(), the rollup tables are empty and the seeded meta
     // row reports refreshed_at==0 ("building") — distinct from a refreshed-but-empty fleet.
     // This is the state the dashboard shows as "catalogue building", not a false empty.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     REQUIRE(store.apply_installed_software(
                 "pre-a1", "", std::vector<SoftwareEntry>{{"Google Chrome", "126", "Google", ""}}, 1) ==
@@ -1163,11 +1175,7 @@ TEST_CASE("SoftwareInventoryStore rollup tables carry the multi-instance unique 
     // UNIQUE constraints are the backstop that makes a racing duplicate INSERT fail; a
     // future migration refactor that drops one would silently reopen the multi-instance
     // duplicate-row bug. Assert both exist so that regression fails loudly here.
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
+    SWINV_SHARED(store, pool);
 
     auto lease = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(lease);

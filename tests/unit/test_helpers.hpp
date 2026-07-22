@@ -50,6 +50,8 @@
 #include <optional>
 #include <set>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <libpq-fe.h>
 
@@ -346,6 +348,81 @@ inline void sweep_stale_test_databases(const std::string& admin_dsn) {
     }
 }
 
+/// ── Shared per-file test databases (shared-DB + TRUNCATE fixtures) ────────
+///
+/// The shared-DB fixture pattern — one migrated clone + one persistent pool
+/// per test FILE, TRUNCATE between tests instead of a fresh database per test
+/// — exists to cut the per-test CREATE DATABASE + pool spin-up (each opens
+/// several backends, and on Windows Postgres is EXEC_BACKEND: a fresh
+/// postgres.exe per connection, the dominant [pg]-shard cost). The clone must
+/// be dropped at testRunEnded, while libpq's TLS stack is still alive, and
+/// NEVER in the function-local static's destructor: that static-dtor DROP
+/// races OpenSSL's atexit cleanup on filtered runs and leaks — the exact
+/// hazard PgTestTemplate::drop_all_built documents. A shared fixture calls
+/// PostgresTestDb::keep_until_run_end(), which hands its clone here; the
+/// test_pg_template_cleanup listener calls drop_all_shared() right next to
+/// PgTestTemplate::drop_all_built().
+class SharedPgDbRegistry {
+public:
+    static void add(std::string admin_dsn, std::string db_name) {
+        Reg& r = reg();
+        const std::lock_guard<std::mutex> lock(r.mu);
+        r.dbs.push_back({std::move(admin_dsn), std::move(db_name)});
+    }
+
+    /// Drop every registered shared database WITH FORCE — which terminates any
+    /// connection the file's persistent pool still holds, so the pool itself
+    /// needs no explicit shutdown (its static PQfinish at process exit then
+    /// closes already-dead sockets harmlessly). Best-effort + announced, the
+    /// same philosophy as PgTestTemplate's drop.
+    static void drop_all_shared() {
+        Reg& r = reg();
+        const std::lock_guard<std::mutex> lock(r.mu);
+        const std::size_t total = r.dbs.size();
+        for (const auto& e : r.dbs) {
+            yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
+            if (PQstatus(conn.get()) != CONNECTION_OK) {
+                std::fputs("SharedPgDbRegistry: teardown admin connect failed — leaked a "
+                           "yuzu_test_* database (next sweep reclaims it)\n",
+                           stderr);
+                continue;
+            }
+            const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+            if (!res.ok())
+                std::fputs(std::format("SharedPgDbRegistry: drop of {} failed: {}\n", e.db_name,
+                                       PQerrorMessage(conn.get()))
+                               .c_str(),
+                           stderr);
+        }
+        r.dbs.clear();
+        if (total > 0) {
+            try {
+                std::fputs(
+                    std::format("SharedPgDbRegistry: dropped {} shared test database(s) at run end\n",
+                                total)
+                        .c_str(),
+                    stderr);
+            } catch (...) {
+            }
+        }
+    }
+
+private:
+    struct Entry {
+        std::string admin_dsn;
+        std::string db_name;
+    };
+    struct Reg {
+        std::mutex mu;
+        std::vector<Entry> dbs;
+    };
+    static Reg& reg() {
+        static Reg r;
+        return r;
+    }
+};
+
 class PgTestTemplate;
 
 /// RAII fixture for an ephemeral, uniquely-named Postgres database.
@@ -370,6 +447,11 @@ public:
     explicit PostgresTestDb(PgTestTemplate& tpl);
 
     ~PostgresTestDb() {
+        // Teardown handed to SharedPgDbRegistry (dropped at testRunEnded, while
+        // OpenSSL is still up) — do nothing here, and in particular do not
+        // PQconnectdb from a static destructor where OpenSSL may be gone.
+        if (detached_)
+            return;
         if (db_name_.empty() || admin_dsn_.empty())
             return;
         yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
@@ -400,6 +482,19 @@ public:
     /// Conninfo (keyword/value form) for the ephemeral database.
     [[nodiscard]] const std::string& dsn() const noexcept { return dsn_; }
     [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
+
+    /// Hand this database's teardown to SharedPgDbRegistry — it is dropped at
+    /// testRunEnded instead of in this object's destructor. For the shared-DB
+    /// + TRUNCATE fixture, where a process-lifetime PostgresTestDb held in a
+    /// function-local static would otherwise DROP in its static destructor,
+    /// racing OpenSSL's atexit teardown (the PgTestTemplate hazard). No-op when
+    /// the database never came up.
+    void keep_until_run_end() {
+        if (!available_ || db_name_.empty() || admin_dsn_.empty())
+            return;
+        SharedPgDbRegistry::add(admin_dsn_, db_name_);
+        detached_ = true;
+    }
 
 private:
     /// Shared constructor body. `tpl_name` == nullptr -> empty database
@@ -546,6 +641,7 @@ private:
     std::string dsn_;
     std::string error_;
     bool available_{false};
+    bool detached_{false}; ///< true → SharedPgDbRegistry owns teardown (keep_until_run_end)
 
     friend class PgTestTemplate; // rewrite_dbname for the template's own DSN
 };
