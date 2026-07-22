@@ -49,13 +49,17 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
     // If a field is added without a matching put() key, or two keys collide, the size check
     // fails.
     //
-    // DESIGNATED initialisers, deliberately. This was a positional list asserting 22, and when
-    // two fields were inserted MID-STRUCT the list silently stopped covering the last four -
-    // including evicted_without_send_evidence, the audit-gap counter and the one field whose
-    // wire key intentionally differs from its name. The test still passed while covering less
-    // than it claimed (#2345 Gate 8 consistency S1). Positional initialisation cannot express
-    // this invariant safely; naming every field is what makes an insertion a compile error
-    // rather than a silent coverage loss.
+    // DESIGNATED initialisers, deliberately - but be precise about what they buy. This was a
+    // positional list asserting 22, and when two fields were inserted MID-STRUCT the list
+    // silently stopped covering the last four - including evicted_without_send_evidence, the
+    // audit-gap counter and the one field whose wire key intentionally differs from its name.
+    // The test still passed while covering less than it claimed (#2345 Gate 8 consistency S1).
+    //
+    // Designators fix the REORDER case: a field moved within the struct can no longer silently
+    // shift values onto the wrong members. They do NOT make an INSERTION a compile error - an
+    // omitted designator is legal and value-initialises, with no diagnostic (Gate 8b compiled a
+    // repro; an earlier version of this comment claimed otherwise). Adding a field therefore
+    // still requires adding its designator here and bumping the count below by hand.
     std::map<std::string, std::string> tags;
     GuardianJournalStats s{
         .stage_dropped = 1,

@@ -599,13 +599,14 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
         for (int i = 0; !stop.load(std::memory_order_relaxed) && i < 200; ++i) {
             const auto rid = "live" + std::to_string(i);
             rig.rt->attach_rule(rid, file_spec("/" + rid), file_exists_rule(rid), true);
-            auto pending = rig.rt->snapshot_pending();
+                        const auto drops = rig.rt->journal_stage_dropped();
+                auto pending = rig.rt->snapshot_pending();
             if (pending.empty())
                 continue;
             std::vector<PersistedBatch> batches;
             const std::size_t written = rig.journal->persist(pending, &batches);
             if (written > 0) {
-                rig.rt->erase_persisted_prefix(written);
+                rig.rt->erase_persisted_prefix(written, drops);
                 for (const auto& b : batches)
                     if (!b.event_ids.empty())
                         rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
@@ -805,12 +806,13 @@ TEST_CASE("a link-down/reconnect cycle with REAL Retain semantics loses nothing"
         rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
     }
     {
-        auto pending = rig.rt->snapshot_pending();
+                const auto drops = rig.rt->journal_stage_dropped();
+                auto pending = rig.rt->snapshot_pending();
         if (!pending.empty()) {
             std::vector<PersistedBatch> batches;
             const std::size_t written = rig.journal->persist(pending, &batches);
             if (written > 0)
-                rig.rt->erase_persisted_prefix(written);
+                rig.rt->erase_persisted_prefix(written, drops);
         }
     }
     std::this_thread::sleep_for(100ms); // several wakes, all Retaining
@@ -1509,39 +1511,49 @@ TEST_CASE("CH-4b: two oversized batches do not cancel each other's aging boost",
     CHECK(big_paged > 0);
 }
 
-TEST_CASE("CH-4c: the reservation does not stop smaller batches that fit the surplus",
+TEST_CASE("CH-4c: a reservation pauses other replay but cannot hold it indefinitely",
           "[spark][guardian][journal][chaos]") {
-    // The first design pinned the rotation to the starved batch and BROKE the pass, which
-    // traded a size-biased partial loss for a total replay stall: with the window held by live
-    // traffic the starved batch never fit and nothing else was ever considered either. The
-    // reservation only withholds the room the starved batch needs - anything that fits in the
-    // surplus still ships. RED under pin-and-break: zero small batches page.
+    // The reservation replaced a pin-and-break that stalled ALL replay. It does NOT avoid
+    // pausing other replay - it cannot: a batch is blocked precisely when headroom is below
+    // what it needs, so withholding that much leaves nothing spare. The first two versions of
+    // this test asserted a "surplus" that cannot exist; Gate 8b proved the first one hollow by
+    // mutating the code to reserve the whole window and watching it still pass.
+    //
+    // What must actually hold is that the pause is BOUNDED, so neither side starves: the
+    // reservation engages, is released after a bounded number of passes, and the small batches
+    // that were held back then ship. RED before the bound: they never ship.
     constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
-    JournalRig rig{kBig * 2}; // a genuine surplus above the reservation
+    JournalRig rig{kBig * 2};
     rig.persist_batch("big", kBig);
-    for (int i = 0; i < 6; ++i)
-        rig.persist_batch("small" + std::to_string(i), 1);
 
-    // Occupy enough that the big batch cannot fit, while leaving surplus for the small ones.
+    // Occupy the window so the big batch cannot fit, and never drain - the worst case for the
+    // batches queued behind it.
     const std::size_t occupy = rig.rt->lifecycle_headroom() - (kBig - 1);
     for (std::size_t i = 0; i < occupy; ++i)
         REQUIRE(rig.rt->try_page_batch({OutboxEntry::lifecycle(
                     "live", 1, "live-" + std::to_string(i), 1'700'000'000'000'000'000, "armed",
                     "file", "n")}).added == 1);
-    REQUIRE(rig.rt->lifecycle_headroom() == kBig - 1); // big blocked, plenty for the smalls
+    REQUIRE(rig.rt->lifecycle_headroom() == kBig - 1); // big is blocked, and stays blocked
 
-    std::size_t small_records = 0;
+    bool reserved = false;
+    std::size_t paged_after_release = 0;
+    bool released = false;
     std::int64_t now = 1'700'000'000'000;
-    bool reserving = false;
-    for (int pass = 0; pass < 8; ++pass) {
+    for (int pass = 0; pass < 20; ++pass) {
+        rig.persist_batch("s" + std::to_string(pass), 1); // small work keeps ARRIVING
         now += 10'000;
         const auto stats = rig.journal->page_into_window(*rig.rt, now);
-        reserving = reserving || stats.starvation_yield;
-        small_records += stats.records_paged;
+        if (reserved && !stats.starvation_yield)
+            released = true;      // the hold expired...
+        if (released)
+            paged_after_release += stats.records_paged; // ...and the small work resumed
+        reserved = reserved || stats.starvation_yield;
     }
-    INFO("small_records=" << small_records << " reserving=" << reserving);
-    CHECK(reserving);           // the boost did engage...
-    CHECK(small_records >= 4);  // ...and replay kept flowing anyway
+    INFO("reserved=" << reserved << " released=" << released
+                     << " paged_after_release=" << paged_after_release);
+    REQUIRE(reserved);                 // the reservation engaged
+    CHECK(released);                   // and did not hold forever
+    CHECK(paged_after_release >= 1);   // the batches it held back are not starved either
 }
 
 TEST_CASE("CH-4d: a fully-windowed batch is never read as blocked by the pre-check",
@@ -1570,12 +1582,18 @@ TEST_CASE("CH-4d: a fully-windowed batch is never read as blocked by the pre-che
     CHECK_FALSE(stats.starvation_yield);
 }
 
-TEST_CASE("CH-5c: a backward clock step does not stop retention",
+TEST_CASE("CH-5c: a backward clock step retains evidence and still bounds the journal",
           "[spark][guardian][journal][chaos]") {
-    // The forward guard protects stored evidence. A BACKWARD step is the opposite hazard: it
-    // parks the cutoff in the past, retention ages nothing out, the journal climbs to its hard
-    // write ceiling and then REFUSES NEW records - a live audit gap, which is worse. The cutoff
-    // is therefore monotonic. RED before the fix: evicted == 0 forever.
+    // A backward step is the opposite hazard to a forward one. An earlier round clamped the
+    // cutoff upward with the previous reading to stop retention "stalling", on the theory that
+    // a stalled retention lets the journal climb to its write ceiling and start REFUSING new
+    // records. That premise was wrong, and the clamp cost real evidence: the pass AFTER a
+    // correction still evicted against the known-bad reading.
+    //
+    // What must actually hold is both halves of this test: a backward step RETAINS (the safe
+    // direction for an audit trail, and the clock's own correction takes effect immediately),
+    // and the journal is still bounded, because the count ceiling is computed with no clock at
+    // all. RED before the fix: the first half evicts 2.
     JournalRig rig;
     const std::int64_t kT = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
@@ -1586,9 +1604,21 @@ TEST_CASE("CH-5c: a backward clock step does not stop retention",
 
     REQUIRE(rig.journal->prune(kT).evicted == 0);
     REQUIRE(rig.journal->prune(kT + kThirtyDays).evicted == 0); // forward jump: declined once
-    // Clock now steps BACKWARD, well before the batches were written.
+
+    // Clock steps BACKWARD, to well before the batches were written.
     const auto back = rig.journal->prune(kT - kThirtyDays);
-    CHECK(back.evicted == 2); // the cutoff did not rewind with it
+    CHECK(back.evicted == 0); // nothing is "too old" against the corrected clock: retained
+
+    // ...and the journal is still bounded while the clock is wrong, by a rule that never reads
+    // it. This is what makes removing the clamp safe rather than merely kinder: a retention
+    // window that cannot bite is not the only thing holding the journal down.
+    rig.persist_batch("c", 1); // three batches now
+    rig.journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/2,
+                                               /*max_bytes=*/std::size_t(-1),
+                                               /*max_quarantine=*/100);
+    const auto capped = rig.journal->prune(kT - kThirtyDays); // clock still wrong
+    CHECK(capped.evicted >= 1);                               // the COUNT ceiling still trims
+    CHECK(rig.journal->journal_batch_count() <= 2);
 }
 
 TEST_CASE("a page-side read failure is counted separately from retention's",

@@ -1209,11 +1209,11 @@ TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
     CHECK(staged[0]->rule_id == "r1");
     CHECK(staged[2]->rule_id == "r3");
 
-    rt->erase_persisted_prefix(2); // drop the two oldest (r1, r2)
+    rt->erase_persisted_prefix(2, /*drops_at_snapshot=*/0); // drop the two oldest (r1, r2)
     REQUIRE(rt->pending_journal_depth() == 1);
     CHECK(rt->snapshot_pending()[0]->rule_id == "r3");
 
-    rt->erase_persisted_prefix(99); // clamps to size
+    rt->erase_persisted_prefix(99, /*drops_at_snapshot=*/0); // clamps to size
     CHECK(rt->pending_journal_depth() == 0);
 }
 
@@ -1606,4 +1606,34 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     CHECK(rig.journal->journal_batch_count() == sz->count);
     CHECK(rig.journal->journal_bytes() == sz->bytes);
     CHECK(rig.journal->gauge_underflow() == 0); // never fell into the fail-open underflow window
+}
+
+TEST_CASE("erase_persisted_prefix identifies the prefix it wrote, not an index",
+          "[spark][runtime][journal][chaos]") {
+    // snapshot_pending() releases outbox_mu_, persist() does its KvStore I/O unlocked, and the
+    // erase re-takes the lock. If staging overflows in that window it drops from the FRONT, so
+    // position 0 is no longer the record it was - and erasing by index deletes records that
+    // were never written. Silent, uncounted destruction of audit evidence, worst exactly when
+    // staging is full, i.e. when persist is already failing. RED before the fix: r4 and r5,
+    // which were never persisted, are erased and lost.
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(rt->attach_rule("r" + std::to_string(i), file_spec("/p" + std::to_string(i)),
+                                file_exists_rule("r" + std::to_string(i)), true));
+    REQUIRE(rt->pending_journal_depth() == 6);
+
+    const auto drops = rt->journal_stage_dropped();
+    REQUIRE(rt->snapshot_pending().size() == 6);
+
+    // ...persist commits the first 4. Meanwhile two overflow drops take r0 and r1 off the front.
+    rt->drop_oldest_pending_for_test(2);
+    REQUIRE(rt->pending_journal_depth() == 4); // r2..r5
+
+    rt->erase_persisted_prefix(4, drops);
+    // r0 and r1 are already gone and r2, r3 were the rest of the persisted prefix, so exactly
+    // r4 and r5 - never written - must SURVIVE to be retried.
+    REQUIRE(rt->pending_journal_depth() == 2);
+    const auto left = rt->snapshot_pending();
+    CHECK(left[0]->rule_id == "r4");
+    CHECK(left[1]->rule_id == "r5");
 }
