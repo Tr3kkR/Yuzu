@@ -65,6 +65,10 @@ struct ExecHarness {
     SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
+    /// Optional shared admission budget (ADR-0034). Default nullptr keeps every
+    /// pre-existing test on the unmetered path; the admission tests pass one in.
+    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+
     fs::path tracker_db, instr_db, resp_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
@@ -112,10 +116,6 @@ struct ExecHarness {
     /// bus so SSE-handler 503-on-no-bus tests can exercise the path where
     /// the route is registered but the underlying bus is intentionally
     /// not wired (governance qe-S1).
-    /// Optional shared admission budget (ADR-0034). Default nullptr keeps every
-    /// pre-existing test on the unmetered path; the admission tests pass one in.
-    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
-
     explicit ExecHarness(bool with_bus = true,
                          yuzu::server::detail::StreamBudget* budget = nullptr)
         : stream_budget(budget),

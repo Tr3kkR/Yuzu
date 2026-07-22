@@ -84,6 +84,10 @@ struct RestEventsHarness {
     SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
+    /// Optional shared admission budget (ADR-0034). nullptr keeps every pre-existing
+    /// test on the unmetered path; the admission tests pass one in.
+    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+
     fs::path tracker_db;
     std::unique_ptr<ExecutionTracker> tracker;
     // Bus outlives tracker — same invariant as production server.cpp
@@ -108,10 +112,6 @@ struct RestEventsHarness {
     /// bus so the 503-on-no-bus path can be exercised independently.
     /// `with_tracker=false` opts out of the tracker entirely (separate
     /// 503 path).
-    /// Optional shared admission budget (ADR-0034). nullptr keeps every pre-existing
-    /// test on the unmetered path; the admission tests pass one in.
-    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
-
     explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true,
                                yuzu::server::detail::StreamBudget* budget = nullptr)
         : stream_budget(budget), tracker_db(uniq("rest-events-tracker")) {
