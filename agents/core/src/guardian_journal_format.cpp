@@ -193,6 +193,15 @@ std::expected<JournalBatch, JournalParseError> parse_journal_batch(std::string_v
 
     auto eit = j.find("entries");
     if (eit == j.end() || !eit->is_array()) return std::unexpected(JournalParseError::Malformed);
+    // A row larger than a batch can legally be is Malformed, so it is quarantined and counted
+    // rather than replayed (#2345 Gate 8 security/UP5-9). persist() never writes one, but the
+    // READ boundary is what has to enforce it: an oversized row - a torn write, a hand-edited
+    // kv_store.db, a future writer bug - can never fit the send window, which is floored at
+    // exactly kMaxJournalEntriesPerBatch. Left to page, it blocks on headroom forever and the
+    // paging reservation below then holds room for a batch that will never be placed. This
+    // bound is what makes that reservation's termination argument true rather than assumed.
+    if (eit->size() > kMaxJournalEntriesPerBatch)
+        return std::unexpected(JournalParseError::Malformed);
 
     const auto req_str = [](const nlohmann::json& o, const char* key,
                             std::string& out) -> bool {
