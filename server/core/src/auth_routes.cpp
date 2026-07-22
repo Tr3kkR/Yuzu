@@ -955,7 +955,8 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
                                          const std::string& principal_role,
                                          const std::string& target_type,
                                          const std::string& target_id,
-                                         const std::string& detail) {
+                                         const std::string& detail,
+                                         const std::string& principal_class_override) {
     if (!audit_store_)
         return true;
     AuditEvent event;
@@ -971,7 +972,12 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     // Actor class (ADR-1005 Phase 3a) — same basis as make_audit_event; this
     // constructor exists precisely for the pre-session sites (login/MFA/OIDC
     // callback), so the request itself is still the only signal available.
-    event.principal_class = std::string(principal_class_of(req));
+    event.principal_class = principal_class_override.empty()
+                                ? std::string(principal_class_of(req))
+                                : principal_class_override;
+    // Stamped like make_audit_event so a row written by this path carries the same
+    // session correlator. Empty at the pre-session login sites, which is correct there.
+    event.session_id = extract_session_cookie(req);
     auto ok = audit_store_->log(event);
     if (!ok) {
         spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "

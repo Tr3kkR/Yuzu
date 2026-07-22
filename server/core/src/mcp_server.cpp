@@ -6661,11 +6661,18 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
             return; // auth_fn already set 401
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,
         // provider) lives in mcp_stream.cpp — this file stays wiring.
-        // Role captured HERE, while the credential is still valid — the close audit runs
-        // at teardown, when it may not be.
+        // The actor is captured HERE, while the credential is still valid — the close
+        // audit runs at teardown, when it may not resolve at all. All three fields must
+        // come from the same live session, or the close row will disagree with the attach
+        // row about who acted: principal_class in particular is re-stamped from
+        // principal_kind at request time, so an engine principal reads "engine" there and
+        // would read "agent" from bare credential presentation here.
+        mcp::StreamAuditPrincipal actor{
+            .id = session->username,
+            .role = auth::role_to_string(auth::effective_role(*session)),
+            .cls = session->principal_kind == "engine" ? std::string("engine") : std::string{}};
         handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
-                        metrics, audit_fn, per_principal_cap,
-                        auth::role_to_string(auth::effective_role(*session)),
+                        metrics, audit_fn, per_principal_cap, std::move(actor),
                         principal_audit_fn);
     };
 }

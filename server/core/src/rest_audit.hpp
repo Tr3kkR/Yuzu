@@ -97,25 +97,25 @@ template <class AuditFn>
 /// no longer resolves — the motivating case is `mcp.stream.close` on a
 /// `credential_revoked` teardown, where re-deriving would leave the actor blank on
 /// precisely the rows that evidence the revocation control.
-template <typename PrincipalAuditFn>
+template <typename PrincipalAuditFn, typename PrincipalT>
 [[nodiscard]] inline bool
 try_persist_audit_for_principal(const PrincipalAuditFn& audit_fn, const httplib::Request& req,
                                 const std::string& action, const std::string& result,
-                                const std::string& principal, const std::string& principal_role,
-                                const std::string& target_type, const std::string& target_id,
-                                const std::string& detail) {
-    static_assert(
-        std::is_invocable_r_v<bool, const PrincipalAuditFn&, const httplib::Request&,
-                              const std::string&, const std::string&, const std::string&,
-                              const std::string&, const std::string&, const std::string&,
-                              const std::string&>,
-        "PrincipalAuditFn must be bool(const httplib::Request&, action, result, principal, "
-        "principal_role, target_type, target_id, detail)");
+                                const PrincipalT& principal, const std::string& target_type,
+                                const std::string& target_id, const std::string& detail) {
+    // NOTE the actor is a distinct STRUCT type, not more strings. That is what makes this
+    // assert meaningful: is_invocable_r_v checks arity and return type only, so a sink whose
+    // same-typed string parameters were transposed would satisfy it silently.
+    static_assert(std::is_invocable_r_v<bool, const PrincipalAuditFn&, const httplib::Request&,
+                                        const std::string&, const std::string&, const PrincipalT&,
+                                        const std::string&, const std::string&,
+                                        const std::string&>,
+                  "PrincipalAuditFn must be bool(const httplib::Request&, action, result, "
+                  "principal-struct, target_type, target_id, detail)");
     if (!audit_fn)
         return true; // audit-off deployment — not a persist failure; serve.
     try {
-        return audit_fn(req, action, result, principal, principal_role, target_type, target_id,
-                        detail);
+        return audit_fn(req, action, result, principal, target_type, target_id, detail);
     } catch (const std::exception& e) {
         spdlog::warn("principal audit_fn threw action={} target={}: {}", action, target_id,
                      e.what());

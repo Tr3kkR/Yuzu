@@ -5491,27 +5491,36 @@ private:
             // stream target is clamped to what their pool can actually carry, not the reverse.
             pool_base = std::max(cfg_.http_worker_threads, detail::kMinHttpWorkerThreads);
         }
+        // Bound the ASK, then create the pool eagerly and in full.
+        //
+        // Eager is the SAFE direction, and the lazy-growth version of this was worse.
+        // httplib's ThreadPool constructor spawns its base count with no try/catch, so a
+        // pthread_create failure there unwinds over joinable threads and terminates — but
+        // that happens at BOOT, with no traffic, so a host that cannot carry the pool never
+        // enters service. Deferring the spawn (base < max) instead activates httplib's
+        // dynamic branch, which does `jobs_.push_back(...)` and THEN
+        // `dynamic_threads_.emplace_back(std::thread(...))` inside enqueue's lock
+        // (httplib.h:9792-9798), called from the accept loop with no handler
+        // (httplib.h:11322). The same terminate then becomes reachable at RUNTIME, under
+        // load, pre-auth — the server boots healthy and aborts later. Lower probability,
+        // far worse blast radius. Note also that a wrapper catching there and returning
+        // false is NOT a fix: the job capturing the socket is already queued, so the
+        // caller's close_socket() races a worker that will still run it (fd reuse).
+        //
+        // The real hazard was only ever the SIZE of the ask — `--max-sse-streams 4096`
+        // derives 8200 threads — so bound it. 2048 threads affords 1020 streams; a target
+        // beyond that is clamped by derive_stream_budget and warned about below, exactly
+        // like any other pool the operator's target outruns.
+        if (pool_base > detail::kMaxHttpWorkerThreads) {
+            spdlog::warn("HTTP worker pool of {} exceeds the {} ceiling; clamping. Concurrent "
+                         "held-open streams are clamped to match.",
+                         pool_base, detail::kMaxHttpWorkerThreads);
+            pool_base = detail::kMaxHttpWorkerThreads;
+        }
         const std::size_t pool_max = pool_base; // the pool IS the budget: capacity == pool_max
-        // Threads are created LAZILY up to pool_max, not all at boot.
-        //
-        // httplib's ThreadPool constructor spawns its *base* count in a loop with no
-        // try/catch (httplib.h ~9780). If a pthread_create fails partway — a container
-        // `pids` cap, RLIMIT_NPROC, memory pressure — std::thread's constructor throws,
-        // and the partially-filled `threads_` vector is destroyed during that unwind with
-        // already-started, unjoined threads in it. ~thread() on a joinable thread is
-        // std::terminate. So an eager base equal to pool_max turned a resource limit into
-        // an unconditional process abort at boot, with no log line and no readiness
-        // signal — and at the CLI ceiling that is 8200 threads created back to back.
-        //
-        // Capacity is unchanged: httplib grows to max_thread_count_ on demand and retires
-        // idle threads, so derive_stream_budget's arithmetic (which is about pool_max)
-        // still holds. What changes is that a server which never holds a stream open no
-        // longer pays for threads it will not use, and the boot-time failure window
-        // shrinks to a handful of threads instead of thousands.
-        const std::size_t hw = std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
-        const std::size_t pool_start = std::min(pool_max, std::max<std::size_t>(8, hw));
-        web_server_->new_task_queue = [pool_start, pool_max] {
-            return new httplib::ThreadPool(pool_start, pool_max);
+        web_server_->new_task_queue = [pool_max] {
+            // base == max: httplib's dynamic-growth branch stays dead by construction.
+            return new httplib::ThreadPool(pool_max, pool_max);
         };
         const std::size_t effective_streams = detail::derive_stream_budget(
             pool_max, detail::kPlainRestReserveDefault, target_streams);
@@ -12008,12 +12017,12 @@ private:
                 // naming the revoked principal would name nobody. Routed to
                 // audit_log_for_principal, which stamps values captured at attach time.
                 [this](const httplib::Request& req, const std::string& action,
-                       const std::string& result, const std::string& principal,
-                       const std::string& principal_role, const std::string& target_type,
-                       const std::string& target_id, const std::string& detail) -> bool {
-                    return auth_routes_->audit_log_for_principal(req, action, result, principal,
-                                                                 principal_role, target_type,
-                                                                 target_id, detail);
+                       const std::string& result, const mcp::StreamAuditPrincipal& principal,
+                       const std::string& target_type, const std::string& target_id,
+                       const std::string& detail) -> bool {
+                    return auth_routes_->audit_log_for_principal(req, action, result, principal.id,
+                                                                 principal.role, target_type,
+                                                                 target_id, detail, principal.cls);
                 });
         }
 

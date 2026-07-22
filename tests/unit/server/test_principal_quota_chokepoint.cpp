@@ -75,6 +75,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "rest_audit.hpp"
+#include "mcp_stream.hpp"
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include <httplib.h>
@@ -678,6 +681,77 @@ static_assert(std::is_nothrow_destructible_v<yuzu::server::QuotaSlot>,
               "~QuotaSlot runs inside ~Response; a throwing destructor is std::terminate");
 static_assert(noexcept(std::declval<yuzu::server::QuotaSlot&>().reset()),
               "QuotaSlot::reset must be noexcept — see the destructor chain above");
+
+// The link where the ACTUAL containment lives is PrincipalQuota::release (the try/catch
+// around the lock), but it is PRIVATE — only QuotaSlot may call it — so no assert can
+// name it from here. QuotaSlot::reset() is the reachable public pin and is asserted
+// above; it is the caller, so if release stopped being noexcept, reset() could not
+// remain noexcept without swallowing, and that assert fires.
+
+TEST_CASE("try_persist_audit_for_principal: every field lands in the slot it names",
+          "[quota][audit][stream]") {
+    // The static_assert on this helper checks arity and return type ONLY, so a sink whose
+    // arguments were transposed would satisfy it silently. The actor is a named struct for
+    // that reason, but the plumbing from struct to sink still has to be right — and it was
+    // not: the first version of this path stamped principal_class from bare credential
+    // presentation, so an engine principal's attach row said "engine" and its close row
+    // said "agent". Nothing bound this sink, so nothing noticed.
+    struct Captured {
+        std::string action, result, id, role, cls, target_type, target_id, detail;
+        bool called = false;
+    } got;
+
+    yuzu::server::mcp::StreamAuditPrincipal actor{
+        .id = "engine:acme", .role = "admin", .cls = "engine"};
+
+    yuzu::server::mcp::StreamPrincipalAuditFn sink =
+        [&got](const httplib::Request&, const std::string& action,
+                       const std::string& result,
+                       const yuzu::server::mcp::StreamAuditPrincipal& p,
+                       const std::string& target_type, const std::string& target_id,
+                       const std::string& detail) -> bool {
+        got = {action, result, p.id, p.role, p.cls, target_type, target_id, detail, true};
+        return true;
+    };
+
+    httplib::Request req;
+    const bool ok = yuzu::server::detail::try_persist_audit_for_principal(
+        sink, req, "mcp.stream.close", "success", actor, "McpSession", "abcd1234",
+        "reason=credential_revoked");
+
+    CHECK(ok);
+    REQUIRE(got.called);
+    CHECK(got.action == "mcp.stream.close");
+    CHECK(got.result == "success");
+    CHECK(got.id == "engine:acme");
+    CHECK(got.role == "admin");
+    CHECK(got.cls == "engine"); // NOT "agent" — the field the mismatch showed up in
+    CHECK(got.target_type == "McpSession");
+    CHECK(got.target_id == "abcd1234");
+    CHECK(got.detail == "reason=credential_revoked");
+}
+
+TEST_CASE("try_persist_audit_for_principal: audit-off is not a persist failure, a throw is",
+          "[quota][audit][stream]") {
+    // Posture must match try_persist_audit exactly: an unwired sink means audit is off
+    // (serve, report success); a throwing sink is contained and reported as a failure,
+    // because this runs inside a destructor where an escape is std::terminate.
+    httplib::Request req;
+    yuzu::server::mcp::StreamAuditPrincipal actor{.id = "alice", .role = "user", .cls = {}};
+
+    yuzu::server::mcp::StreamPrincipalAuditFn unwired;
+    CHECK(yuzu::server::detail::try_persist_audit_for_principal(
+        unwired, req, "a", "success", actor, "T", "id", "d"));
+
+    yuzu::server::mcp::StreamPrincipalAuditFn thrower =
+        [](const httplib::Request&, const std::string&, const std::string&,
+                      const yuzu::server::mcp::StreamAuditPrincipal&, const std::string&,
+                      const std::string&, const std::string&) -> bool {
+        throw std::runtime_error("audit backend exploded");
+    };
+    CHECK_FALSE(yuzu::server::detail::try_persist_audit_for_principal(
+        thrower, req, "a", "success", actor, "T", "id", "d"));
+}
 
 TEST_CASE("Composed stream releaser: a real ~Response returns the engine QuotaSlot",
           "[quota][gate][stream][teardown]") {

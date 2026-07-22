@@ -861,10 +861,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                  sink_state->closed.store(true);
                              }
                              sink_state->cv.notify_all();
-                             // unsubscribe stays OUTSIDE the lock: publishers take the bus
-                             // mutex then the sink mutex, so unsubscribing under `mu`
-                             // inverts that order.
-                             bus->unsubscribe(captured_exec_id, sink_state->sub_id);
+                             // unsubscribe stays OUTSIDE the sink lock (publishers take the bus mutex
+                             // then the sink mutex, so unsubscribing under `mu` inverts that order) and
+                             // in its OWN try: a throw from the lock_guard above must not skip it, or
+                             // the subscription outlives the response and pins the sink forever.
+                             try {
+                                 bus->unsubscribe(captured_exec_id, sink_state->sub_id);
+                             } catch (...) {
+                             }
                              // The lease dies with this lambda, returning the worker to the
                              // one budget every streaming surface shares (ADR-0034).
                              } catch (...) {

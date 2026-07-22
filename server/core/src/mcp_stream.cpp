@@ -643,7 +643,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                      const std::string& principal, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
                      yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
-                     std::size_t per_principal_cap, const std::string& principal_role,
+                     std::size_t per_principal_cap, StreamAuditPrincipal audit_principal,
                      const StreamPrincipalAuditFn& principal_audit_fn) {
     const auto cid = yuzu::server::detail::make_correlation_id();
     const auto audit = [&](const char* action, const char* result, const std::string& target_id,
@@ -836,8 +836,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // from adopt_quota_slot_into_stream's own body), which is still worth having
         // because httplib invokes releasers from ~Response (#2037's class).
         [inner = yuzu::server::detail::adopt_quota_slot_into_stream(
-             [stream, sink, audit_fn, principal_audit_fn, principal, principal_role, req_copy,
-              audit_sid, cid](bool /*success*/) noexcept {
+             [stream, sink, audit_fn, principal_audit_fn, audit_principal, req_copy, audit_sid,
+              cid](bool /*success*/) noexcept {
                 // Runs from ~Response — a DESTRUCTOR. An exception escaping here is
                 // std::terminate no matter what httplib does, so the whole body is guarded
                 // (try_persist_audit swallows its own, but the string building allocates).
@@ -868,7 +868,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                     if (principal_audit_fn) {
                         (void)yuzu::server::detail::try_persist_audit_for_principal(
                             principal_audit_fn, *req_copy, "mcp.stream.close", "success",
-                            principal, principal_role, "McpSession", audit_sid, detail);
+                            audit_principal, "McpSession", audit_sid, detail);
                     } else {
                         // Test seams only — production wires the explicit-principal sink.
                         (void)yuzu::server::detail::try_persist_audit(

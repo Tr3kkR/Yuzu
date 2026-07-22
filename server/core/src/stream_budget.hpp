@@ -75,6 +75,18 @@ inline constexpr std::size_t derive_stream_budget(std::size_t pool_max,
     return requested_global_cap < affordable ? requested_global_cap : affordable;
 }
 
+/// Ceiling on the DERIVED worker pool, and therefore on threads created at boot.
+///
+/// The pool is created eagerly and in full (see the note in server.cpp): that is the
+/// safe direction, because a host that cannot afford the threads fails at startup and
+/// never serves. The hazard it leaves is asking for an absurd number in the first
+/// place — `--max-sse-streams 4096` derives 8200 threads — so the fix is to bound the
+/// ask, not to defer it. 2048 threads still affords 1020 concurrent streams, an order
+/// of magnitude above the 128 default; a target beyond that is clamped by
+/// `derive_stream_budget` and warned about at boot, exactly like any other pool the
+/// operator's target outruns.
+inline constexpr std::size_t kMaxHttpWorkerThreads = 2048;
+
 /// Floor for an explicit `--http-worker-threads`: the smallest pool that can still carry
 /// ONE stream with the reserve intact.
 ///

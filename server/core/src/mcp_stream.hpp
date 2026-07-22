@@ -175,10 +175,20 @@ using StreamAuditFn = std::function<bool(const httplib::Request&, const std::str
 ///
 /// The principal is known at attach time, so it is captured then and stamped here.
 /// Empty = fall back to the generic sink (test seams; production wires it).
+/// The actor, captured at attach. A struct rather than three more `const std::string&`
+/// parameters on purpose: adjacent same-typed positional arguments can be transposed and
+/// still compile, which no `is_invocable_r_v` static_assert can detect — it checks arity
+/// and return type only. Named fields make a transposition a compile error.
+struct StreamAuditPrincipal {
+    std::string id;    ///< session->username — the stable authorization principal
+    std::string role;  ///< role_to_string(effective_role(session)) AS OF ATTACH
+    std::string cls;   ///< principal_class: "engine" for an engine principal, else by credential
+};
+
 using StreamPrincipalAuditFn = std::function<bool(
     const httplib::Request&, const std::string& action, const std::string& result,
-    const std::string& principal, const std::string& principal_role,
-    const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+    const StreamAuditPrincipal& principal, const std::string& target_type,
+    const std::string& target_id, const std::string& detail)>;
 
 /// One live GET attachment: the reusable SSE sink, the close-reason channel the
 /// generic sink lacks, and THE BUDGET LEASE FOR THE WORKER THIS ATTACHMENT PINS.
@@ -399,7 +409,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
                      yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
                      std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault,
-                     const std::string& principal_role = {},
+                     StreamAuditPrincipal audit_principal = {},
                      const StreamPrincipalAuditFn& principal_audit_fn = {});
 
 }  // namespace yuzu::server::mcp

@@ -186,12 +186,21 @@ public:
     /// `make_audit_event` writes an empty `principal` and the SOC 2
     /// CC6.6 query "every privileged session-creation row names the
     /// principal" returns false negatives (Gate 4 consistency B3).
+    ///
+    /// `principal_class_override`: `make_audit_event` re-stamps the class from the
+    /// resolved session's `principal_kind`, so an engine principal audits as "engine"
+    /// rather than the "agent" its bearer-token presentation implies. A caller that
+    /// already knows the class (because it captured it while the session was live) must
+    /// pass it, or its rows will disagree with the request-time rows for the same actor.
+    /// Empty keeps the credential-presentation default, which is right for the
+    /// pre-session login/MFA/OIDC sites.
     bool audit_log_for_principal(const httplib::Request& req, const std::string& action,
                                  const std::string& result, const std::string& principal,
                                  const std::string& principal_role,
                                  const std::string& target_type = {},
                                  const std::string& target_id = {},
-                                 const std::string& detail = {});
+                                 const std::string& detail = {},
+                                 const std::string& principal_class_override = {});
 
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,

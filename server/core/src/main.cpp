@@ -11,6 +11,7 @@
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
+#include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
@@ -452,11 +453,10 @@ int main(int argc, char* argv[]) {
                    "--max-sse-streams, which is what you want; setting it clamps the stream "
                    "target to what your pool can carry. Threads are created on demand up "
                    "to this number, not at boot — size the host's process/thread limit "
-                   "(systemd TasksMax, container pids) above it.")
-        // Ceiling raised to match what the sibling flag can imply: --max-sse-streams 4096
-        // derives a pool of 8200, so a 4096 ceiling here made the documented maximum
-        // unreachable by hand-pinning.
-        ->check(CLI::Range(std::size_t{0}, std::size_t{16384}))
+                   "(systemd TasksMax, container pids) at or above it.")
+        // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
+        // flag cannot accept a value the pool will silently refuse to honour.
+        ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
         ->envname("YUZU_HTTP_WORKER_THREADS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
