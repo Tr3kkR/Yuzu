@@ -1270,7 +1270,7 @@ TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark]
     CHECK_FALSE(lc[0].journal_batch_key.empty());
 }
 
-TEST_CASE("page_into_window does not re-page a windowed entry (re-send-all skips members)",
+TEST_CASE("page_into_window does not re-page a windowed entry (skips entries already windowed)",
           "[spark][runtime][journal]") {
     PageRig rig;
     rig.persist("r1");

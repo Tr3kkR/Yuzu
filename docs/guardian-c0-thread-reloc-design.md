@@ -599,11 +599,15 @@ Whichever PR flips `prefer_spark` MUST also:
     `mtx_`, ~9.9 ms healthy but able to approach the 5 s busy timeout each under KvStore
     contention. A per-tick batch cap or wall deadline is what makes "cheap retry-persist on the
     heartbeat" structurally true rather than true-in-practice.
-12. **Jitter the maintenance phase per agent** (Gate 3 performance). Steady-state redelivery is
-    0.1 batch/s/agent by design; at 10k agents that is ~256k events/s (~615 Mbit/s), and a
-    fleet-wide snapshot restore means ~161 GB over ~35 minutes with every agent's boot burst
-    landing in the same cycle. Phase-jitter `last_page`/`last_prune` by U[0,interval), and treat
-    the sustained figure as a hard gate pending the deferred server ack.
+12. **Jitter the maintenance phase per agent** (Gate 3 performance). NOTE: this item used to
+    size the fleet from a SUSTAINED redelivery floor of 0.1 batch/s/agent - ~256k events/s and
+    ~615 Mbit/s at 10k agents. That floor no longer exists: replay consults the durable
+    sent-label and does not re-offer delivered batches on an ordinary pass (#2345 round 8), so
+    the steady-state redundant term is zero. The figure survives only as a BURST bound - a
+    fleet-wide snapshot restore or gateway bounce still gives every agent a forced pass with a
+    full token burst in the same cycle, which is exactly what jitter is for. Phase-jitter
+    `last_page`/`last_prune` by U[0,interval) and jitter the BOOT page too, since a forced pass
+    bypasses the cadence. Do not treat the old sustained number as a live gate.
 13. **Test the loop-death firewall** (Gate 3 QE). Nothing can currently make `loop()`'s own
     tail throw, so the top-level catch and its counter are unexercised; this needs a seam.
     ~~and the pre-join persist~~ - **the pre-join persist half is DONE (round 7)**: a test parks

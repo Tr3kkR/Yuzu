@@ -5,8 +5,11 @@ This file exists because it did not. Two earlier governance rounds on this branc
 a reader could confirm only that the author said they ran. Gate 6 compliance called that a CC7.2
 traceability failure and it was the blocking finding of this run.
 
-**Standing rule adopted here: no commit may cite a gate number that is not independently recorded
-in this file.**
+**Standing rule adopted here, PROSPECTIVELY: from this run onward, no commit may cite a gate
+number that is not independently recorded in this file.** The existing citations of "Gate 8" and
+"Gate 8b" - in five commit messages and around twenty in-tree comments - are grandfathered and
+remain unrecorded, because their verdicts are not recoverable. Reading the rule as already
+satisfied by this tree would be exactly the kind of false claim it exists to stop.
 
 ## Run
 
@@ -63,7 +66,13 @@ persist test plus two contradictory comments (`97da3f12`, `5791aa0b`).
 
 Tracked, not forgotten. All are unreachable while dormant.
 
-- **sec-M1** clock guard disarmed across a restart. Confirmed by me directly.
+- **sec-M1** the clock guard does not carry its anomaly state across a restart. Precisely: the
+  latch re-arms (it defaults to declined-nothing), but an agent that re-arms Guardian rules at
+  startup persists fresh in-retention records before the first retention pass, and one of those
+  makes the would-this-wipe-everything test false, while the large-step-since-last-pass test has
+  no previous pass at boot. So on a restored VM with rules deployed nothing declines. An earlier
+  wording of this finding - including mine, twice - said a restart alone disarms it; that is
+  wrong, and the distinction is the whole mechanism.
 - **sec-M2** stale replay cutoff surviving prune's early returns.
 - **sec-M3** prune and page order future-dated rows oppositely.
 - **sec-M4** shutdown classification under-reports the loss indicator. Gate 5 DROPped a test for

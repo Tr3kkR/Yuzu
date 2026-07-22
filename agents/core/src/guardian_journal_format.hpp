@@ -56,7 +56,6 @@ inline constexpr std::size_t kMaxJournalBytes = 32ull * 1024 * 1024; // 32 MiB
 /// accumulate outside the caps above.
 inline constexpr std::size_t kMaxQuarantineBatches = 100;
 
-/// Replay paging rate limiter (rev-4.1 #8): a process-lifetime token bucket bounds the
 /// Replay pacing. This USED to double as the steady-state redelivery rate, because a delivered
 /// batch left the send window and window membership was the only "already delivered" test, so
 /// every cadence pass re-paged and re-sent it until retention. That is fixed: page_into_window
