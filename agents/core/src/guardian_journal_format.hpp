@@ -75,6 +75,25 @@ inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
 /// permanent, significance-correlated gap in the audit trail.
 inline constexpr std::uint32_t kJournalStarvationPasses = 3;
 
+/// Consecutive passes a reservation may make NO progress before it is released and the batch
+/// must earn it again.
+///
+/// A reservation necessarily PAUSES other replay: a batch is blocked precisely when headroom is
+/// below what it needs, so withholding that much leaves nothing spare by construction. (An
+/// earlier comment claimed smaller batches "still ship out of the surplus" - there is no
+/// surplus, and the test asserting it was hollow, #2345 Gate 8b.) The pause is the mechanism:
+/// it lets the window drain TOWARD the big batch instead of small ones re-consuming every
+/// freed slot.
+///
+/// So the release cannot be a simple pass count - that just reinstates the size-biased loss,
+/// because a big batch needs many passes of draining to become placeable. It is keyed on
+/// PROGRESS instead: while headroom is climbing, the reservation is working and is kept; when
+/// it stops climbing for this many passes, the link is dead or live traffic is dominating, the
+/// pause is buying nothing, and the room goes back to whatever can use it. Neither side can
+/// starve the other permanently, which is the property that matters - the closed loss channel
+/// is "the largest batches NEVER page", not "the largest batches page first".
+inline constexpr std::uint32_t kJournalReservationStallPasses = 4;
+
 /// Batches a single retention pass may evict for AGE. Age is the one retention rule driven by
 /// an absolute reading of the wall clock, so one bad reading (a VM restored from snapshot, an
 /// NTP overshoot) marks every batch expired simultaneously and would delete the whole durable

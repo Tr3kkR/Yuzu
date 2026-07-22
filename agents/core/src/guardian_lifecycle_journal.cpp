@@ -374,29 +374,36 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
     });
 
-    // Monotonic reference: the age cutoff must never move BACKWARD. A backward clock step
-    // otherwise parks min_ts in the past and retention stops ageing anything out at all, so the
-    // journal climbs to its hard write ceiling and then REFUSES new records - a LIVE audit gap,
-    // strictly worse than the stored-evidence loss the forward guard protects (#2345 Gate 8
-    // UP5-4). Using the later of the two readings keeps retention making progress either way.
-    const std::int64_t window_ms = static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
-    const std::int64_t effective_now = std::max(now_ms, last_prune_now_ms_);
-    const std::int64_t min_ts = effective_now - window_ms;
-
-    // CLOCK-ANOMALY GUARD (#2345 Gate 5 CH-5, restart-hardened at Gate 8). Age eviction is
-    // anchored to the wall clock, which is correct - a batch's ts_ms has to survive a reboot -
-    // but it makes one forward jump catastrophic rather than gradual: a VM restored from an old
-    // snapshot, or a bad NTP correction, puts every batch past retention at once and deletes the
-    // whole durable trail in a single transaction, before any of it has been replayed.
+    // now_ms is used directly. An earlier round clamped it upward with the previous pass's
+    // reading, on the theory that a BACKWARD clock step stops age eviction, lets the journal
+    // climb to its hard write ceiling, and makes it start REFUSING new records. Gate 8b showed
+    // that premise is wrong: the count and byte ceilings below are computed with no clock at
+    // all, so they hold the journal at max_batches_ regardless of what the clock does, and the
+    // rejection ceiling is never reached. What the clamp actually bought was one extra pass of
+    // eviction against a reading already known to be bad, on the pass AFTER a correction - so
+    // it destroyed in-retention evidence to solve a problem that does not exist. Removed.
     //
-    // Detection is deliberately NOT just "the clock moved a lot since the last pass". That test
-    // is process-local, and `last_prune_now_ms_` starts at zero - so it was inert on the FIRST
-    // pass of every process, which is exactly the path a restored VM takes (it reboots the
-    // agent). The load-bearing signal is the OUTCOME: would this pass age out the entire
-    // journal? That is restart-safe, and it is the shape of the harm regardless of cause.
-    const bool would_wipe =
-        !live.empty() && std::all_of(live.begin(), live.end(),
-                                     [min_ts](const Live& l) { return l.ts_ms < min_ts; });
+    // A backward clock therefore just pauses AGE eviction until it is fixed, which is the safe
+    // direction for an audit trail, and a correction takes effect on the very next pass.
+    const std::int64_t window_ms = static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
+    const std::int64_t min_ts = now_ms - window_ms;
+
+    // "Would this pass age out everything?" - counting only batches that are not stamped in the
+    // FUTURE. A plain all_of over every row let a single future-dated batch veto the signal
+    // permanently (#2345 Gate 8b UP6-1): one row written with a wrong RTC, or carried in by a
+    // VM clone, is never itself expired, and because the count ceiling trims oldest-first it is
+    // also immortal - so the guard would be silently disarmed for the life of the endpoint by
+    // one bad row. Future-dated rows are excluded from the question rather than allowed to
+    // answer it.
+    std::size_t datable = 0, expired = 0;
+    for (const auto& l : live) {
+        if (l.ts_ms > now_ms)
+            continue; // future-dated: cannot be "too old", and must not veto the signal
+        ++datable;
+        if (l.ts_ms < min_ts)
+            ++expired;
+    }
+    const bool would_wipe = datable > 0 && expired == datable;
     const bool big_step = last_prune_now_ms_ != 0 && now_ms - last_prune_now_ms_ > window_ms;
     // Declined ONCE per anomaly. Latching matters: declining every time a pass would wipe the
     // journal means a genuinely long-idle agent never ages anything out at all.
@@ -467,7 +474,13 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // and while incrementing a counter documented to mean "this endpoint's clock moved", which
     // would have an operator chasing a second anomaly that never happened. It clears once a
     // pass finds nothing expired, so the guard is armed again for the NEXT real anomaly.
-    age_wipe_declined_ = skip_age || age_candidates > 0;
+    // Hold the latch only while an anomaly BACKLOG is still being worked off - which is what
+    // `pacing` already means. Setting it from `age_candidates > 0` disarmed the guard after any
+    // pass that aged out even one batch, and a live agent past its retention horizon has such a
+    // pass constantly; a real jump arriving next would then evict unguarded, with no warn line
+    // and no clock_jump_skips increment. Four Gate 8b reviewers found this independently, and
+    // the correct expression was already computed one line above.
+    age_wipe_declined_ = pacing;
 
     // Shutdown immediately before the pass's heaviest write: del_keys is one transaction over
     // the whole evict set and is the single longest KvStore call prune makes (#2298 governance
@@ -767,12 +780,16 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // accounting error try_page_batch fixes under the lock, which lived on here at the
     // pre-check one layer up (#2345 Gate 8 QE).
     const auto windowed = rt.lifecycle_event_ids();
-    const auto net_new_of = [&windowed](const JournalBatch& b) {
-        std::size_t n = 0;
+    // De-duplicated, mirroring try_page_batch's `want` set. Counting per entry let a row that
+    // repeats an event_id overstate its requirement by up to a whole batch, which would capture
+    // a large reservation for a batch that actually needs one slot (#2345 Gate 8b security).
+    std::unordered_set<std::string> seen; // reused across candidates to avoid re-allocating
+    const auto net_new_of = [&windowed, &seen](const JournalBatch& b) {
+        seen.clear();
         for (const auto& r : b.entries)
             if (!windowed.count(r.event_id))
-                ++n;
-        return n;
+                seen.insert(r.event_id);
+        return seen.size();
     };
 
     const std::size_t limit = std::min<std::size_t>(cands.size(), kJournalPageMaxBatchesPerPass);
@@ -800,8 +817,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         const std::size_t need = net_new_of(c.batch);
         if (need == 0) {
             // Already fully windowed: no work, and emphatically NOT a blockage.
-            if (is_starved)
+            if (is_starved) {
                 starved_.reset();
+                starved_passes_ = 0;
+                starved_need_ = 0;
+                starved_stalled_ = 0;
+            }
             page_cursor_ = id;
             continue;
         }
@@ -822,15 +843,27 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             // UP-2's scan amplification back in the recovery regime.
             if (stats.min_blocked_headroom == 0 || need < stats.min_blocked_headroom)
                 stats.min_blocked_headroom = need;
-            if (is_starved)
+            if (is_starved) {
                 starved_blocked = true;
-            else if (need > worst_blocked_need) {
+                starved_blocked_headroom_ = headroom; // progress signal for the release rule
+            } else if (need > worst_blocked_need) {
                 worst_blocked = id;
                 worst_blocked_need = need;
             }
             page_cursor_ = id; // advance: never pin the rotation on a blocked batch
-            if (headroom == 0)
-                break; // nothing can fit at all; stop scanning rather than sweep the rotation
+            if (headroom == 0) {
+                // Nothing fits at all, so stop scanning - but first record the SMALLEST batch
+                // still pending, not this one. Reporting the head's requirement made the
+                // worker's re-arm wait for room it never needed (Gate 4 S3). The loop rewrite
+                // for the reservation dropped this scan; restored (#2345 Gate 8b security).
+                std::size_t smallest = need;
+                for (std::size_t m = n + 1; m < limit; ++m)
+                    smallest = std::min(smallest, net_new_of(cands[(start + m) % cands.size()].batch));
+                if (smallest > 0 && (stats.min_blocked_headroom == 0 ||
+                                     smallest < stats.min_blocked_headroom))
+                    stats.min_blocked_headroom = smallest;
+                break;
+            }
             continue;
         }
         const bool have_token = page_bucket_.ready(now_ms); // refills for elapsed time
@@ -851,8 +884,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         page_cursor_ = std::pair{c.ts_ms, c.key};
         // Release the reservation the moment this batch is no longer blocked, whether it paged
         // or turned out to be fully windowed already.
-        if (!outcome.blocked_for_headroom && is_starved)
+        if (!outcome.blocked_for_headroom && is_starved) {
             starved_.reset();
+            starved_passes_ = 0;
+            starved_need_ = 0;
+            starved_stalled_ = 0;
+        }
         if (outcome.blocked_for_headroom) {
             // The window shrank between the pre-check and the locked attempt. Without this the
             // pass would report "nothing to do" and the caller's refill re-arm would never
@@ -897,9 +934,24 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             starved_need_ = 0;
         }
     } else if (starved_blocked) {
-        if (starved_passes_ < kJournalStarvationPasses)
-            ++starved_passes_;
+        ++starved_passes_;
         stats.starvation_yield = starved_passes_ >= kJournalStarvationPasses;
+        // Release on lack of PROGRESS, not on elapsed passes. While headroom is climbing the
+        // reservation is doing its job and must be kept - a 256-entry batch needs many passes
+        // of draining before it fits, and releasing on a pass count simply reinstated the
+        // size-biased loss this exists to close. When headroom stops climbing the pause is
+        // buying nothing (dead link, or live traffic taking the room as fast as the drain frees
+        // it), so the room goes back rather than stalling every other batch behind a batch that
+        // is not getting closer.
+        if (starved_blocked_headroom_ > starved_last_headroom_) {
+            starved_stalled_ = 0; // converging
+        } else if (++starved_stalled_ >= kJournalReservationStallPasses) {
+            starved_.reset();
+            starved_passes_ = 0;
+            starved_need_ = 0;
+            starved_stalled_ = 0;
+        }
+        starved_last_headroom_ = starved_blocked_headroom_;
     } else if (starved_ && starved_seen) {
         starved_.reset(); // considered and not blocked
         starved_passes_ = 0;
@@ -909,6 +961,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         starved_ = worst_blocked; // the biggest thing that could not be placed this pass
         starved_need_ = worst_blocked_need;
         starved_passes_ = 1;
+        starved_stalled_ = 0;
+        starved_last_headroom_ = 0;
     }
 
     pages_.fetch_add(1, std::memory_order_relaxed);

@@ -401,6 +401,12 @@ private:
     std::uint32_t starved_passes_{0};
     /// Net-new records the starved batch needs; the size of the reservation held for it.
     std::size_t starved_need_{0};
+    /// Progress tracking for the reservation's release rule: the headroom observed at the
+    /// starved batch's blocked encounter, the previous pass's value, and how many consecutive
+    /// passes it has failed to climb. All written only under paging_mutex_.
+    std::size_t starved_blocked_headroom_{0};
+    std::size_t starved_last_headroom_{0};
+    std::uint32_t starved_stalled_{0};
     /// Last now_ms a retention pass observed, for the forward-clock-jump guard. Written only
     /// under paging_mutex_ by prune_locked_, the single retention caller.
     std::int64_t last_prune_now_ms_{0};
