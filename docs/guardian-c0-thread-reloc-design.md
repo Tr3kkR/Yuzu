@@ -446,6 +446,31 @@ checklist to be executed, not a record of intent.
 
 ---
 
+## Known limitation: size-biased replay loss (#2364)
+
+Replay places a batch all-or-nothing, and rotates fairly by position, so when the send window is
+nearly full a LARGE batch is skipped every pass while smaller ones are placed - and if that
+persists to the 7-day retention age it is deleted having never been sent. The loss is biased
+towards the biggest batches, which are mass arm/disarm bursts, i.e. the most audit-significant
+records.
+
+Four mechanisms to close it were built and reverted inside this PR (rotation pin; reservation
+with a "surplus"; reservation with a progress release; that one with its defects fixed). They
+fail for the same structural reason rather than through any individual bug: a batch is blocked
+exactly when the window has less room than it needs, so making it fit means pausing competing
+replay until the drain creates room - and in the only regime where this matters, the drain
+cannot create room, so such a scheme must either release (restoring the loss) or hold (stalling
+everything else). Reviewers judged the best version WORSE than doing nothing, because it added a
+duty-cycled global replay pause on top of the original loss. Three successive tests for it were
+proven hollow by mutation, which is its own evidence the behaviour was not well defined.
+
+The channel is narrow - a 256-entry maximum batch against a 4096 window needs sustained
+occupancy above ~94%, which is itself a delivery failure with independent signals - but it is
+real. It is tracked in #2364, whose first step is telemetry (the age of the oldest
+headroom-blocked batch, plus the fleet rollup this checklist already requires) rather than a
+fifth mechanism, because today nobody can tell which regime an endpoint is in. It must be
+resolved or explicitly risk-accepted before the `prefer_spark` flip.
+
 ## Retention differs deliberately from every other store (Gate 8 security/consistency)
 
 The Guardian lifecycle journal is not the only wall-clock expiry site in the codebase, and it is
@@ -529,7 +554,11 @@ Whichever PR flips `prefer_spark` MUST also:
    persists before signalling the workers as well as after them; the post-join flush stays,
    because `persist()` erases the durably-written prefix so a record can never land under two
    keys. They were right that offering the two as equals was the error.
-9. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
+9. **Resolve or explicitly risk-accept the size-biased replay loss (#2364)**, and land its
+   telemetry first: the age of the oldest currently headroom-blocked batch, alongside item 4's
+   fleet rollup. Four mechanisms for this were built and reverted in this PR; the lesson
+   recorded there is that the channel needs measuring before it is engineered.
+10. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
    Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
    is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
    before doing any work still reads identically to a healthy idle one. Item 6's staleness gauge
