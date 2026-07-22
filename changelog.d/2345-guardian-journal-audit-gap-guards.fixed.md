@@ -13,16 +13,18 @@
   process-local memory of the last pass, so it survives the agent restart that a restored VM
   actually performs. Replay now shares retention's decision about what "expired" means and stops
   treating expired batches as unshippable while a paced ageing-out is in progress, so it can no
-  longer skip exactly the records retention deliberately kept. A backward step is guarded too, by
-  never letting the cutoff move backwards: left alone it stopped retention entirely and the
-  journal climbed to its write ceiling, where it REFUSES new records - a live gap, worse than the
-  stored one. (2) A batch whose records were mostly already queued
+  longer skip exactly the records retention deliberately kept. A backward step needs no guard: it simply pauses ageing until the
+  clock is fixed, which is the safe direction for an audit trail, and the count and byte
+  ceilings that bound the journal are computed without reading the clock at all. (2) A batch whose records were mostly already queued
   for sending was charged for its whole size rather than for what it actually needed, so the
   worker waited for room that could not appear while those same records held it. (3) The largest
   batches - mass arm/disarm bursts such as a Baseline deploy, the records most likely to be
   asked for in an audit - could be skipped indefinitely by a steady trickle of small ones and
   aged out unsent; the room a repeatedly-passed-over batch needs is now RESERVED against smaller
-  ones until it fits, while anything that fits in the surplus still ships. (4) A journal row
+  ones until it fits. That deliberately pauses other replay - a batch is blocked precisely when
+  there is less room than it needs, so there is no spare to share - and the reservation is
+  released as soon as it stops making progress, so neither the large batch nor the small ones
+  can starve the other. (4) A journal row
   claiming more entries than a batch may legally contain is now rejected at the read boundary and
   quarantined, rather than blocking replay forever behind a batch that could never be placed.
 - **A Guardian replay pass that cannot read the journal, and a drain worker killed by an
