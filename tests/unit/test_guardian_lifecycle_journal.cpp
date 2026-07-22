@@ -643,3 +643,68 @@ TEST_CASE("journal persist: a negative gauge stays bricked while prune scans kee
     CHECK(j.journal_batch_count() == 1);
     CHECK(j.persist(one("r2", "armed")) == 1); // recovered
 }
+
+TEST_CASE("journal prune: a future-dated batch is shed before real evidence",
+          "[guardian][journal][prune][chaos]") {
+    // A batch stamped implausibly far ahead can never be "too old", and oldest-first count
+    // eviction never reaches it either - so it is immortal, and worse, it DISPLACES real
+    // records: every genuine batch written afterwards is older, so it is the one evicted in
+    // its place. Ordering future-dated batches first is what stops that.
+    // RED before the fix: the two real batches are evicted and the future-dated one survives.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+
+    // Hand-write a batch stamped a year ahead, alongside two ordinary ones.
+    const std::string future_key = std::string{kBatchKeyPrefix} + "future:000000000001";
+    REQUIRE(t.kv->set(kJournalNamespace, future_key,
+                      std::format(R"({{"v":4,"ts_ms":{},"entries":[{}]}})", now + 365LL * 86400000,
+                                  R"({"rule_id":"r","event_id":"future-1","kind":"armed",)"
+                                  R"("guard_type":"file","rule_name":"n","generation":1,)"
+                                  R"("enqueued_ns":1700000000000000000})")));
+    REQUIRE(j.persist(one("real1", "armed")) == 1);
+    REQUIRE(j.persist(one("real2", "armed")) == 1);
+    REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 3);
+
+    // Count ceiling of 2 forces exactly one eviction; it must be the future-dated one.
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/2,
+                                    /*max_bytes=*/kNoCap, /*max_quarantine=*/100);
+    const auto stats = j.prune(now);
+    CHECK(stats.evicted == 1);
+    auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == 2);
+    for (const auto& r : *rows)
+        CHECK(r.key != future_key); // the real evidence is what survived
+}
+
+TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock jump",
+          "[guardian][journal][prune][chaos]") {
+    // The anomaly guard fires on either of two signals: a big clock STEP since the last pass,
+    // or the OUTCOME - this pass would age out everything. Every other test in the suite trips
+    // it via the step, so the outcome branch was dead-covered: removing it left the whole suite
+    // green (#2345 Gate 3 QE). Here the clock advances normally and the RETENTION WINDOW is
+    // tiny, so only the outcome branch can fire.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(j.persist(one("r2", "armed")) == 1);
+
+    // Retention of 0 days: everything is expired, with no clock anomaly whatsoever.
+    j.set_retention_limits_for_test(/*days=*/0, /*max_batches=*/1000,
+                                    /*max_bytes=*/kNoCap, /*max_quarantine=*/100);
+    // A few seconds later both batches are past a zero-length window. This is the FIRST pass,
+    // so last_prune_now_ms_ is still zero and the clock-step branch cannot fire.
+    const auto declined = j.prune(now + 5000);
+    CHECK(declined.evicted == 0);
+    CHECK(j.clock_jump_skips() == 1); // counted, and the trail survives the first pass
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+
+    const auto accepted = j.prune(now + 6000); // ...and the next pass proceeds
+    CHECK(accepted.evicted == 2);
+}

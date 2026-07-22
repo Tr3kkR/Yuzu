@@ -14,6 +14,7 @@
 #include <limits>
 #include <random>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::agent {
@@ -369,9 +370,30 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         live.push_back(Live{row.key, parsed->ts_ms, row.value.size()});
     }
 
-    // Oldest-first by (ts_ms, key) - NOT lexical key (the boot-nonce is random).
-    std::sort(live.begin(), live.end(), [](const Live& a, const Live& b) {
-        return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
+    // Oldest-first by (ts_ms, key) - NOT lexical key (the boot-nonce is random) - with batches
+    // stamped implausibly far in the FUTURE ordered FIRST, so the count and byte ceilings shed
+    // them before they shed real evidence.
+    //
+    // Without that they are immortal: such a batch can never be "too old", and oldest-first
+    // count eviction never reaches it either - so once enough exist (a bad RTC, a VM clone, a
+    // hand-edited kv_store.db) every genuine record written afterwards is the one evicted in
+    // its place, permanently (#2345 Gate 2 security).
+    //
+    // Deliberately an ORDERING rule, not an expiry rule. Treating "future" as expired would
+    // delete on the strength of the local clock being right, and the failure that actually
+    // happens in the field is a clock reading in the PAST (a dead CMOS battery reports 1970),
+    // which would make every real batch look future-dated and wipe the journal wholesale - the
+    // very outcome the anomaly guard above exists to prevent. Reordering cannot delete anything
+    // the count and byte ceilings were not already going to delete; if the clock is wrong
+    // enough that every row looks future, they all compare equal here and the ceilings simply
+    // trim in key order.
+    const std::int64_t future_cutoff = now_ms + kJournalFutureSlackMs;
+    const auto order_key = [future_cutoff](const Live& l) {
+        return l.ts_ms > future_cutoff ? std::numeric_limits<std::int64_t>::min() : l.ts_ms;
+    };
+    std::sort(live.begin(), live.end(), [&order_key](const Live& a, const Live& b) {
+        const auto ka = order_key(a), kb = order_key(b);
+        return ka != kb ? ka < kb : a.key < b.key;
     });
 
     // now_ms is used directly. An earlier round clamped it upward with the previous pass's
@@ -460,9 +482,10 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // The cutoff replay shares (#2345 Gate 5) is INT64_MIN - "nothing is too old to replay" -
     // for as long as this pass is working off a backlog of expired batches, whether because it
     // declined the wipe or because the per-pass cap left some behind. That is what makes the
-    // paced deletion actually buy something: without it, replay skips exactly the batches
-    // retention is about to delete and the pacing would only slow the deletion, shipping
-    // nothing (#2345 Gate 8 S3/UP5-3). It costs a bounded burst of redelivery, since sent-but-
+    // paced deletion buy anything at all: without it, replay skips exactly the batches retention
+    // is about to delete and the pacing would only slow the deletion, shipping nothing
+    // (#2345 Gate 8 S3/UP5-3). It does not make delivery likely - deletion still outruns replay
+    // about five to one at the current cap and refill rate (#2364) - it makes it possible. It costs a bounded burst of redelivery, since sent-but-
     // expired batches become candidates too - bounded by the per-pass batch cap and the paging
     // rate limiter, and the server de-dupes on event_id.
     const bool pacing = skip_age || age_candidates > age_evictions;
@@ -769,13 +792,13 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
 
     // One membership snapshot for the whole pass. Sizing a candidate by its NET-NEW records
     // rather than its raw entry count is what stops a batch that is ALREADY fully windowed
-    // from being read as blocked and feeding the reservation on a phantom shortage - the same
-    // accounting error try_page_batch fixes under the lock, which lived on here at the
-    // pre-check one layer up (#2345 Gate 8 QE).
+    // from being read as blocked on a phantom shortage - the same accounting error
+    // try_page_batch fixes under the lock, which lived on here at the pre-check one layer up
+    // (#2345 Gate 8 QE).
     const auto windowed = rt.lifecycle_event_ids();
     // De-duplicated, mirroring try_page_batch's `want` set. Counting per entry let a row that
-    // repeats an event_id overstate its requirement by up to a whole batch, which would capture
-    // a large reservation for a batch that actually needs one slot (#2345 Gate 8b security).
+    // repeats an event_id overstate its requirement by up to a whole batch, so a batch needing
+    // one slot could be deferred as though it needed many (#2345 Gate 8b security).
     std::unordered_set<std::string> seen; // reused across candidates to avoid re-allocating
     const auto net_new_of = [&windowed, &seen](const JournalBatch& b) {
         seen.clear();
@@ -828,12 +851,23 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 // Nothing fits at all, so stop scanning - but first record the SMALLEST batch
                 // still pending, not this one. Reporting the head's requirement made the
                 // worker's re-arm wait for room it never needed (Gate 4 S3). The loop rewrite
-                // for the reservation dropped this scan; restored (#2345 Gate 8b security).
-                std::size_t smallest = need;
-                for (std::size_t m = n + 1; m < limit; ++m)
-                    smallest = std::min(smallest, net_new_of(cands[(start + m) % cands.size()].batch));
-                if (smallest > 0 && (stats.min_blocked_headroom == 0 ||
-                                     smallest < stats.min_blocked_headroom))
+                // that later replaced it dropped this scan; restored (#2345 Gate 8b security).
+                // Fold in only candidates that actually NEED room. A fully-windowed candidate
+                // reports 0 net-new, and taking that into the minimum zeroed it - whereupon the
+                // "> 0" guard discarded the whole scan and min_blocked_headroom silently kept
+                // the HEAD batch's requirement, which is the exact defect this scan exists to
+                // prevent. Not a corner case: live arm/disarm records are both windowed and
+                // journal candidates, so a recent batch is routinely fully windowed
+                // (#2345 Gate 3 - found independently by three reviewers).
+                std::size_t smallest = need; // seeded from a candidate that does need room
+                for (std::size_t m = n + 1; m < limit; ++m) {
+                    const std::size_t nn = net_new_of(cands[(start + m) % cands.size()].batch);
+                    if (nn > 0)
+                        smallest = std::min(smallest, nn);
+                    if (smallest == 1)
+                        break; // cannot get smaller; stop hashing the rest of the slice
+                }
+                if (stats.min_blocked_headroom == 0 || smallest < stats.min_blocked_headroom)
                     stats.min_blocked_headroom = smallest;
                 break;
             }

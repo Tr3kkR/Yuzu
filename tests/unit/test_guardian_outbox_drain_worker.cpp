@@ -599,14 +599,14 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
         for (int i = 0; !stop.load(std::memory_order_relaxed) && i < 200; ++i) {
             const auto rid = "live" + std::to_string(i);
             rig.rt->attach_rule(rid, file_spec("/" + rid), file_exists_rule(rid), true);
-                        std::uint64_t drops = 0;
-                auto pending = rig.rt->snapshot_pending(&drops);
+                        auto snap = rig.rt->snapshot_pending();
+                auto& pending = snap.records;
             if (pending.empty())
                 continue;
             std::vector<PersistedBatch> batches;
             const std::size_t written = rig.journal->persist(pending, &batches);
             if (written > 0) {
-                rig.rt->erase_persisted_prefix(written, drops);
+                rig.rt->erase_persisted_prefix(written, snap.drops_at_snapshot);
                 for (const auto& b : batches)
                     if (!b.event_ids.empty())
                         rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
@@ -806,13 +806,13 @@ TEST_CASE("a link-down/reconnect cycle with REAL Retain semantics loses nothing"
         rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
     }
     {
-                std::uint64_t drops = 0;
-                auto pending = rig.rt->snapshot_pending(&drops);
+                auto snap = rig.rt->snapshot_pending();
+                auto& pending = snap.records;
         if (!pending.empty()) {
             std::vector<PersistedBatch> batches;
             const std::size_t written = rig.journal->persist(pending, &batches);
             if (written > 0)
-                rig.rt->erase_persisted_prefix(written, drops);
+                rig.rt->erase_persisted_prefix(written, snap.drops_at_snapshot);
         }
     }
     std::this_thread::sleep_for(100ms); // several wakes, all Retaining
@@ -1553,16 +1553,24 @@ TEST_CASE("a full window reports the SMALLEST pending requirement, not the first
     // The worker re-arms a page when lifecycle_headroom() reaches min_blocked_headroom, so that
     // figure has to be the smallest thing actually waiting. Reporting the first-encountered
     // batch's requirement made the re-arm wait for room nothing needed - replay stalled a whole
-    // cadence interval for a 1-entry batch sitting behind a 256-entry one. A previous round
-    // fixed that with a forward scan; a later rewrite of this loop silently dropped it and it
-    // had no test anywhere in the suite. RED without the scan: 256 instead of 1.
+    // cadence interval for a 1-entry batch sitting behind a 256-entry one.
+    //
+    // The third candidate is the point of this test. It is ALREADY fully windowed, so it needs
+    // zero room; an earlier version of the scan folded that zero into the minimum and then
+    // discarded the whole result, silently keeping the head's 256. A first draft of this test
+    // used only blocked candidates and stayed green against that defect - the fully-windowed
+    // one is what makes it real, and it is the common case in production, because live
+    // arm/disarm records are both windowed and journal candidates.
     constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
     JournalRig rig{1}; // clamped up to the floor
     rig.persist_batch("a-big", kBig); // oldest, so it is met first in the rotation
-    rig.persist_batch("b-small", 1);  // ...and the small one is behind it
+    rig.persist_batch("b-small", 1);  // the smallest thing genuinely pending
+    rig.persist_batch("c-windowed", 1); // ...and this one needs no room at all
 
-    std::vector<OutboxEntry> fill; // fill the window completely
-    for (std::size_t i = 0; i < kBig; ++i)
+    std::vector<OutboxEntry> fill; // window full, and it CONTAINS c-windowed's record
+    fill.push_back(OutboxEntry::lifecycle("c-windowed-0", 1, "e-c-windowed-0",
+                                          1'700'000'000'000'000'000, "armed", "file", "n"));
+    for (std::size_t i = 1; i < kBig; ++i)
         fill.push_back(OutboxEntry::lifecycle("live", 1, "live-" + std::to_string(i),
                                               1'700'000'000'000'000'000, "armed", "file", "n"));
     REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == kBig);
@@ -1570,7 +1578,7 @@ TEST_CASE("a full window reports the SMALLEST pending requirement, not the first
 
     const auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'000'000);
     CHECK(stats.headroom_blocked);
-    CHECK(stats.min_blocked_headroom == 1); // the small batch behind it, not the head's 256
+    CHECK(stats.min_blocked_headroom == 1); // b-small, not the head's 256 and not c-windowed's 0
 }
 
 TEST_CASE("a batch repeating an event_id is sized by its distinct records",

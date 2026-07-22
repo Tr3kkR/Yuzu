@@ -67,11 +67,30 @@ inline constexpr double kJournalPageBurst = 5.0;        // small startup burst
 /// Bound per-pass paging work (reconstruct + membership scan) regardless of journal size.
 inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
 
+/// How far in the future a batch's ts_ms may plausibly sit before retention stops trusting it.
+///
+/// A batch stamped beyond this is treated as immediately expired. Without that, such a row is
+/// IMMORTAL - it can never be too old, and count eviction is oldest-first so it is never
+/// count-evicted either - and worse, it DISPLACES real evidence: once enough of them exist
+/// (a bad RTC for a week, a VM clone, a hand-edited kv_store.db), every genuine record written
+/// afterwards is the one evicted at the next prune, permanently. Precedent for the shape is
+/// server-side in app_perf_daily_store.cpp's kFutureSlackDays (#2345 Gate 2 security).
+///
+/// One day is generous for clock skew between an endpoint and its own next prune pass, while
+/// still bounding the damage a badly-set clock can do to the audit trail.
+inline constexpr std::int64_t kJournalFutureSlackMs = 24LL * 3600 * 1000;
+
 /// Batches a single retention pass may evict for AGE. Age is the one retention rule driven by
 /// an absolute reading of the wall clock, so one bad reading (a VM restored from snapshot, an
 /// NTP overshoot) marks every batch expired simultaneously and would delete the whole durable
 /// audit trail in one transaction. Capping the pass converts that into a paced ageing-out that
-/// overlaps with replay and with an operator noticing.
+/// an operator can notice and act on, rather than an instantaneous one.
+///
+/// It does NOT guarantee the paced batches are shipped first: at 64 per ~120 s pass this sheds
+/// roughly 32 batches/minute while replay refills at 0.1 batch/s (~6/minute), so deletion
+/// outruns delivery about five to one (#2345 Gate 2 performance). Lowering the cap to match the
+/// replay rate, or lifting the paging bucket while pacing, is tracked on #2364; what the cap
+/// buys today is time and a signal, not delivery.
 ///
 /// It caps AGE eviction ONLY, and deliberately does not bound how fast a journal shrinks: the
 /// count and byte ceilings are uncapped and trim an over-ceiling journal back in a single pass
