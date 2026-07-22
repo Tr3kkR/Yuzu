@@ -885,9 +885,10 @@ that a client which asked for anything wanted a held-open stream.
 `retry_after_ms` in the A4 `error.data`.
 
 **Cause**: One of two things, distinguished by the `remediation` text. Either the
-concurrent-stream cap is full (`--mcp-max-streams` /
-`--mcp-max-streams-per-principal`) — each held-open stream pins one HTTP worker, so
-this is a real resource limit, and a live stream is never evicted to admit a new one;
+concurrent-stream cap is full (`--max-sse-streams`, shared with every other streaming
+surface, or the per-principal `--mcp-max-streams-per-principal`) — each held-open
+stream pins one HTTP worker, so this is a real resource limit, and a live stream is
+never evicted to admit a new one;
 or a previous stream on **this session** was superseded and its connection has not
 finished closing yet (`retry_after_ms` is short — the handover clears in well under a
 second).

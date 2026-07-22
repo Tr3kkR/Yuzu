@@ -5622,7 +5622,13 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 | 403 | (perm layer) | RBAC `Execution:Read` denied |
 | 404 | A4 envelope | Execution does not exist |
 | 410 | A4 envelope | Execution already terminal |
+| 429 | A4 envelope with `retry_after_ms:5000` | Shared held-open-stream budget exhausted (ADR-0034). Remediation text: `close an existing /api/v1/events stream, or raise --max-sse-streams` |
 | 503 | A4 envelope with `retry_after_ms:5000` | Tracker or event bus not initialised (server warmup window) |
+
+This endpoint holds an HTTP worker thread open for the life of the subscription, so it
+leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
+executions drawer, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+*new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
 
