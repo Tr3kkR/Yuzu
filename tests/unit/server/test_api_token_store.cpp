@@ -20,10 +20,8 @@
 #include "../test_helpers.hpp"
 #include "test_api_token_pg_helper.hpp" // shared "apitoken" PgTestTemplate (one registration)
 
-#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
 
 #include <libpq-fe.h>
 

@@ -15,6 +15,7 @@
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
@@ -6604,7 +6605,8 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                                                   std::vector<std::string> allowed_origins,
                                                   yuzu::server::detail::StreamBudget* stream_budget,
                                                   StreamRevalidateFn revalidate_fn,
-                                                  yuzu::MetricsRegistry* metrics) {
+                                                  yuzu::MetricsRegistry* metrics,
+                                                  std::size_t per_principal_cap) {
     const std::vector<std::string> origins = std::move(allowed_origins);
     return [=](const httplib::Request& req, httplib::Response& res) {
         // NOTE: no up-front Content-Type here. httplib's set_header EMPLACES into a
@@ -6659,7 +6661,7 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,
         // provider) lives in mcp_stream.cpp — this file stays wiring.
         handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
-                        metrics, audit_fn);
+                        metrics, audit_fn, per_principal_cap);
     };
 }
 
@@ -6725,12 +6727,18 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                 "application/json");
             return;
         }
+        // The session id is an attacker-controlled HEADER until it validates, so the
+        // prefix that reaches an audit row is sanitised — raw bytes could inject the
+        // `;`/`=` field separators audit tooling parses, or CR/LF. The GET sibling in
+        // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
+        // the same verbs and was passing it through raw.
+        const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
         if (sessions->terminate(sid, session->username)) {
-            session_audit("mcp.session.close", "success", sid.substr(0, 8), "");
+            session_audit("mcp.session.close", "success", audit_sid, "");
             res.status = 200;
         } else {
             const auto cid = yuzu::server::detail::make_correlation_id();
-            session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
+            session_audit("mcp.session.reject", "failure", audit_sid,
                           "reason=unknown_session cid=" + cid);
             res.status = 404;
             res.set_content(
@@ -6769,13 +6777,14 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 SoftwareLicensingStore* software_licensing_store,
                                 EnginePrincipalStore* engine_principal_store,
                                 yuzu::server::detail::StreamBudget* stream_budget,
-                                StreamRevalidateFn revalidate_fn) {
+                                StreamRevalidateFn revalidate_fn,
+                                std::size_t mcp_max_streams_per_principal) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
     svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
                                           sessions, allowed_origins, stream_budget, revalidate_fn,
-                                          metrics));
+                                          metrics, mcp_max_streams_per_principal));
     svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
                                                 mcp_streaming_disabled, sessions, allowed_origins));
 

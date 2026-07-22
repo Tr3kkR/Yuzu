@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <shared_mutex>
 #include <string_view>
@@ -364,6 +365,46 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     return std::nullopt;
 }
 
+auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token) const {
+    using R = auth::CredentialCheck;
+
+    // Mirrors the two gates synthesize_token_session applies AFTER the token row
+    // validates. Kept beside revalidate_stream deliberately: if that function only
+    // consults the api_tokens row, a live row is treated as live authority even
+    // though a fresh request carrying the same header would be refused.
+
+    // Gate 1: the principal_kind allowlist. An out-of-allowlist value means DB
+    // corruption or a bypassed CHECK constraint; synthesize_token_session refuses to
+    // mint a session for it, so an existing stream must not survive on it either.
+    if (token.principal_kind != "human" && token.principal_kind != "engine") {
+        return R::kRevoked;
+    }
+    if (token.principal_kind != "engine") {
+        return R::kValid; // human tokens have no further backing-principal gate
+    }
+
+    // Gate 2: the engine principal must still be Active. Unwired store = fail closed,
+    // matching synthesize_token_session (an engine token must never authenticate
+    // through an unwired store).
+    if (!engine_principal_store_) {
+        return R::kRevoked;
+    }
+    switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+    case EngineLookupStatus::Active:
+        return R::kValid;
+    case EngineLookupStatus::MissingOrRevoked:
+        // Terminal: the credential's backing principal is dead. Cut the stream now —
+        // this is the revocation path the per-tick re-validation exists for.
+        return R::kRevoked;
+    case EngineLookupStatus::StoreUnreachable:
+        // We asked and did not get an answer. Indeterminate, NOT revoked: the stream
+        // rides out its bounded grace window rather than every engine stream on the
+        // fleet dying together on a store blip (Decision 15(i), CH-4).
+        return R::kIndeterminate;
+    }
+    return R::kRevoked; // unreachable — fail closed on a future enum value
+}
+
 auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                                                     const std::string& expected_principal) {
     using R = auth::CredentialCheck;
@@ -415,8 +456,19 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
         const auto checked = api_token_store_->validate_token_checked(raw);
         switch (checked.status) {
         case ApiTokenStore::TokenCheck::kValid:
-            if (checked.token && checked.token->principal_id == expected_principal)
+            if (checked.token && checked.token->principal_id == expected_principal) {
+                // A live token row is NOT sufficient. synthesize_token_session applies two
+                // further gates before it will mint a session, and the "a stream lives iff
+                // a fresh request would still authenticate" invariant is only true if this
+                // applies them too. Without them a DELETED OR REVOKED ENGINE PRINCIPAL kept
+                // its live MCP stream indefinitely — every fresh request 401'd, while the
+                // stream slid its own idle TTL forward on each tick and never expired.
+                if (const auto engine = engine_credential_state(*checked.token);
+                    engine != R::kValid) {
+                    return engine;
+                }
                 return R::kValid;
+            }
             break; // a valid token for SOMEONE ELSE is not authority for this stream
         case ApiTokenStore::TokenCheck::kUnavailable:
             // The store could not answer. That is NOT evidence of revocation — remember

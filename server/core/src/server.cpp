@@ -5508,6 +5508,11 @@ private:
             std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{effective_streams});
         metrics_.gauge("yuzu_http_held_open_capacity")
             .set(static_cast<double>(effective_streams));
+        // Described at startup but never set, so the series existed in metadata tooling
+        // and never in /metrics — worse than absent, because the describe() text sells it
+        // as the answer to "why am I being rejected below my configured cap". Set beside
+        // its sibling above, from the same post-clamp number.
+        metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
@@ -11735,7 +11740,17 @@ private:
             // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
             app_perf_providers,
             // PR 4.2 — fleet-wide engine role-assignment authoring surface.
-            engine_principal_store_.get());
+            engine_principal_store_.get(),
+            // ADR-0034: the ONE held-open-response budget. GET /api/v1/events pins an
+            // httplib worker for the life of its subscription, so it leases like every
+            // other streaming surface. This wiring was MISSING: the parameter defaults
+            // to nullptr, so the route's try_acquire block was dead code on a real
+            // server while the boot log ("EVERY streaming surface leases from one
+            // budget"), stream_budget.hpp's own "a surface that held a worker without a
+            // lease would make the arithmetic here a fiction", and the documented 429 in
+            // rest-api.md all asserted the opposite — and the plain-REST reserve was not
+            // in fact reserved.
+            stream_budget_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -11962,7 +11977,12 @@ private:
                 [this](const httplib::Request& req,
                        const std::string& principal) -> mcp::StreamRevalidate {
                     return auth_routes_->revalidate_stream(req, principal);
-                });
+                },
+                // The operator's --mcp-max-streams-per-principal. Passing it is what
+                // makes the flag mean anything: the attach site previously read the
+                // compile-time default, so raising or lowering the flag was a no-op
+                // on a control that parses, validates, logs and is documented.
+                cfg_.mcp_max_streams_per_principal);
         }
 
         // -- Listen -----------------------------------------------------------

@@ -371,9 +371,16 @@ private:
 ///
 /// `budget` / `revalidate` may be null/empty in test seams; production wires
 /// both (the registration path warns when they are missing).
+///
+/// `per_principal_cap` is the operator's `--mcp-max-streams-per-principal`. It is a
+/// PARAMETER, not a constant read at the call site: threading it from Config is what
+/// makes the flag do anything. It was previously hardcoded to the default here, so the
+/// flag and its env var parsed, validated, logged and documented as a working control
+/// while having no effect at all.
 void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                      const std::string& principal, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
-                     yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn);
+                     yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
+                     std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault);
 
 }  // namespace yuzu::server::mcp

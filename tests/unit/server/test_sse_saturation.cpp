@@ -16,7 +16,20 @@
 // teardown). So it compiles OUT under TSan rather than being tagged out — a tag can be
 // forgotten by whoever next writes the CI invocation; `#if` cannot.
 
-#if !defined(__SANITIZE_THREAD__)
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_TSAN_ACTIVE 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_TSAN_ACTIVE 1
+#endif
+
+// The two-part predicate is the repo convention (see test_scim_routes.cpp /
+// test_security_headers.cpp): GCC defines __SANITIZE_THREAD__, Clang answers
+// __has_feature(thread_sanitizer). The bare GCC-only form left this file compiled IN
+// under a local Clang TSan build, which is exactly the #438 breakage it opts out of.
+#if !defined(YUZU_TSAN_ACTIVE)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -107,21 +120,25 @@ TEST_CASE("CH-6: a server saturated with held-open streams still answers plain r
 
     // Fill every stream slot with a REAL held-open connection. Each one pins a worker.
     std::vector<std::thread> streamers;
-    std::atomic<int> attached{0};
     for (std::size_t i = 0; i < SaturationRig::kStreams; ++i) {
-        streamers.emplace_back([&rig, &attached] {
+        streamers.emplace_back([&rig] {
             httplib::Client cli("127.0.0.1", rig.port);
             cli.set_read_timeout(10, 0);
-            attached.fetch_add(1);
             // Bleeds heartbeats until the rig tears down; the connection — and its worker —
             // is held for the whole test.
             cli.Get("/stream", [](const char*, std::size_t) { return true; });
         });
     }
-    while (attached.load() < static_cast<int>(SaturationRig::kStreams)) {
+    // Spin on the observable the assertion below actually depends on, not on a fixed
+    // sleep. an `attached` counter would only prove the client THREADS started — the Get() that takes the
+    // lease happens after it — so the old `sleep_for(150ms)` was the real barrier, and
+    // 150 ms is not a safe margin on the shared 4-agent CI boxes (Defender-serialised I/O
+    // on Wee Tam is the documented aggravator, #473/#482). A short attach that slipped the
+    // window failed hard, not soft: the follow-on 429 assertion got a 200 chunked stream
+    // and then blocked to its own read timeout.
+    for (int spin = 0; spin < 400 && rig.budget.active() != SaturationRig::kStreams; ++spin) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(150)); // let them all attach
 
     CHECK(rig.budget.active() == SaturationRig::kStreams); // genuinely saturated
 
@@ -167,20 +184,19 @@ TEST_CASE("CH-6: every held-open response returns its worker on teardown",
 
     for (int round = 0; round < 3; ++round) {
         std::vector<std::thread> streamers;
-        std::atomic<int> attached{0};
         rig.release_streams.store(false);
         for (std::size_t i = 0; i < SaturationRig::kStreams; ++i) {
-            streamers.emplace_back([&rig, &attached] {
+            streamers.emplace_back([&rig] {
                 httplib::Client cli("127.0.0.1", rig.port);
                 cli.set_read_timeout(10, 0);
-                attached.fetch_add(1);
                 cli.Get("/stream", [](const char*, std::size_t) { return true; });
             });
         }
-        while (attached.load() < static_cast<int>(SaturationRig::kStreams)) {
+        // Same bounded spin on the real observable as the first case above.
+        for (int spin = 0; spin < 400 && rig.budget.active() != SaturationRig::kStreams;
+             ++spin) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
         CHECK(rig.budget.active() == SaturationRig::kStreams);
 
         rig.release_streams.store(true);
@@ -196,4 +212,4 @@ TEST_CASE("CH-6: every held-open response returns its worker on teardown",
     }
 }
 
-#endif // !__SANITIZE_THREAD__
+#endif // !YUZU_TSAN_ACTIVE

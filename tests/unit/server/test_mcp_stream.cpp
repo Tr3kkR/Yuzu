@@ -141,11 +141,22 @@ TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can sp
     CHECK(detail::derive_stream_budget(8, 8, 16) == 0);
     CHECK(detail::derive_stream_budget(4, 8, 16) == 0);
     CHECK(detail::derive_stream_budget(0, 8, 16) == 0);
-    // The floor on --http-worker-threads (8 → pool max 32) guarantees the derived
-    // budget is never zero, so MCP streaming cannot be silently disabled by a knob
-    // that reads like a tuning parameter.
-    CHECK(detail::derive_stream_budget(detail::kMinHttpWorkerThreads * 4,
+    // The floor on --http-worker-threads must ITSELF afford at least one stream, so
+    // streaming cannot be silently disabled by a knob that reads like a tuning
+    // parameter. Asserted UNSCALED: the old form multiplied the floor by 4, modelling
+    // httplib's retired "base 8 grows to max 32" behaviour. The pool is now pinned
+    // (pool_base == pool_max), so that factor was fiction — and it hid a real dead
+    // zone, because the floor was 8, kPlainRestReserveDefault is 8, and (8-8)/2 == 0.
+    CHECK(detail::derive_stream_budget(detail::kMinHttpWorkerThreads,
                                        detail::kPlainRestReserveDefault, 16) > 0);
+    // Sweep every pinned value an operator could plausibly pass: each is clamped up to
+    // the floor first, so none of them may yield a zero budget. This is the regression
+    // guard — `--http-worker-threads 8` used to 429 every streaming surface server-wide.
+    for (std::size_t pinned = 1; pinned <= 32; ++pinned) {
+        const std::size_t pool = std::max(pinned, detail::kMinHttpWorkerThreads);
+        INFO("pinned --http-worker-threads=" << pinned << " -> pool " << pool);
+        CHECK(detail::derive_stream_budget(pool, detail::kPlainRestReserveDefault, 16) > 0);
+    }
 }
 
 // ── Replay ring + resume (CH-2, CH-3) ───────────────────────────────────────

@@ -64,11 +64,6 @@ inline constexpr std::size_t derive_worker_pool(std::size_t target_streams,
     return kMaxProvidersPerStream * target_streams + plain_rest_reserve;
 }
 
-/// Floor for an explicit `--http-worker-threads`. Below httplib's own default base the
-/// derived budget collapses, which would disable streaming from behind a knob that reads
-/// like a tuning parameter.
-inline constexpr std::size_t kMinHttpWorkerThreads = 8;
-
 /// Held-open responses a given pool can afford once the reserve is held back. Retained as
 /// the safety clamp for an operator who pins `--http-worker-threads` by hand: the target is
 /// honoured only if the pool they chose can actually carry it.
@@ -79,6 +74,24 @@ inline constexpr std::size_t derive_stream_budget(std::size_t pool_max,
     const std::size_t affordable = spare / kMaxProvidersPerStream;
     return requested_global_cap < affordable ? requested_global_cap : affordable;
 }
+
+/// Floor for an explicit `--http-worker-threads`: the smallest pool that can still carry
+/// ONE stream with the reserve intact.
+///
+/// This MUST be derived, not picked. It was previously a hand-written 8, which equals
+/// `kPlainRestReserveDefault` — so `derive_stream_budget(8, 8, N)` computed `(8-8)/2 == 0`
+/// and the floor sat inside its own dead zone: any `--http-worker-threads` in [1,9] clamped
+/// the budget to 0, and a 0 cap rejects unconditionally (`total_ >= global_cap` is
+/// `0 >= 0`). That silently 429'd EVERY streaming surface server-wide — MCP GET,
+/// /api/v1/events, the dashboard drawer and legacy /events — from behind a knob that reads
+/// like a tuning parameter, which is the exact failure this constant exists to prevent.
+inline constexpr std::size_t kMinHttpWorkerThreads =
+    derive_worker_pool(1, kPlainRestReserveDefault);
+
+/// The floor must afford at least one stream, or it is not a floor. Compiler-checked so the
+/// two constants above can never drift back into the dead zone.
+static_assert(derive_stream_budget(kMinHttpWorkerThreads, kPlainRestReserveDefault, 1) >= 1,
+              "kMinHttpWorkerThreads must afford at least one held-open stream");
 
 /// Per-surface per-principal policies. These are ANTI-MONOPOLY limits, not capacity limits —
 /// capacity is the global cap alone. They differ per surface because the questions differ: an

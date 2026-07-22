@@ -442,6 +442,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--mcp-max-streams-per-principal", cfg.mcp_max_streams_per_principal,
                    "Max concurrent MCP SSE streams for a single principal — an anti-monopoly "
                    "policy, not a capacity limit (capacity is --max-sse-streams)")
+        // Range-checked like its two siblings above. 0 would admit nothing at all, so the
+        // floor is 1; the ceiling matches --max-sse-streams (a per-principal cap above the
+        // global capacity is meaningless, and the global cap clamps it anyway).
+        ->check(CLI::Range(std::size_t{1}, std::size_t{4096}))
         ->envname("YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL");
     app.add_option("--http-worker-threads", cfg.http_worker_threads,
                    "Pin the shared HTTP worker pool size by hand. 0 (default) derives it from "

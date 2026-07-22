@@ -8943,6 +8943,38 @@ void RestApiV1::register_routes(
             }
         }
 
+        // Admission control (ADR-0034). This response is about to hold an httplib worker for
+        // the life of the subscription, so it leases from the ONE budget every streaming
+        // surface shares. Held in a shared_ptr so the lease dies with the release lambda —
+        // the worker returns on every teardown path.
+        //
+        // Taken BEFORE the bus subscription so a rejected caller never leaves a listener
+        // behind, and BEFORE the gauge bump below: the 429 returns without installing the
+        // release callback that decrements, so incrementing first made
+        // yuzu_server_sse_api_active drift upward once per rejection — corrupting the very
+        // utilisation signal ADR-0034 Decision 3 depends on, under exactly the budget
+        // pressure it is meant to measure.
+        auto lease = std::make_shared<detail::StreamBudget::Lease>();
+        if (stream_budget != nullptr) {
+            auto admitted = stream_budget->try_acquire(detail::SseSurface::kApiEvents,
+                                                       session->username,
+                                                       detail::kPerPrincipalApiEvents);
+            if (!admitted.lease) {
+                res.status = 429;
+                // Retry-After alongside the A4 retry_after_ms — the platform 429
+                // convention in docs/user-manual/rest-api.md is both, in whole seconds.
+                res.set_header("Retry-After", "5");
+                res.set_content(
+                    detail::error_json_a4(429, "too many concurrent event streams", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "close an existing /api/v1/events stream, or raise "
+                                          "--max-sse-streams"),
+                    "application/json");
+                return;
+            }
+            *lease = std::move(admitted.lease);
+        }
+
         // Endpoint-scoped metric: subscription count.
         // Incremented BEFORE subscribe to avoid a race where a
         // listener fires and modifies the gauge before this line
@@ -9029,28 +9061,6 @@ void RestApiV1::register_routes(
                            detail::make_event_envelope(exec_id_for_capture, ev);
                 detail::enqueue_capped(sink_state, std::move(sse));
             });
-
-        // Admission control (ADR-0034). This response is about to hold an httplib worker for
-        // the life of the subscription. Taken BEFORE the bus subscription so a rejected
-        // caller never leaves a listener behind. Held in a shared_ptr so the lease dies with
-        // the release lambda — the worker returns on every teardown path.
-        auto lease = std::make_shared<detail::StreamBudget::Lease>();
-        if (stream_budget != nullptr) {
-            auto admitted = stream_budget->try_acquire(detail::SseSurface::kApiEvents,
-                                                       session->username,
-                                                       detail::kPerPrincipalApiEvents);
-            if (!admitted.lease) {
-                res.status = 429;
-                res.set_content(
-                    detail::error_json_a4(429, "too many concurrent event streams", cid,
-                                          /*retry_after_ms=*/5000,
-                                          "close an existing /api/v1/events stream, or raise "
-                                          "--max-sse-streams"),
-                    "application/json");
-                return;
-            }
-            *lease = std::move(admitted.lease);
-        }
 
         auto* bus = execution_event_bus;
         sink_state->sub_id =
@@ -9181,8 +9191,19 @@ void RestApiV1::register_routes(
             },
             detail::adopt_quota_slot_into_stream(
                 [sink_state, bus, exec_id_for_capture, metrics_registry, lease](bool /*success*/) {
-                    sink_state->closed.store(true);
+                    {
+                        // Under the sink mutex: `closed` is the provider's wait predicate,
+                        // and a store between its predicate check and its atomic
+                        // release-and-block is a lost wakeup. Matches the shared
+                        // sse_resource_release in event_bus.hpp — this site and the
+                        // dashboard sibling were the two remaining counter-examples to a
+                        // rule the rest of the tree now follows.
+                        std::lock_guard<std::mutex> lk(sink_state->mu);
+                        sink_state->closed.store(true);
+                    }
                     sink_state->cv.notify_all();
+                    // unsubscribe stays OUTSIDE the lock: publishers take the bus mutex
+                    // then the sink mutex, so unsubscribing under `mu` inverts that order.
                     bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
                     if (metrics_registry) {
                         metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})

@@ -115,6 +115,14 @@ public:
     auth::CredentialCheck revalidate_stream(const httplib::Request& req,
                                             const std::string& expected_principal);
 
+    /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
+    /// validates: the `principal_kind` allowlist, and — for an engine token — that the
+    /// backing engine principal is still Active. `revalidate_stream` must apply them
+    /// too, or a deleted/revoked engine principal keeps its live stream while every
+    /// fresh request it makes is refused. Returns kIndeterminate (never kRevoked) when
+    /// the engine store cannot answer, so a store blip defers rather than mass-kills.
+    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token) const;
+
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.
     bool require_admin(const httplib::Request& req, httplib::Response& res);

@@ -719,6 +719,33 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  res.set_header("Cache-Control", "no-cache");
                  res.set_header("X-Accel-Buffering", "no");
 
+                 // Admission control. This response is about to hold an httplib worker thread
+                 // for as long as the operator leaves the drawer open, so it takes a lease from
+                 // the ONE budget every streaming surface shares (ADR-0034). Held in a
+                 // shared_ptr so it dies with the release lambda — the worker goes back on any
+                 // teardown path, including a throw.
+                 //
+                 // Taken BEFORE the bus subscription below, matching the /api/v1/events
+                 // sibling. Subscribing first and rejecting afterwards leaked the listener:
+                 // the 429 path returns without unsubscribing, and gc_terminal_channels only
+                 // reaps channels whose listener set is empty, so each rejection pinned a
+                 // channel and its event buffer for the life of the process — an unbounded
+                 // memory leak introduced BY the control that exists to bound resources.
+                 auto lease = std::make_shared<detail::StreamBudget::Lease>();
+                 if (stream_budget != nullptr) {
+                     auto admitted = stream_budget->try_acquire(detail::SseSurface::kDashboardExec,
+                                                                session->username,
+                                                                detail::kPerPrincipalDashboard);
+                     if (!admitted.lease) {
+                         res.status = 429;
+                         res.set_header("Retry-After", "5");
+                         res.set_content("too many live streams open — close a tab and retry",
+                                         "text/plain; charset=utf-8");
+                         return;
+                     }
+                     *lease = std::move(admitted.lease);
+                 }
+
                  auto sink_state = std::make_shared<detail::SseSinkState>();
                  // Replay ring-buffer events newer than the client's
                  // Last-Event-ID header (browser EventSource sets this on
@@ -765,26 +792,6 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          sink_state->cv.notify_one();
                      });
                  std::string captured_exec_id = exec_id;
-
-                 // Admission control. This response is about to hold an httplib worker thread
-                 // for as long as the operator leaves the drawer open, so it takes a lease from
-                 // the ONE budget every streaming surface shares (ADR-0034). Held in a
-                 // shared_ptr so it dies with the release lambda — the worker goes back on any
-                 // teardown path, including a throw.
-                 auto lease = std::make_shared<detail::StreamBudget::Lease>();
-                 if (stream_budget != nullptr) {
-                     auto admitted = stream_budget->try_acquire(detail::SseSurface::kDashboardExec,
-                                                                session->username,
-                                                                detail::kPerPrincipalDashboard);
-                     if (!admitted.lease) {
-                         res.status = 429;
-                         res.set_header("Retry-After", "5");
-                         res.set_content("too many live streams open — close a tab and retry",
-                                         "text/plain; charset=utf-8");
-                         return;
-                     }
-                     *lease = std::move(admitted.lease);
-                 }
 
                  // UP-1: adopt any pending engine QuotaSlot into this
                  // stream's resource-releaser so the concurrency reservation
@@ -838,8 +845,18 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      },
                      detail::adopt_quota_slot_into_stream(
                          [sink_state, bus, captured_exec_id, lease](bool /*success*/) {
-                             sink_state->closed.store(true);
+                             {
+                                 // Under the sink mutex — `closed` is the provider's wait
+                                 // predicate, and a store between its check and its atomic
+                                 // release-and-block is a lost wakeup. Matches the shared
+                                 // sse_resource_release in event_bus.hpp.
+                                 std::lock_guard<std::mutex> lk(sink_state->mu);
+                                 sink_state->closed.store(true);
+                             }
                              sink_state->cv.notify_all();
+                             // unsubscribe stays OUTSIDE the lock: publishers take the bus
+                             // mutex then the sink mutex, so unsubscribing under `mu`
+                             // inverts that order.
                              bus->unsubscribe(captured_exec_id, sink_state->sub_id);
                              // The lease dies with this lambda, returning the worker to the
                              // one budget every streaming surface shares (ADR-0034).

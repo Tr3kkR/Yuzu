@@ -24,7 +24,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
 #include <libpq-fe.h>
-#include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
 #include <atomic>

@@ -185,7 +185,8 @@ change: a notification POST now answers `202` instead of `204`).
   already been evicted from that ring, the session is terminated and the request `404`s
   — re-initialize; durable results remain fetchable by `execution_id`. There is never a
   silent gap.
-  Concurrency is capped (`--mcp-max-streams`, `--mcp-max-streams-per-principal`): a cap
+  Concurrency is capped (`--max-sse-streams` globally, `--mcp-max-streams-per-principal`
+  per principal): a cap
   hit returns `-32012` / `429` with an honest `retry_after_ms` and never evicts a live
   stream. A second `GET` on the same session **takes over** (the older stream closes with
   `superseded`), so a client reconnecting across a dead TCP connection is never locked

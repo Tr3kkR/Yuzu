@@ -298,7 +298,8 @@ public:
                                 std::vector<std::string> allowed_origins,
                                 yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                                 StreamRevalidateFn revalidate_fn = {},
-                                yuzu::MetricsRegistry* metrics = nullptr);
+                                yuzu::MetricsRegistry* metrics = nullptr,
+                                std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault);
     HandlerFn build_delete_handler(AuthFn auth_fn, AuditFn audit_fn, const bool* mcp_disabled,
                                    const bool* streaming_disabled, McpSessionRegistry* sessions,
                                    std::vector<std::string> allowed_origins);
@@ -341,7 +342,13 @@ public:
                          // Decision 15(h)) and the per-tick credential re-validation
                          // seam (Decision 15(c)/(i)).
                          yuzu::server::detail::StreamBudget* stream_budget = nullptr,
-                         StreamRevalidateFn revalidate_fn = {});
+                         StreamRevalidateFn revalidate_fn = {},
+                         // Operator's --mcp-max-streams-per-principal. Threaded from Config
+                         // rather than read as a constant at the attach site: without this
+                         // the flag parsed, validated and documented as a live control
+                         // while having no effect whatsoever.
+                         std::size_t mcp_max_streams_per_principal =
+                             kMcpStreamsPerPrincipalDefault);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

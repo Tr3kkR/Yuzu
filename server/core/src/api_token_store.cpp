@@ -6,7 +6,6 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "secure_random.hpp"
-#include "sqlite_raii.hpp"
 
 #include <yuzu/secure_zero.hpp>
 

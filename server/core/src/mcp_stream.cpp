@@ -5,6 +5,7 @@
 #include "mcp_transport.hpp"
 #include "rest_a4_envelope.hpp"
 #include "auth_routes.hpp" // detail::sanitize_detail_value — audit-string sanitiser
+#include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_audit.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -641,7 +642,8 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
 void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                      const std::string& principal, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
-                     yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn) {
+                     yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
+                     std::size_t per_principal_cap) {
     const auto cid = yuzu::server::detail::make_correlation_id();
     const auto audit = [&](const char* action, const char* result, const std::string& target_id,
                            const std::string& detail) {
@@ -697,8 +699,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         return;
     }
 
-    auto attached = stream->attach_and_replay(last_event_id, budget, principal,
-                                              kMcpStreamsPerPrincipalDefault);
+    auto attached = stream->attach_and_replay(last_event_id, budget, principal, per_principal_cap);
     if (attached.status == McpStreamState::AttachStatus::kGap) {
         // The cursor's frames are gone. Terminate the session so the client's next
         // POST 404s too — one coherent "re-initialize" signal, and no abandoned
@@ -719,7 +720,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     if (attached.status == McpStreamState::AttachStatus::kStreamCapHit) {
         deny(429, kMcpStreamCap, "Concurrent stream cap reached",
              attached.reject_reason != nullptr ? attached.reject_reason : "global_stream_cap",
-             "close an existing SSE stream, or raise --mcp-max-streams", kMcpStreamCapRetryAfterMs,
+             "close an existing SSE stream, or raise --max-sse-streams", kMcpStreamCapRetryAfterMs,
              sid);
         return;
     }
@@ -813,20 +814,43 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
             return pump->pump_once(
                 [&s](const char* p, std::size_t n) { return s.write(p, n); });
         },
-        [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
-            // Runs from ~Response — a DESTRUCTOR. An exception escaping here is
-            // std::terminate no matter what httplib does, so the whole body is guarded
-            // (try_persist_audit swallows its own, but the string building allocates).
-            try {
-                stream->detach(sink); // returns this provider's worker to the budget
-                (void)yuzu::server::detail::try_persist_audit(
-                    audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession", audit_sid,
-                    std::string("reason=") + to_string(sink->close_reason.load()) + " cid=" + cid);
-            } catch (...) {
-                // The lease is still returned: detach() is the first call, and Lease's
-                // destructor would return it even if that somehow threw.
-            }
-        });
+        // UP-1: adopt any pending engine QuotaSlot into this stream's releaser so the
+        // per-principal CONCURRENCY reservation lasts for the stream's real lifetime.
+        // `/mcp/v1/` is in is_streaming_path (principal_quota_gate.hpp), so pre-routing
+        // stashes a slot in the thread_local and post-routing resets it unconditionally —
+        // which fires before the streamed body ever runs. Without this adoption an engine
+        // principal's MCP streams are bounded only by StreamBudget's per-principal cap,
+        // and the configurable PrincipalQuota concurrency cap is silently bypassed on the
+        // one surface it most exists to protect.
+        yuzu::server::detail::adopt_quota_slot_into_stream(
+            [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
+                // Runs from ~Response — a DESTRUCTOR. An exception escaping here is
+                // std::terminate no matter what httplib does, so the whole body is guarded
+                // (try_persist_audit swallows its own, but the string building allocates).
+                try {
+                    stream->detach(sink); // returns this provider's worker to the budget
+                    // A teardown that never re-entered the pump leaves close_reason at
+                    // kNone — and that is the MODAL case, not an edge one: httplib tests
+                    // is_peer_alive() BEFORE invoking the provider, so an ordinary client
+                    // disconnect is nearly always observed while the pump sits in its 3 s
+                    // condvar wait, not as a failed write inside finish(). Auditing "none"
+                    // there would emit a value outside the closed set documented in
+                    // observability-conventions.md and pre-seeded in server.cpp, and would
+                    // mean the reason vocabulary said nothing about the commonest close.
+                    const auto reason = sink->close_reason.load();
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession",
+                        audit_sid,
+                        std::string("reason=") +
+                            to_string(reason == McpStreamClose::kNone
+                                          ? McpStreamClose::kClientGone
+                                          : reason) +
+                            " cid=" + cid);
+                } catch (...) {
+                    // The lease is still returned: detach() is the first call, and Lease's
+                    // destructor would return it even if that somehow threw.
+                }
+            }));
     // The releaser now owns the lease's return path; the guard stands down.
     lease_guard.installed = true;
 }
