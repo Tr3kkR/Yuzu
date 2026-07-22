@@ -498,10 +498,10 @@ TEST_CASE("run_bounded_subprocess does not leak an inherited non-CLOEXEC fd into
     CHECK(child_cannot_see_fd(21));
 }
 
-// The earlier fix capped its in-child fcntl sweep at 4096, silently leaking any
-// fd at or above it under an ordinary large RLIMIT_NOFILE (systemd's 524288,
-// this host's 1048576). Raise the limit, place an fd at 5000, and prove the cap
-// is gone (close_range on Linux; a full-soft-limit sweep on macOS).
+// An early fix capped its in-child fcntl sweep at 4096, silently leaking any fd
+// at or above it under an ordinary large RLIMIT_NOFILE (systemd's 524288, this
+// host's 1048576). The sweep now enumerates the real open-fd set, so a fd placed
+// at 5000 is caught regardless of any ceiling.
 TEST_CASE("run_bounded_subprocess sweeps an inherited fd above the old 4096 cap",
           "[subprocess][fd]") {
     struct rlimit saved{};
@@ -518,6 +518,43 @@ TEST_CASE("run_bounded_subprocess sweeps an inherited fd above the old 4096 cap"
     }
     CHECK(child_cannot_see_fd(5000));
     ::setrlimit(RLIMIT_NOFILE, &saved); // restore
+}
+
+// CODEX-1 (adversarial review): a soft-limit ceiling is not a valid upper bound
+// on the live fd set — POSIX keeps an already-open fd valid when RLIMIT_NOFILE is
+// later LOWERED below it. Placing a fd at 5000, then lowering the soft limit to
+// 1024, must still leave the exec'd child unable to see it (the parent-side
+// enumeration of the real open set catches it; a `rlim_cur` ceiling would miss it).
+TEST_CASE("run_bounded_subprocess sweeps an inherited fd retained after the soft limit is lowered",
+          "[subprocess][fd]") {
+    struct rlimit saved{};
+    REQUIRE(::getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    struct rlimit raised = saved;
+    const rlim_t want = 6000;
+    raised.rlim_cur =
+        (saved.rlim_max == RLIM_INFINITY || saved.rlim_max >= want) ? want : saved.rlim_max;
+    if (::setrlimit(RLIMIT_NOFILE, &raised) != 0 || raised.rlim_cur <= 4096) {
+        SKIP("host RLIMIT_NOFILE cannot be raised to place a fd at 5000");
+    }
+    const int devnull = ::open("/dev/null", O_RDONLY);
+    REQUIRE(devnull >= 0);
+    REQUIRE(::dup2(devnull, 5000) == 5000);
+    ::close(devnull);
+    REQUIRE((::fcntl(5000, F_GETFD) & FD_CLOEXEC) == 0); // deliberately inheritable
+
+    // Lower the soft limit BELOW the open fd — the fd stays valid; a ceiling taken
+    // from the now-current soft limit (1024) would fail to sweep fd 5000.
+    struct rlimit lowered = saved;
+    lowered.rlim_cur = 1024;
+    ::setrlimit(RLIMIT_NOFILE, &lowered);
+
+    const std::string probe = "if [ -e /dev/fd/5000 ]; then printf LEAK; else printf CLEAN; fi";
+    SubprocessResult r =
+        run_bounded_subprocess({"/bin/sh", "-c", probe}, SubprocessOptions{.deadline = 5000ms});
+    ::close(5000);
+    ::setrlimit(RLIMIT_NOFILE, &saved); // restore
+    CHECK(r.tool_ran);
+    CHECK(r.output == "CLEAN");
 }
 
 #endif // !_WIN32

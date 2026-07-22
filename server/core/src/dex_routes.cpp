@@ -503,6 +503,9 @@ std::string history_detail(const GuardianObservationRow& r) {
 // logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
 int dex_window_to_days(const std::string& window) { return window_to_days(window); }
 std::string dex_iso_since(int days) { return iso_days_ago(days); }
+std::string dex_normalize_os_filter(const std::string& os) {
+    return (os == "windows" || os == "linux" || os == "macos") ? os : std::string{};
+}
 
 // Canonical window token from the (already-validated) window_days — safe to put
 // into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
@@ -602,9 +605,11 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
         if (o.starts_with("lin")) return "linux";
         return o;
     };
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" || os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token
+    // ("all" when unscoped).
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
 
     // -- Per-OS scoping (#1746): "all" keeps the established all-connected
     // composite (windows_online + the all-OS signal rollup) — byte-unchanged. A
@@ -613,8 +618,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
                              : osf == "macos" ? fleet.macos_online
                                                : fleet.windows_online; // "all" or "windows"
-    const auto signals_scoped =
-        osf == "all" ? store->dex_signal_summary(since) : store->dex_signal_summary(since, osf);
+    const auto signals_scoped = store->dex_signal_summary(since, plat);
 
     std::vector<std::string> scope;
     if (osf == "all") {
@@ -800,18 +804,17 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         if (o.starts_with("lin")) return "linux";
         return o;
     };
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token.
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
 
     // -- Per-OS scoping (#1746 BR-001): resolved BEFORE the summary read so the
     // drill-down reads the SAME lens as the grid — "all" keeps the fleet-wide
     // rollup (byte-unchanged); a single-OS chip reads only that OS's signals.
     // This single read flows into the family rollup, the per-signal table rows,
     // AND the score below, so the whole drill-down is OS-consistent with View 1. --
-    const auto signals =
-        osf == "all" ? store->dex_signal_summary(since) : store->dex_signal_summary(since, osf);
+    const auto signals = store->dex_signal_summary(since, plat);
     const auto r = dex_family_rollup(*grp, signals);
     auto find_sig = [&](const char* t) -> const DexSignalCount* {
         for (const auto& s : signals)
@@ -987,10 +990,10 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     if (obs_type.empty())
         return placeholder("No signal selected", "Pick a signal type from a family.");
     const std::string w = dex_window_token(window_days);
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token.
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
 
     const char* family = nullptr;
     for (const auto& g : dex_signal_groups()) {
@@ -1006,7 +1009,7 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     // OS-scope the detail lists to the selected lens (#C-DEX-1): a single-OS
     // filter must not show cross-OS subjects/devices/days. `by_os` is deliberately
     // left cross-OS — it IS the OS-split chart, so it always spans every OS.
-    const std::string plat = (osf == "all") ? std::string{} : osf;
+    // (`plat` computed above via the shared normaliser.)
     const auto subjects = store->dex_signal_subjects(obs_type, since, 15, plat);
     const auto by_os = store->dex_signal_by_os(obs_type, since);
     const auto devices = store->dex_signal_devices(obs_type, since, 15, plat);

@@ -101,6 +101,13 @@ std::string dex_signal_label(const std::string& obs_type);
 int dex_window_to_days(const std::string& window);
 std::string dex_iso_since(int days);
 
+/// Normalises a REST/MCP `os` filter param to a store-ready platform token:
+/// "windows"/"linux"/"macos" pass through; anything else (including "all" or
+/// empty) returns "" = all-OS. The single source of truth so the machine
+/// surfaces' DEX OS-scoping stays identical to the dashboard drilldown (A1
+/// dashboard-parity, #C-DEX-1 follow-up).
+std::string dex_normalize_os_filter(const std::string& os);
+
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
 /// + trend, all from the crash projection. `since` is an ISO-8601 cutoff

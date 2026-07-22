@@ -628,6 +628,19 @@ TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escap
     CHECK(bad.find("<img src=x") == std::string::npos); // escaped, no XSS
 }
 
+TEST_CASE("dex_normalize_os_filter maps a caller os param to a store-ready platform token",
+          "[dex][routes]") {
+    // The single source of truth shared by the dashboard, REST and MCP surfaces.
+    CHECK(dex_normalize_os_filter("windows") == "windows");
+    CHECK(dex_normalize_os_filter("linux") == "linux");
+    CHECK(dex_normalize_os_filter("macos") == "macos");
+    CHECK(dex_normalize_os_filter("all").empty());     // sentinel → all-OS
+    CHECK(dex_normalize_os_filter("").empty());        // omitted → all-OS
+    CHECK(dex_normalize_os_filter("Windows").empty()); // not canonical (case-sensitive)
+    CHECK(dex_normalize_os_filter("darwin").empty());  // not a caller token
+    CHECK(dex_normalize_os_filter("' OR 1=1").empty()); // junk → all-OS (never reaches SQL raw)
+}
+
 TEST_CASE("DEX catalogue signal drill-down: single-OS lens scopes the subject list (C-DEX-1)",
           "[dex][routes][catalogue]") {
     // A single-OS Catalogue filter must scope the drilldown's subject/device/day
@@ -866,6 +879,22 @@ TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest
     auto html2 = render_dex_overview_fragment(&store, "", 7, DexFleet{0, 0});
     CHECK(html2.find("75.0%") == std::string::npos);
     CHECK(html2.find("no reporting agents") != std::string::npos);
+}
+
+TEST_CASE("DEX overview: crash-free rate is Windows-scoped — a macOS crash can't move it (C-DEX-1)",
+          "[dex][routes]") {
+    // process.crashed now arrives from macOS agents too. The crash-free tile is
+    // denominated over reporting WINDOWS agents, so a macOS crash must NOT lower
+    // it. This guards a future edit that drops the "windows" scope from
+    // dex_crash_summary in render_dex_overview_fragment — that regression would
+    // count MAC-1 as impacted (2 of 4 → 50.0%) instead of the correct 75.0%.
+    GuaranteedStateStore store(":memory:");
+    seed_crash(store, "w1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
+    seed_crash(store, "m1", "MAC-1", "Safari", "", "macos", kDayA + "T11:00:00Z");
+
+    auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
+    CHECK(html.find("75.0%") != std::string::npos); // 1 Windows device of 4 — unchanged by macOS
+    CHECK(html.find("50.0%") == std::string::npos); // NOT 2 of 4 (the macOS crash is excluded)
 }
 
 TEST_CASE("DEX overview: hangs alone keep the crash-free rate honest (100%)",

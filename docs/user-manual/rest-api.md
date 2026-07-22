@@ -4480,7 +4480,7 @@ Guard authoring schema catalog — the static registry of `spark` / `assertion` 
 
 ### DEX (Digital Employee Experience)
 
-The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. The signal endpoints read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row); the perf endpoints aggregate registry heartbeat state at request time. All are gated on the same `GuaranteedState:Read` securable. The signal endpoints accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`); the perf endpoints are now-views with no window.
+The DEX aggregation endpoints are the machine-readable equivalent of the [DEX dashboard](dex.md): the same store rollups the HTMX fragments render, JSON-shaped for agentic workers. The signal endpoints read the ruleless `__observation__` projection (the same data the [events](#get-apiv1guaranteed-stateevents) endpoint exposes per-row); the perf endpoints aggregate registry heartbeat state at request time. All are gated on the same `GuaranteedState:Read` securable. The signal endpoints accept a `window` query parameter — one of `24h`, `7d`, `30d`, `all` (default `7d`; any other value resolves to `7d`) — and an optional `os` filter (`windows`/`linux`/`macos`; omitted or any other value = every OS), which scopes them to one OS's own signals exactly as the dashboard catalogue OS filter does; the perf endpoints are now-views with no window.
 
 **Audit boundary.** The catalogue rollup, per-OS scope and the perf endpoints are aggregates / machine-health telemetry and are **not** audited. The per-signal drill-down returns a most-affected **devices** list (`agent_id`s — behavioral, individual-identifying) and emits a **`dex.signal.view`** audit row (`target_type=ObsType`, `target_id=<obs_type>`) on every call — the same verb as the dashboard per-signal view and consistent with the `agent_id`-filtered events query.
 
@@ -4489,7 +4489,7 @@ The DEX aggregation endpoints are the machine-readable equivalent of the [DEX da
 Whole-catalogue rollup — every observation type present in the window.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `window`.
+- **Query parameters:** `window`; `os` (`windows`/`linux`/`macos` narrows the rollup to that OS's own signals; omitted = every OS).
 - **Response:** `data[]` of `{obs_type, count, distinct_devices, last_seen}`. `obs_type` is the stable machine key (e.g. `process.crashed`, `os.boot`); map your own labels. Not audited.
 
 #### `GET /api/v1/dex/scope`
@@ -4506,8 +4506,8 @@ One signal type's drill-down.
 
 - **Permission:** `GuaranteedState:Read`
 - **Path parameter:** `obs_type` — must match `[A-Za-z0-9._-]{1,64}`.
-- **Query parameters:** `window`; `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
-- **Response (`200`):** an object `{obs_type, subjects[], by_os[], devices[], by_day[]}` where `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
+- **Query parameters:** `window`; `os` (`windows`/`linux`/`macos` scopes `subjects[]`, `devices[]` and `by_day[]` to that OS; `by_os[]` stays cross-OS since it IS the split; omitted = every OS); `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
+- **Response (`200`):** an object `{obs_type, os, subjects[], by_os[], devices[], by_day[]}` where `os` echoes the applied filter (`all` when unscoped), `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
 - **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`.
 - **Audit (behavioral PII):** the `devices[]` array names the `agent_id`s exhibiting this signal, so the endpoint emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) before serving — see the audit boundary note above. **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list (parity with `GET /api/v1/dex/devices/{id}`).
 

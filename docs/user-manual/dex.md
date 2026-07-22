@@ -231,11 +231,15 @@ Every aggregation on this page has a machine-readable equivalent under
 does (agentic-first parity):
 
 - **`GET /api/v1/dex/signals`** — the Catalogue rollup (every signal in the
-  window: count, blast radius, last seen).
+  window: count, blast radius, last seen). Optional `os=windows|linux|macos`
+  narrows to one OS's own signals (matching the dashboard's OS filter).
 - **`GET /api/v1/dex/scope`** — the per-OS signal coverage that drives the
   cross-OS captions.
 - **`GET /api/v1/dex/signals/{obs_type}`** — one signal's drill-down (subjects,
-  OS split, most-affected devices, per-day trend).
+  OS split, most-affected devices, per-day trend). Optional
+  `os=windows|linux|macos` scopes the subjects / devices / per-day lists to that
+  OS (the `os` applied is echoed back); the OS-split view stays cross-OS by
+  design, since that is the breakdown itself.
 - **`GET /api/v1/dex/perf/fleet`** — the Performance tab's fleet-now stats
   (avg/p50/p90/max + n per metric, `null` when nobody reported it, plus the
   reporting/online denominators).
@@ -257,7 +261,9 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/devices/{id}/app-perf?app=`** — one device's retained per-app
   history (behavioral PII; scoped + audited fail-closed, `dex.device.app_perf.view`).
 
-The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all`; the
+The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
+catalogue rollup + per-signal drill-down additionally take the optional `os`
+filter above, `all` when omitted); the
 fleet-now/cohort perf endpoints are now-views (no window), while the
 **application-performance-over-time** endpoints (`/perf/apps`, `/perf/app`,
 `/perf/group`) read **retained Postgres** data (≤180 days fleet / ≤31 days

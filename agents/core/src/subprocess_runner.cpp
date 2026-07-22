@@ -66,19 +66,15 @@
 #include <cassert>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib> // std::strtol (parse /proc/self/fd, /dev/fd entries in the parent)
 #include <ctime>
+#include <dirent.h> // opendir/readdir/dirfd/closedir — parent-side inherited-fd enumeration
 #include <fcntl.h>
+#include <limits>
 #include <mutex>
 #include <sys/resource.h>
 #include <sys/wait.h>
-#if defined(__linux__)
-#include <sys/syscall.h> // SYS_close_range (kernel 5.9+)
-#if defined(__has_include)
-#if __has_include(<linux/close_range.h>)
-#include <linux/close_range.h> // CLOSE_RANGE_CLOEXEC
-#endif
-#endif
-#endif
+#include <vector>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -389,20 +385,46 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         fcntl(err_write_fd.get(), F_SETFD, FD_CLOEXEC) == -1)
         return result; // fail closed, same reasoning as the pipe above
 
-    // Fd ceiling for the child's inherited-fd sweep, computed HERE in the parent:
-    // getrlimit() is NOT async-signal-safe, so it must never run post-fork in the
-    // child. This is the real soft RLIMIT_NOFILE (the highest fd number the
-    // process can hold), so the child's fcntl sweep is complete, not capped. On
-    // Linux the child prefers close_range() and ignores this; it is the bound for
-    // the fcntl fallback (macOS always; Linux only if close_range is unavailable).
-    // The 4096 default is used ONLY when the soft limit is literally infinite
-    // (RLIM_INFINITY) — a genuinely pathological config, not the ordinary large
-    // systemd default (e.g. 524288) the previous cap wrongly swept away.
-    long child_fd_ceiling = 4096;
+    // Enumerate the ACTUAL open descriptors (>= 3) HERE in the parent, before
+    // fork(): opendir()/readdir() are not async-signal-safe, so they must not run
+    // post-fork. Handing the child the real live fd set — rather than sweeping to
+    // a guessed ceiling — is what makes the sanitisation COMPLETE. A soft-limit
+    // ceiling misses a descriptor whose NUMBER exceeds the current soft
+    // RLIMIT_NOFILE, which POSIX permits in two real ways: the limit is
+    // RLIM_INFINITY (no finite ceiling to sweep to), or a descriptor was opened
+    // while the limit was higher and the limit was later lowered (the fd stays
+    // valid). Enumeration also makes the sweep O(open fds) instead of O(soft
+    // limit) — no ~100ms-per-spawn fcntl storm on a large-limit host.
+    std::vector<int> inherited_fds;
+    long fallback_ceiling = 0; // >0 => the fd dir was unreadable; child sweeps [3, ceiling)
     {
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
-            child_fd_ceiling = static_cast<long>(rl.rlim_cur);
+#if defined(__linux__)
+        const char* fd_dir = "/proc/self/fd";
+#else
+        const char* fd_dir = "/dev/fd"; // macOS/BSD fdesc filesystem
+#endif
+        DIR* d = ::opendir(fd_dir);
+        if (d != nullptr) {
+            const int dir_fd = ::dirfd(d); // the enumeration's own fd — closed below, never inherited
+            for (dirent* e = ::readdir(d); e != nullptr; e = ::readdir(d)) {
+                char* endp = nullptr;
+                const long fd = std::strtol(e->d_name, &endp, 10);
+                if (endp != nullptr && *endp == '\0' && fd >= 3 && fd != dir_fd &&
+                    fd <= static_cast<long>(std::numeric_limits<int>::max()))
+                    inherited_fds.push_back(static_cast<int>(fd));
+            }
+            ::closedir(d);
+        } else {
+            // No /proc or /dev/fd (a stripped sandbox): fall back to a bounded
+            // fcntl sweep. Bound on the HARD limit, not the soft one — soft <= hard
+            // always, so no fd can ever have been allocated at or above the hard
+            // limit; this stays complete even after a soft-limit change. 4096 only
+            // if the hard limit is itself infinite (no finite bound available).
+            struct rlimit rl;
+            fallback_ceiling = 4096;
+            if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max != RLIM_INFINITY)
+                fallback_ceiling = static_cast<long>(rl.rlim_max);
+        }
     }
 
     pid_t pid = fork();
@@ -472,31 +494,32 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // closes only the CLOEXEC *race* window between concurrent launchers'
         // own pipe creation; by its own contract it does NOT sanitise
         // already-open inherited fds (fork_lock.hpp, "non-forking pipe creators
-        // are exposed too"). Mark every fd >= 3 close-on-exec so execv() drops
-        // them all. Deliberately mark rather than close: err_write_fd is already
-        // CLOEXEC, so it survives this sweep -- auto-closing only on a
+        // are exposed too"). Mark every inherited fd >= 3 close-on-exec so execv()
+        // drops them all. Deliberately mark rather than close: err_write_fd is
+        // already CLOEXEC, so it survives this sweep -- auto-closing only on a
         // *successful* exec (the parent's success signal) while staying writable
-        // to report an exec failure just below. stdio (0/1/2) is untouched.
+        // to report an exec failure just below. The three own pipe fds were closed
+        // above (fcntl on them now returns EBADF and is skipped); stdio (0/1/2) is
+        // never in the >= 3 set.
         //
-        // Only async-signal-safe calls run here: close_range()/syscall() and
-        // fcntl() (man 7 signal-safety). getrlimit() is NOT async-signal-safe, so
-        // the fd ceiling was computed in the PARENT above (child_fd_ceiling) --
-        // never called here. Linux (kernel 5.9+) uses close_range() with
-        // CLOSE_RANGE_CLOEXEC: one O(1) syscall covering the WHOLE [3, ∞) fd
-        // space, so there is no cap and nothing above any bound is missed. The
-        // raw syscall() avoids depending on the glibc close_range() wrapper's
-        // _GNU_SOURCE declaration. Everything else (macOS always; a pre-5.9 Linux
-        // kernel returning ENOSYS) falls back to a bounded fcntl sweep up to the
-        // real soft RLIMIT_NOFILE -- complete, since no fd can exceed that limit.
-        bool swept = false;
-#if defined(__linux__) && defined(SYS_close_range) && defined(CLOSE_RANGE_CLOEXEC)
-        swept = (syscall(SYS_close_range, 3u, ~0u, static_cast<unsigned>(CLOSE_RANGE_CLOEXEC)) == 0);
-#endif
-        if (!swept) {
-            for (long fd = 3; fd < child_fd_ceiling; ++fd) {
+        // ONLY fcntl() runs here — an fd primitive on POSIX's enumerated
+        // async-signal-safe list (man 7 signal-safety) and the one that toggles
+        // FD_CLOEXEC without closing, matching this branch's list-based contract in
+        // the file header. The fd set was enumerated in the PARENT above (opendir /
+        // readdir are NOT on the list); the child only iterates that vector — no
+        // allocation, no lock — and fcntl()s each. The fallback ceiling sweep runs
+        // only when the fd directory was unreadable.
+        if (fallback_ceiling > 0) {
+            for (long fd = 3; fd < fallback_ceiling; ++fd) {
                 const int flags = fcntl(static_cast<int>(fd), F_GETFD);
                 if (flags != -1 && !(flags & FD_CLOEXEC))
                     fcntl(static_cast<int>(fd), F_SETFD, flags | FD_CLOEXEC);
+            }
+        } else {
+            for (int fd : inherited_fds) {
+                const int flags = fcntl(fd, F_GETFD);
+                if (flags != -1 && !(flags & FD_CLOEXEC))
+                    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
             }
         }
 
