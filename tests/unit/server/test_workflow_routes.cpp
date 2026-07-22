@@ -20,6 +20,7 @@
  */
 
 #include "execution_event_bus.hpp"
+#include "stream_budget.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "response_store.hpp"
@@ -111,8 +112,14 @@ struct ExecHarness {
     /// bus so SSE-handler 503-on-no-bus tests can exercise the path where
     /// the route is registered but the underlying bus is intentionally
     /// not wired (governance qe-S1).
-    explicit ExecHarness(bool with_bus = true)
-        : tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
+    /// Optional shared admission budget (ADR-0034). Default nullptr keeps every
+    /// pre-existing test on the unmetered path; the admission tests pass one in.
+    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+
+    explicit ExecHarness(bool with_bus = true,
+                         yuzu::server::detail::StreamBudget* budget = nullptr)
+        : stream_budget(budget),
+          tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
           resp_db(uniq("wf-routes-resp")) {
         for (auto& p : {tracker_db, instr_db, resp_db})
             fs::remove(p);
@@ -196,6 +203,7 @@ struct ExecHarness {
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
         wf_deps.execution_event_bus = event_bus.get();
+        wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
         routes.register_routes(sink, std::move(wf_deps));
     }
 
@@ -950,6 +958,82 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[workflow][executions
     auto res = h.sink.Get("/sse/executions/" + exec_id);
     REQUIRE(res);
     CHECK(res->status == 410);
+}
+
+// ── ADR-0034 shared-budget admission (governance regression guards) ─────────
+//
+// These exist because the two blockers this route shipped were BOTH invisible to
+// the whole suite: the budget was never wired into production at all, and the
+// lease was taken after bus->subscribe so a rejection leaked the listener. Neither
+// is reachable by a sanitizer — an admission reject is single-threaded and
+// allocation-free — so an assertion-based handler test is the only instrument.
+
+TEST_CASE("SSE handler: 429 once the shared stream budget is exhausted",
+          "[workflow][executions][pr3][sse][admission]") {
+    // Capacity 1: the first attach consumes the only slot, so the second is refused.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    // Pre-consume the slot on the SAME surface so the route hits the global cap.
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kDashboardExec, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalDashboard);
+    REQUIRE(held.lease);
+    REQUIRE(budget.active() == 1);
+
+    ExecHarness h{/*with_bus=*/true, &budget};
+    h.make_def("def-CAP", "Cap");
+    auto exec_id = h.make_exec("def-CAP", "running", 5, 0, 0);
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    // Honest retry hint (the platform 429 convention), not a bare status.
+    CHECK(res->get_header_value("Retry-After") == "5");
+    // A live stream is NEVER evicted to admit a newcomer.
+    CHECK(budget.active() == 1);
+}
+
+TEST_CASE("SSE handler: a budget rejection leaves NO bus subscriber behind",
+          "[workflow][executions][pr3][sse][admission]") {
+    // THE regression guard for the listener leak. The lease used to be taken AFTER
+    // bus->subscribe, and the 429 path returns without unsubscribing — and
+    // gc_terminal_channels only reaps channels whose listener set is empty, so every
+    // rejection pinned a channel plus its event buffer for the life of the process.
+    // Worse, this route's listener enqueues UNCAPPED, so the abandoned queue grew on
+    // every later publish. An unbounded leak introduced by the control that exists to
+    // bound resources.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kDashboardExec, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalDashboard);
+    REQUIRE(held.lease);
+
+    ExecHarness h{/*with_bus=*/true, &budget};
+    h.make_def("def-LEAK", "Leak");
+    auto exec_id = h.make_exec("def-LEAK", "running", 5, 0, 0);
+
+    const auto before = h.event_bus->subscribers_total();
+    for (int i = 0; i < 5; ++i) {
+        auto res = h.sink.Get("/sse/executions/" + exec_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 429);
+    }
+    // Five refusals, zero subscribers gained. Before the fix this was `before + 5`,
+    // and none of them was ever reclaimable.
+    CHECK(h.event_bus->subscribers_total() == before);
+    CHECK(h.event_bus->subscriber_count(exec_id) == 0);
+}
+
+TEST_CASE("SSE handler: an unmetered route still serves (nullptr budget is a test seam)",
+          "[workflow][executions][pr3][sse][admission]") {
+    // The budget parameter is nullable for harnesses. Assert that nullability is a
+    // pass-through and not an accidental deny, so the guard above cannot pass for
+    // the wrong reason.
+    ExecHarness h; // no budget
+    h.make_def("def-FREE", "Free");
+    auto exec_id = h.make_exec("def-FREE", "running", 5, 0, 0);
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution", "[workflow][executions][pr3]") {

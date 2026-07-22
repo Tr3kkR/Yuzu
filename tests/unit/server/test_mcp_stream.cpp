@@ -10,6 +10,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <type_traits>
+
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
@@ -158,6 +160,17 @@ TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can sp
         CHECK(detail::derive_stream_budget(pool, detail::kPlainRestReserveDefault, 16) > 0);
     }
 }
+
+// The Lease's ownership contract, pinned at compile time. A copyable lease would
+// double-release and silently inflate capacity; a throwing release runs from a
+// destructor on the teardown path and would be std::terminate. Neither failure is
+// reachable by a sanitizer, so a static_assert is the only guard that holds.
+static_assert(!std::is_copy_constructible_v<detail::StreamBudget::Lease>,
+              "StreamBudget::Lease must be move-only — a copy double-releases");
+static_assert(!std::is_copy_assignable_v<detail::StreamBudget::Lease>,
+              "StreamBudget::Lease must be move-only — a copy double-releases");
+static_assert(std::is_nothrow_destructible_v<detail::StreamBudget::Lease>,
+              "~Lease runs from an httplib releaser inside ~Response");
 
 // ── Replay ring + resume (CH-2, CH-3) ───────────────────────────────────────
 

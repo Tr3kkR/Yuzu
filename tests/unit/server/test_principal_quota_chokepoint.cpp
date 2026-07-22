@@ -74,6 +74,9 @@
 #include "principal_quota_gate.hpp" // transitively: principal_quota.hpp, principal_quota_denial.hpp
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <type_traits>
+#include <utility>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -659,6 +662,78 @@ TEST_CASE("apply_engine_quota_gate: UP-1 FIX — an engine principal on a stream
 // own resource-releaser so the reservation survives the stream's actual
 // lifetime (server.cpp:6727, the `/events` SSE content provider).
 // ═══════════════════════════════════════════════════════════════════════════
+
+// The noexcept guarantees round 8 made STRUCTURAL rather than commentary. These are
+// compile-time, deliberately: the throw they contain (std::mutex::lock failing) cannot
+// be manufactured at runtime by any sanitizer or fault injector we have, so a
+// static_assert is the only instrument that can hold the line. If someone removes the
+// specifier, this fails to compile rather than failing in production as a terminate.
+//
+// Why it matters here specifically: this release path runs from ~QuotaSlot, which runs
+// from an httplib content-provider releaser, which httplib invokes from ~Response. A
+// destructor is implicitly noexcept, so a throw escaping it calls std::terminate BEFORE
+// unwinding can reach any caller's try/catch — containment at the call site is
+// impossible, and an earlier round shipped a guard that wrongly claimed otherwise.
+static_assert(std::is_nothrow_destructible_v<yuzu::server::QuotaSlot>,
+              "~QuotaSlot runs inside ~Response; a throwing destructor is std::terminate");
+static_assert(noexcept(std::declval<yuzu::server::QuotaSlot&>().reset()),
+              "QuotaSlot::reset must be noexcept — see the destructor chain above");
+
+TEST_CASE("Composed stream releaser: a real ~Response returns the engine QuotaSlot",
+          "[quota][gate][stream][teardown]") {
+    // The end-to-end shape the MCP GET channel actually installs, exercised through a
+    // genuine httplib::Response destructor rather than by calling the releaser by hand.
+    //
+    // The gap this closes: the adopter is well covered in isolation, and the saturation
+    // rig runs a live server but with NO engine principal — so tls_quota_slot() is empty
+    // there and the adopted branch never executed end-to-end in any test. That left the
+    // exact composition three governance rounds churned (inner noexcept lambda ->
+    // adopt_quota_slot_into_stream -> outer noexcept guard) unverified as a whole.
+    using yuzu::server::detail::adopt_quota_slot_into_stream;
+    using yuzu::server::detail::tls_quota_slot;
+
+    tls_quota_slot().reset(); // defensive: no carry-over from an earlier test
+
+    yuzu::server::PrincipalQuota q{yuzu::server::PrincipalQuotaConfig{.max_concurrency = 4}};
+    auto slot = q.try_acquire("engine:teardown", yuzu::server::QuotaSide::kEngine);
+    REQUIRE(slot.admitted());
+    REQUIRE(q.in_flight("engine:teardown") == 1);
+
+    // Hand it to the thread_local exactly as the pre-routing chokepoint does.
+    tls_quota_slot() = std::move(slot);
+    REQUIRE(tls_quota_slot().has_value());
+
+    bool inner_ran = false;
+    {
+        httplib::Response res;
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [](std::size_t, httplib::DataSink& sink) {
+                sink.done();
+                return true;
+            },
+            // Byte-for-byte the composition handle_get_tail installs.
+            [inner = adopt_quota_slot_into_stream(
+                 [&inner_ran](bool) noexcept { inner_ran = true; })](bool ok) noexcept {
+                try {
+                    inner(ok);
+                } catch (...) {
+                }
+            });
+        // Adoption happens during argument evaluation, so the slot has already left
+        // the thread_local — post-routing's unconditional reset is then a no-op and
+        // cannot double-release.
+        CHECK_FALSE(tls_quota_slot().has_value());
+        CHECK(q.in_flight("engine:teardown") == 1); // still held: the stream is "open"
+    } // ~Response fires the releaser
+
+    CHECK(inner_ran);
+    // THE assertion: the reservation came back. If the composition ever stops calling
+    // through — a wrapper that forgets `inner`, an adopter that drops the slot — this
+    // is the only thing in the suite that notices.
+    CHECK(q.in_flight("engine:teardown") == 0);
+    CHECK_FALSE(tls_quota_slot().has_value());
+}
 
 TEST_CASE("adopt_quota_slot_into_stream: moves the pending slot out of tls_quota_slot(), the "
           "returned releaser releases it exactly once and forwards `success` to the wrapped "

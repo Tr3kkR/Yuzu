@@ -1382,6 +1382,31 @@ TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[pg][token][
     CHECK(store.validate_token_checked("").status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
+TEST_CASE("ApiTokenStore: an EXHAUSTED connection pool is kUnavailable, not kInvalid",
+          "[pg][token][auth][stream]") {
+    // The third way the store can fail to answer, and the only one the two schema
+    // saboteurs below do NOT reach: `pool_.try_acquire_for(kReadTimeout)` returns no
+    // lease. Same safe verdict, different branch — and it is the branch a real
+    // Postgres brown-out takes, so leaving it untested left the most likely
+    // production path unguarded.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    // A pool of exactly one, whose sole connection we hold for the duration.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    auto raw = store.create_token("pool-starved", "alice");
+    REQUIRE(raw.has_value());
+
+    // Do NOT validate first — a cached token would answer from memory and never
+    // need a connection, testing nothing.
+    auto hog = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // we now hold the only connection
+
+    const auto checked = store.validate_token_checked(*raw);
+    CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
+    CHECK_FALSE(checked.token.has_value()); // indeterminate NEVER grants access
+}
+
 TEST_CASE("ApiTokenStore: an unreadable store is kUnavailable, NOT kInvalid",
           "[pg][token][auth][stream]") {
     // The whole reason validate_token_checked exists. validate_token collapses "the row
