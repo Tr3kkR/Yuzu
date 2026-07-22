@@ -701,6 +701,17 @@ all, so absence means "nothing to report", not "not collected".
 | `yuzu.guardian_sweep_exceptions` | Firewalled throws in the convergence SWEEP lanes. | Drift DETECTION is degraded (the endpoint may miss policy violations); the audit trail itself is unaffected. |
 | `yuzu.guardian_journal_bytes` / `yuzu.guardian_journal_batch_count` | Current on-disk size and batch count of the journal. Gauges, not counters. | Not independently actionable - use them to interpret the rows above (a climbing size alongside `prune_failures` means retention is not keeping up). |
 
+**Known gap: none of these counters distinguish a healthy idle worker from one that died.**
+The tags are emitted sparsely - a zero is omitted - so a Guardian drain worker that stops before
+doing any work reads on the heartbeat exactly like one with nothing to do. An exception that
+kills the worker's loop is counted (under `yuzu.guardian_journal_maint_exceptions`, with a
+`critical` log line naming it), but a worker that never starts, or that dies on its first cycle,
+is not. Until the "seconds since the last successful pass" gauge tracked for the `prefer_spark`
+cutover (#2298) ships, corroborate a suspected-dead worker with the agent's logs rather than
+with metrics alone. There is no restart primitive short of restarting the agent daemon; doing so
+is safe and loses nothing, because durable writes continue from the heartbeat path regardless of
+the worker's state.
+
 Note the tag KEY is not always the internal field name - the audit-gap row above is emitted
 as `..._evicted_no_send_evidence` though the field is `evicted_without_send_evidence`. Grep
 heartbeat payloads for the key in this table, not for the field name; the emitter in

@@ -455,7 +455,12 @@ Whichever PR flips `prefer_spark` MUST also:
    what actually changes for an operator: the heartbeat and reconnect paths no longer touch the
    KvStore for journal work, and retention/paging now run on the drain worker at their own
    cadences. Without this the behaviour changes with no release note of its own, because the
-   note was consumed by a release where nothing happened.
+   note was consumed by a release where nothing happened. Inline the concrete numbers - the
+   30 s paging and ~120 s retention cadences, the 512-entry / 2 s drain budget, the compliance
+   share - directly in that entry rather than cross-referencing this one: nobody re-reads a
+   changelog fragment from N releases ago (Gate 6 enterprise-readiness). The flip PR should
+   also add a short operator-facing paragraph to `docs/user-manual/guaranteed-state.md`, which
+   today says nothing about journal cadence or the drain worker at all.
 2. **Update the `yuzu.guardian_journal_maint_exceptions` row** in `docs/user-manual/metrics.md`
    to drop the dormancy framing. That counter's meaning has already shifted once during this
    branch (it aggregates the heartbeat's retry-persist and the drain worker's prune/page; convergence
