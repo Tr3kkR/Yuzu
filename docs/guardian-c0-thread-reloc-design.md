@@ -558,7 +558,26 @@ Whichever PR flips `prefer_spark` MUST also:
    telemetry first: the age of the oldest currently headroom-blocked batch, alongside item 4's
    fleet rollup. Four mechanisms for this were built and reverted in this PR; the lesson
    recorded there is that the channel needs measuring before it is engineered.
-10. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
+10. **Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
+    `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
+    ~668 ms per pass at the byte ceiling, 97% of it in `parse_journal_batch`, with `rows` (raw)
+    and `cands` (parsed) both live for a measured +162 MiB RSS on the endpoint every 30 s.
+    Building candidates as `(key, ts_ms)` and parsing only the ones actually considered takes
+    the pass to ~110 ms and +66 MiB. The 128 cap currently bounds 0.5% of the work.
+11. **Bound the heartbeat's retry-persist** (Gate 3 performance). It is circuit-broken on
+    FAILURE but unbounded on slow SUCCESS: 4096 staged records is 16 autocommit inserts under
+    `mtx_`, ~9.9 ms healthy but able to approach the 5 s busy timeout each under KvStore
+    contention. A per-tick batch cap or wall deadline is what makes "cheap retry-persist on the
+    heartbeat" structurally true rather than true-in-practice.
+12. **Jitter the maintenance phase per agent** (Gate 3 performance). Steady-state redelivery is
+    0.1 batch/s/agent by design; at 10k agents that is ~256k events/s (~615 Mbit/s), and a
+    fleet-wide snapshot restore means ~161 GB over ~35 minutes with every agent's boot burst
+    landing in the same cycle. Phase-jitter `last_page`/`last_prune` by U[0,interval), and treat
+    the sustained figure as a hard gate pending the deferred server ack.
+13. **Test the loop-death firewall and the pre-join persist** (Gate 3 QE). Both are untested
+    today: deleting the pre-join `persist_lifecycle_journal_locked()` call leaves the suite
+    green, and nothing can make `loop()`'s own tail throw. Both need a seam.
+14. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
    Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
    is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
    before doing any work still reads identically to a healthy idle one. Item 6's staleness gauge
