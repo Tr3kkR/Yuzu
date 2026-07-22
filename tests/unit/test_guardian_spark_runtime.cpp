@@ -1622,8 +1622,8 @@ TEST_CASE("erase_persisted_prefix identifies the prefix it wrote, not an index",
                                 file_exists_rule("r" + std::to_string(i)), true));
     REQUIRE(rt->pending_journal_depth() == 6);
 
-    const auto drops = rt->journal_stage_dropped();
-    REQUIRE(rt->snapshot_pending().size() == 6);
+    std::uint64_t drops = 0;
+    REQUIRE(rt->snapshot_pending(&drops).size() == 6);
 
     // ...persist commits the first 4. Meanwhile two overflow drops take r0 and r1 off the front.
     rt->drop_oldest_pending_for_test(2);

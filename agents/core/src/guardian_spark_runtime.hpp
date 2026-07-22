@@ -290,7 +290,11 @@ public:
     /// A FIFO copy of the currently-staged (built + validated, not-yet-persisted)
     /// records. Immutable view; the caller serialises + writes them, then calls
     /// erase_persisted_prefix() for the count it durably wrote.
-    [[nodiscard]] std::vector<std::shared_ptr<const JournalRecord>> snapshot_pending() const;
+    /// `drops_at_snapshot`, when non-null, receives journal_stage_dropped() read UNDER the same
+    /// lock as the snapshot - which is what makes erase_persisted_prefix able to identify the
+    /// prefix it wrote rather than trust an index a concurrent overflow drop can shift.
+    [[nodiscard]] std::vector<std::shared_ptr<const JournalRecord>>
+    snapshot_pending(std::uint64_t* drops_at_snapshot = nullptr) const;
 
     /// Drop the oldest `n` staged records (those a persist just durably wrote).
     /// Clamped to the current size.

@@ -385,10 +385,11 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
     // two boot-time reads are the only thing that touches the store while inert.
     if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
         return;
-    // Read the overflow-drop counter WITH the snapshot: the erase below has to identify the
-    // prefix it wrote, and a concurrent drop-oldest shifts positions (#2345 Gate 8b).
-    const auto drops_at_snapshot = spark_runtime_->journal_stage_dropped();
-    const auto pending = spark_runtime_->snapshot_pending();
+    // The overflow-drop counter comes back FROM the snapshot, read under its lock: the erase
+    // below has to identify the prefix it wrote, and a concurrent drop-oldest shifts positions
+    // (#2345 Gate 8b).
+    std::uint64_t drops_at_snapshot = 0;
+    const auto pending = spark_runtime_->snapshot_pending(&drops_at_snapshot);
     if (pending.empty())
         return;
     // snapshot released outbox_mu_; persist() does KV I/O holding NO runtime lock (so the
