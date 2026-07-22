@@ -565,15 +565,24 @@ std::size_t GuardianSparkRuntime::pending_journal_depth() const {
     return pending_journal_.size();
 }
 
-std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+GuardianSparkRuntime::PageOutcome
+GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+    PageOutcome out;
     if (entries.empty())
-        return 0;
+        return out;
     std::lock_guard<std::mutex> ob{outbox_mu_};
     // Headroom gate (design §5): page the batch only if it fits whole; else leave it for a
     // later pass once the window drains (never a partial page that splits a batch).
-    if (lifecycle_log_.headroom() < entries.size())
-        return 0;
-    std::size_t added = 0;
+    //
+    // Reporting WHY nothing was added has to happen here, under the lock. A caller's own
+    // pre-check can be stale by the time it gets here - a concurrent arm can consume the room
+    // in between - and if that case is misread as "already a member" the caller never learns a
+    // backlog is waiting and replay stalls for a whole cadence interval (#2345 Gate 3).
+    if (lifecycle_log_.headroom() < entries.size()) {
+        out.blocked_for_headroom = true;
+        out.required = entries.size();
+        return out;
+    }
     // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
     // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
     // starve heartbeats under a large backlog (review UP-12 / perf P-2). The batch's records
@@ -582,9 +591,9 @@ std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entrie
     for (auto& e : entries) {
         if (!present.count(e.event_id)) // O(1) membership: skip a re-page of an entry in the window
             if (lifecycle_log_.enqueue(std::move(e)))
-                ++added;
+                ++out.added;
     }
-    return added;
+    return out;
 }
 
 void GuardianSparkRuntime::backfill_batch_provenance(const std::string& batch_key,
@@ -705,7 +714,11 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     // Normalise the reserve ratio ONCE, defensively: den == 0 (disabled), num > den
     // (nonsensical), and the wall-only case where max_entries == 0 all have to land somewhere
     // explicit rather than dividing by zero or over-reserving (Sol review).
-    const std::size_t reserve_den = limits.compliance_reserve_den;
+    // A ratio denominator beyond this is nonsense and only invites overflow in the wall
+    // arithmetic below; treat it as "no reserve" rather than trusting the cast.
+    constexpr std::size_t kMaxReserveRatio = 1'000'000;
+    const std::size_t reserve_den =
+        (limits.compliance_reserve_den > kMaxReserveRatio) ? 0 : limits.compliance_reserve_den;
     const std::size_t reserve_num =
         (reserve_den == 0) ? 0 : std::min(limits.compliance_reserve_num, reserve_den);
 
@@ -740,14 +753,26 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     const auto pass_start = std::chrono::steady_clock::now();
     if (limits.max_wall.count() > 0) {
         lim.has_deadline = true;
-        // Same clamped ratio as the count reserve, so the two cannot disagree.
-        const std::chrono::milliseconds lifecycle_wall =
-            (reserve_den == 0)
-                ? limits.max_wall
-                : std::chrono::milliseconds{limits.max_wall.count() *
-                                            static_cast<std::int64_t>(reserve_den - reserve_num) /
-                                            static_cast<std::int64_t>(reserve_den)};
-        lim.deadline = pass_start + lifecycle_wall;
+        // CLAMP BEFORE THE CAST. The count path clamps (min(num,den), reserve <= total) and an
+        // unclamped wall path recreated the very asymmetry this round exists to remove: with a
+        // pathological denominator the size_t->int64_t cast could yield a lifecycle slice
+        // LONGER than the whole pass, leaving compliance's restored deadline already in the
+        // past - zero compliance sends, i.e. the UP-3 detection blackout reached through a
+        // sign flip. Unreachable from the sole production caller (1/2), which is exactly why
+        // it needed a bound rather than an argument (#2345 Gate 2 sec-MEDIUM-1).
+        std::chrono::milliseconds lifecycle_wall = limits.max_wall;
+        // Gated on the WALL, not on max_entries: a {max_entries = 0, max_wall = X} config looks
+        // bounded but previously received neither the count reserve (skipped by !unbounded) nor
+        // a wall slice, i.e. the UP-3 blackout reachable purely by configuration
+        // (#2345 Gate 3 cpp-safety).
+        if (reserve_den > 0 && reserve_den <= kMaxReserveRatio) {
+            lifecycle_wall =
+                std::chrono::milliseconds{limits.max_wall.count() *
+                                          static_cast<std::int64_t>(reserve_den - reserve_num) /
+                                          static_cast<std::int64_t>(reserve_den)};
+        }
+        // Never longer than the pass itself, whatever the ratio said.
+        lim.deadline = pass_start + std::min(lifecycle_wall, limits.max_wall);
     }
 
     bool lifecycle_truncated = false;

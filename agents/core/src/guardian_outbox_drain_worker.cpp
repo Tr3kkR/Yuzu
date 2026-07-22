@@ -54,7 +54,22 @@ void GuardianOutboxDrainWorker::start() {
         }
         sig->cv.notify_all();
     });
-    thread_ = std::thread([this] { loop(); });
+    thread_ = std::thread([this] {
+        // TOP-LEVEL firewall. The inner passes are each firewalled, but the loop's own tail -
+        // the lifecycle_headroom() call (std::mutex::lock can throw system_error) and the
+        // cadence arithmetic - sits outside them, and this is a bare thread: an escape
+        // terminates the whole agent daemon (the #2037 class, #2345 Gate 3 cpp-safety).
+        try {
+            loop();
+        } catch (...) {
+            try {
+                spdlog::critical("Guardian drain worker: loop terminated by an exception; the "
+                                 "worker has stopped, journal maintenance and outbox delivery "
+                                 "are no longer running on this agent.");
+            } catch (...) {
+            }
+        }
+    });
 }
 
 void GuardianOutboxDrainWorker::stop() {
@@ -145,6 +160,19 @@ void GuardianOutboxDrainWorker::loop() {
     // it. Nothing here takes the engine mtx_, so running concurrently with the remainder of
     // wire_spark_engine is safe.
     bool skip_wait = true;
+    // Concurrent arm/disarm traffic can refill the window between the end-of-cycle headroom
+    // check and the next page pass, so the immediate re-arm could chain indefinitely - each
+    // link a full journal scan. The token bucket does NOT bound that: take() is charged only
+    // when a batch pages net-new work, so a chain that pages NOTHING consumes no token and the
+    // bucket's short-circuit never engages. The cap below is therefore the only bound on a
+    // zero-page chain, and is load-bearing (#2345 Gate 3 cpp-safety + perf).
+    // Counts cycles entered WITHOUT a condition-variable wait, from any cause, and is reset
+    // only after a real wait. Counting just the refill re-arms let an alternating
+    // truncated-drain / re-arm pattern run unbounded no-wait cycles with the counter never
+    // exceeding 1 (#2345 Gate 3 perf). The cap is the paging burst, so the token bucket is the
+    // binding limit rather than an unrelated constant.
+    unsigned no_wait_cycles = 0;
+    constexpr unsigned kMaxNoWaitCycles = 5;
 
     const auto firewalled_drain = [this, &skip_wait]() -> std::size_t {
         try {
@@ -176,10 +204,13 @@ void GuardianOutboxDrainWorker::loop() {
             if (sig_->stopping.load(std::memory_order_acquire))
                 break;
             seen = sig_->gen;
+            no_wait_cycles = 0; // a real wait happened: the chain is broken
         } else if (stop_requested()) {
             break; // neither the boot cycle nor a truncated drain may outlive a stop request
         }
-        // Re-armed below ONLY by a truncated drain; every other cycle waits.
+        // Re-armed below by a truncated drain or a refill; every other cycle waits.
+        if (skip_wait)
+            ++no_wait_cycles;
         skip_wait = false;
 
         // MAINTENANCE FIRST, then ONE drain (C0 #2298 + governance f-1/f-3).
@@ -268,9 +299,11 @@ void GuardianOutboxDrainWorker::loop() {
         // skip_wait is set TOO. force_page_ alone only takes effect on the next wake, and an
         // untruncated drain sleeps the whole periodic bound (5 s in production) before that
         // happens - a latency the existing 20 ms-bound reconnect tests masked entirely.
-        if (page_result.headroom_blocked && drained > 0 &&
-            rt_.lifecycle_headroom() >= page_result.min_blocked_headroom &&
-            page_result.min_blocked_headroom > 0) {
+        // Order matters: the cheap local checks first, so a pass with nothing blocked does not
+        // take outbox_mu_ at all (#2345 Gate 2 sec-LOW).
+        if (page_result.headroom_blocked && page_result.min_blocked_headroom > 0 && drained > 0 &&
+            no_wait_cycles < kMaxNoWaitCycles &&
+            rt_.lifecycle_headroom() >= page_result.min_blocked_headroom) {
             force_page_.store(true, std::memory_order_release);
             skip_wait = true; // act on it NOW, not after the backstop
         }

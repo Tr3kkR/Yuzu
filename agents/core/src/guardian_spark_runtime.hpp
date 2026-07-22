@@ -291,7 +291,16 @@ public:
     /// every entry was already present. Paged entries enter lifecycle_log_ ONLY (they are
     /// already durable - never pending_journal_). Does NOT wake the drain; the caller (the
     /// reconnect / low-water / tick hook, C6) drives sending.
-    [[nodiscard]] std::size_t try_page_batch(std::vector<OutboxEntry> entries);
+    /// Outcome of a page attempt, decided UNDER outbox_mu_ so it reflects the window as it
+    /// actually was. A bare count could not distinguish "the window had no room for this
+    /// batch" from "every entry was already a member" - opposite situations, and the caller
+    /// needs the first to know a backlog is waiting (#2345 Gate 3).
+    struct PageOutcome {
+        std::size_t added{0};          ///< entries newly enqueued
+        bool blocked_for_headroom{false}; ///< the batch did not fit, atomically observed
+        std::size_t required{0};       ///< entries the batch needed when blocked
+    };
+    [[nodiscard]] PageOutcome try_page_batch(std::vector<OutboxEntry> entries);
 
     /// Back-fill provenance onto the LIVE window entries of a just-persisted batch (review M3),
     /// so a live send writes its sent-label rather than the batch later ageing out counted

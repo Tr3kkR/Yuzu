@@ -655,7 +655,21 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // several strings - is built and immediately discarded; and the caller cannot
         // otherwise distinguish "window full" from "already a member", which are opposite
         // situations. Recording it here makes the distinction explicit and skips the waste.
-        if (rt.lifecycle_headroom() < c.batch.entries.size()) {
+        // This pre-check is a pure OPTIMISATION - it avoids building up to 256 OutboxEntry
+        // objects for a batch that cannot fit. It is deliberately NOT the source of truth: a
+        // concurrent arm can consume the room between here and try_page_batch, so the
+        // authoritative blocked/member distinction comes back from under outbox_mu_ below
+        // (#2345 Gate 3). It is read per candidate rather than hoisted because a single stale
+        // read would misclassify every later candidate in the pass.
+        const std::size_t headroom = rt.lifecycle_headroom();
+        if (headroom == 0) {
+            stats.headroom_blocked = true;
+            if (stats.min_blocked_headroom == 0 ||
+                c.batch.entries.size() < stats.min_blocked_headroom)
+                stats.min_blocked_headroom = c.batch.entries.size();
+            break; // nothing fits; wait for the drain to free room
+        }
+        if (headroom < c.batch.entries.size()) {
             // CONTINUE, not break. Breaking here left page_cursor_ un-advanced, so an
             // oversized head batch pinned the rotation and smaller NEWER batches never paged -
             // the B2 starvation class the cursor exists to prevent, reintroduced by this very
@@ -690,18 +704,26 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             e.journal_last_in_batch = (i + 1 == c.batch.entries.size());
             entries.push_back(std::move(e));
         }
-        const std::size_t added = rt.try_page_batch(std::move(entries));
+        const auto outcome = rt.try_page_batch(std::move(entries));
         // Advance the cursor for EVERY considered batch (paged or a free member / headroom-defer
         // skip), so an already-windowed head cannot pin the rotation.
         page_cursor_ = std::pair{c.ts_ms, c.key};
-        if (added > 0) {
+        if (outcome.blocked_for_headroom) {
+            // The window shrank between the pre-check and the locked attempt. Without this the
+            // pass would report "nothing to do" and the caller's refill re-arm would never
+            // fire, stalling replay for a full cadence interval (#2345 Gate 3).
+            stats.headroom_blocked = true;
+            if (stats.min_blocked_headroom == 0 || outcome.required < stats.min_blocked_headroom)
+                stats.min_blocked_headroom = outcome.required;
+        }
+        if (outcome.added > 0) {
             page_bucket_.take(); // charge a token ONLY for net-new work
             ++stats.batches_paged;
-            stats.records_paged += added;
+            stats.records_paged += outcome.added;
             if (!have_token)
                 break; // paged one net-new over an empty bucket; the rest wait for a refill
         }
-        // added == 0: member or headroom-deferred, no token, keep rotating.
+        // added == 0 and not blocked: every entry was already a member; keep rotating.
     }
 
     pages_.fetch_add(1, std::memory_order_relaxed);
