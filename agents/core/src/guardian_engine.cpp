@@ -385,6 +385,9 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
     // two boot-time reads are the only thing that touches the store while inert.
     if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
         return;
+    // Read the overflow-drop counter WITH the snapshot: the erase below has to identify the
+    // prefix it wrote, and a concurrent drop-oldest shifts positions (#2345 Gate 8b).
+    const auto drops_at_snapshot = spark_runtime_->journal_stage_dropped();
     const auto pending = spark_runtime_->snapshot_pending();
     if (pending.empty())
         return;
@@ -400,7 +403,7 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
         // back-fill (best-effort, allocates a set) runs AFTER, so a throw there loses only a
         // sent-label back-fill (a later false evicted_without_send_evidence, monitoring noise),
         // never leaves the records staged to re-persist as a DUPLICATE durable batch (review UP-6).
-        spark_runtime_->erase_persisted_prefix(written);
+        spark_runtime_->erase_persisted_prefix(written, drops_at_snapshot);
         for (const auto& b : batches)
             if (!b.event_ids.empty())
                 spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());

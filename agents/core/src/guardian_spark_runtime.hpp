@@ -294,7 +294,23 @@ public:
 
     /// Drop the oldest `n` staged records (those a persist just durably wrote).
     /// Clamped to the current size.
-    void erase_persisted_prefix(std::size_t n);
+    /// TEST-ONLY: perform `n` overflow drop-oldest steps exactly as stage_pending_locked does
+    /// at kMaxPendingJournalRecords (erase the front, count it). Reaching the real 4096-record
+    /// ceiling from a test would need 4096 arms, which is why the interleaving that this
+    /// models - a front-drop landing between snapshot_pending() and erase_persisted_prefix() -
+    /// had no coverage. No production caller.
+    void drop_oldest_pending_for_test(std::size_t n) {
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        n = std::min(n, pending_journal_.size());
+        pending_journal_.erase(pending_journal_.begin(),
+                               pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
+        journal_stage_dropped_.fetch_add(n, std::memory_order_relaxed);
+    }
+
+    /// `drops_at_snapshot` is journal_stage_dropped() as read WITH the snapshot. It is what
+    /// makes the erase identify the prefix rather than trust an index that a concurrent
+    /// overflow drop can shift underneath it.
+    void erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot);
 
     /// Outcome of a page attempt, decided UNDER outbox_mu_ so it reflects the window as it
     /// actually was. A bare count could not distinguish "the window had no room for this

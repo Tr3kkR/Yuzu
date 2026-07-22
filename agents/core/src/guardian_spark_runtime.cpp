@@ -565,8 +565,24 @@ std::vector<std::shared_ptr<const JournalRecord>> GuardianSparkRuntime::snapshot
     return {pending_journal_.begin(), pending_journal_.end()};
 }
 
-void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n) {
+void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot) {
     std::lock_guard<std::mutex> ob{outbox_mu_};
+    // The prefix must be identified by IDENTITY, not by position (#2345 Gate 8b). The caller
+    // snapshots under this lock, RELEASES it to do KvStore I/O, then comes back to erase what
+    // it wrote. In that window stage_pending_locked can hit kMaxPendingJournalRecords and
+    // drop from the FRONT - so slot 0 is no longer the record slot 0 was when the snapshot was
+    // taken, and erasing n positions deletes n records of which the last few were never
+    // written. That is silent, uncounted destruction of audit records, and it is worst exactly
+    // when it matters most: staging only fills when persist is failing or the link is dead.
+    //
+    // Front-drops remove a PREFIX of the same ordered sequence, so the count of drops since the
+    // snapshot is all that is needed to realign: those records are already gone, and they were
+    // the oldest - i.e. the front of what was just persisted.
+    const std::uint64_t dropped_since =
+        journal_stage_dropped_.load(std::memory_order_relaxed) - drops_at_snapshot;
+    if (dropped_since >= n)
+        return; // every record we persisted has already been dropped from staging
+    n -= static_cast<std::size_t>(dropped_since);
     n = std::min(n, pending_journal_.size());
     pending_journal_.erase(pending_journal_.begin(),
                            pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
