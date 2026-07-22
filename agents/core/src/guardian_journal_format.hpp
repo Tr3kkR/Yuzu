@@ -69,9 +69,14 @@ inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
 
 /// How far in the future a batch's ts_ms may plausibly sit before retention stops trusting it.
 ///
-/// A batch stamped beyond this is treated as immediately expired. Without that, such a row is
-/// IMMORTAL - it can never be too old, and count eviction is oldest-first so it is never
-/// count-evicted either - and worse, it DISPLACES real evidence: once enough of them exist
+/// A batch stamped beyond this sorts FIRST for the count and byte ceilings - an ORDERING rule,
+/// NOT an expiry rule. The distinction is load-bearing and was arrived at the hard way: making
+/// such a batch "immediately expired" hands the whole journal to any clock reading in the past
+/// (an RTC that comes up at 1970 makes every real row look future-dated), which is the
+/// wholesale wipe the age guard exists to prevent - it failed 21 tests. Do not "simplify" this
+/// back to an expiry test. Without the ordering rule such a row is IMMORTAL - it can never be
+/// too old, and count eviction is oldest-first so it is never count-evicted either - and worse,
+/// it DISPLACES real evidence: once enough of them exist
 /// (a bad RTC for a week, a VM clone, a hand-edited kv_store.db), every genuine record written
 /// afterwards is the one evicted at the next prune, permanently. Precedent for the shape is
 /// server-side in app_perf_daily_store.cpp's kFutureSlackDays (#2345 Gate 2 security).

@@ -1590,17 +1590,24 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     for (int i = 0; i < 60; ++i)
         rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
 
-    rig.journal->request_stop();
     stop.store(true, std::memory_order_relaxed);
     for (auto& w : workers)
         w.join();
 
+    // request_stop() comes AFTER the settle prune below, not before it. Calling it first made
+    // that prune return at its shutdown gate without doing anything, so the rebase the
+    // assertions depend on never happened and they were checking gauges that had merely
+    // survived the concurrent run - passing or flaking on the documented transient
+    // double-count interleaving rather than on the property this test is named for
+    // (#2345 round 7, Sol). The workers are already joined, so nothing races this.
+    //
     // Beyond race-freedom (TSan): the running-counter gauges (#2303) must stay ACCOUNTING-correct
     // under the real concurrent persist/prune interleaving, not just data-race-free. A final
-    // settle prune (prune ignores stopping_, so it still runs) rebases to on-disk truth; the
+    // settle prune rebases to on-disk truth; the
     // gauges must then exactly equal what namespace_size sees on disk - proving no lost update
     // and no drift accumulated across the concurrent run.
     rig.journal->prune(1'700'000'900'000);
+    rig.journal->request_stop();
     auto sz = rig.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(sz.has_value());
     CHECK(rig.journal->journal_batch_count() == sz->count);

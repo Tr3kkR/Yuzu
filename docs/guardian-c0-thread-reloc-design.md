@@ -471,6 +471,28 @@ headroom-blocked batch, plus the fleet rollup this checklist already requires) r
 fifth mechanism, because today nobody can tell which regime an endpoint is in. It must be
 resolved or explicitly risk-accepted before the `prefer_spark` flip.
 
+**"Structural" is overstated, and two external reviewers said so independently (round 7).** The
+fork above is real for the design as written, but all four reverted mechanisms only ever
+SCHEDULED the window; none questioned its two fixed premises, and relaxing either escapes the
+fork without pausing anything:
+
+- **Admit an overshoot.** The 4096-entry window is a soft RAM bound, and a replayed batch is
+  already durable on disk. Admitting when `size + need <= cap + kMaxJournalEntriesPerBatch`
+  rather than requiring `headroom >= need` (`guardian_spark_runtime.cpp` `try_page_batch`)
+  bounds the overshoot at one batch (~256 entries) and lets a large batch in after a single
+  pop instead of 256. No pause, no hold, no release. (K3)
+- **Stop placing batches whole.** All-or-nothing placement is an implementation choice, not a
+  delivery requirement: the drain already sends one event at a time and each carries its own
+  idempotency key, so replay could page a PREFIX of a durable batch under a fair per-record
+  quota. A dedicated replay lane, protected from live refill, is a variant of the same idea.
+  (Sol)
+
+Neither has been prototyped or measured, and neither is being adopted here. They are recorded
+because "no design escapes the fork" is not proven, and #2364 must be a real decision at the
+flip rather than a default ratification of the revert. The narrowness argument is also
+self-weakening, as K3 noted: a slow-but-flowing link pinning the window near full is precisely
+the regime where replay matters most.
+
 ## Retention differs deliberately from every other store (Gate 8 security/consistency)
 
 The Guardian lifecycle journal is not the only wall-clock expiry site in the codebase, and it is
