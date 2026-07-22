@@ -70,6 +70,21 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
   wrapper change is involved — re-running the provisioning script is the whole
   cutover.
+- **Per-agent PostgreSQL binaries (#2354).** Each cluster also gets a **private
+  copy of the whole PostgreSQL install tree** under `D:\ci\pgbin\agent-<n>`, and
+  its Windows-service `ImagePath` is repointed at that copy's `pg_ctl.exe` (the
+  `-D` datadir and every other argument left intact). Rationale: Postgres on
+  Windows is `EXEC_BACKEND` — every connection `CreateProcess()`es a fresh
+  `postgres.exe` — and when all four CCD-pinned agents shared one
+  `C:\pgsql\bin\postgres.exe`, every backend spawn box-wide contended that single
+  image file's FCB / image-section lock (~1000–1466 ms/spawn under concurrency;
+  root-caused 2026-07-22, **not** Defender and **not** disk). A byte-identical
+  copy at its own path has its own FCB and spawns in ~10–20 ms — validated ~50–70×
+  under all-four-agent churn. The step is idempotent (an already-repointed
+  `ImagePath` is a no-op; `robocopy` refreshes the tree in place) and per-agent
+  catch-and-continue, and it rolls the `ImagePath` back and restarts if a fresh
+  copy fails to serve. `D:\ci\pgbin` and each copy's `postgres.exe` join the
+  Defender exclusions below.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg

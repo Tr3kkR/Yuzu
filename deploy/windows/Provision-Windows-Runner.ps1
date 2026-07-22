@@ -371,6 +371,101 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   }
 }
 
+Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster (#2354)" {
+  # THE residual [pg]-shard cost on Windows, root-caused 2026-07-22 (#2354).
+  # Postgres-on-Windows is EXEC_BACKEND (fork-less): every connection
+  # CreateProcess()es a fresh postgres.exe. All clusters shared ONE binary
+  # (C:\pgsql\bin\postgres.exe), so every backend spawn across all 4 CCD-pinned
+  # runner agents contended that single image file's FCB / image-section lock —
+  # ~1000-1466 ms/spawn under box-wide concurrency. It is NOT Defender (proven
+  # with real-time protection fully off) and NOT disk (zero disk reads measured):
+  # a byte-identical COPY at a different path has its own FCB and spawns in
+  # ~10-20 ms. Give each cluster a private copy of the whole install tree and
+  # repoint its service at that copy; validated live ~50-70x under all-4-agent
+  # churn. Complements the shared-DB+TRUNCATE test fixtures (which cut the spawn
+  # COUNT); this removes the per-spawn cross-cluster contention.
+  #
+  # Idempotent: on re-run the ImagePath already points at the copy (no-op) and
+  # robocopy refreshes the tree in place. Per-agent, catch-and-continue like the
+  # per-agent-clusters step: one agent's failure records + continues, and the
+  # accumulated list still throws once after the loop naming every failure.
+  $major = $PostgresVersion.Split('.')[0]
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ throw "psql not found — the main PostgreSQL step must succeed before per-agent binary copies" }
+  $pgroot  = Split-Path $pgbin -Parent            # install ROOT (parent of bin): C:\pgsql or C:\Program Files\PostgreSQL\$major
+  $srcData = Join-Path $pgroot 'data'             # agent-0's live cluster data — NEVER copy it
+  $failedAgents = @()
+  for($n=0; $n -lt $RunnerCount; $n++){
+    $svc    = if($n -eq 0){ "postgresql-x64-$major-yuzu-ci" } else { "postgresql-x64-$major-yuzu-ci-$n" }
+    $port   = $PostgresPort + $n
+    $dst    = Join-Path $CacheRoot "pgbin\agent-$n"
+    $dstbin = Join-Path $dst 'bin'
+    $newExe = Join-Path $dstbin 'pg_ctl.exe'
+    try {
+      if(-not (Get-Service $svc -EA SilentlyContinue)){
+        throw "service $svc not found — provision its cluster first (agent 0: the main PostgreSQL step; agents 1..N-1: the per-agent-clusters step)"
+      }
+      # 1) Private binary tree: the whole install root EXCEPT the live data dir.
+      #    Agent-0's data is $pgroot\data (excluded); agents 1..N-1 keep their
+      #    data at $CacheRoot\pg\agent-$n, already outside $pgroot. robocopy
+      #    exit 0-7 == success, 8+ == failure (capture before the next native
+      #    call clobbers $LASTEXITCODE).
+      New-Item -ItemType Directory -Force $dst | Out-Null
+      robocopy $pgroot $dst /E /XD $srcData /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+      $rc = $LASTEXITCODE
+      if($rc -ge 8){ throw "robocopy $pgroot -> $dst failed (exit $rc)" }
+      if(-not (Test-Path $newExe)){ throw "copy incomplete: $newExe missing after robocopy" }
+      # NETWORK SERVICE (the account every cluster's service runs as — see the
+      # per-agent-clusters step) must be able to read+execute the copied tree;
+      # robocopy /COPY:DAT does not carry source ACLs, so grant it explicitly.
+      icacls $dst /grant '*S-1-5-20:(OI)(CI)RX' /T /C /Q | Out-Null
+      # 2) Repoint ONLY the service ImagePath's pg_ctl.exe path at the private
+      #    copy; the -D datadir and every other arg are left byte-for-byte
+      #    intact. pg_ctl launches postgres.exe from its own directory, so the
+      #    copy's postgres.exe (its own FCB) is what serves.
+      $regPath  = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
+      $curImage = (Get-ItemProperty $regPath -Name ImagePath -EA Stop).ImagePath
+      $curExe   = if($curImage -match '^\s*"([^"]+)"'){ $Matches[1] } else { ($curImage -split '\s+',2)[0] }
+      if([string]::Equals($curExe, $newExe, 'OrdinalIgnoreCase')){
+        Write-Host "agent ${n}: ImagePath already points at the private copy ($dstbin) — no-op"
+      } else {
+        $newImage = $curImage.Replace($curExe, $newExe)   # $curExe came from $curImage → guaranteed present
+        Set-ItemProperty $regPath -Name ImagePath -Value $newImage -Type ExpandString
+        try {
+          Restart-Service $svc -Force
+          $deadline=(Get-Date).AddSeconds(90)
+          do {
+            & "$dstbin\pg_isready.exe" -q -h 127.0.0.1 -p $port 2>$null
+            if($LASTEXITCODE -eq 0){ break }
+            Start-Sleep 2
+          } while((Get-Date) -lt $deadline)
+          if($LASTEXITCODE -ne 0){ throw "cluster on :$port not ready in 90s after repoint" }
+          $env:PGPASSWORD='postgres'   # superuser pw for agent-0 (EDB --superpassword) and agents 1..N-1 (initdb --pwfile)
+          try {
+            if((& "$dstbin\psql.exe" -U postgres -h 127.0.0.1 -p $port -tAc 'SELECT 1') -ne '1'){
+              throw "SELECT 1 failed on :$port after repoint"
+            }
+          } finally { Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
+          Write-Host "agent ${n}: postgres.exe now private ($dstbin), svc $svc on :$port verified"
+        } catch {
+          # A bad copy must never leave the cluster wedged: restore the original
+          # ImagePath and restart before surfacing the failure.
+          Set-ItemProperty $regPath -Name ImagePath -Value $curImage -Type ExpandString
+          Restart-Service $svc -Force -EA SilentlyContinue
+          throw "repoint of $svc failed, rolled ImagePath back to '$curExe': $($_.Exception.Message)"
+        }
+      }
+    } catch {
+      Write-Warning "agent ${n} binary-copy FAILED: $($_.Exception.Message) — continuing to the next agent; re-run this script to retry (idempotent)"
+      $failedAgents += $n
+    }
+  }
+  if($failedAgents.Count -gt 0){
+    throw "per-agent binary copy failed for agent(s) $($failedAgents -join ', ') — see the WARNING lines above"
+  }
+  "per-agent private postgres.exe copies ready under $CacheRoot\pgbin\agent-0..$($RunnerCount-1)"
+}
+
 Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   # THE dominant [pg]-shard cost on Windows: Postgres has no fork(), so it
   # CreateProcess()es a fresh postgres.exe backend PER CONNECTION, and Defender
@@ -389,6 +484,13 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue   # per-connection backend spawn (the big one)
   } else {
     Write-Warning "pgbin not found - skipping the postgres.exe Defender exclusion; the [pg]-shard perf fix this step exists for is NOT applied on this runner"
+  }
+  # Each cluster now launches its OWN private copy (the per-agent binary-copy
+  # step, #2354), so the single exclusion above — which only covers the original
+  # C:\pgsql\bin path — misses the binary actually running. Exclude every copy's
+  # postgres.exe too.
+  for($n=0; $n -lt $RunnerCount; $n++){
+    Add-MpPreference -ExclusionProcess (Join-Path $CacheRoot "pgbin\agent-$n\bin\postgres.exe") -EA SilentlyContinue
   }
   $paths = @()
   # Each registered runner's work root contains both its GitHub RUNNER_TEMP
@@ -412,6 +514,7 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     $paths += (Join-Path (Split-Path $pgbin -Parent) 'data')  # agent-0 cluster data dir
   }
   $paths += (Join-Path $CacheRoot 'pg')                       # per-agent cluster data dirs (D:\ci\pg\agent-*)
+  $paths += (Join-Path $CacheRoot 'pgbin')                    # per-agent private postgres.exe copies (#2354)
   foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
   $activeExclusions = @((Get-MpPreference).ExclusionPath)
   $missingWorkPaths = @($runnerWorkPaths | Where-Object { $activeExclusions -notcontains $_ })
