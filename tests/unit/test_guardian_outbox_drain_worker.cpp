@@ -599,8 +599,8 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
         for (int i = 0; !stop.load(std::memory_order_relaxed) && i < 200; ++i) {
             const auto rid = "live" + std::to_string(i);
             rig.rt->attach_rule(rid, file_spec("/" + rid), file_exists_rule(rid), true);
-                        const auto drops = rig.rt->journal_stage_dropped();
-                auto pending = rig.rt->snapshot_pending();
+                        std::uint64_t drops = 0;
+                auto pending = rig.rt->snapshot_pending(&drops);
             if (pending.empty())
                 continue;
             std::vector<PersistedBatch> batches;
@@ -806,8 +806,8 @@ TEST_CASE("a link-down/reconnect cycle with REAL Retain semantics loses nothing"
         rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
     }
     {
-                const auto drops = rig.rt->journal_stage_dropped();
-                auto pending = rig.rt->snapshot_pending();
+                std::uint64_t drops = 0;
+                auto pending = rig.rt->snapshot_pending(&drops);
         if (!pending.empty()) {
             std::vector<PersistedBatch> batches;
             const std::size_t written = rig.journal->persist(pending, &batches);
@@ -1425,138 +1425,7 @@ TEST_CASE("CH-5b: one retention pass cannot age out the whole journal",
     CHECK(rest.evicted == 10); // and the remainder follows on the next pass
 }
 
-TEST_CASE("CH-4: a large batch is not starved out by a drip of small ones",
-          "[spark][guardian][journal][chaos]") {
-    // The loss channel is SIZE-BIASED. Per-pass fairness alone lets a steady trickle of small
-    // batches hold the send window's headroom just below the largest batch's size forever, so
-    // the biggest batches - mass arm/disarm bursts, a Baseline deploy, a fleet-wide disable:
-    // exactly the records an auditor asks for - are the ones retention drops unsent.
-    // RED before the aging boost: the big batch pages 0 records in 400 cycles.
-    constexpr std::size_t kBig = kMaxJournalEntriesPerBatch; // 256, the largest a batch can be
-    JournalRig rig{kBig + 8};                                // room for the batch, plus a little
-
-    // Occupy the window so headroom starts well under kBig, and keep it that way below.
-    for (std::size_t i = 0; i < kBig + 3; ++i)
-        REQUIRE(rig.rt->try_page_batch({OutboxEntry::lifecycle(
-                    "live", 1, "live-" + std::to_string(i), 1'700'000'000'000'000'000, "armed",
-                    "file", "n")}).added == 1);
-    REQUIRE(rig.rt->lifecycle_headroom() == 5);
-
-    rig.persist_batch("big", kBig); // persisted FIRST, so it is the oldest candidate
-
-    std::size_t drained_total = 0;
-    auto drain_one = [&] {
-        GuardianSparkRuntime::DrainLimits lim;
-        lim.max_entries = 1;
-        lim.compliance_reserve_num = 0;
-        lim.compliance_reserve_den = 0;
-        rig.rt->drain_bounded([](const OutboxEntry&) { return SendResult::Sent; }, lim);
-        ++drained_total;
-    };
-
-    bool saw_yield = false;
-    std::size_t big_paged_at = 0;
-    std::int64_t now = 1'700'000'000'000;
-    for (std::size_t cycle = 1; cycle <= 400 && big_paged_at == 0; ++cycle) {
-        drain_one();                                              // the link is working
-        rig.persist_batch("s" + std::to_string(cycle), 1);        // ...and small batches keep coming
-        now += 10'000;                                            // one paging token per cycle
-        const auto stats = rig.journal->page_into_window(*rig.rt, now);
-        saw_yield = saw_yield || stats.starvation_yield;
-        if (stats.records_paged >= kBig)
-            big_paged_at = cycle;
-    }
-    INFO("drained=" << drained_total << " saw_yield=" << saw_yield);
-    CHECK(saw_yield);        // the boost engaged
-    CHECK(big_paged_at > 0); // and the big batch actually got through
-}
-
-// --- #2345 Gate 8: the gaps six reviewers found in round 5's own tests -------
-
-TEST_CASE("CH-4b: two oversized batches do not cancel each other's aging boost",
-          "[spark][guardian][journal][chaos]") {
-    // The starvation record is one slot. Counting at the ENCOUNTER let a second big batch reset
-    // the first to passes=1 inside a single pass, so the counter never reached the threshold and
-    // the boost was inert in exactly the mixed-size journal it exists for. Counting per PASS is
-    // what makes it hold. RED before the fix: neither big batch ever pages.
-    constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
-    JournalRig rig{kBig + 8};
-    for (std::size_t i = 0; i < kBig + 3; ++i)
-        REQUIRE(rig.rt->try_page_batch({OutboxEntry::lifecycle(
-                    "live", 1, "live-" + std::to_string(i), 1'700'000'000'000'000'000, "armed",
-                    "file", "n")}).added == 1);
-    REQUIRE(rig.rt->lifecycle_headroom() == 5);
-
-    rig.persist_batch("bigA", kBig);
-    rig.persist_batch("bigB", kBig);
-
-    auto drain_one = [&] {
-        GuardianSparkRuntime::DrainLimits lim;
-        lim.max_entries = 1;
-        lim.compliance_reserve_num = 0;
-        lim.compliance_reserve_den = 0;
-        rig.rt->drain_bounded([](const OutboxEntry&) { return SendResult::Sent; }, lim);
-    };
-
-    std::size_t big_paged = 0;
-    std::int64_t now = 1'700'000'000'000;
-    for (std::size_t cycle = 1; cycle <= 700 && big_paged == 0; ++cycle) {
-        drain_one();
-        rig.persist_batch("s" + std::to_string(cycle), 1);
-        now += 10'000;
-        const auto stats = rig.journal->page_into_window(*rig.rt, now);
-        if (stats.records_paged >= kBig)
-            big_paged = cycle;
-    }
-    CHECK(big_paged > 0);
-}
-
-TEST_CASE("CH-4c: a reservation pauses other replay but cannot hold it indefinitely",
-          "[spark][guardian][journal][chaos]") {
-    // The reservation replaced a pin-and-break that stalled ALL replay. It does NOT avoid
-    // pausing other replay - it cannot: a batch is blocked precisely when headroom is below
-    // what it needs, so withholding that much leaves nothing spare. The first two versions of
-    // this test asserted a "surplus" that cannot exist; Gate 8b proved the first one hollow by
-    // mutating the code to reserve the whole window and watching it still pass.
-    //
-    // What must actually hold is that the pause is BOUNDED, so neither side starves: the
-    // reservation engages, is released after a bounded number of passes, and the small batches
-    // that were held back then ship. RED before the bound: they never ship.
-    constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
-    JournalRig rig{kBig * 2};
-    rig.persist_batch("big", kBig);
-
-    // Occupy the window so the big batch cannot fit, and never drain - the worst case for the
-    // batches queued behind it.
-    const std::size_t occupy = rig.rt->lifecycle_headroom() - (kBig - 1);
-    for (std::size_t i = 0; i < occupy; ++i)
-        REQUIRE(rig.rt->try_page_batch({OutboxEntry::lifecycle(
-                    "live", 1, "live-" + std::to_string(i), 1'700'000'000'000'000'000, "armed",
-                    "file", "n")}).added == 1);
-    REQUIRE(rig.rt->lifecycle_headroom() == kBig - 1); // big is blocked, and stays blocked
-
-    bool reserved = false;
-    std::size_t paged_after_release = 0;
-    bool released = false;
-    std::int64_t now = 1'700'000'000'000;
-    for (int pass = 0; pass < 20; ++pass) {
-        rig.persist_batch("s" + std::to_string(pass), 1); // small work keeps ARRIVING
-        now += 10'000;
-        const auto stats = rig.journal->page_into_window(*rig.rt, now);
-        if (reserved && !stats.starvation_yield)
-            released = true;      // the hold expired...
-        if (released)
-            paged_after_release += stats.records_paged; // ...and the small work resumed
-        reserved = reserved || stats.starvation_yield;
-    }
-    INFO("reserved=" << reserved << " released=" << released
-                     << " paged_after_release=" << paged_after_release);
-    REQUIRE(reserved);                 // the reservation engaged
-    CHECK(released);                   // and did not hold forever
-    CHECK(paged_after_release >= 1);   // the batches it held back are not starved either
-}
-
-TEST_CASE("CH-4d: a fully-windowed batch is never read as blocked by the pre-check",
+TEST_CASE("a fully-windowed batch is never read as blocked by the paging pre-check",
           "[spark][guardian][journal][chaos]") {
     // The journal's own pre-check sized a candidate by its RAW entry count, which is the exact
     // accounting error try_page_batch was fixed for, surviving one layer up. A batch already
@@ -1577,9 +1446,8 @@ TEST_CASE("CH-4d: a fully-windowed batch is never read as blocked by the pre-che
 
     now += 10'000;
     const auto stats = rig.journal->page_into_window(*rig.rt, now);
-    CHECK(stats.records_paged == 0);      // nothing to do...
-    CHECK_FALSE(stats.headroom_blocked);  // ...and emphatically not blocked
-    CHECK_FALSE(stats.starvation_yield);
+    CHECK(stats.records_paged == 0);     // nothing to do...
+    CHECK_FALSE(stats.headroom_blocked); // ...and emphatically not blocked
 }
 
 TEST_CASE("CH-5c: a backward clock step retains evidence and still bounds the journal",
@@ -1640,48 +1508,6 @@ TEST_CASE("a page-side read failure is counted separately from retention's",
     CHECK(rig.journal->prune_failures() == 0); // retention is fine; only replay is stalled
 }
 
-TEST_CASE("CH-4e: the reservation is released once its batch is no longer blocked",
-          "[spark][guardian][journal][chaos]") {
-    // Holding a reservation for a batch that no longer needs one starves everything else for
-    // nothing. Release has to happen on BOTH exits - the batch pages, or it turns out to be
-    // fully windowed already - not only on the paging one.
-    constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
-    JournalRig rig{kBig + 8};
-    for (std::size_t i = 0; i < kBig + 3; ++i)
-        REQUIRE(rig.rt->try_page_batch({OutboxEntry::lifecycle(
-                    "live", 1, "live-" + std::to_string(i), 1'700'000'000'000'000'000, "armed",
-                    "file", "n")}).added == 1);
-    rig.persist_batch("big", kBig);
-
-    std::int64_t now = 1'700'000'000'000;
-    bool engaged = false;
-    for (int pass = 0; pass < 4; ++pass) { // headroom 5: blocked every pass, boost engages
-        now += 10'000;
-        engaged = engaged || rig.journal->page_into_window(*rig.rt, now).starvation_yield;
-    }
-    REQUIRE(engaged);
-
-    // Drain the window completely; the batch now fits, so the next pass must place it AND drop
-    // the reservation rather than keep holding room for a batch that is already dealt with.
-    GuardianSparkRuntime::DrainLimits lim;
-    lim.max_entries = 10'000;
-    lim.compliance_reserve_num = 0;
-    lim.compliance_reserve_den = 0;
-    rig.rt->drain_bounded([](const OutboxEntry&) { return SendResult::Sent; }, lim);
-
-    now += 10'000;
-    const auto placed = rig.journal->page_into_window(*rig.rt, now);
-    CHECK(placed.records_paged == kBig);
-    CHECK_FALSE(placed.starvation_yield);
-
-    // ...and with the reservation gone, a later pass over the same (now fully windowed) batch
-    // reports no blockage at all.
-    now += 10'000;
-    const auto after = rig.journal->page_into_window(*rig.rt, now);
-    CHECK_FALSE(after.starvation_yield);
-    CHECK_FALSE(after.headroom_blocked);
-}
-
 TEST_CASE("a page deferred by an empty rate limiter says so, so the kick is not dropped",
           "[spark][guardian][drain][maint]") {
     // A reconnect kick that lands while the paging token bucket is empty was swallowed: the
@@ -1720,4 +1546,62 @@ TEST_CASE("a page deferred by an empty rate limiter says so, so the kick is not 
         }
     }
     CHECK(went_dry); // ...and said WHY, which is what the re-arm keys off
+}
+
+TEST_CASE("a full window reports the SMALLEST pending requirement, not the first seen",
+          "[spark][guardian][journal]") {
+    // The worker re-arms a page when lifecycle_headroom() reaches min_blocked_headroom, so that
+    // figure has to be the smallest thing actually waiting. Reporting the first-encountered
+    // batch's requirement made the re-arm wait for room nothing needed - replay stalled a whole
+    // cadence interval for a 1-entry batch sitting behind a 256-entry one. A previous round
+    // fixed that with a forward scan; a later rewrite of this loop silently dropped it and it
+    // had no test anywhere in the suite. RED without the scan: 256 instead of 1.
+    constexpr std::size_t kBig = kMaxJournalEntriesPerBatch;
+    JournalRig rig{1}; // clamped up to the floor
+    rig.persist_batch("a-big", kBig); // oldest, so it is met first in the rotation
+    rig.persist_batch("b-small", 1);  // ...and the small one is behind it
+
+    std::vector<OutboxEntry> fill; // fill the window completely
+    for (std::size_t i = 0; i < kBig; ++i)
+        fill.push_back(OutboxEntry::lifecycle("live", 1, "live-" + std::to_string(i),
+                                              1'700'000'000'000'000'000, "armed", "file", "n"));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == kBig);
+    REQUIRE(rig.rt->lifecycle_headroom() == 0);
+
+    const auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'000'000);
+    CHECK(stats.headroom_blocked);
+    CHECK(stats.min_blocked_headroom == 1); // the small batch behind it, not the head's 256
+}
+
+TEST_CASE("a batch repeating an event_id is sized by its distinct records",
+          "[spark][guardian][journal]") {
+    // The paging pre-check sizes a candidate by its NET-NEW records. Counting per entry rather
+    // than per distinct event_id let a row that repeats an id overstate its requirement by up
+    // to a whole batch, so a batch needing one slot could be deferred as though it needed many.
+    // persist() never writes such a row, which is exactly why this needs writing by hand.
+    // RED without the de-duplication: the batch is reported blocked and pages nothing.
+    JournalRig rig;
+    const auto key = std::string{kBatchKeyPrefix} + "dup:000000000001";
+    const std::string row =
+        R"({"v":4,"ts_ms":1700000000000,"entries":[)"
+        R"({"rule_id":"r","event_id":"dup","kind":"armed","guard_type":"file","rule_name":"n",)"
+        R"("generation":1,"enqueued_ns":1700000000000000000},)"
+        R"({"rule_id":"r","event_id":"dup","kind":"armed","guard_type":"file","rule_name":"n",)"
+        R"("generation":1,"enqueued_ns":1700000000000000000},)"
+        R"({"rule_id":"r","event_id":"dup","kind":"armed","guard_type":"file","rule_name":"n",)"
+        R"("generation":1,"enqueued_ns":1700000000000000000}]})";
+    REQUIRE(rig.kv->set(kJournalNamespace, key, row));
+
+    // Leave exactly ONE free slot: enough for the single distinct record, far short of three.
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i + 1 < cap; ++i)
+        fill.push_back(OutboxEntry::lifecycle("live", 1, "live-" + std::to_string(i),
+                                              1'700'000'000'000'000'000, "armed", "file", "n"));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap - 1);
+    REQUIRE(rig.rt->lifecycle_headroom() == 1);
+
+    const auto stats = rig.journal->page_into_window(*rig.rt, 1'700'000'000'000);
+    CHECK(stats.records_paged == 1); // one distinct record placed in the one free slot
+    CHECK_FALSE(stats.headroom_blocked);
 }

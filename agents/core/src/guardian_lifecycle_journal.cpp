@@ -751,28 +751,21 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     if (start == cands.size())
         start = 0; // cursor at/after the end: wrap to the oldest
 
-    // AGING BOOST (#2345 Gate 5 CH-4, redesigned at Gate 8). Per-pass fairness alone is
-    // size-biased: a steady drip of small batches holds headroom just below the largest
-    // batch's size forever, so the biggest batches - mass arm/disarm bursts such as a Baseline
-    // deploy, the records an auditor actually asks for - are the ones retention drops unsent.
+    // NOTE ON A REMOVED MECHANISM. Four attempts were made here to stop a LARGE batch being
+    // skipped every pass while small ones are placed, and then deleted by retention unsent -
+    // a loss channel biased towards the biggest batches, which are mass arm/disarm bursts and
+    // so the most audit-significant records. All four scheduled the send window; all four
+    // failed, and the reason is structural rather than a bug in any of them: a batch is
+    // blocked precisely when the window has less room than it needs, so making it fit means
+    // pausing competing replay until the drain creates room. Where the drain cannot create
+    // room, such a scheme must either release (restoring the original loss) or hold (stalling
+    // every other batch). No amount of counter or branch fixing removes that fork.
     //
-    // The mechanism is a RESERVATION, not a priority pin. The first design pinned the rotation
-    // to the starved batch and broke the pass; three Gate 8 reviewers independently showed that
-    // trades a partial, size-biased loss for a TOTAL replay stall - with live arm/disarm traffic
-    // holding the window, the starved batch never fits and nothing else is ever considered
-    // either. Reserving instead means smaller batches keep flowing out of the surplus while the
-    // room the starved batch needs stops being consumed underneath it.
-    //
-    // It terminates because a batch can never need more than the window holds: persist() writes
-    // at most kMaxJournalEntriesPerBatch, parse_journal_batch REJECTS a larger row as malformed,
-    // and the window is floored at exactly that. Without the parse-side bound this would hold
-    // room for a batch that could never be placed.
-    const std::size_t reserve_for =
-        (starved_ && starved_passes_ >= kJournalStarvationPasses) ? starved_need_ : 0;
-    bool starved_seen = false;         // the starved batch was still a candidate this pass
-    bool starved_blocked = false;      // ...and it was still blocked
-    std::optional<std::pair<std::int64_t, std::string>> worst_blocked; // biggest need this pass
-    std::size_t worst_blocked_need = 0;
+    // The channel is therefore DOCUMENTED, not scheduled around: see #2364 and the retention
+    // section of docs/guardian-c0-thread-reloc-design.md. It is narrow - a maximum batch is
+    // 256 entries against a 4096 window, so it needs sustained occupancy above ~94%, which is
+    // itself a delivery failure with its own signals - and the right next step is a signal for
+    // that regime (the age of the oldest headroom-blocked batch), not a fifth scheduler.
 
     // One membership snapshot for the whole pass. Sizing a candidate by its NET-NEW records
     // rather than its raw entry count is what stops a batch that is ALREADY fully windowed
@@ -811,26 +804,13 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // read would misclassify every later candidate in the pass.
         const std::size_t headroom = rt.lifecycle_headroom();
         const auto id = std::pair{c.ts_ms, c.key};
-        const bool is_starved = starved_ && *starved_ == id;
-        if (is_starved)
-            starved_seen = true;
         const std::size_t need = net_new_of(c.batch);
         if (need == 0) {
             // Already fully windowed: no work, and emphatically NOT a blockage.
-            if (is_starved) {
-                starved_.reset();
-                starved_passes_ = 0;
-                starved_need_ = 0;
-                starved_stalled_ = 0;
-            }
             page_cursor_ = id;
             continue;
         }
-        // A non-starved candidate may only use the surplus above the reservation.
-        const std::size_t avail =
-            (reserve_for > 0 && !is_starved) ? (headroom > reserve_for ? headroom - reserve_for : 0)
-                                             : headroom;
-        if (avail < need) {
+        if (headroom < need) {
             // Paging a newer batch ahead of an older blocked one can invert armed/disarmed
             // wire order across batches. That is tolerated by the server today: dedup compares
             // immutable fields only on an event_id collision, lifecycle events do not update
@@ -843,13 +823,6 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             // UP-2's scan amplification back in the recovery regime.
             if (stats.min_blocked_headroom == 0 || need < stats.min_blocked_headroom)
                 stats.min_blocked_headroom = need;
-            if (is_starved) {
-                starved_blocked = true;
-                starved_blocked_headroom_ = headroom; // progress signal for the release rule
-            } else if (need > worst_blocked_need) {
-                worst_blocked = id;
-                worst_blocked_need = need;
-            }
             page_cursor_ = id; // advance: never pin the rotation on a blocked batch
             if (headroom == 0) {
                 // Nothing fits at all, so stop scanning - but first record the SMALLEST batch
@@ -882,14 +855,6 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // Advance the cursor for EVERY considered batch (paged or a free member / headroom-defer
         // skip), so an already-windowed head cannot pin the rotation.
         page_cursor_ = std::pair{c.ts_ms, c.key};
-        // Release the reservation the moment this batch is no longer blocked, whether it paged
-        // or turned out to be fully windowed already.
-        if (!outcome.blocked_for_headroom && is_starved) {
-            starved_.reset();
-            starved_passes_ = 0;
-            starved_need_ = 0;
-            starved_stalled_ = 0;
-        }
         if (outcome.blocked_for_headroom) {
             // The window shrank between the pre-check and the locked attempt. Without this the
             // pass would report "nothing to do" and the caller's refill re-arm would never
@@ -897,12 +862,6 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             stats.headroom_blocked = true;
             if (stats.min_blocked_headroom == 0 || outcome.required < stats.min_blocked_headroom)
                 stats.min_blocked_headroom = outcome.required;
-            if (is_starved)
-                starved_blocked = true;
-            else if (outcome.required > worst_blocked_need) {
-                worst_blocked = id;
-                worst_blocked_need = outcome.required;
-            }
         }
         if (outcome.added > 0) {
             page_bucket_.take(); // charge a token ONLY for net-new work
@@ -912,57 +871,6 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 break; // paged one net-new over an empty bucket; the rest wait for a refill
         }
         // added == 0 and not blocked: every entry was already a member; keep rotating.
-    }
-
-    // Starvation accounting is per PASS, not per encounter. Counting at the encounter let two
-    // oversized batches reset each other inside a single pass, so the counter never reached the
-    // threshold and the boost was inert in exactly the mixed-size case it exists for
-    // (#2345 Gate 8 cpp-safety).
-    if (starved_ && !starved_seen) {
-        // Not VISITED is not the same as GONE. A pass covers at most
-        // kJournalPageMaxBatchesPerPass of the rotation, so on a large journal the starved
-        // batch is simply out of this pass's slice most of the time; dropping the reservation
-        // then let the small batches refill the room on exactly those passes and the boost
-        // never accumulated. Only release it when the batch has actually left the journal.
-        const bool still_present =
-            std::any_of(cands.begin(), cands.end(), [this](const Cand& x) {
-                return x.ts_ms == starved_->first && x.key == starved_->second;
-            });
-        if (!still_present) {
-            starved_.reset(); // pruned, quarantined, or sent: stop reserving room for it
-            starved_passes_ = 0;
-            starved_need_ = 0;
-        }
-    } else if (starved_blocked) {
-        ++starved_passes_;
-        stats.starvation_yield = starved_passes_ >= kJournalStarvationPasses;
-        // Release on lack of PROGRESS, not on elapsed passes. While headroom is climbing the
-        // reservation is doing its job and must be kept - a 256-entry batch needs many passes
-        // of draining before it fits, and releasing on a pass count simply reinstated the
-        // size-biased loss this exists to close. When headroom stops climbing the pause is
-        // buying nothing (dead link, or live traffic taking the room as fast as the drain frees
-        // it), so the room goes back rather than stalling every other batch behind a batch that
-        // is not getting closer.
-        if (starved_blocked_headroom_ > starved_last_headroom_) {
-            starved_stalled_ = 0; // converging
-        } else if (++starved_stalled_ >= kJournalReservationStallPasses) {
-            starved_.reset();
-            starved_passes_ = 0;
-            starved_need_ = 0;
-            starved_stalled_ = 0;
-        }
-        starved_last_headroom_ = starved_blocked_headroom_;
-    } else if (starved_ && starved_seen) {
-        starved_.reset(); // considered and not blocked
-        starved_passes_ = 0;
-        starved_need_ = 0;
-    }
-    if (!starved_ && worst_blocked) {
-        starved_ = worst_blocked; // the biggest thing that could not be placed this pass
-        starved_need_ = worst_blocked_need;
-        starved_passes_ = 1;
-        starved_stalled_ = 0;
-        starved_last_headroom_ = 0;
     }
 
     pages_.fetch_add(1, std::memory_order_relaxed);

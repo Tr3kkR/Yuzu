@@ -66,33 +66,6 @@ inline constexpr double kJournalPageRefillPerSec = 0.1; // 1 batch / 10 s / agen
 inline constexpr double kJournalPageBurst = 5.0;        // small startup burst
 /// Bound per-pass paging work (reconstruct + membership scan) regardless of journal size.
 inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
-/// Consecutive passes a single batch may lose the headroom race before paging yields the rest
-/// of the pass to let the send window drain toward it (#2345 Gate 5 CH-4). Per-pass fairness
-/// alone is size-biased: a steady drip of small batches keeps headroom below the largest
-/// batch's size forever, so the biggest batches - mass arm/disarm bursts, the most
-/// audit-significant records - are the ones retention drops unsent. 3 is deliberately small:
-/// the cost of yielding early is one cadence interval of delay, the cost of not yielding is a
-/// permanent, significance-correlated gap in the audit trail.
-inline constexpr std::uint32_t kJournalStarvationPasses = 3;
-
-/// Consecutive passes a reservation may make NO progress before it is released and the batch
-/// must earn it again.
-///
-/// A reservation necessarily PAUSES other replay: a batch is blocked precisely when headroom is
-/// below what it needs, so withholding that much leaves nothing spare by construction. (An
-/// earlier comment claimed smaller batches "still ship out of the surplus" - there is no
-/// surplus, and the test asserting it was hollow, #2345 Gate 8b.) The pause is the mechanism:
-/// it lets the window drain TOWARD the big batch instead of small ones re-consuming every
-/// freed slot.
-///
-/// So the release cannot be a simple pass count - that just reinstates the size-biased loss,
-/// because a big batch needs many passes of draining to become placeable. It is keyed on
-/// PROGRESS instead: while headroom is climbing, the reservation is working and is kept; when
-/// it stops climbing for this many passes, the link is dead or live traffic is dominating, the
-/// pause is buying nothing, and the room goes back to whatever can use it. Neither side can
-/// starve the other permanently, which is the property that matters - the closed loss channel
-/// is "the largest batches NEVER page", not "the largest batches page first".
-inline constexpr std::uint32_t kJournalReservationStallPasses = 4;
 
 /// Batches a single retention pass may evict for AGE. Age is the one retention rule driven by
 /// an absolute reading of the wall clock, so one bad reading (a VM restored from snapshot, an
