@@ -50,7 +50,14 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
       boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
-      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {
+      // The LIFECYCLE window must be able to hold at least one maximum-size journal batch.
+      // Paging is all-or-nothing per batch, so a window smaller than kMaxJournalEntriesPerBatch
+      // makes large batches permanently unpageable - they are skipped every pass and then
+      // silently deleted at retention. That loss channel is SIZE-BIASED: the largest batches
+      // are mass arm/disarm bursts, i.e. the most security-relevant audit records, so it is
+      // strictly worse than a random one (#2345 Gate 5 CH-4 / Gate 4 UP-5+UP-15).
+      lifecycle_log_(std::max({kMinOutboxCapacity, cfg.outbox_capacity,
+                               kMaxJournalEntriesPerBatch})) {
     // Reserve the staging vector ONCE - never from rule count. push_back then never
     // reallocates, which is what makes stage_pending_locked's noexcept contract real.
     pending_journal_.reserve(kMaxPendingJournalRecords);
@@ -571,27 +578,48 @@ GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
     if (entries.empty())
         return out;
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    // Headroom gate (design §5): page the batch only if it fits whole; else leave it for a
-    // later pass once the window drains (never a partial page that splits a batch).
+    // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
+    // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
+    // starve heartbeats under a large backlog (review UP-12 / perf P-2).
+    const auto present = lifecycle_log_.event_id_set();
+
+    // Required headroom is the count of NET-NEW event_ids, not the raw batch size (#2345
+    // Gate 5 CH-7). Charging the raw size is not merely pessimistic, it can wedge replay:
+    // a 256-entry batch with 255 entries already in the window needs ONE slot, but reporting
+    // 256 makes the worker's refill re-arm wait for 256 free slots - room the window may
+    // never have while those same 255 entries are what is occupying it. The batch then never
+    // pages and its one unsent record is eventually pruned: a permanent, silent audit gap
+    // produced by the accounting rather than by any real shortage.
+    //
+    // Deduplicated, so a batch that repeats an event_id (a torn or hand-edited journal row)
+    // cannot inflate the requirement past what enqueue would actually consume, nor enqueue
+    // the same record twice against a membership set built before the loop.
+    std::unordered_set<std::string> want;
+    want.reserve(entries.size());
+    for (const auto& e : entries)
+        if (!present.count(e.event_id))
+            want.insert(e.event_id);
+    if (want.empty())
+        return out; // every entry is already windowed: nothing to do, and nothing is blocked
+
+    // Headroom gate (design §5): page the batch only if its net-new records fit whole; else
+    // leave it for a later pass once the window drains (never a partial page that splits a
+    // batch).
     //
     // Reporting WHY nothing was added has to happen here, under the lock. A caller's own
     // pre-check can be stale by the time it gets here - a concurrent arm can consume the room
     // in between - and if that case is misread as "already a member" the caller never learns a
     // backlog is waiting and replay stalls for a whole cadence interval (#2345 Gate 3).
-    if (lifecycle_log_.headroom() < entries.size()) {
+    if (lifecycle_log_.headroom() < want.size()) {
         out.blocked_for_headroom = true;
-        out.required = entries.size();
+        out.required = want.size();
         return out;
     }
-    // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
-    // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
-    // starve heartbeats under a large backlog (review UP-12 / perf P-2). The batch's records
-    // carry distinct event_ids, so a static pre-batch set is correct here.
-    const auto present = lifecycle_log_.event_id_set();
     for (auto& e : entries) {
-        if (!present.count(e.event_id)) // O(1) membership: skip a re-page of an entry in the window
-            if (lifecycle_log_.enqueue(std::move(e)))
-                ++out.added;
+        if (want.erase(e.event_id) == 0) // already windowed, or an intra-batch duplicate
+            continue;
+        if (lifecycle_log_.enqueue(std::move(e)))
+            ++out.added;
     }
     return out;
 }

@@ -1113,11 +1113,18 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     GuardianSparkRuntime::Config cfg;
-    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    cfg.outbox_capacity = 1; // clamped up to the one-max-batch floor
     auto rt = make_rt(r, b, cfg);
 
-    // Fill the (shared-capacity) lifecycle log past its floor via same-id
-    // replace churn (armed/disarmed/armed/... never coalesces or gets purged).
+    // Fill the lifecycle log to capacity, then churn one rule's arm/disarm on top. Paged in
+    // directly because the window is floored at a whole maximum-size batch, so filling it via
+    // rule churn alone would take hundreds of attaches to say the same thing.
+    const std::size_t cap = rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rt->try_page_batch(std::move(fill)).added == cap);
+    REQUIRE(rt->lifecycle_headroom() == 0);
     for (int i = 0; i < 5; ++i)
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
@@ -1231,10 +1238,14 @@ TEST_CASE("try_page_batch skips entries already in the window (membership scan)"
 
 TEST_CASE("try_page_batch defers a batch that does not fit the headroom", "[spark][runtime][journal]") {
     GuardianSparkRuntime::Config cfg;
-    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    cfg.outbox_capacity = 1; // clamped up to the one-max-batch floor
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}).added == 1); // headroom 2 → ok
-    // headroom now 1; a 2-entry batch is deferred WHOLE (never split).
+    const std::size_t cap = rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill; // fill to exactly ONE free slot
+    for (std::size_t i = 0; i + 1 < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rt->try_page_batch(std::move(fill)).added == cap - 1);
+    // headroom is 1; a 2-entry batch is deferred WHOLE (never split).
     {   // A 0 return now carries WHY: blocked for headroom, not "already a member". That
         // distinction is what lets the journal tell a waiting backlog from an idle steady
         // state (#2345 Gate 3).
