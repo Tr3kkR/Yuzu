@@ -663,11 +663,20 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // read would misclassify every later candidate in the pass.
         const std::size_t headroom = rt.lifecycle_headroom();
         if (headroom == 0) {
+            // Nothing fits, so stop - but record the SMALLEST candidate still pending, not
+            // this head batch. Breaking here recorded the head's size (up to 256) even when a
+            // 1-entry batch was queued behind it, and the worker's re-arm then waited for 256
+            // free slots before retrying: replay stalled a full cadence interval for room it
+            // never needed (#2345 Gate 4 consistency S3).
             stats.headroom_blocked = true;
-            if (stats.min_blocked_headroom == 0 ||
-                c.batch.entries.size() < stats.min_blocked_headroom)
-                stats.min_blocked_headroom = c.batch.entries.size();
-            break; // nothing fits; wait for the drain to free room
+            std::size_t smallest = c.batch.entries.size();
+            for (std::size_t m = n; m < limit; ++m) {
+                const auto& other = cands[(start + m) % cands.size()];
+                smallest = std::min(smallest, other.batch.entries.size());
+            }
+            if (stats.min_blocked_headroom == 0 || smallest < stats.min_blocked_headroom)
+                stats.min_blocked_headroom = smallest;
+            break;
         }
         if (headroom < c.batch.entries.size()) {
             // CONTINUE, not break. Breaking here left page_cursor_ un-advanced, so an

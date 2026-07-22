@@ -1250,3 +1250,42 @@ TEST_CASE("R4: a completely full window blocks the pass without sweeping the cur
     CHECK(stats.headroom_blocked);          // the caller must learn a backlog is waiting...
     CHECK(stats.min_blocked_headroom == 2); // ...and how much room it needs
 }
+
+TEST_CASE("R4: a lifecycle send slower than the whole pass still lets compliance ship",
+          "[spark][guardian][drain][maint][r4]") {
+    // The wall slice alone guarantees compliance an opportunity to START only if the in-flight
+    // lifecycle send returns before the full deadline. A single send slower than max_wall
+    // therefore left compliance's restored deadline permanently in the past: zero compliance
+    // sends, every pass, forever - a detection blackout that survived the wall fix
+    // (#2345 Gate 4 UP-3).
+    JournalRig rig;
+    for (int i = 0; i < 6; ++i) {
+        const auto rid = "lc" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true));
+    }
+    // Real compliance traffic behind it.
+    REQUIRE(rig.rt->attach_rule("cmp", file_spec("/cmp"), file_exists_rule("cmp"), true));
+    rig.reader->file = read_known(FileSnapshot{.exists = false});
+    rig.rt->evaluate_key(spark_key(file_spec("/cmp")), EvalReason::Convergence);
+
+    std::atomic<int> lifecycle_sent{0}, compliance_sent{0};
+    auto very_slow_lifecycle = [&](const OutboxEntry& e) -> SendResult {
+        if (e.domain == OutboxDomain::Lifecycle) {
+            lifecycle_sent.fetch_add(1);
+            std::this_thread::sleep_for(120ms); // ONE send longer than the entire pass budget
+        } else {
+            compliance_sent.fetch_add(1);
+        }
+        return SendResult::Sent;
+    };
+
+    GuardianSparkRuntime::DrainLimits limits;
+    limits.max_entries = 100;
+    limits.max_wall = 60ms; // deliberately shorter than a single lifecycle send
+    rig.rt->drain_bounded(very_slow_lifecycle, limits);
+
+    INFO("lifecycle_sent=" << lifecycle_sent.load()
+                           << " compliance_sent=" << compliance_sent.load());
+    CHECK(lifecycle_sent.load() >= 1);  // lifecycle overran the pass, as designed
+    CHECK(compliance_sent.load() >= 1); // and compliance STILL got its guaranteed attempt
+}

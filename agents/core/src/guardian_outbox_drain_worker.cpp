@@ -166,13 +166,19 @@ void GuardianOutboxDrainWorker::loop() {
     // when a batch pages net-new work, so a chain that pages NOTHING consumes no token and the
     // bucket's short-circuit never engages. The cap below is therefore the only bound on a
     // zero-page chain, and is load-bearing (#2345 Gate 3 cpp-safety + perf).
-    // Counts cycles entered WITHOUT a condition-variable wait, from any cause, and is reset
-    // only after a real wait. Counting just the refill re-arms let an alternating
-    // truncated-drain / re-arm pattern run unbounded no-wait cycles with the counter never
-    // exceeding 1 (#2345 Gate 3 perf). The cap is the paging burst, so the token bucket is the
-    // binding limit rather than an unrelated constant.
-    unsigned no_wait_cycles = 0;
-    constexpr unsigned kMaxNoWaitCycles = 5;
+    // The refill re-arm is rate-limited by TIME, not by a cycle counter.
+    //
+    // A counter reset "after a real wait" is not a bound at all: cv.wait_for returns
+    // IMMEDIATELY whenever the generation already moved, and every outbox enqueue bumps it, so
+    // under an arm/disarm storm the wait branch runs without ever waiting and resets the
+    // counter each cycle - restoring exactly the scan amplification the cap was added to
+    // prevent (#2345 Gate 4 UP-1). Sharing one counter with the truncated-drain path also let a
+    // sustained backlog exhaust it and silently disable the re-arm entirely (UP-2).
+    //
+    // A minimum interval is immune to both: it bounds forced full-journal scans to one per
+    // interval no matter what wakes the loop, while staying far below the 30 s page cadence so
+    // reconnect replay is still prompt.
+    auto last_refill_page = std::chrono::steady_clock::now() - kGuardianMinRefillInterval;
 
     const auto firewalled_drain = [this, &skip_wait]() -> std::size_t {
         try {
@@ -204,13 +210,10 @@ void GuardianOutboxDrainWorker::loop() {
             if (sig_->stopping.load(std::memory_order_acquire))
                 break;
             seen = sig_->gen;
-            no_wait_cycles = 0; // a real wait happened: the chain is broken
         } else if (stop_requested()) {
             break; // neither the boot cycle nor a truncated drain may outlive a stop request
         }
         // Re-armed below by a truncated drain or a refill; every other cycle waits.
-        if (skip_wait)
-            ++no_wait_cycles;
         skip_wait = false;
 
         // MAINTENANCE FIRST, then ONE drain (C0 #2298 + governance f-1/f-3).
@@ -301,11 +304,13 @@ void GuardianOutboxDrainWorker::loop() {
         // happens - a latency the existing 20 ms-bound reconnect tests masked entirely.
         // Order matters: the cheap local checks first, so a pass with nothing blocked does not
         // take outbox_mu_ at all (#2345 Gate 2 sec-LOW).
+        const auto cycle_end = std::chrono::steady_clock::now();
         if (page_result.headroom_blocked && page_result.min_blocked_headroom > 0 && drained > 0 &&
-            no_wait_cycles < kMaxNoWaitCycles &&
+            cycle_end - last_refill_page >= kGuardianMinRefillInterval &&
             rt_.lifecycle_headroom() >= page_result.min_blocked_headroom) {
             force_page_.store(true, std::memory_order_release);
             skip_wait = true; // act on it NOW, not after the backstop
+            last_refill_page = cycle_end;
         }
     }
 }

@@ -618,6 +618,13 @@ struct DrainPassLimits {
     std::chrono::steady_clock::time_point deadline{}; ///< zero-valued when unbounded
     bool has_deadline{false};
     const std::function<bool()>* should_stop{nullptr};
+    /// Sends allowed to proceed even past `deadline`. The wall slice alone guarantees only
+    /// that compliance gets to START, and only if the in-flight lifecycle send returns in
+    /// time - so a single send slower than the whole pass budget left compliance's restored
+    /// deadline permanently in the past and it shipped NOTHING, every pass, forever
+    /// (#2345 Gate 4 UP-3). This converts that into a hard floor. It does NOT bypass
+    /// should_stop: shutdown still wins immediately.
+    std::size_t guaranteed_attempts{0};
 };
 
 template <typename Log>
@@ -639,12 +646,21 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
         // send: the point is to avoid STARTING work, since an in-flight send cannot be
         // interrupted and the caller may be holding a lock across a thread join
         // (#2298 Sol review). Checking them earlier would report a drained log as truncated.
-        if (lim.budget == 0 ||
-            (lim.has_deadline && std::chrono::steady_clock::now() >= lim.deadline) ||
-            (lim.should_stop && *lim.should_stop && (*lim.should_stop)())) {
+        // A guaranteed attempt overrides the DEADLINE only - never the budget, and never the
+        // stop predicate.
+        const bool guaranteed = lim.guaranteed_attempts > 0;
+        if (lim.should_stop && *lim.should_stop && (*lim.should_stop)()) {
             truncated = true;
             return sent;
         }
+        if (lim.budget == 0 ||
+            (!guaranteed && lim.has_deadline &&
+             std::chrono::steady_clock::now() >= lim.deadline)) {
+            truncated = true;
+            return sent;
+        }
+        if (guaranteed)
+            --lim.guaranteed_attempts;
         SendResult r = SendResult::Retain;
         try {
             r = send(entry); // outbox_mu_ RELEASED here
@@ -772,6 +788,13 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
                                           static_cast<std::int64_t>(reserve_den)};
         }
         // Never longer than the pass itself, whatever the ratio said.
+        // FLOOR the slice, mirroring the count reserve's floor. Without it a small max_wall
+        // truncates lifecycle_wall to 0, lifecycle gets a deadline equal to pass_start and
+        // ships NOTHING - the same starve-a-lane bug this round fixed for compliance, simply
+        // pointed the other way (#2345 Gate 4 consistency S5). One millisecond is enough to
+        // guarantee an attempt; the count budget still bounds the work.
+        if (lifecycle_wall < std::chrono::milliseconds{1})
+            lifecycle_wall = std::chrono::milliseconds{1};
         lim.deadline = pass_start + std::min(lifecycle_wall, limits.max_wall);
     }
 
@@ -783,6 +806,10 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     lim.budget += reserve;
     if (limits.max_wall.count() > 0)
         lim.deadline = pass_start + limits.max_wall;
+    // Guarantee compliance at least one attempt even if lifecycle already overran the pass.
+    // Without this the "compliance gets to start" property is conditional on the in-flight
+    // lifecycle send returning in time, and a persistently slow send makes it never true.
+    lim.guaranteed_attempts = (reserve > 0) ? 1 : 0;
     bool compliance_truncated = false;
     out.sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_, lim,
                                   compliance_truncated);

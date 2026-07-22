@@ -112,10 +112,11 @@ private:
 
 public:
     /// Cumulative convergence-sweep passes that threw and were firewalled. A counter nobody
-    /// can read is not observability: this is folded into the operator-facing
-    /// `yuzu.guardian_journal_maint_exceptions` tag by GuardianEngine::journal_stats(),
-    /// alongside the heartbeat's and the drain worker's, so one number answers "did any
-    /// Guardian background pass fail?". Lock-free.
+    /// can read is not observability: this surfaces as its OWN `yuzu.guardian_sweep_exceptions`
+    /// tag via GuardianEngine::journal_stats(). Deliberately not folded into
+    /// `yuzu.guardian_journal_maint_exceptions` - a sweep failure means drift DETECTION is
+    /// degraded, a journal failure means the AUDIT TRAIL is at risk, and an operator needs to
+    /// tell those apart. Lock-free.
     [[nodiscard]] std::uint64_t sweep_exception_count() const noexcept {
         return sweep_exceptions_.load(std::memory_order_relaxed);
     }

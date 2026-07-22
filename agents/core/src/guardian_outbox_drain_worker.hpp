@@ -100,6 +100,13 @@ inline constexpr std::chrono::milliseconds kGuardianJournalPruneInterval{120'000
 /// hitting this bound, so steady-state throughput is unchanged.
 inline constexpr std::size_t kGuardianDrainBudget = 512;
 
+/// Minimum gap between refill-driven forced pages. The refill re-arm exists so a reconnect
+/// backlog moves without waiting out the page cadence, but each forced page is a full journal
+/// scan, so it needs a floor. TIME rather than a cycle count: a counter reset on a
+/// condition-variable wait is no bound at all, because that wait returns immediately whenever
+/// an enqueue already moved the generation (#2345 Gate 4 UP-1).
+inline constexpr std::chrono::milliseconds kGuardianMinRefillInterval{1'000};
+
 /// Wall-clock companion to kGuardianDrainBudget. 512 entries bounds the COUNT but not the
 /// TIME: at a pathological seconds-per-send it is still minutes, and the worker may be
 /// holding up GuardianEngine::stop()'s join for all of it.
@@ -207,10 +214,11 @@ public:
     }
 
     /// Cumulative count of journal-maintenance passes that threw and were firewalled
-    /// by loop(). Counted SEPARATELY from drain_exception_count so the two failure
-    /// domains stay distinguishable, but folded into the SAME operator-facing tag
-    /// (guardian_journal_maint_exceptions) by GuardianEngine::journal_stats(), which
-    /// is where prune/page throws were counted before C0. Lock-free.
+    /// by loop(). Surfaces as `yuzu.guardian_journal_maint_exceptions` alongside the
+    /// heartbeat's retry-persist - that tag is JOURNAL work only. Delivery throws are
+    /// counted separately (drain_exception_count) and emitted as
+    /// `yuzu.guardian_drain_exceptions`: a retention failure and a delivery failure need
+    /// different operator responses, so they are deliberately not one number. Lock-free.
     [[nodiscard]] std::uint64_t journal_maint_exception_count() const noexcept {
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
     }

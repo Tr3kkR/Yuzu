@@ -244,8 +244,11 @@ public:
         /// shutdown is requested rather than at the end of a whole bounded pass. The
         /// in-flight send is not interruptible; no further one begins.
         std::function<bool()> should_stop{};
-        /// Fraction of `max_entries` reserved for the compliance/health outbox so a busy
-        /// lifecycle log cannot consume the entire pass. Unused lifecycle allowance rolls
+        /// Fraction reserved for the compliance/health outbox so a busy lifecycle log cannot
+        /// consume the entire pass. Applies to BOTH dimensions: the entry count and (gated on
+        /// `max_wall > 0`, not on `max_entries`) the wall clock. The guarantee is that
+        /// compliance gets an opportunity to START - not a slice of time, since an in-flight
+        /// send cannot be interrupted. Unused lifecycle allowance rolls
         /// over, so this costs nothing when lifecycle is quiet. Load-bearing: draining
         /// lifecycle first with a SHARED budget silently recreated the detection blackout
         /// that Gate 4 UP-3 removed - compliance simply never ran (#2298 Sol review).
@@ -258,10 +261,11 @@ public:
         /// remain. The caller should re-drain without waiting rather than sleep.
         bool truncated{false};
     };
-    /// Free slots in the lifecycle send window. Lets the journal's replay path tell the two
-    /// reasons try_page_batch() returns 0 apart - "the window is FULL" versus "every entry
-    /// was already a member" - which are operationally opposite: the first is a backlog
-    /// waiting on drain progress, the second is a steady state needing no action at all.
+    /// Free slots in the lifecycle send window, sampled without a lock held by the caller.
+    /// Used by the replay path as a pure OPTIMISATION - to avoid building entries for a batch
+    /// that plainly cannot fit. It is NOT the authority on whether a batch was blocked: that
+    /// comes back from try_page_batch's PageOutcome, decided under outbox_mu_, because this
+    /// value can be stale by the time the attempt happens (#2345).
     [[nodiscard]] std::size_t lifecycle_headroom() const;
 
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
@@ -285,12 +289,6 @@ public:
     /// Clamped to the current size.
     void erase_persisted_prefix(std::size_t n);
 
-    /// Page a REPLAYED batch into the send window: iff the window has >= batch-size
-    /// headroom, enqueue each entry NOT already present (window-scan membership, no
-    /// allocating set). Returns the count newly enqueued - 0 if deferred for headroom or
-    /// every entry was already present. Paged entries enter lifecycle_log_ ONLY (they are
-    /// already durable - never pending_journal_). Does NOT wake the drain; the caller (the
-    /// reconnect / low-water / tick hook, C6) drives sending.
     /// Outcome of a page attempt, decided UNDER outbox_mu_ so it reflects the window as it
     /// actually was. A bare count could not distinguish "the window had no room for this
     /// batch" from "every entry was already a member" - opposite situations, and the caller
@@ -300,6 +298,14 @@ public:
         bool blocked_for_headroom{false}; ///< the batch did not fit, atomically observed
         std::size_t required{0};       ///< entries the batch needed when blocked
     };
+    /// Page a REPLAYED batch into the send window: iff the window has >= batch-size headroom,
+    /// enqueue each entry NOT already present (window-scan membership, no allocating set).
+    /// Paged entries enter lifecycle_log_ ONLY (they are already durable - never
+    /// pending_journal_). Does NOT wake the drain; the caller drives sending.
+    ///
+    /// Reports WHY nothing was added via PageOutcome above: a bare count could not separate
+    /// "no room for this batch" from "every entry already a member", and the caller needs the
+    /// first to know a backlog is waiting (#2345).
     [[nodiscard]] PageOutcome try_page_batch(std::vector<OutboxEntry> entries);
 
     /// Back-fill provenance onto the LIVE window entries of a just-persisted batch (review M3),
