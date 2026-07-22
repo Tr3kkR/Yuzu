@@ -156,6 +156,9 @@ struct GuardianMaintenanceResult {
     bool headroom_blocked{false};
     /// Smallest blocked batch's requirement; see JournalPageStats.
     std::size_t min_blocked_headroom{0};
+    /// The pass did nothing because the paging rate-limiter had no token; see
+    /// JournalPageStats::deferred_no_token. A forced page must be re-armed on this.
+    bool deferred_no_token{false};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {

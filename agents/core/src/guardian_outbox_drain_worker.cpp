@@ -62,6 +62,14 @@ void GuardianOutboxDrainWorker::start() {
         try {
             loop();
         } catch (...) {
+            // Count it BEFORE logging. start() is one-shot, so the thread never comes back;
+            // without a counter a worker that dies on its first cycle is indistinguishable on
+            // the heartbeat from a healthy idle one, because the journal tags are emitted
+            // sparsely and a dead worker's counters simply stay at zero (#2345 Gate 6 SRE).
+            // Folded into the maintenance-exception tag: an operator reading a nonzero
+            // maint_exceptions is already told to expect stalled journal maintenance, which is
+            // exactly what a dead loop causes - with the log line naming the difference.
+            journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
             try {
                 spdlog::critical("Guardian drain worker: loop terminated by an exception; the "
                                  "worker has stopped, journal maintenance and outbox delivery "
@@ -139,6 +147,7 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         result.records_paged = stats.records_paged;
         result.headroom_blocked = stats.headroom_blocked;
         result.min_blocked_headroom = stats.min_blocked_headroom;
+        result.deferred_no_token = stats.deferred_no_token;
     }
     return result;
 }
@@ -271,7 +280,10 @@ void GuardianOutboxDrainWorker::loop() {
             last_page = std::chrono::steady_clock::now();
             // A FORCED page that never ran must not be lost: re-arm so the next cycle
             // retries it rather than waiting out a full cadence interval.
-            if (forced_page && !ok)
+            // ...and one that ran but did NO work because the paging rate-limiter had no
+            // token is equally lost: the pass returns clean, so `ok` alone would drop the
+            // kick and replay would wait out a full cadence interval after a reconnect.
+            if (forced_page && (!ok || page_result.deferred_no_token))
                 force_page_.store(true, std::memory_order_release);
         }
 

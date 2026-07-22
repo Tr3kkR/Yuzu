@@ -35,6 +35,14 @@ struct GuardianJournalStats {
     std::uint64_t quarantine_capacity_evicted{0}; ///< over-cap quarantined batches shed (UP-7)
     std::uint64_t batches_pruned{0};
     std::uint64_t prune_failures{0};
+    /// Replay-side scan failures. Deliberately NOT folded into prune_failures: the same
+    /// O(journal) KvStore read failing on the page side stops all replay while retention keeps
+    /// succeeding, which is a different operator situation from retention itself failing.
+    std::uint64_t page_read_failures{0};
+    /// Retention passes that declined to age-evict because the wall clock jumped implausibly
+    /// far forward. Nonzero is NOT an error - it means an endpoint's clock moved and the
+    /// journal deliberately kept evidence it would otherwise have deleted.
+    std::uint64_t clock_jump_skips{0};
     std::uint64_t write_capacity_rejected{0}; ///< new batch refused: journal at its byte/count cap (UP-1)
     std::uint64_t journal_bytes{0};           ///< current live journal size estimate (gauge)
     std::uint64_t journal_batch_count{0};     ///< current live batch count (gauge)
@@ -78,6 +86,8 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_quarantine_capacity_evicted", s.quarantine_capacity_evicted);
     put("yuzu.guardian_journal_pruned", s.batches_pruned);
     put("yuzu.guardian_journal_prune_failures", s.prune_failures);
+    put("yuzu.guardian_journal_page_read_failures", s.page_read_failures);
+    put("yuzu.guardian_journal_clock_jump_skips", s.clock_jump_skips);
     put("yuzu.guardian_journal_write_capacity_rejected", s.write_capacity_rejected);
     put("yuzu.guardian_journal_bytes", s.journal_bytes);
     put("yuzu.guardian_journal_batch_count", s.journal_batch_count);

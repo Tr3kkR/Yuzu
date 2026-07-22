@@ -458,6 +458,8 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.quarantine_capacity_evicted = lifecycle_journal_->quarantine_capacity_evicted();
         s.batches_pruned = lifecycle_journal_->batches_pruned();
         s.prune_failures = lifecycle_journal_->prune_failures();
+        s.page_read_failures = lifecycle_journal_->page_read_failures();
+        s.clock_jump_skips = lifecycle_journal_->clock_jump_skips();
         s.write_capacity_rejected = lifecycle_journal_->write_capacity_rejected();
         s.journal_bytes = lifecycle_journal_->journal_bytes();
         s.journal_batch_count = lifecycle_journal_->journal_batch_count();

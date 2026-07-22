@@ -116,6 +116,7 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     s.stage_dropped = s.stage_failures = s.field_rejected = s.clock_rejected = 1;
     s.pending_depth = s.maint_exceptions = s.drain_exceptions = s.sweep_exceptions = 1;
     s.journal_bytes = s.journal_batch_count = 1;
+    s.page_read_failures = s.clock_jump_skips = 1;
     emit_guardian_journal_heartbeat_tags(emitted, s);
     REQUIRE(emitted.size() > 10); // the emitter really did populate
 
