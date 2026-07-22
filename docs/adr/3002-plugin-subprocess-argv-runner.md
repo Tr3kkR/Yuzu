@@ -13,11 +13,14 @@ deciders: >-
   (per-PR lexical gate + scheduled CodeQL), the out-of-tree spawn-path gap stated, batch
   files banned on Windows, termination honesty elevated to an automation-correctness
   prerequisite gating mutating waves, interpreter sites registered, and the descent rule
-  set to evidence-backed justification.
+  set to evidence-backed justification. The syscall/native-API split was subsequently
+  collapsed into a single native-interface rung: every in-process route bottoms out in
+  the same syscall layer, and the load-bearing boundaries are the process and the
+  interpreter, not wrapper depth.
 depends-on: >-
   The shared argv runner (agents/core subprocess_runner, work item BR-001) currently on
   feat/macos-subproc-runner-certs (#2273/#2274, PR #2321 stacked on #2277). This ADR sets
-  the target state; the runner landing on dev is the prerequisite for the rung-3/4
+  the target state; the runner landing on dev is the prerequisite for the rung-2/3
   migration waves.
 related: >-
   docs/agent-privilege-model.md (macOS agent is root, Windows LocalSystem today — the
@@ -28,8 +31,8 @@ related: >-
   on making them a failing gate). agents/plugins/tar/src/tar_mapdrive_collector.cpp
   (the documented shell exception this ADR re-homes onto the runner).
   docs/yuzu-guardian-design-v1.1.md §restart-process (posix_spawn mandate — Decision 9's
-  evolution path). docs/tar-implementer.md (capture sources — already built at rungs
-  1–2: Endpoint Security, ETW).
+  evolution path). docs/tar-implementer.md (capture sources — already built at rung 1:
+  Endpoint Security, ETW).
 ---
 
 # ADR-3002 — The acquisition ladder: how plugins and capture sources get data and act on endpoints
@@ -38,20 +41,19 @@ related: >-
 
 Every plugin action and capture source ultimately asks the operating system a
 question ("what model is this machine?", "which TCP connections exist?") or tells
-it to do something ("quarantine this file"). There are four ways to ask, and this
+it to do something ("quarantine this file"). There are three ways to ask, and this
 ADR fixes their priority order — and the order is **mandatory and sequential**.
 Development starts at rung 1, and moves down **one rung at a time, only on
 recorded evidence** that the rung above cannot reasonably serve the site: the
-syscall/kernel surface is considered and ruled out on evidence before a native
-API, the API before spawning a process, the argv runner before any shell. A
+native OS interface is considered and ruled out on evidence before spawning a
+process, the argv runner before any shell. A
 bare assertion ("the API route looked painful") never justifies a descent; a
 cited, checkable justification from the categories below does.
 
 ```
-Rung 1  KERNEL INTERFACE   agent ──syscall / kernel surface──▶ kernel        (0 processes, typed data)
-Rung 2  NATIVE OS API      agent ──framework / OS API call──▶ OS service     (0 processes, typed data)
-Rung 3  ARGV RUNNER        agent ──fork/exec──▶ tool ──▶ text ──▶ C++ parse  (1 process)
-Rung 4  GOVERNED SHELL     agent ──runner──▶ /bin/sh ──parse──▶ tool ──▶ …   (2+ processes, string = code)
+Rung 1  NATIVE OS INTERFACE  agent ──syscall / kernel surface / OS API──▶ OS  (0 processes, typed data)
+Rung 2  ARGV RUNNER          agent ──fork/exec──▶ tool ──▶ text ──▶ C++ parse (1 process)
+Rung 3  GOVERNED SHELL       agent ──runner──▶ /bin/sh ──parse──▶ tool ──▶ …  (2+ processes, string = code)
 ```
 
 Each rung down inserts another layer between the agent and the answer — another
@@ -64,39 +66,42 @@ locales).
 
 ### The rungs, concretely
 
-**Rung 1 — kernel data interfaces.** Syscalls and kernel-published surfaces:
-`sysctlbyname()`, `/proc` and `/sys` reads, `getifaddrs()`, `statvfs()`,
-netlink, kernel control sockets. Zero processes, near-zero cost, data arrives
-as structs or stable kernel text. Already ours in places: `network_diag` reads
-`/proc/net/tcp` directly; the netqual work's nstat spike replaced a would-be
-`nettop` spawn with one kernel-control socket. Platform honesty: "kernel
-interface" means the lowest *supported* surface — on Linux the kernel ABI is
-the contract; on macOS and Windows you reach it through libSystem/Win32
-wrappers, never raw syscall numbers (those are unstable there by design).
+**Rung 1 — the native OS interface.** Everything in-process: syscalls and
+kernel-published surfaces (`sysctlbyname()`, `/proc` and `/sys` reads,
+`getifaddrs()`, `statvfs()`, netlink, kernel control sockets) and the OS APIs
+and frameworks layered over them (WMI, Win32 APIs such as
+`GetExtendedTcpTable` and `Reg*W`, IOKit, Security.framework, Endpoint
+Security, ETW, `sd_journal`). Zero processes, near-zero cost, data arrives as
+structs or stable kernel text — and there is no meaningful mechanism split
+inside this rung: every in-process route bottoms out in the same syscall
+layer, differing only in how thick the supported wrapper is. Within the rung,
+ordinary engineering judgment prefers the lowest-dependency surface available
+(a kernel-published surface over a daemon-mediated framework call that can
+block on a wedged service) — a preference, not an evidence-gated step.
+Already ours in places: Windows plugins live here
+(`hardware`/`bitlocker`/`license_scan` via WMI), the TAR capture sources were
+built here from day one (ES on macOS, ETW on Windows — `ProcStreamCollector`
+implementations, never spawned tools), `network_diag` reads `/proc/net/tcp`
+directly, and the netqual nstat spike replaced a would-be `nettop` spawn with
+one kernel-control socket. Platform honesty: "native interface" means the
+lowest *supported* surface — on Linux the kernel ABI is the contract; on
+macOS and Windows you reach it through libSystem/Win32 wrappers, never raw
+syscall numbers (those are unstable there by design).
 
-**Rung 2 — native OS APIs and frameworks.** WMI, Win32 APIs
-(`GetExtendedTcpTable`, `Reg*W`), IOKit, Security.framework, Endpoint
-Security, ETW, `sd_journal`. Still in-process, still typed, but mediated by an
-OS service or framework — heavier (COM apartments, daemon dependencies), and
-some calls can block on a wedged system service. This is where Windows
-plugins already live (`hardware`/`bitlocker`/`license_scan` via WMI), and
-where the TAR capture sources were built from day one (ES on macOS, ETW on
-Windows — `ProcStreamCollector` implementations, never spawned tools).
-
-**Rung 3 — the argv runner.** A subprocess, exec'd directly from a pre-split
+**Rung 2 — the argv runner.** A subprocess, exec'd directly from a pre-split
 argument array through the shared agent-core `subprocess_runner`: absolute
 path, no PATH search, no interpreter, hard deadline, output caps,
 process-group kill, fork-lock covered. The right rung when the capability
-only exists as a CLI, or when a subprocess is *desirable* (see "stepping
-down" below).
+only exists as a CLI, or when a subprocess is *desirable* (see "Justifying a
+descent" below).
 
-**Rung 4 — the governed shell.** A shell string — but executed *through the
+**Rung 3 — the governed shell.** A shell string — but executed *through the
 runner* (`{"/bin/sh", "-c", <validated literal>}`), as a registered exception
 only. The shell is an interpreter: everything in the string is code to it,
 which is why it sits last and why raw `popen()`/`system()` are banned
 outright (Decision 2).
 
-### Same question, four rungs
+### Same question, three rungs
 
 Reading the hardware model on macOS today: `run_command("sysctl -n hw.model")`
 — a shell parses the string, forks, execs `sysctl`, which calls…
@@ -126,7 +131,7 @@ recognised categories:
 - **The rung cannot satisfy a hard requirement of the site.** Three recognised
   hard requirements: *per-call privilege elevation* on Linux — the agent must
   not hold the privilege in-process, and `sudo` exists only at a process
-  boundary, so rungs 1–2 are ruled out for privileged Linux operations
+  boundary, so rung 1 is ruled out for privileged Linux operations
   (Decision 8); *bounded cancellation* — a daemon-backed in-process call with
   a demonstrated wedge history cannot be killed without killing the agent,
   where a child is SIGKILLed at the runner's deadline; *crash isolation* — an
@@ -143,9 +148,9 @@ recognised categories:
 ## Context
 
 - **The fleet is split by platform and by history.** Windows plugins largely
-  live at rungs 1–2 already (WMI/Win32, registry via `Reg*W`); TAR capture
-  sources were built at rungs 1–2 (ES/ETW). But 27 of 49 plugins — heavily
-  concentrated on macOS and Linux — sit at an *ungoverned* rung 4: per-plugin
+  live at rung 1 already (WMI/Win32, registry via `Reg*W`); TAR capture
+  sources were built at rung 1 (ES/ETW). But 27 of 49 plugins — heavily
+  concentrated on macOS and Linux — sit at an *ungoverned* rung 3: per-plugin
   shell helpers of varying shapes (`run_command`, `run_command_rc`,
   `run_command_lines`, bare `system()` probes, bespoke `tar`/`interaction`
   helpers) wrapping `popen()`/`system()`. Exactly three plugins exec directly
@@ -158,7 +163,7 @@ recognised categories:
   arguments in plugin sources — but they upload SARIF without failing CI
   (Decision 10), and nothing records why a site is at the rung it's at.
 - **The risk is not hypothetical.** Governance history records 4 CRITICAL
-  command-injection vulnerabilities. Surviving rung-4 sites interpolate
+  command-injection vulnerabilities. Surviving rung-3 sites interpolate
   values that are untrusted or attacker-influenceable — operator/server
   params (`network_actions`/`wol` ping hosts), derived values (`discovery`
   IPs), local-system strings (`users` usernames, `license_scan` filenames,
@@ -178,7 +183,7 @@ recognised categories:
   27 spawning plugins' scattered `popen` calls remain **not** covered; each
   is an unserialised `fork()` that can leak fds. The residual closes only if
   every spawn, including approved shell use, routes through covered code
-  (Decisions 2 and 7). Rung-1/2 promotions close it harder still — a spawn
+  (Decisions 2 and 7). Rung-1 promotions close it harder still — a spawn
   that no longer exists cannot race.
 - **A shared runner now exists** (`agents/core` `subprocess_runner`, on
   `feat/macos-subproc-runner-certs`): fixed argv, absolute-path `execv`, own
@@ -186,7 +191,7 @@ recognised categories:
   cooperative cancel; in agent-core deliberately so its reaper thread
   survives plugin `dlclose()`. On that branch `filesystem` is fully migrated;
   `certificates`/`event_logs` are migrated on their macOS paths only. The
-  branch also establishes the governed rung-4 shape: `certificates` routes
+  branch also establishes the governed rung-3 shape: `certificates` routes
   one validated `{"/bin/sh", "-c", cmd}` call *through the runner* where the
   outer shell's `~username` expansion is genuinely needed.
 
@@ -300,7 +305,7 @@ includes a representative-load latency measurement rather than resting on this
 arithmetic. The genuinely scarce resource in a burst is plugin-host *threads*
 (each call blocks its caller up to the deadline) — identical under `popen`
 today and under any per-plugin runner; an async variant on the same runner is
-the fix if ever measured, not decentralisation. And every rung-1/2 promotion
+the fix if ever measured, not decentralisation. And every rung-1 promotion
 removes its spawn from the picture entirely.
 
 **Scaling levers, should spawn rate ever grow orders of magnitude** — both work
@@ -321,13 +326,13 @@ removes its spawn from the picture entirely.
 
 1. **The ladder is mandatory and sequential, and every descent is
    evidence-backed.** Every new data-acquisition or action path in plugins
-   and capture sources starts at rung 1 — the syscall/kernel surface is
+   and capture sources starts at rung 1 — the native OS interface is
    considered first — and moves down **one rung at a time, only on recorded
    evidence** from the recognised categories above (no interface exists; only
    interface unsupported by platform contract; a hard requirement —
    privilege elevation, bounded cancellation, crash isolation — demonstrably
-   unmeetable; a written disproportionate-cost comparison). Syscalls are
-   ruled out on evidence before APIs, APIs before the argv runner, the argv
+   unmeetable; a written disproportionate-cost comparison). The native
+   interface is ruled out on evidence before spawning a process, the argv
    runner before any shell. Each descent's **rung evidence** is recorded in
    the code and in the sink manifest; a bare assertion is not evidence;
    reviewers reject any descent without it. Existing sites acquire their
@@ -375,7 +380,7 @@ removes its spawn from the picture entirely.
    today's `is_safe_host()` permits a leading `-`), keep numeric parameters
    bounds-checked, keep per-tool allowlists as defense-in-depth, and treat any
    interpreter payload under Decision 5 as code.
-7. **Documented rung-4 exceptions are registered call identities, narrowly.**
+7. **Documented rung-3 exceptions are registered call identities, narrowly.**
    An exception names the exact function/call site (never a whole file), uses
    only compile-time constant or allowlist-validated strings, carries an
    in-code comment stating why the shell capability is unavoidable, and
@@ -385,10 +390,10 @@ removes its spawn from the picture entirely.
    closes the BR-001 residual; a retained raw `popen` would sit outside the
    fork lock and keep the race alive.
 8. **Privileged execution on Linux keeps the sudo boundary intact — and stays
-   rung 3 by design.** Linux runs the agent unprivileged with narrow
+   rung 2 by design.** Linux runs the agent unprivileged with narrow
    `sudo NOPASSWD` grants matched against specific command forms
    (`docs/agent-privilege-model.md`); per-call elevation exists only at a
-   process boundary, so rung-1/2 promotion is out of scope for privileged
+   process boundary, so rung-1 promotion is out of scope for privileged
    Linux operations. The canonical privileged argv is
    `{"/usr/bin/sudo", "-n", "--", "/abs/path/tool", args…}`; every migrated
    privileged site is checked against the sudoers grant it relies on — a
@@ -421,17 +426,17 @@ removes its spawn from the picture entirely.
     coverage, the call-identity allowlist, and executed query tests. Making
     CodeQL itself run per-PR is an explicit capacity decision (a full traced
     build per PR on the self-hosted pools), recorded as open — not assumed.
-    Rung *choice* (1/2 vs 3) is not machine-checkable — it is enforced by the
+    Rung *choice* (1 vs 2) is not machine-checkable — it is enforced by the
     Decision-1 rung evidence in code review and the manifest.
 
 ## Considered alternatives
 
-- **Rungs 1–2 only (ban subprocesses outright).** Rejected: some capabilities
+- **Rung 1 only (ban subprocesses outright).** Rejected: some capabilities
   exist only as CLIs; the CLI is sometimes the more stable contract than a
   private ABI; the subprocess boundary provides kill-ability and crash
   isolation that in-process calls cannot; and the Linux privilege model
   requires a process boundary to elevate through. The ladder captures the
-  preference without pretending the top rungs always reach.
+  preference without pretending the top rung always reaches.
 - **Per-plugin ephemeral argv runners** (each plugin its own runner/helper).
   Rejected: no isolation gained (same process, same address space); fork-lock
   coverage becomes per-site discipline again — scattered copies forgetting the
@@ -456,7 +461,7 @@ removes its spawn from the picture entirely.
 
 Before wave work starts, generate a complete manifest of every spawn call
 site — one row each: plugin/file/line, mechanism, platform, **ladder review**
-(*does this subprocess need to exist, or does a rung-1/2 interface answer the
+(*does this subprocess need to exist, or does a rung-1 interface answer the
 same question?* — with the per-rung evidence chain when it stays a subprocess), data
 provenance (operator/server param, derived, filesystem, constant), mutating vs
 read-only, shell features used, environment/cwd/stdin needs, output semantics,
@@ -466,10 +471,10 @@ manifest is, and it is how "no site missed" is proven at the end.
 
 Known rung-promotion candidates to seed the ladder-review column (each still
 subject to the descent-evidence tests — contract stability and kill-ability in
-particular): `sysctl -n …` spawns → `sysctlbyname()` (rung 1); DEX Linux
-`journalctl` `popen` → `sd_journal` API (rung 2); macOS `certificates`
-`security`-CLI reads → Security.framework where equivalent (rung 2); `ioreg`
-subsets → IOKit registry reads (rung 2).
+particular): `sysctl -n …` spawns → `sysctlbyname()`; DEX Linux
+`journalctl` `popen` → `sd_journal`; macOS `certificates` `security`-CLI
+reads → Security.framework where equivalent; `ioreg` subsets → IOKit
+registry reads — all rung-1 promotions.
 
 ### Runner API work to close first (prerequisites, in agent-core; feed back to #2321 follow-ups)
 
@@ -533,7 +538,7 @@ not all are operator-supplied, all are influenceable):
 - `users` — usernames read from `/etc/passwd` into `lastlog -u …`
 - `license_scan` — filesystem filenames via hand-rolled `shell_single_quote()`
 - `certificates` — filesystem paths and thumbprints interpolated into
-  OpenSSL/security commands on `dev` (not literal-only; also a rung-2
+  OpenSSL/security commands on `dev` (not literal-only; also a rung-1
   promotion candidate)
 - `quarantine` — destructive file operations (mutating; high blast radius)
 - `services` — service mutation commands (mutating)
@@ -550,7 +555,7 @@ line of defense.
 ### Wave 2 — literal single-command sites (mechanical swaps or rung promotions)
 
 Straight `run_command("tool args")` with no shell features: per the manifest's
-ladder review, either **promote** (delete the spawn for a rung-1/2 call) or
+ladder review, either **promote** (delete the spawn for a rung-1 call) or
 **swap** to a runner call with a probed absolute path. Representative set:
 `hardware`, `os_info`, `device_identity`, `antivirus`, `bitlocker`, `sccm`,
 `network_diag`, `processes` (`ps -axo …`), `firewall`. Sites whose only shell
@@ -589,7 +594,7 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
   the shared runner **only after** the prerequisite runner features above
   exist — premature convergence would regress behaviour.
 - Agent-core shell-outs migrate under the same rules: `dex_macos_collector.cpp`,
-  `dex_linux_collector.cpp` (a `sd_journal` rung-2 candidate), and the
+  `dex_linux_collector.cpp` (a `sd_journal` rung-1 candidate), and the
   `trigger_engine.cpp` `popen` sites (the Linux branch of which is also
   outside the fork lock today).
 - `tar` mapdrive/service collectors: re-homed as Decision-7 registered
@@ -599,7 +604,7 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
 
 ### Explicit non-goals
 
-- Existing rung-1/2 paths (Windows WMI/Win32, TAR ES/ETW capture sources,
+- Existing rung-1 paths (Windows WMI/Win32, TAR ES/ETW capture sources,
   `/proc`//`sys` reads) are untouched — they are already the target state.
 - The Erlang gateway spawns no plugin subprocesses and is out of scope; the
   only interaction is budget arithmetic (an agent-side subprocess deadline
@@ -619,7 +624,7 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
   recorded, reviewable acquisition pattern aligned with the lightweight-
   footprint principle; rung promotions delete subprocesses outright
   (microseconds and structs where there were processes and text);
-  shell-metacharacter injection is eliminated structurally at rungs ≤3 in
+  shell-metacharacter injection is eliminated structurally at rungs ≤2 in
   bundled plugins (out-of-tree plugins: see Decision 4's stated gap); every
   surviving spawn — shell exceptions included — gains a deadline, caps, group
   kill, honest termination reporting, and fork-lock coverage; 27 divergent
@@ -631,7 +636,7 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
   runner's mandatory deadline converts every step into a bounded outcome,
   the precondition for autonomous retry/escalation existing at all.
 - **Negative / accepted:** migration effort across 27 plugins (staged waves,
-  each independently shippable); rung-1/2 promotions cost per-OS API code and
+  each independently shippable); rung-1 promotions cost per-OS API code and
   carry their own ABI/blocking risks — hence the recognised evidence
   categories rather than silent judgment; the sequential-descent rule
   front-loads investigation effort (each site must research the higher rung
@@ -646,7 +651,7 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
   C++ API (accepted per Decision 4's internal-seam boundary — never for third
   parties).
 - **Risk:** behaviour drift during restructures — a C++ filter subtly unlike
-  the `grep`/`awk` it replaces, a rung-2 API subtly unlike the CLI's output,
+  the `grep`/`awk` it replaces, a native API subtly unlike the CLI's output,
   an argv rewrite subtly unlike the sudoers grant it must match. Controlled by
   fixture-driven parser tests per site (capture real command output as the
   fixture before migrating; assert identical extraction after), per-site
