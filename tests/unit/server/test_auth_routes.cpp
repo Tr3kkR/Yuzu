@@ -17,11 +17,13 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
+#include "pg/pg_raii.hpp" // PgConn/PgResult — the CH-4 saboteur's second connection
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#include <libpq-fe.h>
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
@@ -692,14 +694,13 @@ TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not r
 
     // Break the store underneath the token, from a SECOND connection — no test-only
     // hook on the production store, and this is what a real corruption/ops accident
-    // looks like from the reader's side: the statement it needs will not prepare.
+    // looks like from the reader's side: the query it needs will not run.
     {
-        sqlite3* saboteur = nullptr;
-        REQUIRE(sqlite3_open((f.tmp_dir / "api_tokens.db").string().c_str(), &saboteur) ==
-                SQLITE_OK);
-        REQUIRE(sqlite3_exec(saboteur, "DROP TABLE api_tokens;", nullptr, nullptr, nullptr) ==
-                SQLITE_OK);
-        sqlite3_close(saboteur);
+        yuzu::server::pg::PgConn saboteur{PQconnectdb(f.api_tokens.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(saboteur.get(), "DROP TABLE api_token_store.api_tokens")};
+        REQUIRE(r.ok());
     }
 
     CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kIndeterminate);

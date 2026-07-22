@@ -72,23 +72,6 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ (fail-closed)
 }
 
-// Per-instance unique path so tests are safe to run under parallel
-// meson test --num-processes N. The prior hardcoded path collided
-// between concurrent test cases.
-/// Per-test SQLite path. Uses the shared `unique_temp_path` helper: the previous
-/// local salt combined `std::hash<std::thread::id>` with `steady_clock::now()`, the
-/// exact pattern CLAUDE.md bans after flake #473 — under Defender-serialised I/O on
-/// the shared-identity CI runners those collide silently, and two tests then fight
-/// over one database file.
-struct TempDb {
-    std::filesystem::path path;
-    TempDb() : path(yuzu::test::unique_temp_path("yuzu-api-tokens-")) {}
-    ~TempDb() {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-    }
-};
-
 // ── Regression guard: behaviour preserved verbatim across the PG port ────
 
 TEST_CASE("ApiTokenStore: create and validate token", "[pg][token][crud]") {
@@ -1349,9 +1332,11 @@ TEST_CASE("ApiTokenStore: revoking a rotation SUCCESSOR clears the predecessor's
 // killing every live stream on the fleet at once (Decision 15(i), chaos CH-4).
 
 TEST_CASE("ApiTokenStore: validate_token_checked reports a live token as valid",
-          "[token][auth][stream]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+          "[pg][token][auth][stream]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     auto raw = store.create_token("Stream Token", "alice");
     REQUIRE(raw.has_value());
 
@@ -1362,9 +1347,11 @@ TEST_CASE("ApiTokenStore: validate_token_checked reports a live token as valid",
 }
 
 TEST_CASE("ApiTokenStore: a revoked token is DEFINITIVELY invalid, not indeterminate",
-          "[token][auth][stream]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+          "[pg][token][auth][stream]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     auto raw = store.create_token("Doomed", "alice");
     REQUIRE(raw.has_value());
     auto live = store.validate_token(*raw);
@@ -1380,38 +1367,45 @@ TEST_CASE("ApiTokenStore: a revoked token is DEFINITIVELY invalid, not indetermi
     CHECK_FALSE(checked.token.has_value());
 }
 
-TEST_CASE("ApiTokenStore: an unknown token is definitively invalid", "[token][auth][stream]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: an unknown token is definitively invalid", "[pg][token][auth][stream]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     auto checked = store.validate_token_checked("yuzu_never_issued_0123456789012");
     CHECK(checked.status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
-TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[token][auth][stream]") {
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[pg][token][auth][stream]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     CHECK(store.validate_token_checked("").status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
 TEST_CASE("ApiTokenStore: an unreadable store is kUnavailable, NOT kInvalid",
-          "[token][auth][stream]") {
+          "[pg][token][auth][stream]") {
     // The whole reason validate_token_checked exists. validate_token collapses "the row
     // is gone" and "I could not read the table" into the same nullopt — right for
     // request auth (both mean 401), fatal for a held-open stream, where the first must
     // kill it immediately and the second must NOT (an auth-store hiccup would otherwise
     // cut every stream on the fleet at once — ADR-1005 Decision 15(i), chaos CH-4).
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     auto raw = store.create_token("doomed-store", "alice");
     REQUIRE(raw.has_value());
 
     // Break the store from a second connection. Do NOT validate first — a cached token
-    // would answer from memory and never touch the broken table.
-    sqlite3* saboteur = nullptr;
-    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &saboteur) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(saboteur, "DROP TABLE api_tokens;", nullptr, nullptr, nullptr) ==
-            SQLITE_OK);
-    sqlite3_close(saboteur);
+    // would answer from memory and never touch the dropped table.
+    {
+        PgConn saboteur{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        PgResult r{PQexec(saboteur.get(), "DROP TABLE api_token_store.api_tokens")};
+        REQUIRE(r.ok());
+    }
 
     const auto checked = store.validate_token_checked(*raw);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
@@ -1419,29 +1413,34 @@ TEST_CASE("ApiTokenStore: an unreadable store is kUnavailable, NOT kInvalid",
 }
 
 TEST_CASE("ApiTokenStore: a CONTENDED store is kUnavailable, not a false revocation",
-          "[token][auth][stream][ch4]") {
+          "[pg][token][auth][stream][ch4]") {
     // The bug this replaced: validate_token_checked used to call validate_token and then
     // probe the store with a DIFFERENT trivial statement to decide whether the negative
-    // answer was real. But validate_token folds a failed step on the row SELECT (BUSY,
-    // I/O error) into the same nullopt as "no such row" — and the probe statement can
-    // still succeed on a merely-contended database. A healthy stream was therefore killed
-    // as `credential_revoked` because the store was busy, and the 60 s grace window that
-    // exists for exactly this fault was unreachable.
+    // answer was real. But validate_token folds a failed row lookup into the same nullopt
+    // as "no such row" — and the probe statement can still succeed on a merely-contended
+    // store. A healthy stream was therefore killed as `credential_revoked` because the
+    // backend was busy, and the 60 s grace window that exists for exactly this fault was
+    // unreachable.
     //
     // Here the table is present (so a "SELECT 1 FROM api_tokens LIMIT 1" probe WOULD
-    // succeed) but the row lookup cannot run, because the schema it needs is gone.
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+    // succeed) but the row lookup cannot run, because the column it needs is gone.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     auto raw = store.create_token("busy-store", "alice");
     REQUIRE(raw.has_value());
 
-    sqlite3* saboteur = nullptr;
-    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &saboteur) == SQLITE_OK);
-    // Rename the column the lookup selects: the table still exists, so a naive probe is
-    // happy — only the real query fails.
-    REQUIRE(sqlite3_exec(saboteur, "ALTER TABLE api_tokens RENAME COLUMN token_hash TO gone;",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(saboteur);
+    {
+        PgConn saboteur{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        // Rename the column the lookup selects: the table still exists, so a naive probe
+        // is happy — only the real query fails.
+        PgResult r{PQexec(saboteur.get(),
+                          "ALTER TABLE api_token_store.api_tokens "
+                          "RENAME COLUMN token_hash TO gone")};
+        REQUIRE(r.ok());
+    }
 
     const auto checked = store.validate_token_checked(*raw);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
@@ -1449,13 +1448,15 @@ TEST_CASE("ApiTokenStore: a CONTENDED store is kUnavailable, not a false revocat
 }
 
 TEST_CASE("ApiTokenStore: re-validation does not write last_used_at",
-          "[token][auth][stream]") {
+          "[pg][token][auth][stream]") {
     // Re-validation runs on every heartbeat tick of every live stream. Writing here would
-    // make last_used_at track heartbeats instead of actual calls, and would put an
-    // exclusive write on the shared connection each time a stream's cache entry expired —
-    // a thundering herd that every token-authenticated request then queues behind.
-    TempDb tmp;
-    ApiTokenStore store(tmp.path);
+    // make last_used_at track heartbeats instead of actual calls, and would put a write on
+    // a pooled connection each time a stream's cache entry expired — a thundering herd
+    // that every token-authenticated request then queues behind.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
     auto raw = store.create_token("read-only-check", "alice");
     REQUIRE(raw.has_value());
 
@@ -1465,14 +1466,10 @@ TEST_CASE("ApiTokenStore: re-validation does not write last_used_at",
 
     // Read the column straight from the DB — a write by the check would show up here even
     // though the cached copy would not.
-    sqlite3* reader = nullptr;
-    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &reader) == SQLITE_OK);
-    sqlite3_stmt* st = nullptr;
-    REQUIRE(sqlite3_prepare_v2(reader, "SELECT last_used_at FROM api_tokens;", -1, &st,
-                               nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
-    const auto persisted = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    sqlite3_close(reader);
-    CHECK(persisted == 0); // the check is a READ — it did not stamp last_used_at
+    PgConn reader{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(reader.get()) == CONNECTION_OK);
+    PgResult r{PQexec(reader.get(), "SELECT last_used_at FROM api_token_store.api_tokens")};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "0"); // a READ — it did not stamp
 }
