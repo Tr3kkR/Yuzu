@@ -299,7 +299,8 @@ public:
                                 yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                                 StreamRevalidateFn revalidate_fn = {},
                                 yuzu::MetricsRegistry* metrics = nullptr,
-                                std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault);
+                                std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault,
+                                StreamPrincipalAuditFn principal_audit_fn = {});
     HandlerFn build_delete_handler(AuthFn auth_fn, AuditFn audit_fn, const bool* mcp_disabled,
                                    const bool* streaming_disabled, McpSessionRegistry* sessions,
                                    std::vector<std::string> allowed_origins);
@@ -348,7 +349,10 @@ public:
                          // the flag parsed, validated and documented as a live control
                          // while having no effect whatsoever.
                          std::size_t mcp_max_streams_per_principal =
-                             kMcpStreamsPerPrincipalDefault);
+                             kMcpStreamsPerPrincipalDefault,
+                         // Explicit-principal audit sink for mcp.stream.close (see
+                         // StreamPrincipalAuditFn). Empty falls back to the generic sink.
+                         StreamPrincipalAuditFn principal_audit_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

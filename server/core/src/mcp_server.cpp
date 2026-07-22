@@ -6606,7 +6606,8 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                                                   yuzu::server::detail::StreamBudget* stream_budget,
                                                   StreamRevalidateFn revalidate_fn,
                                                   yuzu::MetricsRegistry* metrics,
-                                                  std::size_t per_principal_cap) {
+                                                  std::size_t per_principal_cap,
+                                                  StreamPrincipalAuditFn principal_audit_fn) {
     const std::vector<std::string> origins = std::move(allowed_origins);
     return [=](const httplib::Request& req, httplib::Response& res) {
         // NOTE: no up-front Content-Type here. httplib's set_header EMPLACES into a
@@ -6660,8 +6661,12 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
             return; // auth_fn already set 401
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,
         // provider) lives in mcp_stream.cpp — this file stays wiring.
+        // Role captured HERE, while the credential is still valid — the close audit runs
+        // at teardown, when it may not be.
         handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
-                        metrics, audit_fn, per_principal_cap);
+                        metrics, audit_fn, per_principal_cap,
+                        auth::role_to_string(auth::effective_role(*session)),
+                        principal_audit_fn);
     };
 }
 
@@ -6778,13 +6783,15 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 EnginePrincipalStore* engine_principal_store,
                                 yuzu::server::detail::StreamBudget* stream_budget,
                                 StreamRevalidateFn revalidate_fn,
-                                std::size_t mcp_max_streams_per_principal) {
+                                std::size_t mcp_max_streams_per_principal,
+                                StreamPrincipalAuditFn principal_audit_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
     svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
                                           sessions, allowed_origins, stream_budget, revalidate_fn,
-                                          metrics, mcp_max_streams_per_principal));
+                                          metrics, mcp_max_streams_per_principal,
+                                          principal_audit_fn));
     svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
                                                 mcp_streaming_disabled, sessions, allowed_origins));
 

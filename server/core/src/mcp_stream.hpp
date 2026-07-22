@@ -163,6 +163,23 @@ using StreamAuditFn = std::function<bool(const httplib::Request&, const std::str
                                          const std::string& result, const std::string& target_type,
                                          const std::string& target_id, const std::string& detail)>;
 
+/// Audit sink that STAMPS the principal explicitly instead of re-deriving it from the
+/// request. Required for `mcp.stream.close`, and only for it.
+///
+/// The generic sink resolves the actor by calling `resolve_session(req)` when the row is
+/// written. That is correct for a request-time audit, and wrong for a stream close: the
+/// close audit runs at teardown against the ORIGINAL attach request, so on a
+/// `credential_revoked` close the credential no longer resolves BY DEFINITION and the row
+/// lands with an empty `principal`/`principal_role`. The rows that prove the revocation
+/// control are exactly the rows that lose their actor (SOC 2 CC6.2/CC7.2).
+///
+/// The principal is known at attach time, so it is captured then and stamped here.
+/// Empty = fall back to the generic sink (test seams; production wires it).
+using StreamPrincipalAuditFn = std::function<bool(
+    const httplib::Request&, const std::string& action, const std::string& result,
+    const std::string& principal, const std::string& principal_role,
+    const std::string& target_type, const std::string& target_id, const std::string& detail)>;
+
 /// One live GET attachment: the reusable SSE sink, the close-reason channel the
 /// generic sink lacks, and THE BUDGET LEASE FOR THE WORKER THIS ATTACHMENT PINS.
 ///
@@ -381,6 +398,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                      const std::string& principal, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
                      yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
-                     std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault);
+                     std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault,
+                     const std::string& principal_role = {},
+                     const StreamPrincipalAuditFn& principal_audit_fn = {});
 
 }  // namespace yuzu::server::mcp

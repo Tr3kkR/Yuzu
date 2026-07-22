@@ -90,6 +90,42 @@ template <class AuditFn>
     return false;
 }
 
+/// Same guarantees as `try_persist_audit`, for a sink that STAMPS the principal
+/// explicitly rather than re-deriving it from the request.
+///
+/// Needed wherever the audit row is written at a moment when the request's credential
+/// no longer resolves — the motivating case is `mcp.stream.close` on a
+/// `credential_revoked` teardown, where re-deriving would leave the actor blank on
+/// precisely the rows that evidence the revocation control.
+template <typename PrincipalAuditFn>
+[[nodiscard]] inline bool
+try_persist_audit_for_principal(const PrincipalAuditFn& audit_fn, const httplib::Request& req,
+                                const std::string& action, const std::string& result,
+                                const std::string& principal, const std::string& principal_role,
+                                const std::string& target_type, const std::string& target_id,
+                                const std::string& detail) {
+    static_assert(
+        std::is_invocable_r_v<bool, const PrincipalAuditFn&, const httplib::Request&,
+                              const std::string&, const std::string&, const std::string&,
+                              const std::string&, const std::string&, const std::string&,
+                              const std::string&>,
+        "PrincipalAuditFn must be bool(const httplib::Request&, action, result, principal, "
+        "principal_role, target_type, target_id, detail)");
+    if (!audit_fn)
+        return true; // audit-off deployment — not a persist failure; serve.
+    try {
+        return audit_fn(req, action, result, principal, principal_role, target_type, target_id,
+                        detail);
+    } catch (const std::exception& e) {
+        spdlog::warn("principal audit_fn threw action={} target={}: {}", action, target_id,
+                     e.what());
+    } catch (...) {
+        spdlog::warn("principal audit_fn threw (non-std exception) action={} target={}", action,
+                     target_id);
+    }
+    return false;
+}
+
 /// HTTP wrapper: `try_persist_audit` + set the `Sec-Audit-Failed: true`
 /// response header on failure. Returns the persist outcome so the caller picks
 /// its posture (HTML fragments PROCEED and render; REST JSON FAIL CLOSED 503).

@@ -643,7 +643,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                      const std::string& principal, McpSessionRegistry& sessions,
                      sse_bus::StreamBudget* budget, const StreamRevalidateFn& revalidate,
                      yuzu::MetricsRegistry* metrics, const StreamAuditFn& audit_fn,
-                     std::size_t per_principal_cap) {
+                     std::size_t per_principal_cap, const std::string& principal_role,
+                     const StreamPrincipalAuditFn& principal_audit_fn) {
     const auto cid = yuzu::server::detail::make_correlation_id();
     const auto audit = [&](const char* action, const char* result, const std::string& target_id,
                            const std::string& detail) {
@@ -835,7 +836,8 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // from adopt_quota_slot_into_stream's own body), which is still worth having
         // because httplib invokes releasers from ~Response (#2037's class).
         [inner = yuzu::server::detail::adopt_quota_slot_into_stream(
-             [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
+             [stream, sink, audit_fn, principal_audit_fn, principal, principal_role, req_copy,
+              audit_sid, cid](bool /*success*/) noexcept {
                 // Runs from ~Response — a DESTRUCTOR. An exception escaping here is
                 // std::terminate no matter what httplib does, so the whole body is guarded
                 // (try_persist_audit swallows its own, but the string building allocates).
@@ -850,14 +852,29 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                     // observability-conventions.md and pre-seeded in server.cpp, and would
                     // mean the reason vocabulary said nothing about the commonest close.
                     const auto reason = sink->close_reason.load();
-                    (void)yuzu::server::detail::try_persist_audit(
-                        audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession",
-                        audit_sid,
+                    const auto detail =
                         std::string("reason=") +
-                            to_string(reason == McpStreamClose::kNone
-                                          ? McpStreamClose::kClientGone
-                                          : reason) +
-                            " cid=" + cid);
+                        to_string(reason == McpStreamClose::kNone ? McpStreamClose::kClientGone
+                                                                  : reason) +
+                        " cid=" + cid;
+                    // STAMP the principal rather than letting the sink re-derive it. The
+                    // generic sink resolves the actor from the request when the row is
+                    // written, and this row is written at teardown against the ORIGINAL
+                    // attach request — so on a `credential_revoked` close the credential no
+                    // longer resolves by definition and the row would name nobody. The rows
+                    // that prove the revocation control would be exactly the rows missing
+                    // their actor (SOC 2 CC6.2/CC7.2). Both values were captured at attach,
+                    // while the credential was still good.
+                    if (principal_audit_fn) {
+                        (void)yuzu::server::detail::try_persist_audit_for_principal(
+                            principal_audit_fn, *req_copy, "mcp.stream.close", "success",
+                            principal, principal_role, "McpSession", audit_sid, detail);
+                    } else {
+                        // Test seams only — production wires the explicit-principal sink.
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, *req_copy, "mcp.stream.close", "success", "McpSession",
+                            audit_sid, detail);
+                    }
                 } catch (...) {
                     // The lease is still returned: detach() is the first call, and Lease's
                     // destructor would return it even if that somehow threw.

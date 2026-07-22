@@ -5491,9 +5491,27 @@ private:
             // stream target is clamped to what their pool can actually carry, not the reverse.
             pool_base = std::max(cfg_.http_worker_threads, detail::kMinHttpWorkerThreads);
         }
-        const std::size_t pool_max = pool_base; // no growth games: the pool IS the budget
-        web_server_->new_task_queue = [pool_base, pool_max] {
-            return new httplib::ThreadPool(pool_base, pool_max);
+        const std::size_t pool_max = pool_base; // the pool IS the budget: capacity == pool_max
+        // Threads are created LAZILY up to pool_max, not all at boot.
+        //
+        // httplib's ThreadPool constructor spawns its *base* count in a loop with no
+        // try/catch (httplib.h ~9780). If a pthread_create fails partway — a container
+        // `pids` cap, RLIMIT_NPROC, memory pressure — std::thread's constructor throws,
+        // and the partially-filled `threads_` vector is destroyed during that unwind with
+        // already-started, unjoined threads in it. ~thread() on a joinable thread is
+        // std::terminate. So an eager base equal to pool_max turned a resource limit into
+        // an unconditional process abort at boot, with no log line and no readiness
+        // signal — and at the CLI ceiling that is 8200 threads created back to back.
+        //
+        // Capacity is unchanged: httplib grows to max_thread_count_ on demand and retires
+        // idle threads, so derive_stream_budget's arithmetic (which is about pool_max)
+        // still holds. What changes is that a server which never holds a stream open no
+        // longer pays for threads it will not use, and the boot-time failure window
+        // shrinks to a handful of threads instead of thousands.
+        const std::size_t hw = std::max<std::size_t>(std::thread::hardware_concurrency(), 1);
+        const std::size_t pool_start = std::min(pool_max, std::max<std::size_t>(8, hw));
+        web_server_->new_task_queue = [pool_start, pool_max] {
+            return new httplib::ThreadPool(pool_start, pool_max);
         };
         const std::size_t effective_streams = detail::derive_stream_budget(
             pool_max, detail::kPlainRestReserveDefault, target_streams);
@@ -11982,7 +12000,21 @@ private:
                 // makes the flag mean anything: the attach site previously read the
                 // compile-time default, so raising or lowering the flag was a no-op
                 // on a control that parses, validates, logs and is documented.
-                cfg_.mcp_max_streams_per_principal);
+                cfg_.mcp_max_streams_per_principal,
+                // Explicit-principal audit sink for mcp.stream.close. The generic sink
+                // re-derives the actor by resolving the request's credential when the row
+                // is written; a close row is written at teardown, so on a
+                // credential_revoked close that resolution fails BY DEFINITION and the row
+                // naming the revoked principal would name nobody. Routed to
+                // audit_log_for_principal, which stamps values captured at attach time.
+                [this](const httplib::Request& req, const std::string& action,
+                       const std::string& result, const std::string& principal,
+                       const std::string& principal_role, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail) -> bool {
+                    return auth_routes_->audit_log_for_principal(req, action, result, principal,
+                                                                 principal_role, target_type,
+                                                                 target_id, detail);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
