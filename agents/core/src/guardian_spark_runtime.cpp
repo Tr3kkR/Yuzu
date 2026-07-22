@@ -702,32 +702,62 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     // was removed for exactly that reason (Gate 4 UP-3), reintroduced in bounded form.
     // Unused lifecycle allowance rolls over below, so this costs nothing when lifecycle is
     // quiet, and the overall cap is still `total`.
+    // Normalise the reserve ratio ONCE, defensively: den == 0 (disabled), num > den
+    // (nonsensical), and the wall-only case where max_entries == 0 all have to land somewhere
+    // explicit rather than dividing by zero or over-reserving (Sol review).
+    const std::size_t reserve_den = limits.compliance_reserve_den;
+    const std::size_t reserve_num =
+        (reserve_den == 0) ? 0 : std::min(limits.compliance_reserve_num, reserve_den);
+
     std::size_t reserve = 0;
-    if (!unbounded && limits.compliance_reserve_den > 0) {
-        reserve = total / limits.compliance_reserve_den * limits.compliance_reserve_num;
+    if (!unbounded && reserve_den > 0) {
+        reserve = total / reserve_den * reserve_num;
         if (reserve > total)
             reserve = total;
         // Integer division floors to 0 whenever total < den, which silently removes the
         // reserve and reopens the starvation this exists to prevent - with no diagnostic
         // (#2298 Gate 4 UP-8). Guarantee at least one slot whenever there is more than one
         // to give; at total == 1 there is nothing to split and lifecycle keeps first claim.
-        if (reserve == 0 && total > 1)
+        if (reserve == 0 && total > 1 && reserve_num > 0)
             reserve = 1;
     }
 
     DrainPassLimits lim;
     lim.budget = total - reserve;
     lim.should_stop = limits.should_stop ? &limits.should_stop : nullptr;
+
+    // Slice the WALL the same way the count is sliced. A single shared deadline made the
+    // count reserve dead on arrival under time pressure: drain_log_unlocked checks the
+    // deadline BEFORE the budget, so once lifecycle consumed the wall, compliance returned on
+    // entry without ever spending a reserved slot - the Gate-4 UP-3 detection blackout reached
+    // through the other limit (#2345 important-1).
+    //
+    // GUARANTEE, stated precisely: compliance gets an opportunity to START, provided the
+    // in-flight lifecycle send returns before the full-pass deadline. It is NOT "compliance
+    // gets time" - a lifecycle send begun just inside its slice can return after the full
+    // deadline, and no bound here can interrupt it. You cannot have both a hard pass deadline
+    // and a guaranteed compliance attempt while sends are uninterruptible (Sol review).
+    const auto pass_start = std::chrono::steady_clock::now();
     if (limits.max_wall.count() > 0) {
         lim.has_deadline = true;
-        lim.deadline = std::chrono::steady_clock::now() + limits.max_wall;
+        // Same clamped ratio as the count reserve, so the two cannot disagree.
+        const std::chrono::milliseconds lifecycle_wall =
+            (reserve_den == 0)
+                ? limits.max_wall
+                : std::chrono::milliseconds{limits.max_wall.count() *
+                                            static_cast<std::int64_t>(reserve_den - reserve_num) /
+                                            static_cast<std::int64_t>(reserve_den)};
+        lim.deadline = pass_start + lifecycle_wall;
     }
 
     bool lifecycle_truncated = false;
     out.sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, lim,
                                  lifecycle_truncated);
-    // Hand the compliance pass its reserve PLUS whatever lifecycle did not use.
+    // Hand the compliance pass its reserve PLUS whatever lifecycle did not use, and restore
+    // the FULL pass deadline - lifecycle only ever held a slice of it.
     lim.budget += reserve;
+    if (limits.max_wall.count() > 0)
+        lim.deadline = pass_start + limits.max_wall;
     bool compliance_truncated = false;
     out.sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_, lim,
                                   compliance_truncated);
