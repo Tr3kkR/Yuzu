@@ -9,8 +9,12 @@
   capped per pass so even an accepted jump ages the journal out gradually, and replay stops
   treating expired batches as unshippable while that is in progress, so it can no longer skip
   exactly the records retention deliberately kept. Detection keys off the OUTCOME - would this
-  pass age out the entire journal - rather than a process-local memory of the previous pass, so
-  it survives the agent restart a restored VM actually performs. A backward step needs no guard:
+  pass age out the entire journal - rather than only a process-local memory of the previous
+  pass. One gap remains and is tracked rather than claimed closed: the guard's state does not
+  survive a process restart, and an agent that restarts into the jumped clock - which is exactly
+  what a restored VM does - re-arms with no memory of the anomaly, so the first pass after that
+  restart is not declined. The per-pass eviction cap still bounds it. A backward step needs no
+  guard:
   it simply pauses ageing until the clock is fixed, which is the safe direction for an audit
   trail, and the count and byte ceilings that bound the journal never read the clock at all.
   (2) A batch whose records were mostly already queued for sending was charged for its whole

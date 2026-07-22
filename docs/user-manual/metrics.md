@@ -712,8 +712,10 @@ all, so absence means "nothing to report", not "not collected".
 The tags are emitted sparsely - a zero is omitted - so a Guardian drain worker that stops before
 doing any work reads on the heartbeat exactly like one with nothing to do. An exception that
 kills the worker's loop is counted (under `yuzu.guardian_journal_maint_exceptions`, with a
-`critical` log line naming it), but a worker that never starts, or that dies on its first cycle,
-is not. Until the "seconds since the last successful pass" gauge tracked for the `prefer_spark`
+`critical` log line naming it) no matter which cycle it happens on. What is NOT counted is a
+worker that never starts, or one that HANGS rather than throwing - blocked indefinitely on a
+store call, say. Nothing throws, so the firewall has nothing to catch and every counter simply
+stays where it was. Until the "seconds since the last successful pass" gauge tracked for the `prefer_spark`
 cutover (#2298) ships, corroborate a suspected-dead worker with the agent's logs rather than
 with metrics alone. There is no restart primitive short of restarting the agent daemon, and a
 restart is not free: records already written to the journal survive it, but `GuardianEngine`'s
