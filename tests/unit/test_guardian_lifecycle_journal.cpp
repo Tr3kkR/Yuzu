@@ -180,8 +180,15 @@ TEST_CASE("journal prune: age cap evicts batches older than retention", "[guardi
     REQUIRE(j.persist(one("r2", "armed")) == 1);
     REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 2);
 
-    // A now_ms far in the future makes every real-now batch older than 7 days.
-    auto stats = j.prune(32503680000000LL); // ~year 3000 in ms
+    // A now_ms far in the future makes every real-now batch older than 7 days. A pass that
+    // would age out the WHOLE journal declines once and reports it, so a clock anomaly cannot
+    // delete the audit trail wholesale (#2345 Gate 5 CH-5); the pass after it proceeds.
+    auto declined = j.prune(32503680000000LL); // ~year 3000 in ms
+    CHECK(declined.evicted == 0);
+    CHECK(j.clock_jump_skips() == 1);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+
+    auto stats = j.prune(32503680001000LL);
     CHECK(stats.evicted == 2);
     CHECK(j.batches_pruned() == 2);
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 0);
@@ -353,8 +360,10 @@ TEST_CASE("journal persist: a hard write ceiling refuses runaway growth, resumes
     CHECK(j.write_capacity_rejected() == 1);
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2); // r3 never written
 
-    // A prune that ages everything out frees the ceiling; persist resumes.
+    // A prune that ages everything out frees the ceiling; persist resumes. Two passes: the
+    // first declines the whole-journal wipe (the clock-anomaly guard), the second proceeds.
     j.prune(32503680000000LL); // ~year 3000: all batches older than retention
+    j.prune(32503680001000LL);
     CHECK(j.journal_batch_count() == 0);
     CHECK(j.persist(one("r3", "armed")) == 1);
     CHECK(j.write_capacity_rejected() == 1); // no new rejection

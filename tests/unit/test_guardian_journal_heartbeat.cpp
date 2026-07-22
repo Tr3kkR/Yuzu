@@ -45,13 +45,48 @@ TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinne
 }
 
 TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journal][heartbeat]") {
-    // Set all 22 fields to distinct non-zero values -> 22 distinct tags (no key collision). If a
-    // field is added without a matching put() key (or two keys collide), this size check fails.
+    // Every field set to a distinct non-zero value -> one distinct tag each (no key collision).
+    // If a field is added without a matching put() key, or two keys collide, the size check
+    // fails.
+    //
+    // DESIGNATED initialisers, deliberately. This was a positional list asserting 22, and when
+    // two fields were inserted MID-STRUCT the list silently stopped covering the last four -
+    // including evicted_without_send_evidence, the audit-gap counter and the one field whose
+    // wire key intentionally differs from its name. The test still passed while covering less
+    // than it claimed (#2345 Gate 8 consistency S1). Positional initialisation cannot express
+    // this invariant safely; naming every field is what makes an insertion a compile error
+    // rather than a silent coverage loss.
     std::map<std::string, std::string> tags;
-    GuardianJournalStats s{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                           12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22};
+    GuardianJournalStats s{
+        .stage_dropped = 1,
+        .stage_failures = 2,
+        .field_rejected = 3,
+        .clock_rejected = 4,
+        .pending_depth = 5,
+        .batches_written = 6,
+        .write_failures = 7,
+        .key_collisions = 8,
+        .quarantined = 9,
+        .quarantine_failures = 10,
+        .quarantine_capacity_evicted = 11,
+        .batches_pruned = 12,
+        .prune_failures = 13,
+        .page_read_failures = 14,
+        .clock_jump_skips = 15,
+        .write_capacity_rejected = 16,
+        .journal_bytes = 17,
+        .journal_batch_count = 18,
+        .pages = 19,
+        .records_paged = 20,
+        .sent_labels_written = 21,
+        .evicted_sent_unacked = 22,
+        .evicted_without_send_evidence = 23,
+        .maint_exceptions = 24,
+        .drain_exceptions = 25,
+        .sweep_exceptions = 26,
+    };
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 22);
+    CHECK(tags.size() == 26);
 }
 
 TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",

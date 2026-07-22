@@ -1429,6 +1429,18 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
         while (!stop.load(std::memory_order_relaxed))
             rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
     });
+    // A RETENTION thread, not only pagers (#2345 Gate 8 cpp-safety). prune_locked_ and
+    // page_into_window hand three non-atomic members between them - last_prune_now_ms_,
+    // last_age_cutoff_, pruned_cutoff_valid_ - and with pagers alone that handoff is never
+    // exercised concurrently, so a TSan pass over this test said nothing about it. The clock
+    // walks forward fast enough here to drive the age-cutoff logic, not just the lock.
+    std::thread pruner([&] {
+        std::int64_t t = 1'700'000'000'000;
+        while (!stop.load(std::memory_order_relaxed)) {
+            rig.journal->prune(t);
+            t += 60'000;
+        }
+    });
 
     // Interleave from the main thread too, then signal stop (also exercises the stop-race gate).
     for (int i = 0; i < 200; ++i)
@@ -1439,7 +1451,8 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     for (auto& t : pagers)
         t.join();
     drainer.join();
-    SUCCEED("no data race / crash across concurrent pagers + drain");
+    pruner.join();
+    SUCCEED("no data race / crash across concurrent pagers + retention + drain");
 }
 
 TEST_CASE("page_into_window quarantines a corrupt batch instead of replaying it (M6)",
