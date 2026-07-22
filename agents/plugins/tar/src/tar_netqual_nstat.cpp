@@ -25,6 +25,28 @@ std::optional<DecodedMsgHeader> nstat_decode_header(std::span<const std::byte> r
     return DecodedMsgHeader{hdr.context, hdr.type, hdr.length, hdr.flags};
 }
 
+std::vector<std::span<const std::byte>>
+nstat_frame_messages(std::span<const std::byte> buf) {
+    std::vector<std::span<const std::byte>> msgs;
+    std::size_t off = 0;
+    while (off + sizeof(nstat_raw::NstatMsgHdr) <= buf.size()) {
+        const std::span<const std::byte> rest = buf.subspan(off);
+        auto hdr = nstat_decode_header(rest);
+        if (!hdr)
+            break; // guarded by the while condition; defensive
+        const std::size_t msg_len = hdr->length;
+        // A declared length that can't hold even the common header, or that
+        // overruns this datagram (a truncated trailing frame the kernel should
+        // never emit for SOCK_DGRAM), means we can no longer frame safely —
+        // stop rather than spin on a zero-length message or read past the end.
+        if (msg_len < sizeof(nstat_raw::NstatMsgHdr) || off + msg_len > buf.size())
+            break;
+        msgs.push_back(rest.subspan(0, msg_len));
+        off += msg_len;
+    }
+    return msgs;
+}
+
 bool nstat_length_matches_expected(std::uint32_t type, std::uint16_t length) noexcept {
     switch (type) {
     case kNstatMsgSrcAdded:
@@ -799,11 +821,24 @@ struct NstatClient::Impl {
             }
             if (stop_requested.load(std::memory_order_relaxed))
                 break;
-            try {
-                handle_message(std::span<const std::byte>(buf.data(), static_cast<std::size_t>(n)));
-            } catch (...) {
-                // A decode/mapping exception (e.g. bad_alloc under memory
-                // pressure) must cost one message, never the reader thread.
+            // A single recv() can carry MULTIPLE concatenated messages: XNU
+            // batches records back-to-back into one datagram (nstat_frame_messages
+            // documents the kernel path). Dispatch EVERY framed sub-message —
+            // decoding only the first and discarding the rest silently violates
+            // the fail-closed contract (docs/darwin-compat.md) exactly during
+            // the feature's primary use case (the ADD_ALL_SRCS burst), without
+            // ever tripping a self-check.
+            for (std::span<const std::byte> msg :
+                 nstat_frame_messages(std::span<const std::byte>(
+                     buf.data(), static_cast<std::size_t>(n)))) {
+                try {
+                    handle_message(msg);
+                } catch (...) {
+                    // A decode/mapping exception (e.g. bad_alloc under memory
+                    // pressure) must cost one message, never the reader thread.
+                }
+                if (stop_requested.load(std::memory_order_relaxed))
+                    break; // handle_message may have set this on a layout mismatch
             }
             if (stop_requested.load(std::memory_order_relaxed))
                 break; // handle_message may have set this on a layout mismatch

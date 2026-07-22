@@ -31,6 +31,11 @@
 #include "wifi_corewlan.hpp"  // CoreWLAN current-connection query (first .mm TU)
 #endif
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <chrono>
+#include <yuzu/agent/subprocess_runner.hpp> // bounded runner for the Linux nmcli/iw shell-out (review blocker)
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -56,15 +61,14 @@ inline std::string sof(std::string_view v) { return yuzu::util::safe_output_fiel
 
 #if defined(__linux__) || defined(__APPLE__)
 std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
+    // Bounded, fork-lock-covered runner (review blocker) instead of a raw,
+    // deadline-less popen that bypassed both the fork lock and any timeout.
+    // `/bin/sh -c` preserves the shell semantics the `nmcli`/`iw` callers rely
+    // on; the runner drains and caps stdout.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    std::string result = std::move(res.output);
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }

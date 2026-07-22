@@ -69,6 +69,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <mutex>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -437,6 +438,38 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // err_write_fd stays open here: its CLOEXEC flag closes it
         // automatically on a successful execvp(); on failure the code
         // below writes to it explicitly before exiting.
+
+        // Inherited-fd sanitisation (review blocker). A newly exec'd helper --
+        // often a privileged tool (security, codesign, launchctl, pkgutil) --
+        // must not inherit any descriptor this agent or a linked library opened
+        // without O_CLOEXEC: a gRPC connection socket, a SQLite database fd, or
+        // anything else would otherwise leak into an external, possibly-root
+        // process (information exposure + resource-lifetime hazard). global_fork_lock()
+        // closes only the CLOEXEC *race* window between concurrent launchers'
+        // own pipe creation; by its own contract it does NOT sanitise
+        // already-open inherited fds (fork_lock.hpp, "non-forking pipe creators
+        // are exposed too"). Mark every fd >= 3 close-on-exec so execv() drops
+        // them all. Deliberately mark rather than close: err_write_fd is already
+        // CLOEXEC, so it survives this sweep -- auto-closing only on a
+        // *successful* exec (the parent's success signal) while staying writable
+        // to report an exec failure just below. stdio (0/1/2) is untouched. Only
+        // async-signal-safe calls (getrlimit + fcntl), per the POSIX 2.4.3 rule
+        // this whole child branch obeys. The soft RLIMIT_NOFILE bounds the
+        // highest possible fd number, so the sweep is complete in the common
+        // case; the 4096 cap only engages under a pathological/infinite limit
+        // (documented residual, not a silent truncation of a realistic table).
+        {
+            struct rlimit rl;
+            long maxfd = 4096;
+            if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+                rl.rlim_cur < static_cast<rlim_t>(maxfd))
+                maxfd = static_cast<long>(rl.rlim_cur);
+            for (int fd = 3; fd < maxfd; ++fd) {
+                const int flags = fcntl(fd, F_GETFD);
+                if (flags != -1 && !(flags & FD_CLOEXEC))
+                    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+            }
+        }
 
         // BR-003: execv(), not execvp() -- execvp() is not on Darwin's
         // async-signal-safe list because it does a PATH search (fopen()

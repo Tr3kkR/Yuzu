@@ -47,27 +47,36 @@ namespace {
 // ── subprocess helpers ─────────────────────────────────────────────────────
 
 std::vector<std::string> run_command_lines(const char* cmd) {
-    std::vector<std::string> lines;
-    std::array<char, 512> buf{};
+    std::string output;
 #ifdef _WIN32
+    std::array<char, 512> buf{};
     FILE* pipe = _popen(cmd, "r");
+    if (pipe) {
+        while (fgets(buf.data(), static_cast<int>(buf.size()), pipe))
+            output += buf.data();
+        _pclose(pipe);
+    }
 #else
-    FILE* pipe = popen(cmd, "r");
+    // Bounded, fork-lock-covered runner (review blocker) instead of a raw,
+    // deadline-less popen that bypassed both the fork lock and any timeout.
+    // `/bin/sh -c` preserves the shell semantics the Linux `journalctl` callers
+    // rely on; the runner drains and caps stdout.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    output = std::move(res.output);
 #endif
-    if (!pipe)
-        return lines;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line(buf.data());
+    std::vector<std::string> lines;
+    for (std::size_t scan = 0; scan < output.size();) {
+        const std::size_t nl = output.find('\n', scan);
+        const std::size_t end = (nl == std::string::npos) ? output.size() : nl;
+        std::string line = output.substr(scan, end - scan);
+        scan = (nl == std::string::npos) ? output.size() : nl + 1;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
             line.pop_back();
         if (!line.empty())
             lines.push_back(std::move(line));
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
     return lines;
 }
 

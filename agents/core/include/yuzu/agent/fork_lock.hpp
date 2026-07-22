@@ -43,15 +43,24 @@
  *   - agents/core/src/trigger_engine.cpp (query_service_status, macOS popen)
  * (filesystem_plugin.cpp's compute_hash_unix no longer forks directly -- it
  * now routes through the shared bounded runner, which is the first site above.
- * The bitlocker, msi_packages, services, users, network_config, and interaction
- * plugins likewise route their POSIX shell-outs through run_bounded_subprocess,
- * so they are covered transitively via the first site.)
+ * The bitlocker, msi_packages, services, users, network_config, interaction,
+ * wifi, certificates, and event_logs plugins likewise route ALL of their POSIX
+ * shell-outs through run_bounded_subprocess, so they are covered transitively
+ * via the first site -- their only remaining popen() calls are Windows _popen(),
+ * which does not fork and so cannot race this lock. This ledger is verified
+ * against the code: an earlier revision listed `services` here while
+ * services_plugin.cpp still had two raw POSIX popen() sites (the Linux
+ * enumerate + the shared run_command_exit), and wifi/certificates/event_logs
+ * still had raw POSIX popen() in their Linux shell-out helpers -- all were
+ * migrated to run_bounded_subprocess so the list now matches reality.)
  * The remaining popen() call sites scattered across the plugin directories
- * (most single-shot `popen(cmd, "r")` info-gathering plugins not yet migrated)
- * are not covered; any of them can still race a locked launcher's window until
- * they are migrated too. The Linux branch of trigger_engine.cpp's
- * query_service_status has its own, separate popen() call and is not
- * covered either -- only the macOS branch was in scope for BR-001.
+ * (the single-shot `popen(cmd, "r")` info-gathering plugins -- hardware,
+ * discovery, os_info, vuln_scan, ioc, network_diag, license_scan, and others --
+ * plus the tar mapdrive/service collectors) are NOT migrated and NOT covered;
+ * any of them can still race a locked launcher's window until they are migrated
+ * too. The Linux branch of trigger_engine.cpp's query_service_status has its
+ * own, separate popen() call and is not covered either -- only the macOS branch
+ * was in scope for BR-001.
  *
  * Non-forking pipe creators are exposed too, symmetrically: anything that
  * calls raw pipe() without also holding this lock across its own

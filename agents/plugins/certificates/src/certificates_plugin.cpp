@@ -67,6 +67,12 @@
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
 #endif
 
+#ifdef __linux__
+// The Linux openssl x509 shell-out routes through the bounded, fork-lock-covered
+// runner too (review blocker); macOS already includes this above.
+#include <yuzu/agent/subprocess_runner.hpp>
+#endif
+
 // The pure parse/validate/classify/verdict helpers this file shares with
 // tests/unit/test_certificates_macos.cpp live in yuzu::certificates_macos
 // (certificates_macos_parsers.hpp). Pulled into scope here -- including for
@@ -96,21 +102,23 @@ bool is_safe_path(std::string_view s) {
 
 std::string run_command(const char* cmd) {
     std::string result;
+#ifdef _WIN32
     std::array<char, 4096> buf{};
-#ifdef _WIN32
     FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+    if (pipe) {
+        while (fgets(buf.data(), static_cast<int>(buf.size()), pipe))
+            result += buf.data();
+        _pclose(pipe);
     }
-#ifdef _WIN32
-    _pclose(pipe);
 #else
-    pclose(pipe);
+    // Bounded, fork-lock-covered runner (review blocker) instead of a raw,
+    // deadline-less popen that bypassed both the fork lock and any timeout.
+    // `/bin/sh -c` preserves the shell semantics the Linux `openssl x509`
+    // callers rely on; the runner drains and caps stdout.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    result = std::move(res.output);
 #endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();

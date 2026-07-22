@@ -135,6 +135,105 @@ TEST_CASE("nstat_decode_header rejects a too-short buffer", "[tar][netqual][nsta
     REQUIRE_FALSE(nstat_decode_header(empty_buf).has_value());
 }
 
+// ── Datagram framing (multi-message recv, XNU accumulation) ──────────────────
+
+TEST_CASE("nstat_frame_messages splits concatenated SRC_ADDED + SRC_COUNTS in one buffer",
+          "[tar][netqual][nstat]") {
+    // XNU's accumulator batches records back-to-back into one datagram, so a
+    // single recv() can carry several messages; the reader must dispatch every
+    // one. This is the regression guard for the "decode only the first, drop
+    // the rest" bug — the failure mode hits hardest during the ADD_ALL_SRCS
+    // burst, exactly the feature's primary use case.
+    MsgSrcAdded added{};
+    added.hdr.type = kNstatMsgSrcAdded;
+    added.hdr.length = sizeof(MsgSrcAdded);
+    added.provider = kNstatProviderTcp;
+    added.srcref = 0x1111;
+
+    MsgSrcCounts counts{};
+    counts.hdr.type = kNstatMsgSrcCounts;
+    counts.hdr.length = sizeof(MsgSrcCounts);
+    counts.srcref = 0x2222;
+
+    auto buf = concat(to_bytes(added), to_bytes(counts));
+    auto msgs = nstat_frame_messages(buf);
+
+    REQUIRE(msgs.size() == 2);
+    // Each subspan is exactly its declared length and decodes independently.
+    REQUIRE(msgs[0].size() == sizeof(MsgSrcAdded));
+    REQUIRE(msgs[1].size() == sizeof(MsgSrcCounts));
+    auto d0 = nstat_decode_src_added(msgs[0]);
+    REQUIRE(d0.has_value());
+    REQUIRE(d0->srcref == 0x1111);
+    auto d1 = nstat_decode_src_counts(msgs[1]);
+    REQUIRE(d1.has_value());
+    REQUIRE(d1->srcref == 0x2222);
+}
+
+TEST_CASE("nstat_frame_messages frames a burst of three SRC_ADDED records",
+          "[tar][netqual][nstat]") {
+    std::vector<std::byte> buf;
+    for (std::uint64_t ref : {0xA1u, 0xB2u, 0xC3u}) {
+        MsgSrcAdded m{};
+        m.hdr.type = kNstatMsgSrcAdded;
+        m.hdr.length = sizeof(MsgSrcAdded);
+        m.provider = kNstatProviderTcp;
+        m.srcref = ref;
+        buf = concat(buf, to_bytes(m));
+    }
+    auto msgs = nstat_frame_messages(buf);
+    REQUIRE(msgs.size() == 3);
+    REQUIRE(nstat_decode_src_added(msgs[0])->srcref == 0xA1u);
+    REQUIRE(nstat_decode_src_added(msgs[2])->srcref == 0xC3u);
+}
+
+TEST_CASE("nstat_frame_messages yields the single message unchanged",
+          "[tar][netqual][nstat]") {
+    MsgSrcAdded m{};
+    m.hdr.type = kNstatMsgSrcAdded;
+    m.hdr.length = sizeof(MsgSrcAdded);
+    auto msgs = nstat_frame_messages(to_bytes(m));
+    REQUIRE(msgs.size() == 1);
+    REQUIRE(msgs[0].size() == sizeof(MsgSrcAdded));
+}
+
+TEST_CASE("nstat_frame_messages keeps complete frames and stops at a truncated trailer",
+          "[tar][netqual][nstat]") {
+    // A complete SRC_ADDED followed by a header that declares a length the
+    // buffer can't satisfy: the good frame is returned, the partial one dropped
+    // rather than read past the buffer.
+    MsgSrcAdded good{};
+    good.hdr.type = kNstatMsgSrcAdded;
+    good.hdr.length = sizeof(MsgSrcAdded);
+    good.srcref = 0x55;
+
+    NstatMsgHdr partial{};
+    partial.type = kNstatMsgSrcCounts;
+    partial.length = sizeof(MsgSrcCounts); // declares 144B but only 16B follow
+
+    auto buf = concat(to_bytes(good), to_bytes(partial));
+    auto msgs = nstat_frame_messages(buf);
+    REQUIRE(msgs.size() == 1);
+    REQUIRE(nstat_decode_src_added(msgs[0])->srcref == 0x55);
+}
+
+TEST_CASE("nstat_frame_messages stops on a zero declared length rather than spinning",
+          "[tar][netqual][nstat]") {
+    // A header claiming length 0 must not advance the offset by zero forever.
+    NstatMsgHdr zero{};
+    zero.type = kNstatMsgSrcAdded;
+    zero.length = 0;
+    auto msgs = nstat_frame_messages(to_bytes(zero));
+    REQUIRE(msgs.empty());
+}
+
+TEST_CASE("nstat_frame_messages returns nothing for a buffer shorter than a header",
+          "[tar][netqual][nstat]") {
+    std::vector<std::byte> tiny(sizeof(NstatMsgHdr) - 1);
+    REQUIRE(nstat_frame_messages(tiny).empty());
+    REQUIRE(nstat_frame_messages({}).empty());
+}
+
 // ── nstat_subscription_rejected — the ERROR-reply demote latch ─────────────
 
 TEST_CASE("nstat_subscription_rejected demotes only once BOTH subscriptions are rejected",

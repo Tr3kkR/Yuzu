@@ -46,11 +46,13 @@
 #include <sys/wait.h>
 #endif
 
-#ifdef __APPLE__
+#if defined(__linux__) || defined(__APPLE__)
 #include <chrono>
 #include <spdlog/spdlog.h>
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#endif
 
+#ifdef __APPLE__
 #include "services_macos_launchd.hpp" // pure launchctl print-disabled parser (C-1.12)
 #endif
 
@@ -62,6 +64,29 @@ namespace {
 // into the pipe-delimited protocol -- see is_safe_service_name's definition
 // for the allowed character set.
 bool is_safe_service_name(std::string_view name);
+
+#if defined(__linux__) || defined(__APPLE__)
+// Read the full stdout of a command into a string, via the bounded,
+// fork-lock-covered runner rather than a raw, deadline-less popen (K-7/CDX-07,
+// review blocker). `/bin/sh -c` preserves the shell semantics popen used (the
+// callers rely on `2>/dev/null`); the runner's own ~1 MiB sanity cap bounds a
+// runaway/adversarial `systemctl`/`launchctl` output. Shared by the Linux and
+// macOS enumerate paths (not part of services_macos_launchd.hpp, which stays
+// subprocess-free). Pure I/O helper.
+std::string slurp_command_output(const char* cmd) {
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    // A cut-short enumeration returns empty/partial output that parses as "0
+    // services" — a silent false-negative. Warn so an operator can tell a
+    // degraded enumeration from a genuinely empty one (sre-M1).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("services: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
+    return res.output;
+}
+#endif
 
 #ifdef _WIN32
 
@@ -190,13 +215,15 @@ std::vector<ServiceInfo> enumerate_services_linux(bool running_only) {
               "2>/dev/null"
             : "systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null";
 
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return services;
-
-    std::array<char, 1024> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line{buf.data()};
+    // Bounded, fork-lock-covered shell-out (review blocker): the raw popen()
+    // here bypassed both the deadline and the fork lock. Slurp the full output
+    // via the shared runner, then parse it line by line exactly as before.
+    const std::string out = slurp_command_output(cmd);
+    for (std::size_t scan = 0; scan < out.size();) {
+        const std::size_t nl = out.find('\n', scan);
+        const std::size_t end = (nl == std::string::npos) ? out.size() : nl;
+        std::string line = out.substr(scan, end - scan);
+        scan = (nl == std::string::npos) ? out.size() : nl + 1;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
             line.pop_back();
         }
@@ -236,7 +263,6 @@ std::vector<ServiceInfo> enumerate_services_linux(bool running_only) {
 
         services.push_back(std::move(si));
     }
-    pclose(pipe);
     return services;
 }
 
@@ -255,26 +281,6 @@ struct ServiceInfo {
 // Rows beyond the cap are still drained from the `launchctl list` pipe (so
 // the child process never blocks writing into a full pipe) -- just not kept.
 constexpr std::size_t kMaxServiceRows = 512;
-
-// Read the full stdout of a command into a string, via the bounded,
-// fork-lock-covered runner rather than a raw, deadline-less popen (K-7/CDX-07).
-// `/bin/sh -c` preserves the shell semantics popen used (the callers rely on
-// `2>/dev/null`); the runner's own ~1 MiB sanity cap bounds a runaway/
-// adversarial `launchctl list`/`print-disabled`. Pure I/O helper (not part of
-// services_macos_launchd.hpp, which stays subprocess-free).
-std::string slurp_command_output(const char* cmd) {
-    auto res = yuzu::agent::run_bounded_subprocess(
-        {"/bin/sh", "-c", cmd},
-        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
-    // A cut-short launchctl returns empty/partial output that parses as "0
-    // services" — a silent false-negative. Warn so an operator can tell a
-    // degraded enumeration from a genuinely empty one (sre-M1).
-    if (res.timed_out || !res.tool_ran || res.output_truncated) {
-        spdlog::warn("services: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
-                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
-    }
-    return res.output;
-}
 
 // total_seen (out) receives the number of services that passed all filters
 // (label allowlist + running_only) BEFORE the kMaxServiceRows cap, so the
@@ -391,21 +397,20 @@ bool is_safe_service_name(std::string_view name) {
     return true;
 }
 
-/// Run a command via popen and return its exit code.
-/// Drains stdout so the child process doesn't block on a full pipe.
+/// Run a command via the bounded, fork-lock-covered runner and return its exit
+/// code (review blocker: this replaced a raw, deadline-less popen that bypassed
+/// both the fork lock and any timeout). `/bin/sh -c` preserves the shell
+/// semantics the callers built around; stdout is drained-and-discarded by the
+/// runner. `!tool_ran` (spawn/exec failure) maps to the old `popen()==nullptr`
+/// / non-WIFEXITED path: a -1 "unknown", never a fabricated success.
 #if defined(__linux__) || defined(__APPLE__)
 int run_command_exit(const char* cmd) {
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    if (!res.tool_ran || res.timed_out)
         return -1;
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-    }
-    int raw = pclose(pipe);
-    // pclose returns the wait status; extract the actual exit code
-    if (WIFEXITED(raw))
-        return WEXITSTATUS(raw);
-    return -1;
+    return res.exit_code;
 }
 #endif
 

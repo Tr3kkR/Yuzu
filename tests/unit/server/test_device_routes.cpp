@@ -313,6 +313,64 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
     }
 }
 
+// #1703: the RESULT poll — where the real process-tree/DNS/connections/users PII
+// actually reaches the operator — must funnel through the behavioural-PII audit
+// chokepoint, not only the /run dispatch. These assert the audit fires when
+// output is served, stays silent on the error/failure/timeout notes, and adopts
+// the dashboard set-and-proceed posture (renders anyway, raises Sec-Audit-Failed).
+TEST_CASE("device live result: rendering PII audits at the result chokepoint",
+          "[device][routes][audit]") {
+    SECTION("real output audits device.live.<kind>|rendered and renders") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 0, "uptime_display|2d 2h 29m", ""}};
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("2d 2h 29m") != std::string::npos);
+        CHECK(h.audited == "device.live.uptime|rendered|a-1");
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+    }
+    SECTION("terminal success-empty output audits device.live.<kind>|rendered_empty") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "", ""}}; // SUCCESS, no output
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=processes-test&agent_id=a-1&kind=processes&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("No processes returned") != std::string::npos);
+        CHECK(h.audited == "device.live.processes|rendered_empty|a-1");
+    }
+    SECTION("a dropped audit row on a result poll still renders but sets Sec-Audit-Failed") {
+        LiveHarness h;
+        h.audit_ok = false; // audit_fn → false (evidence row dropped)
+        h.fake_rows = {{"a-1", 0, "uptime_display|2d 2h 29m", ""}};
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("2d 2h 29m") != std::string::npos);          // set-and-proceed
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("a throwing audit_fn on a result poll is caught, still renders") {
+        LiveHarness h;
+        h.audit_throws = true;
+        h.fake_rows = {{"a-1", 0, "uptime_display|2d 2h 29m", ""}};
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1"));
+        REQUIRE(r);
+        CHECK(r->body.find("2d 2h 29m") != std::string::npos);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("the error/failure/timeout notes render NO PII and are not audited") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 0, "error|boom", ""}}; // agent error payload
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("reported an error") != std::string::npos);
+        CHECK(h.audited.empty()); // no PII served -> no result-chokepoint audit
+    }
+}
+
 // The expanded live-snapshot kinds each map to ONE real plugin action with its own
 // audit verb. process_tree additionally dual-dispatches its connection join.
 TEST_CASE("device live run: expanded kinds map to the right plugin/action + audit",

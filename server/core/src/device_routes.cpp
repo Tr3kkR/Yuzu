@@ -833,12 +833,29 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                        ? lookup_fn_(id).transform([](const DeviceRow& d) { return d.os; }).value_or("")
                        : std::string{};
         };
+        // Behavioural-PII access-audit chokepoint (#1647/#1703). The RESULT poll
+        // is where the real process-tree / DNS / connections / users output
+        // actually reaches the operator — the /run dispatch audit above records
+        // the request, but only THIS route renders the PII, so the access must be
+        // audited here too or the read is unaccountable (a works-council /
+        // usage-class concern). Dashboard set-and-proceed posture matching /run:
+        // a transient audit-store outage still renders the lens but raises
+        // Sec-Audit-Failed for the SIEM (REST fail-closed is a separate seam).
+        // Only fires on a branch that actually serves rendered output, never on
+        // the error/failure/timeout notes.
+        auto audit_live_result = [&](const char* result) {
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, lk->audit_action, result, "Agent", id,
+                lk->plugin + "/" + lk->action + " kind=" + kind +
+                    " command_id=" + command_id);
+        };
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
                 note(res, "The device reported an error: " +
                               html_escape(with_output->output.substr(6, 200)));
                 return;
             }
+            audit_live_result("rendered");
             res.set_content(render_live_result(kind, *lk, with_output->output, output2, agent_os()),
                             "text/html; charset=utf-8");
             return;
@@ -851,6 +868,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                               html_escape(terminal->error_detail.substr(0, 200)));
                 return;
             }
+            audit_live_result("rendered_empty");
             res.set_content(render_live_result(kind, *lk, "", output2, agent_os()), "text/html; charset=utf-8");
             return;
         }

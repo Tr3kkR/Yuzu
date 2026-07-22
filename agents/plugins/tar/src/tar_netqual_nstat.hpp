@@ -351,6 +351,19 @@ struct DecodedMsgHeader {
 /// `raw` is shorter than the header.
 std::optional<DecodedMsgHeader> nstat_decode_header(std::span<const std::byte> raw) noexcept;
 
+/// PURE. Splits one received datagram into its constituent message subspans.
+/// A single kctl SOCK_DGRAM recv() can carry SEVERAL nstat messages: XNU's
+/// nstat_accumulate_msg()/nstat_flush_accumulated_msgs() batch records
+/// back-to-back into one mbuf (no inter-message padding), so a burst of
+/// SRC_ADDED during the ADD_ALL_SRCS bulk subscribe, or a SRC_DESC followed
+/// immediately by SRC_COUNTS, arrives concatenated. Each subspan spans exactly
+/// one message, sized by that message's declared `nstat_msg_hdr.length`.
+/// Framing stops (returning what was framed so far) at the first frame whose
+/// declared length can't hold the common header or would overrun the buffer —
+/// a truncated trailing frame the kernel should never emit for SOCK_DGRAM.
+std::vector<std::span<const std::byte>>
+nstat_frame_messages(std::span<const std::byte> buf);
+
 /// PURE. The runtime offset/size self-check (memo §6 risk 1): true when a
 /// decoded `nstat_msg_hdr.length` matches what OUR transcribed struct expects
 /// for `type`. Fixed-size types (SrcAdded/SrcRemoved/SrcCounts) require an
