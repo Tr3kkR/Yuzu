@@ -560,8 +560,7 @@ void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> r
     pending_journal_.push_back(std::move(record));
 }
 
-std::vector<std::shared_ptr<const JournalRecord>>
-GuardianSparkRuntime::snapshot_pending(std::uint64_t* drops_at_snapshot) const {
+GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     // The drop counter is read HERE, under the same lock as the snapshot. Reading it from the
     // caller just before this call left a gap in which a drop could land: it would then be
@@ -569,9 +568,8 @@ GuardianSparkRuntime::snapshot_pending(std::uint64_t* drops_at_snapshot) const {
     // record would stay staged to be persisted again under a second key. That is the safe
     // direction (a duplicate, which the server de-dupes) rather than loss - but it is the same
     // read-outside-the-lock mistake this whole mechanism exists to fix (#2345 focused review).
-    if (drops_at_snapshot)
-        *drops_at_snapshot = journal_stage_dropped_.load(std::memory_order_relaxed);
-    return {pending_journal_.begin(), pending_journal_.end()};
+    return PendingSnapshot{{pending_journal_.begin(), pending_journal_.end()},
+                          journal_stage_dropped_.load(std::memory_order_relaxed)};
 }
 
 void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot) {

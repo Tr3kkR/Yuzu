@@ -1144,7 +1144,7 @@ TEST_CASE("attach_rule stages a durable record; its event_id matches the wire ev
     auto rt = make_rt(r, b);
 
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    auto staged = rt->snapshot_pending();
+    auto staged = rt->snapshot_pending().records;
     REQUIRE(staged.size() == 1);
     CHECK(staged[0]->rule_id == "r1");
     CHECK(staged[0]->kind == "armed");
@@ -1169,7 +1169,7 @@ TEST_CASE("detach_rule stages a disarmed record after the armed one", "[spark][r
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true)); // stages "armed"
     rt->detach_rule("r1");                                                         // ->0 edge, stages "disarmed"
 
-    auto staged = rt->snapshot_pending();
+    auto staged = rt->snapshot_pending().records;
     REQUIRE(staged.size() == 2);
     CHECK(staged[0]->kind == "armed");
     CHECK(staged[1]->kind == "disarmed");
@@ -1182,7 +1182,7 @@ TEST_CASE("a refused arm stages no durable record (no phantom)", "[spark][runtim
     b->fail_arm.store(true);
     auto rt = make_rt(r, b);
     CHECK_FALSE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
-    CHECK(rt->snapshot_pending().empty()); // arm refused before enqueue → nothing staged
+    CHECK(rt->snapshot_pending().records.empty()); // arm refused before enqueue → nothing staged
 }
 
 TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runtime][journal]") {
@@ -1191,7 +1191,7 @@ TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runti
     b->throw_arm.store(true);
     auto rt = make_rt(r, b);
     CHECK_THROWS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    CHECK(rt->snapshot_pending().empty()); // rollback undid the arm; nothing staged
+    CHECK(rt->snapshot_pending().records.empty()); // rollback undid the arm; nothing staged
 }
 
 TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
@@ -1204,16 +1204,16 @@ TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
     REQUIRE(rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3"), true));
     REQUIRE(rt->pending_journal_depth() == 3);
 
-    auto staged = rt->snapshot_pending();
+    auto staged = rt->snapshot_pending().records;
     REQUIRE(staged.size() == 3);
     CHECK(staged[0]->rule_id == "r1");
     CHECK(staged[2]->rule_id == "r3");
 
-    rt->erase_persisted_prefix(2, /*drops_at_snapshot=*/0); // drop the two oldest (r1, r2)
+    rt->erase_persisted_prefix(2, rt->snapshot_pending().drops_at_snapshot); // drop the two oldest (r1, r2)
     REQUIRE(rt->pending_journal_depth() == 1);
-    CHECK(rt->snapshot_pending()[0]->rule_id == "r3");
+    CHECK(rt->snapshot_pending().records[0]->rule_id == "r3");
 
-    rt->erase_persisted_prefix(99, /*drops_at_snapshot=*/0); // clamps to size
+    rt->erase_persisted_prefix(99, rt->snapshot_pending().drops_at_snapshot); // clamps to size
     CHECK(rt->pending_journal_depth() == 0);
 }
 
@@ -1487,7 +1487,7 @@ TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
     PageRig rig;
     // A live entry enters BOTH the send window and staging; persist it, then back-fill.
     REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    auto pending = rig.rt->snapshot_pending();
+    auto pending = rig.rt->snapshot_pending().records;
     REQUIRE(pending.size() == 1);
 
     std::vector<PersistedBatch> batches;
@@ -1622,8 +1622,9 @@ TEST_CASE("erase_persisted_prefix identifies the prefix it wrote, not an index",
                                 file_exists_rule("r" + std::to_string(i)), true));
     REQUIRE(rt->pending_journal_depth() == 6);
 
-    std::uint64_t drops = 0;
-    REQUIRE(rt->snapshot_pending(&drops).size() == 6);
+    const auto snap = rt->snapshot_pending();
+    const auto drops = snap.drops_at_snapshot;
+    REQUIRE(snap.records.size() == 6);
 
     // ...persist commits the first 4. Meanwhile two overflow drops take r0 and r1 off the front.
     rt->drop_oldest_pending_for_test(2);
@@ -1633,7 +1634,7 @@ TEST_CASE("erase_persisted_prefix identifies the prefix it wrote, not an index",
     // r0 and r1 are already gone and r2, r3 were the rest of the persisted prefix, so exactly
     // r4 and r5 - never written - must SURVIVE to be retried.
     REQUIRE(rt->pending_journal_depth() == 2);
-    const auto left = rt->snapshot_pending();
+    const auto left = rt->snapshot_pending().records;
     CHECK(left[0]->rule_id == "r4");
     CHECK(left[1]->rule_id == "r5");
 }

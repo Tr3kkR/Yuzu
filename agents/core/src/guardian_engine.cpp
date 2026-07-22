@@ -388,8 +388,8 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
     // The overflow-drop counter comes back FROM the snapshot, read under its lock: the erase
     // below has to identify the prefix it wrote, and a concurrent drop-oldest shifts positions
     // (#2345 Gate 8b).
-    std::uint64_t drops_at_snapshot = 0;
-    const auto pending = spark_runtime_->snapshot_pending(&drops_at_snapshot);
+    const auto snap = spark_runtime_->snapshot_pending();
+    const auto& pending = snap.records;
     if (pending.empty())
         return;
     // snapshot released outbox_mu_; persist() does KV I/O holding NO runtime lock (so the
@@ -404,7 +404,7 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
         // back-fill (best-effort, allocates a set) runs AFTER, so a throw there loses only a
         // sent-label back-fill (a later false evicted_without_send_evidence, monitoring noise),
         // never leaves the records staged to re-persist as a DUPLICATE durable batch (review UP-6).
-        spark_runtime_->erase_persisted_prefix(written, drops_at_snapshot);
+        spark_runtime_->erase_persisted_prefix(written, snap.drops_at_snapshot);
         for (const auto& b : batches)
             if (!b.event_ids.empty())
                 spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());

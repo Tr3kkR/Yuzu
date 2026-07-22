@@ -290,11 +290,16 @@ public:
     /// A FIFO copy of the currently-staged (built + validated, not-yet-persisted)
     /// records. Immutable view; the caller serialises + writes them, then calls
     /// erase_persisted_prefix() for the count it durably wrote.
-    /// `drops_at_snapshot`, when non-null, receives journal_stage_dropped() read UNDER the same
-    /// lock as the snapshot - which is what makes erase_persisted_prefix able to identify the
-    /// prefix it wrote rather than trust an index a concurrent overflow drop can shift.
-    [[nodiscard]] std::vector<std::shared_ptr<const JournalRecord>>
-    snapshot_pending(std::uint64_t* drops_at_snapshot = nullptr) const;
+    /// A staging snapshot and the overflow-drop count observed WITH it, under one lock. The
+    /// pair travels together because erase_persisted_prefix needs both to identify the prefix
+    /// it wrote rather than trust an index a concurrent overflow drop can shift; returning
+    /// them as one value is what stops a caller taking the snapshot and forgetting the count,
+    /// which is the mistake that produced the bug in the first place.
+    struct PendingSnapshot {
+        std::vector<std::shared_ptr<const JournalRecord>> records;
+        std::uint64_t drops_at_snapshot{0};
+    };
+    [[nodiscard]] PendingSnapshot snapshot_pending() const;
 
     /// Drop the oldest `n` staged records (those a persist just durably wrote).
     /// Clamped to the current size.

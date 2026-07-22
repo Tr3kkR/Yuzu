@@ -25,8 +25,8 @@ std::int64_t journal_now_ms() {
 }
 } // namespace
 
-void set_guardian_joined_thread(bool on) noexcept { tl_guardian_joined_thread = on; }
-bool on_guardian_joined_thread() noexcept { return tl_guardian_joined_thread; }
+YUZU_EXPORT void set_guardian_joined_thread(bool on) noexcept { tl_guardian_joined_thread = on; }
+YUZU_EXPORT bool on_guardian_joined_thread() noexcept { return tl_guardian_joined_thread; }
 
 GuardianOutboxDrainWorker::GuardianOutboxDrainWorker(GuardianSparkRuntime& rt, SendFn send,
                                                      std::uint64_t periodic_bound_ms,
