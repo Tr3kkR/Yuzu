@@ -888,6 +888,81 @@ TEST_CASE("GuaranteedStateStore: generic per-obs_type drill-down + OS scope",
     CHECK(mat[2].count == 1);
 }
 
+TEST_CASE("GuaranteedStateStore: DEX crash + signal aggregations are OS-scopable (C-DEX-1)",
+          "[guaranteed_state_store][dex][signals][crash]") {
+    // process.crashed now arrives from BOTH Windows and macOS agents. The
+    // crash-free headline is Windows-denominated, and the Catalogue drilldown
+    // honours a single-OS lens, so both must be scopable by platform — the
+    // default (empty platform) stays all-OS.
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& subject, const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = type;
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = ts;
+        REQUIRE(store.insert_event(r));
+    };
+    obs("c1", "win-1", "process.crashed", "chrome.exe", "windows", "2026-06-08T10:00:00Z");
+    obs("c2", "win-1", "process.crashed", "chrome.exe", "windows", "2026-06-09T10:00:00Z");
+    obs("c3", "win-2", "process.crashed", "outlook.exe", "windows", "2026-06-09T11:00:00Z");
+    obs("c4", "mac-1", "process.crashed", "Safari", "macos", "2026-06-09T12:00:00Z");
+
+    SECTION("dex_crash_summary scopes by platform; empty = all-OS") {
+        auto all = store.dex_crash_summary();
+        CHECK(all.total_crashes == 4);
+        CHECK(all.distinct_devices == 3);
+
+        auto win = store.dex_crash_summary("", "windows");
+        CHECK(win.total_crashes == 3);
+        CHECK(win.distinct_devices == 2); // win-1, win-2 — NOT mac-1
+
+        auto mac = store.dex_crash_summary("", "macos");
+        CHECK(mac.total_crashes == 1);
+        CHECK(mac.distinct_devices == 1);
+    }
+
+    SECTION("subjects/devices/by_day OS-scope the drilldown; by_os stays cross-OS") {
+        // subjects: the Windows lens sees chrome.exe + outlook.exe, never Safari.
+        auto subj_win = store.dex_signal_subjects("process.crashed", "", 15, "windows");
+        REQUIRE(subj_win.size() == 2);
+        bool win_has_safari = false;
+        for (const auto& s : subj_win)
+            if (s.subject == "Safari")
+                win_has_safari = true;
+        CHECK_FALSE(win_has_safari);
+
+        auto subj_mac = store.dex_signal_subjects("process.crashed", "", 15, "macos");
+        REQUIRE(subj_mac.size() == 1);
+        CHECK(subj_mac[0].subject == "Safari");
+
+        // devices: the Windows lens is win-1/win-2 only.
+        auto dev_win = store.dex_signal_devices("process.crashed", "", 15, "windows");
+        REQUIRE(dev_win.size() == 2);
+        for (const auto& d : dev_win)
+            CHECK(d.agent_id != "mac-1");
+
+        // by_day: the Windows lens excludes the macOS-only crash on 06-09.
+        int64_t all_0609 = 0, win_0609 = 0;
+        for (const auto& d : store.dex_signal_by_day("process.crashed"))
+            if (d.day == "2026-06-09")
+                all_0609 = d.crashes;
+        for (const auto& d : store.dex_signal_by_day("process.crashed", "", "windows"))
+            if (d.day == "2026-06-09")
+                win_0609 = d.crashes;
+        CHECK(all_0609 == 3); // c2(win) + c3(win) + c4(mac)
+        CHECK(win_0609 == 2); // c2 + c3 only
+
+        // by_os is deliberately NOT platform-scoped — it IS the cross-OS split.
+        auto os = store.dex_signal_by_os("process.crashed");
+        REQUIRE(os.size() == 2); // both windows and macos rows present
+    }
+}
+
 TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[guaranteed_state_store][crash][dex]") {
     GuaranteedStateStore store(":memory:");
     auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,

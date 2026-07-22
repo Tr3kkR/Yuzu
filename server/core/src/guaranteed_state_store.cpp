@@ -1127,20 +1127,28 @@ GuaranteedStateStore::query_observations(int limit) const {
 // Indexes from migration {7} (subject / (obs_type, observed_at) / agent /
 // platform) cover the GROUP BYs.
 
-DexCrashSummary GuaranteedStateStore::dex_crash_summary(const std::string& since) const {
+DexCrashSummary GuaranteedStateStore::dex_crash_summary(const std::string& since,
+                                                        const std::string& platform) const {
     std::shared_lock lock(mtx_);
     DexCrashSummary s;
     if (!db_)
         return s;
-    const char* sql = R"(
+    // Conditional platform predicate (empty = all-OS, unchanged) — mirrors
+    // dex_signal_summary. Scopes the crash numerator to one OS so a
+    // Windows-denominated tile isn't fed all-OS crashes (#C-DEX-1).
+    std::string sql = R"(
         SELECT COUNT(*), COUNT(DISTINCT agent_id), COUNT(DISTINCT subject)
         FROM guardian_observations
         WHERE obs_type = 'process.crashed' AND observed_at >= ?1
     )";
+    if (!platform.empty())
+        sql += " AND platform = ?2";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, st.addr(), nullptr) != SQLITE_OK)
         return s;
     sqlite3_bind_text(st.get(), 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (!platform.empty())
+        sqlite3_bind_text(st.get(), 2, platform.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st.get()) == SQLITE_ROW) {
         s.total_crashes = sqlite3_column_int64(st.get(), 0);
         s.distinct_devices = sqlite3_column_int64(st.get(), 1);
@@ -1413,25 +1421,34 @@ GuaranteedStateStore::dex_device_signal_summary(const std::string& agent_id,
 
 std::vector<DexSubjectCount>
 GuaranteedStateStore::dex_signal_subjects(const std::string& obs_type, const std::string& since,
-                                          int limit) const {
+                                          int limit, const std::string& platform) const {
     std::shared_lock lock(mtx_);
     std::vector<DexSubjectCount> out;
     if (!db_)
         return out;
-    const char* sql = R"(
+    // Conditional platform predicate (empty = all-OS) — OS-scopes the drilldown
+    // subjects to the selected Catalogue lens (#C-DEX-1). ?4 is bound only when
+    // present; a ?N referenced out of textual order is valid for SQLite.
+    std::string sql = R"(
         SELECT subject, COUNT(*), COUNT(DISTINCT agent_id), MAX(observed_at)
         FROM guardian_observations
         WHERE obs_type = ?1 AND observed_at >= ?2 AND subject <> ''
+    )";
+    if (!platform.empty())
+        sql += " AND platform = ?4";
+    sql += R"(
         GROUP BY subject
         ORDER BY COUNT(*) DESC, subject ASC
         LIMIT ?3
     )";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    if (!platform.empty())
+        sqlite3_bind_text(st.get(), 4, platform.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexSubjectCount c;
         c.subject = col_text(st.get(), 0);
@@ -1473,25 +1490,32 @@ GuaranteedStateStore::dex_signal_by_os(const std::string& obs_type, const std::s
 
 std::vector<DexDeviceCrashCount>
 GuaranteedStateStore::dex_signal_devices(const std::string& obs_type, const std::string& since,
-                                         int limit) const {
+                                         int limit, const std::string& platform) const {
     std::shared_lock lock(mtx_);
     std::vector<DexDeviceCrashCount> out;
     if (!db_)
         return out;
-    const char* sql = R"(
+    // Conditional platform predicate (empty = all-OS) — #C-DEX-1.
+    std::string sql = R"(
         SELECT agent_id, COUNT(*), MAX(observed_at)
         FROM guardian_observations
         WHERE obs_type = ?1 AND observed_at >= ?2
+    )";
+    if (!platform.empty())
+        sql += " AND platform = ?4";
+    sql += R"(
         GROUP BY agent_id
         ORDER BY COUNT(*) DESC, agent_id ASC
         LIMIT ?3
     )";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.get(), 3, std::clamp(limit, 0, kMaxEventsLimit));
+    if (!platform.empty())
+        sqlite3_bind_text(st.get(), 4, platform.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexDeviceCrashCount c;
         c.agent_id = col_text(st.get(), 0);
@@ -1503,23 +1527,31 @@ GuaranteedStateStore::dex_signal_devices(const std::string& obs_type, const std:
 }
 
 std::vector<DexDayCrashCount>
-GuaranteedStateStore::dex_signal_by_day(const std::string& obs_type, const std::string& since) const {
+GuaranteedStateStore::dex_signal_by_day(const std::string& obs_type, const std::string& since,
+                                        const std::string& platform) const {
     std::shared_lock lock(mtx_);
     std::vector<DexDayCrashCount> out;
     if (!db_)
         return out;
-    const char* sql = R"(
+    // Conditional platform predicate (empty = all-OS) — #C-DEX-1.
+    std::string sql = R"(
         SELECT substr(observed_at, 1, 10) AS day, COUNT(*)
         FROM guardian_observations
         WHERE obs_type = ?1 AND observed_at >= ?2
+    )";
+    if (!platform.empty())
+        sql += " AND platform = ?3";
+    sql += R"(
         GROUP BY day
         ORDER BY day ASC
     )";
     SqliteStmt st;
-    if (sqlite3_prepare_v2(db_, sql, -1, st.addr(), nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, st.addr(), nullptr) != SQLITE_OK)
         return out;
     sqlite3_bind_text(st.get(), 1, obs_type.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st.get(), 2, since.c_str(), -1, SQLITE_TRANSIENT);
+    if (!platform.empty())
+        sqlite3_bind_text(st.get(), 3, platform.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st.get()) == SQLITE_ROW) {
         DexDayCrashCount c;
         c.day = col_text(st.get(), 0);

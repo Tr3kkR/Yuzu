@@ -71,6 +71,14 @@
 #include <mutex>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#if defined(__linux__)
+#include <sys/syscall.h> // SYS_close_range (kernel 5.9+)
+#if defined(__has_include)
+#if __has_include(<linux/close_range.h>)
+#include <linux/close_range.h> // CLOSE_RANGE_CLOEXEC
+#endif
+#endif
+#endif
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -381,6 +389,22 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         fcntl(err_write_fd.get(), F_SETFD, FD_CLOEXEC) == -1)
         return result; // fail closed, same reasoning as the pipe above
 
+    // Fd ceiling for the child's inherited-fd sweep, computed HERE in the parent:
+    // getrlimit() is NOT async-signal-safe, so it must never run post-fork in the
+    // child. This is the real soft RLIMIT_NOFILE (the highest fd number the
+    // process can hold), so the child's fcntl sweep is complete, not capped. On
+    // Linux the child prefers close_range() and ignores this; it is the bound for
+    // the fcntl fallback (macOS always; Linux only if close_range is unavailable).
+    // The 4096 default is used ONLY when the soft limit is literally infinite
+    // (RLIM_INFINITY) — a genuinely pathological config, not the ordinary large
+    // systemd default (e.g. 524288) the previous cap wrongly swept away.
+    long child_fd_ceiling = 4096;
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+            child_fd_ceiling = static_cast<long>(rl.rlim_cur);
+    }
+
     pid_t pid = fork();
     if (pid < 0)
         return result; // all four fds close themselves
@@ -452,22 +476,27 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // them all. Deliberately mark rather than close: err_write_fd is already
         // CLOEXEC, so it survives this sweep -- auto-closing only on a
         // *successful* exec (the parent's success signal) while staying writable
-        // to report an exec failure just below. stdio (0/1/2) is untouched. Only
-        // async-signal-safe calls (getrlimit + fcntl), per the POSIX 2.4.3 rule
-        // this whole child branch obeys. The soft RLIMIT_NOFILE bounds the
-        // highest possible fd number, so the sweep is complete in the common
-        // case; the 4096 cap only engages under a pathological/infinite limit
-        // (documented residual, not a silent truncation of a realistic table).
-        {
-            struct rlimit rl;
-            long maxfd = 4096;
-            if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
-                rl.rlim_cur < static_cast<rlim_t>(maxfd))
-                maxfd = static_cast<long>(rl.rlim_cur);
-            for (int fd = 3; fd < maxfd; ++fd) {
-                const int flags = fcntl(fd, F_GETFD);
+        // to report an exec failure just below. stdio (0/1/2) is untouched.
+        //
+        // Only async-signal-safe calls run here: close_range()/syscall() and
+        // fcntl() (man 7 signal-safety). getrlimit() is NOT async-signal-safe, so
+        // the fd ceiling was computed in the PARENT above (child_fd_ceiling) --
+        // never called here. Linux (kernel 5.9+) uses close_range() with
+        // CLOSE_RANGE_CLOEXEC: one O(1) syscall covering the WHOLE [3, ∞) fd
+        // space, so there is no cap and nothing above any bound is missed. The
+        // raw syscall() avoids depending on the glibc close_range() wrapper's
+        // _GNU_SOURCE declaration. Everything else (macOS always; a pre-5.9 Linux
+        // kernel returning ENOSYS) falls back to a bounded fcntl sweep up to the
+        // real soft RLIMIT_NOFILE -- complete, since no fd can exceed that limit.
+        bool swept = false;
+#if defined(__linux__) && defined(SYS_close_range) && defined(CLOSE_RANGE_CLOEXEC)
+        swept = (syscall(SYS_close_range, 3u, ~0u, static_cast<unsigned>(CLOSE_RANGE_CLOEXEC)) == 0);
+#endif
+        if (!swept) {
+            for (long fd = 3; fd < child_fd_ceiling; ++fd) {
+                const int flags = fcntl(static_cast<int>(fd), F_GETFD);
                 if (flags != -1 && !(flags & FD_CLOEXEC))
-                    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+                    fcntl(static_cast<int>(fd), F_SETFD, flags | FD_CLOEXEC);
             }
         }
 

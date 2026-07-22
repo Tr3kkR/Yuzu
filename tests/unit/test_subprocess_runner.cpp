@@ -39,6 +39,7 @@
 #include <atomic>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -464,6 +465,59 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines cleanly stops at exa
     REQUIRE(result.lines.size() == kLines);
     CHECK(result.lines[0] == "x");
     CHECK(result.exit_code == 0);
+}
+
+namespace {
+// Places a deliberately non-CLOEXEC descriptor at `target` (dup2 always clears
+// CLOEXEC on the new fd — exactly the inherited-leak scenario), then asks a
+// child whether it can still see it via /dev/fd/<target>. Returns true iff the
+// child could NOT see it (i.e. the runner swept it close-on-exec before exec).
+bool child_cannot_see_fd(int target) {
+    const int devnull = ::open("/dev/null", O_RDONLY);
+    REQUIRE(devnull >= 0);
+    REQUIRE(::dup2(devnull, target) == target);
+    ::close(devnull);
+    // Precondition: the placed fd really is inheritable (non-CLOEXEC).
+    REQUIRE((::fcntl(target, F_GETFD) & FD_CLOEXEC) == 0);
+
+    const std::string probe = "if [ -e /dev/fd/" + std::to_string(target) +
+                              " ]; then printf LEAK; else printf CLEAN; fi";
+    SubprocessResult r =
+        run_bounded_subprocess({"/bin/sh", "-c", probe}, SubprocessOptions{.deadline = 5000ms});
+    ::close(target);
+    return r.tool_ran && r.output == "CLEAN";
+}
+} // namespace
+
+// B3 (review blocker): a subprocess exec'd by the runner must NOT inherit fds
+// this process opened without O_CLOEXEC — they would leak into an external,
+// possibly-root helper. The runner marks every fd >= 3 close-on-exec first.
+TEST_CASE("run_bounded_subprocess does not leak an inherited non-CLOEXEC fd into the child",
+          "[subprocess][fd]") {
+    // A low-numbered inherited fd (below any historical cap) is swept.
+    CHECK(child_cannot_see_fd(21));
+}
+
+// The earlier fix capped its in-child fcntl sweep at 4096, silently leaking any
+// fd at or above it under an ordinary large RLIMIT_NOFILE (systemd's 524288,
+// this host's 1048576). Raise the limit, place an fd at 5000, and prove the cap
+// is gone (close_range on Linux; a full-soft-limit sweep on macOS).
+TEST_CASE("run_bounded_subprocess sweeps an inherited fd above the old 4096 cap",
+          "[subprocess][fd]") {
+    struct rlimit saved{};
+    REQUIRE(::getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    struct rlimit raised = saved;
+    const rlim_t want = 6000;
+    raised.rlim_cur =
+        (saved.rlim_max == RLIM_INFINITY || saved.rlim_max >= want) ? want : saved.rlim_max;
+    const bool bumped = (::setrlimit(RLIMIT_NOFILE, &raised) == 0);
+    struct rlimit now{};
+    ::getrlimit(RLIMIT_NOFILE, &now);
+    if (!bumped || now.rlim_cur <= 4096) {
+        SKIP("host RLIMIT_NOFILE cannot be raised above 4096; cap-regression path unexercisable here");
+    }
+    CHECK(child_cannot_see_fd(5000));
+    ::setrlimit(RLIMIT_NOFILE, &saved); // restore
 }
 
 #endif // !_WIN32

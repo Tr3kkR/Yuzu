@@ -628,6 +628,48 @@ TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escap
     CHECK(bad.find("<img src=x") == std::string::npos); // escaped, no XSS
 }
 
+TEST_CASE("DEX catalogue signal drill-down: single-OS lens scopes the subject list (C-DEX-1)",
+          "[dex][routes][catalogue]") {
+    // A single-OS Catalogue filter must scope the drilldown's subject/device/day
+    // lists to that OS — no cross-OS bleed. (by_os stays cross-OS; that's the
+    // split chart, exercised elsewhere.)
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& subject,
+                   const std::string& plat) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = "network.wifi_drop";
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = kDayB + "T10:00:00Z";
+        REQUIRE(store.insert_event(r));
+    };
+    obs("a", "agent-A", "CorpNet", "windows");
+    obs("b", "agent-B", "CorpNet", "windows");
+    obs("c", "mac-1", "AirportWiFi", "macos");
+
+    SECTION("macOS lens hides the Windows-only subject") {
+        const auto html =
+            render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop", "macos");
+        CHECK(html.find("AirportWiFi") != std::string::npos); // the macOS subject shows
+        CHECK(html.find("CorpNet") == std::string::npos);     // the Windows subject is scoped out
+    }
+    SECTION("Windows lens hides the macOS-only subject") {
+        const auto html =
+            render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop", "windows");
+        CHECK(html.find("CorpNet") != std::string::npos);
+        CHECK(html.find("AirportWiFi") == std::string::npos);
+    }
+    SECTION("the all-OS lens shows both subjects") {
+        const auto html =
+            render_dex_catalogue_signal_fragment(&store, "", 7, "network.wifi_drop", "all");
+        CHECK(html.find("CorpNet") != std::string::npos);
+        CHECK(html.find("AirportWiFi") != std::string::npos);
+    }
+}
+
 TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
           "[dex][routes][health]") {
     GuaranteedStateStore store(":memory:");

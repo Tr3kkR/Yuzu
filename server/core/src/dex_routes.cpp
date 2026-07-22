@@ -1003,13 +1003,22 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
             break;
     }
 
-    const auto subjects = store->dex_signal_subjects(obs_type, since, 15);
+    // OS-scope the detail lists to the selected lens (#C-DEX-1): a single-OS
+    // filter must not show cross-OS subjects/devices/days. `by_os` is deliberately
+    // left cross-OS — it IS the OS-split chart, so it always spans every OS.
+    const std::string plat = (osf == "all") ? std::string{} : osf;
+    const auto subjects = store->dex_signal_subjects(obs_type, since, 15, plat);
     const auto by_os = store->dex_signal_by_os(obs_type, since);
-    const auto devices = store->dex_signal_devices(obs_type, since, 15);
-    const auto by_day = store->dex_signal_by_day(obs_type, since);
+    const auto devices = store->dex_signal_devices(obs_type, since, 15, plat);
+    const auto by_day = store->dex_signal_by_day(obs_type, since, plat);
 
+    // Headline totals follow the same lens as the detail lists: sum the whole
+    // cross-OS split for "all", or just the selected OS's row otherwise — so the
+    // "Events"/"Devices" tiles never disagree with the (now OS-scoped) lists.
     int64_t events = 0, devs = 0;
     for (const auto& o : by_os) {
+        if (!plat.empty() && o.platform != plat)
+            continue;
         events += o.crashes; // generic event count
         devs += o.distinct_devices;
     }
@@ -1272,7 +1281,11 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
             : "default";
 
     const auto signals = store->dex_signal_summary(since);
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): the crash-free headline is denominated over
+    // reporting Windows agents (N below), so the numerator must be Windows
+    // crashes only — otherwise macOS process.crashed events (now emitted) would
+    // inflate the rate against the Windows fleet.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const int64_t N = fleet.windows_online; // scored over reporting Windows agents
 
     std::string h;
@@ -1454,7 +1467,9 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
         return placeholder("Trends unavailable", "The signal observation store is not open.");
     const auto scope = store->dex_os_signal_scope(since);
     const auto matrix = store->dex_signal_day_matrix(since);
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): the crash-free number below is capped at and
+    // divided by fleet.windows_online, so the crash numerator is Windows-only.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const int64_t total_types = static_cast<int64_t>(dex_catalogued_type_count());
 
     auto scope_of = [&](const char* p) -> const DexOsScope* {
@@ -1611,7 +1626,11 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     // not (zero counts are real data: "monitored, nothing happened").
     const auto signals = store->dex_signal_summary(since);
 
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): every tile below (crash-free %, crashes/1k,
+    // devices impacted) and the per-OS table's Windows row are denominated over
+    // reporting Windows agents, so the crash counts must be Windows-only — the
+    // all-OS summary would divide macOS crashes into the Windows fleet.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const auto apps = store->dex_top_apps(since, 8);
     const auto devices = store->dex_top_devices(since, 8);
     const auto by_day = store->dex_crashes_by_day(since);

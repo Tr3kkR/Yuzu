@@ -337,7 +337,13 @@ public:
     // cutoff ('' = all). `limit` clamped to kMaxEventsLimit. Rates (crash-free-%,
     // /1k device-days) are composed with the agent-registry fleet size at the
     // route layer, not here. Crash-scoped unless noted.
-    DexCrashSummary dex_crash_summary(const std::string& since = "") const;
+    // `platform` narrows the crash aggregation to one OS (lowercase
+    // windows/linux/macos; empty = all-OS). The overview's crash-free-% /
+    // crashes-per-1k tiles are Windows-denominated, so they pass "windows" —
+    // otherwise all-OS crashes (macOS now emits process.crashed too) would be
+    // divided by the Windows fleet size, inflating the rate (#C-DEX-1).
+    DexCrashSummary dex_crash_summary(const std::string& since = "",
+                                      const std::string& platform = "") const;
     // Spans process.crashed + process.hung (the app-reliability table).
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
     // Per-DEVICE app reliability, split by VERSION (slice 2b) — the per-(app,
@@ -370,16 +376,23 @@ public:
     // the generic event count. `dex_os_signal_scope` is the per-OS coverage (how
     // many distinct types each OS collects) — drives the live cross-OS captions
     // that replace the mockups' stale "macOS 6 of 103".
+    // `platform` (lowercase windows/linux/macos; empty = all-OS) OS-scopes the
+    // drilldown so a single-OS Catalogue filter doesn't show cross-OS events
+    // (#C-DEX-1). dex_signal_by_os is deliberately NOT scoped — it IS the cross-OS
+    // breakdown, so it always spans every OS regardless of the selected lens.
     std::vector<DexSubjectCount> dex_signal_subjects(const std::string& obs_type,
                                                      const std::string& since = "",
-                                                     int limit = 20) const;
+                                                     int limit = 20,
+                                                     const std::string& platform = "") const;
     std::vector<DexOsCrashCount> dex_signal_by_os(const std::string& obs_type,
                                                   const std::string& since = "") const;
     std::vector<DexDeviceCrashCount> dex_signal_devices(const std::string& obs_type,
                                                         const std::string& since = "",
-                                                        int limit = 20) const;
+                                                        int limit = 20,
+                                                        const std::string& platform = "") const;
     std::vector<DexDayCrashCount> dex_signal_by_day(const std::string& obs_type,
-                                                    const std::string& since = "") const;
+                                                    const std::string& since = "",
+                                                    const std::string& platform = "") const;
     std::vector<DexOsScope> dex_os_signal_scope(const std::string& since = "") const;
     // The (day, obs_type, count) matrix — aggregated to family×day in the route
     // for the Trends small-multiples + heatmap. One GROUP BY pass.
