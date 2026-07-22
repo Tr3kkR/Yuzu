@@ -359,6 +359,8 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+)HTM"
+    R"HTM(
     <!-- ── Access Reviews (SOC 2 CC6.2) ──────────────────── -->
     <div class="section">
       <div class="section-header">Access Reviews</div>

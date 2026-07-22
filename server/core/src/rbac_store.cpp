@@ -238,6 +238,36 @@ void RbacStore::create_tables() {
             DELETE FROM group_members
             WHERE group_name IN (SELECT name FROM groups WHERE source != 'local');
         )"},
+        // Periodic Access Reviews (#2324 review round) — retire the
+        // now-superseded AuditLog:Read/AuditLog:Attest grants an earlier
+        // (pre-fix) version of this PR seeded for access-review gating,
+        // now replaced by the dedicated AccessReview securable. `INSERT OR
+        // IGNORE` in `seed_defaults()` only ever ADDS rows, so a dev/UAT
+        // rbac.db that was seeded under the earlier scheme would otherwise
+        // keep these three retired grants forever — a Reviewer created
+        // before the flip would still carry the live AuditLog:Read op that
+        // a fresh-install Reviewer never gets, and Administrator would
+        // carry a stray AuditLog:Attest op that was only ever added for
+        // this feature. Scoped to EXACTLY these three (role, securable,
+        // operation) tuples — Administrator's other AuditLog ops
+        // (Read/Write/Delete/etc.) and every other role's AuditLog:Read
+        // (Operator/PlatformEngineer/Viewer — unrelated, still legitimate)
+        // are untouched. Safe no-op on a fresh DB (rows never existed).
+        // One-way cleanup: like any data migration it is version-gated and
+        // runs exactly once, but restoring a pre-v4 backup and re-booting
+        // re-applies it — so an operator who DELIBERATELY re-grants one of
+        // these three tuples (e.g. Reviewer:AuditLog:Read to let reviewers
+        // also browse the audit trail) after v4 has run keeps it, but would
+        // lose it on such a restore. That grant belongs on a separate role
+        // or a distinct securable, not these retired access-review tuples.
+        {4, R"(
+            DELETE FROM role_permissions
+            WHERE (role_name, securable_type, operation) IN (
+                ('Administrator', 'AuditLog', 'Attest'),
+                ('Reviewer', 'AuditLog', 'Read'),
+                ('Reviewer', 'AuditLog', 'Attest')
+            );
+        )"},
     };
     if (!MigrationRunner::run(db_, "rbac_store", kMigrations)) {
         spdlog::error("RbacStore: schema migration failed, closing database");
@@ -277,6 +307,14 @@ void RbacStore::seed_defaults() {
                            "FileRetrieval",
                            "GuaranteedState",
                            "Inventory",
+                           // Periodic Access Reviews (SOC 2 CC6.2): dedicated narrow
+                           // securable for the fleet-wide grant export + attestation-
+                           // campaign lifecycle — deliberately separate from AuditLog so
+                           // AuditLog:Read holders (e.g. Operator, PlatformEngineer) do
+                           // NOT also get the grant-graph export. Seeded to
+                           // Administrator (via the CRUD loop below) + the Reviewer role
+                           // (Read + Attest, see the explicit grants further down).
+                           "AccessReview",
                            // SLE (ADR-0024 Decision 9). DISTINCT from the existing
                            // `License` securable (Yuzu's OWN product licence, §22.3) —
                            // this gates the /api/v1/sle/* discovery reads + the erasure
@@ -324,7 +362,7 @@ void RbacStore::seed_defaults() {
     // catalogue, but deliberately EXCLUDED from `crud_ops` so the
     // Administrator/ITServiceOwner/Viewer cross-type loops below never widen
     // it onto an unrelated securable — it is granted explicitly, only on
-    // AuditLog, only to Administrator and the new Reviewer role.
+    // AccessReview, only to Administrator and the new Reviewer role.
     const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"};
     const char* crud_ops[] = {"Read", "Write", "Execute", "Delete", "Approve"};
     for (auto* o : ops) {
@@ -353,9 +391,10 @@ void RbacStore::seed_defaults() {
         {"ITServiceOwner", "Admin control over devices tagged with the same IT Service"},
         {"Viewer", "Read-only access to operational data"},
         // Periodic Access Reviews (SOC 2 CC6.2): a reviewer who can read the
-        // audit trail and record attestation decisions on an access-review
-        // campaign, without holding any of Administrator's broader write
-        // access. AuditLog:Read + AuditLog:Attest only — see the grants below.
+        // grant-graph evidence and record attestation decisions on an
+        // access-review campaign, without holding any of Administrator's
+        // broader write access. AccessReview:Read + AccessReview:Attest only
+        // — see the grants below.
         {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"},
     };
     for (auto& [name, desc] : roles) {
@@ -393,13 +432,14 @@ void RbacStore::seed_defaults() {
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'GuaranteedState', 'Push', 'allow');",
         nullptr, nullptr, nullptr);
-    // Administrator: Attest on AuditLog (Periodic Access Reviews, SOC 2
+    // Administrator: Attest on AccessReview (Periodic Access Reviews, SOC 2
     // CC6.2) — same targeted-grant treatment as the Push grant above; Attest
     // is deliberately excluded from `crud_ops` so it is never seeded
     // cross-type by the loop.
     sqlite3_exec(
         db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'AuditLog', 'Attest', 'allow');",
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'AccessReview', 'Attest', "
+        "'allow');",
         nullptr, nullptr, nullptr);
 
     // PlatformEngineer: full CRUD on definitions, sets, and read on related types
@@ -670,17 +710,20 @@ void RbacStore::seed_defaults() {
         sqlite3_finalize(s);
     }
 
-    // Reviewer (Periodic Access Reviews, SOC 2 CC6.2): AuditLog:Read (browse
-    // the evidence trail) + AuditLog:Attest (record a decision on a campaign
-    // row). Deliberately NOT crud_ops — a reviewer must not gain Write/
-    // Delete/Approve on AuditLog, only the ability to read and attest.
+    // Reviewer (Periodic Access Reviews, SOC 2 CC6.2): AccessReview:Read
+    // (browse the evidence trail) + AccessReview:Attest (record a decision
+    // on a campaign row). Deliberately NOT crud_ops — a reviewer must not
+    // gain Write/Delete/Approve on AccessReview, only the ability to read
+    // and attest.
     sqlite3_exec(
         db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AuditLog', 'Read', 'allow');",
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AccessReview', 'Read', "
+        "'allow');",
         nullptr, nullptr, nullptr);
     sqlite3_exec(
         db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AuditLog', 'Attest', 'allow');",
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AccessReview', 'Attest', "
+        "'allow');",
         nullptr, nullptr, nullptr);
 }
 

@@ -24,7 +24,7 @@
 /// belonging to a principal outside every roster was a silent false
 /// negative in exactly the evidence CC6.2 exists to produce; walking the
 /// grant table directly makes that omission structurally impossible. The
-/// rosters (`AuthDB::list_users`, `RbacStore::list_groups_checked`,
+/// rosters (`AuthDB::list_users_including_inactive`, `RbacStore::list_groups_checked`,
 /// `EnginePrincipalStore::list_all_checked`) are still read, but only to
 /// ENRICH a grant-table row with display metadata — a principal with ZERO
 /// grants produces no row (nothing to review), which is the intended scope
@@ -120,8 +120,10 @@ struct AccessReviewRow {
     std::int64_t last_activity_ms{0};  ///< epoch ms; 0 when unknown/not applicable
     std::string last_activity_kind;    ///< "last_login" | "last_used" | "n/a"
     std::string classification;        ///< engine: "internal"|"external"; else ""
-    std::string lifecycle_state;       ///< engine: "active"|"revoked"; user: "active" (list_users()
-                                        ///< only returns active rows); group: ""; orphan: "unknown"
+    std::string lifecycle_state;       ///< engine: "active"|"revoked"; user: "active"|"disabled"
+                                        ///< (per AuthDB::list_users_including_inactive's is_active
+                                        ///< flag — a disabled user still holding a grant is matched
+                                        ///< evidence, NOT an orphan); group: ""; orphan: "unknown"
     std::string source; ///< "local" | "scim" | "idp" | "engine" | "orphan" — best-effort
                         ///< normalisation of the principal's provenance ("orphan" = grant with no
                         ///< matching roster row, UP-1); see the .cpp for the exact mapping

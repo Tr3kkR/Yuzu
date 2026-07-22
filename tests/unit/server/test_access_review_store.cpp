@@ -40,10 +40,9 @@
 
 #include <libpq-fe.h>
 
-#include <chrono>
+#include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 using yuzu::server::AccessReviewStore;
@@ -160,6 +159,39 @@ TEST_CASE("open_campaign with an empty population still opens a campaign (zero p
     REQUIRE(view_res.has_value());
     CHECK(view_res->attestations.empty());
     CHECK(view_res->pending_count == 0);
+}
+
+// governance hardening round: get_campaign's two reads (campaign row +
+// attestation rows) now run under REPEATABLE READ instead of a plain
+// `with_txn_for` BEGIN (READ COMMITTED); this test pins that get_campaign's
+// genuine mid-read failure path — as opposed to the not_found path above —
+// still surfaces as a plain error, distinguishable by NOT carrying the
+// `not_found:` prefix. Forced by dropping the attestation table out from
+// under an already-open store (the campaign row read succeeds first, the
+// attestation-rows read then fails), mirroring the migration-fail fixture's
+// raw-connection pattern at the top of this file.
+TEST_CASE("get_campaign: a genuine read failure mid-enumeration is a plain error, never "
+         "mistaken for not_found",
+         "[access_review][store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, access_review_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AccessReviewStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto open_res = store.open_campaign("Drop test", "admin", three_grants());
+    REQUIRE(open_res.has_value());
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(), "DROP TABLE access_review_store.access_review_attestation")};
+        REQUIRE(d.ok());
+    }
+
+    auto view_res = store.get_campaign(*open_res);
+    REQUIRE_FALSE(view_res.has_value());
+    CHECK_FALSE(view_res.error().starts_with("not_found:"));
+    CHECK(view_res.error().find("attestation read failed") != std::string::npos);
 }
 
 // ── record_attestation: transition + upsert ─────────────────────────────────
@@ -377,27 +409,32 @@ TEST_CASE("list_campaigns: returns every opened campaign's metadata, newest-firs
 
     auto open_a = store.open_campaign("Campaign A", "admin", {});
     REQUIRE(open_a.has_value());
-    // The store orders strictly by `created_at_ms` with no secondary sort key
-    // (access_review_store.cpp) — force a distinct millisecond timestamp per
-    // open so "newest-first" order is unambiguous, not a race against the
-    // clock's own resolution.
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
     auto open_b = store.open_campaign("Campaign B", "admin", {});
     REQUIRE(open_b.has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
     auto open_c = store.open_campaign("Campaign C", "admin", three_grants());
     REQUIRE(open_c.has_value());
 
     auto list_res = store.list_campaigns();
     REQUIRE(list_res.has_value());
     REQUIRE(list_res->size() == 3);
-    // Newest-first: C, B, A.
-    CHECK((*list_res)[0].campaign_id == *open_c);
-    CHECK((*list_res)[0].title == "Campaign C");
-    CHECK((*list_res)[1].campaign_id == *open_b);
-    CHECK((*list_res)[1].title == "Campaign B");
-    CHECK((*list_res)[2].campaign_id == *open_a);
-    CHECK((*list_res)[2].title == "Campaign A");
+
+    // The store orders by `created_at_ms DESC, campaign_id DESC`
+    // (access_review_store.cpp) — the secondary key is a deterministic
+    // tie-breaker for opens that land in the same millisecond, so the
+    // returned order must be internally consistent on every run rather than
+    // depending on wall-clock spacing between the three opens above.
+    for (std::size_t i = 1; i < list_res->size(); ++i) {
+        const auto& prev = (*list_res)[i - 1];
+        const auto& cur = (*list_res)[i];
+        CHECK((prev.created_at_ms > cur.created_at_ms ||
+               (prev.created_at_ms == cur.created_at_ms &&
+                prev.campaign_id > cur.campaign_id)));
+    }
+
+    std::set<std::string> seen_ids;
+    for (const auto& c : *list_res)
+        seen_ids.insert(c.campaign_id);
+    CHECK(seen_ids == std::set<std::string>{*open_a, *open_b, *open_c});
 
     // list_campaigns is metadata-only — it does NOT return attestation rows
     // (get_campaign is the surface for those); every listed row's status

@@ -943,9 +943,10 @@ static const ToolDef kTools[] = {
      "activity, classification, lifecycle_state, and provenance. Mirrors GET "
      "/api/v1/access-reviews/export exactly, JSON ONLY (the REST twin's ?format=csv has no "
      "MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately "
-     "gated on a GLOBAL AuditLog:Read, not a management-group-confined read — a scoped "
+     "gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + "
+     "the Reviewer role, NOT AuditLog:Read), not a management-group-confined read — a scoped "
      "slice would be useless as fleet-wide CC6.2 evidence. Self-audited as "
-     "access_review.exported. Requires AuditLog:Read.",
+     "access_review.exported. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}}},"required":["count","rows"]})j",
      R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Export access review evidence"})"},
@@ -958,7 +959,7 @@ static const ToolDef kTools[] = {
      "stays reviewable (frozen, not re-derived from live state). Mirrors POST "
      "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
-     "Requires AuditLog:Attest.",
+     "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("title":{"type":"string","description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
@@ -976,7 +977,7 @@ static const ToolDef kTools[] = {
      "role_name) OVERWRITES the prior reviewer's decision, reviewer, and justification — "
      "the earlier evidence is not retained, so destructiveHint:true. Mirrors "
      "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
-     "or access_review.flagged (by decision). Requires AuditLog:Attest.",
+     "or access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string"},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
@@ -992,7 +993,7 @@ static const ToolDef kTools[] = {
      "Full evidentiary state of one review campaign: metadata plus every frozen "
      "attestation row (pending/attested/flagged_revoke) plus pending_count. Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
-     "AuditLog:Read.",
+     "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string"})j"
      R"j(},"required":["campaign_id"]})j",
@@ -1003,7 +1004,7 @@ static const ToolDef kTools[] = {
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
      "for those), newest-first, capped at the most recent 500. The surface an auditor "
      "needs to prove reviews ran on cadence. Mirrors GET /api/v1/access-reviews. "
-     "Self-audited as access_review.list. Requires AuditLog:Read.",
+     "Self-audited as access_review.list. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"}}}}},"required":["count","campaigns"]})j",
      R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"List access review campaigns"})"},
@@ -1014,7 +1015,7 @@ static const ToolDef kTools[] = {
      "not something this tool silently forces to completion. Mirrors POST "
      "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Finalizes "
      "a campaign's lifecycle state — it does not destroy any evidence (attestation rows "
-     "are untouched), so destructiveHint:false. Requires AuditLog:Attest.",
+     "are untouched), so destructiveHint:false. Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string"})j"
      R"j(},"required":["campaign_id"]})j",
@@ -1159,13 +1160,15 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"discover_plugins", {"Infrastructure", "Read"}},
     {"query_software_licenses", {"SoftwareLicensing", "Read"}},
     // Periodic Access Reviews (SOC 2 CC6.2) — parity with the REST twins'
-    // AuditLog:Read (export/get) and AuditLog:Attest (open/attest) gates.
-    {"export_access_review", {"AuditLog", "Read"}},
-    {"open_access_review", {"AuditLog", "Attest"}},
-    {"record_attestation", {"AuditLog", "Attest"}},
-    {"get_access_review", {"AuditLog", "Read"}},
-    {"list_access_reviews", {"AuditLog", "Read"}},
-    {"close_access_review", {"AuditLog", "Attest"}},
+    // AccessReview:Read (export/get/list) and AccessReview:Attest
+    // (open/attest/close) gates — a dedicated narrow securable, NOT AuditLog,
+    // seeded to Administrator + the Reviewer role only.
+    {"export_access_review", {"AccessReview", "Read"}},
+    {"open_access_review", {"AccessReview", "Attest"}},
+    {"record_attestation", {"AccessReview", "Attest"}},
+    {"get_access_review", {"AccessReview", "Read"}},
+    {"list_access_reviews", {"AccessReview", "Read"}},
+    {"close_access_review", {"AccessReview", "Attest"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -6582,13 +6585,13 @@ McpServer::HandlerFn McpServer::build_handler(
             // not a human reviewer and must never mint or sign this evidence.
 
             if (tool_name == "export_access_review") {
-                if (!tier_allows(tier, "AuditLog", "Read")) {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "AuditLog", "Read"))
+                if (!perm_fn(req, res, "AccessReview", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -6643,13 +6646,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "open_access_review") {
-                if (!tier_allows(tier, "AuditLog", "Attest")) {
+                if (!tier_allows(tier, "AccessReview", "Attest")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "AuditLog", "Attest"))
+                if (!perm_fn(req, res, "AccessReview", "Attest"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -6727,13 +6730,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "record_attestation") {
-                if (!tier_allows(tier, "AuditLog", "Attest")) {
+                if (!tier_allows(tier, "AccessReview", "Attest")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "AuditLog", "Attest"))
+                if (!perm_fn(req, res, "AccessReview", "Attest"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -6808,13 +6811,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_access_review") {
-                if (!tier_allows(tier, "AuditLog", "Read")) {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "AuditLog", "Read"))
+                if (!perm_fn(req, res, "AccessReview", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -6878,13 +6881,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_access_reviews") {
-                if (!tier_allows(tier, "AuditLog", "Read")) {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "AuditLog", "Read"))
+                if (!perm_fn(req, res, "AccessReview", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -6929,13 +6932,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "close_access_review") {
-                if (!tier_allows(tier, "AuditLog", "Attest")) {
+                if (!tier_allows(tier, "AccessReview", "Attest")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "AuditLog", "Attest"))
+                if (!perm_fn(req, res, "AccessReview", "Attest"))
                     return;
                 if (deny_if_engine_session())
                     return;

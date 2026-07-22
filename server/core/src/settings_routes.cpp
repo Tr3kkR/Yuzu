@@ -1337,9 +1337,9 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
     // a read-only auditor gets an honest omission rather than a swallowed
     // 403 (mirrors dex_routes.cpp's can_execute pattern). The probe is
     // against the SAME securable:operation the REST POST route itself
-    // gates (AuditLog:Attest).
+    // gates (AccessReview:Attest).
     httplib::Response probe;
-    bool can_attest = perm_fn_(req, probe, "AuditLog", "Attest");
+    bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
 
     if (can_attest) {
         html += "<form onsubmit=\"return arOpenCampaign(this)\" "
@@ -1385,7 +1385,7 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     const auto& view = *view_res;
 
     httplib::Response probe;
-    bool can_attest = perm_fn_(req, probe, "AuditLog", "Attest");
+    bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
     bool is_open_campaign = view.campaign.status == "open";
 
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
@@ -3122,16 +3122,16 @@ void SettingsRoutes::register_routes(
              });
 
     // Periodic Access Reviews (SOC 2 CC6.2) — Settings convenience surface.
-    // Gated on AuditLog:Read (matches the REST export/get routes); the
-    // fragment renderer itself probes AuditLog:Attest to decide whether to
-    // show the write controls (open/attest/flag/close) — see
+    // Gated on AccessReview:Read (matches the REST export/get routes); the
+    // fragment renderer itself probes AccessReview:Attest to decide whether
+    // to show the write controls (open/attest/flag/close) — see
     // render_access_review_fragment()'s doc comment. The REST endpoints
     // under /api/v1/access-reviews* (rest_api_v1.cpp) and their MCP twins
     // are the ADR-1005 API-parity surface this fragment is a convenience
     // layer over, not a replacement for.
     sink.Get("/fragments/settings/access-reviews",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "AuditLog", "Read"))
+                 if (!perm_fn_(req, res, "AccessReview", "Read"))
                      return;
                  res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
              });
@@ -3142,7 +3142,7 @@ void SettingsRoutes::register_routes(
     // an attest/flag/close action (arLoadCampaign in kAccessReviewScript).
     sink.Get("/fragments/settings/access-reviews/campaign",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "AuditLog", "Read"))
+                 if (!perm_fn_(req, res, "AccessReview", "Read"))
                      return;
                  std::string id = req.has_param("id") ? req.get_param_value("id") : "";
                  res.set_content(render_access_review_campaign_fragment(req, id),

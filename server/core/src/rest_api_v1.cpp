@@ -294,6 +294,18 @@ static int access_review_error_status(const std::string& err) {
     return err.starts_with("not_found:") ? 404 : 503;
 }
 
+// A present-but-wrong-typed JSON body field (e.g. {"title": 5}) must degrade
+// to the default rather than throw nlohmann's type_error.302 out of
+// `body.value(key, default)` (-> uncaught -> 500). Mirrors MCP's
+// param_str (mcp_server.cpp) so the REST and MCP twins agree on the same
+// wrong-typed-field -> clean-400 behavior.
+static std::string access_review_str_field(const nlohmann::json& body, const char* key,
+                                            const char* def = "") {
+    if (body.contains(key) && body[key].is_string())
+        return body[key].get<std::string>();
+    return def;
+}
+
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
 // dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
@@ -942,20 +954,20 @@ const std::string& openapi_spec() {
         // Access Reviews (SOC 2 CC6.2) paths.
         R"json(,
     "/access-reviews/export": {
-      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AuditLog:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AuditLog:Read, not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}. CSV: same fields, Content-Disposition: attachment.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AuditLog:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
+      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + the Reviewer role, NOT AuditLog:Read), not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}. CSV: same fields, Content-Disposition: attachment.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
     },
     "/access-reviews": {
-      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AuditLog:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}], meta}"}, "403": {"description": "Requires AuditLog:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
-      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AuditLog:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AuditLog:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}], meta}"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
     },
     "/access-reviews/{id}": {
-      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AuditLog:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}"}, "403": {"description": "Requires AuditLog:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
+      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}"}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
     },
     "/access-reviews/{id}/attestations": {
-      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AuditLog:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AuditLog:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     },
     "/access-reviews/{id}/close": {
-      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AuditLog:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AuditLog:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     }
   }
 })json";
@@ -4459,19 +4471,21 @@ void RestApiV1::register_routes(
     //
     // #2225 chokepoint note: this is a FLEET-WIDE read of per-*principal*
     // authorization evidence (every user/group/engine-principal's direct role
-    // grants), deliberately gated on a GLOBAL AuditLog:Read — NOT the
-    // ADR-0017 `authorize_list_read` admit-then-filter chokepoint every new
+    // grants), gated on the dedicated `AccessReview:Read` securable — seeded
+    // to Administrator + the Reviewer role only — NOT the ADR-0017
+    // `authorize_list_read` admit-then-filter chokepoint every new
     // per-*agent* list read must use. A management-group-confinement filter
     // would make this export USELESS as CC6.2 evidence: a reviewer certifying
     // the fleet must see the ENTIRE grant population, not one operator's
-    // confined slice of it. Access review is intentionally admin/auditor-only
-    // and unconfined by design — a deliberate exception to the ADR-0017
-    // default, not an oversight.
+    // confined slice of it. It remains a global/unconfined evidence read by
+    // design — the dedicated narrow securable now correctly scopes it so
+    // AuditLog:Read holders like Operator/PlatformEngineer can no longer pull
+    // the grant graph.
     sink.Get(
         "/api/v1/access-reviews/export",
         [perm_fn, auth_fn, audit_fn, auth_db, rbac_store, eps, token_store, directory_sync,
          metrics_registry](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Read"))
+            if (!perm_fn(req, res, "AccessReview", "Read"))
                 return;
             auto session = auth_fn(req, res);
             if (!session)
@@ -4581,7 +4595,7 @@ void RestApiV1::register_routes(
         "/api/v1/access-reviews",
         [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
                                                            httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Read"))
+            if (!perm_fn(req, res, "AccessReview", "Read"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
                 res.status = 503;
@@ -4598,7 +4612,7 @@ void RestApiV1::register_routes(
 
             auto rows_res = access_review_store->list_campaigns();
             if (!rows_res) {
-                res.status = 503;
+                res.status = access_review_error_status(rows_res.error());
                 res.set_content(detail::a4_error(res, rows_res.error(),
                                                  detail::A4ErrorOpts{.retry_after_ms = 5000,
                                                                      .remediation = {},
@@ -4633,7 +4647,7 @@ void RestApiV1::register_routes(
         "/api/v1/access-reviews",
         [perm_fn, auth_fn, audit_fn, access_review_store, auth_db, rbac_store, eps, token_store,
          directory_sync, metrics_registry](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Attest"))
+            if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
                 res.status = 503;
@@ -4654,7 +4668,7 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
-            auto title = body.value("title", "");
+            auto title = access_review_str_field(body, "title");
             if (title.empty()) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "title is required"), "application/json");
@@ -4698,14 +4712,33 @@ void RestApiV1::register_routes(
 
             auto open_res = access_review_store->open_campaign(title, session->username, frozen);
             if (!open_res) {
-                (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview", "",
-                               open_res.error());
+                try {
+                    (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview",
+                                   "", open_res.error());
+                } catch (const std::exception& ex) {
+                    spdlog::warn("access_review.campaign_opened audit emission threw: {}",
+                                 ex.what());
+                }
                 res.status = access_review_error_status(open_res.error());
                 res.set_content(detail::a4_error(res, open_res.error()), "application/json");
                 return;
             }
-            (void)audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
-                           *open_res, "grants=" + std::to_string(frozen.size()));
+            // The campaign was already opened — the audit row is evidence of that,
+            // never a gate on it. A failed audit surfaces via Sec-Audit-Failed and
+            // the response proceeds (mirrors the export path above).
+            bool open_audit_emitted = false;
+            try {
+                open_audit_emitted =
+                    audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
+                            *open_res, "grants=" + std::to_string(frozen.size()));
+            } catch (const std::exception& ex) {
+                spdlog::warn("access_review.campaign_opened audit emission threw: {}", ex.what());
+            }
+            if (!open_audit_emitted) {
+                spdlog::warn("access_review.campaign_opened did not persist — evidence-chain gap "
+                             "for an access-review campaign open");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
             if (metrics_registry)
                 metrics_registry->counter("yuzu_access_review_campaigns_opened_total").increment();
             res.status = 201;
@@ -4722,7 +4755,7 @@ void RestApiV1::register_routes(
         R"(/api/v1/access-reviews/([^/]+))",
         [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
                                                            httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Read"))
+            if (!perm_fn(req, res, "AccessReview", "Read"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
                 res.status = 503;
@@ -4788,7 +4821,7 @@ void RestApiV1::register_routes(
         R"(/api/v1/access-reviews/([^/]+)/attestations)",
         [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry](
             const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Attest"))
+            if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
                 res.status = 503;
@@ -4810,11 +4843,11 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                 return;
             }
-            auto principal_type = body.value("principal_type", "");
-            auto principal_id = body.value("principal_id", "");
-            auto role_name = body.value("role_name", "");
-            auto decision = body.value("decision", "");
-            auto justification = body.value("justification", "");
+            auto principal_type = access_review_str_field(body, "principal_type");
+            auto principal_id = access_review_str_field(body, "principal_id");
+            auto role_name = access_review_str_field(body, "role_name");
+            auto decision = access_review_str_field(body, "decision");
+            auto justification = access_review_str_field(body, "justification");
             if (principal_type.empty() || principal_id.empty() || role_name.empty()) {
                 res.status = 400;
                 res.set_content(detail::a4_error(
@@ -4839,8 +4872,12 @@ void RestApiV1::register_routes(
             const std::string audit_action =
                 decision == "flagged_revoke" ? "access_review.flagged" : "access_review.attested";
             if (!rec_res) {
-                (void)audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
-                               rec_res.error());
+                try {
+                    (void)audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
+                                   rec_res.error());
+                } catch (const std::exception& ex) {
+                    spdlog::warn("{} audit emission threw: {}", audit_action, ex.what());
+                }
                 res.status = access_review_error_status(rec_res.error());
                 res.set_content(detail::a4_error(res, rec_res.error()), "application/json");
                 return;
@@ -4851,9 +4888,25 @@ void RestApiV1::register_routes(
             // this path. Acting on the flag is a separate, explicit RBAC/
             // EnginePrincipal write an operator performs after reading this
             // evidence (flag != revoke).
-            (void)audit_fn(req, audit_action, "success", "AccessReview",
-                           campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
-                           "decision=" + decision);
+            //
+            // The attestation was already recorded — the audit row is evidence of
+            // that, never a gate on it. A failed audit surfaces via
+            // Sec-Audit-Failed and the response proceeds (mirrors export above).
+            bool attest_audit_emitted = false;
+            try {
+                attest_audit_emitted = audit_fn(
+                    req, audit_action, "success", "AccessReview",
+                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
+                    "decision=" + decision);
+            } catch (const std::exception& ex) {
+                spdlog::warn("{} audit emission threw: {}", audit_action, ex.what());
+            }
+            if (!attest_audit_emitted) {
+                spdlog::warn("{} did not persist — evidence-chain gap for an access-review "
+                             "attestation",
+                             audit_action);
+                res.set_header("Sec-Audit-Failed", "true");
+            }
             if (metrics_registry)
                 metrics_registry->counter("yuzu_access_review_attestations_total",
                                           {{"decision", decision}})
@@ -4869,7 +4922,7 @@ void RestApiV1::register_routes(
         R"(/api/v1/access-reviews/([^/]+)/close)",
         [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
                                                            httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Attest"))
+            if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
                 res.status = 503;
@@ -4887,13 +4940,31 @@ void RestApiV1::register_routes(
 
             auto close_res = access_review_store->close_campaign(campaign_id, session->username);
             if (!close_res) {
-                (void)audit_fn(req, "access_review.closed", "failure", "AccessReview", campaign_id,
-                               close_res.error());
+                try {
+                    (void)audit_fn(req, "access_review.closed", "failure", "AccessReview",
+                                   campaign_id, close_res.error());
+                } catch (const std::exception& ex) {
+                    spdlog::warn("access_review.closed audit emission threw: {}", ex.what());
+                }
                 res.status = access_review_error_status(close_res.error());
                 res.set_content(detail::a4_error(res, close_res.error()), "application/json");
                 return;
             }
-            (void)audit_fn(req, "access_review.closed", "success", "AccessReview", campaign_id, "");
+            // The campaign was already closed — the audit row is evidence of that,
+            // never a gate on it. A failed audit surfaces via Sec-Audit-Failed and
+            // the response proceeds (mirrors export above).
+            bool close_audit_emitted = false;
+            try {
+                close_audit_emitted =
+                    audit_fn(req, "access_review.closed", "success", "AccessReview", campaign_id, "");
+            } catch (const std::exception& ex) {
+                spdlog::warn("access_review.closed audit emission threw: {}", ex.what());
+            }
+            if (!close_audit_emitted) {
+                spdlog::warn("access_review.closed did not persist — evidence-chain gap for an "
+                             "access-review campaign close");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
             res.set_content(ok_json(JObj().add("closed", true).str()), "application/json");
         });
 

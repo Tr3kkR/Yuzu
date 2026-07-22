@@ -916,6 +916,45 @@ std::expected<std::vector<auth::UserEntry>, AuthDBError> AuthDB::list_users() {
     return users;
 }
 
+std::expected<std::vector<UserWithStatus>, AuthDBError> AuthDB::list_users_including_inactive() {
+    // Same shape as list_users() above, minus the `WHERE is_active = 1`
+    // filter and plus the `is_active` column itself — see the .hpp doc for
+    // why this is a dedicated accessor rather than a change to list_users().
+    static const char* sql = R"(
+        SELECT username, role, identity_source, is_active
+        FROM users
+        ORDER BY username
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("Failed to prepare list_users_including_inactive statement: {}",
+                     sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+
+    std::vector<UserWithStatus> users;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        UserWithStatus entry;
+        entry.username = col_text(stmt, 0);
+        entry.role = auth::string_to_role(col_text(stmt, 1));
+        entry.identity_source = col_text(stmt, 2);
+        entry.is_active = sqlite3_column_int(stmt, 3) != 0;
+        users.push_back(std::move(entry));
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        spdlog::error("list_users_including_inactive query failed: {}",
+                      sqlite3_errmsg(impl_->db));
+        return std::unexpected(AuthDBError::QueryFailed);
+    }
+
+    return users;
+}
+
 std::optional<std::vector<std::string>> AuthDB::find_reserved_prefix_users(const std::string& prefix) {
     // Read-only prefix scan over `users.username` — backs the T8 startup
     // collision-scan preflight (decision log #3: "The PR 4.2 migration

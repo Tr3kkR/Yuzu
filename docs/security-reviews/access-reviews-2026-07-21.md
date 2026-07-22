@@ -46,9 +46,14 @@ listed **MISSING**; Priority-2 item 12).
   schema `access_review_store`) — born-on-Postgres (ADR-0006), two tables
   (`access_review_campaign`, `access_review_attestation`), authoritative/
   fail-hard posture (ADR-0012 §1).
-- **RBAC:** new `AuditLog:Attest` operation on the existing `AuditLog`
-  securable, granted only to `Administrator` and a new seeded `Reviewer`
-  role (`AuditLog:Read` + `AuditLog:Attest` only — 7 built-in roles total).
+- **RBAC:** new dedicated `AccessReview` securable type with two operations,
+  `Read` (export/get/list) and `Attest` (open/attest/close), granted only to
+  `Administrator` and a new seeded `Reviewer` role (`AccessReview:Read` +
+  `AccessReview:Attest` only — 7 built-in roles total). **Round-2 fix
+  (this review):** the original implementation gated these routes on the
+  existing `AuditLog:Read`/`AuditLog:Attest` operations instead — see
+  "#2225 round 2" below for why that over-disclosed and how the dedicated
+  securable closes it.
 - **MCP twins:** `export_access_review`, `open_access_review`,
   `record_attestation`, `get_access_review`, `list_access_reviews`
   (hardening round), `close_access_review` (hardening round) — JSON only;
@@ -100,7 +105,7 @@ subset. It has its own dedicated, complete-by-construction export (`GET
 correct-shaped evidence surface for its own control, not a candidate for
 folding into a sibling control's sampled stream.
 
-### #2225 — global `AuditLog:Read`/`AuditLog:Attest` gate, not `authorize_list_read`
+### #2225 — global gate, not `authorize_list_read`
 
 Every new list/fan-out read of **per-agent** data must use the ADR-0017
 `authorize_list_read` admit-then-filter chokepoint (World A) — never a bare
@@ -120,20 +125,88 @@ oversight, for three reasons:
    certification is not a certification. An auditor signing off on CC6.2
    compliance needs the *complete* grant population, every time.
 3. **The privileged surface is the gate itself, not a filter on top of it.**
-   `AuditLog:Read`/`AuditLog:Attest` are already RBAC-privileged operations
-   — nobody gets them by default. Requiring them (global, unconfined) for
-   this feature is the same posture the shipped `GET
-   /api/v1/audit/auth-sample` sibling already uses, and for the same reason:
-   a dedicated read-only auditor/reviewer principal can be granted evidence
-   access **without** also granting full `Administrator` authority
-   (separation of duties) — a *stronger* CC6.3 least-privilege posture than
-   folding this into `require_admin`, not a weaker one.
+   Requiring a dedicated permission (global, unconfined) for this feature is
+   the same posture the shipped `GET /api/v1/audit/auth-sample` sibling
+   already uses, and for the same reason: a dedicated read-only
+   auditor/reviewer principal can be granted evidence access **without**
+   also granting full `Administrator` authority (separation of duties) — a
+   *stronger* CC6.3 least-privilege posture than folding this into
+   `require_admin`, not a weaker one.
 
-The seeded `Reviewer` role operationalizes this: `AuditLog:Read` +
-`AuditLog:Attest`, nothing else — no `Write`/`Delete`/`Approve`/`Push` on
-`AuditLog`, and none of the write access `Administrator` carries elsewhere.
-An organization appoints a reviewer without handing them the keys to the
-platform.
+This first-round reasoning (why the gate is global/unconfined rather than
+`authorize_list_read`-scoped) stands unchanged. What round 2 (this review)
+corrected is **which permission** operationalizes it — see below.
+
+### #2225 round 2 — reviewer-found over-disclosure via `AuditLog:Read`, fixed with a dedicated `AccessReview` securable
+
+The original implementation of the above reasoning reused the existing
+`AuditLog:Read`/`AuditLog:Attest` operations on the `AuditLog` securable as
+the gate, on the assumption that `AuditLog:Read` was effectively
+`Reviewer`-only. **A reviewer found this assumption false and the design
+over-disclosing:** `AuditLog:Read` is also seeded to the built-in `Operator`
+and `PlatformEngineer` roles (for the pre-existing `GET
+/api/v1/audit/auth-sample` CC7.2 evidence route and the general audit-log
+read routes), neither of which is granted `UserManagement:Read` (the
+dedicated `/rbac/roles` permission) or `Security:Read` (the dedicated
+`/engine-principals/{id}/roles` permission). Under the original gate, an
+`Operator` or `PlatformEngineer` — roles explicitly **denied** the
+purpose-built routes for reading the fleet's role-assignment graph — could
+still pull the *entire* grant population, every principal's every role, via
+`GET /api/v1/access-reviews/export`. That is a materially broader
+disclosure than either of the routes those roles are deliberately excluded
+from, reached through a permission (`AuditLog:Read`) that predates this
+feature and was never scoped with access-review disclosure in mind.
+
+**The fix:** a new, dedicated RBAC securable type **`AccessReview`** with
+exactly two operations, **`Read`** (export/get/list) and **`Attest`**
+(open/attest/close), seeded **only** to `Administrator` and the `Reviewer`
+role. The `Reviewer` role now holds `AccessReview:Read` +
+`AccessReview:Attest` (no longer `AuditLog:Read`/`AuditLog:Attest`). The
+`AuditLog:Attest` operation — added earlier in this PR solely to support
+access reviews — is removed as unused now that `AccessReview:Attest`
+exists; `AuditLog:Read` reverts to its pre-existing scope (`auth-sample`
+export, general audit-log reads) and is no longer sufficient, by itself, to
+reach any access-review route. `Operator`/`PlatformEngineer` keep
+`AuditLog:Read` for their legitimate uses but hold no `AccessReview`
+operation, so they can no longer reach `/api/v1/access-reviews*` in any
+form.
+
+This closes the over-disclosure while **preserving** every property
+established in the three numbered reasons above: the gate is still global
+and unconfined (reason 2 — a confinement-filtered slice remains worthless
+as CC6.2 evidence), and it is still a dedicated RBAC-privileged operation
+nobody gets by default (reason 3) — it is simply now a *narrow* securable
+purpose-built for this feature instead of a *broad* one shared with
+unrelated audit-log functionality. If anything, this is the stronger
+reading of reason 3's least-privilege argument: the original design assumed
+"`AuditLog:Read` ≈ `Reviewer`-only", which was false the moment `Operator`/
+`PlatformEngineer` were seeded that permission for an unrelated purpose; a
+securable dedicated to exactly one feature cannot silently widen the same
+way as new roles are seeded onto a shared permission in the future.
+
+The seeded `Reviewer` role operationalizes the fixed design: `AccessReview:Read`
++ `AccessReview:Attest`, nothing else — no `Write`/`Delete`/`Approve`/`Push`
+on `AccessReview`, no `AuditLog` operation at all, and none of the write
+access `Administrator` carries elsewhere. An organization appoints a
+reviewer without handing them the keys to the platform, and without that
+reviewer grant riding on (or being silently widened by) any other role's
+unrelated `AuditLog:Read` grant.
+
+### Disabled-user lifecycle honesty (round 2 fix)
+
+A second, unrelated round-2 fix: a user who is disabled but still holds a
+live role grant previously surfaced on the export as `source="orphan"`,
+`lifecycle_state="unknown"` — indistinguishable from a genuinely orphaned
+grant belonging to a principal absent from every roster. That mis-shown a
+real, roster-matched user as if they didn't exist. The export now correctly
+enriches a disabled user's row from the `AuthDB` roster like any other user
+row, reporting `source="user"`, `lifecycle_state="disabled"`. This matters
+for CC6.2 review quality specifically: a disabled-but-still-granted user is
+exactly the kind of finding a periodic access review exists to catch (a
+likely `flagged_revoke` candidate), and it must be presented as "a known
+user whose account is disabled yet still holds access" — not conflated with
+the `source="orphan"` bucket, which means "no roster entry could be found
+for this grant at all" and carries a different investigative next step.
 
 ### PII judgment — `last_activity_ms`/`last_activity_kind` are NOT behavioral-PII-tier
 
@@ -162,9 +235,10 @@ classification decision, not an oversight:
   account-hygiene fact CC6.2/CC6.3 evidence is built from, not a new
   disclosure surface.
 - **The existing gate is the correct-strength control for this data
-  class.** These fields ride the SAME `AuditLog:Read` permission check that
-  gates every other field on this row (roles, `effective_permission_count`,
-  `classification`, `lifecycle_state`), and the export is self-audited
+  class.** These fields ride the SAME `AccessReview:Read` permission check
+  that gates every other field on this row (roles,
+  `effective_permission_count`, `classification`, `lifecycle_state`), and
+  the export is self-audited
   (`access_review.exported`) exactly like the sibling `auth-sample` export.
   Layering the stricter fail-closed-503 behavioral-PII posture on top would
   be a mismatch of control strength to data sensitivity — and would make a
@@ -194,8 +268,8 @@ reasons:
    dependent workflow or lock out a legitimate user, and belongs on the
    ordinary, individually-audited RBAC/engine-principal write surface
    (`unassign_role`, `revoke_certificate`, etc.), gated by *its own*
-   permission (`Security:Write`/`Delete`, not `AuditLog:Attest`).
-2. **Auto-revoking on a flag would make `AuditLog:Attest` a second, less-
+   permission (`Security:Write`/`Delete`, not `AccessReview:Attest`).
+2. **Auto-revoking on a flag would make `AccessReview:Attest` a second, less-
    audited path to a real authorization change** — exactly the kind of
    confused-deputy shortcut the access-review surface must not become.
    Keeping flag and revoke on separate, separately-gated routes means the
@@ -286,8 +360,9 @@ reference.
 - `record_attestation` never calls any RBAC/`EnginePrincipalStore` mutating
   function — grepped `access_review_store.cpp` for `unassign`/`revoke`/
   `delete_role` call sites: none. ✅
-- Every route requires `AuditLog:Read` or `AuditLog:Attest`, and **every
-  route — reads included — additionally runs `deny_engine_session`**: an
+- Every route requires `AccessReview:Read` or `AccessReview:Attest`, and
+  **every route — reads included — additionally runs
+  `deny_engine_session`**: an
   engine-classed caller is structurally denied on every access-review
   route, not just the mutating ones, matching the engine-principal
   surface's own posture. ✅
@@ -352,7 +427,7 @@ reference.
   evidence-window requirement is an explicit, separately-reviewed decision,
   not something this feature should default to.
 - **No rate limit on the export route.** `GET /api/v1/access-reviews/export`
-  has no request-rate cap of its own beyond the standard `AuditLog:Read`
+  has no request-rate cap of its own beyond the standard `AccessReview:Read`
   gate — a low-risk gap today (the route is admin/auditor-scoped and O(grant
   count) per call, not O(fleet size)), but worth a shared rate-limit
   primitive if/when one exists for other admin-read routes.

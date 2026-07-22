@@ -2154,7 +2154,7 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 **group**, and **engine**.
 
 > **#2225 chokepoint note.** These routes are deliberately gated on a
-> **GLOBAL** `AuditLog:Read`/`AuditLog:Attest`, **not** the ADR-0017
+> **GLOBAL** `AccessReview:Read`/`AccessReview:Attest`, **not** the ADR-0017
 > `authorize_list_read` admit-then-filter confinement chokepoint every new
 > per-agent list read must use. A management-group-confined slice of the
 > grant population would be **useless** as CC6.2 evidence — a reviewer
@@ -2162,7 +2162,16 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > operator's confined view of it. Access review is intentionally
 > admin/auditor-only and unconfined by design, not an oversight. See
 > `docs/auth-architecture.md` "Periodic access reviews" for the full
-> rationale.
+> rationale. `AccessReview` is a **dedicated** securable type (not a reuse
+> of `AuditLog`) seeded only to `Administrator` and the `Reviewer` role — an
+> earlier round of this feature gated it on `AuditLog:Read`/`AuditLog:Attest`
+> instead, which over-disclosed the full grant population to the `Operator`
+> and `PlatformEngineer` roles (both seeded `AuditLog:Read` for unrelated
+> reasons, neither seeded `UserManagement:Read`/`Security:Read`, the
+> permissions gating the equivalent-sensitivity `/rbac/roles` and
+> `/engine-principals/{id}/roles` routes). See
+> `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2" for
+> the finding and fix.
 
 > **Engine-session denial, every route including reads.** Every route on
 > this surface — `GET`/list, `GET .../export`, `GET .../{id}`, and every
@@ -2193,7 +2202,7 @@ Stateless cross-principal grant export — every user/group/engine-principal's
 access; that access appears on the group's own row). `?format=json|csv`
 (default `json`).
 
-**Permission:** `AuditLog:Read`.
+**Permission:** `AccessReview:Read`.
 
 The export is itself audited as `access_review.exported`.
 
@@ -2208,7 +2217,7 @@ display_name, owner_or_email, roles[], effective_permission_count,
 last_activity_ms, last_activity_kind, classification, lifecycle_state,
 source}`. CSV: the same fields with a `Content-Disposition: attachment`
 header. `400` if `format` is not `json`/`csv`. `403` without
-`AuditLog:Read` (or an engine-classed caller — see the note above). `503` —
+`AccessReview:Read` (or an engine-classed caller — see the note above). `503` —
 **fail-loud**: a read across users, groups, engine-principals, or tokens
 failed. This endpoint never returns a silent partial export — an empty 200
 always means "no grants", never "the read partially failed". If the
@@ -2230,7 +2239,11 @@ read accessor for last-login yet (a noted follow-up); `source="scim"` for
 users is forward-compat and not yet populated by any write path; an orphan
 row (grant with no matching roster entry — see "Grant-table-driven
 completeness" above) always carries `last_activity_kind="n/a"` and
-`classification=""` too, since there is no roster row to enrich it from.
+`classification=""` too, since there is no roster row to enrich it from. A
+**disabled** user who still holds a live grant is a normal, roster-matched
+row — `source="user"`, `lifecycle_state="disabled"` — never confused with
+an orphan row; it is exactly the kind of finding a periodic access review
+exists to surface.
 
 #### `GET /api/v1/access-reviews`
 
@@ -2239,11 +2252,11 @@ List every review campaign's metadata (**not** its attestations — use
 most recent 500. The surface an auditor needs to prove reviews ran on
 cadence without already knowing a `campaign_id` out-of-band.
 
-**Permission:** `AuditLog:Read`.
+**Permission:** `AccessReview:Read`.
 
 **Responses:** `200` — `{data: [{campaign_id, title, status, created_by,
 created_at_ms, closed_by, closed_at_ms}], meta}`. `403` without
-`AuditLog:Read` (or an engine-classed caller). `503` — the access-review
+`AccessReview:Read` (or an engine-classed caller). `503` — the access-review
 store is unavailable, or a genuine read failure.
 
 Audited as `access_review.list`.
@@ -2259,7 +2272,7 @@ is not re-derived from live state. This freeze-at-open property is what
 makes "every grant that existed when the campaign opened has a reviewable
 row" provable rather than assumed.
 
-**Permission:** `AuditLog:Attest`.
+**Permission:** `AccessReview:Attest`.
 
 **Request body:**
 
@@ -2272,7 +2285,7 @@ row" provable rather than assumed.
 | `title` | string | Yes | Human-readable campaign name |
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
-or `title` missing/empty. `403` without `AuditLog:Attest` (or an
+or `title` missing/empty. `403` without `AccessReview:Attest` (or an
 engine-classed caller). `503` — the access-review store is unavailable, or
 the grant-population read failed.
 
@@ -2285,7 +2298,7 @@ Full evidentiary state of one review campaign: metadata plus every frozen
 attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
 (the review-completeness number).
 
-**Permission:** `AuditLog:Read`.
+**Permission:** `AccessReview:Read`.
 
 **Responses:** `200` —
 
@@ -2307,7 +2320,7 @@ attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
 }
 ```
 
-`403` without `AuditLog:Read` (or an engine-classed caller). `404` — no
+`403` without `AccessReview:Read` (or an engine-classed caller). `404` — no
 campaign with that id. `503` — the access-review store is unavailable, or a
 genuine read failure.
 
@@ -2317,7 +2330,7 @@ Audited as `access_review.get`.
 
 Record one reviewer decision against a grant frozen into an open campaign.
 
-**Permission:** `AuditLog:Attest`.
+**Permission:** `AccessReview:Attest`.
 
 **Request body:**
 
@@ -2347,7 +2360,7 @@ flag ≠ revoke.
 
 **Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
 `principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`. `403` without `AuditLog:Attest` (or an engine-classed
+nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
 caller). `404` — no campaign with that id, no such frozen grant in it, or
 the campaign is already closed. `503` — the access-review store is
 unavailable, or a genuine write failure.
@@ -2369,9 +2382,9 @@ decided first — a campaign closed with `pending` rows still outstanding is
 itself evidence (an incomplete review), not something this route silently
 forces to completion.
 
-**Permission:** `AuditLog:Attest`.
+**Permission:** `AccessReview:Attest`.
 
-**Responses:** `200` — `{closed: true}`. `403` without `AuditLog:Attest`
+**Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
 (or an engine-classed caller). `404` — no campaign with that id, or already
 closed. `503` — the access-review store is unavailable, or a genuine write
 failure.

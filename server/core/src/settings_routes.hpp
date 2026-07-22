@@ -218,7 +218,7 @@ private:
     /// `/api/v1/access-reviews*` (rest_api_v1.cpp) and their MCP twins are
     /// the ADR-1005 API-parity surface. Shows the current cross-principal
     /// grant export (`access_review_model::build_access_review`) + a CSV
-    /// download link; an operator holding `AuditLog:Attest` additionally
+    /// download link; an operator holding `AccessReview:Attest` additionally
     /// sees the "open review campaign" control (probed via a throwaway
     /// `httplib::Response`, mirroring `dex_routes.cpp`'s `can_execute`
     /// pattern — never gates the whole route on Attest, since a read-only
@@ -228,10 +228,10 @@ private:
     /// Render one review campaign's evidentiary state (metadata + frozen
     /// attestation rows) as a sub-fragment — used both for the initial
     /// `?id=` deep link and for the JS-driven refresh after an attest/flag/
-    /// close action. Gated by the caller on `AuditLog:Read` (matches the
+    /// close action. Gated by the caller on `AccessReview:Read` (matches the
     /// REST `GET /api/v1/access-reviews/{id}` gate); per-row Attest/Flag
     /// buttons and the Close-campaign button are additionally probed against
-    /// `AuditLog:Attest` inside this function, same pattern as the top-level
+    /// `AccessReview:Attest` inside this function, same pattern as the top-level
     /// fragment above. Empty `campaign_id` renders an empty container.
     std::string render_access_review_campaign_fragment(const httplib::Request& req,
                                                         const std::string& campaign_id);

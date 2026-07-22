@@ -252,39 +252,66 @@ AccessReviewStore::get_campaign(const std::string& campaign_id) {
     if (campaign_id.empty())
         return std::unexpected("not_found: campaign_id required");
 
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return std::unexpected("database unavailable — try again");
-
-    std::string csql = std::string("SELECT ") + kCampaignCols +
-                       " FROM access_review_store.access_review_campaign WHERE campaign_id=$1";
-    pg::PgResult cres =
-        pg::exec_params(lease.get(), csql.c_str(), std::vector<std::string>{campaign_id});
-    if (cres.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("get_campaign read failed: ") +
-                               PQerrorMessage(lease.get()));
-    if (PQntuples(cres.get()) == 0)
-        return std::unexpected("not_found: no campaign with this id");
-
+    // Both reads share one REPEATABLE READ transaction so a concurrent
+    // attestation write between the campaign-row read and the attestation-rows
+    // read can't yield inconsistent metadata vs rows/pending_count: a plain
+    // `with_txn_for` only issues `BEGIN` (READ COMMITTED), under which each
+    // statement takes its own snapshot and the two SELECTs could still
+    // straddle a concurrent record_attestation COMMIT. `SET TRANSACTION
+    // ISOLATION LEVEL REPEATABLE READ` as the first statement pins both
+    // reads to the one snapshot taken at that point.
     CampaignView view;
-    view.campaign = read_campaign(cres.get(), 0);
+    std::string error_msg;
+    bool not_found = false;
+    const bool ok = pool_.with_txn_for(kReadTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult iso_res{PQexec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
+        if (iso_res.status() != PGRES_COMMAND_OK) {
+            error_msg =
+                std::string("get_campaign: failed to set REPEATABLE READ isolation: ") +
+                PQerrorMessage(conn);
+            return false;
+        }
 
-    std::string asql = std::string("SELECT ") + kAttestationCols +
-                       " FROM access_review_store.access_review_attestation "
-                       "WHERE campaign_id=$1 ORDER BY principal_type, principal_id, role_name";
-    pg::PgResult ares =
-        pg::exec_params(lease.get(), asql.c_str(), std::vector<std::string>{campaign_id});
-    if (ares.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("get_campaign attestation read failed: ") +
-                               PQerrorMessage(lease.get()));
+        std::string csql = std::string("SELECT ") + kCampaignCols +
+                           " FROM access_review_store.access_review_campaign WHERE campaign_id=$1";
+        pg::PgResult cres =
+            pg::exec_params(conn, csql.c_str(), std::vector<std::string>{campaign_id});
+        if (cres.status() != PGRES_TUPLES_OK) {
+            error_msg = std::string("get_campaign read failed: ") + PQerrorMessage(conn);
+            return false;
+        }
+        if (PQntuples(cres.get()) == 0) {
+            not_found = true;
+            return false;
+        }
+        view.campaign = read_campaign(cres.get(), 0);
 
-    const int rows = PQntuples(ares.get());
-    view.attestations.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
-        auto a = read_attestation(ares.get(), i);
-        if (a.decision == "pending")
-            ++view.pending_count;
-        view.attestations.push_back(std::move(a));
+        std::string asql = std::string("SELECT ") + kAttestationCols +
+                           " FROM access_review_store.access_review_attestation "
+                           "WHERE campaign_id=$1 ORDER BY principal_type, principal_id, role_name";
+        pg::PgResult ares =
+            pg::exec_params(conn, asql.c_str(), std::vector<std::string>{campaign_id});
+        if (ares.status() != PGRES_TUPLES_OK) {
+            error_msg = std::string("get_campaign attestation read failed: ") +
+                       PQerrorMessage(conn);
+            return false;
+        }
+
+        const int rows = PQntuples(ares.get());
+        view.attestations.reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i) {
+            auto a = read_attestation(ares.get(), i);
+            if (a.decision == "pending")
+                ++view.pending_count;
+            view.attestations.push_back(std::move(a));
+        }
+        return true;
+    });
+
+    if (!ok) {
+        if (not_found)
+            return std::unexpected("not_found: no campaign with this id");
+        return std::unexpected(error_msg.empty() ? "get_campaign failed" : error_msg);
     }
     return view;
 }
@@ -328,7 +355,7 @@ std::expected<std::vector<AccessReviewCampaignRow>, std::string> AccessReviewSto
     // paged operational feed.
     std::string sql = std::string("SELECT ") + kCampaignCols +
                       " FROM access_review_store.access_review_campaign "
-                      "ORDER BY created_at_ms DESC LIMIT 500";
+                      "ORDER BY created_at_ms DESC, campaign_id DESC LIMIT 500";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string("list_campaigns read failed: ") +

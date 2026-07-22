@@ -347,6 +347,35 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
         CHECK(row->effective_permission_count == 1); // Tag:Read still computed correctly
     }
 
+    SECTION("disabled user — a soft-deleted roster row with a residual grant is surfaced as "
+            "source=user/lifecycle=disabled, NOT an orphan") {
+        // A user who was disabled (SCIM deprovision / admin remove — a soft
+        // delete that sets is_active=0 but keeps the row) while an RBAC grant
+        // still points at them. This is materially different, higher-priority
+        // CC6.2 evidence than an orphan: a KNOWN account with RESIDUAL access,
+        // not an unrostered principal. It must NOT collapse into orphan/unknown.
+        h.add_user("evicted-eve");
+        REQUIRE(h.rbac.assign_role({"user", "evicted-eve", "OrphanRole"}).has_value());
+        // Soft-delete via remove_user (is_active=0); the RBAC grant lives in a
+        // separate store and survives, reproducing the disabled-but-granted case.
+        REQUIRE(h.auth_db.remove_user("evicted-eve").has_value());
+
+        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        REQUIRE(result.has_value());
+
+        const auto* row = h.find(*result, "user", "evicted-eve");
+        REQUIRE(row != nullptr);
+        // Still a rostered user: source stays the identity source (NOT "orphan"),
+        // and only the lifecycle reflects the disablement.
+        CHECK(row->source != "orphan");
+        CHECK(row->source == "local");             // identity source, as for an active user
+        CHECK(row->lifecycle_state == "disabled"); // NOT "unknown"
+        CHECK(row->display_name == "evicted-eve");
+        REQUIRE(row->roles.size() == 1);
+        CHECK(row->roles[0] == "OrphanRole");
+        CHECK(row->effective_permission_count == 1); // Tag:Read still computed
+    }
+
     SECTION("orphan group — a grant against a group name no longer in the groups roster") {
         REQUIRE(h.rbac.assign_role({"group", "deleted-group", "OrphanRole"}).has_value());
 
@@ -397,6 +426,55 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
         CHECK(orphan_row->lifecycle_state == "unknown");
 
         CHECK(result->size() == 2);
+    }
+}
+
+// governance hardening round: disabled-user edges. Mirrors the "disabled
+// user" SECTION above, but isolates two invariants that section doesn't
+// exercise on its own: a disabled principal is subject to the SAME
+// grant-table-driven "no row without a grant" rule as anyone else, and a
+// disabled + an active grant coexist in one result without collapsing onto
+// a shared (buggy) code path.
+TEST_CASE("build_access_review: disabled-user edges — zero grants still yields no row, and a "
+          "disabled + active grant coexist with distinct lifecycle_state",
+          "[access_review][model][pg]") {
+    ModelHarness h;
+    REQUIRE(h.rbac.create_role({.name = "DisabledEdgeRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac.set_permission({"DisabledEdgeRole", "Tag", "Read", "allow"}).has_value());
+
+    SECTION("a disabled user with ZERO grants produces NO row — the 'who has access' invariant "
+            "holds even for a disabled account") {
+        h.add_user("disabled-no-grants");
+        REQUIRE(h.auth_db.remove_user("disabled-no-grants").has_value());
+
+        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        REQUIRE(result.has_value());
+
+        CHECK(h.find(*result, "user", "disabled-no-grants") == nullptr);
+    }
+
+    SECTION("a disabled user and an active user with grants in the SAME result — lifecycle "
+            "differs, proving they don't share a buggy code path") {
+        h.add_user("disabled-with-grant");
+        REQUIRE(h.rbac.assign_role({"user", "disabled-with-grant", "DisabledEdgeRole"})
+                    .has_value());
+        REQUIRE(h.auth_db.remove_user("disabled-with-grant").has_value());
+
+        h.add_user("active-with-grant");
+        REQUIRE(h.rbac.assign_role({"user", "active-with-grant", "DisabledEdgeRole"}).has_value());
+
+        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        REQUIRE(result.has_value());
+
+        const auto* disabled_row = h.find(*result, "user", "disabled-with-grant");
+        REQUIRE(disabled_row != nullptr);
+        CHECK(disabled_row->lifecycle_state == "disabled");
+        CHECK(disabled_row->source != "orphan");
+
+        const auto* active_row = h.find(*result, "user", "active-with-grant");
+        REQUIRE(active_row != nullptr);
+        CHECK(active_row->lifecycle_state == "active");
+        CHECK(active_row->source != "orphan");
     }
 }
 

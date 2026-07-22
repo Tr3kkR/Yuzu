@@ -1494,7 +1494,7 @@ evidence forever).
 
 ### Export model
 
-`GET /api/v1/access-reviews/export` (`AuditLog:Read`) builds one row per
+`GET /api/v1/access-reviews/export` (`AccessReview:Read`) builds one row per
 principal via the pure read-model `access_review_model.hpp`
 (`build_access_review`). For **all three** principal types uniformly it
 reads the principal's **direct** role grants and expands each to its
@@ -1535,6 +1535,15 @@ consequences that change what the export means and what it shows:
   `source="orphan"` rows and treat them as a `flagged_revoke` candidate by
   default unless the principal is independently known-good.
 
+**Disabled-user lifecycle honesty.** A user who is disabled but still holds
+a live role grant is enriched from the `AuthDB` roster like any other user
+row — `source="user"`, `lifecycle_state="disabled"` — never conflated with
+`source="orphan"`/`lifecycle_state="unknown"`, which means "no roster entry
+matched this grant at all". A disabled-but-still-granted user is exactly
+the kind of finding a periodic access review exists to catch (a likely
+`flagged_revoke` candidate); showing it as an unresolvable orphan would
+obscure that it is a known, roster-matched account.
+
 **Non-atomic, best-effort cross-substrate read.** The grant population this
 export (and every campaign freeze) computes is a **point-in-time
 best-effort cut** across two substrates — `RbacStore`/`EnginePrincipalStore`/
@@ -1571,7 +1580,7 @@ forward-compat and not yet populated by any write path.
 
 ### Attestation campaign model
 
-`POST /api/v1/access-reviews` (`AuditLog:Attest`) expands the export into
+`POST /api/v1/access-reviews` (`AccessReview:Attest`) expands the export into
 one `GrantRef` per `(principal, role)` pair and calls
 `AccessReviewStore::open_campaign`, which — in **one transaction** — inserts
 the campaign row and one `decision='pending'` attestation row per frozen
@@ -1586,24 +1595,24 @@ evidence must answer, and a campaign that quietly dropped a since-revoked
 grant would erase that history.
 
 Reviewers record a decision via `POST /api/v1/access-reviews/{id}/attestations`
-(`AuditLog:Attest`): `attested` (still appropriate) or `flagged_revoke`
+(`AccessReview:Attest`): `attested` (still appropriate) or `flagged_revoke`
 (should be revoked). **`flag ≠ revoke`.** `flagged_revoke` records evidence
 only — no RBAC or `EnginePrincipalStore` mutation happens on this path.
 Acting on the flag (unassigning the role, revoking the engine principal,
 etc.) is a separate, explicit operator action performed after reading the
 evidence, on the ordinary RBAC/engine-principal write surface. This
-deliberately keeps the access-review surface (`AuditLog:Attest`) from
+deliberately keeps the access-review surface (`AccessReview:Attest`) from
 becoming a second, less-audited path to a real authorization change — every
 actual grant/revoke still goes through its own gated, individually-audited
 route.
 
-`POST /api/v1/access-reviews/{id}/close` (`AuditLog:Attest`) closes a
+`POST /api/v1/access-reviews/{id}/close` (`AccessReview:Attest`) closes a
 campaign without requiring every attestation to be decided — an incomplete
 review is itself a fact the evidence should show (partial coverage), not
 something the route silently forces to completion by auto-attesting the
 remainder.
 
-`GET /api/v1/access-reviews` (`AuditLog:Read`) lists every campaign's
+`GET /api/v1/access-reviews` (`AccessReview:Read`) lists every campaign's
 metadata (not its attestations — `GET /api/v1/access-reviews/{id}` for
 those), newest-first, capped at the most recent 500 — the surface an
 auditor needs to prove reviews ran on cadence without already knowing a
@@ -1638,8 +1647,8 @@ Every new list/fan-out read of **per-agent** data must use the ADR-0017
 `authorize_list_read` admit-then-filter chokepoint (see "Authentication,
 RBAC..." in the routed-concerns table). Access-review export/campaign-open/
 campaign-list are list reads too, but every one of them is deliberately
-gated on the **global** `AuditLog:Read`/`AuditLog:Attest` instead — a
-considered exception, not an oversight:
+gated on the **global** `AccessReview:Read`/`AccessReview:Attest` instead —
+a considered exception, not an oversight:
 
 - The confinement model exists to stop a management-group-scoped operator
   from seeing agents/devices outside their scope. **A grant/role assignment
@@ -1653,24 +1662,49 @@ considered exception, not an oversight:
   one operator's confined slice of it. A partial certification is not a
   certification.
 - Access review is therefore intentionally **admin/auditor-only and
-  unconfined by design**. The seeded `Reviewer` role (`AuditLog:Read` +
-  `AuditLog:Attest` only — no Write/Delete/Approve/Push on `AuditLog`) is
-  the least-privilege way to grant this: an organization can appoint a
-  dedicated reviewer without also granting full `Administrator` access
-  (separation of duties), mirroring the existing `GET
-  /api/v1/audit/auth-sample` precedent (also gated `AuditLog:Read`, not
-  admin-only).
+  unconfined by design**. The seeded `Reviewer` role (`AccessReview:Read` +
+  `AccessReview:Attest` only — no Write/Delete/Approve/Push on
+  `AccessReview`) is the least-privilege way to grant this: an organization
+  can appoint a dedicated reviewer without also granting full
+  `Administrator` access (separation of duties), mirroring the existing
+  `GET /api/v1/audit/auth-sample` precedent (also gated on a dedicated
+  read permission, not admin-only).
+
+**Round-2 fix — dedicated `AccessReview` securable, not `AuditLog`.** The
+original implementation gated this surface on the existing
+`AuditLog:Read`/`AuditLog:Attest` operations, on the assumption that
+`AuditLog:Read` was effectively `Reviewer`-only. A reviewer found that
+assumption false: `AuditLog:Read` is also seeded to the built-in `Operator`
+and `PlatformEngineer` roles (for `GET /api/v1/audit/auth-sample` and the
+general audit-log read routes), neither of which holds
+`UserManagement:Read` (`/rbac/roles`) or `Security:Read`
+(`/engine-principals/{id}/roles`) — so both roles could pull the *complete*
+fleet-wide grant population via the access-review export despite being
+denied the two purpose-built routes for reading role-assignment data. The
+fix is the dedicated `AccessReview` securable described above: it preserves
+every argument in this section (the gate is still global/unconfined, and
+still a dedicated RBAC-privileged operation nobody gets by default) while
+closing the over-disclosure — `Operator`/`PlatformEngineer` keep
+`AuditLog:Read` for their legitimate uses but hold no `AccessReview`
+operation, so neither can reach `/api/v1/access-reviews*` any more. Full
+narrative: `docs/security-reviews/access-reviews-2026-07-21.md` "#2225
+round 2".
 
 ### RBAC additions
 
-- New operation **`AuditLog:Attest`** on the existing `AuditLog` securable
-  — "Attest" is Periodic-Access-Review-specific: recording a reviewer
-  decision on a frozen grant. It is granted only to `Administrator` and the
-  new `Reviewer` role, never blanket-granted to every role that already
-  holds `AuditLog:Read`.
-- New seeded system role **`Reviewer`** — `AuditLog:Read` + `AuditLog:Attest`
-  only (7 built-in roles total: Administrator, PlatformEngineer, Operator,
-  ApiTokenManager, ITServiceOwner, Viewer, Reviewer).
+- New dedicated securable type **`AccessReview`** with two operations,
+  **`Read`** (export/get/list) and **`Attest`** (open/attest/close),
+  granted only to `Administrator` and the new `Reviewer` role. Not folded
+  into the existing `AuditLog` securable — see the "Round-2 fix" note above
+  for why a shared/broadly-seeded permission over-disclosed the fleet-wide
+  grant population to `Operator`/`PlatformEngineer`. The `AuditLog:Attest`
+  operation from the first round of this PR is removed as unused now that
+  `AccessReview:Attest` exists; `AuditLog:Read`/`AuditLog:Write`/etc. are
+  otherwise unchanged and keep their pre-existing scope.
+- New seeded system role **`Reviewer`** — `AccessReview:Read` +
+  `AccessReview:Attest` only (7 built-in roles total: Administrator,
+  PlatformEngineer, Operator, ApiTokenManager, ITServiceOwner, Viewer,
+  Reviewer).
 
 ### MCP twins
 
@@ -1689,7 +1723,10 @@ grant). See `docs/mcp-server.md` and `docs/user-manual/mcp.md`
 
 ## Granular RBAC (Phase 3)
 
-- 7 roles, 21 securable types, 7 operations (`Read`/`Write`/`Execute`/`Delete`/`Approve`/`Push`/`Attest`), per-operation permissions, deny-override logic.
+- 7 roles, 22 securable types (adds `AccessReview`, dedicated to Periodic
+  Access Reviews — see "Periodic access reviews" above), 7 operations
+  (`Read`/`Write`/`Execute`/`Delete`/`Approve`/`Push`/`Attest`),
+  per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 

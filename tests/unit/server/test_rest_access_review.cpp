@@ -15,7 +15,10 @@
  * `yuzu::MetricsRegistry` (not nullptr) is wired into BOTH transports so the
  * governance-round metrics wiring can be exercised directly.
  *
- * Covers: the AuditLog:Read/AuditLog:Attest gate split (both transports), the
+ * Covers: the AccessReview:Read/AccessReview:Attest gate split (both
+ * transports; a dedicated narrow securable seeded ONLY to Administrator +
+ * the Reviewer role — NOT AuditLog, so an AuditLog:Read-only principal like
+ * Operator/PlatformEngineer is denied), the
  * engine-classed-session structural deny belt (both transports — REST gets a
  * raw 403, MCP's `deny_if_engine_session()` is a JSON-RPC-shaped kTierDenied
  * error at transport-level 200), 503 fail-loud on a source-store failure
@@ -115,6 +118,14 @@ struct AccessReviewHarness {
 
     std::vector<AuditRecord> audit_log;
 
+    /// When non-empty, `rest_audit_fn` returns false (simulating a persist
+    /// failure) for exactly this action name — every other action still
+    /// succeeds. Scoped to one action (rather than a blanket bool) so setup
+    /// calls, e.g. opening a campaign before testing an attest/close-path
+    /// audit failure, aren't collaterally broken. Mirrors InvHarness's
+    /// audit_should_fail in test_inventory_routes.cpp.
+    std::string audit_fail_action;
+
     /// Real (not nullptr) registry — item G (governance hardening round)
     /// exercises the metric names/labels rest_api_v1.cpp actually touches.
     yuzu::MetricsRegistry metrics;
@@ -172,7 +183,7 @@ struct AccessReviewHarness {
                                     const std::string& result, const std::string&,
                                     const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return true;
+            return audit_fail_action.empty() || action != audit_fail_action;
         };
 
         // The access-review routes' `eps` local (rest_api_v1.cpp) is sourced
@@ -334,43 +345,49 @@ struct AccessReviewHarness {
 
 } // namespace
 
-// ── Gates: AuditLog:Read vs AuditLog:Attest ─────────────────────────────────
+// ── Gates: AccessReview:Read vs AccessReview:Attest ─────────────────────────
+// A dedicated narrow securable — NOT AuditLog:Read/AuditLog:Attest — seeded
+// ONLY to Administrator + the Reviewer role (rbac_store.cpp seed_defaults()).
+// This is the exact over-disclosure fix: an AuditLog:Read-only principal
+// (e.g. Operator, PlatformEngineer) must NOT be able to pull the fleet-wide
+// grant graph merely because it also holds AuditLog:Read for unrelated
+// reasons (auth-sample export etc.) — see #2225 round 2.
 
-TEST_CASE("access-reviews: read routes require AuditLog:Read, write routes require "
-          "AuditLog:Attest — denied without the right permission",
+TEST_CASE("access-reviews: read routes require AccessReview:Read, write routes require "
+          "AccessReview:Attest — denied without the right permission",
           "[access_review][rest][gate]") {
     AccessReviewHarness h;
 
-    SECTION("export denied without AuditLog:Read") {
+    SECTION("export denied without AccessReview:Read") {
         h.perm_override = [](const std::string& t, const std::string& op) {
-            return !(t == "AuditLog" && op == "Read");
+            return !(t == "AccessReview" && op == "Read");
         };
         auto res = h.sink.Get("/api/v1/access-reviews/export");
         REQUIRE(res);
         CHECK(res->status == 403);
     }
 
-    SECTION("GET /{id} denied without AuditLog:Read") {
+    SECTION("GET /{id} denied without AccessReview:Read") {
         h.perm_override = [](const std::string& t, const std::string& op) {
-            return !(t == "AuditLog" && op == "Read");
+            return !(t == "AccessReview" && op == "Read");
         };
         auto res = h.sink.Get("/api/v1/access-reviews/whatever");
         REQUIRE(res);
         CHECK(res->status == 403);
     }
 
-    SECTION("open (POST /access-reviews) denied without AuditLog:Attest") {
+    SECTION("open (POST /access-reviews) denied without AccessReview:Attest") {
         h.perm_override = [](const std::string& t, const std::string& op) {
-            return !(t == "AuditLog" && op == "Attest");
+            return !(t == "AccessReview" && op == "Attest");
         };
         auto res = h.sink.Post("/api/v1/access-reviews", R"({"title":"x"})");
         REQUIRE(res);
         CHECK(res->status == 403);
     }
 
-    SECTION("attestations denied without AuditLog:Attest") {
+    SECTION("attestations denied without AccessReview:Attest") {
         h.perm_override = [](const std::string& t, const std::string& op) {
-            return !(t == "AuditLog" && op == "Attest");
+            return !(t == "AccessReview" && op == "Attest");
         };
         auto res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                                R"({"principal_type":"user","principal_id":"a",)"
@@ -379,9 +396,9 @@ TEST_CASE("access-reviews: read routes require AuditLog:Read, write routes requi
         CHECK(res->status == 403);
     }
 
-    SECTION("close denied without AuditLog:Attest") {
+    SECTION("close denied without AccessReview:Attest") {
         h.perm_override = [](const std::string& t, const std::string& op) {
-            return !(t == "AuditLog" && op == "Attest");
+            return !(t == "AccessReview" && op == "Attest");
         };
         auto res = h.sink.Post("/api/v1/access-reviews/whatever/close", "");
         REQUIRE(res);
@@ -389,11 +406,11 @@ TEST_CASE("access-reviews: read routes require AuditLog:Read, write routes requi
     }
 }
 
-TEST_CASE("access-reviews: a session with only AuditLog:Read can export but not attest",
+TEST_CASE("access-reviews: a session with only AccessReview:Read can export but not attest",
           "[access_review][rest][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
-        return t == "AuditLog" && op == "Read"; // ONLY Read is granted
+        return t == "AccessReview" && op == "Read"; // ONLY Read is granted
     };
 
     auto export_res = h.sink.Get("/api/v1/access-reviews/export");
@@ -413,6 +430,173 @@ TEST_CASE("access-reviews: a session with only AuditLog:Read can export but not 
     auto close_res = h.sink.Post("/api/v1/access-reviews/whatever/close", "");
     REQUIRE(close_res);
     CHECK(close_res->status == 403);
+}
+
+TEST_CASE("access-reviews: an AuditLog:Read-only principal is denied all six ops — the "
+          "over-disclosure #2225 round 2 closes (Operator/PlatformEngineer no longer pull "
+          "the grant graph via their unrelated AuditLog:Read grant)",
+          "[access_review][rest][gate]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AuditLog" && op == "Read"; // AuditLog:Read only — NOT AccessReview
+    };
+
+    auto export_res = h.sink.Get("/api/v1/access-reviews/export");
+    REQUIRE(export_res);
+    CHECK(export_res->status == 403);
+
+    auto list_res = h.sink.Get("/api/v1/access-reviews");
+    REQUIRE(list_res);
+    CHECK(list_res->status == 403);
+
+    auto get_res = h.sink.Get("/api/v1/access-reviews/whatever");
+    REQUIRE(get_res);
+    CHECK(get_res->status == 403);
+
+    auto open_res = h.sink.Post("/api/v1/access-reviews", R"({"title":"x"})");
+    REQUIRE(open_res);
+    CHECK(open_res->status == 403);
+
+    auto attest_res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
+                                  R"({"principal_type":"user","principal_id":"a",)"
+                                  R"("role_name":"R","decision":"attested"})");
+    REQUIRE(attest_res);
+    CHECK(attest_res->status == 403);
+
+    auto close_res = h.sink.Post("/api/v1/access-reviews/whatever/close", "");
+    REQUIRE(close_res);
+    CHECK(close_res->status == 403);
+}
+
+TEST_CASE("MCP: an AuditLog:Read-only principal is denied all six access-review tools — the "
+          "over-disclosure #2225 round 2 closes, MCP twin",
+          "[access_review][mcp][gate]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AuditLog" && op == "Read"; // AuditLog:Read only — NOT AccessReview
+    };
+
+    auto export_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());
+    REQUIRE(export_res);
+    CHECK(export_res->status == 403);
+
+    auto list_res = h.mcp_call_tool("list_access_reviews", nlohmann::json::object());
+    REQUIRE(list_res);
+    CHECK(list_res->status == 403);
+
+    auto get_res = h.mcp_call_tool("get_access_review", {{"campaign_id", "whatever"}});
+    REQUIRE(get_res);
+    CHECK(get_res->status == 403);
+
+    auto open_res = h.mcp_call_tool("open_access_review", {{"title", "x"}});
+    REQUIRE(open_res);
+    CHECK(open_res->status == 403);
+
+    auto attest_res = h.mcp_call_tool("record_attestation", {{"campaign_id", "whatever"},
+                                                              {"principal_type", "user"},
+                                                              {"principal_id", "a"},
+                                                              {"role_name", "R"},
+                                                              {"decision", "attested"}});
+    REQUIRE(attest_res);
+    CHECK(attest_res->status == 403);
+
+    auto close_res = h.mcp_call_tool("close_access_review", {{"campaign_id", "whatever"}});
+    REQUIRE(close_res);
+    CHECK(close_res->status == 403);
+}
+
+TEST_CASE("access-reviews: a Reviewer-equivalent grant (AccessReview:Read + "
+          "AccessReview:Attest) can perform all six ops — the seeded Reviewer role's shape",
+          "[access_review][rest][gate]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && (op == "Read" || op == "Attest");
+    };
+    REQUIRE(h.rbac.create_role({.name = "ReviewerAllowRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db.upsert_user("revallow", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac.assign_role({"user", "revallow", "ReviewerAllowRole"}).has_value());
+
+    auto export_res = h.sink.Get("/api/v1/access-reviews/export");
+    REQUIRE(export_res);
+    CHECK(export_res->status == 200);
+
+    auto list_before_res = h.sink.Get("/api/v1/access-reviews");
+    REQUIRE(list_before_res);
+    CHECK(list_before_res->status == 200);
+
+    const auto cid = h.open_campaign_rest("reviewer allow test");
+
+    auto get_res = h.sink.Get("/api/v1/access-reviews/" + cid);
+    REQUIRE(get_res);
+    CHECK(get_res->status == 200);
+
+    auto list_res = h.sink.Get("/api/v1/access-reviews");
+    REQUIRE(list_res);
+    CHECK(list_res->status == 200);
+    CHECK(list_res->body.find(cid) != std::string::npos);
+
+    auto attest_res = h.sink.Post(
+        "/api/v1/access-reviews/" + cid + "/attestations",
+        nlohmann::json{{"principal_type", "user"},
+                      {"principal_id", "revallow"},
+                      {"role_name", "ReviewerAllowRole"},
+                      {"decision", "attested"}}
+            .dump());
+    REQUIRE(attest_res);
+    CHECK(attest_res->status == 200);
+
+    auto close_res = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+    REQUIRE(close_res);
+    CHECK(close_res->status == 200);
+}
+
+TEST_CASE("MCP: a Reviewer-equivalent grant (AccessReview:Read + AccessReview:Attest) can "
+          "perform all six access-review tools",
+          "[access_review][mcp][gate]") {
+    AccessReviewHarness h;
+    h.perm_override = [](const std::string& t, const std::string& op) {
+        return t == "AccessReview" && (op == "Read" || op == "Attest");
+    };
+    REQUIRE(h.rbac.create_role({.name = "McpReviewerAllowRole", .description = "d"}).has_value());
+    REQUIRE(h.auth_db.upsert_user("mcprevallow", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac.assign_role({"user", "mcprevallow", "McpReviewerAllowRole"}).has_value());
+
+    auto export_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());
+    REQUIRE(export_res);
+    CHECK(export_res->status == 200);
+    CHECK(export_res->body.find("\"error\"") == std::string::npos);
+
+    auto open_res = h.mcp_call_tool("open_access_review", {{"title", "mcp reviewer allow"}});
+    REQUIRE(open_res);
+    CHECK(open_res->status == 200);
+    auto open_body = nlohmann::json::parse(open_res->body);
+    REQUIRE(open_body.contains("result"));
+    const std::string cid =
+        open_body["result"]["structuredContent"]["campaign_id"].get<std::string>();
+
+    auto get_res = h.mcp_call_tool("get_access_review", {{"campaign_id", cid}});
+    REQUIRE(get_res);
+    CHECK(get_res->status == 200);
+    CHECK(get_res->body.find("\"error\"") == std::string::npos);
+
+    auto list_res = h.mcp_call_tool("list_access_reviews", nlohmann::json::object());
+    REQUIRE(list_res);
+    CHECK(list_res->status == 200);
+    CHECK(list_res->body.find(cid) != std::string::npos);
+
+    auto attest_res = h.mcp_call_tool("record_attestation", {{"campaign_id", cid},
+                                                              {"principal_type", "user"},
+                                                              {"principal_id", "mcprevallow"},
+                                                              {"role_name", "McpReviewerAllowRole"},
+                                                              {"decision", "attested"}});
+    REQUIRE(attest_res);
+    CHECK(attest_res->status == 200);
+    CHECK(attest_res->body.find("\"error\"") == std::string::npos);
+
+    auto close_res = h.mcp_call_tool("close_access_review", {{"campaign_id", cid}});
+    REQUIRE(close_res);
+    CHECK(close_res->status == 200);
+    CHECK(close_res->body.find("\"error\"") == std::string::npos);
 }
 
 // ── Engine-classed session structural deny belt ─────────────────────────────
@@ -469,6 +653,120 @@ TEST_CASE("attestations: decision outside {attested,flagged_revoke} -> 400",
                            R"("decision":"maybe"})");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// ── wrong-typed JSON body fields degrade to 400, never an uncaught 500 ──────
+// `access_review_str_field`'s is_string guard treats a wrong-typed field
+// (number/array/null) as absent rather than throwing nlohmann::json's
+// type_error, so these hit the ordinary "required field missing" 400 path.
+
+TEST_CASE("open campaign: wrong-typed title degrades to 400, never 500",
+          "[access_review][rest][badtype]") {
+    AccessReviewHarness h;
+    for (const std::string body : {R"({"title":123})", R"({"title":[]})", R"({"title":null})"}) {
+        INFO("body=" << body);
+        auto res = h.sink.Post("/api/v1/access-reviews", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+}
+
+TEST_CASE("attestations: wrong-typed decision/principal_type degrades to 400, never 500",
+          "[access_review][rest][badtype]") {
+    AccessReviewHarness h;
+
+    SECTION("decision not a string") {
+        auto res = h.sink.Post(
+            "/api/v1/access-reviews/whatever/attestations",
+            nlohmann::json{{"principal_type", "user"},
+                          {"principal_id", "a"},
+                          {"role_name", "R"},
+                          {"decision", 123}}
+                .dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+
+    SECTION("principal_type not a string") {
+        auto res = h.sink.Post(
+            "/api/v1/access-reviews/whatever/attestations",
+            nlohmann::json{{"principal_type", 123},
+                          {"principal_id", "a"},
+                          {"role_name", "R"},
+                          {"decision", "attested"}}
+                .dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+}
+
+// ── Sec-Audit-Failed on the mutation paths — set-and-proceed, mirrors export ─
+
+TEST_CASE("access-reviews: an audit-persist failure on open/attest/close still commits the "
+          "mutation and surfaces Sec-Audit-Failed",
+          "[access_review][rest][audit][secauditfailed]") {
+    SECTION("open") {
+        AccessReviewHarness h;
+        h.audit_fail_action = "access_review.campaign_opened";
+        auto res = h.sink.Post("/api/v1/access-reviews", R"({"title":"audit fail open"})");
+        REQUIRE(res);
+        CHECK(res->status == 201); // still committed
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        auto body = nlohmann::json::parse(res->body);
+        const auto cid = body["data"]["campaign_id"].get<std::string>();
+
+        // The campaign really was opened — a subsequent (audit-succeeding)
+        // read finds it.
+        h.audit_fail_action.clear();
+        auto get_res = h.sink.Get("/api/v1/access-reviews/" + cid);
+        REQUIRE(get_res);
+        CHECK(get_res->status == 200);
+        CHECK(get_res->get_header_value("Sec-Audit-Failed").empty());
+    }
+
+    SECTION("attest") {
+        AccessReviewHarness h;
+        REQUIRE(h.rbac.create_role({.name = "AuditFailRole", .description = "d"}).has_value());
+        REQUIRE(
+            h.auth_db.upsert_user("auditfailuser", "hash", "salt", auth::Role::user).has_value());
+        REQUIRE(h.rbac.assign_role({"user", "auditfailuser", "AuditFailRole"}).has_value());
+        const auto cid = h.open_campaign_rest("audit fail attest");
+
+        h.audit_fail_action = "access_review.attested";
+        auto res = h.sink.Post(
+            "/api/v1/access-reviews/" + cid + "/attestations",
+            nlohmann::json{{"principal_type", "user"},
+                          {"principal_id", "auditfailuser"},
+                          {"role_name", "AuditFailRole"},
+                          {"decision", "attested"}}
+                .dump());
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+
+        // The attestation really was recorded.
+        h.audit_fail_action.clear();
+        auto get_res = h.sink.Get("/api/v1/access-reviews/" + cid);
+        REQUIRE(get_res);
+        CHECK(get_res->body.find("\"attested\"") != std::string::npos);
+    }
+
+    SECTION("close") {
+        AccessReviewHarness h;
+        const auto cid = h.open_campaign_rest("audit fail close");
+
+        h.audit_fail_action = "access_review.closed";
+        auto res = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+
+        // The close really committed — a re-close 404s (already closed).
+        h.audit_fail_action.clear();
+        auto reclose_res = h.sink.Post("/api/v1/access-reviews/" + cid + "/close", "");
+        REQUIRE(reclose_res);
+        CHECK(reclose_res->status == 404);
+    }
 }
 
 // ── format enum (REST-only — MCP export has no format concept) #2291 ───────
@@ -688,10 +986,10 @@ TEST_CASE("GET /access-reviews: happy path returns opened campaigns", "[access_r
     CHECK(res->body.find("\"List me\"") != std::string::npos);
 }
 
-TEST_CASE("GET /access-reviews: 403 without AuditLog:Read", "[access_review][rest][list]") {
+TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[access_review][rest][list]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
-        return !(t == "AuditLog" && op == "Read");
+        return !(t == "AccessReview" && op == "Read");
     };
     auto res = h.sink.Get("/api/v1/access-reviews");
     REQUIRE(res);
@@ -828,12 +1126,12 @@ TEST_CASE("MCP: close_access_review — not_found maps to kInvalidParams, store-
 
 // ── MCP gate-split + engine-deny ─────────────────────────────────────────────
 
-TEST_CASE("MCP: a session with only AuditLog:Read can export/get/list but not "
+TEST_CASE("MCP: a session with only AccessReview:Read can export/get/list but not "
           "open/attest/close",
           "[access_review][mcp][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
-        return t == "AuditLog" && op == "Read"; // ONLY Read granted
+        return t == "AccessReview" && op == "Read"; // ONLY Read granted
     };
 
     auto export_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());

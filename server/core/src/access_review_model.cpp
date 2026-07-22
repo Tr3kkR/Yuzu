@@ -126,11 +126,15 @@ build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engine
     // engine row's display_name/owner/classification/lifecycle rather than
     // fail loudly, which is exactly the kind of quiet evidence corruption R1
     // exists to rule out.
-    auto users_r = users->list_users();
+    // list_users_including_inactive(), NOT list_users(): a disabled user
+    // still holding a grant is materially different CC6.2 evidence than an
+    // "orphan" grant with no matching roster row at all — see the file
+    // header + AccessReviewRow::lifecycle_state doc.
+    auto users_r = users->list_users_including_inactive();
     if (!users_r)
         return std::unexpected("failed to read users (code=" +
                                std::to_string(static_cast<int>(users_r.error())) + ")");
-    std::unordered_map<std::string, const auth::UserEntry*> user_by_name;
+    std::unordered_map<std::string, const UserWithStatus*> user_by_name;
     user_by_name.reserve(users_r->size());
     for (const auto& u : *users_r)
         user_by_name.emplace(u.username, &u);
@@ -182,7 +186,7 @@ build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engine
         if (ptype == "user") {
             auto it = user_by_name.find(pid);
             if (it != user_by_name.end()) {
-                const auth::UserEntry& u = *it->second;
+                const UserWithStatus& u = *it->second;
                 row.display_name = u.username;
                 auto email_it = email_by_upn.find(u.username);
                 row.owner_or_email = email_it != email_by_upn.end() ? email_it->second : "";
@@ -195,9 +199,11 @@ build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engine
                 row.last_activity_ms = 0;
                 row.last_activity_kind = "n/a";
                 row.classification = "";
-                // `list_users()` filters `WHERE is_active = 1` — every row
-                // it returns is, by construction, active.
-                row.lifecycle_state = "active";
+                // A matched user row that is DISABLED (still holds this
+                // grant, but the account itself is deactivated) is
+                // "disabled", not "orphan" — the principal exists and is
+                // identifiable, it just shouldn't have standing access.
+                row.lifecycle_state = u.is_active ? "active" : "disabled";
                 row.source = normalize_source(u.identity_source);
             } else {
                 fill_orphan(row);
