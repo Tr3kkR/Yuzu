@@ -12,7 +12,7 @@ deciders: >-
   COMMENT, 2026-07-21, findings F1–F10) is folded in this revision: two-tier enforcement
   (per-PR lexical gate + scheduled CodeQL), the out-of-tree spawn-path gap stated, batch
   files banned on Windows, termination honesty elevated to an automation-correctness
-  prerequisite gating mutating waves, interpreter sites registered, and the descent rule
+  prerequisite for mutating-site migrations, interpreter sites registered, and the descent rule
   set to evidence-backed justification. The syscall/native-API split was subsequently
   collapsed into a single native-interface rung: every in-process route bottoms out in
   the same syscall layer, and the load-bearing boundaries are the process and the
@@ -21,7 +21,8 @@ depends-on: >-
   The shared argv runner (agents/core subprocess_runner, work item BR-001) currently on
   feat/macos-subproc-runner-certs (#2273/#2274, PR #2321 stacked on #2277). This ADR sets
   the target state; the runner landing on dev is the prerequisite for the rung-2/3
-  migration waves.
+  migrations. Migration sequencing is owned by a separately maintained roadmap — this
+  ADR records direction only.
 related: >-
   docs/agent-privilege-model.md (macOS agent is root, Windows LocalSystem today — the
   privilege context; and the Linux sudo-boundary rules Decision 8 preserves).
@@ -455,28 +456,23 @@ removes its spawn from the picture entirely.
   evidence: 4 shipped CRITICAL injections, no timeouts, uncovered fork race,
   root/LocalSystem privilege.
 
-## What we must refactor
+## The sink manifest — the standing evidence ledger
 
-### Step 0 — the sink manifest (first migration artifact)
+The decisions above refer to the **sink manifest**: the standing register of
+every spawn call site — location, mechanism, platform, data provenance,
+mutating vs read-only nature, shell features used, privilege path (sudoers
+grant, if any), its **ladder review** (*does this subprocess need to exist, or
+does a rung-1 interface answer the same question?*), and the Decision-1
+evidence chain for every rung passed over. It is where descent evidence,
+Decision-5 interpreter registrations, and Decision-7 exceptions live, and it
+is how "no site missed" is provable at any time. It is a **governance
+artifact, not a plan** — sequencing of the migration it describes is owned by
+the roadmap, outside this ADR.
 
-Before wave work starts, generate a complete manifest of every spawn call
-site — one row each: plugin/file/line, mechanism, platform, **ladder review**
-(*does this subprocess need to exist, or does a rung-1 interface answer the
-same question?* — with the per-rung evidence chain when it stays a subprocess), data
-provenance (operator/server param, derived, filesystem, constant), mutating vs
-read-only, shell features used, environment/cwd/stdin needs, output semantics,
-privilege path (sudoers grant, if any), target wave, and the covering test.
-The wave lists below are the starting inventory, not the authority — the
-manifest is, and it is how "no site missed" is proven at the end.
+## Runner contract requirements
 
-Known rung-promotion candidates to seed the ladder-review column (each still
-subject to the descent-evidence tests — contract stability and kill-ability in
-particular): `sysctl -n …` spawns → `sysctlbyname()`; DEX Linux
-`journalctl` `popen` → `sd_journal`; macOS `certificates` `security`-CLI
-reads → Security.framework where equivalent; `ioreg` subsets → IOKit
-registry reads — all rung-1 promotions.
-
-### Runner API work to close first (prerequisites, in agent-core; feed back to #2321 follow-ups)
+Requirements this ADR places on the runner's contract — direction, not
+schedule; ordering is owned by the roadmap:
 
 - **Windows implementation** — currently a stub. The contract must specify:
   explicit absolute `lpApplicationName`; a documented UTF-8→UTF-16,
@@ -502,7 +498,8 @@ registry reads — all rung-1 promotions.
   is what lets an autonomous consumer distinguish "ran and failed" (retry)
   from "killed at deadline" (escalate) from "spawn error" (never retry), and
   a fabricated exit 0 from a killed process reads as a *succeeded
-  remediation* mid-chain. **Mutating-site migration waves gate on this fix.**
+  remediation* mid-chain. **Mutating sites must not migrate onto the runner
+  before this holds.**
 - **Termination semantics for mutating tools** — an optional soft-terminate
   grace (`SIGTERM` → bounded wait → process-group `SIGKILL`;
   `CTRL_BREAK`/job-close on Windows) so a deadline firing mid-`dpkg`/`rpm`
@@ -514,98 +511,33 @@ registry reads — all rung-1 promotions.
   make the output byte cap caller-configurable (the 1 MB sanity cap is fixed;
   `script_exec` needs 16 MiB).
 - **Environment / locale / stdio policy** — explicit child environment
-  control (sanitized env, `LC_ALL=C` option so wave-3 C++ parsers never meet
+  control (sanitized env, `LC_ALL=C` option so C++ parsers never meet
   localized tool output), stdin → `/dev/null` by default, intentional signal
   defaults.
 - **stderr policy** — `merge_stderr` exists (capture or `/dev/null`); confirm
-  it covers all `2>&1`/`2>/dev/null` call-site patterns during wave 2.
+  it covers all `2>&1`/`2>/dev/null` call-site patterns as sites migrate.
 - **Tool path probing** — a "first existing absolute path wins" helper (e.g.
   `ip` differs across distros). Honestly noted: stat-then-exec is still a
   filesystem TOCTOU if an attacker can replace the probed binary — root-owned
   tool directories are the mitigation, not the probe.
-- **Streaming output** — wave 4 (`script_exec`) needs incremental line
-  delivery to the command context, not just collect-at-end.
+- **Streaming output** — `script_exec` needs incremental line delivery to
+  the command context, not just collect-at-end; convergence of the existing
+  argv islands (`script_exec`, `content_dist`) onto the shared runner must
+  not precede the features they depend on — premature convergence would
+  regress behaviour.
 
-### Wave 1 — sites executing untrusted or attacker-influenceable values (highest priority)
+## Scope and non-goals
 
-Values interpolated into shell strings today, behind per-site
-allowlists/quoting (provenance per site recorded honestly in the manifest —
-not all are operator-supplied, all are influenceable):
-
-- `network_actions` — ping host/count (operator/server params)
-- `wol` — ping host (operator/server param)
-- `discovery` — target IPs derived from validated CIDR
-- `users` — usernames read from `/etc/passwd` into `lastlog -u …`
-- `license_scan` — filesystem filenames via hand-rolled `shell_single_quote()`
-- `certificates` — filesystem paths and thumbprints interpolated into
-  OpenSSL/security commands on `dev` (not literal-only; also a rung-1
-  promotion candidate)
-- `quarantine` — destructive file operations (mutating; high blast radius)
-- `services` — service mutation commands (mutating)
-- `interaction` — a **redesign, not a spawn swap**: it nests shells inside
-  shells (`sh -c` wrapping zenity command substitution; `_popen` of
-  PowerShell with interpolated operator text through a character-replacement
-  `sanitize()`). Converting to frozen-script-plus-data-as-argv is
-  dialog-layer work — sized accordingly (interpreter payload; Decision-5
-  register)
-
-The allowlists stay (defense-in-depth per Decision 6) but stop being the only
-line of defense.
-
-### Wave 2 — literal single-command sites (mechanical swaps or rung promotions)
-
-Straight `run_command("tool args")` with no shell features: per the manifest's
-ladder review, either **promote** (delete the spawn for a rung-1 call) or
-**swap** to a runner call with a probed absolute path. Representative set:
-`hardware`, `os_info`, `device_identity`, `antivirus`, `bitlocker`, `sccm`,
-`network_diag`, `processes` (`ps -axo …`), `firewall`. Sites whose only shell
-feature is `2>/dev/null`/`2>&1`/`2>nul` also land here via `merge_stderr`.
-Branch note: the `certificates`/`event_logs` migrations on
-`feat/macos-subproc-runner-certs` cover their **macOS paths only** — their
-generic-path `popen` helpers are wave 2/3 work like everyone else's.
-
-### Wave 3 — shell-feature restructures (pipelines, globs, fallbacks)
-
-Each replaces in-shell text processing with the base tool + C++ filtering —
-the same code the `*_parsers.hpp` test discipline wants anyway. Run with
-`LC_ALL=C` so parsers never meet localized output:
-
-- **Pipelines** (`… | grep | awk | head | wc`): `wifi`
-  (`iw`/`iwlist`/`iwconfig`), `hardware` (`system_profiler`/`ioreg` on
-  macOS), `network_config` (`route`/`scutil`), `software_actions`
-  (`yum`/`dpkg` counting), `windows_updates` (`rpm`/`apt` listings), `users`
-  (`last | head`), `installed_apps` + `vuln_scan`
-  (`system_profiler SPApplicationsDataType`), `event_logs`
-  (`log show … | head`), `services` (`launchctl list`). Truncation moves to
-  the runner's `max_lines` (+ `stop_after_max_lines` where "first N lines" is
-  the whole ask).
-- **Glob:** `windows_updates` `ls -t /boot/vmlinuz-* | head -1` →
-  `std::filesystem` iteration + mtime sort.
-- **Fallback chain:** `network_actions` `systemd-resolve … || true` → run
-  first argv, check exit code, run alternate.
-- **`system()` capability probes** (`command -v tool`): `vuln_scan`,
-  `discovery`, `installed_apps`, `license_scan` → stat against the probe
-  list.
-
-### Wave 4 — converge the argv islands, agent-core sites, and the tar exception
-
-- `script_exec` and `content_dist` keep their specialised behaviours (env
-  whitelist, staged-binary execution, streaming, 16 MiB cap) and converge onto
-  the shared runner **only after** the prerequisite runner features above
-  exist — premature convergence would regress behaviour.
-- Agent-core shell-outs migrate under the same rules: `dex_macos_collector.cpp`,
-  `dex_linux_collector.cpp` (a `sd_journal` rung-1 candidate), and the
-  `trigger_engine.cpp` `popen` sites (the Linux branch of which is also
-  outside the fork lock today).
-- `tar` mapdrive/service collectors: re-homed as Decision-7 registered
-  exceptions executing via the runner's shell shape — commands stay literal
-  shell strings, the raw `popen` spawns go away, and the sites gain the
-  lock/deadline/caps.
-
-### Explicit non-goals
-
-- Existing rung-1 paths (Windows WMI/Win32, TAR ES/ETW capture sources,
-  `/proc`//`sys` reads) are untouched — they are already the target state.
+- **Migration sequencing is deliberately out of scope — the roadmap has been
+  separated from this ADR.** An ADR records strategic direction; per-plugin
+  targets, wave ordering, rung-promotion candidates, and work-item
+  scheduling are owned by the migration roadmap maintained separately. The
+  scope of this ADR is the ladder, the runner contract, the evidence rules,
+  and the enforcement gates.
+- This ADR covers `agents/plugins/*` and the agent-core spawn sites
+  (collectors, trigger engine); existing rung-1 paths (Windows WMI/Win32,
+  TAR ES/ETW capture sources, `/proc`//`sys` reads) are untouched — they are
+  already the target state.
 - The Erlang gateway spawns no plugin subprocesses and is out of scope; the
   only interaction is budget arithmetic (an agent-side subprocess deadline
   must fit inside the command/gateway response budget, and a Reflex-step
@@ -635,8 +567,8 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
   state, so an autonomous remediation step can hang indefinitely — the
   runner's mandatory deadline converts every step into a bounded outcome,
   the precondition for autonomous retry/escalation existing at all.
-- **Negative / accepted:** migration effort across 27 plugins (staged waves,
-  each independently shippable); rung-1 promotions cost per-OS API code and
+- **Negative / accepted:** migration effort across 27 plugins (sequencing
+  owned by the separated roadmap); rung-1 promotions cost per-OS API code and
   carry their own ABI/blocking risks — hence the recognised evidence
   categories rather than silent judgment; the sequential-descent rule
   front-loads investigation effort (each site must research the higher rung
@@ -660,7 +592,7 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
 
 ## Verification
 
-- Per-wave: fixture tests in `tests/unit/` for each new/extended
+- Per migrated site: fixture tests in `tests/unit/` for each new/extended
   `*_parsers.hpp` (canned real-output fixtures captured pre-migration,
   `LC_ALL=C`); plugin suite green (`meson test -C build-<os> --suite agent`);
   on macOS additionally the migrated plugins' actions exercised against the
@@ -681,8 +613,8 @@ the same code the `*_parsers.hpp` test discipline wants anyway. Run with
   passed over.
 - Runner: `test_subprocess_runner.cpp` extended for the termination-reason
   enum, argv[0]/NUL enforcement, byte-cap configurability, env/locale policy,
-  the probe helper, and the Windows quoting edge cases, before the wave that
-  depends on each starts.
+  the probe helper, and the Windows quoting edge cases, before migrations
+  that depend on each land.
 - Concurrency: a deterministic fork-lock coverage test — a test hook/barrier
   around pipe creation plus direct inspection of child fd state — pinning the
   "library seam, not chokepoint" contract (Decision 4); plus a
