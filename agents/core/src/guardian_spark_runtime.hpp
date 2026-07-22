@@ -62,6 +62,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -267,6 +268,12 @@ public:
     /// comes back from try_page_batch's PageOutcome, decided under outbox_mu_, because this
     /// value can be stale by the time the attempt happens (#2345).
     [[nodiscard]] std::size_t lifecycle_headroom() const;
+    /// Snapshot of the event_ids currently in the lifecycle send window, taken ONCE per replay
+    /// pass. Lets the replay path size a candidate by its NET-NEW records rather than its raw
+    /// entry count without taking outbox_mu_ per candidate. Same status as lifecycle_headroom():
+    /// an optimisation, stale the moment it returns, never the authority - try_page_batch's
+    /// PageOutcome decides under the lock (#2345 Gate 8 QE).
+    [[nodiscard]] std::unordered_set<std::string> lifecycle_event_ids() const;
 
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
     DrainOutcome drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,

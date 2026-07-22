@@ -93,8 +93,8 @@ struct JournalPageStats {
     /// justifies re-attempting once the drain frees room; the second is an idle steady state
     /// where re-attempting is a full-journal rescan for nothing (#2298 Gate 4 UP-2).
     bool headroom_blocked{false};
-    /// A batch has been blocked for kJournalStarvationPasses consecutive passes and the pass
-    /// stopped early so the window can drain toward it. Diagnostic/test signal only.
+    /// A batch has been blocked for kJournalStarvationPasses consecutive passes, so the pass
+    /// is now RESERVING the room it needs against smaller batches. Diagnostic/test signal only.
     bool starvation_yield{false};
     /// The pass did no work because the paging rate-limiter had no token. A FORCED page (a
     /// reconnect kick) that lands on an empty bucket would otherwise be silently swallowed:
@@ -296,6 +296,14 @@ public:
         inject_fail_reads_.store(n, std::memory_order_relaxed);
     }
 
+    /// TEST-ONLY: force the next `n` REPLAY scans (the list_entries at the head of
+    /// page_into_window) to fail. Deliberately a separate counter from the prune-side
+    /// injection: the point of page_read_failures() is that the two scans fail independently,
+    /// so a test that conflated them could not observe the difference. No production caller.
+    void inject_page_read_failures_for_test(int n) noexcept {
+        inject_fail_page_reads_.store(n, std::memory_order_relaxed);
+    }
+
     /// TEST-ONLY: overwrite the size gauges directly, to stage a state the production
     /// paths reach only via a rare boot condition - e.g. the fail-closed boot seed that
     /// pins them at the hard ceiling. Used to prove a later successful prune REBASES them
@@ -380,6 +388,7 @@ private:
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
     std::atomic<int> inject_fail_reads_{0};             ///< test-only: force the next N prune scans to fail
+    std::atomic<int> inject_fail_page_reads_{0};        ///< test-only: force the next N replay scans to fail
     std::atomic<int> inject_fail_deletes_{0};           ///< test-only: force the next N retention deletes to fail
     // Paging state - all guarded by paging_mutex_ (paging is single-threaded per pass).
     std::mutex paging_mutex_;
@@ -390,6 +399,8 @@ private:
     /// Drives the aging boost in page_into_window; written only under paging_mutex_.
     std::optional<std::pair<std::int64_t, std::string>> starved_;
     std::uint32_t starved_passes_{0};
+    /// Net-new records the starved batch needs; the size of the reservation held for it.
+    std::size_t starved_need_{0};
     /// Last now_ms a retention pass observed, for the forward-clock-jump guard. Written only
     /// under paging_mutex_ by prune_locked_, the single retention caller.
     std::int64_t last_prune_now_ms_{0};
@@ -398,6 +409,8 @@ private:
     /// never disagree about what "expired" means. Written only under paging_mutex_.
     std::int64_t last_age_cutoff_{0};
     bool pruned_cutoff_valid_{false};
+    /// True while the last pass declined a whole-journal age wipe, so the next one proceeds.
+    bool age_wipe_declined_{false};
     /// Retention passes that declined to age-evict because the clock jumped implausibly far
     /// forward. Nonzero means an endpoint's clock moved; it is NOT an error in itself.
     std::atomic<std::uint64_t> clock_jump_skips_{0};

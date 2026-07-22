@@ -724,6 +724,12 @@ std::size_t GuardianSparkRuntime::lifecycle_headroom() const {
     return lifecycle_log_.headroom();
 }
 
+std::unordered_set<std::string> GuardianSparkRuntime::lifecycle_event_ids() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    const auto present = lifecycle_log_.event_id_set(); // borrowed views, valid under the lock
+    return std::unordered_set<std::string>(present.begin(), present.end());
+}
+
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
     // Drain lifecycle (audit) BEFORE compliance/health so a rule's "armed" precedes its
     // first drift on the wire in the common case (stream up, both drain fully). This is

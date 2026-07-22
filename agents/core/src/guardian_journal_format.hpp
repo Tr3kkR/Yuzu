@@ -79,9 +79,15 @@ inline constexpr std::uint32_t kJournalStarvationPasses = 3;
 /// an absolute reading of the wall clock, so one bad reading (a VM restored from snapshot, an
 /// NTP overshoot) marks every batch expired simultaneously and would delete the whole durable
 /// audit trail in one transaction. Capping the pass converts that into a paced ageing-out that
-/// overlaps with replay and with an operator noticing. At the ~2-minute retention cadence a
-/// full 2000-batch journal still ages out in about an hour, so this does not let a genuinely
-/// idle agent accumulate: the count and byte ceilings are NOT capped and remain hard bounds.
+/// overlaps with replay and with an operator noticing.
+///
+/// It caps AGE eviction ONLY, and deliberately does not bound how fast a journal shrinks: the
+/// count and byte ceilings are uncapped and trim an over-ceiling journal back in a single pass
+/// regardless of this constant, so an over-cap journal converges as fast as it ever did. The
+/// pacing therefore applies to the case it was built for - a journal that is within its
+/// ceilings but suddenly entirely expired - and NOT, as an earlier version of this comment
+/// claimed, to "a full 2000-batch journal ageing out in about an hour": at 2000 batches the
+/// count ceiling is what evicts, and it evicts ~1000 in one pass (#2345 Gate 8 UP5-2).
 inline constexpr std::size_t kMaxAgeEvictionsPerPass = 64;
 
 /// Key prefixes within kJournalNamespace. A batch key is "lc:<nonce>:<seq12>";
