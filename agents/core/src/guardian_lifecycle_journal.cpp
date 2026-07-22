@@ -881,14 +881,19 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             std::any_of(cands.begin(), cands.end(), [this](const Cand& x) {
                 return x.ts_ms == starved_->first && x.key == starved_->second;
             });
-        if (!still_present)
+        if (!still_present) {
             starved_.reset(); // pruned, quarantined, or sent: stop reserving room for it
+            starved_passes_ = 0;
+            starved_need_ = 0;
+        }
     } else if (starved_blocked) {
         if (starved_passes_ < kJournalStarvationPasses)
             ++starved_passes_;
         stats.starvation_yield = starved_passes_ >= kJournalStarvationPasses;
     } else if (starved_ && starved_seen) {
         starved_.reset(); // considered and not blocked
+        starved_passes_ = 0;
+        starved_need_ = 0;
     }
     if (!starved_ && worst_blocked) {
         starved_ = worst_blocked; // the biggest thing that could not be placed this pass

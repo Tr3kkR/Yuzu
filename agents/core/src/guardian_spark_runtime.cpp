@@ -58,6 +58,11 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
       // strictly worse than a random one (#2345 Gate 5 CH-4 / Gate 4 UP-5+UP-15).
       lifecycle_log_(std::max({kMinOutboxCapacity, cfg.outbox_capacity,
                                kMaxJournalEntriesPerBatch})) {
+    if (cfg.outbox_capacity > 0 && cfg.outbox_capacity < kMaxJournalEntriesPerBatch)
+        spdlog::info("Guardian: lifecycle audit window raised from the configured {} to {} - a "
+                     "window smaller than one maximum-size journal batch makes large batches "
+                     "permanently unpageable",
+                     cfg.outbox_capacity, kMaxJournalEntriesPerBatch);
     // Reserve the staging vector ONCE - never from rule count. push_back then never
     // reallocates, which is what makes stage_pending_locked's noexcept contract real.
     pending_journal_.reserve(kMaxPendingJournalRecords);
@@ -581,6 +586,12 @@ GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
     // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
     // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
     // starve heartbeats under a large backlog (review UP-12 / perf P-2).
+    // Scoped: `present` holds string_views borrowed from the window's own entries. They are
+    // valid here (the log's nodes are stable and nothing is erased under this lock), but the
+    // enqueue loop below moves entries, so keeping a borrowed view alive across it is one edit
+    // away from a use-after-free for no benefit (#2345 Gate 8 cpp-safety).
+    std::unordered_set<std::string> want;
+    {
     const auto present = lifecycle_log_.event_id_set();
 
     // Required headroom is the count of NET-NEW event_ids, not the raw batch size (#2345
@@ -594,11 +605,11 @@ GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
     // Deduplicated, so a batch that repeats an event_id (a torn or hand-edited journal row)
     // cannot inflate the requirement past what enqueue would actually consume, nor enqueue
     // the same record twice against a membership set built before the loop.
-    std::unordered_set<std::string> want;
     want.reserve(entries.size());
     for (const auto& e : entries)
         if (!present.count(e.event_id))
             want.insert(e.event_id);
+    }
     if (want.empty())
         return out; // every entry is already windowed: nothing to do, and nothing is blocked
 
@@ -816,10 +827,14 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
         // a wall slice, i.e. the UP-3 blackout reachable purely by configuration
         // (#2345 Gate 3 cpp-safety).
         if (reserve_den > 0 && reserve_den <= kMaxReserveRatio) {
-            lifecycle_wall =
-                std::chrono::milliseconds{limits.max_wall.count() *
-                                          static_cast<std::int64_t>(reserve_den - reserve_num) /
-                                          static_cast<std::int64_t>(reserve_den)};
+            // DIVIDE FIRST. Multiplying max_wall by (den - num) before dividing overflows a
+            // signed 64-bit millisecond count for a large max_wall with a large denominator -
+            // undefined behaviour, not merely a wrong slice. Unreachable from the sole
+            // production caller, but the comment above claims a bound, so it needs to be one
+            // (#2345 Gate 8 security). Dividing first costs at most (den - 1) ms of slice.
+            lifecycle_wall = std::chrono::milliseconds{
+                limits.max_wall.count() / static_cast<std::int64_t>(reserve_den) *
+                static_cast<std::int64_t>(reserve_den - reserve_num)};
         }
         // Never longer than the pass itself, whatever the ratio said.
         // FLOOR the slice, mirroring the count reserve's floor. Without it a small max_wall
@@ -851,6 +866,11 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     // Give any STILL-unused allowance back to lifecycle. Without this the transfer is
     // one-directional and the reserve becomes a hard cap on lifecycle even when compliance
     // is completely idle - which at a small budget throttles audit delivery for no benefit.
+    // Spend or drop the guaranteed attempt HERE. If the compliance log was empty the token is
+    // never consumed, and carrying it into the lifecycle retry below lets lifecycle start one
+    // send past the whole pass deadline - the deadline this exception exists to relax for
+    // COMPLIANCE only (#2345 Gate 8 security). should_stop still bounds shutdown either way.
+    lim.guaranteed_attempts = 0;
     bool lifecycle_retry_truncated = false;
     const bool retried = lifecycle_truncated && lim.budget > 0;
     if (retried)
