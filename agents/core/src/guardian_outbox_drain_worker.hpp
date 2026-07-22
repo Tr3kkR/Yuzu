@@ -142,10 +142,13 @@ struct GuardianMaintenanceOps {
 struct GuardianMaintenanceResult {
     bool page_attempted{false};   ///< a paging pass was requested and ran
     std::size_t records_paged{0}; ///< net-new records placed in the send window
-    /// The pass had a candidate it could not place because the send window was FULL. Only
+    /// The pass had a candidate it could not place for lack of room FOR THAT BATCH (not
+    /// necessarily a full window - headroom 255 blocks a 256-entry batch). Only
     /// this - never "records_paged == 0" - justifies re-attempting outside the cadence
     /// (#2298 Gate 4 UP-2).
     bool headroom_blocked{false};
+    /// Smallest blocked batch's requirement; see JournalPageStats.
+    std::size_t min_blocked_headroom{0};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {
@@ -179,8 +182,12 @@ public:
     /// the force flag are observed by the loop's first cycle.
     void notify();
 
-    /// Deterministic test seam: run ONE drain pass synchronously on the caller's thread,
-    /// UNBOUNDED. (The loop body itself uses the bounded private drain_bounded().) Does NOT firewall
+    /// TEST-ONLY deterministic seam: run ONE drain pass synchronously on the caller's thread,
+    /// UNBOUNDED. It has NO production caller by design - the loop body uses the bounded
+    /// private drain_bounded(). Deliberately retained rather than deleted because several
+    /// tests rely on a synchronous drain, but note it bypasses every limit the worker applies
+    /// in production (count, wall clock, stop predicate), so it must not become a shortcut for
+    /// production code (#2345 / Sol). Does NOT firewall
     /// exceptions - the worker thread's loop() does (so a test can still observe a
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();

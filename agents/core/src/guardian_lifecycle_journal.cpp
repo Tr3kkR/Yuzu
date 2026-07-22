@@ -656,8 +656,27 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // otherwise distinguish "window full" from "already a member", which are opposite
         // situations. Recording it here makes the distinction explicit and skips the waste.
         if (rt.lifecycle_headroom() < c.batch.entries.size()) {
+            // CONTINUE, not break. Breaking here left page_cursor_ un-advanced, so an
+            // oversized head batch pinned the rotation and smaller NEWER batches never paged -
+            // the B2 starvation class the cursor exists to prevent, reintroduced by this very
+            // precheck (#2345). The old comment claimed "no smaller batch will fit either",
+            // which is simply false: batches vary up to kMaxJournalEntriesPerBatch.
+            //
+            // Paging a newer batch ahead of an older blocked one can invert armed/disarmed
+            // wire order across batches. That is tolerated by the server today: dedup compares
+            // immutable fields only on an event_id collision, lifecycle events do not update
+            // the compliance census, and event queries order by event timestamp rather than
+            // arrival. Strict replay order is in any case already best-effort (fair-rotation
+            // resume, second-truncated ingest timestamps).
             stats.headroom_blocked = true;
-            break; // no smaller batch will fit either; wait for the drain to free room
+            // Record the SMALLEST blocked requirement so the caller can re-arm only once that
+            // much room actually exists - "any headroom > 0" re-armed on every cycle and put
+            // UP-2's scan amplification back in the recovery regime.
+            if (stats.min_blocked_headroom == 0 ||
+                c.batch.entries.size() < stats.min_blocked_headroom)
+                stats.min_blocked_headroom = c.batch.entries.size();
+            page_cursor_ = std::pair{c.ts_ms, c.key}; // advance: do not pin the rotation
+            continue;
         }
         const bool have_token = page_bucket_.ready(now_ms); // refills for elapsed time
 

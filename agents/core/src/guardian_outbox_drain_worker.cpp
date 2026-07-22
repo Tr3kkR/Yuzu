@@ -123,6 +123,7 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms());
         result.records_paged = stats.records_paged;
         result.headroom_blocked = stats.headroom_blocked;
+        result.min_blocked_headroom = stats.min_blocked_headroom;
     }
     return result;
 }
@@ -259,8 +260,20 @@ void GuardianOutboxDrainWorker::loop() {
         // every cycle. Requiring headroom_blocked - a candidate the window could not fit -
         // plus headroom actually existing NOW means we only re-attempt when a real backlog
         // is waiting and the drain genuinely made room for it.
-        if (page_result.headroom_blocked && drained > 0 && rt_.lifecycle_headroom() > 0)
+        // Re-arm only once there is room for the SMALLEST batch that was actually blocked.
+        // "any headroom > 0" fired when one slot opened for a batch needing up to 256, so
+        // force_page_ re-armed every cycle and each forced page is a full journal scan -
+        // UP-2's amplification back in the recovery regime (#2345 / Sol).
+        //
+        // skip_wait is set TOO. force_page_ alone only takes effect on the next wake, and an
+        // untruncated drain sleeps the whole periodic bound (5 s in production) before that
+        // happens - a latency the existing 20 ms-bound reconnect tests masked entirely.
+        if (page_result.headroom_blocked && drained > 0 &&
+            rt_.lifecycle_headroom() >= page_result.min_blocked_headroom &&
+            page_result.min_blocked_headroom > 0) {
             force_page_.store(true, std::memory_order_release);
+            skip_wait = true; // act on it NOW, not after the backstop
+        }
     }
 }
 

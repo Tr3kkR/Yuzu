@@ -86,12 +86,17 @@ private:
 struct JournalPageStats {
     std::size_t batches_paged{0}; ///< batches that contributed >=1 net-new record this pass
     std::size_t records_paged{0}; ///< records newly enqueued into the send window this pass
-    /// A candidate batch could not be placed because the send window was FULL, as distinct
-    /// from placing nothing because every entry was already a member. Callers must not
+    /// A candidate batch could not be placed because the window lacked room FOR THAT BATCH -
+    /// which is NOT the same as the window being full: headroom 255 blocks a 256-entry batch.
+    /// Distinct from placing nothing because every entry was already a member. Callers must not
     /// conflate the two: the first means "a backlog is waiting on drain progress" and
     /// justifies re-attempting once the drain frees room; the second is an idle steady state
     /// where re-attempting is a full-journal rescan for nothing (#2298 Gate 4 UP-2).
     bool headroom_blocked{false};
+    /// Entries the SMALLEST blocked batch needed. A caller must not re-attempt until at least
+    /// this much room exists; re-arming on any headroom at all meant a 1-slot opening
+    /// retriggered a full journal scan for a batch needing 256 (#2345).
+    std::size_t min_blocked_headroom{0};
 };
 
 /// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the

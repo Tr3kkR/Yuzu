@@ -400,8 +400,8 @@ void GuardianEngine::journal_maintenance_tick() {
     // journal can no longer stall the heartbeat into false staleness. A no-op after stop().
     //
     // No worker kick after a successful persist: paging is already MORE frequent than before
-    // (the worker's 5 s backstop vs this 30 s tick), so a kick would add an mtx_ -> Signal.mu
-    // lock edge on the heartbeat path for latency the backstop already bounds more tightly.
+    // (the worker's 30 s page cadence, kicked immediately on reconnect, vs this 30 s tick), so a kick would add an mtx_ -> Signal.mu
+    // lock edge on the heartbeat path for latency the page cadence already bounds.
     std::lock_guard lock(mtx_);
     if (stopped_ || !prefer_spark_)
         return;
