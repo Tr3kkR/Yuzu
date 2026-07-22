@@ -856,7 +856,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                         std::string("reason=") +
                         to_string(reason == McpStreamClose::kNone ? McpStreamClose::kClientGone
                                                                   : reason) +
-                        " cid=" + cid;
+                        " cid=" + cid + " role_as_of=attach";
                     // STAMP the principal rather than letting the sink re-derive it. The
                     // generic sink resolves the actor from the request when the row is
                     // written, and this row is written at teardown against the ORIGINAL

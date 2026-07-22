@@ -6830,6 +6830,12 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // limit onto the shared worker pool; without re-validation, a revoked
     // credential keeps its live stream until the session TTL. Test seams omit
     // them deliberately; a production registration must not.
+    if (!streaming_off && !principal_audit_fn) {
+        spdlog::warn("MCP: streaming enabled with NO explicit-principal audit sink — "
+                     "mcp.stream.close rows will re-derive the actor from a credential that "
+                     "no longer resolves on a revocation close, and will name nobody. Test "
+                     "seams omit it deliberately; a production server must not.");
+    }
     if (!streaming_off && stream_budget == nullptr) {
         spdlog::warn("MCP: streaming enabled with NO stream budget — concurrent GET SSE "
                      "streams are uncapped on the shared HTTP worker pool");

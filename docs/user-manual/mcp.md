@@ -193,11 +193,13 @@ change: a notification POST now answers `202` instead of `204`).
   out by its own zombie.
   The credential that opened a stream is re-checked on every heartbeat. On a
   single-server deployment, revoking it ends the stream within one tick
-  (`credential_revoked`). On a **multi-replica** deployment, revocation latency is up to
-  the 60 s token-cache TTL plus one tick, not instantaneous: the token cache and the
-  session table are per-process, so a revoke handled by one replica does not reach a
-  stream held by another until that replica's own cache entry expires and it re-reads
-  the store. Streams end with a final
+  (`credential_revoked`). On a **multi-replica** deployment, revocation of an
+  **API token** is not instantaneous: the token cache is per-process, so a revoke
+  handled by one replica does not reach a stream held by another until that replica's
+  own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
+  tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
+  stream simply does not exist on another replica; the bound above is an API-token
+  property.) Streams end with a final
   `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
   auth store was unreachable for longer than the **60 s** grace window — the stream is not
