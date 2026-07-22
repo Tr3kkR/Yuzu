@@ -115,6 +115,10 @@ struct JournalPageStats {
     /// this much room exists; re-arming on any headroom at all meant a 1-slot opening
     /// retriggered a full journal scan for a batch needing 256 (#2345).
     std::size_t min_blocked_headroom{0};
+    /// Candidates skipped because they already carry a durable sent-label. Only a FORCED pass
+    /// (boot, reconnect) re-offers those, so in steady state this counts the redundant
+    /// redelivery that is no longer being generated.
+    std::size_t skipped_already_sent{0};
 };
 
 /// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the
@@ -171,7 +175,11 @@ public:
     /// replay provenance) and pages them via rt.try_page_batch. Re-send-all: nothing is
     /// permanently skipped (membership is a window scan; retention is the only deletion).
     /// Takes KvStore.mu_ then outbox_mu_ SEQUENTIALLY, never nested, never the engine mtx_.
-    JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms);
+    /// `replay_sent` re-offers batches that already carry a durable sent-label. FALSE on the
+    /// ordinary cadence pass and TRUE on a forced one (boot, reconnect) - see the note on
+    /// re-send-all in guardian_journal_format.hpp.
+    JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms,
+                                      bool replay_sent = false);
 
     /// Write the (best-effort) sent-label for a batch - called from the send path after the
     /// batch's LAST paged entry is delivered. Presence classifies eviction (sent-unacked vs

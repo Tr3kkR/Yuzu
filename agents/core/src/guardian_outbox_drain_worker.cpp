@@ -143,7 +143,7 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         maint_.journal->prune(journal_now_ms());
     if (ops.page) {
         result.page_attempted = true;
-        const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms());
+        const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms(), ops.replay_sent);
         result.records_paged = stats.records_paged;
         result.headroom_blocked = stats.headroom_blocked;
         result.min_blocked_headroom = stats.min_blocked_headroom;
@@ -276,7 +276,8 @@ void GuardianOutboxDrainWorker::loop() {
 
         GuardianMaintenanceResult page_result;
         if (page_due && !stop_requested()) {
-            const bool ok = firewalled([&] { page_result = maintenance_once({.page = true}); });
+            const bool ok = firewalled(
+                [&] { page_result = maintenance_once({.replay_sent = forced_page, .page = true}); });
             last_page = std::chrono::steady_clock::now();
             // A FORCED page that never ran must not be lost: re-arm so the next cycle
             // retries it rather than waiting out a full cadence interval.

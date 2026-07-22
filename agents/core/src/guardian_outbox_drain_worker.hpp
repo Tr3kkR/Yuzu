@@ -139,6 +139,11 @@ struct GuardianMaintenanceConfig {
 /// keeps its timers as locals, so the worker holds no cross-thread timer state and
 /// maintenance_once() is a pure function of its argument.
 struct GuardianMaintenanceOps {
+    /// Re-offer batches that already carry a durable sent-label. TRUE only on a FORCED page
+    /// (boot replay, reconnect kick) - the events after which an in-flight send may have been
+    /// lost. False on the cadence pass, so steady state does not re-deliver what the server
+    /// already has (#2345 round 8).
+    bool replay_sent{false};
     bool prune{false};
     bool page{false};
 };

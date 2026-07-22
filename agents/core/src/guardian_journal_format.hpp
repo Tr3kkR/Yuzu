@@ -57,11 +57,15 @@ inline constexpr std::size_t kMaxJournalBytes = 32ull * 1024 * 1024; // 32 MiB
 inline constexpr std::size_t kMaxQuarantineBatches = 100;
 
 /// Replay paging rate limiter (rev-4.1 #8): a process-lifetime token bucket bounds the
-/// STEADY-STATE redelivery bandwidth - re-send-all re-pages a sent+popped entry on every
-/// tick until retention, so the refill rate IS the per-agent redelivery rate. At this rate
-/// a fleet of N agents redelivers <= N * kJournalPageRefillPerSec batches/sec server-wide,
-/// each a cheap redelivered-quiet ingest; the DEFERRED server ack removes re-send-all
-/// entirely. Tunable.
+/// Replay pacing. This USED to double as the steady-state redelivery rate, because a delivered
+/// batch left the send window and window membership was the only "already delivered" test, so
+/// every cadence pass re-paged and re-sent it until retention. That is fixed: page_into_window
+/// consults the durable sent-label and re-offers a delivered batch only on a FORCED pass (boot
+/// replay, reconnect kick) - the events after which an in-flight send may actually have been
+/// lost (#2345 round 8). So this now bounds genuinely-new replay plus post-reconnect catch-up,
+/// NOT a permanent per-agent redelivery floor. The deferred server ack remains the proper fix
+/// for the residual case: a send the stream accepted but the server never ingested, on an agent
+/// that neither reboots nor reconnects. Tunable.
 inline constexpr double kJournalPageRefillPerSec = 0.1; // 1 batch / 10 s / agent
 inline constexpr double kJournalPageBurst = 5.0;        // small startup burst
 /// Bound per-pass paging work (reconstruct + membership scan) regardless of journal size.

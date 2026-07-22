@@ -1685,3 +1685,47 @@ TEST_CASE("CH-9: a failed retention delete does not strand the rows it meant to 
     const auto paged = rig.journal->page_into_window(*rig.rt, kT + kEightDays + 2000);
     CHECK(paged.records_paged == 3);
 }
+
+TEST_CASE("CH-10: a delivered batch is not re-offered on the ordinary cadence pass",
+          "[spark][guardian][journal][chaos]") {
+    // A delivered batch leaves the in-memory window the instant it ships, and window membership
+    // was the ONLY test for "already delivered" - so the next cadence pass saw it as net-new,
+    // re-paged it and re-sent it, for as long as retention kept the batch. Per agent that spends
+    // the entire paging budget re-delivering what the server already has; across a fleet it is a
+    // permanent floor of redundant ingest proportional to endpoint count.
+    // RED before the fix: records_paged == 2 on the second cadence pass.
+    JournalRig rig;
+    constexpr std::int64_t kT = 1'700'000'000'000;
+    const std::size_t empty_headroom = rig.rt->lifecycle_headroom(); // window empty at rest
+    rig.persist_batch("a", 2);
+
+    REQUIRE(rig.journal->page_into_window(*rig.rt, kT).records_paged == 2);
+    REQUIRE(rig.rt->lifecycle_headroom() == empty_headroom - 2);
+
+    // Ship it, so the entries leave the window and only the durable sent-label records that
+    // delivery happened at all.
+    GuardianSparkRuntime::DrainLimits lim;
+    lim.compliance_reserve_num = 0;
+    lim.compliance_reserve_den = 0;
+    rig.rt->drain_bounded([](const OutboxEntry&) { return SendResult::Sent; }, lim);
+    // Precondition, not decoration: if the entries were still windowed the pass below would
+    // place nothing for the ordinary membership reason and the test would pass vacuously.
+    REQUIRE(rig.rt->lifecycle_headroom() == empty_headroom);
+    auto rows = rig.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    rig.journal->mark_batch_sent(rows->front().key);
+
+    // The ordinary cadence pass must leave it alone...
+    const auto cadence = rig.journal->page_into_window(*rig.rt, kT + 30'000);
+    CHECK(cadence.records_paged == 0);
+    CHECK(cadence.skipped_already_sent == 1);
+
+    // ...but a FORCED pass - boot replay or a reconnect kick, the events after which an
+    // in-flight send may have been lost - must still re-offer it. That is the safety net, kept
+    // where it can pay.
+    const auto forced =
+        rig.journal->page_into_window(*rig.rt, kT + 60'000, /*replay_sent=*/true);
+    CHECK(forced.records_paged == 2);
+    CHECK(forced.skipped_already_sent == 0);
+}

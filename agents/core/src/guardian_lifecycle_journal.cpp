@@ -637,7 +637,8 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
 }
 
 JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime& rt,
-                                                           std::int64_t now_ms) {
+                                                           std::int64_t now_ms,
+                                                           bool replay_sent) {
     JournalPageStats stats;
     if (!kv_)
         return stats;
@@ -821,11 +822,48 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         return seen.size();
     };
 
+    // RE-SEND-ALL IS NOT THE STEADY STATE (#2345 round 8). A delivered batch is popped from the
+    // in-memory window the instant it ships, and membership in that window was the ONLY test for
+    // "already delivered" - so on the next cadence pass the batch looked net-new again and was
+    // re-paged and re-sent, for as long as retention kept it. Per agent that is the whole
+    // paging budget spent re-delivering records the server already has and de-dupes; across a
+    // fleet it is a permanent floor of redundant ingest that scales with endpoint count and
+    // does nothing for durability.
+    //
+    // The durable sent-label already records delivery; it simply was not consulted here (it is
+    // read only by prune's eviction classifier). Consult it, and re-offer a labelled batch ONLY
+    // on a FORCED pass - boot and reconnect, which are exactly the events after which an
+    // in-flight send may have been lost. The safety net is kept where it can pay and removed
+    // where it cannot: a steady stream that returned Sent is not made safer by re-sending the
+    // same batch ten seconds later.
+    //
+    // The trade, stated plainly: a batch whose send was accepted by the stream but never
+    // ingested server-side, on an agent that then neither reboots nor reconnects, is no longer
+    // re-offered. That is the case the DEFERRED server ack closes properly; until it lands this
+    // is the honest boundary of at-least-once here.
+    std::unordered_set<std::string> sent_labels;
+    if (!replay_sent) {
+        if (auto labels = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+            sent_labels.reserve(labels->size());
+            for (auto& row : *labels)
+                sent_labels.insert(std::move(row.key));
+        }
+        // A read failure here is NOT fatal and must not silently re-enable re-send-all: an
+        // empty set would make every labelled batch look unsent. Treat the pass as if it were
+        // forced - the old behaviour - rather than pretending nothing was delivered.
+    }
+
     const std::size_t limit = std::min<std::size_t>(cands.size(), kJournalPageMaxBatchesPerPass);
     for (std::size_t n = 0; n < limit; ++n) {
         if (stopping_.load(std::memory_order_acquire))
             break; // shutdown began: stop mutating the window (stop-race gate, rev-4.1 #7)
         Cand& c = cands[(start + n) % cands.size()];
+        if (!sent_labels.empty() &&
+            sent_labels.count(journal_sent_key_from_batch_key(c.key)) != 0) {
+            ++stats.skipped_already_sent;
+            page_cursor_ = std::pair{c.ts_ms, c.key}; // advance: never pin the rotation
+            continue;
+        }
         // Check headroom BEFORE building anything. Two reasons (#2298 Gate 4 UP-2 + f-2):
         // try_page_batch's own headroom gate is all-or-nothing per batch, so a full window
         // means every OutboxEntry constructed below - up to 256 per batch, each carrying
