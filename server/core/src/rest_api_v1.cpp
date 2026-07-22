@@ -9210,8 +9210,10 @@ void RestApiV1::register_routes(
                     sink_state->cv.notify_all();
                     // unsubscribe stays OUTSIDE the sink lock (publishers take the bus mutex
                     // then the sink mutex, so unsubscribing under `mu` inverts that order) and
-                    // in its OWN try: a throw from the lock_guard above must not skip it, or
-                    // the subscription outlives the response and pins the sink forever.
+                    // in its OWN try so that unsubscribe's OWN throw cannot skip the steps
+                    // after it (the metrics decrement / lease return). A leaked subscription
+                    // pins the sink for the life of the process; contain it, do not propagate
+                    // it out of this ~Response-invoked releaser.
                     try {
                         bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
                     } catch (...) {

@@ -451,9 +451,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--http-worker-threads", cfg.http_worker_threads,
                    "Pin the shared HTTP worker pool size by hand. 0 (default) derives it from "
                    "--max-sse-streams, which is what you want; setting it clamps the stream "
-                   "target to what your pool can carry. Threads are created on demand up "
-                   "to this number, not at boot — size the host's process/thread limit "
-                   "(systemd TasksMax, container pids) at or above it.")
+                   "target to what your pool can carry. The whole pool is created at BOOT, so "
+                   "size the host's process/thread limit (systemd TasksMax, container pids) at "
+                   "or above this number before starting.")
         // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
