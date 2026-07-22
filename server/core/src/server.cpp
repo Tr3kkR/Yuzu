@@ -6910,14 +6910,19 @@ private:
 
         // SSE endpoint
         web_server_->Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
-            // ADMISSION CONTROL (ADR-0030). This route performs NO authentication — a
-            // separate, tracked defect — so until that is fixed it is a pre-auth
-            // thread-pinning DoS: every connection holds an httplib worker for its whole
-            // life. Leasing it bounds that. The principal is resolved BEST-EFFORT (never
-            // enforced, so dashboard behaviour is unchanged): a signed-in operator's tabs key
-            // to their own name and get the normal dashboard allowance, while every
-            // unauthenticated caller shares one small anonymous bucket — which caps the DoS
-            // without locking out an operator.
+            // ADMISSION CONTROL (ADR-0034). Every connection holds an httplib worker for
+            // its whole life, so it takes a lease like every other streaming surface.
+            // This route IS session-gated: `/events` is not in `is_login_exempt_path`,
+            // and the pre-routing chokepoint 401s a caller with no session by name
+            // (alongside `/api/` and `/mcp/`), so the handler only ever runs for an
+            // authenticated operator. What the lease bounds here is therefore an
+            // AUTHENTICATED thread-pinning path, not a pre-auth one.
+            // The anonymous branch below is unreachable today and kept only as
+            // defence-in-depth against a future change to the exempt list — it must not
+            // be read as evidence that this surface is open. The residual defect on this
+            // route is the missing per-connection queue cap (`/api/v1/events` opts into
+            // `kPerConnectionQueueCapDefault`; this one does not), which the lease does
+            // NOT address — see ADR-0034 Decision 1.
             std::string principal = "anonymous";
             std::size_t per_principal = detail::kPerPrincipalAnonymous;
             if (auth_routes_) {

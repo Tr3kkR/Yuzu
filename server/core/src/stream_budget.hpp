@@ -86,10 +86,11 @@ inline constexpr std::size_t derive_stream_budget(std::size_t pool_max,
 /// tabs open, and one number cannot answer both without locking somebody out of the product.
 inline constexpr std::size_t kPerPrincipalApiEvents = 16;
 inline constexpr std::size_t kPerPrincipalDashboard = 16;
-/// The legacy `/events` stream performs NO authentication (a separate, tracked defect: it is a
-/// pre-auth thread-pinning DoS on today's dev). Every unauthenticated caller therefore shares
-/// ONE small bucket, which bounds that DoS without locking out a signed-in operator, whose
-/// connections key to their own principal instead.
+/// Fallback bucket for a caller whose principal could not be resolved. No shipped surface
+/// reaches it today — the legacy `/events` stream is session-gated by the pre-routing
+/// chokepoint (see the `/events` handler in server.cpp) — so it exists as defence-in-depth
+/// against a future exempt-list change, deliberately small enough that an unauthenticated
+/// caller could not pin the pool if one ever arrived.
 inline constexpr std::size_t kPerPrincipalAnonymous = 4;
 
 /// The surfaces that hold a response open. A CLOSED set — it is the metric label, and it is
