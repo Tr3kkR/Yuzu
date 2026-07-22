@@ -340,7 +340,12 @@ TEST_CASE("a running worker pages AND ships a durable batch in one wake (no seco
                                      {.journal = rig.journal});
     worker.start();
     worker.notify(); // the reconnect kick
-    CHECK(spin_until([&] { return sink.count() == 1; }));
+    // 30 s, not the 5 s default: this waits on a real journal scan plus a send, and under a
+    // sanitizer build sharing a box with the rest of the suite that overran 5 s in one full
+    // TSan run out of two (isolated, it passes 5/5). The deadline is only there to stop a
+    // never-shipping worker hanging the suite - what the test asserts is that ONE wake
+    // suffices, which a longer deadline does not weaken.
+    CHECK(spin_until([&] { return sink.count() == 1; }, 30s));
     worker.stop();
 }
 
