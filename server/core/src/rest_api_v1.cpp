@@ -9213,6 +9213,19 @@ void RestApiV1::register_routes(
                 }));
     });
 
+    // GET /api/v1/events holds an httplib worker for the life of its subscription, so an
+    // unwired budget means that surface is uncapped on the shared pool and the plain-REST
+    // reserve is not in fact reserved. The parameter is trailing-defaulted for test seams,
+    // which is exactly how the production wiring came to be omitted silently — the route
+    // registered, the try_acquire block became dead code, and nothing said so. Mirrors the
+    // MCP registration's warning; a boot line is the cheapest guard that survives, since no
+    // unit test can observe a missing argument at the server.cpp call site.
+    if (stream_budget == nullptr) {
+        spdlog::warn("REST API v1: GET /api/v1/events registered with NO stream budget — "
+                     "held-open event streams are uncapped on the shared HTTP worker pool "
+                     "(ADR-0034). Test seams omit it deliberately; a production server "
+                     "must not.");
+    }
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }
 

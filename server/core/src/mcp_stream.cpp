@@ -822,8 +822,17 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // principal's MCP streams are bounded only by StreamBudget's per-principal cap,
         // and the configurable PrincipalQuota concurrency cap is silently bypassed on the
         // one surface it most exists to protect.
-        yuzu::server::detail::adopt_quota_slot_into_stream(
-            [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
+        //
+        // The composition is re-wrapped in a noexcept guard, and that outer guard is
+        // load-bearing rather than belt-and-braces: adopt_quota_slot_into_stream returns a
+        // NON-noexcept std::function whose body runs `slot->reset()` AFTER the inner
+        // releaser, i.e. OUTSIDE the inner guard. That reset destroys a QuotaSlot ->
+        // PrincipalQuota::release -> std::lock_guard, which can throw std::system_error.
+        // httplib invokes releasers from ~Response, so such a throw is std::terminate
+        // (#2037's class). Wrapping the inner lambda alone would have silently dropped the
+        // hard boundary this handler was deliberately given.
+        [inner = yuzu::server::detail::adopt_quota_slot_into_stream(
+             [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
                 // Runs from ~Response — a DESTRUCTOR. An exception escaping here is
                 // std::terminate no matter what httplib does, so the whole body is guarded
                 // (try_persist_audit swallows its own, but the string building allocates).
@@ -850,7 +859,13 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                     // The lease is still returned: detach() is the first call, and Lease's
                     // destructor would return it even if that somehow threw.
                 }
-            }));
+             })](bool success) noexcept {
+            try {
+                inner(success);
+            } catch (...) {
+                // Nothing to do but contain it — this frame is a destructor's callee.
+            }
+        });
     // The releaser now owns the lease's return path; the guard stands down.
     lease_guard.installed = true;
 }

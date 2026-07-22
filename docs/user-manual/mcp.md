@@ -204,11 +204,11 @@ change: a notification POST now answers `202` instead of `204`).
   In this release the channel carries heartbeats and replayed frames;
   `notifications/progress` for long-running tools arrives in the next 2f rung (see
   `docs/mcp-server.md`).
-  **Open guard (PR 4.4 / UP-1):** the stream's per-principal cap is the stream
-  budget's own — it does **not yet** debit an engine principal's quota
-  concurrency slot for the stream's lifetime, unlike the three routes already
-  covered by the PR 4.4 quota cap. See `docs/user-manual/engine-principals.md`
-  "Per-principal quota cap".
+  An engine principal's stream holds its per-principal quota **concurrency**
+  slot for the stream's whole lifetime, the same as the other streaming routes
+  covered by the PR 4.4 quota cap — so a long-lived stream counts against that
+  cap rather than releasing it at routing hand-off. See
+  `docs/user-manual/engine-principals.md` "Per-principal quota cap".
 - The session id is **transport affinity only** — never an auth credential;
   per-request token auth runs on every method regardless.
 
