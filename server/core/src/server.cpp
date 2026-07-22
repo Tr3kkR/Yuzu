@@ -3417,7 +3417,7 @@ public:
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
                 // Held-open responses across EVERY streaming surface, against the capacity the
-                // worker pool was sized for (ADR-0030 Decision 3). This is THE number: it is
+                // worker pool was sized for (ADR-0034 Decision 3). This is THE number: it is
                 // what says "raise --max-sse-streams", and no per-surface gauge can express
                 // it, because the pool is what they all share.
                 if (stream_budget_) {
@@ -5472,7 +5472,7 @@ private:
         // httplib's implicit default and nothing capped concurrent streams, so a
         // fleet of agentic clients could occupy every worker and starve plain REST.
         //
-        // The arrow points FROM the workload TO the pool (ADR-0030). It used to point the
+        // The arrow points FROM the workload TO the pool (ADR-0034). It used to point the
         // other way: the pool was httplib's accidental default (32 threads on an 8-core box)
         // and the stream cap fell out of it at 12 — on a platform whose own design notes size
         // it for "hundreds of agentic clients per server". A cap two orders of magnitude below
@@ -5513,7 +5513,7 @@ private:
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
                      "GET /mcp/v1/, GET /api/v1/events, the dashboard executions drawer, and the "
                      "legacy /events stream. Watch yuzu_http_held_open_responses / "
-                     "yuzu_http_held_open_capacity; the ceiling is thread-count (ADR-0030).",
+                     "yuzu_http_held_open_capacity; the ceiling is thread-count (ADR-0034).",
                      pool_max, effective_streams, detail::kPlainRestReserveDefault);
 
         // -- Auth middleware (pre-routing) -----------------------------------
@@ -11310,7 +11310,7 @@ private:
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
-        wf_deps.stream_budget = stream_budget_.get(); // ADR-0030: one budget, every surface
+        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*

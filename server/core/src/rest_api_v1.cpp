@@ -9030,7 +9030,7 @@ void RestApiV1::register_routes(
                 detail::enqueue_capped(sink_state, std::move(sse));
             });
 
-        // Admission control (ADR-0030). This response is about to hold an httplib worker for
+        // Admission control (ADR-0034). This response is about to hold an httplib worker for
         // the life of the subscription. Taken BEFORE the bus subscription so a rejected
         // caller never leaves a listener behind. Held in a shared_ptr so the lease dies with
         // the release lambda — the worker returns on every teardown path.

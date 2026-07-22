@@ -293,7 +293,7 @@ public:
         // 503 (list still works if rbac_store is wired — it doesn't need
         // this store).
         EnginePrincipalStore* engine_principal_store = nullptr,
-        // ADR-0030: THE shared admission budget for held-open responses. GET /api/v1/events
+        // ADR-0034: THE shared admission budget for held-open responses. GET /api/v1/events
         // pins an httplib worker for the life of the subscription, so it leases from the same
         // counter as every other streaming surface. nullptr = no admission control (tests).
         yuzu::server::detail::StreamBudget* stream_budget = nullptr);
@@ -349,7 +349,7 @@ public:
         // `engine_principal_store_` MEMBER (set via set_engine_principal_store);
         // server.cpp wires BOTH. Follow-up: unify onto the member.
         EnginePrincipalStore* engine_principal_store = nullptr,
-        // ADR-0030: the shared held-open-response budget (see the overload above).
+        // ADR-0034: the shared held-open-response budget (see the overload above).
         yuzu::server::detail::StreamBudget* stream_budget = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing

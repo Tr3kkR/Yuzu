@@ -312,7 +312,7 @@ struct Config {
     /// cursor, a held-open worker is not.
     /// Concurrent held-open SSE responses this server is sized for, across EVERY streaming
     /// surface (MCP GET, /api/v1/events, the dashboard executions drawer, the legacy /events
-    /// stream). The worker pool is derived FROM this — not the other way round (ADR-0030):
+    /// stream). The worker pool is derived FROM this — not the other way round (ADR-0034):
     /// a stream costs a blocked thread, which is cheap, so the operator declares the workload
     /// and the pool is sized to honour it. 0 = the default (128).
     std::size_t max_sse_streams{0};

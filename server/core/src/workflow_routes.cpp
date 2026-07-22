@@ -768,7 +768,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
                  // Admission control. This response is about to hold an httplib worker thread
                  // for as long as the operator leaves the drawer open, so it takes a lease from
-                 // the ONE budget every streaming surface shares (ADR-0030). Held in a
+                 // the ONE budget every streaming surface shares (ADR-0034). Held in a
                  // shared_ptr so it dies with the release lambda — the worker goes back on any
                  // teardown path, including a throw.
                  auto lease = std::make_shared<detail::StreamBudget::Lease>();
@@ -842,7 +842,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                              sink_state->cv.notify_all();
                              bus->unsubscribe(captured_exec_id, sink_state->sub_id);
                              // The lease dies with this lambda, returning the worker to the
-                             // one budget every streaming surface shares (ADR-0030).
+                             // one budget every streaming surface shares (ADR-0034).
                          }));
              });
 

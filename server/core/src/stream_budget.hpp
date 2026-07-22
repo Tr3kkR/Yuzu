@@ -27,7 +27,7 @@
 namespace yuzu::server::detail {
 
 /// Plain-REST reserve: worker threads held back from streams, so held-open connections
-/// can never starve ordinary request/response traffic (ADR-0030 Decision 1; ADR-1005
+/// can never starve ordinary request/response traffic (ADR-0034 Decision 1; ADR-1005
 /// execution plan Decision 15(h); chaos CH-6).
 ///
 /// This is a real reserve, not an aspiration: EVERY surface that holds a response open
@@ -46,7 +46,7 @@ inline constexpr std::size_t kMaxProvidersPerStream = 2;
 /// Concurrent held-open responses the server is sized for, across ALL surfaces.
 ///
 /// This is the number an operator reasons about, and the pool is derived FROM it — not the
-/// other way round (ADR-0030 Decision 2). The previous arrow pointed the wrong way: the pool
+/// other way round (ADR-0034 Decision 2). The previous arrow pointed the wrong way: the pool
 /// was httplib's accidental default (32 on an 8-core box) and the stream cap fell out of it
 /// at 12 — while this platform's own design notes size it for "hundreds of agentic clients
 /// per server" (`event_bus.hpp`). A cap two orders of magnitude below the workload is not a
@@ -93,7 +93,7 @@ inline constexpr std::size_t kPerPrincipalDashboard = 16;
 inline constexpr std::size_t kPerPrincipalAnonymous = 4;
 
 /// The surfaces that hold a response open. A CLOSED set — it is the metric label, and it is
-/// the list ADR-0030 says must be exhaustive. Adding a new streaming route means adding a
+/// the list ADR-0034 says must be exhaustive. Adding a new streaming route means adding a
 /// value here and taking a lease; there is no third option.
 enum class SseSurface {
     kMcpGet,          ///< GET /mcp/v1/          — token, principal-bound session
@@ -132,7 +132,7 @@ class StreamBudget {
 public:
     struct Config {
         /// Held-open responses allowed across ALL surfaces. Derived from the worker pool,
-        /// which is in turn derived from the operator's declared stream target (ADR-0030).
+        /// which is in turn derived from the operator's declared stream target (ADR-0034).
         std::size_t global_cap = kTargetHeldOpenStreamsDefault;
     };
 
@@ -276,7 +276,7 @@ public:
 
     /// Held-open responses right now, across every surface. THE number: this is what the
     /// worker pool is actually spending, and `active() / capacity()` is the utilisation an
-    /// operator needs (ADR-0030 Decision 3) — no per-surface gauge can express it.
+    /// operator needs (ADR-0034 Decision 3) — no per-surface gauge can express it.
     std::size_t active() const {
         std::lock_guard<std::mutex> lk(mu_);
         return total_;
