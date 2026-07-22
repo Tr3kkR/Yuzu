@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,63 @@ using yuzu::server::ProductRegistryStore;
 using yuzu::server::RegistryReadError;
 using yuzu::server::pg::PgPool;
 namespace pg = yuzu::server::pg;
+
+namespace {
+
+// ── Shared pre-migrated fixture (behaviour-preserving DB-provisioning swap) ──
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per test (see
+// test_software_inventory_store.cpp for the rationale). RESTART IDENTITY matters
+// here — product_id is a minted sequence, so a reset must rewind it too.
+// Behaviour-preserving: identical store calls + CHECKs; only the DB
+// provisioning/isolation changes. CARVE-OUTS that DROP SCHEMA / wipe
+// public.schema_meta are NOT converted — TRUNCATE cannot undo that DDL, so they
+// keep their own per-test database (YUZU_REQUIRE_PG_DB).
+yuzu::test::PgTestTemplate prod_tpl{"prodreg", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ProductRegistryStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("prodreg template: store failed to migrate");
+}};
+
+struct ProdShared {
+    yuzu::test::PostgresTestDb db{prod_tpl};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProdShared() {
+        REQUIRE(db.available());
+        REQUIRE(pool.valid());
+        db.keep_until_run_end();
+    }
+};
+ProdShared& prod_shared() {
+    static ProdShared s;
+    return s;
+}
+
+// TRUNCATE both tables (RESTART IDENTITY rewinds the product_id sequence, CASCADE
+// clears the FK-linked aliases); public.schema_meta is untouched so the per-test
+// store ctor finds the clone migrated and skips migration.
+void prod_reset() {
+    auto lease = prod_shared().pool.acquire();
+    REQUIRE(lease);
+    auto trunc = pg::exec_params(
+        lease.get(),
+        "TRUNCATE product_registry_store.products, "
+        "product_registry_store.product_aliases RESTART IDENTITY CASCADE",
+        std::vector<std::string>{});
+    REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+}
+
+#define PROD_SHARED(store, pool)                                                               \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                           \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                        \
+    }                                                                                          \
+    prod_reset();                                                                              \
+    [[maybe_unused]] PgPool& pool = prod_shared().pool;                                        \
+    ProductRegistryStore store{pool};                                                          \
+    REQUIRE(store.is_open())
+
+} // namespace
 
 TEST_CASE("ProductRegistryStore migrates at construction and reopens idempotently",
           "[pg][product_registry]") {
@@ -47,11 +105,7 @@ TEST_CASE("ProductRegistryStore migrates at construction and reopens idempotentl
 
 TEST_CASE("ProductRegistryStore upsert_product mints, is idempotent by norm_key, and refreshes",
           "[pg][product_registry]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    ProductRegistryStore store{pool};
-    REQUIRE(store.is_open());
+    PROD_SHARED(store, pool);
 
     auto id1 = store.upsert_product("microsoft:sql server:standard", "microsoft", "sql server",
                                     "standard", "windows");
@@ -99,11 +153,7 @@ TEST_CASE("ProductRegistryStore upsert_product mints, is idempotent by norm_key,
 
 TEST_CASE("ProductRegistryStore alias upsert/resolve round-trip + re-point semantics",
           "[pg][product_registry]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    ProductRegistryStore store{pool};
-    REQUIRE(store.is_open());
+    PROD_SHARED(store, pool);
 
     auto pid_a = store.upsert_product("acme:reader", "acme", "reader", "", "");
     auto pid_b = store.upsert_product("acme:reader:pro", "acme", "reader", "pro", "");

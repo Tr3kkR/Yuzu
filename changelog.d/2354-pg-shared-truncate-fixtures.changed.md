@@ -5,8 +5,9 @@
   connections that dominate the Windows `[pg]`-shard cost (Postgres on Windows is
   `EXEC_BACKEND` — a fresh `postgres.exe` per connection). Behaviour-preserving: identical
   store calls and assertions; only the database provisioning/isolation substrate changes.
-  Tests that DROP the store schema, rewind `schema_meta`, or drop columns to force a
-  degrade keep their own per-test database. `test_software_inventory_store.cpp` is the
-  reference conversion; `test_helpers.hpp` gains `SharedPgDbRegistry`, which drops the
-  shared clones at `testRunEnded` (never a static destructor, avoiding the OpenSSL-atexit
-  teardown hazard).
+  Tests that DROP the store schema, rewind `schema_meta`, drop columns to force a degrade,
+  or hold a session-level advisory lock keep their own per-test database. Converted:
+  `test_software_inventory_store.cpp` (reference), `test_software_licensing_store.cpp`,
+  `test_software_licensing_ingestion.cpp`, and `test_product_registry_store.cpp`.
+  `test_helpers.hpp` gains `SharedPgDbRegistry`, which drops the shared clones at
+  `testRunEnded` (never a static destructor, avoiding the OpenSSL-atexit teardown hazard).
