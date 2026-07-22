@@ -465,9 +465,11 @@ agent-side retention driven from `agents/plugins/tar/src/tar_schema_registry.cpp
 The asymmetry is defensible for the server stores: they run on an NTP-managed host, they are
 backed up, and their clock is not one an endpoint controls. It is less comfortable for the
 agent-side TAR retention, which shares exactly the clock this guard exists for, and for
-`audit_store`, which holds SOC 2 evidence. Neither is in this change's scope. **Follow-ups are
-NOT yet filed** - this section is the only record, which is precisely the weakness it was
-written to avoid, so filing them is outstanding work rather than something already done.
+`audit_store`, which holds SOC 2 evidence. Neither is in this change's scope. Follow-ups are filed for the two
+that matter: **#2360** (`audit_store`, the SOC 2 evidence trail) and **#2361** (agent-side TAR
+retention, which shares the endpoint clock this guard exists for). The remaining server-side
+sites are recorded in #2360 rather than filed individually, since they share one fix pattern and
+a lower stake.
 
 ## REQUIRED at the `prefer_spark` flip (Gate 6 enterprise-readiness)
 
