@@ -482,6 +482,22 @@ Whichever PR flips `prefer_spark` MUST also:
    healthy one.
 7. **Run chaos scenario CH-5** (live-event latency under KvStore contention, UAT rig). It is
    the only scenario that measures the thing C0 was built to fix, so it is the flip's genuine
-   go/no-go rather than a formality.
+   go/no-go rather than a formality. Run it at the journal's HARD ceiling (2000 batches /
+   64 MiB), not at the ~900 measured so far (Gate 6 sre): a full scan already exceeded one
+   second at 900, so the pass duration - not `kGuardianMinRefillInterval` - is what actually
+   paces chained forced pages during a large-backlog recovery.
+8. **Persist pending lifecycle records BEFORE the drain-worker join**, or record an explicit
+   risk acceptance (Gate 6 compliance, CC7.2/PI1.1). `GuardianEngine::stop()` joins the worker
+   (a blocking wait on a possibly-blackholed send) and only afterwards runs
+   `persist_lifecycle_journal_locked()`. If the join is slow and the process is then hard-killed
+   - operator `kill -9`, a supervisor's stop timeout - the in-memory pending records are never
+   written. That is real loss of an audit record, not the at-least-once redelivery the design
+   otherwise guarantees, and it is the one loss channel in this area that dormancy hides rather
+   than removes.
+9. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
+   Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
+   is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
+   before doing any work still reads identically to a healthy idle one. Item 6's staleness gauge
+   is the real fix; this note records that the counter is a partial mitigation, not a closure.
 
 Tracked on #2298, which is the cutover gate list.
