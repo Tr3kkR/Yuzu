@@ -191,8 +191,13 @@ change: a notification POST now answers `202` instead of `204`).
   stream. A second `GET` on the same session **takes over** (the older stream closes with
   `superseded`), so a client reconnecting across a dead TCP connection is never locked
   out by its own zombie.
-  The credential that opened a stream is re-checked on every heartbeat: revoking it ends
-  the stream within one tick (`credential_revoked`). Streams end with a final
+  The credential that opened a stream is re-checked on every heartbeat. On a
+  single-server deployment, revoking it ends the stream within one tick
+  (`credential_revoked`). On a **multi-replica** deployment, revocation latency is up to
+  the 60 s token-cache TTL plus one tick, not instantaneous: the token cache and the
+  session table are per-process, so a revoke handled by one replica does not reach a
+  stream held by another until that replica's own cache entry expires and it re-reads
+  the store. Streams end with a final
   `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
   auth store was unreachable for longer than the **60 s** grace window — the stream is not

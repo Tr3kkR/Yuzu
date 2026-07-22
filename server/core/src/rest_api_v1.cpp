@@ -9190,7 +9190,13 @@ void RestApiV1::register_routes(
                 return true;
             },
             detail::adopt_quota_slot_into_stream(
-                [sink_state, bus, exec_id_for_capture, metrics_registry, lease](bool /*success*/) {
+                [sink_state, bus, exec_id_for_capture, metrics_registry,
+                 lease](bool /*success*/) noexcept {
+                    // noexcept + catch-all: this runs from ~Response, a DESTRUCTOR, so an
+                    // escaping exception is std::terminate regardless of what httplib does
+                    // (#2037's class). The lock_guard added here is the throw site that made
+                    // the guard necessary. Matches the MCP sibling.
+                    try {
                     {
                         // Under the sink mutex: `closed` is the provider's wait predicate,
                         // and a store between its predicate check and its atomic
@@ -9210,6 +9216,9 @@ void RestApiV1::register_routes(
                             .decrement();
                     }
                     // `lease` dies here, returning the worker to the one shared budget.
+                    } catch (...) {
+                        // Contained — see the note above.
+                    }
                 }));
     });
 

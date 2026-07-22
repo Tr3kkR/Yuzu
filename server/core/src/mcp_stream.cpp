@@ -823,14 +823,17 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // and the configurable PrincipalQuota concurrency cap is silently bypassed on the
         // one surface it most exists to protect.
         //
-        // The composition is re-wrapped in a noexcept guard, and that outer guard is
-        // load-bearing rather than belt-and-braces: adopt_quota_slot_into_stream returns a
-        // NON-noexcept std::function whose body runs `slot->reset()` AFTER the inner
-        // releaser, i.e. OUTSIDE the inner guard. That reset destroys a QuotaSlot ->
-        // PrincipalQuota::release -> std::lock_guard, which can throw std::system_error.
-        // httplib invokes releasers from ~Response, so such a throw is std::terminate
-        // (#2037's class). Wrapping the inner lambda alone would have silently dropped the
-        // hard boundary this handler was deliberately given.
+        // The composition is re-wrapped in a noexcept guard. Note precisely what that
+        // guard does and does not do: it CANNOT catch a throw from `slot->reset()`, and an
+        // earlier version of this comment wrongly claimed it could. ~QuotaSlot is
+        // implicitly noexcept (every subobject has a non-throwing destructor), so a throw
+        // out of PrincipalQuota::release would call std::terminate INSIDE that destructor,
+        // two frames within this try — no caller-side handler can intercept it. That path
+        // is contained where it must be, at the source: QuotaSlot::reset() and
+        // PrincipalQuota::release() are now noexcept by construction. This outer guard is
+        // belt-and-braces for the rest of the composition (a bad_function_call, or a throw
+        // from adopt_quota_slot_into_stream's own body), which is still worth having
+        // because httplib invokes releasers from ~Response (#2037's class).
         [inner = yuzu::server::detail::adopt_quota_slot_into_stream(
              [stream, sink, audit_fn, req_copy, audit_sid, cid](bool /*success*/) noexcept {
                 // Runs from ~Response — a DESTRUCTOR. An exception escaping here is

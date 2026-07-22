@@ -844,7 +844,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          return true;
                      },
                      detail::adopt_quota_slot_into_stream(
-                         [sink_state, bus, captured_exec_id, lease](bool /*success*/) {
+                         [sink_state, bus, captured_exec_id,
+                          lease](bool /*success*/) noexcept {
+                             // noexcept + catch-all: runs from ~Response, a DESTRUCTOR,
+                             // so an escaping exception is std::terminate whatever
+                             // httplib does (#2037's class). The lock_guard below is
+                             // the throw site that made the guard necessary. Matches
+                             // the MCP sibling.
+                             try {
                              {
                                  // Under the sink mutex — `closed` is the provider's wait
                                  // predicate, and a store between its check and its atomic
@@ -860,6 +867,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                              bus->unsubscribe(captured_exec_id, sink_state->sub_id);
                              // The lease dies with this lambda, returning the worker to the
                              // one budget every streaming surface shares (ADR-0034).
+                             } catch (...) {
+                                 // Contained — see the note above.
+                             }
                          }));
              });
 
