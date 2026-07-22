@@ -12,10 +12,13 @@
   `yuzu.guardian_journal_maint_exceptions` heartbeat counter. This machinery is wired but
   dormant until the Spark detection path becomes the authoritative backend, so no
   currently-released agent changes behaviour.
-- **A slow server connection can no longer starve Guardian journal retention.** Each drain pass
+- **A slow server connection can no longer starve Guardian journal retention.** (Also dormant:
+  the drain worker itself only starts once the Spark path is authoritative.) Each drain pass
   now ships at most 512 entries (or 2 seconds' worth, whichever comes first) before the worker
   re-checks its other work, and re-drains immediately if more remain. Previously one pass drained
   the entire 4096-entry send window, which on a slow link took long enough to hold off retention
   until the journal reached its write ceiling and began dropping lifecycle audit records. The
-  compliance/health outbox is also guaranteed a share of each pass, so a busy lifecycle log
-  cannot delay drift reporting.
+  compliance/health outbox is guaranteed a share of each pass - of both the entry count and the
+  wall-clock budget - so a busy lifecycle log cannot delay drift reporting. (The guarantee is
+  that compliance gets an opportunity to START; a single in-flight send cannot be interrupted,
+  so it can still overrun the pass deadline.)
