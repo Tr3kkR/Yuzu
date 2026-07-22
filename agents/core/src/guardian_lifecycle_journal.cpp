@@ -11,6 +11,7 @@
 #include <cassert>
 #include <chrono>
 #include <format>
+#include <limits>
 #include <random>
 #include <set>
 #include <vector>
@@ -373,8 +374,35 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
     });
 
-    const std::int64_t min_ts =
-        now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
+    std::int64_t min_ts = now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
+    // CLOCK-JUMP GUARD (#2345 Gate 5 CH-5). Age eviction is anchored to system_clock, which is
+    // correct - batch ts_ms must survive a reboot - but that makes a single forward jump
+    // catastrophic rather than gradual: a VM restored from an old snapshot, or one bad NTP
+    // correction, moves now_ms past the retention window for EVERY batch at once and the whole
+    // durable audit trail is deleted in one transaction, before it has ever been replayed.
+    //
+    // On the FIRST implausible forward jump we decline to age-evict and count it. The count and
+    // byte caps still apply, so this cannot be used to grow the journal without bound; the next
+    // pass, having observed the new clock, proceeds normally. Declining once costs at most one
+    // retention interval of extra retention - the opposite error to destroying evidence.
+    //
+    // Skipping ONE pass is not on its own sufficient, and this deliberately does not claim to
+    // be: if the clock genuinely moved and stays moved, the data really is past retention and
+    // deleting it is the policy. What the pass cap below adds is that it is then deleted at a
+    // PACE - so a jump degrades into a gradual ageing-out that replay and an operator alert
+    // can both still overlap, rather than an instantaneous wipe with nothing left to look at.
+    if (last_prune_now_ms_ != 0 && now_ms - last_prune_now_ms_ >
+                                       static_cast<std::int64_t>(retention_days_) * 86400 * 1000) {
+        clock_jump_skips_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("Guardian journal: wall clock jumped forward {} ms since the last retention "
+                     "pass (> the {}-day window); skipping AGE eviction once so a clock anomaly "
+                     "cannot delete the audit trail wholesale",
+                     now_ms - last_prune_now_ms_, retention_days_);
+        min_ts = std::numeric_limits<std::int64_t>::min(); // nothing is too old this pass
+    }
+    last_prune_now_ms_ = now_ms;
+    last_age_cutoff_ = min_ts;
+    pruned_cutoff_valid_ = true;
     std::size_t total_bytes = 0;
     for (const auto& l : live)
         total_bytes += l.bytes;
@@ -382,10 +410,18 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     std::vector<std::string> evict;
     std::int64_t evicted_bytes = 0; // #2303: bytes to fetch_sub once the delete SUCCEEDS
     std::size_t surviving = live.size();
+    // Cap AGE evictions per pass (#2345 Gate 5 CH-5). The count and byte caps are self-limiting
+    // - they only ever trim the excess over a fixed ceiling - but age is absolute, so a single
+    // clock reading can mark the entire journal expired at once. Bounding the pass turns that
+    // into a paced ageing-out. Not applied to the count/byte caps: those must be free to bring
+    // an over-ceiling journal back under its ceiling in one pass, which is a hard storage bound.
+    std::size_t age_evictions = 0;
     for (const auto& l : live) { // oldest first: age is absolute, count/bytes trim from this end
-        const bool too_old = l.ts_ms < min_ts;
         const bool too_many = surviving > max_batches_;
         const bool too_big = total_bytes > max_bytes_;
+        const bool too_old = l.ts_ms < min_ts && age_evictions < kMaxAgeEvictionsPerPass;
+        if (too_old)
+            ++age_evictions;
         if (too_old || too_many || too_big) {
             evict.push_back(l.key);
             evicted_bytes += static_cast<std::int64_t>(l.bytes);
@@ -532,8 +568,10 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // token-bearing page both still bound an over-cap journal; nothing is skipped, only deferred.
     // (The process's first page has the startup burst, so the boot prune still runs before the
     // very first replay.) rev-4.1 #6 warned a slow KvStore delays heartbeats; this respects it.
-    if (!page_bucket_.ready(now_ms))
+    if (!page_bucket_.ready(now_ms)) {
+        stats.deferred_no_token = true;
         return stats;
+    }
 
     // Prune-before-page barrier (rev-4.1 #6): the FIRST paging attempt prunes before it can
     // return any replay candidate, so a stale over-cap journal is bounded before replay. Latch
@@ -567,8 +605,13 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         return stats;
 
     auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
-    if (!rows)
-        return stats; // read error: fail-safe (prune counts it); page nothing this pass
+    if (!rows) {
+        // Read error: fail-safe, page nothing this pass. Counted separately from prune's own
+        // scan failures - a page-side read that fails every pass stops ALL replay while prune
+        // keeps succeeding, so the two are different operator situations (#2345 Gate 6 SRE).
+        page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+        return stats;
+    }
 
     // Order candidates by (ts_ms, key) - NOT lexical key (the boot-nonce is random). Skip
     // expired batches (prune removes them; don't re-send an aged-out event).
@@ -579,8 +622,15 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     };
     std::vector<Cand> cands;
     cands.reserve(rows->size());
+    // Use the cutoff RETENTION last decided, not a freshly computed one (#2345 Gate 5 CH-5).
+    // Computing it here independently reintroduced the very loss the clock-jump guard exists to
+    // prevent, one layer along: prune declined to age-evict on the anomalous reading, so the
+    // batches survived on disk - and then page, computing its own cutoff from the same bad
+    // clock, classified all of them "expired, prune will remove them" and replayed none. The
+    // trail was retained and never sent, which is the worst of both. One decision, one place.
     const std::int64_t min_ts =
-        now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
+        pruned_cutoff_valid_ ? last_age_cutoff_
+                             : now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
     for (auto& row : *rows) {
         // Shutdown mid-scan: this loop can issue one rename_key per corrupt row, so bail rather
         // than finish quarantining a large journal (C0 #2298). Nothing has been paged yet, so
@@ -644,6 +694,26 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     if (start == cands.size())
         start = 0; // cursor at/after the end: wrap to the oldest
 
+    // AGING BOOST, part 2 (#2345 Gate 5 CH-4). Once a batch has lost the headroom race
+    // kJournalStarvationPasses times running, jump the rotation to IT. Recording the
+    // starvation without moving the cursor was not enough: the pass still reached the small
+    // batches sitting between the cursor and the starved batch first, they consumed the room
+    // the drain had just freed, and the starved batch was blocked again on arrival - the same
+    // size-biased loss, one indirection later. Considering it first means either it fits (and
+    // the boost clears) or the pass stops before anything smaller can take its room.
+    if (starved_ && starved_passes_ >= kJournalStarvationPasses) {
+        bool found = false;
+        for (std::size_t i = 0; i < cands.size(); ++i) {
+            if (cands[i].ts_ms == starved_->first && cands[i].key == starved_->second) {
+                start = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            starved_.reset(); // quarantined, pruned, or already sent: stop holding for it
+    }
+
     const std::size_t limit = std::min<std::size_t>(cands.size(), kJournalPageMaxBatchesPerPass);
     for (std::size_t n = 0; n < limit; ++n) {
         if (stopping_.load(std::memory_order_acquire))
@@ -698,7 +768,32 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             if (stats.min_blocked_headroom == 0 ||
                 c.batch.entries.size() < stats.min_blocked_headroom)
                 stats.min_blocked_headroom = c.batch.entries.size();
-            page_cursor_ = std::pair{c.ts_ms, c.key}; // advance: do not pin the rotation
+
+            // AGING BOOST (#2345 Gate 5 CH-4). Skipping the big batch is fair per pass but is
+            // NOT fair over time: under a steady drip of small batches the window's headroom
+            // hovers just above the small sizes and never reaches 256, so the largest batches
+            // are skipped every pass until retention evicts them unsent. That is a loss channel
+            // correlated with SIGNIFICANCE - the biggest batches are mass arm/disarm bursts, a
+            // Baseline deploy or a fleet-wide disable, exactly the records an auditor wants -
+            // so left alone the journal drops preferentially the evidence that matters most.
+            //
+            // After kJournalStarvationPasses consecutive passes blocked on the same batch we
+            // stop paging ANYTHING smaller and leave the cursor pinned on it, so the window
+            // drains toward the room it needs instead of being refilled past it. This
+            // terminates because a send window is floored at kMaxJournalEntriesPerBatch
+            // (guardian_spark_runtime.cpp) and no batch can exceed that: once the window
+            // empties the starved batch always fits.
+            const auto id = std::pair{c.ts_ms, c.key};
+            if (starved_ && *starved_ == id) {
+                if (++starved_passes_ >= kJournalStarvationPasses) {
+                    stats.starvation_yield = true;
+                    break; // cursor NOT advanced: next pass reconsiders this batch first
+                }
+            } else {
+                starved_ = id;
+                starved_passes_ = 1;
+            }
+            page_cursor_ = id; // advance: do not pin the rotation
             continue;
         }
         const bool have_token = page_bucket_.ready(now_ms); // refills for elapsed time
@@ -726,6 +821,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 stats.min_blocked_headroom = outcome.required;
         }
         if (outcome.added > 0) {
+            if (starved_ && starved_->second == c.key)
+                starved_.reset(); // it got through: stop holding the rotation for it
             page_bucket_.take(); // charge a token ONLY for net-new work
             ++stats.batches_paged;
             stats.records_paged += outcome.added;

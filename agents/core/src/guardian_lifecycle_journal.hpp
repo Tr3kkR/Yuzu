@@ -93,6 +93,14 @@ struct JournalPageStats {
     /// justifies re-attempting once the drain frees room; the second is an idle steady state
     /// where re-attempting is a full-journal rescan for nothing (#2298 Gate 4 UP-2).
     bool headroom_blocked{false};
+    /// A batch has been blocked for kJournalStarvationPasses consecutive passes and the pass
+    /// stopped early so the window can drain toward it. Diagnostic/test signal only.
+    bool starvation_yield{false};
+    /// The pass did no work because the paging rate-limiter had no token. A FORCED page (a
+    /// reconnect kick) that lands on an empty bucket would otherwise be silently swallowed:
+    /// the pass returns clean, so the caller's "re-arm if the forced page failed" never fires
+    /// and replay waits out a whole cadence interval after the link came back (#2345 Gate 6).
+    bool deferred_no_token{false};
     /// Entries the SMALLEST blocked batch needed. A caller must not re-attempt until at least
     /// this much room exists; re-arming on any headroom at all meant a 1-slot opening
     /// retriggered a full journal scan for a batch needing 256 (#2345).
@@ -186,6 +194,16 @@ public:
     }
     [[nodiscard]] std::uint64_t batches_pruned() const noexcept {
         return batches_pruned_.load(std::memory_order_relaxed);
+    }
+    /// page_into_window passes whose journal scan failed. The read is the same O(journal)
+    /// KvStore scan prune() counts under prune_failures(); without its own counter a page-side
+    /// read failure is invisible and replay silently does nothing (#2345 Gate 6 SRE).
+    [[nodiscard]] std::uint64_t page_read_failures() const noexcept {
+        return page_read_failures_.load(std::memory_order_relaxed);
+    }
+    /// Retention passes that skipped age eviction due to an implausible forward clock jump.
+    [[nodiscard]] std::uint64_t clock_jump_skips() const noexcept {
+        return clock_jump_skips_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] std::uint64_t prune_failures() const noexcept {
         return prune_failures_.load(std::memory_order_relaxed);
@@ -368,6 +386,22 @@ private:
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
     JournalPagingBucket page_bucket_{kJournalPageRefillPerSec, kJournalPageBurst};
     std::atomic<bool> stopping_{false}; ///< set by request_stop(); page_into_window bails on it
+    /// Batch currently losing the headroom race, and how many consecutive passes it has lost.
+    /// Drives the aging boost in page_into_window; written only under paging_mutex_.
+    std::optional<std::pair<std::int64_t, std::string>> starved_;
+    std::uint32_t starved_passes_{0};
+    /// Last now_ms a retention pass observed, for the forward-clock-jump guard. Written only
+    /// under paging_mutex_ by prune_locked_, the single retention caller.
+    std::int64_t last_prune_now_ms_{0};
+    /// The age cutoff the last retention pass actually applied, and whether one has run.
+    /// page_into_window reuses it rather than deriving its own, so retention and replay can
+    /// never disagree about what "expired" means. Written only under paging_mutex_.
+    std::int64_t last_age_cutoff_{0};
+    bool pruned_cutoff_valid_{false};
+    /// Retention passes that declined to age-evict because the clock jumped implausibly far
+    /// forward. Nonzero means an endpoint's clock moved; it is NOT an error in itself.
+    std::atomic<std::uint64_t> clock_jump_skips_{0};
+    std::atomic<std::uint64_t> page_read_failures_{0};
     /// Fair-rotation cursor (review B2): the last-CONSIDERED (ts_ms, key). Each pass resumes at
     /// the first candidate strictly greater and wraps, so the never-sent tail is reached instead
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT

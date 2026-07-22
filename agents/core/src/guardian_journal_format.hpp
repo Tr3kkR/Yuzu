@@ -66,6 +66,23 @@ inline constexpr double kJournalPageRefillPerSec = 0.1; // 1 batch / 10 s / agen
 inline constexpr double kJournalPageBurst = 5.0;        // small startup burst
 /// Bound per-pass paging work (reconstruct + membership scan) regardless of journal size.
 inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
+/// Consecutive passes a single batch may lose the headroom race before paging yields the rest
+/// of the pass to let the send window drain toward it (#2345 Gate 5 CH-4). Per-pass fairness
+/// alone is size-biased: a steady drip of small batches keeps headroom below the largest
+/// batch's size forever, so the biggest batches - mass arm/disarm bursts, the most
+/// audit-significant records - are the ones retention drops unsent. 3 is deliberately small:
+/// the cost of yielding early is one cadence interval of delay, the cost of not yielding is a
+/// permanent, significance-correlated gap in the audit trail.
+inline constexpr std::uint32_t kJournalStarvationPasses = 3;
+
+/// Batches a single retention pass may evict for AGE. Age is the one retention rule driven by
+/// an absolute reading of the wall clock, so one bad reading (a VM restored from snapshot, an
+/// NTP overshoot) marks every batch expired simultaneously and would delete the whole durable
+/// audit trail in one transaction. Capping the pass converts that into a paced ageing-out that
+/// overlaps with replay and with an operator noticing. At the ~2-minute retention cadence a
+/// full 2000-batch journal still ages out in about an hour, so this does not let a genuinely
+/// idle agent accumulate: the count and byte ceilings are NOT capped and remain hard bounds.
+inline constexpr std::size_t kMaxAgeEvictionsPerPass = 64;
 
 /// Key prefixes within kJournalNamespace. A batch key is "lc:<nonce>:<seq12>";
 /// its sent-label is "sent:<nonce>:<seq12>"; a quarantined batch is
