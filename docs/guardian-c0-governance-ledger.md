@@ -88,6 +88,25 @@ Tracked, not forgotten. All are unreachable while dormant.
   cost; P3 re-arm floor below pass cost.
 - **sre** rollout control is a compile-time bool with no kill switch; liveness needs two gauges.
 
+### Reconciled against origin after the review (merge `93367961`)
+
+The gates above reviewed `85711833..c869ee72` while this branch was 29 commits behind origin.
+Merging revealed that some of what they recorded as open had already shipped:
+
+- **Flip item 4, the `yuzu_fleet_guardian_*` rollup, is DONE** (PR #2334), with 18 Guardian
+  journal rules in `docs/prometheus/yuzu-alerts.yml`. Gate 6 sre called this BLOCKING-for-flip
+  on the grounds that nothing aggregated the per-agent tags; that objection is answered. Its
+  alerting recommendations should be read against the rules that actually landed, not against
+  a blank page.
+- The rollup ships a static assertion binding the journal stats field count to the gauge table.
+  It caught four fields this branch added that origin had never seen - the two counters from
+  this run plus the drain/sweep exception split. The merge auto-resolved with ZERO textual
+  conflicts and still broke the build, which is the most useful thing in this section: on this
+  subsystem a clean merge is not evidence of a correct one.
+- Findings from the gates that touch fleet-visibility (security F5 and consistency #7 on
+  `skipped_already_sent`, sre's alerting set) predate the rollup and should be re-read against
+  it before anyone acts on them.
+
 Gate 5's triage is the spec for these: each NOW item names its seam, its vacuity-proof
 precondition, its observable, and the production line whose removal must turn it red.
 

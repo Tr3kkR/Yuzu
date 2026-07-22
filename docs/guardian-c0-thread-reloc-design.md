@@ -558,10 +558,16 @@ Whichever PR flips `prefer_spark` MUST also:
    loss indicator is worse than under-counting a success one. Dormancy caps the severity
    today; it does not once C0 is live. This needs to be an explicit checklist item on #2298,
    not prose in a design doc.
-4. **Land the `yuzu_fleet_guardian_*` server rollup** (#2298 gate 3). The loss and redelivery
-   signals exist only in per-agent heartbeat tags today, so compliance evidence automation
-   scraping `/metrics` cannot see them at all, and one wedged endpoint is invisible without
-   inspecting that host by hand.
+4. ~~**Land the `yuzu_fleet_guardian_*` server rollup**~~ - **DONE**, merged into this branch as
+   PR #2334 (`server/core/src/guardian_journal_fleet_tags.hpp`, the writer/reader bind test, 18
+   Guardian journal rules in `docs/prometheus/yuzu-alerts.yml`). Gate 6 sre had this as the item
+   that made every other alerting item moot, since the loss and redelivery signals existed only
+   in per-agent heartbeat tags and nothing aggregated them.
+   NOTE for whoever adds the next journal counter: the rollup carries a static assertion pinning
+   the `GuardianJournalStats` field count to the gauge table's row count, so a counter added
+   without its gauge is a BUILD failure, not a silently dead metric. Merging this branch into
+   it tripped exactly that guard on four fields - fix it by adding the row, never by relaxing
+   the assert.
 5. **Surface `gauge_underflow_`** (pre-existing #2303, self-flagged in
    `guardian_lifecycle_journal.hpp` as needing to land WITH the cutover): the accounting bug it
    detects camouflages as a healthy empty journal because `journal_batch_count` clamps to 0.
