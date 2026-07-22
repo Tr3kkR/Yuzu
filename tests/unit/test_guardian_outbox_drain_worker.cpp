@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -236,7 +237,7 @@ TEST_CASE("the periodic bound drains even without an explicit enqueue-wake",
     std::vector<OutboxEntry> batch;
     batch.push_back(OutboxEntry::lifecycle("r1", 1, "e-backstop", 1'700'000'000'000'000'000,
                                            "armed", "file", "n"));
-    REQUIRE(rt->try_page_batch(std::move(batch)) == 1);
+    REQUIRE(rt->try_page_batch(std::move(batch)).added == 1);
     CHECK(sink.count() == 0); // nothing woke the worker
 
     REQUIRE(spin_until([&] { return sink.count() >= 1; }, 2s)); // the backstop did
@@ -983,7 +984,8 @@ TEST_CASE("CH-3b: the compliance reserve survives pathological denominators",
     // den == 0 is a divide-by-zero if the guard is ever dropped; den > max_entries used to
     // floor the reserve to nothing (Gate 4 UP-8).
     for (const std::size_t den : {std::size_t{0}, std::size_t{1}, std::size_t{8},
-                                  std::size_t{1000}}) {
+                                  std::size_t{1000},
+                                  std::numeric_limits<std::size_t>::max()}) {
         JournalRig rig;
         for (int i = 0; i < 6; ++i) {
             const auto rid = "r" + std::to_string(i);
@@ -997,16 +999,34 @@ TEST_CASE("CH-3b: the compliance reserve survives pathological denominators",
         rig.reader->file = read_known(FileSnapshot{.exists = false});
         rig.rt->evaluate_key(spark_key(file_spec("/cmp")), EvalReason::Convergence);
 
+        // SLOW sends, so the WALL is genuinely the binding constraint. With an instant sink the
+        // wall never binds and a mis-sliced lifecycle deadline starves nobody - the coverage
+        // would be nominal only. (Adding max_wall without making it bind was the first,
+        // inadequate version of this fix.)
         CollectingSink sink;
+        auto slow = [&](const OutboxEntry& e) -> SendResult {
+            std::this_thread::sleep_for(30ms);
+            return sink(e);
+        };
         GuardianSparkRuntime::DrainLimits limits;
         limits.max_entries = 4;
+        // The WALL dimension needs the same pathological-input coverage as the count: round 4
+        // added wall slicing derived from this same ratio, and an unclamped cast could make
+        // the lifecycle slice LONGER than the whole pass, leaving compliance with an
+        // already-expired deadline (#2345 Gate 2 sec-MEDIUM). Without max_wall set, this test
+        // exercised only the count path and would not have seen that.
+        limits.max_wall = 500ms;
         limits.compliance_reserve_den = den;
         INFO("compliance_reserve_den = " << den);
-        const auto out = rig.rt->drain_bounded(std::ref(sink), limits); // must not crash
+        const auto out = rig.rt->drain_bounded(slow, limits); // must not crash
         CHECK(out.sent <= 4); // the overall cap holds
         // The DISCRIMINATING observable: with a sane denominator a compliance entry actually
         // ships. `out.sent <= 4` alone was true even when compliance shipped nothing.
-        if (den > 0 && den <= 8) {
+        // Only a denominator ABOVE kMaxReserveRatio is clamped to "no reserve"; every sane
+        // one still gets at least the floor of 1 slot, so it must still ship compliance. The
+        // earlier `den <= 8` gate was stricter than the code's guarantee and left den=1000
+        // asserting only "did not crash" (#2345 Gate 3 QE).
+        if (den > 0 && den <= 1'000'000) {
             bool saw_compliance = false;
             std::lock_guard<std::mutex> lk{sink.mu};
             for (const auto& e : sink.sent)
@@ -1144,12 +1164,17 @@ TEST_CASE("R4: a refill re-arm does not wait out the periodic bound",
                                      {.journal = rig.journal,
                                       .page_interval = 1h,
                                       .prune_interval = 1h});
-    worker.start();
-    // Occupy 4 of 8 slots with live entries, leaving headroom 4 < the 6-entry batch.
+    // Occupy 4 of 8 slots BEFORE the worker starts. Attaching after start() races the seeded
+    // boot page: if the enqueues land after that pass reads headroom, the whole 6-entry batch
+    // pages, headroom drops to 2, and GuardianLifecycleLog::enqueue silently DROPS the
+    // remaining live entries on backpressure - after which this test waits forever for sends
+    // that will never happen. A real ordering race, not load-dependent slop (#2345 Gate 3 QE).
     for (int i = 0; i < 4; ++i) {
         const auto rid = "live" + std::to_string(i);
-        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true));
     }
+    REQUIRE(rig.rt->lifecycle_headroom() == 4); // deterministic precondition: 4 < the 6-batch
+    worker.start();
     CHECK(spin_until([&] { return rig.journal->pages() >= 1; }));
     const auto pages_before = rig.journal->pages();
 
@@ -1163,4 +1188,65 @@ TEST_CASE("R4: a refill re-arm does not wait out the periodic bound",
     // if the re-arm does not itself wake the loop, this waits the hour-long bound and fails.
     CHECK(spin_until([&] { return rig.journal->pages() > pages_before + 1; }, 10s));
     worker.stop();
+}
+
+TEST_CASE("R4: a pathological reserve ratio cannot make a pass exceed its wall budget",
+          "[spark][guardian][drain][maint][r4]") {
+    // The lifecycle wall slice is derived from the reserve ratio via a size_t->int64_t cast.
+    // Unclamped, a pathological denominator makes (den-num)/den wrap to a POSITIVE multiplier
+    // greater than one, so lifecycle receives a deadline LONGER than the whole pass and the
+    // pass overruns its own max_wall - and compliance's restored deadline is already expired
+    // (#2345 Gate 2 sec-MEDIUM-1).
+    //
+    // The observable is pass DURATION, not compliance delivery: at a pathological denominator
+    // the ratio degrades to "no reserve" by design, so compliance starvation is expected there
+    // and cannot discriminate. CH-3b could not catch this - its count bound binds first and its
+    // compliance assertion is gated to sane denominators.
+    JournalRig rig;
+    for (int i = 0; i < 40; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true);
+    }
+
+    auto slow = [](const OutboxEntry&) -> SendResult {
+        std::this_thread::sleep_for(20ms);
+        return SendResult::Sent;
+    };
+    GuardianSparkRuntime::DrainLimits limits;
+    limits.max_entries = 1000; // deliberately NOT binding: the wall must be the constraint
+    limits.max_wall = 200ms;
+    limits.compliance_reserve_den = std::numeric_limits<std::size_t>::max();
+    limits.compliance_reserve_num = 1;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto out = rig.rt->drain_bounded(slow, limits);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    INFO("elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                       << " sent=" << out.sent);
+    // The pass may overrun by at most ONE in-flight send (uninterruptible), never by a
+    // multiple of the budget.
+    CHECK(elapsed < limits.max_wall + 20ms + 120ms);
+}
+
+TEST_CASE("R4: a completely full window blocks the pass without sweeping the cursor",
+          "[spark][guardian][drain][maint][r4]") {
+    // The headroom == 0 path was untested (#2345 Gate 3 QE). It must BREAK rather than
+    // continue: with no room at all, no batch can fit, and continuing would take outbox_mu_
+    // once per candidate and sweep page_cursor_ over the whole rotation while paging nothing,
+    // destroying oldest-first replay locality on reconnect.
+    JournalRig rig{/*outbox_capacity=*/4};
+    rig.persist_batch("b", 2);
+
+    // Fill the window completely with live entries.
+    for (int i = 0; i < 4; ++i) {
+        const auto rid = "live" + std::to_string(i);
+        REQUIRE(rig.rt->attach_rule(rid, file_spec("/p" + rid), file_exists_rule(rid), true));
+    }
+    REQUIRE(rig.rt->lifecycle_headroom() == 0);
+
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.records_paged == 0);
+    CHECK(stats.headroom_blocked);          // the caller must learn a backlog is waiting...
+    CHECK(stats.min_blocked_headroom == 2); // ...and how much room it needs
 }

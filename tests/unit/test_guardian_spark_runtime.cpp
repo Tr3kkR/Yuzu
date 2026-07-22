@@ -1214,7 +1214,7 @@ TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
 
 TEST_CASE("try_page_batch pages new entries into the send window", "[spark][runtime][journal]") {
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 2);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}).added == 2);
     auto lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 2);
     CHECK(lc[0].event_id == "e1");
@@ -1224,19 +1224,26 @@ TEST_CASE("try_page_batch pages new entries into the send window", "[spark][runt
 TEST_CASE("try_page_batch skips entries already in the window (membership scan)",
           "[spark][runtime][journal]") {
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}).added == 1);
     // e1 already present; only e2 is net-new.
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 1);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}).added == 1);
 }
 
 TEST_CASE("try_page_batch defers a batch that does not fit the headroom", "[spark][runtime][journal]") {
     GuardianSparkRuntime::Config cfg;
     cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1); // headroom 2 → ok
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}).added == 1); // headroom 2 → ok
     // headroom now 1; a 2-entry batch is deferred WHOLE (never split).
-    CHECK(rt->try_page_batch({lc_entry("r2", "e2"), lc_entry("r3", "e3")}) == 0);
-    CHECK(rt->try_page_batch({lc_entry("r2", "e2")}) == 1); // a 1-entry batch fits
+    {   // A 0 return now carries WHY: blocked for headroom, not "already a member". That
+        // distinction is what lets the journal tell a waiting backlog from an idle steady
+        // state (#2345 Gate 3).
+        const auto blocked = rt->try_page_batch({lc_entry("r2", "e2"), lc_entry("r3", "e3")});
+        CHECK(blocked.added == 0);
+        CHECK(blocked.blocked_for_headroom);
+        CHECK(blocked.required == 2);
+    }
+    CHECK(rt->try_page_batch({lc_entry("r2", "e2")}).added == 1); // a 1-entry batch fits
 }
 
 TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark][runtime][journal]") {

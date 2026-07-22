@@ -390,6 +390,58 @@ assertion would have broken replay.
 
 ---
 
+## Third hardening round (PR #2345 blocking review)
+
+A human reviewer blocked the PR; two external model reviews then found more, including in the
+fixes. Recorded because three of the findings were the SAME defect classes earlier rounds had
+supposedly closed.
+
+- **The wall budget was not sliced, only the count.** `drain_log_unlocked` checks the deadline
+  BEFORE the count budget, so once lifecycle consumed the single shared wall, compliance
+  returned on entry without ever spending a reserved slot. The compliance reserve added in
+  round 3 was therefore dead under time pressure - the Gate-4 UP-3 detection blackout reached
+  through the other limit. Lifecycle now takes a slice of the wall; compliance and the
+  lifecycle-retry get the full pass deadline; the ratio is normalised once for `den == 0`,
+  `num > den` and the wall-only case. The guarantee is stated honestly in the code: compliance
+  gets an opportunity to START, not a slice of time, because an in-flight send is
+  uninterruptible.
+- **The headroom precheck reintroduced B2 starvation.** It `break`'d before `page_cursor_`
+  advanced, so an oversized head batch pinned the rotation and smaller newer batches never
+  paged. Now `continue` with the cursor advanced. Paging a newer batch ahead of an older
+  blocked one was verified tolerable against the server rather than assumed.
+- **The refill re-arm reintroduced UP-2 amplification.** `lifecycle_headroom() > 0` fired when
+  one slot opened for a batch needing up to 256, so `force_page_` re-armed every cycle and each
+  forced page is a full journal scan. It now requires room for the smallest actually-blocked
+  batch (`min_blocked_headroom`), and sets `skip_wait` so it acts immediately instead of after
+  the periodic bound - a latency the 20 ms-bound reconnect tests had masked entirely.
+- **`drain_once()`** is documented as test-only with no production caller, noting it bypasses
+  every limit the worker applies.
+
+### The test discipline that was missing
+
+Four hollow tests across this PR shared one signature: none asserted the discriminating
+observable of the mechanism it claimed to cover. The rule now applied is that **a test claiming
+to cover a branch must assert that branch's own flag or counter, and must be observed red
+against the unfixed code before it counts.** Each round-4 fix has such a test. The refill test
+was itself hollow on the first attempt - it forced a page that was never headroom-blocked - and
+was caught by exactly that rule.
+
+`metrics.md` is now bound to the emitter by a mechanical cross-check test in the H2/G9
+bind-or-drift idiom. It proves NAME PRESENCE only; it cannot catch a row whose description is
+wrong, which is the other error this round fixed. That limitation is stated in the test and
+should not be trimmed.
+
+### A pattern worth naming
+
+The false `maint_exceptions` description was corrected in `metrics.md` and one changelog
+fragment while remaining false in the OTHER fragment and in this document's own flip-list -
+found by governance Gate 2 after the fix commit. Prose written from intention at time T and
+never reconciled at T+n is the recurring failure of this PR, and it recurred inside the commit
+that fixed it. Bind doc claims to executable checks wherever possible; treat the flip-list as a
+checklist to be executed, not a record of intent.
+
+---
+
 ## REQUIRED at the `prefer_spark` flip (Gate 6 enterprise-readiness)
 
 Everything in this change that relocates journal maintenance is DORMANT until the Spark
@@ -406,8 +458,10 @@ Whichever PR flips `prefer_spark` MUST also:
    note was consumed by a release where nothing happened.
 2. **Update the `yuzu.guardian_journal_maint_exceptions` row** in `docs/user-manual/metrics.md`
    to drop the dormancy framing. That counter's meaning has already shifted once during this
-   branch (it now aggregates the heartbeat's retry-persist, the drain worker's prune/page, and
-   the convergence sweeps) and shifts again in effect at the flip.
+   branch (it aggregates the heartbeat's retry-persist and the drain worker's prune/page; convergence
+   sweeps are NOT included - they have their own `yuzu.guardian_sweep_exceptions`, as does
+   outbox delivery via `yuzu.guardian_drain_exceptions`) and shifts again in effect at the
+   flip. All three carry dormancy framing that must be shed at the same time.
 3. **Close or explicitly risk-accept the shutdown-classification undercount** (Gate 6
    compliance, CC7.2): when a stop lands mid-classification, the remaining evicted keys are
    counted in neither `evicted_sent_unacked` nor `evicted_no_send_evidence`, so the counter an
