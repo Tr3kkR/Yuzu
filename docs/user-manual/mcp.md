@@ -355,6 +355,15 @@ for the tool to execute.
 > (`destructiveHint` `false`→`true`) — and downgrades two over-warnings
 > (`create_engine_principal`, `mint_engine_credential` `destructiveHint`
 > `true`→`false`; both are additive).
+>
+> Because MCP advertises `tools.listChanged:false`, an already-connected client
+> that cached `tools/list` keeps the old (pre-fix) hints until it reconnects —
+> **long-lived MCP clients should reconnect after this deploy** to pick up the
+> corrected hints. Separately, the non-standard `safety` annotation key
+> previously present on nine read tools (`get_fleet_posture_fast`,
+> `classify_operational_question`, `get_incident_playbook`,
+> `summarize_working_set`, and the five `discover_*` tools) is **removed**; its
+> guidance now lives in those tools' descriptions.
 
 | # | Tool | Description | RBAC Permission |
 |---|------|-------------|-----------------|
