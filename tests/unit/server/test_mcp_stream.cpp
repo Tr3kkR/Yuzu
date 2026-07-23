@@ -20,6 +20,8 @@
 #include <yuzu/server/auth.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <future> // the two-thread handshake test parks the pump on another thread
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1010,4 +1012,56 @@ TEST_CASE("McpStreamState: set_log_context does not weaken the publish boundary 
     CHECK_NOTHROW(id = state.publish("progress", "lost"));
     CHECK(id == 0);
     CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the tick (#2382)",
+          "[mcp][stream]") {
+    // The deferred #2366 follow-up: prove the DETERMINISTIC condvar handoff, not just the
+    // outcome. The existing sink-enqueue test runs pump_once on the SAME thread after the
+    // fault, so the predicate is already true on entry and the pump never parks — it cannot
+    // distinguish "woken by notify" from "predicate true on arrival". Here a second thread
+    // parks the pump in wait_for, then this thread faults+publishes: the containment path
+    // bumps dropped_total UNDER the sink mutex and notify_one's, so a parked waiter wakes at
+    // once and emits the events-dropped synthetic.
+    //
+    // The discriminator is timing, and ONLY timing: even a broken notify would eventually
+    // emit events-dropped when the tick fires (the predicate also tests dropped_total). So
+    // the tick is set to 30 s — far beyond any wakeup latency — and the assertion is "the
+    // pump returned well within a 5 s safety window", i.e. it woke on the notify, not the
+    // 30 s tick. This is a generous margin, not a tight latency bound.
+    //
+    // Never false-RED: if this thread happens to publish BEFORE the pump reaches wait_for,
+    // the predicate is simply true on entry and the pump returns fast anyway (a PASS that
+    // did not exercise the notify). The test can only FAIL if the pump parked AND the notify
+    // failed to wake it — exactly the regression it guards. The atomic handshake biases
+    // heavily toward the parked-first interleaving so CI actually exercises the notify.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump::Config long_tick;
+    long_tick.tick = std::chrono::seconds(30); // a tick-driven wake would blow the safety window
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
+                            long_tick};
+    FakeWire wire;
+
+    std::atomic<bool> about_to_pump{false};
+    auto pumped = std::async(std::launch::async, [&] {
+        about_to_pump.store(true, std::memory_order_release);
+        return pump.pump_once(wire.writer()); // parks in wait_for on an empty, open sink
+    });
+    while (!about_to_pump.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // Fault the live-sink enqueue: the frame commits to the ring, the by-value copy "throws",
+    // and the containment bumps dropped_total under the sink mutex + notify_one.
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    REQUIRE(state->publish("message", "missed") == 1); // committed under id 1
+
+    // Woken by the notify — ready in milliseconds, nowhere near the 30 s tick.
+    REQUIRE(pumped.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK(pumped.get()); // pump_once returned true — the stream continues
+    CHECK(wire.contains("event: events-dropped"));
 }
