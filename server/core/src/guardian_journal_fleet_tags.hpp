@@ -6,12 +6,13 @@
 /// tag keys, the `yuzu_fleet_guardian_journal_*` gauge names they roll up into, their
 /// HELP text, and the forged-value-safe parse of the agent-supplied values.
 ///
-/// The writer is agents/core/src/guardian_journal_heartbeat.hpp
-/// (`emit_guardian_journal_heartbeat_tags`). The two sides are bound by
-/// tests/unit/server/test_guardian_journal_fleet_tags.cpp, which emits through the
-/// agent's REAL emitter and asserts every key it produces is one this table
-/// recognises. That test is the drift guard: a rename on either side without the
-/// other is a red test, not a silently-dead gauge.
+/// The writer is agents/core/src/guardian_journal_heartbeat.hpp - the sparse counter
+/// emitter (`emit_guardian_journal_heartbeat_tags`) for the 29-row table, and the age
+/// emitter (`emit_guardian_journal_age_tags`) for the MAX table further down. Both
+/// sides are bound by tests/unit/server/test_guardian_journal_fleet_tags.cpp, which
+/// emits through the agent's REAL emitters and asserts every key produced is one a
+/// table here recognises. That test is the drift guard: a rename on either side
+/// without the other is a red test, not a silently-dead gauge.
 ///
 /// The keys are duplicated here rather than `#include`d from the agent header ON
 /// PURPOSE. Server production code including an agent private header would add an
@@ -38,9 +39,9 @@
 /// readings against.
 ///
 /// The writer is SPARSE: a counter that is 0 ships no tag.
-/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 29 at the top of
-/// every sweep and re-publishes only those at least one retained agent reported this
-/// cycle. So an absent family means: no retained agent's latest heartbeat carried a
+/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 29 (and the age
+/// family's 3, same rule) at the top of every sweep and re-publishes only those at
+/// least one retained agent reported this cycle. So an absent family means: no retained agent's latest heartbeat carried a
 /// value for it that PASSED the forged-value parse. Note both edges, each pinned by a
 /// test in tests/unit/server/test_agent_health_store.cpp: a non-conforming agent's
 /// explicit "0" parses and PUBLISHES the family at 0, and a rejected non-zero value
@@ -309,6 +310,23 @@ inline constexpr std::size_t kNGuardianJournalMetrics = std::size(kGuardianJourn
 // absent-means-healthy). So server-side: absent family = nothing live reported;
 // a published 0 = at least one live worker, all of them fresh.
 //
+// COVERAGE DENOMINATOR, considered and DECLINED (governance Gate 3 architect): ages
+// deliberately do not count toward yuzu_fleet_guardian_journal_reporting (that meta's
+// documented meaning is the counter family), and no separate ages-reporting meta ships
+// with the monitor-only phase - partial coverage (5 live workers reporting fresh reads
+// identically to 10,000) is a KNOWN gap. Post-flip, compare the family's presence
+// against yuzu_fleet_agents_healthy for a coarse denominator; a real per-family
+// coverage meta rides the per-agent operator surface work (#2083-class), not this
+// table. Revisit at the flip (#2390) rather than relitigating here.
+//
+// ATTRIBUTION (same #2083-class caveat as the counter family, WORSE under MAX): a
+// single agent shipping a plausible-but-wrong value below the 1e9 ceiling OWNS the
+// fleet MAX outright - a sum dilutes a forgery, a max is captured by it - and no
+// per-agent axis exists yet to identify which endpoint is reporting the extreme.
+// Treat any surprising MAX as "find the endpoint first" (today: query agents'
+// heartbeat tags directly), and do not raise the plausibility ceiling to accommodate
+// an outlier.
+//
 // Name rule (asserted by the pin test): gauge == "yuzu_fleet_" + tag minus its
 // "yuzu." prefix + "_max".
 inline constexpr GuardianJournalMetric kGuardianJournalAgeMetrics[] = {
@@ -342,7 +360,10 @@ inline constexpr GuardianJournalMetric kGuardianJournalAgeMetrics[] = {
      "batches - so read it as replay-window congestion, not proof of unsent loss. Its "
      "loss-relevant threshold is the 7-day retention window (604800 s): an episode age "
      "approaching that means never-sent records on that endpoint are nearing deletion "
-     "(see evicted_no_send_evidence). Sparse: absent means no endpoint is blocked"},
+     "(see evicted_no_send_evidence). CAVEAT: a clear can COINCIDE with the blocked "
+     "batch's own terminal eviction (the evicted batch stops being a candidate, so "
+     "coverage completes) - corroborate any clear against evicted_no_send_evidence "
+     "before reading it as recovery. Sparse: absent means no endpoint is blocked"},
 };
 
 inline constexpr std::size_t kNGuardianJournalAgeMetrics = std::size(kGuardianJournalAgeMetrics);

@@ -954,6 +954,30 @@ groups:
   #     # worker is live and nothing while dormant, so pre-cutover these series are
   #     # ABSENT and the rules below would simply never fire - they stay commented
   #     # anyway so the group enables as one reviewed unit at the cutover (#2390).
+  #     #
+  #     # KNOWN FALSE-POSITIVE SOURCES both rules inherit (record them NOW so #2390 does
+  #     # not rediscover them under incident pressure - governance UP-1/UP-5/UP-15):
+  #     #  1. Flip-day / cold start: a worker's FIRST pass over a near-ceiling journal
+  #     #     (64 MiB / thousands of batches, under KV contention) can legitimately
+  #     #     exceed these thresholds before its first success stamp lands. Do not
+  #     #     enable within the first hour after a fleet-wide prefer_spark flip - or
+  #     #     widen the threshold / `for:` for that window. Measure the real cold-pass
+  #     #     time in the flip validation stage (CH-C) before picking final numbers.
+  #     #  2. Suspend/resume: steady_clock behaviour across sleep is per-OS (Windows
+  #     #     counts suspended time, Linux does not), so a morning wake-wave of laptops
+  #     #     can transiently breach the threshold across many endpoints at once with
+  #     #     no worker fault. `for: 10m` absorbs a single machine, not a wave.
+  #     #  3. Slow-but-alive: a fleet under moderate KV contention (passes ~minutes,
+  #     #     phase-staggered) can hold the MAX above threshold continuously while
+  #     #     every worker is healthy. Confirm via maint_exceptions (flat = hung or
+  #     #     died-earlier; climbing = throwing) AND agent uptime/restart state before
+  #     #     paging.
+  #     # FLIP-DAY BOOTSTRAP: this is a hard cutover - the family goes from absent
+  #     # everywhere to present everywhere in one release. Pre-provisioned dashboard
+  #     # panels referencing these series show "No Data" pre-flip (expected, not an
+  #     # outage), and prerequisite (a) above (a per-agent operator surface) gates
+  #     # sensible triage of THESE rules too, not only the loss counters - a MAX with
+  #     # no attribution axis names no endpoint.
   #     - alert: YuzuGuardianJournalPageStale
   #       expr: |
   #         yuzu_fleet_guardian_journal_page_stale_seconds_max > 300

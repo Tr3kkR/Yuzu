@@ -243,8 +243,13 @@ public:
     /// when a pass throws (deliberate min-GAP pacing); these advance ONLY on a non-throwing
     /// pass, so a dead thread or a permanently-throwing pass reads as an ever-growing age on
     /// the heartbeat. A deferred-no-token or read-failed pass still counts: it returned, so
-    /// the LOOP is alive - this is a liveness gauge, not a throughput gauge (those failure
-    /// modes have their own counters). Lock-free.
+    /// the LOOP is alive - this is a liveness gauge, not a throughput gauge. KNOWN BLIND
+    /// SPOT (governance UP-4): read failures have their own counter
+    /// (page_read_failures), but a PERMANENTLY token-starved worker does not - deferred
+    /// passes stamp "fresh" here while zero replay happens, and deferred_no_token is
+    /// per-pass state with no cumulative counter or heartbeat tag. A starvation counter is
+    /// tracked as a follow-up; until it lands, do not cite this gauge as evidence replay is
+    /// making progress. Lock-free.
     [[nodiscard]] std::uint64_t last_page_success_steady_ms() const noexcept {
         return last_page_success_steady_ms_.load(std::memory_order_relaxed);
     }

@@ -635,6 +635,38 @@ TEST_CASE("item 6 stamps: a permanently-throwing pass never advances them",
     worker.stop();
 }
 
+TEST_CASE("item 6 stamps + episode age: lock-free readers race a live worker (TSan checkpoint)",
+          "[spark][guardian][drain][maint][tsan]") {
+    // The age telemetry's concurrency shape is lock-free readers (the heartbeat)
+    // against a mutex-serialized writer (the drain thread). Safe by inspection - this
+    // exists so nightly TSan actually DRIVES it (governance Gate 3 cpp-safety): a
+    // main-thread polling loop hammers every new accessor while the worker runs
+    // continuous maintenance passes.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/1,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    worker.start();
+    const auto deadline = std::chrono::steady_clock::now() + kSpinScale * 200ms;
+    std::uint64_t last_page = 0, last_prune = 0, age = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        last_page = worker.last_page_success_steady_ms();
+        last_prune = worker.last_prune_success_steady_ms();
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        age = rig.journal->headroom_blocked_age_ms(now_ms);
+        (void)rig.journal->headroom_blocked_since_for_test();
+    }
+    worker.stop();
+    CHECK(last_page > 0);  // seeded + racing reads observed real values
+    CHECK(last_prune > 0);
+    CHECK(age == 0); // nothing blocked in this rig
+}
+
 TEST_CASE("a throwing send does not suppress journal maintenance (independent firewalls)",
           "[spark][guardian][drain][maint]") {
     JournalRig rig;

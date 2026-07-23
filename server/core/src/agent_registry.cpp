@@ -1473,6 +1473,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             keys[i] = kGuardianJournalMetrics[i].tag;
         return keys;
     }();
+    // Same static-destruction-safety rationale as gj_keys directly above.
     static const std::array<std::string, kNGuardianJournalAgeMetrics> gja_keys = [] {
         std::array<std::string, kNGuardianJournalAgeMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianJournalAgeMetrics; ++i)

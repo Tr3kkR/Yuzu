@@ -348,7 +348,9 @@ public:
     /// disposition. Exists so a test can land request_stop() BETWEEN candidates and drive
     /// the mid-loop stop-truncation path - the branch that protects the episode state from
     /// counting an incomplete pass, which no external sequence can hit deterministically.
-    /// Null in production.
+    /// Null in production. Set BEFORE any concurrent pass can run (the write is
+    /// unsynchronized, same discipline as the pre/post_scan hooks - a set racing a live
+    /// drain worker's read would be a TSan-visible data race).
     void set_post_classify_hook_for_test(std::function<void()> hook) {
         post_classify_hook_ = std::move(hook);
     }
@@ -502,9 +504,13 @@ private:
     /// comment). A DISTINCT-KEY set, deliberately not a count: a count compared against the
     /// current set size clears early under shrink-churn (prune evicts already-counted
     /// candidates, the count survives, the bar drops - Fable review, 2026-07-23), which
-    /// sawtooths the gauge in exactly the #2364 starvation regime. Bounded by the journal's
-    /// hard batch cap; populated only while an episode is active; cleared on every block and
-    /// on episode clear. Plain member: only touched under paging_mutex_.
+    /// sawtooths the gauge in exactly the #2364 starvation regime. Populated only while an
+    /// episode is active; cleared on every blocked observation and on episode clear. Size
+    /// bound is EPOCH-scoped, not the live batch cap: keys of candidates evicted mid-epoch
+    /// linger until the next block or clear, so under churn the set can transiently exceed
+    /// the live count - still bounded in practice because every blocked pass resets it, and
+    /// growth without a re-block requires sustained all-clean batch turnover. Plain member:
+    /// only touched under paging_mutex_.
     std::unordered_set<std::string> clean_keys_since_block_;
     // Retention (SOFT) caps - default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};

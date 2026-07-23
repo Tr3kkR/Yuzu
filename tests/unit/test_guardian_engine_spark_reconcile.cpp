@@ -448,6 +448,16 @@ TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt whe
         CHECK(ages->page_stale_seconds < 60);
         CHECK(ages->prune_stale_seconds < 60);
         CHECK(ages->headroom_blocked_seconds == 0);
+        // COMPOSED with the real emitter (governance Gate 3 QE - the same
+        // engine->emitter composition the counter family's aggregate-inertness test
+        // pins): a live fresh worker ships EXACTLY the two staleness tags, including
+        // their zero values, and no blocked tag.
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_journal_age_tags(tags, ages);
+        REQUIRE(tags.size() == 2);
+        CHECK(tags.count("yuzu.guardian_journal_page_stale_seconds") == 1);
+        CHECK(tags.count("yuzu.guardian_journal_prune_stale_seconds") == 1);
+        CHECK(tags.count("yuzu.guardian_journal_headroom_blocked_seconds") == 0);
     }
     // prefer_spark=false + wired: the worker is CONSTRUCTED but never started (the flag
     // gates start()), and the ages must be ABSENT - not zero. This is the dormancy
@@ -466,7 +476,13 @@ TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt whe
         engine.wire_spark_engine(&spark_engine, false,
                                  [](const OutboxEntry&) { return SendResult::Sent; });
         REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
-        CHECK_FALSE(engine.journal_age_stats().has_value());
+        const auto ages = engine.journal_age_stats();
+        CHECK_FALSE(ages.has_value());
+        // Composed: nullopt through the real emitter ships NOTHING - the dormancy
+        // contract at the exact seam agent.cpp uses.
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_journal_age_tags(tags, ages);
+        CHECK(tags.empty());
         engine.stop();
         spark_engine.stop();
     }

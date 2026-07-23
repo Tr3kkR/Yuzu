@@ -1510,14 +1510,17 @@ TEST_CASE("#2364 episode: shrink-churn cannot clear it early (distinct coverage,
     CHECK(rig.journal->headroom_blocked_since_for_test() == since);
 }
 
-TEST_CASE("#2364 episode: a mid-loop stop truncation reaches the footer without clearing",
+TEST_CASE("#2364 episode: a stop-truncated pass with FULL coverage still does not clear",
           "[spark][runtime][journal]") {
     // Drives the in-loop stopping_ break (the only writer of stop_truncated) via the
     // test-only per-candidate hook - no external sequence can land a stop between
-    // candidates deterministically. The truncated pass classifies some candidates
-    // cleanly but must leave the episode untouched: an incomplete scan refutes nothing.
+    // candidates deterministically. DISCRIMINATING setup (governance Gate 3 QE): the
+    // truncated pass completes the coverage of EVERY candidate before the stop lands,
+    // so if the stop_truncated guard were deleted the footer's covered-check would
+    // evaluate TRUE and clear - this test flips on exactly that mutation, unlike a
+    // partial-coverage truncation where the missing keys also block the clear.
     GuardianSparkRuntime::Config cfg;
-    cfg.outbox_capacity = 1;
+    cfg.outbox_capacity = 1; // floor 256
     PageRig rig;
     rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
 
@@ -1528,34 +1531,105 @@ TEST_CASE("#2364 episode: a mid-loop stop truncation reaches the footer without 
                 R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
                 R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
     };
+    // Same 131-candidate scaffold as the clean-slice test: blk oldest, 130 batches
+    // whose records are pre-windowed (need==0 -> clean, token-free classifications).
     const std::int64_t base_ts = 1'700'000'000'000;
-    write_batch("lc:aaa:000000000000", base_ts - 1'000, "e-blk"); // will block (oldest)
-    write_batch("lc:bbb:000000000000", base_ts + 1, "e-c1");
-    write_batch("lc:bbb:000000000001", base_ts + 2, "e-c2");
+    write_batch("lc:aaa:000000000000", base_ts - 1'000, "e-blk");
+    std::vector<OutboxEntry> windowed;
+    for (int i = 0; i < 130; ++i) {
+        const auto id = std::to_string(i);
+        write_batch("lc:bbb:" + std::string(12 - id.size(), '0') + id, base_ts + i, "e-r" + id);
+        windowed.push_back(lc_entry("r" + id, "e-r" + id));
+    }
     const std::size_t cap = rig.rt->lifecycle_headroom();
-    std::vector<OutboxEntry> fill;
-    for (std::size_t i = 0; i < cap; ++i)
-        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
-    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap);
+    for (std::size_t i = 130; i < cap; ++i)
+        windowed.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(windowed)).added == cap);
 
+    // Pass 1: blocked at blk -> episode starts. Then label blk as delivered so every
+    // candidate classifies cleanly from here on.
     REQUIRE(rig.journal->page_into_window(*rig.rt, base_ts + 50'000).headroom_blocked);
     const auto since = rig.journal->headroom_blocked_since_for_test();
     REQUIRE(since >= 0);
+    REQUIRE(rig.kv->set(kJournalNamespace, journal_sent_key_from_batch_key("lc:aaa:000000000000"),
+                        ""));
 
-    // Make every candidate cleanly classifiable, then stop the pass after the second
-    // classification: the third candidate is never examined, stop_truncated fires, and
-    // the footer must run its touch-nothing branch.
-    for (const char* k : {"lc:aaa:000000000000", "lc:bbb:000000000000", "lc:bbb:000000000001"})
-        REQUIRE(rig.kv->set(kJournalNamespace, journal_sent_key_from_batch_key(k), ""));
+    // Pass 2: ordinary clean 128-slice (covers bbb0..bbb127). Survives - partial.
+    (void)rig.journal->page_into_window(*rig.rt, base_ts + 110'000);
+    REQUIRE(rig.journal->headroom_blocked_since_for_test() == since);
+
+    // Pass 3: the rotation continues at bbb128, bbb129, then blk - after those THREE
+    // classifications coverage of all 131 candidates is complete. Stop on the 4th
+    // examined candidate: the pass is truncated AFTER coverage completed, so ONLY the
+    // stop_truncated guard stands between this pass and a (wrong) clear.
     int classify_calls = 0;
     rig.journal->set_post_classify_hook_for_test([&] {
-        if (++classify_calls == 2)
+        if (++classify_calls == 4)
             rig.journal->request_stop();
     });
-    const auto s2 = rig.journal->page_into_window(*rig.rt, base_ts + 110'000);
-    CHECK_FALSE(s2.headroom_blocked);
-    CHECK(classify_calls == 2); // the break landed between candidates
-    CHECK(rig.journal->headroom_blocked_since_for_test() == since); // untouched
+    const auto s3 = rig.journal->page_into_window(*rig.rt, base_ts + 170'000);
+    CHECK_FALSE(s3.headroom_blocked);
+    CHECK(classify_calls == 4); // truncated mid-loop, after the coverage-completing 3rd
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since); // NOT cleared
+}
+
+TEST_CASE("#2364 episode: restart after clear - a fresh episode stamps and clears cleanly",
+          "[spark][runtime][journal]") {
+    // Guards the epoch-reset path (governance Gate 3 QE): after block -> clear, a
+    // SECOND blocking episode must get its own fresh stamp and must itself be
+    // clearable - i.e. the clear really reset the coverage set, and no stale coverage
+    // from epoch 1 lets epoch 2 clear early (or blocks it from clearing at all).
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1;
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i + 3 < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap - 3);
+
+    // Episode 1: a 4-record batch blocks against headroom 3.
+    std::vector<std::shared_ptr<const JournalRecord>> big;
+    for (int i = 0; i < 4; ++i)
+        big.push_back(std::make_shared<const JournalRecord>(
+            JournalRecord{.rule_id = "big", .generation = 1, .event_id = "e-big-" + std::to_string(i),
+                          .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                          .guard_type = "file", .rule_name = "n"}));
+    REQUIRE(rig.journal->persist(big) == 4);
+    const std::int64_t t0 = 1'700'000'000'000;
+    REQUIRE(rig.journal->page_into_window(*rig.rt, t0).headroom_blocked);
+    REQUIRE(rig.journal->headroom_blocked_since_for_test() >= 0);
+
+    // Clear episode 1: drain frees the window; the next pass places big (full clean
+    // coverage of the single candidate).
+    drain_lifecycle(*rig.rt);
+    (void)rig.journal->page_into_window(*rig.rt, t0 + 60'000);
+    REQUIRE(rig.journal->headroom_blocked_since_for_test() == -1);
+
+    // Episode 2: a fresh 2-record batch against a re-filled window (headroom 1).
+    const std::size_t headroom_now = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> refill;
+    for (std::size_t i = 0; i + 1 < headroom_now; ++i)
+        refill.push_back(lc_entry("fill2", "g" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(refill)).added == headroom_now - 1);
+    std::vector<std::shared_ptr<const JournalRecord>> big2;
+    for (int i = 0; i < 2; ++i)
+        big2.push_back(std::make_shared<const JournalRecord>(
+            JournalRecord{.rule_id = "big2", .generation = 1, .event_id = "e-b2-" + std::to_string(i),
+                          .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                          .guard_type = "file", .rule_name = "n"}));
+    REQUIRE(rig.journal->persist(big2) == 2);
+    const auto s3 = rig.journal->page_into_window(*rig.rt, t0 + 120'000);
+    CHECK(s3.headroom_blocked);
+    const auto since2 = rig.journal->headroom_blocked_since_for_test();
+    CHECK(since2 >= 0); // fresh episode stamped after a genuine -1
+
+    // And episode 2 clears on recovery exactly like episode 1 did.
+    drain_lifecycle(*rig.rt);
+    (void)rig.journal->page_into_window(*rig.rt, t0 + 180'000);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == -1);
 }
 
 TEST_CASE("#2364 episode: early returns leave the state untouched",

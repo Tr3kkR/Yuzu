@@ -1027,6 +1027,32 @@ TEST_CASE("REAL AgentHealthStore: age gauges publish an explicit 0, reject forge
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_tag_rejected") == 1.0);
 }
 
+TEST_CASE("REAL AgentHealthStore: a stale agent's age reading leaves the fleet MAX",
+          "[guardian][journal][rollup][real]") {
+    // The MAX sibling of the counter family's staleness-eviction test below: the
+    // staleness prune runs before accumulation, so an aged-out agent's staleness
+    // reading drops out of the MAX on the next sweep. For MAX this is double-edged and
+    // deliberate (governance UP-11/UP-12): eviction can only LOWER the max - the
+    // honest reading, since a silent agent's age is unknowable - but it also means the
+    // worst endpoint leaving the reporting population resolves the fleet signal
+    // without the endpoint healing. Driven with a zero window for determinism.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_journal_page_stale_seconds"] = "900";
+    store.upsert("doomed", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(unlabelled_series(metrics.serialize(),
+                              "yuzu_fleet_guardian_journal_page_stale_seconds_max") == 900.0);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    CHECK_FALSE(has_unlabelled_series(metrics.serialize(),
+                                      "yuzu_fleet_guardian_journal_page_stale_seconds_max"));
+}
+
 TEST_CASE("REAL AgentHealthStore: guardian journal gauges go absent (not zero) when nobody reports",
           "[guardian][journal][rollup][real]") {
     yuzu::server::detail::AgentHealthStore store;
