@@ -214,4 +214,13 @@ std::size_t McpSessionRegistry::active_count() const {
     return sessions_.size();
 }
 
+bool McpSessionRegistry::exists(const std::string& id, const std::string& principal) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = sessions_.find(id);
+    if (it == sessions_.end() || it->second.principal != principal) {
+        return false;
+    }
+    return now() - it->second.last_seen <= cfg_.idle_ttl;  // gc_locked's predicate, negated
+}
+
 }  // namespace yuzu::server::mcp

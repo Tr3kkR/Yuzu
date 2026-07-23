@@ -235,9 +235,10 @@ std::uint64_t McpStreamState::publish_guarded(std::string_view event_type, std::
     }
 }
 
-void McpStreamState::inject_publish_fault_for_test(PublishFault fault) {
+void McpStreamState::inject_publish_fault_for_test(PublishFault fault, int times) {
     std::lock_guard<std::mutex> lk(mu_);
     publish_fault_ = fault;
+    publish_fault_remaining_ = (fault == PublishFault::kNone) ? 0 : times;
 }
 
 void McpStreamState::set_log_context(std::string context) {
@@ -290,8 +291,16 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // injected while no sink is live would otherwise never reach its consumption
         // point below and would silently fire on a LATER real client's first frame.
         // Consuming it here makes both fault phases symmetric (always consumed once).
-        // Test seam only — publish_fault_ is kNone in production.
-        const PublishFault fault = std::exchange(publish_fault_, PublishFault::kNone);
+        // Test seam only - publish_fault_ is kNone in production. `times` (see the
+        // header) lets the same fault fire on N consecutive publishes; the historical
+        // one-shot is times == 1.
+        PublishFault fault = PublishFault::kNone;
+        if (publish_fault_remaining_ > 0) {
+            fault = publish_fault_;
+            if (--publish_fault_remaining_ == 0) {
+                publish_fault_ = PublishFault::kNone;
+            }
+        }
         if (fault == PublishFault::kPreCommit) {
             throw std::bad_alloc{};
         }

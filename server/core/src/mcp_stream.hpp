@@ -328,7 +328,11 @@ public:
         /// publish()'s outer boundary: publish returns the committed id.
         kPostCommitObservability,
     };
-    void inject_publish_fault_for_test(PublishFault fault);
+    /// `times` arms the same fault for the next N publishes (default 1 = the historical
+    /// one-shot). Needed by the bridge's double-terminal-failure -> poison test: both the
+    /// real-final and fallback-final publishes happen inside ONE projector pass, so the
+    /// seam cannot be re-armed between them from the test thread.
+    void inject_publish_fault_for_test(PublishFault fault, int times = 1);
 
     /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s
     /// rare WARN lines so an operator can attribute a dropped/anomalous frame to a session.
@@ -450,6 +454,7 @@ private:
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
     PublishFault publish_fault_ = PublishFault::kNone;  ///< test seam; guarded by mu_
+    int publish_fault_remaining_ = 0;  ///< publishes left that consume publish_fault_; guarded by mu_
     // Write-once at mint before the stream is shared (set_log_context contract); read
     // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.
     std::string log_context_;

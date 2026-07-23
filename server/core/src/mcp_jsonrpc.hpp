@@ -30,6 +30,8 @@ constexpr int kMcpSessionCap         = -32010;  // per-principal/global session 
 constexpr int kMcpNotAcceptable      = -32011;  // GET without Accept: text/event-stream → HTTP 406
 constexpr int kMcpStreamCap          = -32012;  // per-principal/global stream cap hit   → HTTP 429
 constexpr int kMcpStreamPoisoned     = -32013;  // terminal delivery failed twice        → HTTP 410
+constexpr int kMcpTerminalUnavailable = -32014;  // parked result forced-expired under pressure -
+                                                 // fetch by execution_id (bridge sweep, 2f PR 3)
 
 // ── Request ───────────────────────────────────────────────────────────────
 
