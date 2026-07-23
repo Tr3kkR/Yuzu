@@ -485,7 +485,10 @@ public:
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
-                          "Frames dropped from a slow consumer's per-connection queue", "counter");
+                          "Frames dropped before reaching a connection's per-connection queue — "
+                          "usually a slow consumer's queue overflow, also a rare producer-side "
+                          "post-commit allocation failure (#2366); recoverable via Last-Event-ID",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_frames_too_large_total",
                           "Frames replaced by a frame_too_large notice because they exceeded the "
                           "per-session replay-ring byte budget",
@@ -498,12 +501,18 @@ public:
                           "MCP GET SSE stream attach denials by reason", "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
+        metrics_.describe("yuzu_mcp_stream_publish_failures_total",
+                          "publish() exception-boundary catches — a producer's frame "
+                          "construction failed before commit (#2366); the frame was never "
+                          "published and no event id was consumed",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
+        metrics_.counter("yuzu_mcp_stream_publish_failures_total");
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});

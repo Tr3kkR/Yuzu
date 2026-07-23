@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <new> // std::bad_alloc — the publish() fault-injection seam throws it
 #include <random>
 #include <functional>
 #include <string_view>
@@ -50,6 +51,7 @@ constexpr const char* kMetricStreamRejects = "yuzu_mcp_stream_rejects_total";
 constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
 constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
 constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large_total";
+constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -173,11 +175,54 @@ McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metr
     }
 }
 
-std::uint64_t McpStreamState::publish(std::string event_type, std::string data) {
+std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_view data) noexcept {
+    // HARD exception boundary (#2366) — the pump_once/pump_once_impl pattern. PR 3's
+    // progress bridge calls this from an ExecutionEventBus listener on a worker task
+    // httplib's routing try/catch never sees, so an escaped throw is std::terminate
+    // (the #2037 class). publish_impl contains every post-commit fault itself, so an
+    // exception reaching this catch proves the ring and next_id_ are untouched — 0
+    // ("not published, no id consumed") is the honest answer, and the caller's frame
+    // simply never happened rather than silently gapping Last-Event-ID.
+    //
+    // string_view params (not by-value std::string): a by-value parameter is
+    // copy-constructed in the CALLER's frame for an lvalue arg, so a bad_alloc there
+    // would escape to the unguarded listener BEFORE this try. The views convert without
+    // allocating; publish_impl owns them inside the guard.
+    try {
+        return publish_impl(event_type, data);
+    } catch (...) {
+        // Best-effort observability only — the metric lookup and the log line both
+        // allocate, and under bad_alloc a throw from THIS handler would propagate
+        // straight out of the boundary it implements. Nested guard, same as pump_once.
+        try {
+            if (metrics_ != nullptr) {
+                metrics_->counter(kMetricPublishFailures).increment();
+            }
+            spdlog::warn("MCP stream publish: frame dropped pre-commit (exception contained)");
+        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
+        }
+        return 0;
+    }
+}
+
+void McpStreamState::inject_publish_fault_for_test(PublishFault fault) {
+    std::lock_guard<std::mutex> lk(mu_);
+    publish_fault_ = fault;
+}
+
+std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
+                                           std::string_view data_view) {
+    // Own the payload INSIDE the boundary. These two copies are the caller-visible
+    // allocations that used to happen in the caller's frame (by-value params); doing them
+    // here means a bad_alloc is caught by publish()'s guard as a clean pre-commit 0
+    // (nothing mutated yet), never an escape to the unguarded ExecutionEventBus listener.
+    std::string event_type{event_type_view};
+    std::string data{data_view};
     std::shared_ptr<McpStreamSink> live;
     std::uint64_t id = 0;
     std::uint64_t evicted = 0;
     bool oversized = false;
+    bool sink_enqueue_failed = false;
     {
         // A single frame must not exceed the ring's byte budget, or the "always keep the
         // newest frame" rule below would admit it whole and the byte cap would bound
@@ -201,9 +246,28 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
             oversized = true;
         }
         std::lock_guard<std::mutex> lk(mu_);
-        id = next_id_++;
+        // One-shot: read AND clear the injected fault up front, so an armed fault can
+        // never persist past the publish that observes it. In particular kSinkEnqueue
+        // injected while no sink is live would otherwise never reach its consumption
+        // point below and would silently fire on a LATER real client's first frame.
+        // Consuming it here makes both fault phases symmetric (always consumed once).
+        // Test seam only — publish_fault_ is kNone in production.
+        const PublishFault fault = std::exchange(publish_fault_, PublishFault::kNone);
+        if (fault == PublishFault::kPreCommit) {
+            throw std::bad_alloc{};
+        }
+        // Ordering is the fix for #2366 (the stream_budget.hpp "every allocating step
+        // happens before any counter moves" template): read next_id_ WITHOUT
+        // incrementing, do every allocating step (sanitize, frame construction, the
+        // deque node push), and only then advance the id. A throw from push_back
+        // (strong guarantee — deque unchanged) therefore leaves next_id_ untouched too:
+        // no permanent hole in the id space, no silent Last-Event-ID gap. The old
+        // `id = next_id_++` BEFORE the push consumed the id even when the push failed.
+        id = next_id_;
         ring_.push_back(sse_bus::SseEvent{sanitize_event_type(std::move(event_type)),
                                           std::move(data), id});
+        // ── COMMITTED from here: everything below is noexcept or locally contained. ──
+        ++next_id_;
         while (ring_.size() > ring_cap_ ||
                (ring_bytes_ + frame_bytes(ring_.back()) > ring_bytes_cap_ && ring_.size() > 1)) {
             // Bounded on BOTH axes (Decision 15(d)). The frame count alone is not a memory
@@ -225,19 +289,78 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
         // never blocks on I/O or calls back into us.
         live = live_;
         if (live) {
-            sse_bus::enqueue_capped(live->sse, ring_.back(), ring_cap_);
+            // Post-commit containment (#2366): enqueue_capped takes the SseEvent BY
+            // VALUE, so the copy of ring_.back() at the call boundary is itself an
+            // allocation that can throw — with the frame already committed to the ring.
+            // Contain it HERE and convert it into the existing slow-consumer gap signal:
+            // dropped_total is a lock-free atomic the pump already turns into the
+            // `events-dropped` synthetic on its next tick, so the client learns a frame
+            // never reached the wire and recovers it via Last-Event-ID replay (the ring
+            // still holds it). Letting the throw escape instead would return 0 for a
+            // frame that IS in the ring — a lie in both directions.
+            try {
+                if (fault == PublishFault::kSinkEnqueue) {
+                    throw std::bad_alloc{};
+                }
+                sse_bus::enqueue_capped(live->sse, ring_.back(), ring_cap_);
+            } catch (...) {
+                // The committed frame's by-value copy threw (bad_alloc under memory
+                // pressure — near-never by construction). Count it as a delivery drop:
+                // the pump turns dropped_total into the events-dropped synthetic and the
+                // ring still holds the frame, so Last-Event-ID replay recovers it. The
+                // WARN is emitted post-lock (below) — unlike a routine slow-consumer
+                // overflow this is an anomalous server-side allocation fault worth a log
+                // line, and it is rare enough that it cannot flood.
+                //
+                // Bump dropped_total UNDER the sink mutex — the same synchronization the
+                // enqueue path (enqueue_capped, just above) already uses for its
+                // push_back. This makes the pump's wait predicate a proper condvar
+                // handoff: a waiter cannot check the predicate false and then miss this
+                // bump, so the events-dropped synthetic wakes deterministically on the
+                // notify_one below rather than only on the next tick. Lock order mu_ →
+                // sink mu (we hold mu_ here) — identical to enqueue_capped's own acquire.
+                //
+                // std::mutex::lock() can itself throw std::system_error (a broken mutex —
+                // essentially never). Contain it: the frame is ALREADY committed to the
+                // ring, so letting that throw reach publish()'s boundary catch would
+                // return 0 for a committed frame — the one thing the contract forbids.
+                // Fall back to a bare atomic bump (still counts the drop; the wakeup
+                // degrades to bounded-by-tick, acceptable for a degenerate mutex fault).
+                try {
+                    std::lock_guard<std::mutex> sink_lk(live->sse->mu);
+                    live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                    live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
+                }
+                sink_enqueue_failed = true;
+            }
         }
     }
     if (live) {
         live->sse->cv.notify_one(); // outside mu_ — no need to hold it to wake a waiter
     }
-    if (evicted > 0 && metrics_ != nullptr) {
-        metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
-    }
-    if (oversized && metrics_ != nullptr) {
-        // Counted, not just logged: an unbounded warn-per-publish is a log-flood vector,
-        // and a new failure mode nobody can alert on is a failure mode nobody sees.
-        metrics_->counter(kMetricFramesTruncated).increment();
+    // Post-commit best-effort: Counter::increment allocates on a family's first use and
+    // takes the registry lock — a throw here must not turn a committed publish into a
+    // 0 return (the boundary's catch cannot tell it apart from a pre-commit failure).
+    try {
+        if (sink_enqueue_failed) {
+            // Cause-honest and rare: a post-commit allocation fault, NOT a slow consumer
+            // (which is counted silently per-event). The client already learns of the gap
+            // via events-dropped; this is the server-side breadcrumb an operator correlates
+            // with memory pressure.
+            spdlog::warn("MCP stream publish: live-sink enqueue failed post-commit — frame "
+                         "is in the ring, client resyncs via events-dropped");
+        }
+        if (evicted > 0 && metrics_ != nullptr) {
+            metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
+        }
+        if (oversized && metrics_ != nullptr) {
+            // Counted, not just logged: an unbounded warn-per-publish is a log-flood
+            // vector, and a new failure mode nobody can alert on is a failure mode
+            // nobody sees.
+            metrics_->counter(kMetricFramesTruncated).increment();
+        }
+    } catch (...) {  // NOLINT(bugprone-empty-catch) — observability must not un-commit
     }
     return id;
 }
@@ -536,8 +659,17 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     {
         std::unique_lock<std::mutex> lk(sink_->sse->mu);
         sink_->sse->cv.wait_for(lk, cfg_.tick, [this] {
+            // dropped_total is in the predicate (#2366): a producer-side containment can
+            // bump dropped_total WITHOUT enqueueing a frame (the by-value copy threw after
+            // the ring commit), so `queue.empty()` alone would keep the synthetic waiting a
+            // full tick. Before #2366 every drop rode alongside a real push_back, so this
+            // case could not arise. The bump is done UNDER this sink mutex (see the
+            // publish() containment catch), so this is a proper condvar handoff — a waiter
+            // cannot check the predicate false and miss the bump, and the publish's
+            // notify_one wakes it deterministically rather than on the next tick.
             return !sink_->sse->queue.empty() || sink_->sse->closed.load() ||
-                   sink_->sse->pre_emit.has_value();
+                   sink_->sse->pre_emit.has_value() ||
+                   sink_->sse->dropped_total.load(std::memory_order_relaxed) > 0;
         });
         if (sink_->sse->closed.load()) {
             lk.unlock();
@@ -621,18 +753,25 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         }
     }
     if (dropped > 0) {
-        // The sink queue overflowed. Tell the client — a silent gap is the one thing
-        // this channel must never produce. But do NOT promise a replay we may not be
-        // able to honour: the ring and the sink share a cap, so a consumer slow enough
-        // to overflow the queue has usually also fallen out of the replay window, and
-        // its reconnect will be answered with a 404 + re-initialize rather than the
-        // frames it lost. Say both.
+        // Frames were dropped before reaching this connection. Tell the client — a silent
+        // gap is the one thing this channel must never produce. But do NOT promise a replay
+        // we may not be able to honour: the ring and the sink share a cap, so a consumer
+        // slow enough to overflow the queue has usually also fallen out of the replay
+        // window, and its reconnect will be answered with a 404 + re-initialize rather than
+        // the frames it lost. Say both.
+        // Cause-neutral by design (#2366): dropped_total now has two producers — the common
+        // slow-consumer queue overflow AND a rare producer-side post-commit allocation
+        // fault — and the pump cannot tell them apart from the count alone. The reason must
+        // not assert "slow consumer" for a fault it cannot prove; the server-side WARN
+        // distinguishes the rare case. Recovery is identical either way, so the client
+        // needs the gap + the remediation, not the cause.
         // Field names match the `/api/v1/events` sibling's synthetic (dropped_count +
         // reason) — one taxonomy, not a per-route format.
         const sse_bus::SseEvent ev{
             "events-dropped",
             "{\"dropped_count\":" + std::to_string(dropped) +
-                ",\"reason\":\"slow consumer — the per-connection queue overflowed\""
+                ",\"reason\":\"one or more frames were dropped before reaching this "
+                "connection\""
                 ",\"remediation\":\"reconnect with Last-Event-ID; if the replay window has "
                 "also passed you will get a 404 — re-initialize, durable results remain "
                 "fetchable by execution_id\"}"};
