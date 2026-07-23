@@ -8964,11 +8964,24 @@ void RestApiV1::register_routes(
                 // Retry-After alongside the A4 retry_after_ms — the platform 429
                 // convention in docs/user-manual/rest-api.md is both, in whole seconds.
                 res.set_header("Retry-After", "5");
+                // Name a remediation that can ACTUALLY resolve THIS reject. There is no
+                // operator flag for /api/v1/events' per-principal cap (it is compile-time
+                // kPerPrincipalApiEvents), so a per-principal reject can only be resolved
+                // by the caller closing one of its own streams — telling it to raise
+                // --max-sse-streams (the global cap) would be misleading.
+                const bool per_principal =
+                    admitted.reject_reason != nullptr &&
+                    std::string_view(admitted.reject_reason) ==
+                        detail::StreamBudget::kRejectPerPrincipal;
                 res.set_content(
-                    detail::error_json_a4(429, "too many concurrent event streams", cid,
-                                          /*retry_after_ms=*/5000,
-                                          "close an existing /api/v1/events stream, or raise "
-                                          "--max-sse-streams"),
+                    detail::error_json_a4(
+                        429, "too many concurrent event streams", cid,
+                        /*retry_after_ms=*/5000,
+                        per_principal
+                            ? "close one of your own /api/v1/events streams (this is a "
+                              "per-principal limit)"
+                            : "close an existing /api/v1/events stream, or raise "
+                              "--max-sse-streams"),
                     "application/json");
                 return;
             }

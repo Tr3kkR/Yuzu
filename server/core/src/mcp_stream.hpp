@@ -347,6 +347,22 @@ public:
     struct Config {
         std::chrono::milliseconds tick = kMcpStreamTickDefault;
         std::chrono::milliseconds revalidate_grace = kMcpRevalidateGraceDefault;
+        // Maximum extra grace ADDED per-stream, chosen once uniformly in
+        // [0, revalidate_grace_jitter_max] when a stream first enters the indeterminate
+        // grace window. Its whole purpose is to DE-SYNCHRONISE the mass kill: without it,
+        // every stream's grace equals the token-cache TTL (60 s), so a PG brownout drives
+        // every stream into grace within one tick of onset and they all die at onset+60 s
+        // together — a simultaneous fleet-wide reconnect storm that re-floods the very
+        // pool that is trying to recover (the substrate has NO SQLite fallback, ADR-0006).
+        // Spreading the deadlines turns a cliff into a ramp. Grace only ever applies to
+        // kIndeterminate (auth store unreachable), NEVER to a real revocation (which is an
+        // immediate kill), so a longer grace can never keep a revoked credential alive —
+        // this is a pure availability knob with no security cost.
+        //
+        // Defaults to 0 so the pump is DETERMINISTIC in unit tests; production wires a real
+        // spread (half the grace). A stream picks its own offset once, so the spread is
+        // stable for the life of that stream.
+        std::chrono::milliseconds revalidate_grace_jitter_max{0};
     };
 
     using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
@@ -389,6 +405,11 @@ private:
     ClockFn clock_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
     std::optional<std::chrono::steady_clock::time_point> grace_start_;
+    // The effective grace deadline for THIS stream's current indeterminate spell,
+    // = grace_start_ + revalidate_grace + a per-stream jitter chosen once when
+    // grace_start_ is set (see Config::revalidate_grace_jitter_max). Reset alongside
+    // grace_start_ when the credential re-validates.
+    std::optional<std::chrono::steady_clock::time_point> grace_deadline_;
 };
 
 /// The `GET /mcp/v1/` tail, called by `McpServer::build_get_handler` after its

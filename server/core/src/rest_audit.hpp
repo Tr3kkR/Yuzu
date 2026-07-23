@@ -43,6 +43,7 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include <exception>
 #include <string>
 #include <type_traits>
 

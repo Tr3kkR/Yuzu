@@ -225,9 +225,21 @@ inline bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, siz
     return true;
 }
 
+/// `noexcept`, and that is STRUCTURAL, not decorative. This is the shared release helper
+/// for the legacy `GET /events` SSE surface, and httplib invokes a content-provider
+/// releaser from `~Response` — a destructor. An exception escaping here is therefore
+/// `std::terminate` (#2037's class), which no caller-side try/catch can intercept because
+/// the terminate happens inside the destructor before unwinding reaches any handler. The
+/// two throw sites — `std::lock_guard` construction (`std::system_error`, and this PR's
+/// lost-wakeup fix is what ADDED it: the store used to be a bare atomic) and
+/// `bus.unsubscribe` (locks `mu_`) — are contained AT THE SOURCE, the same way
+/// `QuotaSlot::reset` and `StreamBudget::Lease::release` are, so every caller is safe by
+/// construction rather than by remembering to wrap the call. The MCP / `/api/v1/events` /
+/// dashboard sibling releasers inline their own equivalent guards; this one is shared, so
+/// the guard lives in the shared function.
 inline void sse_resource_release(const std::shared_ptr<SseSinkState>& state, EventBus& bus,
-                                 bool /*success*/) {
-    {
+                                 bool /*success*/) noexcept {
+    try {
         // `closed` is the provider's wait PREDICATE, so it must be modified while owning
         // the mutex: a store issued between the provider's predicate check and its atomic
         // release-and-block is a lost wakeup, and the provider then sleeps a full 3 s tick
@@ -235,12 +247,22 @@ inline void sse_resource_release(const std::shared_ptr<SseSinkState>& state, Eve
         // the modification is what orders it against the wait.
         std::lock_guard<std::mutex> lk(state->mu);
         state->closed.store(true);
+    } catch (...) {
+        // A lock that cannot be taken means the sink is already unusable; contain it. A
+        // stalled provider is strictly better than aborting the whole process from a
+        // destructor.
     }
-    // The scope above ENDS here on purpose: publishers take the bus mutex and then the
-    // sink mutex, so unsubscribing while still holding `state->mu` would invert that
-    // order and deadlock. Do not move `unsubscribe` into the block.
-    state->cv.notify_all();
-    bus.unsubscribe(state->sub_id);
+    // notify/unsubscribe are OUTSIDE the block above on purpose: publishers take the bus
+    // mutex and then the sink mutex, so unsubscribing while still holding `state->mu` would
+    // invert that order and deadlock. Do not move `unsubscribe` into the block.
+    state->cv.notify_all(); // noexcept
+    // `unsubscribe` in its OWN try so its throw cannot skip the notify above and cannot
+    // escape the destructor. A leaked subscription pins the sink for the process's life —
+    // a bounded leak, not a terminate.
+    try {
+        bus.unsubscribe(state->sub_id);
+    } catch (...) {
+    }
 }
 
 } // namespace yuzu::server::detail

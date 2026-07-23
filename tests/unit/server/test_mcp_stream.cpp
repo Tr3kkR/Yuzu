@@ -456,6 +456,40 @@ TEST_CASE("McpStreamPump/CH-4: an auth-backend outage buys a bounded grace windo
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
 }
 
+TEST_CASE("McpStreamPump/CH-4: grace jitter spreads the deadline, breaking the mass-kill",
+          "[mcp][stream][ch4]") {
+    // The de-synchronising fix for the correlated PG-brownout outage: without jitter every
+    // stream's grace is exactly revalidate_grace, so a brownout drives them all into grace
+    // together and they all die together at onset+grace — a fleet-wide simultaneous
+    // reconnect storm. With a jitter of J each stream's death lands in [grace, grace+J], so
+    // the cliff becomes a ramp. The knob defaults to 0 (deterministic for the tests above);
+    // production sets grace/2. Here we assert: (a) it still survives up to `grace`, and
+    // (b) with a jitter it is NOT dead at exactly `grace` (it waits out its own offset).
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::milliseconds(1000);
+
+    auto cfg = fast_cfg(grace);
+    cfg.revalidate_grace_jitter_max = std::chrono::milliseconds(1000); // deaths in [1000, 2000]
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [] { return mcp::StreamRevalidate::kIndeterminate; },
+                            [] { return true; },  cfg,
+                            [&clock_now] { return clock_now; }};
+
+    FakeWire wire;
+    CHECK(pump.pump_once(wire.writer())); // enters grace, picks its jittered deadline
+    // At exactly `grace` a NON-jittered stream would die; a jittered one has a deadline in
+    // [grace, grace+jitter], so at t=grace it must STILL be alive (deadline > grace unless
+    // the offset was 0, and even then the check is strictly `now > deadline`).
+    clock_now += grace;
+    CHECK(pump.pump_once(wire.writer()));
+    // Past the maximum jittered deadline it is definitely dead.
+    clock_now += std::chrono::milliseconds(1001);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
 TEST_CASE("McpStreamPump/CH-4: a recovered backend resets the grace window",
           "[mcp][stream][ch4]") {
     auto state = std::make_shared<mcp::McpStreamState>();

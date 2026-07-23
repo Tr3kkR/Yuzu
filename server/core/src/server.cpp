@@ -445,7 +445,7 @@ public:
                           "Superseded MCP SSE streams still draining — each still pins a worker",
                           "gauge");
         // The EFFECTIVE cap, after the boot-time clamp. Without this an operator who set
-        // --mcp-max-streams=16 and is being rejected at 12 has only a boot log line to
+        // --max-sse-streams and is being rejected at 12 has only a boot log line to
         // tell them why.
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
@@ -7006,7 +7006,10 @@ private:
                     return detail::sse_content_provider(sink_state, offset, sink);
                 },
                 detail::adopt_quota_slot_into_stream(
-                    [sink_state, bus, lease](bool success) {
+                    [sink_state, bus, lease](bool success) noexcept {
+                        // noexcept for parity with the three sibling releasers: this runs
+                        // from ~Response, and sse_resource_release is now noexcept at source
+                        // (event_bus.hpp), so the whole chain is terminate-safe.
                         detail::sse_resource_release(sink_state, *bus, success);
                         // `lease` dies here — the worker returns to the one shared budget.
                     }));

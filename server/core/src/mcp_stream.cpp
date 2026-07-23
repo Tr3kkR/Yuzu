@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <random>
 #include <functional>
 #include <string_view>
 #include <system_error>
@@ -564,16 +565,32 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         case StreamRevalidate::kIndeterminate:
             // The auth backend is unreachable — that is NOT a revocation. Ride it
             // out for a bounded grace window rather than cutting every live stream
-            // on the fleet at the same instant.
-            if (!grace_start_.has_value()) {
+            // on the fleet at the same instant. The deadline carries a per-stream
+            // jitter chosen ONCE here, so streams that all entered grace together do
+            // not all die together (Config::revalidate_grace_jitter_max).
+            if (!grace_deadline_.has_value()) {
                 grace_start_ = now();
-            } else if (now() - *grace_start_ > cfg_.revalidate_grace) {
+                std::chrono::milliseconds jitter{0};
+                if (cfg_.revalidate_grace_jitter_max.count() > 0) {
+                    // A per-stream offset in [0, jitter_max]. thread_local RNG seeded once
+                    // per worker; non-cryptographic — this only decorrelates timers, it
+                    // guards nothing.
+                    static thread_local std::minstd_rand rng{static_cast<std::uint32_t>(
+                        std::chrono::steady_clock::now().time_since_epoch().count())};
+                    const auto span = static_cast<std::minstd_rand::result_type>(
+                        cfg_.revalidate_grace_jitter_max.count());
+                    jitter =
+                        std::chrono::milliseconds{static_cast<std::int64_t>(rng() % (span + 1))};
+                }
+                grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
+            } else if (now() > *grace_deadline_) {
                 stream_->close(McpStreamClose::kAuthUnavailable);
                 return finish(write, McpStreamClose::kAuthUnavailable);
             }
             break;
         case StreamRevalidate::kValid:
             grace_start_.reset();
+            grace_deadline_.reset();
             break;
         }
     }
@@ -665,6 +682,13 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
                     std::string("reason=") + reason + " cid=" + cid);
         count_reject(metrics, reason);
         res.status = status;
+        // Retry-After header alongside the A4 retry_after_ms — the platform 429 convention
+        // is BOTH (whole seconds, rounded up), and the three sibling surfaces set it. MCP
+        // was the one surface that carried only the body field.
+        if (retry_after_ms.has_value() && *retry_after_ms > 0) {
+            const auto secs = (*retry_after_ms + 999) / 1000;
+            res.set_header("Retry-After", std::to_string(secs));
+        }
         res.set_content(error_response_null_a4(code, message, cid, remediation, retry_after_ms),
                         "application/json");
     };
@@ -719,10 +743,18 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         return;
     }
     if (attached.status == McpStreamState::AttachStatus::kStreamCapHit) {
-        deny(429, kMcpStreamCap, "Concurrent stream cap reached",
-             attached.reject_reason != nullptr ? attached.reject_reason : "global_stream_cap",
-             "close an existing SSE stream, or raise --max-sse-streams", kMcpStreamCapRetryAfterMs,
-             sid);
+        const char* const cap_reason =
+            attached.reject_reason != nullptr ? attached.reject_reason : "global_stream_cap";
+        // Name the flag that can ACTUALLY resolve THIS reject. Telling a per-principal
+        // reject to raise --max-sse-streams is inert (that is the global cap) and actively
+        // misleading — the per-principal knob is --mcp-max-streams-per-principal.
+        const bool per_principal =
+            std::string_view(cap_reason) == sse_bus::StreamBudget::kRejectPerPrincipal;
+        deny(429, kMcpStreamCap, "Concurrent stream cap reached", cap_reason,
+             per_principal
+                 ? "close one of your own SSE streams, or raise --mcp-max-streams-per-principal"
+                 : "close an existing SSE stream, or raise --max-sse-streams",
+             kMcpStreamCapRetryAfterMs, sid);
         return;
     }
     if (attached.status == McpStreamState::AttachStatus::kHandoverPending) {
@@ -805,8 +837,14 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         return registry->validate_and_touch(sid, principal) ==
                McpSessionRegistry::ValidateResult::kValid;
     };
+    // Production config: spread the indeterminate-grace deadline by up to half the grace
+    // window per stream, so a PG brownout does not drive the whole fleet's streams to die
+    // at the same instant (Config::revalidate_grace_jitter_max — the default is 0 for
+    // deterministic unit tests). At the 60 s default this spreads deaths over [60 s, 90 s].
+    McpStreamPump::Config pump_cfg{};
+    pump_cfg.revalidate_grace_jitter_max = pump_cfg.revalidate_grace / 2;
     auto pump = std::make_shared<McpStreamPump>(sink, stream, generation, std::move(revalidate_fn),
-                                                std::move(session_alive), McpStreamPump::Config{},
+                                                std::move(session_alive), pump_cfg,
                                                 McpStreamPump::ClockFn{}, metrics);
 
     res.set_chunked_content_provider(

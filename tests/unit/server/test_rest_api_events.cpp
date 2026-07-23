@@ -393,6 +393,44 @@ TEST_CASE("GET /api/v1/events: a budget rejection leaves no subscriber and no ga
     CHECK(h.event_bus->subscribers_total() == before);
 }
 
+TEST_CASE("GET /api/v1/events: the PER-PRINCIPAL cap is keyed on the authenticated identity",
+          "[events][admission][sse]") {
+    // Falsification guard the global-cap tests above cannot provide: they force a reject
+    // by pre-seeding a DIFFERENT principal, so they would still pass if the handler keyed
+    // its lease on a hardcoded literal instead of `session->username`. Here the reject can
+    // only fire if the handler keys on the SAME principal the harness authenticates as
+    // ("tester"). A generous global cap isolates the per-principal cap as the sole cause.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/100}};
+    // Fill "tester"'s per-principal allowance (compile-time kPerPrincipalApiEvents).
+    std::vector<yuzu::server::detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < yuzu::server::detail::kPerPrincipalApiEvents; ++i) {
+        auto a = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "tester",
+                                    yuzu::server::detail::kPerPrincipalApiEvents);
+        REQUIRE(a.lease);
+        held.push_back(std::move(a.lease));
+    }
+    // Global budget still has plenty of room — only the per-principal cap is exhausted.
+    REQUIRE(budget.active() < 100);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    // If the handler used any principal string other than "tester", its key would have 0
+    // prior leases and it would be ADMITTED (200). The 429 proves it keyed on the session.
+    CHECK(res->status == 429);
+    // And the remediation must be the per-principal one (no --max-sse-streams, which would
+    // not resolve a per-principal reject).
+    CHECK(res->body.find("per-principal") != std::string::npos);
+    CHECK(res->body.find("--max-sse-streams") == std::string::npos);
+
+    // A different principal is unaffected — proves the cap is per-principal, not global.
+    auto other = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                    yuzu::server::detail::kPerPrincipalApiEvents);
+    CHECK(other.lease);
+}
+
 TEST_CASE("GET /api/v1/events: an unmetered route still serves (nullptr budget is a seam)",
           "[events][admission][sse]") {
     // Guards against the admission tests above passing for the wrong reason.
