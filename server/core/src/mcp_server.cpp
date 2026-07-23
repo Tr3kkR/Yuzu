@@ -218,7 +218,9 @@ struct ToolDef {
     const char* description;
     const char* input_schema_json;            // Pre-serialized JSON Schema
     const char* output_schema_json = nullptr; // Optional 2025-06-18 MCP output schema
-    const char* annotations_json = nullptr;   // Optional safety/discovery annotations
+    // Standard MCP annotations are no longer stored per-ToolDef — they are
+    // generated at tools/list time from the single-source kToolAnnotation
+    // classification (2g PR 2), so the served hints cannot drift.
 };
 
 constexpr const char* kObjectOutputSchema = R"({"type":"object","additionalProperties":true})";
@@ -626,8 +628,9 @@ static const ToolDef kTools[] = {
      "module. Engine credentials minted against it are hard-locked to MCP tier readonly and can "
      "never be granted the admin/wildcard role (no admin, ever). owner_username is the named "
      "responsible human and is FK-validated against the user store before the row is written. "
-     "Mirrors POST /api/v1/engine-principals. Destructive — requires Security:Write (supervised "
-     "MCP tier; approval-gated like every other destructive MCP op).",
+     "Mirrors POST /api/v1/engine-principals. Approval-gated — requires Security:Write (supervised "
+     "MCP tier; maker-checker approval like every other privileged MCP op). Additive: creates a "
+     "new identity, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
      R"j("display_name":{"type":"string","description":"UI/audit label"},)j"
@@ -635,8 +638,7 @@ static const ToolDef kTools[] = {
      R"j("justification":{"type":"string","description":"Grant justification captured at creation (feeds access reviews)"},)j"
      R"j("classification":{"type":"string","enum":["internal","external"],"description":"Required at creation, no default"})j"
      R"j(},"required":["principal_id","display_name","owner_username","justification","classification"]})j",
-     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"created_at":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j",
-     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Create engine principal"})j"},
+     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"created_at":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
 
     {"list_engine_principals",
      "List engine principals with each principal's active-credential count (admin/auditor "
@@ -644,8 +646,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"principals":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["count","principals"]})j",
-     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"List engine principals"})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"principals":{"type":"array","items":{"type":"object","additionalProperties":true}}},"required":["count","principals"]})j"},
 
     {"get_engine_principal",
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
@@ -653,8 +654,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"justification":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"superseded_by":{"type":"string"},"created_at":{"type":"integer"},"revoked_at":{"type":"integer"},"created_by":{"type":"string"},"active_credentials":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j",
-     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Get engine principal"})j"},
+     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"justification":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"superseded_by":{"type":"string"},"created_at":{"type":"integer"},"revoked_at":{"type":"integer"},"created_by":{"type":"string"},"active_credentials":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
 
     {"revoke_engine_principal",
      "Terminally revoke an engine principal: revokes every active credential first, THEN flips "
@@ -669,8 +669,7 @@ static const ToolDef kTools[] = {
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"},)j"
      R"j("superseded_by":{"type":"string","description":"Optional successor engine principal id, recorded on this row for audit trail continuity"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"revoked":{"type":"boolean"},"principal_id":{"type":"string"},"credentials_revoked":{"type":"integer"}},"required":["revoked","principal_id"]})j",
-     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Revoke engine principal"})j"},
+     R"j({"type":"object","properties":{"revoked":{"type":"boolean"},"principal_id":{"type":"string"},"credentials_revoked":{"type":"integer"}},"required":["revoked","principal_id"]})j"},
 
     {"mint_engine_credential",
      "Mint the FIRST credential for an engine principal (MCP tier hard-locked to readonly, "
@@ -679,15 +678,15 @@ static const ToolDef kTools[] = {
      "rotate_engine_credential once a credential already exists — this tool is for the initial "
      "mint only (a second call errors: at most two active credentials, and only "
      "rotate_engine_credential drives that state machine). Mirrors POST "
-     "/api/v1/engine-principals/{id}/credentials. Destructive — requires Security:Write (live "
-     "credential issuance; supervised MCP tier; approval-gated).",
+     "/api/v1/engine-principals/{id}/credentials. Approval-gated — requires Security:Write (live "
+     "credential issuance; supervised MCP tier; maker-checker approval). Additive: issues the "
+     "first credential, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
      R"j("name":{"type":"string","description":"Human-readable credential label"},)j"
      R"j("ttl_days":{"type":"integer","default":90,"minimum":1,"maximum":90,"description":"Credential lifetime in days (90-day ceiling, design doc §7)"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time reveal — capture now"},"principal_id":{"type":"string"},"expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id","expires_at"]})j",
-     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Mint engine credential"})j"},
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time reveal — capture now"},"principal_id":{"type":"string"},"expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id","expires_at"]})j"},
 
     {"rotate_engine_credential",
      "Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): "
@@ -704,8 +703,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j",
-     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Rotate engine credential"})j"},
+     R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j"},
 
     {"confirm_engine_rotation",
      "Explicit maker-checker confirmation that a rotation's successor secret has been received/"
@@ -718,8 +716,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
-     R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j",
-     R"j({"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Confirm engine credential rotation"})j"},
+     R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
     {"transfer_engine_principal_owner",
      "Reassign an engine principal's named responsible owner. Admin-forced — independent of the "
@@ -732,8 +729,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
      R"j("new_owner":{"type":"string","description":"Username of the new responsible human; must reference an existing user"})j"
      R"j(},"required":["principal_id","new_owner"]})j",
-     R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j",
-     R"j({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Transfer engine principal owner"})j"},
+     R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
     {"audit_engine_no_admin",
      "Auditor-runnable proof (design doc §4.2) that 'no admin, ever' and 'no all-permissions "
@@ -753,8 +749,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts the audit to lifecycle_state=active principals only"})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"ok":{"type":"boolean"},"violations":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},"required":["principal_id","reason"]}}},"required":["ok","violations"]})j",
-     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Audit engine principals for admin-grant violations"})j"},
+     R"j({"type":"object","properties":{"ok":{"type":"boolean"},"violations":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},"required":["principal_id","reason"]}}},"required":["ok","violations"]})j"},
 
     // ── Phase 2 write tools (#289 / Issue 13.5) — dispatched below ──────────
     // The optional `approval_id` argument on the approval-gated tools
@@ -832,8 +827,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
      R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
      R"j(},"required":["principal_id","role"]})j",
-     kObjectOutputSchema,
-     R"({"readOnlyHint":false,"idempotentHint":false,"destructiveHint":false,"title":"Assign a fleet-wide role to an engine principal"})"},
+     kObjectOutputSchema},
 
     {"unassign_engine_role",
      "Revoke a FLEET-WIDE RBAC role from an engine principal, immediately removing the "
@@ -845,8 +839,7 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
      R"j("role":{"type":"string","description":"The role name to revoke"})j"
      R"j(},"required":["principal_id","role"]})j",
-     kObjectOutputSchema,
-     R"({"readOnlyHint":false,"idempotentHint":false,"destructiveHint":true,"title":"Revoke a fleet-wide role from an engine principal"})"},
+     kObjectOutputSchema},
 
     {"list_engine_roles",
      "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
@@ -856,37 +849,34 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
-     kObjectOutputSchema,
-     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"title":"List an engine principal's fleet-wide roles"})"},
+     kObjectOutputSchema},
 
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
      "Return a compact fleet-health briefing for an agentic worker: OS mix, online population, "
      "optional compliance, DEX/network source availability, freshness metadata, and honest "
      "missing-source flags. Use this first for executive briefings and incident triage; do not "
-     "use it as proof of cluster/database internals.",
+     "use it as proof of cluster/database internals. Summary only; performs no endpoint execution.",
      R"({"type":"object","properties":{"ttl_seconds":{"type":"integer","default":30,"minimum":5,"maximum":300}}})",
-     R"({"type":"object","required":["generated_at","data_age_seconds","partial","missing_sources","agents","os_mix","recommended_next_tools"],"properties":{"generated_at":{"type":"string"},"data_age_seconds":{"type":"integer"},"partial":{"type":"boolean"},"missing_sources":{"type":"array","items":{"type":"string"}},"agents":{"type":"object"},"os_mix":{"type":"object"},"recommended_next_tools":{"type":"array","items":{"type":"string"}}}})",
-     R"({"readOnlyHint":true,"title":"Get fleet posture fast","safety":"summary-only; no endpoint execution"})"},
+     R"({"type":"object","required":["generated_at","data_age_seconds","partial","missing_sources","agents","os_mix","recommended_next_tools"],"properties":{"generated_at":{"type":"string"},"data_age_seconds":{"type":"integer"},"partial":{"type":"boolean"},"missing_sources":{"type":"array","items":{"type":"string"}},"agents":{"type":"object"},"os_mix":{"type":"object"},"recommended_next_tools":{"type":"array","items":{"type":"string"}}}})"},
     {"classify_operational_question",
      "Classify an operator question into answerable_now, answerable_with_live_dispatch, "
      "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use this "
-     "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks.",
+     "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks. "
+     "Advisory classification only, not a security gate.",
      R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
-     kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Classify operational question","safety":"advisory classification only; not a security gate"})"},
+     kObjectOutputSchema},
     {"get_incident_playbook",
      "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
-     "the first tool, safe tool path, connector gaps, and approval boundaries.",
+     "the first tool, safe tool path, connector gaps, and approval boundaries. Workflow guidance "
+     "only.",
      R"({"type":"object","properties":{"scenario":{"type":"string","maxLength":2048,"description":"Exact scenario name, category, or curated tag (e.g. openshift, teams, crowdstrike, postgres, buildx) — matched exactly, not by substring"}},"required":["scenario"]})",
-     kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Get incident playbook","safety":"workflow guidance only"})"},
+     kObjectOutputSchema},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
-     "links and next tools instead of dumping unbounded rows.",
+     "links and next tools instead of dumping unbounded rows. Summarization only.",
      R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
-     kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Summarize working set","safety":"summarization only"})"},
+     kObjectOutputSchema},
 
     // ── A2 discovery tools (roadmap Issue 17.1, docs/agentic-first-principle.md
     // §A2) — mirrors of the GET /api/v1/discover/* REST family, sharing the SAME
@@ -895,35 +885,30 @@ static const ToolDef kTools[] = {
     // any concurrent PR inserting WRITE tools earlier in this array).
     {"discover_permissions",
      "RBAC permission catalog: every securable_type x operation pair the RBAC store "
-     "recognizes, plus the full role -> allowed-operations grid.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Discover RBAC permissions","safety":"catalog read only"})"},
+     "recognizes, plus the full role -> allowed-operations grid. Read-only catalog.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema},
     {"discover_instructions",
      "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
-     "commands this worker may dispatch via execute_instruction.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Discover instruction definitions","safety":"catalog read only"})"},
+     "commands this worker may dispatch via execute_instruction. Read-only catalog.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
-     "(the response carries a caveat field).",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Discover REST routes","safety":"catalog read only"})"},
+     "(the response carries a caveat field). Read-only catalog.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema},
     {"discover_scope_kinds",
      "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
      "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
-     "syntax and examples for building a `scope` expression.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Discover scope DSL","safety":"catalog read only, static"})"},
+     "syntax and examples for building a `scope` expression. Read-only, static catalog.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema},
     {"discover_plugins",
      "Plugin/action catalog observed across currently-connected agents. Each action carries an "
      "inline parameter_schema when it has a published InstructionDefinition (so you learn HOW to "
      "call it, not just that it exists); actions without one are name+description only — "
      "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. New to "
      "the fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
-     "before acting.",
-     R"({"type":"object","properties":{}})", kObjectOutputSchema,
-     R"({"readOnlyHint":true,"title":"Discover plugins","safety":"catalog read only"})"},
+     "before acting. Read-only catalog.",
+     R"({"type":"object","properties":{}})", kObjectOutputSchema},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -932,8 +917,7 @@ static const ToolDef kTools[] = {
      "11) is NOT returned here — it is served only by the audited, management-group-scoped "
      "REST drill. Requires SoftwareLicensing:Read.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j",
-     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Query software licenses"})"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j"},
 
     // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
     // /api/v1/access-reviews* (ADR-1005 parity). JSON only: the REST
@@ -950,8 +934,7 @@ static const ToolDef kTools[] = {
      "slice would be useless as fleet-wide CC6.2 evidence. Self-audited as "
      "access_review.exported. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}}},"required":["count","rows"]})j",
-     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Export access review evidence"})"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}}},"required":["count","rows"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
@@ -965,8 +948,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("title":{"type":"string","description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
-     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j",
-     R"({"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"title":"Open access review campaign"})"},
+     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
 
     {"record_attestation",
      "Record one reviewer decision against a grant frozen into an open campaign — "
@@ -988,8 +970,7 @@ static const ToolDef kTools[] = {
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
      R"j("justification":{"type":"string"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
-     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j",
-     R"({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Record access review attestation"})"},
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
@@ -999,8 +980,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j",
-     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Get access review campaign"})"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
@@ -1008,8 +988,7 @@ static const ToolDef kTools[] = {
      "needs to prove reviews ran on cadence. Mirrors GET /api/v1/access-reviews. "
      "Self-audited as access_review.list. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"}}}}},"required":["count","campaigns"]})j",
-     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"List access review campaigns"})"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"}}}}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
@@ -1021,8 +1000,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j",
-     R"({"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"title":"Close access review campaign"})"},
+     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -1172,6 +1150,159 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"list_access_reviews", {"AccessReview", "Read"}},
     {"close_access_review", {"AccessReview", "Attest"}},
 };
+
+// ── Tool annotation classification (ADR-1005 track 2g PR 2, invariant A5 item 1) ──
+//
+// SINGLE SOURCE for the standard MCP annotation hints. Every tool's served
+// `annotations` object is GENERATED from this table (build_tool_annotations),
+// so an incoherent combination (e.g. readOnlyHint && destructiveHint) is
+// unrepresentable and the served bytes cannot drift from the classification.
+//
+// `effect` is the tool's substantive domain side-effect, NOT its approval
+// tier — destructiveness ("can overwrite/remove/irreversibly transition
+// EXISTING state") and maker-checker approval answer different questions and
+// are deliberately independent (e.g. record_attestation is destructive yet not
+// approval-gated; assign_engine_role is approval-gated yet additive). Derive:
+//   readOnlyHint    = (effect == ReadOnly)
+//   destructiveHint = (effect == Destructive)   // meaningful only when !readOnly
+//   openWorldHint   = false                     // closed managed fleet, always
+// `idempotent` is ORTHOGONAL to effect (all four quadrants exist) and is a
+// hand-authored, safe-direction value (when in doubt, false — a false
+// idempotentHint:true invites an unsafe blind retry, a BLOCKING A5 defect).
+//
+// A false SAFE-direction hint (a destructive tool marked destructiveHint:false,
+// or a non-idempotent tool marked idempotentHint:true) is a BLOCKING defect per
+// A5. This table + its cross-check test (test_mcp_server.cpp) is the CI backstop
+// for that. Incidental audit rows / metrics / access-timestamps do NOT make an
+// otherwise-additive tool Destructive. security-guardian reviews this table on
+// every change (governance).
+enum class ToolEffect { ReadOnly, Additive, Destructive };
+
+struct ToolAnnotation {
+    ToolEffect effect;
+    bool idempotent;
+    const char* title;
+};
+
+static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
+    // ── Read-only tools (effect ReadOnly, idempotent) ─────────────────────────
+    {"list_agents", {ToolEffect::ReadOnly, true, "List agents"}},
+    {"get_agent_details", {ToolEffect::ReadOnly, true, "Get agent details"}},
+    {"query_audit_log", {ToolEffect::ReadOnly, true, "Query audit log"}},
+    {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
+    {"get_definition", {ToolEffect::ReadOnly, true, "Get instruction definition"}},
+    {"query_responses", {ToolEffect::ReadOnly, true, "Query responses"}},
+    {"aggregate_responses", {ToolEffect::ReadOnly, true, "Aggregate responses"}},
+    {"query_inventory", {ToolEffect::ReadOnly, true, "Query inventory"}},
+    {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
+    {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
+    {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
+    {"get_tags", {ToolEffect::ReadOnly, true, "Get tags"}},
+    {"search_agents_by_tag", {ToolEffect::ReadOnly, true, "Search agents by tag"}},
+    {"list_policies", {ToolEffect::ReadOnly, true, "List policies"}},
+    {"get_compliance_summary", {ToolEffect::ReadOnly, true, "Get compliance summary"}},
+    {"get_fleet_compliance", {ToolEffect::ReadOnly, true, "Get fleet compliance"}},
+    {"list_management_groups", {ToolEffect::ReadOnly, true, "List management groups"}},
+    {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
+    {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
+    {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
+    {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
+    {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
+    {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
+    {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
+    {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
+    {"get_dex_signal_detail", {ToolEffect::ReadOnly, true, "Get DEX signal detail"}},
+    {"get_dex_perf_fleet", {ToolEffect::ReadOnly, true, "Get DEX fleet performance"}},
+    {"get_dex_perf_cohorts", {ToolEffect::ReadOnly, true, "Get DEX performance cohorts"}},
+    {"get_dex_perf_cohort_diff", {ToolEffect::ReadOnly, true, "Get DEX cohort performance diff"}},
+    {"list_dex_perf_devices", {ToolEffect::ReadOnly, true, "List DEX performance devices"}},
+    {"list_dex_perf_apps", {ToolEffect::ReadOnly, true, "List DEX performance apps"}},
+    {"get_dex_app_perf", {ToolEffect::ReadOnly, true, "Get DEX app performance"}},
+    {"get_dex_group_app_perf", {ToolEffect::ReadOnly, true, "Get DEX group app performance"}},
+    {"compare_app_perf_versions", {ToolEffect::ReadOnly, true, "Compare app performance versions"}},
+    {"get_network_fleet", {ToolEffect::ReadOnly, true, "Get fleet network quality"}},
+    {"list_network_devices", {ToolEffect::ReadOnly, true, "List network devices"}},
+    {"get_bundle_result", {ToolEffect::ReadOnly, true, "Get bundle result"}},
+    {"list_issued_certs", {ToolEffect::ReadOnly, true, "List issued certificates"}},
+    {"list_engine_principals", {ToolEffect::ReadOnly, true, "List engine principals"}},
+    {"get_engine_principal", {ToolEffect::ReadOnly, true, "Get engine principal"}},
+    {"audit_engine_no_admin",
+     {ToolEffect::ReadOnly, true, "Audit engine principals for admin-grant violations"}},
+    {"list_engine_roles", {ToolEffect::ReadOnly, true, "List engine principal roles"}},
+    {"get_fleet_posture_fast", {ToolEffect::ReadOnly, true, "Get fleet posture fast"}},
+    {"classify_operational_question",
+     {ToolEffect::ReadOnly, true, "Classify operational question"}},
+    {"get_incident_playbook", {ToolEffect::ReadOnly, true, "Get incident playbook"}},
+    {"summarize_working_set", {ToolEffect::ReadOnly, true, "Summarize working set"}},
+    {"discover_permissions", {ToolEffect::ReadOnly, true, "Discover RBAC permissions"}},
+    {"discover_instructions", {ToolEffect::ReadOnly, true, "Discover instruction definitions"}},
+    {"discover_routes", {ToolEffect::ReadOnly, true, "Discover REST routes"}},
+    {"discover_scope_kinds", {ToolEffect::ReadOnly, true, "Discover scope DSL"}},
+    {"discover_plugins", {ToolEffect::ReadOnly, true, "Discover plugins"}},
+    {"query_software_licenses", {ToolEffect::ReadOnly, true, "Query software licenses"}},
+    {"export_access_review", {ToolEffect::ReadOnly, true, "Export access review evidence"}},
+    {"get_access_review", {ToolEffect::ReadOnly, true, "Get access review campaign"}},
+    {"list_access_reviews", {ToolEffect::ReadOnly, true, "List access review campaigns"}},
+
+    // ── Mutating tools (effect Additive/Destructive) ──────────────────────────
+    // set_tag: INSERT OR REPLACE overwrites an existing tag value → Destructive,
+    // but the end state on retry is identical → idempotent.
+    {"set_tag", {ToolEffect::Destructive, true, "Set agent tag"}},
+    {"delete_tag", {ToolEffect::Destructive, true, "Delete agent tag"}},
+    // execute_*: dispatch caller-selected plugin actions → worst-case destructive,
+    // and each call is a fresh async run (new command/execution ids) → not idempotent.
+    {"execute_instruction", {ToolEffect::Destructive, false, "Execute instruction"}},
+    {"execute_bundle", {ToolEffect::Destructive, false, "Execute live-query bundle"}},
+    // approve/reject: one-way pending→decided transition (approve also arms a live
+    // one-time execution ticket) → destructive + non-idempotent.
+    {"approve_request", {ToolEffect::Destructive, false, "Approve request"}},
+    {"reject_request", {ToolEffect::Destructive, false, "Reject request"}},
+    {"quarantine_device", {ToolEffect::Destructive, false, "Quarantine device"}},
+    {"revoke_certificate", {ToolEffect::Destructive, false, "Revoke certificate"}},
+    // create/mint: pure INSERT of NEW state, nothing existing overwritten → Additive
+    // (approval-gated + high-impact, but that is the tier's job, not this hint).
+    {"create_engine_principal", {ToolEffect::Additive, false, "Create engine principal"}},
+    {"revoke_engine_principal", {ToolEffect::Destructive, false, "Revoke engine principal"}},
+    {"transfer_engine_principal_owner",
+     {ToolEffect::Destructive, false, "Transfer engine principal owner"}},
+    {"mint_engine_credential", {ToolEffect::Additive, false, "Mint engine credential"}},
+    {"rotate_engine_credential", {ToolEffect::Destructive, false, "Rotate engine credential"}},
+    // confirm_engine_rotation: revokes the predecessor credential in the confirm
+    // txn (api_token_store.cpp) → Destructive; only takes principal_id (does not
+    // pin the rotation), so a blind retry can confirm a LATER rotation early →
+    // NOT idempotent. Both were shipped wrong (2g PR 2 fix).
+    {"confirm_engine_rotation", {ToolEffect::Destructive, false, "Confirm engine credential rotation"}},
+    // assign/unassign_engine_role: INSERT OR IGNORE (additive) vs DELETE grant
+    // (destructive). Both reach a fixed end state on retry → idempotent.
+    {"assign_engine_role", {ToolEffect::Additive, true, "Assign fleet-wide role to engine principal"}},
+    {"unassign_engine_role",
+     {ToolEffect::Destructive, true, "Revoke fleet-wide role from engine principal"}},
+    {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
+    // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
+    {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
+    // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
+    {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
+};
+
+// Generate a tool's served MCP `annotations` object from its classification.
+// A missing entry fails SAFE (over-warn: readOnly=false, destructive=true,
+// idempotent=false) rather than emitting UB or a false-safe; the cross-check
+// test guarantees every kTools[] entry is classified, so this fallback never
+// fires in a shipped build.
+std::string build_tool_annotations(const char* name) {
+    auto it = kToolAnnotation.find(name);
+    if (it == kToolAnnotation.end())
+        return R"({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false})";
+    const ToolAnnotation& a = it->second;
+    return JObj()
+        .add("title", a.title)
+        .add("readOnlyHint", a.effect == ToolEffect::ReadOnly)
+        .add("destructiveHint", a.effect == ToolEffect::Destructive)
+        .add("idempotentHint", a.idempotent)
+        .add("openWorldHint", false)
+        .str();
+}
 
 // ── Resource definitions ──────────────────────────────────────────────────
 
@@ -1612,8 +1743,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     .raw("inputSchema", kTools[i].input_schema_json);
                 if (kTools[i].output_schema_json)
                     tool.raw("outputSchema", kTools[i].output_schema_json);
-                if (kTools[i].annotations_json)
-                    tool.raw("annotations", kTools[i].annotations_json);
+                // Annotations are generated from the single-source kToolAnnotation
+                // classification (2g PR 2) — every tool carries all four spec hints;
+                // the served bytes cannot drift from the reviewed table.
+                tool.raw("annotations", build_tool_annotations(kTools[i].name));
                 arr.add(tool);
             }
             auto result = JObj().raw("tools", arr.str()).str();
@@ -7387,6 +7520,26 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         spdlog::warn("MCP: streaming enabled with NO credential re-validation — a live GET SSE "
                      "stream will survive revocation of the credential that opened it");
     }
+}
+
+// Test-only accessor for the internal kToolSecurity map (2g PR 2). The map has
+// internal linkage in the anonymous namespace above but is visible here in the
+// same translation unit; this exposes a copy so the annotation cross-check test
+// (a separate TU) can assert the served hints against each tool's operation.
+std::vector<ToolSecurityRow> tool_security_rows_for_test() {
+    std::vector<ToolSecurityRow> rows;
+    rows.reserve(kToolSecurity.size());
+    for (const auto& [name, sec] : kToolSecurity)
+        rows.push_back({name, sec.securable_type, sec.operation});
+    return rows;
+}
+
+std::vector<std::string_view> tool_annotation_names_for_test() {
+    std::vector<std::string_view> names;
+    names.reserve(kToolAnnotation.size());
+    for (const auto& [name, _ann] : kToolAnnotation)
+        names.push_back(name);
+    return names;
 }
 
 } // namespace yuzu::server::mcp
