@@ -83,6 +83,9 @@ Tracked, not forgotten. All are unreachable while dormant.
   `evicted_no_send_evidence`; persist wedged by a key collision; disk-full triple bind.
 - **UP-4** `send_exception_count()` and `lifecycle_backpressure_drops()` reach no heartbeat tag.
   Confirmed by me: referenced only in tests. Highest-value cheap fix outstanding.
+  **DELIVERED** on branch `feat/guardian-journal-observability` (alongside flip-checklist item 5):
+  wired both into the journal family as `yuzu.guardian_send_exceptions` and
+  `yuzu.guardian_journal_backpressure_drops`, with fleet rollups and metrics.md rows.
 - **compliance** provenance-backfill throw can OVER-report the audit-gap counter.
 - **performance** P1 RSS ratchet (5 -> 206 MiB, permanent); P2 per-batch tokens vs per-record
   cost; P3 re-arm floor below pass cost.

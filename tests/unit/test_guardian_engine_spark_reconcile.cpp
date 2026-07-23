@@ -836,18 +836,45 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
                                  return SendResult::Sent;
                              });
 
+    // A fatal assertion at the wait boundary can unwind while the worker is racing into
+    // the parked callback. Declared after engine so this releases the worker before
+    // ~GuardianEngine joins it, while send_mu/send_cv/release are still alive.
+    struct ReleaseParkedWorker {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release_flag;
+        ~ReleaseParkedWorker() {
+            {
+                std::lock_guard<std::mutex> lk{mu};
+                release_flag = true;
+            }
+            cv.notify_all();
+        }
+    } release_parked_worker{send_mu, send_cv, release};
+
     // One injected write failure leaves the armed rule's record PENDING rather than durable,
     // so what reaches disk later is attributable to a stop()-path persist and nothing else.
     engine.lifecycle_journal_for_test()->inject_write_failures_for_test(1);
     gpb::GuaranteedStatePush push;
     push.set_full_sync(true);
     *push.add_rules() = make_service_rule("r1");
-    engine.apply_rules(push);
+    // Serialize-then-dispatch because the rule carries a protobuf Map; see the fixture's
+    // apply() helper above for the Windows EXE/DLL abseil hash-seed boundary.
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, push.SerializeAsString())
+                .exit_code == 0);
     REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
 
     {   // Park the worker inside a send, so the join below cannot complete.
+        // Generous deadline: on a saturated Windows CI runner the drain worker can
+        // be starved well past its ~5 s periodic backstop before it reaches the
+        // send callback (box-contention flake, not a logic bug - see the WeeTam
+        // agent-suite timeouts). The deadline is NOT shrunk by pinning the
+        // backstop cadence: a short backstop would let the worker persist the
+        // pending record on its own timer BEFORE the stop()-path persist, which
+        // would defeat this test's whole attribution. If the worker still misses
+        // this window, ReleaseParkedWorker above makes the failure exit cleanly.
         std::unique_lock<std::mutex> lk{send_mu};
-        REQUIRE(send_cv.wait_for(lk, std::chrono::seconds(10), [&] { return in_send; }));
+        REQUIRE(send_cv.wait_for(lk, std::chrono::seconds(30), [&] { return in_send; }));
     }
 
     std::atomic<bool> stop_returned{false};

@@ -265,14 +265,14 @@ public:
     // prune rebase restores it - and increments this. Correct operation never goes negative, so
     // any non-zero here is a real accounting bug surfacing, not silently admitted on a clamp.
     //
-    // OBSERVABILITY GAP (untracked prerequisite, CUTOVER-GATED): unlike its sibling
-    // write_capacity_rejected, this counter is NOT in GuardianJournalStats / the heartbeat emit
-    // AT ALL yet - so a negative-gauge brick is currently only locally counted. Worse, the
-    // journal_batch_count gauge CLAMPS a negative to 0, i.e. reads as a healthy EMPTY journal,
-    // so the brick is camouflaged on the primary gauge (governance UP-4). Adding this field to
-    // the heartbeat (mirror write_capacity_rejected: struct field + journal_stats() + emit) must
-    // land WITH the prefer_spark cutover, not after; only THEN does its server-side fleet rollup
-    // ride #2298 gate 3. Harmless while inert (prefer_spark=false).
+    // NOW WIRED (flip checklist item 5, #2298 / L1): this counter mirrors write_capacity_rejected
+    // through GuardianJournalStats + journal_stats() + emit_guardian_journal_heartbeat_tags, and
+    // rolls up server-side as yuzu_fleet_guardian_journal_gauge_underflow (#2298 gate 3). Landed
+    // PRE-flip on purpose: it stays 0 (and the sparse emit ships no tag) while inert
+    // (prefer_spark=false), so the telemetry is already in place when the cutover makes the write
+    // path live. Without it the journal_batch_count gauge CLAMPS a negative to 0 - reading as a
+    // healthy EMPTY journal - so this is the only signal that de-camouflages the fail-closed
+    // state (governance UP-4).
     [[nodiscard]] std::uint64_t gauge_underflow() const noexcept {
         return gauge_underflow_.load(std::memory_order_relaxed);
     }
