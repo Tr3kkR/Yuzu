@@ -888,6 +888,81 @@ TEST_CASE("GuaranteedStateStore: generic per-obs_type drill-down + OS scope",
     CHECK(mat[2].count == 1);
 }
 
+TEST_CASE("GuaranteedStateStore: DEX crash + signal aggregations are OS-scopable (C-DEX-1)",
+          "[guaranteed_state_store][dex][signals][crash]") {
+    // process.crashed now arrives from BOTH Windows and macOS agents. The
+    // crash-free headline is Windows-denominated, and the Catalogue drilldown
+    // honours a single-OS lens, so both must be scopable by platform — the
+    // default (empty platform) stays all-OS.
+    GuaranteedStateStore store(":memory:");
+    auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& subject, const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow r;
+        r.event_id = id;
+        r.rule_id = "__observation__";
+        r.agent_id = agent;
+        r.event_type = type;
+        r.severity = "info";
+        r.detail_json = "{\"subject\":\"" + subject + "\",\"platform\":\"" + plat + "\"}";
+        r.timestamp = ts;
+        REQUIRE(store.insert_event(r));
+    };
+    obs("c1", "win-1", "process.crashed", "chrome.exe", "windows", "2026-06-08T10:00:00Z");
+    obs("c2", "win-1", "process.crashed", "chrome.exe", "windows", "2026-06-09T10:00:00Z");
+    obs("c3", "win-2", "process.crashed", "outlook.exe", "windows", "2026-06-09T11:00:00Z");
+    obs("c4", "mac-1", "process.crashed", "Safari", "macos", "2026-06-09T12:00:00Z");
+
+    SECTION("dex_crash_summary scopes by platform; empty = all-OS") {
+        auto all = store.dex_crash_summary();
+        CHECK(all.total_crashes == 4);
+        CHECK(all.distinct_devices == 3);
+
+        auto win = store.dex_crash_summary("", "windows");
+        CHECK(win.total_crashes == 3);
+        CHECK(win.distinct_devices == 2); // win-1, win-2 — NOT mac-1
+
+        auto mac = store.dex_crash_summary("", "macos");
+        CHECK(mac.total_crashes == 1);
+        CHECK(mac.distinct_devices == 1);
+    }
+
+    SECTION("subjects/devices/by_day OS-scope the drilldown; by_os stays cross-OS") {
+        // subjects: the Windows lens sees chrome.exe + outlook.exe, never Safari.
+        auto subj_win = store.dex_signal_subjects("process.crashed", "", 15, "windows");
+        REQUIRE(subj_win.size() == 2);
+        bool win_has_safari = false;
+        for (const auto& s : subj_win)
+            if (s.subject == "Safari")
+                win_has_safari = true;
+        CHECK_FALSE(win_has_safari);
+
+        auto subj_mac = store.dex_signal_subjects("process.crashed", "", 15, "macos");
+        REQUIRE(subj_mac.size() == 1);
+        CHECK(subj_mac[0].subject == "Safari");
+
+        // devices: the Windows lens is win-1/win-2 only.
+        auto dev_win = store.dex_signal_devices("process.crashed", "", 15, "windows");
+        REQUIRE(dev_win.size() == 2);
+        for (const auto& d : dev_win)
+            CHECK(d.agent_id != "mac-1");
+
+        // by_day: the Windows lens excludes the macOS-only crash on 06-09.
+        int64_t all_0609 = 0, win_0609 = 0;
+        for (const auto& d : store.dex_signal_by_day("process.crashed"))
+            if (d.day == "2026-06-09")
+                all_0609 = d.crashes;
+        for (const auto& d : store.dex_signal_by_day("process.crashed", "", "windows"))
+            if (d.day == "2026-06-09")
+                win_0609 = d.crashes;
+        CHECK(all_0609 == 3); // c2(win) + c3(win) + c4(mac)
+        CHECK(win_0609 == 2); // c2 + c3 only
+
+        // by_os is deliberately NOT platform-scoped — it IS the cross-OS split.
+        auto os = store.dex_signal_by_os("process.crashed");
+        REQUIRE(os.size() == 2); // both windows and macos rows present
+    }
+}
+
 TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[guaranteed_state_store][crash][dex]") {
     GuaranteedStateStore store(":memory:");
     auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,
@@ -1031,6 +1106,97 @@ TEST_CASE("GuaranteedStateStore: multi-signal summary, hang-aware apps, boot sta
     CHECK(dh[0].obs_type == "service.crashed"); // newest first
     CHECK(dh[3].obs_type == "os.boot");
     CHECK(dh[3].metric == 43210.0);
+}
+
+TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; "
+          "empty stays all-OS (#1746)",
+          "[guaranteed_state_store][dex][signals]") {
+    // The Catalogue's single-OS filter needs its own signal rollup, not the
+    // all-fleet composite read under a Linux/macOS heading. `platform` is an
+    // ADDITIVE filter on top of the existing GROUP BY obs_type — proven here on
+    // both a type shared across all three platforms (process.crashed) and a type
+    // exclusive to one (network.wifi_drop, macOS-only).
+    GuaranteedStateStore store(":memory:");
+    auto sig = [&](const std::string& id, const std::string& agent, const std::string& type,
+                   const std::string& plat, const std::string& ts) {
+        GuaranteedStateEventRow e;
+        e.event_id = id;
+        e.rule_id = "__observation__";
+        e.agent_id = agent;
+        e.event_type = type;
+        e.severity = "info";
+        e.detail_json = "{\"subject\":\"x\",\"platform\":\"" + plat + "\"}";
+        e.timestamp = ts;
+        REQUIRE(store.insert_event(e));
+    };
+    sig("w1", "agent-A", "process.crashed", "windows", "2026-06-09T10:00:00Z");
+    sig("w2", "agent-B", "process.crashed", "windows", "2026-06-09T10:05:00Z");
+    sig("l1", "agent-C", "process.crashed", "linux", "2026-06-09T10:10:00Z");
+    sig("m1", "agent-D", "process.crashed", "macos", "2026-06-09T10:15:00Z");
+    sig("m2", "agent-D", "network.wifi_drop", "macos", "2026-06-09T10:20:00Z");
+    // Non-canonical agent token: canonicalized at projection write (the per-OS
+    // lens filters on exact platform match, so "Darwin" must land in "macos"
+    // rather than silently vanishing from every single-OS lens).
+    sig("m3", "agent-E", "network.wifi_drop", "Darwin", "2026-06-09T10:25:00Z");
+    // QE-c: three more canonicalization edge cases on top of "Darwin" above.
+    // "WINDOWS" (all-caps) lowercases to "windows" then starts_with("win") — an
+    // ordinary canonicalization, landing in the windows lens like w1/w2.
+    sig("w3", "agent-F", "process.crashed", "WINDOWS", "2026-06-09T10:30:00Z");
+    // "Linux " (trailing space) lowercases to "linux " — starts_with("lin") still
+    // matches on the PREFIX, and the canonicalization is a full literal
+    // reassignment (not a trim), so the trailing space is discarded and this
+    // still lands in the linux lens like l1.
+    sig("l2", "agent-G", "process.crashed", "Linux ", "2026-06-09T10:35:00Z");
+    // "" (no platform key/empty value): none of the canonicalization branches
+    // match, so it stays "". It can never equal "windows"/"linux"/"macos" in the
+    // scoped query's exact-match filter, so it is EXCLUDED from every single-OS
+    // lens — but it has no platform filter at all in the unscoped ("all") query,
+    // so it still counts there.
+    sig("e1", "agent-H", "process.crashed", "", "2026-06-09T10:40:00Z");
+
+    // Scoped to macOS: only macOS's own rows — its slice of process.crashed AND
+    // its exclusive network.wifi_drop (including the "Darwin"-token agent). The
+    // new WINDOWS/"Linux "/"" rows above are all non-macOS, so this is unchanged.
+    // Windows/Linux crashes never leak in.
+    auto mac = store.dex_signal_summary("", "macos");
+    REQUIRE(mac.size() == 2);
+    CHECK(mac[0].obs_type == "network.wifi_drop"); // count 2 > crashed's 1
+    CHECK(mac[0].count == 2);
+    CHECK(mac[0].distinct_devices == 2);
+    CHECK(mac[1].obs_type == "process.crashed");
+    CHECK(mac[1].count == 1);
+    CHECK(mac[1].distinct_devices == 1);
+
+    // Scoped to windows: w1/w2 plus the canonicalized "WINDOWS" row (w3) = 3
+    // crashes, 3 devices; the macOS-only wifi_drop and the empty-platform row
+    // are both absent.
+    auto win = store.dex_signal_summary("", "windows");
+    REQUIRE(win.size() == 1);
+    CHECK(win[0].obs_type == "process.crashed");
+    CHECK(win[0].count == 3);
+    CHECK(win[0].distinct_devices == 3);
+
+    // Scoped to linux: l1 plus the canonicalized "Linux " row (l2) = 2 crashes,
+    // 2 devices; the empty-platform row is absent (never matches an exact
+    // single-OS filter).
+    auto lin = store.dex_signal_summary("", "linux");
+    REQUIRE(lin.size() == 1);
+    CHECK(lin[0].obs_type == "process.crashed");
+    CHECK(lin[0].count == 2);
+    CHECK(lin[0].distinct_devices == 2);
+
+    // Unscoped (platform="", the default parameter): the full all-OS rollup now
+    // also picks up the WINDOWS/"Linux "/"" rows — process.crashed climbs from 4
+    // to 7 rows / 7 distinct agents (the empty-platform row counts here even
+    // though it's excluded from every single-OS lens above); network.wifi_drop
+    // is macOS-only (2 rows incl. the canonicalized "Darwin" agent), unchanged.
+    auto all = store.dex_signal_summary();
+    REQUIRE(all.size() == 2);
+    CHECK(all[0].obs_type == "process.crashed"); // count=7 beats wifi_drop's count=2
+    CHECK(all[0].count == 7);
+    CHECK(all[0].distinct_devices == 7);
+    CHECK(all[1].obs_type == "network.wifi_drop");
+    CHECK(all[1].count == 2);
 }
 
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",

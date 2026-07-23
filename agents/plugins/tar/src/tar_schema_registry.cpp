@@ -115,12 +115,25 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/net/{tcp,tcp6,udp,udp6}. Connection lifetime "
                  "below the fast interval may be missed."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
+                 "PRIMARY tcp-lifecycle source: com.apple.network.statistics "
+                 "kctl (nstat) SRC_ADDED/SRC_REMOVED, the same client the "
+                 "netqual source uses for its quality leg (roadmap 2.2). "
+                 "System-wide flow visibility needs root; an unprivileged agent "
+                 "sees only its own flows and reports the honest 'none' rather "
+                 "than a partial capture. The wire structs are transcribed from "
+                 "XNU bsd/net/ntstat.h at the 13.3 floor and gated on a runtime "
+                 "length self-check that fails closed to the poll on mismatch. "
+                 "Endpoint Security has NO tcp/inet socket events "
+                 "(NOTIFY_EXEC/EXIT only), so it is not a replacement here."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "proc_pidfdinfo",
-                 "proc_listallpids + proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via "
-                 "libproc. Inherent TOCTOU between pid enumeration and per-fd "
-                 "query — short-lived sockets that close before the per-fd "
-                 "query may produce empty rows. Endpoint Security framework "
-                 "(kPlanned) is the modern replacement for sub-second fidelity."},
+                 "Fallback/seed poll: proc_listallpids + "
+                 "proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via libproc — always for "
+                 "udp; for tcp only while the nstat event stream above is "
+                 "unavailable (not root, socket/layout failure, or self-failed). "
+                 "Inherent TOCTOU between pid enumeration and per-fd query — "
+                 "short-lived sockets that close before the per-fd query may "
+                 "produce empty rows."},
             },
             .granularities = {
                 {
@@ -442,9 +455,20 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "(sub-ms LAN RTTs read 0); retrans/segs_out count since "
                  "stats-enable, not connection start; lost/ca_state are "
                  "delta-derived approximations of the Linux gauges."},
-                {"macos",   OsSupportStatus::kPlanned,   "nstat",
-                 "per-socket tcp_connection_info via the private nstat / "
-                 "PRIVATE_TCP_INFO path."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
+                 "com.apple.network.statistics kctl (nstat) SRC_DESC/SRC_COUNTS "
+                 "per tcp flow, the same client the tcp source's lifecycle leg "
+                 "uses (roadmap 2.2). Constraints: system-wide flow visibility "
+                 "needs root — an unprivileged agent sees only its own flows "
+                 "and netqual_capture_method honestly reports none rather than "
+                 "a partial capture; rtt/rtt_var are believed microseconds "
+                 "already (no *1000, unlike Windows' ms-resolution ESTATS); "
+                 "lost is a per-tick delta off the cumulative retransmit "
+                 "counter, never the lifetime total; a runtime wire-layout "
+                 "self-check falls back to capture_method=none on any mismatch "
+                 "rather than emit a plausible-but-wrong number (the private, "
+                 "unversioned nstat struct layout is this source's largest "
+                 "risk — see the roadmap 2.1 spike memo)."},
             },
             .granularities = {
                 {
@@ -1042,16 +1066,18 @@ std::vector<std::string> accepted_capture_methods_for_os(std::string_view source
 }
 
 std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
-    // Polling is the only wired network capture mechanism on every OS today.
-    // `enumerate_connections()` (the collect_fast network leg) always polls,
+    // The collect_fast NETWORK leg — `enumerate_connections()` — always polls,
     // regardless of the stored `network_capture_method`: the per-OS platform
     // APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling implementation,
     // and the kPlanned kernel-event methods (etw / endpoint_security) are
     // accepted for pre-staging but not yet collected. So every configured value
-    // maps to an effective mechanism of "polling". When a kernel-event collector
-    // lands, branch on `configured` (and the live session state, as the process
-    // collector does with `etw_active_`) here -- this is the single source of
-    // truth the `status` action reports (issue #1528).
+    // maps to an effective mechanism of "polling". (This is ONLY the fast
+    // network leg: the separate `tcp` lifecycle and `netqual` sources DO use a
+    // live kernel-event mechanism on macOS — nstat — reported through their own
+    // `*_capture_method` status keys, not this one.) When a kernel-event
+    // collector lands for THIS leg, branch on `configured` (and live session
+    // state, as the process collector does with `etw_active_`) here -- this is
+    // the single source of truth the `status` action reports (issue #1528).
     return "polling";
 }
 

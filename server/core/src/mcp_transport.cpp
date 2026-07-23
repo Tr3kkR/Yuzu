@@ -20,6 +20,24 @@ bool origin_allowed(std::string_view origin, const std::vector<std::string>& all
     return std::find(allowlist.begin(), allowlist.end(), origin) != allowlist.end();
 }
 
+namespace {
+
+// Case-insensitive whole-token compare against `text/event-stream`.
+bool is_sse_media_type(std::string_view token) {
+    constexpr std::string_view needle = "text/event-stream";
+    if (token.size() != needle.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < needle.size(); ++i) {
+        if (static_cast<char>(std::tolower(static_cast<unsigned char>(token[i]))) != needle[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 bool accept_wants_sse(std::string_view accept_header) {
     // Parse the Accept header as a comma-separated list of media ranges and look
     // for `text/event-stream` as a WHOLE media type — never a bare substring.
@@ -28,24 +46,42 @@ bool accept_wants_sse(std::string_view accept_header) {
     // (a prefix), so each range is split off, its `;`-delimited parameters are
     // dropped, OWS is trimmed, and the remaining media type is compared exactly
     // (case-insensitive per RFC 9110 — media types are case-insensitive).
-    // Limitation (acceptable while this has no production caller — SSE gating is
-    // 2f PR 2/3): the split is naive over `,` and does NOT honour RFC 9110
-    // quoted-strings, so a `,` inside a quoted parameter value (e.g.
-    // `application/json;x=",text/event-stream,"`) could mis-split into a false
-    // match. Harden with quoted-string-aware tokenisation before the GET/SSE
-    // channel branches on this (tracked follow-up).
+    //
+    // The `,` split is RFC-9110 quoted-string aware (#2073): a comma inside a
+    // quoted parameter value (`application/json;x=",text/event-stream,"`) is
+    // part of that value, not a range separator, and must NOT mis-split into a
+    // false SSE match — this function gates the GET SSE channel (2f PR 2), so a
+    // false positive would hand an SSE stream to a client that asked for JSON.
+    // Quoted-pair (`\"`) inside a quoted-string is honoured. An unterminated
+    // quote swallows the rest of the header into one range, which then fails the
+    // whole-type compare — fail-closed, the direction a parse ambiguity must go.
+    //
     // Wildcards (`*/*`, `text/*`) deliberately do NOT match — SSE requires an
     // explicit `text/event-stream` opt-in, so this fails closed to JSON.
-    constexpr std::string_view needle = "text/event-stream";
-    const auto lower = [](char c) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    };
     std::size_t pos = 0;
-    while (pos <= accept_header.size()) {
-        const std::size_t comma = accept_header.find(',', pos);
-        std::string_view token =
-            accept_header.substr(pos, comma == std::string_view::npos ? std::string_view::npos
-                                                                      : comma - pos);
+    const std::size_t n = accept_header.size();
+    while (pos <= n) {
+        // Scan to the next range-separating comma, tracking quoted-string state.
+        // The media type/subtype grammar admits no `"`, so the first `;` we meet
+        // outside quotes always ends the type — parameters are all that follow.
+        bool in_quotes = false;
+        std::size_t i = pos;
+        for (; i < n; ++i) {
+            const char c = accept_header[i];
+            if (in_quotes) {
+                if (c == '\\' && i + 1 < n) {
+                    ++i;  // quoted-pair: skip the escaped octet
+                } else if (c == '"') {
+                    in_quotes = false;
+                }
+            } else if (c == '"') {
+                in_quotes = true;
+            } else if (c == ',') {
+                break;
+            }
+        }
+        const bool last = i >= n;
+        std::string_view token = accept_header.substr(pos, i - pos);
         // Drop any `;`-delimited parameters (q=, charset, etc.) — only the type matters.
         if (const std::size_t semi = token.find(';'); semi != std::string_view::npos) {
             token = token.substr(0, semi);
@@ -54,23 +90,13 @@ bool accept_wants_sse(std::string_view accept_header) {
         std::size_t b = 0, e = token.size();
         while (b < e && std::isspace(static_cast<unsigned char>(token[b]))) ++b;
         while (e > b && std::isspace(static_cast<unsigned char>(token[e - 1]))) --e;
-        token = token.substr(b, e - b);
-        if (token.size() == needle.size()) {
-            bool match = true;
-            for (std::size_t j = 0; j < needle.size(); ++j) {
-                if (lower(token[j]) != needle[j]) {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) {
-                return true;
-            }
+        if (is_sse_media_type(token.substr(b, e - b))) {
+            return true;
         }
-        if (comma == std::string_view::npos) {
+        if (last) {
             break;
         }
-        pos = comma + 1;
+        pos = i + 1;
     }
     return false;
 }

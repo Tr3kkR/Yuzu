@@ -67,6 +67,20 @@ enum class AuthDBError : std::uint8_t {
     MfaAlreadyEnrolled,
 };
 
+/// `list_users_including_inactive()` row — same fields as `auth::UserEntry`
+/// plus the `is_active` flag `list_users()` deliberately filters out. A NEW
+/// type rather than extending `auth::UserEntry` itself: that struct is a
+/// broadly-shared read contract (session/login paths never care about
+/// disabled accounts), so adding a field there would be a cross-cutting
+/// change out of scope for the one caller (periodic access reviews, CC6.2)
+/// that needs to see disabled-but-still-granted users.
+struct UserWithStatus {
+    std::string username;
+    auth::Role role;
+    std::string identity_source{"local"};
+    bool is_active{true};
+};
+
 // ── AuthDB Class ─────────────────────────────────────────────────────────────
 
 class AuthDB {
@@ -155,6 +169,17 @@ public:
 
     /// List all active users.
     std::expected<std::vector<auth::UserEntry>, AuthDBError> list_users();
+
+    /// List EVERY user row (active AND disabled), each carrying its
+    /// `is_active` flag. Mirrors `list_users()`'s query with no `WHERE
+    /// is_active` filter — deliberately does NOT modify or replace
+    /// `list_users()` (other callers depend on its active-only contract).
+    /// The sole intended caller is the periodic access review builder
+    /// (`access_review_model.cpp`): a disabled user still holding a grant is
+    /// materially different CC6.2 evidence than an "orphan" grant with no
+    /// matching roster row at all, so the reviewer needs the full roster,
+    /// not just the active slice.
+    std::expected<std::vector<UserWithStatus>, AuthDBError> list_users_including_inactive();
 
     /// Read-only prefix scan over `users.username` (active AND soft-deleted)
     /// — backs the T8 startup collision-scan preflight (auth-engine-

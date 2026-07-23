@@ -42,6 +42,8 @@
 #include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
 #else
+#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
+
 #include <csignal>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -191,8 +193,30 @@ int run_process_win(yuzu::CommandContext& ctx, const std::string& cmd_line, int 
 
 int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>& argv,
                       int timeout_secs) {
+    // BR-001: hold the process-wide fork lock across [pipe()..fork()] --
+    // macOS/BSD has no pipe2(), so an unrelated thread's fork() landing in
+    // this window could inherit these still-inheritable fds. Released in
+    // the PARENT right after fork() returns; the child inherits it locked
+    // and never touches it (see fork_lock.hpp's contract).
+    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
+
     int pipe_fd[2];
     if (pipe(pipe_fd) != 0) {
+        ctx.write_output("status|error");
+        ctx.write_output("exit_code|-1");
+        return 1;
+    }
+
+    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC
+    // (F_SETFD, distinct from the O_NONBLOCK F_SETFL below) on both pipe
+    // ends before the lock is released, so a concurrent locked launcher
+    // forking in the unlock->close window can never inherit a live,
+    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
+    // failed pipe() above rather than silently forking with a leaky fd.
+    if (fcntl(pipe_fd[0], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(pipe_fd[1], F_SETFD, FD_CLOEXEC) == -1) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
         ctx.write_output("status|error");
         ctx.write_output("exit_code|-1");
         return 1;
@@ -246,6 +270,10 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
 #endif
         _exit(127); // exec failed
     }
+
+    // Parent: fork() has returned and this is not the child branch --
+    // release the fork lock now (see fork_lock.hpp's contract).
+    fork_pipe_lock.unlock();
 
     // Parent
     close(pipe_fd[1]);

@@ -120,6 +120,31 @@ public:
     /// Validate a raw Bearer token. Returns the ApiToken if valid and not expired/revoked.
     std::optional<ApiToken> validate_token(const std::string& raw_token);
 
+    /// Outcome of `validate_token_checked` — the tri-state `validate_token`
+    /// deliberately collapses. A held-open SSE stream must be able to tell
+    /// "this credential is definitively gone" (kill the stream NOW) from "we
+    /// cannot reach the store to find out" (ride out a bounded grace window
+    /// rather than cut every live stream on the fleet at once) — ADR-1005
+    /// Decision 15(i) / chaos CH-4. Ordinary request auth has no such need:
+    /// there, "cannot tell" and "no" both mean 401, which is why
+    /// `validate_token` folds them together.
+    enum class TokenCheck {
+        kValid,        ///< token exists, unrevoked, unexpired
+        kInvalid,      ///< DEFINITIVELY absent / revoked / expired
+        kUnavailable,  ///< store unreachable — indeterminate, NOT a revocation
+    };
+
+    struct CheckedToken {
+        TokenCheck status = TokenCheck::kInvalid;
+        std::optional<ApiToken> token;  ///< engaged iff kValid
+    };
+
+    /// `validate_token` with the failure mode preserved. The extra store probe
+    /// runs ONLY on the negative path (a valid token — the steady state for a
+    /// live stream — is served from the same 60 s cache as `validate_token`, so
+    /// re-validation stays O(cache-refresh), not O(streams × tick)).
+    CheckedToken validate_token_checked(const std::string& raw_token);
+
     /// List all tokens (for admin UI). Raw token values are never returned.
     /// Authoritative read (ADR-0012 §1): `unexpected` on a runtime DB error, a
     /// value (possibly empty) on success — never an empty vector papering over

@@ -11,6 +11,7 @@
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
+#include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
@@ -432,6 +433,31 @@ int main(int argc, char* argv[]) {
                    "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
                    "repeatable). Empty rejects any present Origin (absent is always allowed).")
         ->envname("YUZU_MCP_ALLOWED_ORIGINS");
+    app.add_option("--max-sse-streams", cfg.max_sse_streams,
+                   "Concurrent held-open SSE responses this server is sized for, across ALL "
+                   "streaming surfaces (MCP GET, /api/v1/events, dashboard, legacy /events). "
+                   "The HTTP worker pool is derived from this: a stream costs one blocked "
+                   "thread (no CPU; resident cost is a fraction of a virtual, platform-dependent stack reservation and is not yet measured). 0 = default (128). See ADR-0034.")
+        ->check(CLI::Range(std::size_t{0}, std::size_t{4096}))
+        ->envname("YUZU_MAX_SSE_STREAMS");
+    app.add_option("--mcp-max-streams-per-principal", cfg.mcp_max_streams_per_principal,
+                   "Max concurrent MCP SSE streams for a single principal — an anti-monopoly "
+                   "policy, not a capacity limit (capacity is --max-sse-streams)")
+        // Range-checked like its two siblings above. 0 would admit nothing at all, so the
+        // floor is 1; the ceiling matches --max-sse-streams (a per-principal cap above the
+        // global capacity is meaningless, and the global cap clamps it anyway).
+        ->check(CLI::Range(std::size_t{1}, std::size_t{4096}))
+        ->envname("YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL");
+    app.add_option("--http-worker-threads", cfg.http_worker_threads,
+                   "Pin the shared HTTP worker pool size by hand. 0 (default) derives it from "
+                   "--max-sse-streams, which is what you want; setting it clamps the stream "
+                   "target to what your pool can carry. The whole pool is created at BOOT, so "
+                   "size the host's process/thread limit (systemd TasksMax, container pids) at "
+                   "or above this number before starting.")
+        // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
+        // flag cannot accept a value the pool will silently refuse to honour.
+        ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
+        ->envname("YUZU_HTTP_WORKER_THREADS");
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     app.add_flag("--viz-disable", cfg.viz_disable,

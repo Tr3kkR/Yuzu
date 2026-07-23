@@ -15,6 +15,17 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (BR-07)
+
+#ifndef _WIN32
+#include <chrono>
+#include <spdlog/spdlog.h>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#endif
+
+#if defined(__APPLE__)
+#include "users_macos_last.hpp" // pure `last -y` parsers (qe-M1)
+#endif
 
 #include <array>
 #include <cstdio>
@@ -23,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #if defined(__linux__)
 #include <ctime>
@@ -35,6 +47,7 @@
 
 #if defined(__APPLE__)
 #include <ctime>
+#include <macos_console_user.hpp>
 #endif
 
 #ifdef _WIN32
@@ -61,6 +74,14 @@ namespace {
 bool is_safe_identifier(std::string_view s) {
     if (s.empty())
         return false;
+    // Reject a leading '-' or '.' (sec-L1): the value is interpolated as a bare
+    // token into `last -y -1 {user}` / `dscl` argument lists, and an option-like
+    // account name (`-foo`) would otherwise be misread as a flag by `last`
+    // (argument injection — no command injection, the allowlist below still
+    // blocks every shell metacharacter, but wrong/empty output). Mirrors the
+    // certificates plugin's is_valid_username first-character rule.
+    if (s.front() == '-' || s.front() == '.')
+        return false;
     for (char c : s) {
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
               c == '.' || c == '_' || c == '-')) {
@@ -72,28 +93,50 @@ bool is_safe_identifier(std::string_view s) {
 
 // ── subprocess helper (all platforms) ──────────────────────────────────────
 
+#ifndef _WIN32
+// Per-call wall-clock bound for the local account tools (dscl/last/lastlog/
+// who/w). Generous enough never to fire in practice, short enough that a
+// wedged tool cannot pin the instruction worker indefinitely.
+constexpr std::chrono::seconds kUsersCmdDeadline{20};
+#endif
+
 std::string run_command(const char* cmd) {
+#ifdef _WIN32
     std::string result;
     std::array<char, 256> buf{};
-#ifdef _WIN32
     FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-#ifdef _WIN32
     _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
     return result;
+#else
+    // Route through the bounded, fork-lock-covered runner instead of a raw,
+    // deadline-less popen (K-7/CDX-07). `/bin/sh -c` preserves the shell
+    // semantics popen used (these commands use `2>/dev/null` redirects and a
+    // `| tail` pipe), so the returned stdout blob is byte-identical — now with
+    // a hard deadline, an output cap, and the global fork-lock.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kUsersCmdDeadline});
+    // A cut-short tool returns empty/partial output that parses as "no users /
+    // unknown last-logon" — a silent false-negative. Warn so an operator can
+    // distinguish a degraded scan from a genuinely empty result (sre-M1).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("users: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
+    std::string result = res.output;
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+        result.pop_back();
+    }
+    return result;
+#endif
 }
 
 #ifdef _WIN32
@@ -316,6 +359,14 @@ int do_sessions(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+#if defined(__APPLE__)
+// The `last -y` timestamp/weekday parsers live in users_macos_last.hpp so they
+// are independently unit-testable without a subprocess (qe-M1); bring them into
+// scope here unqualified to keep the call sites below unchanged.
+using yuzu::users_macos::is_weekday;
+using yuzu::users_macos::parse_last_timestamp;
+#endif // __APPLE__
+
 // ── local_users action ────────────────────────────────────────────────────
 
 int do_local_users(yuzu::CommandContext& ctx) {
@@ -386,6 +437,11 @@ int do_local_users(yuzu::CommandContext& ctx) {
     // Tested and verified on macOS 14 (Sonoma). If Apple changes the dscl
     // output format in a future macOS release, this parsing will need updating.
     auto dscl_out = run_command("dscl . -list /Users UniqueID 2>/dev/null");
+    // Queried once per call, not per user: the console/GUI-login user via the
+    // shared helper (agents/shared/macos_console_user.hpp). nullopt (no
+    // SystemConfiguration, or nobody at the console) means every row below
+    // honestly reports is_console_user="unknown" rather than guessing false.
+    auto console_login_user = yuzu::macos::console_user();
     if (!dscl_out.empty()) {
         std::istringstream ss(dscl_out);
         std::string line;
@@ -444,8 +500,81 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 }
             }
 
-            ctx.write_output(std::format("local_user|{}|{}|unknown|{}", user,
-                                         enabled ? "true" : "false", desc.empty() ? "-" : desc));
+            // last_logon: parse `last -y -1 <user>` for this user's most
+            // recent login record (the plugin already uses plain `last` for
+            // primary_user above). `-y` forces an explicit year in the
+            // output so parse_last_timestamp never has to guess one, and
+            // `LC_ALL=C` pins the weekday/month names and the "wtmp begins"
+            // boilerplate to a locale this parser understands. `user` was
+            // already validated by is_safe_identifier above before any
+            // subprocess use. Default is "unknown": a command failure,
+            // empty output, or unrecognized output leaves it there rather
+            // than fabricating "Never" for an indeterminate result. "Never"
+            // is only assigned once the boilerplate line confirms `last`
+            // actually ran and completed its (empty) search for this user.
+            std::string last_logon = "unknown";
+            {
+                auto last_out = run_command(
+                    std::format("LC_ALL=C last -y -1 {} 2>/dev/null", user).c_str());
+                bool saw_record = false;
+                std::istringstream last_ss(last_out);
+                std::string last_line;
+                while (std::getline(last_ss, last_line)) {
+                    if (last_line.empty())
+                        continue;
+                    std::istringstream ls2(last_line);
+                    std::string first;
+                    ls2 >> first;
+                    // Boilerplate lines (e.g. "wtmp begins ...") don't start
+                    // with the username; `last -1 <user>` already filters to
+                    // this user, so a first-token match is the real record.
+                    if (first != user)
+                        continue;
+                    saw_record = true;
+                    std::vector<std::string> tokens;
+                    std::string tok;
+                    while (ls2 >> tok)
+                        tokens.push_back(tok);
+                    for (size_t i = 0; i + 4 < tokens.size(); ++i) {
+                        if (is_weekday(tokens[i])) {
+                            auto parsed = parse_last_timestamp(tokens[i + 1], tokens[i + 2],
+                                                               tokens[i + 3], tokens[i + 4]);
+                            if (!parsed.empty()) {
+                                last_logon = parsed;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+                if (!saw_record && last_out.find("wtmp begins") != std::string::npos)
+                    last_logon = "Never";
+            }
+
+            // console_state is tri-state, not a bool: console_login_user is
+            // std::nullopt whenever detection is unavailable (no
+            // SystemConfiguration, or the API call failed), and that must
+            // stay distinguishable from a confirmed "not the console user"
+            // -- collapsing it to false would misreport an unknown state as
+            // a definite negative, including for the real console user.
+            std::string console_state = "unknown";
+            if (console_login_user)
+                console_state = *console_login_user == user ? "true" : "false";
+
+            // NOTE arity extension: local_user gained a 6th field
+            // (is_console_user) here to surface the GUI-login signal
+            // honestly; other platforms keep the original 5-field
+            // local_user|username|enabled|last_logon|description form. The
+            // field is tri-state ("true"/"false"/"unknown"), not boolean.
+            // safe_output_field on desc: a directory RealName can carry an
+            // embedded CR/LF (multi-valued/malformed) or a literal '|', either
+            // of which would inject an extra output row or shift columns
+            // (K-11/CDX-10). Matches the certificates/event_logs row-safety
+            // discipline on the same branch.
+            ctx.write_output(std::format("local_user|{}|{}|{}|{}|{}", user,
+                                         enabled ? "true" : "false", last_logon,
+                                         desc.empty() ? "-" : yuzu::util::safe_output_field(desc),
+                                         console_state));
         }
     }
 

@@ -11,6 +11,7 @@
  */
 
 #include "mcp_jsonrpc.hpp"
+#include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
 
 #include "agent_registry.hpp"
@@ -710,6 +711,13 @@ struct McpTestServer {
     bool streaming_disabled_{false};
     std::vector<std::string> allowed_origins_for_test{};
 
+    /// 2f PR 2 (GET SSE channel): the shared held-open-stream budget and the
+    /// per-tick credential re-validation seam. Default nullptr/{} = no admission
+    /// control and always-valid — the posture the pre-PR-2 GET tests assume.
+    yuzu::server::detail::StreamBudget* stream_budget_for_test{nullptr};
+    yuzu::server::mcp::StreamRevalidateFn revalidate_fn_for_test{};
+    yuzu::MetricsRegistry* metrics_for_test{nullptr};
+
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
     /// the bundle collate IDOR path (dispatch as owner, collate as a stranger).
@@ -855,7 +863,9 @@ private:
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
         get_handler = mcp.build_get_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
-                                            session_registry_for_test, allowed_origins_for_test);
+                                            session_registry_for_test, allowed_origins_for_test,
+                                            stream_budget_for_test, revalidate_fn_for_test,
+                                            metrics_for_test);
         delete_handler =
             mcp.build_delete_handler(auth_fn, audit_fn, &mcp_disabled_, &streaming_disabled_,
                                      session_registry_for_test, allowed_origins_for_test);
@@ -887,7 +897,7 @@ private:
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
             /*inventory_scope_fn=*/inventory_scope_fn_for_test,
-            /*metrics=*/nullptr,
+            /*metrics=*/metrics_for_test,
             /*app_perf_providers=*/app_perf_providers_for_test,
             /*quarantine_store=*/quarantine_store_for_test,
             /*tag_push_fn=*/
@@ -929,6 +939,268 @@ TEST_CASE("MCP Integration: initialize handshake", "[mcp][integration]") {
     CHECK(result["capabilities"].contains("tools"));
     CHECK(result["capabilities"].contains("resources"));
     CHECK(result["capabilities"].contains("prompts"));
+}
+
+// ── 1b. 2g PR 1: initialize.instructions orientation blob ───────────────────
+
+TEST_CASE("MCP 2g: initialize returns a non-empty instructions orientation blob",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["result"].contains("instructions"));
+    const auto blob = body["result"]["instructions"].get<std::string>();
+    CHECK_FALSE(blob.empty());
+    // Single-source proof: the handshake blob CONTAINS the two resource texts
+    // verbatim, so yuzu://about / yuzu://operating-model cannot drift from it.
+    CHECK(blob.find(std::string(mcp::about_text())) != std::string::npos);
+    CHECK(blob.find(std::string(mcp::operating_model_text())) != std::string::npos);
+    // The blob returned over the wire is exactly the shared source.
+    CHECK(blob == mcp::initialize_instructions());
+}
+
+TEST_CASE("MCP 2g: yuzu://about and yuzu://operating-model are single-sourced with the blob",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto about = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":1,"params":{"uri":"yuzu://about"}})");
+    auto ab = nlohmann::json::parse(about->body);
+    CHECK(ab["result"]["contents"][0]["text"].get<std::string>() == std::string(mcp::about_text()));
+
+    auto om = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":2,"params":{"uri":"yuzu://operating-model"}})");
+    auto ob = nlohmann::json::parse(om->body);
+    CHECK(ob["result"]["contents"][0]["text"].get<std::string>() ==
+          std::string(mcp::operating_model_text()));
+}
+
+TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    const auto blob = nlohmann::json::parse(res->body)["result"]["instructions"].get<std::string>();
+    for (const auto& fam : mcp::tool_families())
+        CHECK(blob.find(std::string(fam.name)) != std::string::npos);
+}
+
+TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness tether B)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    // Every tool belongs to exactly one family (no dup across families).
+    std::set<std::string> family_tools;
+    for (const auto& fam : mcp::tool_families())
+        for (const auto& t : fam.tools)
+            CHECK(family_tools.insert(std::string(t)).second);
+
+    // The advertised surface (tools/list is tier-independent — it iterates all
+    // kTools[]) must match the family union exactly. A new tool with no family
+    // (or a family listing a removed tool) fails HERE, mechanically.
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::set<std::string> live;
+    for (const auto& t : tools)
+        live.insert(t["name"].get<std::string>());
+    CHECK(family_tools == live);
+}
+
+TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labeled counter",
+          "[mcp][2g]") {
+    const std::string kCtr = "yuzu_mcp_initialize_protocol_total";
+
+    // Sections 1-2 wire NO session registry -> streaming OFF -> the STATELESS
+    // initialize path. Section "streaming mode..." wires one to prove the counter
+    // also fires on the streaming/session-minting path (the source claims both).
+    SECTION("supported client revision is echoed and counted (stateless)") {
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.start();
+        ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 0.0);
+    }
+    SECTION("streaming mode also counts on a successful mint") {
+        yuzu::MetricsRegistry reg;
+        mcp::McpSessionRegistry sreg({.per_principal_cap = 4, .global_cap = 8});
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.session_registry_for_test = &sreg; // streaming ON
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Mcp-Session-Id").size() == 32); // minted -> streaming path
+        CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
+    }
+    SECTION("absent/unsupported revision counts under the baseline") {
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.start();
+        ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{"protocolVersion":"2099-01-01"}})");
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 2.0);
+    }
+    SECTION("a 429 session-cap reject is NOT counted") {
+        yuzu::MetricsRegistry reg;
+        mcp::McpSessionRegistry sreg({.per_principal_cap = 1, .global_cap = 8});
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.session_registry_for_test = &sreg;
+        ts.start();
+        auto first = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        CHECK(first->status == 200); // mints the one allowed session → counts once
+        auto rejected = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{}})");
+        CHECK(rejected->status == 429);
+        // Still 1: the reject returned before the counter increment.
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 1.0);
+    }
+}
+
+// ── 1c. 2g PR 2: tool annotations present + truthful (cross-check) ───────────
+
+TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with the dispatch class",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+
+    // operation per tool, straight from the internal dispatch table
+    std::unordered_map<std::string, std::string> op;
+    for (const auto& r : mcp::tool_security_rows_for_test())
+        op[std::string(r.name)] = std::string(r.operation);
+
+    std::set<std::string> listed;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        listed.insert(name);
+        INFO("tool = " << name);
+
+        // Coverage: every listed tool has a dispatch-class entry.
+        REQUIRE(op.count(name) == 1);
+        const std::string& operation = op[name];
+
+        // Presence: all four spec hints, as booleans. MCP's absent-defaults are
+        // wrong-direction (openWorldHint + destructiveHint both default true), so
+        // an omitted hint is a FAILURE — this is the CI backstop for every future
+        // tool, governed or not.
+        REQUIRE(t.contains("annotations"));
+        const auto& a = t["annotations"];
+        for (const char* key :
+             {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"}) {
+            INFO("hint = " << key);
+            REQUIRE(a.contains(key));
+            REQUIRE(a[key].is_boolean());
+        }
+        const bool read_only = a["readOnlyHint"];
+        const bool destructive = a["destructiveHint"];
+        const bool idempotent = a["idempotentHint"];
+        const bool open_world = a["openWorldHint"];
+
+        // Closed managed fleet: never open-world.
+        CHECK(open_world == false);
+        // readOnlyHint is mechanically the Read operation.
+        CHECK(read_only == (operation == "Read"));
+        // Coherence: a read-only tool is neither destructive, and reads are idempotent.
+        if (read_only) {
+            CHECK(destructive == false);
+            CHECK(idempotent == true);
+        }
+        // Safe-direction floor (a RULE, not a per-tool count): Delete and Execute
+        // operations are always destructive, so a future Delete/Execute tool can
+        // never ship annotated non-destructive.
+        if (operation == "Delete" || operation == "Execute")
+            CHECK(destructive == true);
+        // Prose must not contradict the hint, BOTH directions. Forward: a tool the
+        // machine calls non-destructive may not advertise itself as "Destructive".
+        // Reverse: an embedded literal "destructiveHint:<bool>" claim in the
+        // description must match the served hint — this catches the
+        // close_access_review-class reverse-drift (a destructive tool whose prose
+        // still says destructiveHint:false) that the forward check alone misses.
+        const auto desc = t["description"].get<std::string>();
+        INFO("description = " << desc);
+        if (!destructive)
+            CHECK(desc.find("Destructive") == std::string::npos);
+        if (desc.find("destructiveHint:true") != std::string::npos)
+            CHECK(destructive == true);
+        if (desc.find("destructiveHint:false") != std::string::npos)
+            CHECK(destructive == false);
+    }
+
+    // Coverage the other direction: every dispatch-class tool is advertised.
+    for (const auto& [name, _op] : op) {
+        INFO("dispatch tool = " << name);
+        CHECK(listed.count(name) == 1);
+    }
+
+    // Every advertised tool is EXPLICITLY classified in kToolAnnotation (no tool
+    // rides the generator's safe fallback) — so a new tool cannot merge
+    // unclassified and coast on a coincidentally-coherent default.
+    std::set<std::string> classified;
+    for (const auto sv : mcp::tool_annotation_names_for_test())
+        classified.insert(std::string(sv));
+    CHECK(classified == listed);
+
+    // kWriteTools (the --mcp-read-only proactive guard set) must equal the non-Read
+    // dispatch class exactly, or a mutating tool could execute on a read-only
+    // server. Bind it here like the annotation table, closing the one keyed
+    // structure the surface otherwise leaves ungoverned (arch / consistency SHOULD).
+    std::set<std::string> write_tools, non_read;
+    for (const auto sv : mcp::write_tool_names_for_test())
+        write_tools.insert(std::string(sv));
+    for (const auto& [name, operation] : op)
+        if (operation != "Read")
+            non_read.insert(name);
+    CHECK(write_tools == non_read);
+
+    auto ann = [&](const std::string& n) -> nlohmann::json {
+        for (const auto& t : tools)
+            if (t["name"] == n)
+                return t["annotations"];
+        REQUIRE(false); // the tool must exist
+        return {};
+    };
+
+    // Write/Attest tools have NO mechanical destructive-floor (unlike Delete/Execute),
+    // so their destructiveHint truth rests on human + security-guardian review of the
+    // kToolAnnotation classification against each store's actual side effects. Pin
+    // every one by name here so a false-safe flip on this exact class (the A5-BLOCKING
+    // case, e.g. the confirm_engine_rotation / close_access_review bugs this PR fixed)
+    // is caught mechanically, not only in review (qa / unhappy-path SHOULD).
+    const struct {
+        const char* name;
+        bool destructive;
+    } kWriteAttestExpect[] = {
+        {"set_tag", true},          {"approve_request", true},
+        {"reject_request", true},   {"create_engine_principal", false}, // additive
+        {"revoke_engine_principal", true}, {"transfer_engine_principal_owner", true},
+        {"mint_engine_credential", false}, // additive
+        {"rotate_engine_credential", true}, {"confirm_engine_rotation", true}, // was false-safe
+        {"assign_engine_role", false},     // additive (INSERT OR IGNORE)
+        {"unassign_engine_role", true},    {"open_access_review", false}, // additive
+        {"record_attestation", true},      {"close_access_review", true}, // was false-safe
+    };
+    for (const auto& e : kWriteAttestExpect) {
+        INFO("write/attest tool = " << e.name);
+        CHECK(ann(e.name)["destructiveHint"] == e.destructive);
+    }
+    // confirm_engine_rotation is non-idempotent (takes only principal_id, does not
+    // pin the rotation) — the other shipped false-safe this PR corrected.
+    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false);
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────
@@ -1336,6 +1608,32 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
+TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":54,"params":{"name":"list_dex_signals","arguments":{"window":"all","os":"macos"}}})");
+    REQUIRE(res);
+    auto rows = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    bool has_storage = false, has_crashed = false;
+    for (const auto& r : rows) {
+        const auto t = r["obs_type"].get<std::string>();
+        if (t == "storage.low") has_storage = true;
+        if (t == "process.crashed") has_crashed = true;
+    }
+    CHECK(has_storage);            // macOS-sourced signal present
+    CHECK_FALSE(has_crashed);      // Windows-sourced signal scoped out
+}
+
 TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
           "[mcp][integration][dex]") {
     GuaranteedStateStore store(":memory:");
@@ -1396,6 +1694,39 @@ TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal
             saw_view = true;
     CHECK(saw_view);
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_detail|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 parity)",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "w2", "WS-2", "process.crashed", "outlook.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    mcp_seed_obs(store, "m1", "MAC-1", "process.crashed", "Safari", "macos",
+                 "2026-06-10T12:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto win = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all","os":"windows"}}})");
+    REQUIRE(win);
+    auto wpayload = nlohmann::json::parse(
+        nlohmann::json::parse(win->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(wpayload["os"] == "windows");
+    REQUIRE(wpayload["devices"].is_array());
+    CHECK(wpayload["devices"].size() == 2); // WS-1 + WS-2, never MAC-1
+    CHECK(wpayload["by_os"].size() == 2);   // by_os stays cross-OS even under a filter
+
+    auto mac = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":53,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all","os":"macos"}}})");
+    REQUIRE(mac);
+    auto mpayload = nlohmann::json::parse(
+        nlohmann::json::parse(mac->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(mpayload["os"] == "macos");
+    REQUIRE(mpayload["devices"].size() == 1);
+    CHECK(mpayload["devices"][0]["agent_id"] == "MAC-1");
 }
 
 // #1647: get_dex_signal_detail previously DISCARDED the AuditFn bool. It now captures
@@ -5656,9 +5987,12 @@ TEST_CASE("MCP 2f/CH-9: Origin allowlist enforced on POST and DELETE", "[mcp][tr
         auto body = nlohmann::json::parse(res->body);
         CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
     }
-    SECTION("hostile Origin rejected on GET too (403 precedes the 405 placeholder)") {
-        auto res = ts.call_raw("GET", "", {{"Origin", "https://evil.example.com"}});
-        CHECK(res->status == 403); // Origin check runs before the PR-1 405 placeholder
+    SECTION("hostile Origin rejected on GET too (403 precedes the SSE channel)") {
+        auto res = ts.call_raw("GET", "", {{"Origin", "https://evil.example.com"},
+                                           {"Accept", "text/event-stream"}});
+        // Origin runs before auth AND before the session/Accept gates: a rebinding
+        // attacker never reaches the stream machinery.
+        CHECK(res->status == 403);
         auto body = nlohmann::json::parse(res->body);
         CHECK(body["error"]["code"] == mcp::kMcpOriginRejected);
         CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
@@ -5730,12 +6064,310 @@ TEST_CASE("MCP 2f: initialize negotiates protocolVersion (clamp to supported)",
     }
 }
 
-TEST_CASE("MCP 2f: GET is a 405 placeholder this rung", "[mcp][transport][2f]") {
+TEST_CASE("MCP 2f PR2: GET SSE channel — session gate + Accept negotiation",
+          "[mcp][transport][2f][stream]") {
     mcp::McpSessionRegistry reg;
     McpTestServer ts;
     ts.session_registry_for_test = &reg;
     ts.start();
-    CHECK(ts.call_raw("GET", "")->status == 405);
+
+    SECTION("no Mcp-Session-Id → 400 (a GET carries no JSON-RPC id to bind to)") {
+        auto res = ts.call_raw("GET", "", {{"Accept", "text/event-stream"}});
+        CHECK(res->status == 400);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kInvalidRequest);
+        CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
+    }
+    SECTION("unknown session → 404, no oracle") {
+        auto res = ts.call_raw("GET", "", {{"Accept", "text/event-stream"},
+                                           {"Mcp-Session-Id", std::string(32, 'a')}});
+        CHECK(res->status == 404);
+        CHECK(nlohmann::json::parse(res->body)["error"]["code"] == mcp::kMcpUnknownSession);
+    }
+    SECTION("valid session but no Accept: text/event-stream → 406, fail closed") {
+        const auto sid = mint_session(ts);
+        REQUIRE_FALSE(sid.empty());
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "application/json"}});
+        CHECK(res->status == 406);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpNotAcceptable);
+        CHECK(body["error"]["data"]["remediation"] == "send Accept: text/event-stream");
+    }
+    SECTION("a session belonging to ANOTHER principal → 404, not 403 (CH-8)") {
+        const auto sid = mint_session(ts);
+        REQUIRE_FALSE(sid.empty());
+        ts.mock_username = "someone-else";
+        auto res = ts.call_raw("GET", "", {{"Accept", "text/event-stream"},
+                                           {"Mcp-Session-Id", sid}});
+        CHECK(res->status == 404);
+    }
+    SECTION("session gate precedes Accept — an unknown session never learns its Accept was bad") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", std::string(32, 'b')},
+                                           {"Accept", "application/json"}});
+        CHECK(res->status == 404); // NOT 406
+    }
+}
+
+TEST_CASE("MCP 2f PR2: GET SSE attach — headers, audit, one Content-Type",
+          "[mcp][transport][2f][stream]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                       {"Accept", "text/event-stream"}});
+    CHECK(res->status == 200);
+    // httplib's set_header EMPLACES into a multimap; set_chunked_content_provider
+    // set_header's its own type. An application/json set up-front on the GET path
+    // would ride along as a SECOND Content-Type on the SSE response — the exact
+    // shape a client cannot parse. Assert the header is singular and correct.
+    CHECK(res->get_header_value_count("Content-Type") == 1);
+    CHECK(res->get_header_value("Content-Type") == "text/event-stream");
+    CHECK(res->get_header_value("Cache-Control") == "no-cache");
+    CHECK(res->get_header_value("X-Accel-Buffering") == "no");
+    CHECK(res->get_header_value("X-Content-Type-Options") == "nosniff");
+    CHECK(res->get_header_value("X-Correlation-Id").rfind("req-", 0) == 0);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.stream.attach|success") !=
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP 2f PR2: attach audit failure sets Sec-Audit-Failed and PROCEEDS",
+          "[mcp][transport][2f][stream]") {
+    // The /api/v1/events posture: a transient audit hiccup signals the evidence gap
+    // in a header rather than silently dropping the operator's stream.
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    ts.audit_succeeds_ = false;
+    auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                       {"Accept", "text/event-stream"}});
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("MCP 2f PR2/CH-5: stream cap rejects with an A4 429 and never evicts a live stream",
+          "[mcp][transport][2f][stream][ch5]") {
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 1}};
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.start();
+
+    const auto sid1 = mint_session(ts);
+    const auto sid2 = mint_session(ts);
+    REQUIRE_FALSE(sid1.empty());
+    REQUIRE_FALSE(sid2.empty());
+
+    auto first = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid1},
+                                         {"Accept", "text/event-stream"}});
+    REQUIRE(first->status == 200);
+    CHECK(budget.active() == 1);
+
+    // The cap is hit. The NEWCOMER is rejected — the live stream is not touched.
+    auto second = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid2},
+                                          {"Accept", "text/event-stream"}});
+    CHECK(second->status == 429);
+    auto body = nlohmann::json::parse(second->body);
+    CHECK(body["error"]["code"] == mcp::kMcpStreamCap);
+    // An honest retry_after_ms, not a null that invites an immediate retry storm.
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStreamCapRetryAfterMs);
+    CHECK(budget.active() == 1); // reject-not-evict
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP 2f PR2/CH-2: a resume past the replay window 404s and re-inits — never a silent gap",
+          "[mcp][transport][2f][stream][ch2]") {
+    // Ring of 2. Publish 5 frames: ids 1-3 are evicted, so a client resuming from
+    // id 1 cannot be served the frames it missed.
+    mcp::McpSessionRegistry reg{{.ring_cap = 2}};
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    auto stream = reg.stream_for(sid, "test-user");
+    REQUIRE(stream);
+    for (int i = 0; i < 5; ++i) {
+        stream->publish("message", R"({"jsonrpc":"2.0"})");
+    }
+    CHECK(stream->evictions_total() == 3);
+
+    auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                       {"Accept", "text/event-stream"},
+                                       {"Last-Event-ID", "1"}});
+    CHECK(res->status == 404);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == mcp::kMcpUnknownSession);
+    CHECK(body["error"]["message"] == "Replay window exceeded");
+
+    // The session is TERMINATED, so the client's next POST 404s too: one coherent
+    // "re-initialize" signal rather than a GET that says re-init and a POST that
+    // carries on as if the session were healthy.
+    auto post = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":9})",
+                            {{"Mcp-Session-Id", sid}});
+    CHECK(post->status == 404);
+}
+
+TEST_CASE("MCP 2f PR2/CH-2: an in-window resume is admitted", "[mcp][transport][2f][stream][ch2]") {
+    mcp::McpSessionRegistry reg{{.ring_cap = 8}};
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    auto stream = reg.stream_for(sid, "test-user");
+    REQUIRE(stream);
+    for (int i = 0; i < 3; ++i) {
+        stream->publish("message", "{}");
+    }
+
+    auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                       {"Accept", "text/event-stream"},
+                                       {"Last-Event-ID", "2"}});
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("MCP 2f PR2: tearing down the response returns the worker and audits the close",
+          "[mcp][transport][2f][stream]") {
+    // The release callback is the ONLY place a stream's budget lease is returned, and it
+    // runs from ~Response (httplib invokes it unconditionally there). If it ever stopped
+    // running — or threw — every stream would leak a worker slot until restart, which is
+    // invisible in testing and fatal over a server's uptime. Destroying the Response here
+    // exercises exactly the production teardown.
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 4}};
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        REQUIRE(res->status == 200);
+        CHECK(budget.active() == 1); // a worker is pinned while the stream is held open
+    } // ~Response → releaser → detach
+
+    CHECK(budget.active() == 0);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.stream.close|success") !=
+          ts.audit_log.end());
+    // The session survives its stream's teardown — a dropped connection is not a
+    // terminated session; the client can reconnect and resume.
+    CHECK(reg.active_count() == 1);
+}
+
+TEST_CASE("MCP 2f PR2/CH-5: a rapid re-GET is refused while the superseded stream drains",
+          "[mcp][transport][2f][stream][ch5]") {
+    // Bounds the pool: a takeover skips the cap check (so a client is never locked out
+    // by its own zombie), so the number of PROVIDERS per session must be bounded some
+    // other way — one live plus at most one draining.
+    yuzu::server::detail::StreamBudget budget{{.global_cap = 8}};
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.stream_budget_for_test = &budget;
+    ts.start();
+    const auto sid = mint_session(ts);
+
+    auto first = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                         {"Accept", "text/event-stream"}});
+    REQUIRE(first->status == 200);
+    auto second = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                          {"Accept", "text/event-stream"}});
+    REQUIRE(second->status == 200); // takeover: admitted even though `first` is undrained
+    CHECK(budget.active() == 2);    // …and COUNTED — both providers still pin a worker
+
+    auto third = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                         {"Accept", "text/event-stream"}});
+    CHECK(third->status == 429);
+    auto body = nlohmann::json::parse(third->body);
+    CHECK(body["error"]["code"] == mcp::kMcpStreamCap);
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpHandoverRetryAfterMs);
+    CHECK(budget.active() == 2); // the refusal costs nothing and evicts nothing
+}
+
+TEST_CASE("MCP 2f PR2: a hostile Last-Event-ID never destroys the session",
+          "[mcp][transport][2f][stream]") {
+    // std::stoull("-1") does not throw — it WRAPS to UINT64_MAX, which lands past the
+    // ring window and would have terminated the client's session over a typo. A cursor
+    // we cannot parse means "replay what we still hold", never "burn the session down".
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+
+    for (const char* hostile : {"-1", "+5", "abc", "9999999999999999999999999", "1abc", " 1"}) {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"Last-Event-ID", hostile}});
+        INFO("Last-Event-ID: " << hostile);
+        CHECK(res->status == 200);
+        CHECK(reg.active_count() == 1); // still alive
+    }
+}
+
+TEST_CASE("MCP 2f: an unsupported MCP-Protocol-Version is rejected on EVERY method",
+          "[mcp][transport][2f]") {
+    // The protocol-version contract is a property of the /mcp/v1/ ENDPOINT
+    // (docs/user-manual/mcp.md), not of POST alone. A strict client that sends the header
+    // on a GET should get the same 400 it would get on a POST — not a stream.
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.start();
+    const auto sid = mint_session(ts);
+    REQUIRE_FALSE(sid.empty());
+
+    SECTION("GET") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"MCP-Protocol-Version", "1999-01-01"}});
+        CHECK(res->status == 400);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == mcp::kMcpBadProtocolVersion);
+    }
+    SECTION("DELETE") {
+        auto res = ts.call_raw("DELETE", "", {{"Mcp-Session-Id", sid},
+                                              {"MCP-Protocol-Version", "1999-01-01"}});
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["code"] == mcp::kMcpBadProtocolVersion);
+        // …and the session survives a rejected request.
+        CHECK(reg.active_count() == 1);
+    }
+    SECTION("a SUPPORTED version is accepted on GET") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"},
+                                           {"MCP-Protocol-Version", "2025-06-18"}});
+        CHECK(res->status == 200);
+    }
+    SECTION("an ABSENT version is accepted on GET (the default revision is assumed)") {
+        auto res = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                           {"Accept", "text/event-stream"}});
+        CHECK(res->status == 200);
+    }
+}
+
+TEST_CASE("MCP 2f PR2: --mcp-no-streaming still 405s GET (kill switch beats the channel)",
+          "[mcp][transport][2f][stream][ch7]") {
+    mcp::McpSessionRegistry reg;
+    McpTestServer ts;
+    ts.session_registry_for_test = &reg;
+    ts.streaming_disabled_ = true;
+    ts.start();
+    CHECK(ts.call_raw("GET", "", {{"Accept", "text/event-stream"}})->status == 405);
 }
 
 TEST_CASE("MCP 2f/CH-7(c): --mcp-disable still ANSWERS GET/DELETE (not 404)",

@@ -87,4 +87,27 @@ enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
     return DialogOutcome::not_reachable;
 }
 
+/// The (output line, return code) decision for the macOS `input`/`survey`
+/// osascript-capture legs, extracted here so it is unit-testable without a
+/// subprocess (qe-L2). Given the captured osascript exit code and its trimmed
+/// output:
+///   - a non-zero exit is a delivery failure (no reachable GUI session, TCC
+///     denial, …) -> an honest `status|unavailable` line + rc 1, NEVER wrapping
+///     the error text as a `response`;
+///   - the `##CANCELLED##` sentinel (AppleScript -128, converted at exit 0) ->
+///     `cancelled|true` + rc 0;
+///   - anything else on a successful run is genuine user input -> `response|…`.
+struct CaptureDecision {
+    std::string output_line;
+    int rc = 0;
+};
+
+inline CaptureDecision classify_input_capture(int exit_code, std::string_view output) {
+    if (exit_code != 0)
+        return {"status|unavailable|no reachable GUI session", 1};
+    if (output == "##CANCELLED##")
+        return {"cancelled|true", 0};
+    return {std::format("response|{}", output), 0};
+}
+
 } // namespace yuzu::interaction

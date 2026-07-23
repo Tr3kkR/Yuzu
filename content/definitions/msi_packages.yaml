@@ -1,5 +1,6 @@
-## MSI Package Inventory Definitions
-## Enumerates installed MSI packages and product codes (Windows only).
+## MSI / pkgutil Package Inventory Definitions
+## Enumerates installed packages and product codes: MSI products via
+## MsiEnumProducts on Windows, pkgutil receipts on macOS.
 ## Plugin: msi_packages | Actions: list, product_codes
 
 ---
@@ -10,16 +11,18 @@ metadata:
   displayName: List MSI Packages
   version: 1.0.0
   description: >
-    Enumerates all installed Windows Installer (MSI) packages using
-    the MsiEnumProducts API. Returns each package's product code GUID,
-    display name, version string, and install location. Useful for
-    software inventory, patch compliance, and license auditing on
-    Windows endpoints.
-  tags: [software, msi, inventory, windows]
+    Enumerates installed software packages: on Windows, Windows Installer
+    (MSI) products via the MsiEnumProducts API, returning each package's
+    product code GUID, display name, version string, and install location;
+    on macOS, `pkgutil` package receipts, returning each package's
+    reverse-domain identifier, a derived display name, version string, and
+    install location. Useful for software inventory, patch compliance, and
+    license auditing.
+  tags: [software, msi, inventory, windows, macos]
 
 spec:
   type: question
-  platforms: [windows]
+  platforms: [windows, darwin]
 
   execution:
     plugin: msi_packages
@@ -33,7 +36,7 @@ spec:
   result:
     columns:
       - name: product_code
-        type: guid
+        type: string
       - name: name
         type: string
       - name: version
@@ -73,15 +76,17 @@ metadata:
   displayName: List MSI Product Codes
   version: 1.0.0
   description: >
-    Returns a compact list of installed MSI product code GUIDs with
-    their associated product names. This is a lightweight alternative
-    to the full MSI list when only product identification is needed,
-    such as for uninstall targeting or compliance matching.
-  tags: [software, msi, inventory, windows]
+    Returns a compact list of installed package identifiers with their
+    associated product names: MSI product code GUIDs on Windows,
+    reverse-domain pkgutil package identifiers on macOS. This is a
+    lightweight alternative to the full list when only product
+    identification is needed, such as for uninstall targeting or
+    compliance matching.
+  tags: [software, msi, inventory, windows, macos]
 
 spec:
   type: question
-  platforms: [windows]
+  platforms: [windows, darwin]
 
   execution:
     plugin: msi_packages
@@ -95,7 +100,7 @@ spec:
   result:
     columns:
       - name: product_code
-        type: guid
+        type: string
       - name: name
         type: string
 

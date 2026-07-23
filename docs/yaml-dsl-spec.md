@@ -1620,7 +1620,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
 | `software.inventory` | `installed_apps` | Y | Y | Y | Verified |
-| `software.package.inventory` | `msi_packages` | Y | - | - | Verified |
+| `software.package.inventory` | `msi_packages` | Y | - | Y | Verified |
 | `software.uninstall` | `software_actions` | Y | Y | Y | Verified |
 | `software.install` | content staging | Y | Y | Y | Planned |
 | `software.update` | pkg adapter | Y | Y | Y | Proposed |
