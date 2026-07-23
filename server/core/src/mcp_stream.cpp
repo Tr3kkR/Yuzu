@@ -629,9 +629,16 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         sink_->sse->cv.wait_for(lk, cfg_.tick, [this] {
             // dropped_total is in the predicate (#2366): a producer-side containment can
             // bump dropped_total WITHOUT enqueueing a frame (the by-value copy threw after
-            // the ring commit), so `queue.empty()` alone would sleep on the publish's
-            // notify_one and defer the events-dropped synthetic a full tick. Before #2366
-            // every drop rode alongside a real push_back, so this case could not arise.
+            // the ring commit), so `queue.empty()` alone would keep the synthetic waiting a
+            // full tick. Before #2366 every drop rode alongside a real push_back, so this
+            // case could not arise. NOTE the wakeup is prompt in the common case but not
+            // fully deterministic: the bump is under McpStreamState::mu_, not this sink
+            // mutex, so in the narrow window where the bump+notify lands between this
+            // predicate check and the wait() sleep, emission is still bounded by one tick
+            // (deferred, never lost — the next tick re-evaluates and drains it). Making it
+            // deterministic = bump dropped_total under the sink mutex (lock order mu_ → sink
+            // mu already permits it); deferred to PR 3, where a real producer makes the
+            // sub-tick latency observable and a TSan pass over a concurrent publisher pays.
             return !sink_->sse->queue.empty() || sink_->sse->closed.load() ||
                    sink_->sse->pre_emit.has_value() ||
                    sink_->sse->dropped_total.load(std::memory_order_relaxed) > 0;

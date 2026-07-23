@@ -867,8 +867,10 @@ TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and 
     // were lost, and the ring still holds the frame so a Last-Event-ID resume recovers
     // it. NOTE this is the empty-queue lone-drop case: dropped_total==1 with an EMPTY
     // queue is the interaction #2366 introduced (pre-#2366 a drop always rode alongside
-    // a real push_back), and the pump's wait predicate now includes dropped_total so this
-    // wakes promptly on the publish's notify rather than deferring a full tick.
+    // a real push_back), and the pump's wait predicate now includes dropped_total so a
+    // re-evaluation emits the synthetic. (The wakeup is prompt in the common case but
+    // bounded by one tick in a narrow race — see the predicate comment; with the fast
+    // test tick the outcome, not the timing, is what this asserts.)
     mcp::McpStreamPump pump{attached.sink, state, attached.generation,
                             [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
                             fast_cfg()};
