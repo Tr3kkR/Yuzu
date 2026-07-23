@@ -37,15 +37,16 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
-#include <stdexcept>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server::mcp {
 namespace {
@@ -1212,56 +1213,88 @@ ToolSecurityClass classify_tool_security(
     return ToolSecurityClass::kKnownRegistered;
 }
 
-// Borrowed (name, operation) row for the registration validator. Views are
-// valid only for the duration of the call; nothing is retained.
-struct ToolNameOp {
+// Borrowed (name, securable, operation) row for the registration validator.
+// Views are valid only for the duration of the call; nothing is retained.
+struct ToolSecurityTuple {
     std::string_view name;
+    std::string_view securable;
     std::string_view operation;
 };
+
+// Closed RBAC operation vocabulary — mirrors rbac_store.cpp's seeded `ops[]`
+// catalogue (MOVE TOGETHER; the [rbac_store] binding test compares both
+// mirrors against a live store). An operation typo (e.g. "read") is NOT
+// harmlessly conservative: supervised tier_allows() permits every operation
+// while requires_approval() matches exact strings, so a typo'd op skips its
+// intended approval rule — fail OPEN. Reject at boot instead.
+constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete",
+                                         "Approve", "Push",  "Attest"};
+
+// Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
+// `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
+// fail-open class as a typo'd op: supervised tier_allows() permits every
+// type and requires_approval() exact-matches type strings, so e.g.
+// {"quarantine_device", {"Securty", "Execute"}} would silently skip its
+// approval rule (governance UP-6).
+constexpr std::string_view kRbacSecurables[] = {
+    "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
+    "Execution",      "Schedule",           "Approval",              "Tag",
+    "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
+    "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
+    "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
+    "AccessReview",   "SoftwareLicensing"};
 
 // Pure registration validator (#2383) — throws std::runtime_error naming every
 // offender (sorted, so the message is deterministic regardless of hash-map
 // iteration order). Called by the McpServer ctor with the real tables and by
-// validate_tool_registration_for_test with synthetic ones.
+// validate_tool_registration_for_test with synthetic ones. Inputs are raw
+// (possibly-duplicated) sequences, NOT pre-deduplicated sets — a duplicate
+// entry is itself an offence (a dropped duplicate could silently discard the
+// stricter of two conflicting registrations).
 void validate_tool_security_registration(const std::vector<std::string_view>& tool_names,
-                                         const std::vector<ToolNameOp>& security_rows,
+                                         const std::vector<ToolSecurityTuple>& security_rows,
                                          const std::vector<std::string_view>& write_tools) {
-    // Closed RBAC operation vocabulary (rbac_store.cpp's seeded catalogue). An
-    // operation typo (e.g. "read") is NOT harmlessly conservative: supervised
-    // tier_allows() permits every operation while requires_approval() matches
-    // exact strings, so a typo'd op skips its intended approval rule — fail
-    // OPEN. Reject anything outside the catalogue at boot instead.
-    static constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete",
-                                                    "Approve", "Push",  "Attest"};
+    std::vector<std::string> offences;
 
-    const std::unordered_set<std::string_view> names(tool_names.begin(), tool_names.end());
-    std::unordered_map<std::string_view, std::string_view> rows;
+    std::unordered_set<std::string_view> names;
+    names.reserve(tool_names.size());
+    for (const auto& n : tool_names)
+        if (!names.insert(n).second)
+            offences.push_back("duplicate served tool name '" + std::string(n) + "'");
+    std::unordered_map<std::string_view, ToolSecurityTuple> rows;
     rows.reserve(security_rows.size());
     for (const auto& r : security_rows)
-        rows.emplace(r.name, r.operation);
+        if (!rows.emplace(r.name, r).second)
+            offences.push_back("duplicate kToolSecurity row for '" + std::string(r.name) + "'");
     const std::unordered_set<std::string_view> writes(write_tools.begin(), write_tools.end());
 
-    std::vector<std::string> offences;
     // Exact set equality BOTH directions: a subset-only check would accept an
     // extra security row, and an extra row for an unserved name is the drift
     // state under which the dispatch pre-gate's knownness ordering matters.
     for (const auto& n : names)
         if (!rows.contains(n))
             offences.push_back("served tool '" + std::string(n) + "' has no kToolSecurity row");
-    for (const auto& [n, op] : rows) {
+    for (const auto& [n, row] : rows) {
         if (!names.contains(n))
             offences.push_back("kToolSecurity row '" + std::string(n) + "' names no served tool");
-        if (std::find(std::begin(kRbacOps), std::end(kRbacOps), op) == std::end(kRbacOps))
-            offences.push_back("tool '" + std::string(n) + "' has operation '" + std::string(op) +
+        if (std::find(std::begin(kRbacOps), std::end(kRbacOps), row.operation) ==
+            std::end(kRbacOps))
+            offences.push_back("tool '" + std::string(n) + "' has operation '" +
+                               std::string(row.operation) +
                                "' outside the RBAC operation catalogue");
+        if (std::find(std::begin(kRbacSecurables), std::end(kRbacSecurables), row.securable) ==
+            std::end(kRbacSecurables))
+            offences.push_back("tool '" + std::string(n) + "' has securable type '" +
+                               std::string(row.securable) +
+                               "' outside the RBAC securable catalogue");
     }
     // kWriteTools must be EXACTLY the non-Read subset: the C7 --mcp-read-only
     // guard keys on kWriteTools, so a non-Read tool missing from it silently
     // executes in read-only mode (a second, independent fail-open surface).
-    for (const auto& [n, op] : rows) {
+    for (const auto& [n, row] : rows) {
         if (!names.contains(n))
             continue;  // already reported above
-        const bool non_read = (op != "Read");
+        const bool non_read = (row.operation != "Read");
         if (non_read && !writes.contains(n))
             offences.push_back("non-Read tool '" + std::string(n) +
                                "' is missing from kWriteTools");
@@ -1590,12 +1623,19 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // misregistration deterministically. --mcp-disable skips construction, which
 // is fine: no MCP surface, nothing to enforce.
 McpServer::McpServer() {
-    const auto& known = known_tool_names();
-    std::vector<std::string_view> names(known.begin(), known.end());
-    std::vector<ToolNameOp> rows;
+    // Force the dispatch classifier's name set to build here, at construction,
+    // rather than lazily on the first request.
+    (void)known_tool_names();
+    // Feed the validator the RAW kTools sequence (not the deduplicated set) so
+    // a copy-pasted duplicate ToolDef is an offence, not silently collapsed.
+    std::vector<std::string_view> names;
+    names.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        names.push_back(t.name);
+    std::vector<ToolSecurityTuple> rows;
     rows.reserve(kToolSecurity.size());
     for (const auto& [name, sec] : kToolSecurity)
-        rows.push_back({name, sec.operation});
+        rows.push_back({name, sec.securable_type, sec.operation});
     std::vector<std::string_view> writes(kWriteTools.begin(), kWriteTools.end());
     validate_tool_security_registration(names, rows, writes);
 }
@@ -2408,6 +2448,17 @@ McpServer::HandlerFn McpServer::build_handler(
             const auto sec_class =
                 classify_tool_security(tool_name, known_tool_names(), kToolSecurity);
             if (sec_class == ToolSecurityClass::kKnownMissingSecurity) {
+                // Server-side fault, not an authz denial — and PERMANENT, not
+                // retryable, despite kInternalError's transient-store use in
+                // mcp_error_for_store_msg (retry_after_ms stays null). Loud on
+                // every channel — journal + metric + audit (governance UP-5):
+                // this branch firing at all means the boot validator was
+                // bypassed, which is itself the incident to surface.
+                spdlog::error("MCP dispatch: tool '{}' has no security registration — "
+                              "denied fail-closed (#2383)",
+                              tool_name);
+                if (metrics != nullptr)
+                    metrics->counter("yuzu_mcp_tool_security_misconfig_total").increment();
                 mcp_audit("failure", "tool security registration missing");
                 res.set_content(
                     a4_error(kInternalError,
@@ -7801,19 +7852,30 @@ ToolClassForTest classify_tool_for_test(const std::string& tool_name,
     case ToolSecurityClass::kKnownMissingSecurity:
         return ToolClassForTest::kKnownMissingSecurity;
     }
-    return ToolClassForTest::kUnknown;  // unreachable; silences -Wreturn-type
+    // Not a fallback mapping: a 4th enumerator must extend the switch (kept
+    // live by -Wswitch), never silently classify as kUnknown in tests while
+    // real dispatch diverges (governance C-4).
+    std::unreachable();
 }
 
 void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
                                          const std::vector<ToolSecurityRowOwned>& security_rows,
                                          const std::vector<std::string>& write_tools) {
     std::vector<std::string_view> names(tool_names.begin(), tool_names.end());
-    std::vector<ToolNameOp> rows;
+    std::vector<ToolSecurityTuple> rows;
     rows.reserve(security_rows.size());
     for (const auto& r : security_rows)
-        rows.push_back({r.name, r.operation});
+        rows.push_back({r.name, r.securable, r.operation});
     std::vector<std::string_view> writes(write_tools.begin(), write_tools.end());
     validate_tool_security_registration(names, rows, writes);
+}
+
+std::vector<std::string> rbac_ops_for_test() {
+    return {std::begin(kRbacOps), std::end(kRbacOps)};
+}
+
+std::vector<std::string> rbac_securables_for_test() {
+    return {std::begin(kRbacSecurables), std::end(kRbacSecurables)};
 }
 
 } // namespace yuzu::server::mcp

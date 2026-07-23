@@ -1253,7 +1253,8 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         auto names = tool_names_for_test();
         std::vector<ToolSecurityRowOwned> rows;
         for (const auto& r : tool_security_rows_for_test())
-            rows.push_back({std::string(r.name), std::string(r.operation)});
+            rows.push_back(
+                {std::string(r.name), std::string(r.securable), std::string(r.operation)});
         std::vector<std::string> writes;
         for (const auto& w : write_tool_names_for_test())
             writes.emplace_back(w);
@@ -1261,36 +1262,90 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
     }
 
     // (a) served tool with no security row — the original C8 fail-open state.
-    REQUIRE_THROWS_WITH(
-        validate_tool_registration_for_test({"alpha", "beta"}, {{"alpha", "Read"}}, {}),
-        ContainsSubstring("'beta' has no kToolSecurity row"));
+    // Prefix "served tool" is load-bearing in the assert: the kWriteTools-entry
+    // offence ends in the same "has no kToolSecurity row" suffix.
+    CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"},
+                                                          {{"alpha", "Infrastructure", "Read"}},
+                                                          {}),
+                      ContainsSubstring("served tool 'beta' has no kToolSecurity row"));
 
     // (b) extra security row naming no served tool — a subset-only check would
     // accept this; exact equality both directions must reject it.
-    REQUIRE_THROWS_WITH(
-        validate_tool_registration_for_test({"alpha"}, {{"alpha", "Read"}, {"ghost", "Read"}},
-                                            {}),
-        ContainsSubstring("'ghost' names no served tool"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"alpha"}, {{"alpha", "Infrastructure", "Read"}, {"ghost", "Infrastructure", "Read"}},
+            {}),
+        ContainsSubstring("kToolSecurity row 'ghost' names no served tool"));
 
     // (c) kWriteTools vs non-Read subset, both directions, plus a write entry
     // with no security row at all.
-    REQUIRE_THROWS_WITH(validate_tool_registration_for_test({"w"}, {{"w", "Write"}}, {}),
-                        ContainsSubstring("non-Read tool 'w' is missing from kWriteTools"));
-    REQUIRE_THROWS_WITH(validate_tool_registration_for_test({"r"}, {{"r", "Read"}}, {"r"}),
-                        ContainsSubstring("Read tool 'r' must not be in kWriteTools"));
-    REQUIRE_THROWS_WITH(
-        validate_tool_registration_for_test({"a"}, {{"a", "Read"}}, {"phantom"}),
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"w"}, {{"w", "Tag", "Write"}}, {}),
+        ContainsSubstring("non-Read tool 'w' is missing from kWriteTools"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"r"}, {{"r", "Tag", "Read"}}, {"r"}),
+        ContainsSubstring("Read tool 'r' must not be in kWriteTools"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"a"}, {{"a", "Tag", "Read"}}, {"phantom"}),
         ContainsSubstring("kWriteTools entry 'phantom' has no kToolSecurity row"));
 
     // (d) operation outside the closed RBAC catalogue. NOT harmlessly
     // conservative: a typo'd "read" passes supervised tier_allows() (permits
     // every op) yet misses every exact-string requires_approval() rule — the
     // tool would skip its intended approval, failing OPEN.
-    REQUIRE_THROWS_WITH(
-        validate_tool_registration_for_test({"t"}, {{"t", "read"}}, {"t"}),
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "read"}}, {"t"}),
         ContainsSubstring("operation 'read' outside the RBAC operation catalogue"));
     // Attest is a first-class catalogue member (AccessReview) — valid non-Read.
-    REQUIRE_NOTHROW(validate_tool_registration_for_test({"t"}, {{"t", "Attest"}}, {"t"}));
+    CHECK_NOTHROW(
+        validate_tool_registration_for_test({"t"}, {{"t", "AccessReview", "Attest"}}, {"t"}));
+
+    // (e) securable TYPE outside the catalogue — same fail-open class as (d):
+    // supervised tier_allows() permits every type and requires_approval()
+    // exact-matches type strings, so {"Securty","Execute"} would silently skip
+    // the quarantine-class approval rule (governance UP-6).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"q"}, {{"q", "Securty", "Execute"}}, {"q"}),
+        ContainsSubstring("securable type 'Securty' outside the RBAC securable catalogue"));
+
+    // (f) duplicates are offences, not silent collapses: a dropped duplicate
+    // could discard the stricter of two conflicting registrations.
+    CHECK_THROWS_WITH(validate_tool_registration_for_test(
+                          {"d", "d"}, {{"d", "Infrastructure", "Read"}}, {}),
+                      ContainsSubstring("duplicate served tool name 'd'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"d"}, {{"d", "Infrastructure", "Read"}, {"d", "Security", "Execute"}}, {}),
+        ContainsSubstring("duplicate kToolSecurity row for 'd'"));
+
+    // (g) multiple simultaneous offences: ALL are named, in sorted order (the
+    // std::sort is what makes the thrown message deterministic across
+    // hash-map iteration order — this is the regression net for it).
+    try {
+        validate_tool_registration_for_test({"alpha", "beta"}, {}, {"gamma"});
+        FAIL("expected validator throw");
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        const auto p_gamma = msg.find("kWriteTools entry 'gamma' has no kToolSecurity row");
+        const auto p_alpha = msg.find("served tool 'alpha' has no kToolSecurity row");
+        const auto p_beta = msg.find("served tool 'beta' has no kToolSecurity row");
+        REQUIRE(p_gamma != std::string::npos);
+        REQUIRE(p_alpha != std::string::npos);
+        REQUIRE(p_beta != std::string::npos);
+        // Lexicographic: "kWriteTools..." < "served tool 'alpha'..." < "'beta'...".
+        CHECK(p_gamma < p_alpha);
+        CHECK(p_alpha < p_beta);
+    }
+}
+
+// #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
+// the live rbac_store seed — asserted from the store side in
+// test_rbac_store.cpp ("seeded catalogues match the MCP C8 validator
+// mirrors"); here we only pin the mirror sizes so an accidental edit to one
+// array is caught even when the rbac_store suite is filtered out.
+TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
+    CHECK(rbac_ops_for_test().size() == 7);
+    CHECK(rbac_securables_for_test().size() == 22);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {

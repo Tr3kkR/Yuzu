@@ -3,11 +3,15 @@
 // Test-only accessors for the internal MCP dispatch/classification tables.
 //
 // These expose copies of translation-unit-private tables defined in
-// mcp_server.cpp (kToolSecurity / kToolAnnotation / kWriteTools) so the
-// annotation cross-check test — a separate TU — can assert the served hints
-// without duplicating the maps. Relocated out of mcp_server.hpp (issue #2385)
-// so the production header carries no test-only surface. Definitions live in
-// mcp_server.cpp; only the unit test includes this header.
+// mcp_server.cpp (kToolSecurity / kToolAnnotation / kWriteTools / kTools) so
+// the annotation cross-check test — a separate TU — can assert the served
+// hints without duplicating the maps. Also exposes wrappers that run the REAL
+// C8 dispatch classifier / registration validator (#2383) over synthetic
+// tables, plus the validator's RBAC catalogue mirrors, so drift in any of
+// them cannot silently regress while tests stay green. Relocated out of
+// mcp_server.hpp (issue #2385) so the production header carries no test-only
+// surface. Definitions live in mcp_server.cpp; only unit tests include this
+// header.
 
 #include <string>
 #include <string_view>
@@ -57,9 +61,10 @@ ToolClassForTest classify_tool_for_test(const std::string& tool_name,
                                         const std::vector<std::string>& known_tools,
                                         const std::vector<std::string>& registered_tools);
 
-// Owning-string (name, operation) row for synthetic validator input.
+// Owning-string (name, securable, operation) row for synthetic validator input.
 struct ToolSecurityRowOwned {
     std::string name;
+    std::string securable;
     std::string operation;
 };
 
@@ -68,5 +73,11 @@ struct ToolSecurityRowOwned {
 void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
                                          const std::vector<ToolSecurityRowOwned>& security_rows,
                                          const std::vector<std::string>& write_tools);
+
+// The validator's closed-catalogue mirrors of rbac_store.cpp's seeded `ops[]`
+// and `types[]` (#2383 UP-6/C-3) — the [rbac_store] binding test compares
+// these against a live store so the mirrors cannot drift silently.
+std::vector<std::string> rbac_ops_for_test();
+std::vector<std::string> rbac_securables_for_test();
 
 } // namespace yuzu::server::mcp
