@@ -856,3 +856,29 @@ TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3
             [&] { return fx.reg.counter("yuzu_mcp_bridge_mailbox_drops_total").value() >= 4.0; }));
     }
 }
+
+TEST_CASE("bridge arm() throw leaves the record cleanly abandonable (Sol finding 2)",
+          "[mcp][bridge][2f]") {
+    // A pre-flip allocation failure in arm() (result_base copy / fallback build)
+    // must throw WITHOUT having mutated the record, so it stays kArming and the
+    // handler's guard can abandon it - no leaked global slot, no half-armed state.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-af"));
+    fx.bridge->inject_arm_fault_for_test();
+    CHECK_THROWS_AS(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly),
+                    std::bad_alloc);
+    // Still kArming - the throw was pre-flip, nothing changed.
+    auto ph = fx.bridge->phase_for(s.id, json(1));
+    REQUIRE(ph.has_value());
+    CHECK(*ph == Bridge::Phase::kArming);
+    // abandon cleans it, the subscription is torn down, the slot frees.
+    REQUIRE(fx.bridge->abandon(s.id, json(1)));
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.bus.subscriber_count("exec-af") == 0);
+    // The one-shot fault cleared: a fresh reserve+arm now succeeds.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-af2"));
+    CHECK(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+}

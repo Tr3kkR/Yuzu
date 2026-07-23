@@ -76,34 +76,45 @@ void McpStreamBridge::shutdown() {
     if (projector_.joinable()) {
         projector_.join();
     }
-    std::vector<std::shared_ptr<BridgeRecord>> reaped;
-    {
-        std::lock_guard<std::mutex> lk(bridge_mu_);
-        reaped.reserve(records_.size());
-        for (auto& [key, rec] : records_) {
-            if (rec->subscribed && bus_ != nullptr) {
-                // bridge_mu_ → Channel::mu is a declared edge; unsubscribe waits
-                // out in-flight listeners (they take record mu + WakeCore::mu
-                // only, never bridge_mu_ - no cycle).
-                bus_->unsubscribe(rec->execution_id, rec->sub_id);
-            }
-            rec->subscribed = false;
-            reaped.push_back(rec);
-        }
-        records_.clear();
-        streamed_unpinned_.clear();
-    }
-    for (const auto& rec : reaped) {
+    // The critical shutdown guarantees are already met above (mutators gated,
+    // projector joined) BEFORE any allocation. The teardown below allocates a
+    // reaped vector; a bad_alloc there must not propagate through the noexcept
+    // ServerImpl::stop() or the destructor (→ std::terminate) and must not leave
+    // the idempotence flag consumed with the work half-done in a way a retry
+    // could resume - so the whole best-effort cleanup is contained. On OOM at
+    // shutdown some subscriptions may linger, but the process is already tearing
+    // down and no projector remains to touch them.
+    try {
+        std::vector<std::shared_ptr<BridgeRecord>> reaped;
         {
-            // Settle charge bookkeeping for consistency (the ledger map is
-            // already gone; the flag must not read as "held" to a late observer).
-            std::lock_guard<std::mutex> lk(rec->mu);
-            rec->streamed_charge_held = false;
+            std::lock_guard<std::mutex> lk(bridge_mu_);
+            reaped.reserve(records_.size());
+            for (auto& [key, rec] : records_) {
+                if (rec->subscribed && bus_ != nullptr) {
+                    // bridge_mu_ → Channel::mu is a declared edge; unsubscribe waits
+                    // out in-flight listeners (they take record mu + WakeCore::mu
+                    // only, never bridge_mu_ - no cycle).
+                    bus_->unsubscribe(rec->execution_id, rec->sub_id);
+                }
+                rec->subscribed = false;
+                reaped.push_back(rec);
+            }
+            records_.clear();
+            streamed_unpinned_.clear();
         }
-        flush_record_obs(*rec);
+        for (const auto& rec : reaped) {
+            {
+                // Settle charge bookkeeping for consistency (the ledger map is
+                // already gone; the flag must not read as "held" to a late observer).
+                std::lock_guard<std::mutex> lk(rec->mu);
+                rec->streamed_charge_held = false;
+            }
+            flush_record_obs(*rec);
+        }
+        flush_core_obs();
+        publish_records_gauge(0);
+    } catch (...) {  // NOLINT(bugprone-empty-catch) - see the note above
     }
-    flush_core_obs();
-    publish_records_gauge(0);
 }
 
 // ── Key / lookup ───────────────────────────────────────────────────────────
@@ -312,6 +323,9 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
     if (!rec) {
         return ArmOutcome::kNotFound;  // abandon won and erased - equally valid
     }
+    if (arm_fault_.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc{};  // test seam: model a pre-flip allocation failure
+    }
     // Prebuild the minimal fallback final BEFORE the flip (H2): all throwing
     // work happens while nothing has changed.
     std::string exec_id;
@@ -334,6 +348,15 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
         // handoff wake. A concurrent listener append lands pre-flip (drained by
         // this wake) or post-flip (drained by its own unconditional wake).
         std::lock_guard<std::mutex> rlk(rec->mu);
+        // C6 re-check under the flip hold: shutdown() sets shutdown_called_
+        // (atomic) at its very start, BEFORE it stops+joins the projector and
+        // clears the map. A caller that passed the top-of-arm shutdown gate but
+        // released bridge_mu_ before reaching here could otherwise flip a
+        // detached record and wake a joined projector. Bailing keeps the C6
+        // gating contract true independent of the (masking) server wiring order.
+        if (shutdown_called_.load(std::memory_order_acquire)) {
+            return ArmOutcome::kNotFound;
+        }
         const Phase cur = rec->phase.load(std::memory_order_acquire);
         if (cur == Phase::kAborted) {
             return ArmOutcome::kAborted;
@@ -454,6 +477,12 @@ bool McpStreamBridge::on_post_closed(const std::string& session_id,
     }
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
+        // C6 re-check under the transition hold (same rationale as arm()): a
+        // shutdown that raced past the top gate must not have this transition
+        // wake a joined projector on a detached record.
+        if (shutdown_called_.load(std::memory_order_acquire)) {
+            return false;
+        }
         Phase expected = Phase::kStreaming;
         if (!rec->phase.compare_exchange_strong(expected, Phase::kRingOnly,
                                                 std::memory_order_acq_rel)) {
@@ -481,26 +510,36 @@ void McpStreamBridge::run_projector() {
             }
             core_->work_pending = false;
         }
-        std::vector<std::shared_ptr<BridgeRecord>> snap;
-        {
-            std::lock_guard<std::mutex> lk(bridge_mu_);
-            snap.reserve(records_.size());
-            for (const auto& [key, rec] : records_) {
-                snap.push_back(rec);
+        // BARE-THREAD BOUNDARY: run_projector is a std::thread entry with no
+        // caller try/catch, so ANY escaped exception is std::terminate (#2037
+        // class). The record snapshot ALLOCATES (snap.reserve / push_back) - a
+        // bad_alloc there would escape past the per-record guard below, which is
+        // why the whole cycle body is contained. A transient allocation failure
+        // drops this cycle; the next wake retries, and a latched terminal stays
+        // durably fetchable in the meantime (Decision 15(f)).
+        try {
+            std::vector<std::shared_ptr<BridgeRecord>> snap;
+            {
+                std::lock_guard<std::mutex> lk(bridge_mu_);
+                snap.reserve(records_.size());
+                for (const auto& [key, rec] : records_) {
+                    snap.push_back(rec);
+                }
             }
-        }
-        for (const auto& rec : snap) {
-            try {
-                project_record(rec);
-            } catch (...) {
-                // project_record's claim guard restored any unsettled terminal;
-                // this is a true should-not-happen backstop (all interior throw
-                // sites are individually caught).
-                spdlog::warn("MCP bridge projector: projection pass failed (contained)");
+            for (const auto& rec : snap) {
+                try {
+                    project_record(rec);
+                } catch (...) {
+                    // project_record's claim guard restored any unsettled terminal;
+                    // this is a true should-not-happen backstop (all interior throw
+                    // sites are individually caught).
+                    spdlog::warn("MCP bridge projector: projection pass failed (contained)");
+                }
+                flush_record_obs(*rec);
             }
-            flush_record_obs(*rec);
+            flush_core_obs();
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - see the boundary note above
         }
-        flush_core_obs();
     }
 }
 
@@ -827,6 +866,23 @@ void McpStreamBridge::sweep() {
         }
         // Stage 2: quiesce - after unsubscribe returns, no listener can be
         // in flight for this record and none will ever run again.
+        //
+        // KNOWN GAP - 3b-gated (Sol code-review finding, 2026-07-23). Once
+        // unsubscribe() removes the listener, a terminal published to the BUS in
+        // the window before the revalidate below is no longer latched into
+        // terminal_slot (there is no listener to do it), so the revalidate's
+        // `terminal_accepted` check is blind to it and a `-32014`
+        // terminal-unavailable can be synthesized over a real terminal that is
+        // sitting in the bus buffer + durable execution state. This path is
+        // UNREACHABLE in 3a: nothing reaches kRingOnly (on_post_closed is the
+        // only entry and is a 3b pump seam with no production caller), so the
+        // pressure hatch never fires. When 3b wires the pump, close this by
+        // making the final bus-terminal check, the record claim, and the listener
+        // removal atomic under Channel::mu (a new bus query in the declared
+        // bridge_mu_ → Channel::mu → record mu order). Even when it fires the
+        // synthesized frame carries the execution_id + "fetch by execution_id"
+        // remediation, so the real result stays recoverable (Decision 15(f)) -
+        // bounded, recoverable, and off the live surface until then.
         {
             std::lock_guard<std::mutex> lk(bridge_mu_);
             if (shutdown_started_) {
@@ -1077,6 +1133,10 @@ void McpStreamBridge::inject_listener_fault_for_test() {
 
 void McpStreamBridge::inject_observability_fault_for_test(int times) {
     obs_fault_remaining_.store(times, std::memory_order_relaxed);
+}
+
+void McpStreamBridge::inject_arm_fault_for_test() {
+    arm_fault_.store(true, std::memory_order_release);
 }
 
 }  // namespace yuzu::server::mcp

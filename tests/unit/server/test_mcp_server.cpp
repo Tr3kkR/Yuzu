@@ -6963,4 +6963,33 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
             return p.has_value() && *p == smcp::McpStreamBridge::Phase::kDone;
         }));
     }
+
+    SECTION("arm() allocation failure still returns the plain response, leaks no record") {
+        // Sol code-review finding 2: an unguarded arm() throw on a SUCCESSFUL
+        // dispatch turned the response into an httplib 500 and stranded a kArming
+        // record. The handler now contains it - the client still gets the plain
+        // success and the record is abandoned.
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-armfault", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        bridge.inject_arm_fault_for_test(); // next arm() throws pre-flip
+        auto res = call_exec(exec_body(11, true));
+        REQUIRE(res->status == 200); // NOT a 500 - the guard held
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result")); // plain success shape, unchanged
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text.contains("execution_id"));
+        CHECK(text["command_id"] == "cmd-armfault");
+        // The record was abandoned, not stranded in kArming.
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(11)).has_value());
+        CHECK(bridge.record_count() == 0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}}).value() ==
+              1.0);
+    }
 }

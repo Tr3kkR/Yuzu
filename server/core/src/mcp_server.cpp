@@ -5052,13 +5052,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     // The session id was validated (principal-bound) at handler
                     // entry; reserve re-checks it against the registry anyway
                     // (no TOCTOU widening - a dead session just degrades).
-                    auto rr = bridge->reserve(bridge_sid, session->username, id,
-                                              std::move(bridge_token),
-                                              /*streamed_intent=*/false);
-                    if (rr.ok) {
-                        bridge_active = true;
-                    } else {
-                        bridge_degrade(rr.reject_reason);
+                    // GUARD: reserve allocates (make_shared + map insert); a
+                    // bad_alloc here must degrade to the plain path, not turn a
+                    // dispatchable command into a 500 (byte-identical contract).
+                    try {
+                        auto rr = bridge->reserve(bridge_sid, session->username, id,
+                                                  std::move(bridge_token),
+                                                  /*streamed_intent=*/false);
+                        if (rr.ok) {
+                            bridge_active = true;
+                        } else {
+                            bridge_degrade(rr.reject_reason);
+                        }
+                    } catch (...) {
+                        bridge_degrade("reserve_threw");
                     }
                 }
 
@@ -5262,7 +5269,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).
                 if (bridge_active) {
-                    bridge->arm(bridge_sid, id, McpStreamBridge::ArmMode::kGetOnly, result);
+                    // GUARD (Sol code-review finding, 2026-07-23): passing the
+                    // lvalue `result` to arm()'s by-value result_base copies it,
+                    // and arm() builds a fallback string, both BEFORE the phase
+                    // flip - either can bad_alloc. An escaped throw here would
+                    // turn a successful dispatch into an httplib 500 (breaking the
+                    // byte-identical plain-path contract) AND strand the record in
+                    // kArming (sweep excludes kArming → a permanently leaked
+                    // global slot). Contain it: best-effort abandon the still-
+                    // kArming record and fall through to the unchanged success
+                    // response below.
+                    try {
+                        bridge->arm(bridge_sid, id, McpStreamBridge::ArmMode::kGetOnly, result);
+                    } catch (...) {
+                        try {
+                            bridge->abandon(bridge_sid, id);
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Under sustained OOM even abandon may fail; the record
+                            // then leaks one bounded slot (global cap 256) but the
+                            // plain response below still goes out - the contract
+                            // that matters.
+                        }
+                        bridge_degrade("arm_threw");
+                    }
                 }
                 // governance R1 happy-LOW-1: include command_id and
                 // execution_id in audit detail so SOC 2 investigators

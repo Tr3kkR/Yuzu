@@ -9,8 +9,12 @@
 // revalidation, or wire writes (those live in McpPostPump, PR 3b). In-memory,
 // non-durable, no new store.
 //
-// DELIBERATELY DEAD CODE until rung 3a.7 wires construction in server.cpp -
-// the same zero-producer landing posture as publish_final (3a.4).
+// GET-only mode is LIVE (rung 3a.7 wires reserve/subscribe/arm(kGetOnly) into
+// execute_instruction in mcp_server.cpp + construction in server.cpp). The
+// STREAMED-POST surface is still dead: on_post_closed / request_cancel /
+// ArmMode::kStreaming and therefore the whole kRingOnly lifecycle (parked
+// finals, the pressure hatch) have no production caller until the 3b pump lands
+// - deliberately, the same zero-producer staging as publish_final (3a.4).
 //
 // ── Record lifecycle ────────────────────────────────────────────────────────
 //
@@ -248,6 +252,11 @@ public:
     /// Test seam: force the next audit/metrics flush attempts to observe a
     /// throwing observability layer (C5 fault seam).
     void inject_observability_fault_for_test(int times = 1);
+    /// One-shot: the NEXT arm() throws std::bad_alloc pre-flip, modelling an
+    /// allocation failure in the result_base copy / fallback build. Proves the
+    /// execute_instruction handler's guard degrades to the plain path and leaks
+    /// no kArming record.
+    void inject_arm_fault_for_test();
 
 private:
     /// One latched bus event. Nothrow-movable - load-bearing for the projector's
@@ -394,6 +403,7 @@ private:
     std::thread projector_;
     std::atomic<bool> shutdown_called_{false};
     std::atomic<int> obs_fault_remaining_{0};  ///< C5 fault seam
+    std::atomic<bool> arm_fault_{false};       ///< one-shot arm() throw seam
 };
 
 }  // namespace yuzu::server::mcp
