@@ -2,6 +2,7 @@
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_jsonrpc.hpp"
+#include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
 #include "mcp_transport.hpp" // Streamable HTTP transport pre-checks (2f)
 
@@ -1850,24 +1851,13 @@ McpServer::HandlerFn McpServer::build_handler(
             if (uri == "yuzu://about") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const std::string content =
-                    "# Yuzu\n\n"
-                    "Yuzu is an agentic enterprise endpoint management control plane for "
-                    "Windows, Linux, and macOS fleets. Through MCP, an LLM can inspect fleet "
-                    "state, inventory, compliance, command responses, audit evidence, DEX "
-                    "signals, and network posture.\n\n"
-                    "Safe operating rules: classify the question first; read existing facts "
-                    "before dispatch; narrow scope before action; use dry-run/read-only probes "
-                    "where possible; request explicit approval before remediation; label "
-                    "connector gaps honestly.\n\n"
-                    "Engine-principal management (create/list/get/revoke/mint/rotate/transfer-"
-                    "owner engine principals, plus a no-admin audit) is a supervised-tier, "
-                    "human-admin-only surface for provisioning the durable identities behind "
-                    "autonomous use-case-engine modules — engine-classed sessions are structurally "
-                    "barred from calling it, and every mutation is approval-gated.";
+                // Single-sourced with initialize.instructions (mcp_orientation.hpp,
+                // 2g PR 1) so the handshake and this resource cannot drift.
                 JArr contents;
-                contents.add(
-                    JObj().add("uri", uri).add("mimeType", "text/markdown").add("text", content));
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "text/markdown")
+                                 .add("text", about_text()));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
@@ -1902,15 +1892,13 @@ McpServer::HandlerFn McpServer::build_handler(
             if (uri == "yuzu://operating-model") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const std::string content =
-                    "Recommended MCP workflow: classify the question, identify connector gaps, "
-                    "read high-level posture, narrow scope by cohort/site/OS/management group, "
-                    "prefer existing responses and inventory, use live dispatch only for "
-                    "read-only probes, request approval for mutation, execute with the smallest "
-                    "safe scope, then monitor responses/audit/events.";
+                // Single-sourced with initialize.instructions (mcp_orientation.hpp,
+                // 2g PR 1) so the handshake and this resource cannot drift.
                 JArr contents;
-                contents.add(
-                    JObj().add("uri", uri).add("mimeType", "text/markdown").add("text", content));
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "text/markdown")
+                                 .add("text", operating_model_text()));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
