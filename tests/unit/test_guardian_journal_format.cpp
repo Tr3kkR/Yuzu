@@ -209,3 +209,33 @@ TEST_CASE("parse_journal_batch: pathologically-nested JSON is rejected, never st
     REQUIRE(ok.has_value());
     CHECK(ok->entries.at(0).rule_name == brackety);
 }
+
+TEST_CASE("parse_journal_batch rejects a row claiming more entries than a batch may hold",
+          "[guardian][journal][format][chaos]") {
+    // persist() writes at most kMaxJournalEntriesPerBatch, and the send window is floored at
+    // exactly that, so the replay path's termination argument is "no batch can need more room
+    // than the window holds". The READ boundary is what has to enforce that: an over-long row -
+    // a torn write, a hand-edited kv_store.db, a future writer bug - would otherwise parse,
+    // never fit, and hold a paging reservation for a batch that can never be placed, while
+    // every counter stays clean. RED before the fix: the row parses.
+    const auto row = [](std::size_t n) {
+        std::string j = R"({"v":4,"ts_ms":1700000000000,"entries":[)";
+        for (std::size_t i = 0; i < n; ++i) {
+            if (i)
+                j += ',';
+            j += R"({"rule_id":"r","event_id":"e)" + std::to_string(i) +
+                 R"(","kind":"armed","guard_type":"file","rule_name":"n","generation":1,)"
+                 R"("enqueued_ns":1700000000000000000})";
+        }
+        return j + "]}";
+    };
+    // At the limit it parses; one over is Malformed, so prune quarantines it rather than
+    // replaying it forever.
+    auto ok = parse_journal_batch(row(kMaxJournalEntriesPerBatch));
+    REQUIRE(ok.has_value());
+    CHECK(ok->entries.size() == kMaxJournalEntriesPerBatch);
+
+    auto bad = parse_journal_batch(row(kMaxJournalEntriesPerBatch + 1));
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error() == JournalParseError::Malformed);
+}

@@ -1113,11 +1113,18 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     GuardianSparkRuntime::Config cfg;
-    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    cfg.outbox_capacity = 1; // clamped up to the one-max-batch floor
     auto rt = make_rt(r, b, cfg);
 
-    // Fill the (shared-capacity) lifecycle log past its floor via same-id
-    // replace churn (armed/disarmed/armed/... never coalesces or gets purged).
+    // Fill the lifecycle log to capacity, then churn one rule's arm/disarm on top. Paged in
+    // directly because the window is floored at a whole maximum-size batch, so filling it via
+    // rule churn alone would take hundreds of attaches to say the same thing.
+    const std::size_t cap = rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rt->try_page_batch(std::move(fill)).added == cap);
+    REQUIRE(rt->lifecycle_headroom() == 0);
     for (int i = 0; i < 5; ++i)
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
@@ -1137,7 +1144,7 @@ TEST_CASE("attach_rule stages a durable record; its event_id matches the wire ev
     auto rt = make_rt(r, b);
 
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    auto staged = rt->snapshot_pending();
+    auto staged = rt->snapshot_pending().records;
     REQUIRE(staged.size() == 1);
     CHECK(staged[0]->rule_id == "r1");
     CHECK(staged[0]->kind == "armed");
@@ -1162,7 +1169,7 @@ TEST_CASE("detach_rule stages a disarmed record after the armed one", "[spark][r
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true)); // stages "armed"
     rt->detach_rule("r1");                                                         // ->0 edge, stages "disarmed"
 
-    auto staged = rt->snapshot_pending();
+    auto staged = rt->snapshot_pending().records;
     REQUIRE(staged.size() == 2);
     CHECK(staged[0]->kind == "armed");
     CHECK(staged[1]->kind == "disarmed");
@@ -1175,7 +1182,7 @@ TEST_CASE("a refused arm stages no durable record (no phantom)", "[spark][runtim
     b->fail_arm.store(true);
     auto rt = make_rt(r, b);
     CHECK_FALSE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
-    CHECK(rt->snapshot_pending().empty()); // arm refused before enqueue → nothing staged
+    CHECK(rt->snapshot_pending().records.empty()); // arm refused before enqueue → nothing staged
 }
 
 TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runtime][journal]") {
@@ -1184,7 +1191,7 @@ TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runti
     b->throw_arm.store(true);
     auto rt = make_rt(r, b);
     CHECK_THROWS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    CHECK(rt->snapshot_pending().empty()); // rollback undid the arm; nothing staged
+    CHECK(rt->snapshot_pending().records.empty()); // rollback undid the arm; nothing staged
 }
 
 TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
@@ -1197,16 +1204,16 @@ TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
     REQUIRE(rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3"), true));
     REQUIRE(rt->pending_journal_depth() == 3);
 
-    auto staged = rt->snapshot_pending();
+    auto staged = rt->snapshot_pending().records;
     REQUIRE(staged.size() == 3);
     CHECK(staged[0]->rule_id == "r1");
     CHECK(staged[2]->rule_id == "r3");
 
-    rt->erase_persisted_prefix(2); // drop the two oldest (r1, r2)
+    rt->erase_persisted_prefix(2, rt->snapshot_pending().drops_at_snapshot); // drop the two oldest (r1, r2)
     REQUIRE(rt->pending_journal_depth() == 1);
-    CHECK(rt->snapshot_pending()[0]->rule_id == "r3");
+    CHECK(rt->snapshot_pending().records[0]->rule_id == "r3");
 
-    rt->erase_persisted_prefix(99); // clamps to size
+    rt->erase_persisted_prefix(99, rt->snapshot_pending().drops_at_snapshot); // clamps to size
     CHECK(rt->pending_journal_depth() == 0);
 }
 
@@ -1214,7 +1221,7 @@ TEST_CASE("snapshot_pending is FIFO; erase_persisted_prefix drops the oldest N",
 
 TEST_CASE("try_page_batch pages new entries into the send window", "[spark][runtime][journal]") {
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 2);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}).added == 2);
     auto lc = drain_lifecycle(*rt);
     REQUIRE(lc.size() == 2);
     CHECK(lc[0].event_id == "e1");
@@ -1224,19 +1231,30 @@ TEST_CASE("try_page_batch pages new entries into the send window", "[spark][runt
 TEST_CASE("try_page_batch skips entries already in the window (membership scan)",
           "[spark][runtime][journal]") {
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}).added == 1);
     // e1 already present; only e2 is net-new.
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}) == 1);
+    CHECK(rt->try_page_batch({lc_entry("r1", "e1"), lc_entry("r2", "e2")}).added == 1);
 }
 
 TEST_CASE("try_page_batch defers a batch that does not fit the headroom", "[spark][runtime][journal]") {
     GuardianSparkRuntime::Config cfg;
-    cfg.outbox_capacity = GuardianSparkRuntime::kMinOutboxCapacity; // floor: 2
+    cfg.outbox_capacity = 1; // clamped up to the one-max-batch floor
     auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
-    CHECK(rt->try_page_batch({lc_entry("r1", "e1")}) == 1); // headroom 2 → ok
-    // headroom now 1; a 2-entry batch is deferred WHOLE (never split).
-    CHECK(rt->try_page_batch({lc_entry("r2", "e2"), lc_entry("r3", "e3")}) == 0);
-    CHECK(rt->try_page_batch({lc_entry("r2", "e2")}) == 1); // a 1-entry batch fits
+    const std::size_t cap = rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill; // fill to exactly ONE free slot
+    for (std::size_t i = 0; i + 1 < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rt->try_page_batch(std::move(fill)).added == cap - 1);
+    // headroom is 1; a 2-entry batch is deferred WHOLE (never split).
+    {   // A 0 return now carries WHY: blocked for headroom, not "already a member". That
+        // distinction is what lets the journal tell a waiting backlog from an idle steady
+        // state (#2345 Gate 3).
+        const auto blocked = rt->try_page_batch({lc_entry("r2", "e2"), lc_entry("r3", "e3")});
+        CHECK(blocked.added == 0);
+        CHECK(blocked.blocked_for_headroom);
+        CHECK(blocked.required == 2);
+    }
+    CHECK(rt->try_page_batch({lc_entry("r2", "e2")}).added == 1); // a 1-entry batch fits
 }
 
 TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark][runtime][journal]") {
@@ -1252,7 +1270,7 @@ TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark]
     CHECK_FALSE(lc[0].journal_batch_key.empty());
 }
 
-TEST_CASE("page_into_window does not re-page a windowed entry (re-send-all skips members)",
+TEST_CASE("page_into_window does not re-page a windowed entry (skips entries already windowed)",
           "[spark][runtime][journal]") {
     PageRig rig;
     rig.persist("r1");
@@ -1392,7 +1410,7 @@ TEST_CASE("a paged batch's last entry, when sent, gets a sent-label (send-wrap l
 }
 
 TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
-          "[spark][runtime][journal][tsan]") {
+          "[spark][runtime][journal][tsan][tsan-heavy]") {
     PageRig rig;
     for (int i = 0; i < 20; ++i)
         rig.persist("r" + std::to_string(i));
@@ -1411,6 +1429,18 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
         while (!stop.load(std::memory_order_relaxed))
             rig.rt->drain([](const OutboxEntry&) { return SendResult::Sent; });
     });
+    // A RETENTION thread, not only pagers (#2345 Gate 8 cpp-safety). prune_locked_ and
+    // page_into_window hand three non-atomic members between them - last_prune_now_ms_,
+    // last_age_cutoff_, pruned_cutoff_valid_ - and with pagers alone that handoff is never
+    // exercised concurrently, so a TSan pass over this test said nothing about it. The clock
+    // walks forward fast enough here to drive the age-cutoff logic, not just the lock.
+    std::thread pruner([&] {
+        std::int64_t t = 1'700'000'000'000;
+        while (!stop.load(std::memory_order_relaxed)) {
+            rig.journal->prune(t);
+            t += 60'000;
+        }
+    });
 
     // Interleave from the main thread too, then signal stop (also exercises the stop-race gate).
     for (int i = 0; i < 200; ++i)
@@ -1421,7 +1451,8 @@ TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
     for (auto& t : pagers)
         t.join();
     drainer.join();
-    SUCCEED("no data race / crash across concurrent pagers + drain");
+    pruner.join();
+    SUCCEED("no data race / crash across concurrent pagers + retention + drain");
 }
 
 TEST_CASE("page_into_window quarantines a corrupt batch instead of replaying it (M6)",
@@ -1456,7 +1487,7 @@ TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
     PageRig rig;
     // A live entry enters BOTH the send window and staging; persist it, then back-fill.
     REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    auto pending = rig.rt->snapshot_pending();
+    auto pending = rig.rt->snapshot_pending().records;
     REQUIRE(pending.size() == 1);
 
     std::vector<PersistedBatch> batches;
@@ -1507,7 +1538,7 @@ TEST_CASE("a hostile rule_name is rejected from the journal but never crashes th
 }
 
 TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)",
-          "[spark][runtime][journal][tsan]") {
+          "[spark][runtime][journal][tsan][tsan-heavy]") {
     PageRig rig;
     // A small retention cap keeps the pruner trimming the journal so page-passes stay O(small):
     // TSan finds a race from the INTERLEAVING, not from volume, so a short bounded run suffices.
@@ -1559,20 +1590,89 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
     for (int i = 0; i < 60; ++i)
         rig.journal->page_into_window(*rig.rt, 1'700'000'500'000 + i * 1000);
 
-    rig.journal->request_stop();
     stop.store(true, std::memory_order_relaxed);
     for (auto& w : workers)
         w.join();
 
+    // request_stop() comes AFTER the settle prune below, not before it. Calling it first made
+    // that prune return at its shutdown gate without doing anything, so the rebase the
+    // assertions depend on never happened and they were checking gauges that had merely
+    // survived the concurrent run - passing or flaking on the documented transient
+    // double-count interleaving rather than on the property this test is named for
+    // (#2345 round 7, Sol). The workers are already joined, so nothing races this.
+    //
     // Beyond race-freedom (TSan): the running-counter gauges (#2303) must stay ACCOUNTING-correct
     // under the real concurrent persist/prune interleaving, not just data-race-free. A final
-    // settle prune (prune ignores stopping_, so it still runs) rebases to on-disk truth; the
+    // settle prune rebases to on-disk truth; the
     // gauges must then exactly equal what namespace_size sees on disk - proving no lost update
     // and no drift accumulated across the concurrent run.
     rig.journal->prune(1'700'000'900'000);
+    rig.journal->request_stop();
     auto sz = rig.kv->namespace_size(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(sz.has_value());
     CHECK(rig.journal->journal_batch_count() == sz->count);
     CHECK(rig.journal->journal_bytes() == sz->bytes);
     CHECK(rig.journal->gauge_underflow() == 0); // never fell into the fail-open underflow window
+}
+
+TEST_CASE("erase_persisted_prefix identifies the prefix it wrote, not an index",
+          "[spark][runtime][journal][chaos]") {
+    // snapshot_pending() releases outbox_mu_, persist() does its KvStore I/O unlocked, and the
+    // erase re-takes the lock. If staging overflows in that window it drops from the FRONT, so
+    // position 0 is no longer the record it was - and erasing by index deletes records that
+    // were never written. Silent, uncounted destruction of audit evidence, worst exactly when
+    // staging is full, i.e. when persist is already failing. RED before the fix: r4 and r5,
+    // which were never persisted, are erased and lost.
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(rt->attach_rule("r" + std::to_string(i), file_spec("/p" + std::to_string(i)),
+                                file_exists_rule("r" + std::to_string(i)), true));
+    REQUIRE(rt->pending_journal_depth() == 6);
+
+    const auto snap = rt->snapshot_pending();
+    const auto drops = snap.drops_at_snapshot;
+    REQUIRE(snap.records.size() == 6);
+
+    // ...persist commits the first 4. Meanwhile two overflow drops take r0 and r1 off the front.
+    rt->drop_oldest_pending_for_test(2);
+    REQUIRE(rt->pending_journal_depth() == 4); // r2..r5
+
+    rt->erase_persisted_prefix(4, drops);
+    // r0 and r1 are already gone and r2, r3 were the rest of the persisted prefix, so exactly
+    // r4 and r5 - never written - must SURVIVE to be retried.
+    REQUIRE(rt->pending_journal_depth() == 2);
+    const auto left = rt->snapshot_pending().records;
+    CHECK(left[0]->rule_id == "r4");
+    CHECK(left[1]->rule_id == "r5");
+}
+
+TEST_CASE("erase_persisted_prefix erases nothing when drops already exceeded the prefix",
+          "[spark][runtime][journal][chaos]") {
+    // The far end of the same seam, and the dangerous one. If MORE records were dropped from
+    // the front than persist durably wrote, the whole persisted prefix is already gone and
+    // there is nothing left to erase. Without the early return, `n -= dropped_since` wraps a
+    // size_t to an enormous value, std::min clamps it to the buffer size, and the erase takes
+    // the ENTIRE remaining staging buffer - every record staged but never written. That is
+    // silent audit-record destruction, and it is worst exactly when it is most likely: staging
+    // only overflows when persist is already failing.
+    // RED before the fix: pending_journal_depth() == 0 - everything still waiting is destroyed.
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(rt->attach_rule("r" + std::to_string(i), file_spec("/p" + std::to_string(i)),
+                                file_exists_rule("r" + std::to_string(i)), true));
+
+    const auto snap = rt->snapshot_pending();
+    const auto drops = snap.drops_at_snapshot;
+    REQUIRE(snap.records.size() == 6);
+
+    // persist committed 3 (r0..r2). Meanwhile FIVE overflow drops took r0..r4 off the front -
+    // strictly more than the prefix that was written.
+    rt->drop_oldest_pending_for_test(5);
+    REQUIRE(rt->pending_journal_depth() == 1); // only r5 is left, and it was never persisted
+
+    rt->erase_persisted_prefix(3, drops);
+    REQUIRE(rt->pending_journal_depth() == 1); // untouched: nothing of the prefix remained
+    const auto left = rt->snapshot_pending().records;
+    REQUIRE(left.size() == 1);
+    CHECK(left[0]->rule_id == "r5"); // the never-persisted record survives to be retried
 }

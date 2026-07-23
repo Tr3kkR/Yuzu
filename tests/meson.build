@@ -219,11 +219,28 @@ agent_test_exe = executable(
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
+# Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
+# threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
+# ballooned under Big Tam filesystem contention (four CI jobs sharing one host's /tmp), where
+# one stalled ~8 minutes and timed the whole agent suite out (#2345). In a PLAIN build they
+# detect nothing (no instrumentation), so that cost buys no signal there - skip them. A
+# sanitizer build runs everything (ASan for use-after-free in the concurrent teardown, TSan
+# for the races they exist for), where the ~10x-larger job budget absorbs their cost as it did
+# before this change. The OTHER four [tsan] tests are cheap and bounded (no real SQLite, or a
+# fixed sleep) and stay in every build. A coverage build (b_coverage, no sanitizer) also skips
+# the two heavy tests; their concurrent code paths are line-covered by the sequential
+# prune/page/gauge tests and the cheap concurrent tests, so no meaningful line coverage is lost.
+# The residual risk that these two balloon on the shared Big Tam pool even under the sanitizer
+# budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
+# that route introduced its own flakiness (a busy main thread starving the workers it waited on)
+# and was backed out.
+agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
 test(
   'agent unit tests',
   agent_test_exe,
+  args: agent_test_args,
   suite: 'agent',
-  timeout: 240,
+  timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 

@@ -35,6 +35,14 @@ struct GuardianJournalStats {
     std::uint64_t quarantine_capacity_evicted{0}; ///< over-cap quarantined batches shed (UP-7)
     std::uint64_t batches_pruned{0};
     std::uint64_t prune_failures{0};
+    /// Replay-side scan failures. Deliberately NOT folded into prune_failures: the same
+    /// O(journal) KvStore read failing on the page side stops all replay while retention keeps
+    /// succeeding, which is a different operator situation from retention itself failing.
+    std::uint64_t page_read_failures{0};
+    /// Retention passes that declined to age-evict because the wall clock jumped implausibly
+    /// far forward. Nonzero is NOT an error - it means an endpoint's clock moved and the
+    /// journal deliberately kept evidence it would otherwise have deleted.
+    std::uint64_t clock_jump_skips{0};
     std::uint64_t write_capacity_rejected{0}; ///< new batch refused: journal at its byte/count cap (UP-1)
     std::uint64_t journal_bytes{0};           ///< current live journal size estimate (gauge)
     std::uint64_t journal_batch_count{0};     ///< current live batch count (gauge)
@@ -44,7 +52,17 @@ struct GuardianJournalStats {
     std::uint64_t sent_labels_written{0};
     std::uint64_t evicted_sent_unacked{0};          ///< aged out WITH a sent-label (monitor)
     std::uint64_t evicted_without_send_evidence{0}; ///< aged out with NO sent-label (integrity gap, alert)
-    std::uint64_t maint_exceptions{0};              ///< swallowed tick/page/flush throws (review B4)
+    std::uint64_t maint_exceptions{0};              ///< swallowed persist/prune/page throws (review B4)
+    /// Firewalled OUTBOX-DELIVERY throws on the drain worker (bad_alloc in the drain
+    /// machinery). Separate from maint_exceptions: delivery failing and retention failing
+    /// need different operator responses.
+    std::uint64_t drain_exceptions{0};
+    /// Firewalled CONVERGENCE-SWEEP throws on the scheduler lanes. Deliberately NOT folded
+    /// into maint_exceptions (#2298 Gate 6 sre): these are drift-DETECTION failures with
+    /// nothing to do with the journal, and a tag named journal_maint_exceptions counting
+    /// them leaves an operator unable to tell "audit trail at risk" from "detection
+    /// degraded" - the two have different urgency and different remediation.
+    std::uint64_t sweep_exceptions{0};
 };
 
 /// Populate `tags` with the (sparse) journal telemetry. `TagMap` is any map with a string
@@ -68,6 +86,8 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_quarantine_capacity_evicted", s.quarantine_capacity_evicted);
     put("yuzu.guardian_journal_pruned", s.batches_pruned);
     put("yuzu.guardian_journal_prune_failures", s.prune_failures);
+    put("yuzu.guardian_journal_page_read_failures", s.page_read_failures);
+    put("yuzu.guardian_journal_clock_jump_skips", s.clock_jump_skips);
     put("yuzu.guardian_journal_write_capacity_rejected", s.write_capacity_rejected);
     put("yuzu.guardian_journal_bytes", s.journal_bytes);
     put("yuzu.guardian_journal_batch_count", s.journal_batch_count);
@@ -77,6 +97,8 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_evicted_sent_unacked", s.evicted_sent_unacked);
     put("yuzu.guardian_journal_evicted_no_send_evidence", s.evicted_without_send_evidence);
     put("yuzu.guardian_journal_maint_exceptions", s.maint_exceptions);
+    put("yuzu.guardian_drain_exceptions", s.drain_exceptions);
+    put("yuzu.guardian_sweep_exceptions", s.sweep_exceptions);
 }
 
 } // namespace yuzu::agent
