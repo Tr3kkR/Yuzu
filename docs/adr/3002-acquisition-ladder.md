@@ -3,26 +3,41 @@ status: proposed
 date: 2026-07-21
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
-  Proposed. To be ratified by the engineering colleagues. Grounded in the standing rule at
-  docs/cpp-conventions.md §Shell/process boundaries and the plugin CodeQL queries that
-  already police non-literal spawn arguments. An independent external pre-PR review
-  (2026-07-21, verdict REQUEST-CHANGES) was adjudicated against the code; every accepted
-  blocking finding is folded in. Reframed 2026-07-21 from an argv-vs-shell decision into
-  the acquisition-ladder standard it enforces. A colleague review on the PR (advisory
-  COMMENT, 2026-07-21, findings F1–F10) is folded in this revision: two-tier enforcement
-  (per-PR lexical gate + scheduled CodeQL), the out-of-tree spawn-path gap stated, batch
-  files banned on Windows, termination honesty elevated to an automation-correctness
-  prerequisite for mutating-site migrations, interpreter sites registered, and the descent rule
-  set to evidence-backed justification. The syscall/native-API split was subsequently
-  collapsed into a single native-interface rung: every in-process route bottoms out in
-  the same syscall layer, and the load-bearing boundaries are the process and the
-  interpreter, not wrapper depth.
+  @Doomgoose (author). Ratified by PR approval from the engineering colleagues
+  (@Tr3kkR, @FortitudeEtc, @lesault, @fjarvis) under the dev-branch protection rule
+  (at least one non-author approval).
+effective: >-
+  Binding on merge (ratification) for the ladder, the descent-evidence rules, and the
+  Decision-2 interim rule (no new raw spawn site). The runner-routing obligations
+  (Decisions 2/3/5/7) become operative when the runner (#2321) lands on dev; mutating-site
+  migrations additionally gate on the termination-honesty prerequisites (Runner contract
+  requirements).
+revision-history: >-
+  Grounded in the standing rule at docs/cpp-conventions.md §Shell/process boundaries and
+  the plugin CodeQL queries that already police non-literal spawn arguments. An independent
+  external pre-PR review (2026-07-21, verdict REQUEST-CHANGES) was adjudicated against the
+  code; every accepted blocking finding is folded in. Reframed 2026-07-21 from an
+  argv-vs-shell decision into the acquisition-ladder standard it enforces. A colleague
+  review on the PR (advisory COMMENT, 2026-07-21, findings F1–F10) is folded in: two-tier
+  enforcement (per-PR lexical gate + scheduled CodeQL), the out-of-tree spawn-path gap
+  stated, batch files banned on Windows, termination honesty elevated to an
+  automation-correctness prerequisite for mutating-site migrations, interpreter sites
+  registered, and the descent rule set to evidence-backed justification. The
+  syscall/native-API split was subsequently collapsed into a single native-interface rung:
+  every in-process route bottoms out in the same syscall layer, and the load-bearing
+  boundaries are the process and the interpreter, not wrapper depth. The migration roadmap
+  was separated out 2026-07-22 (an ADR records direction; sequencing is execution
+  planning). Second-round colleague review (2026-07-23) folded in: grandfathered-site
+  freeze, interim-window rule, token-list alignment and lexical-gate semantics,
+  per-invocation cancellation, wire propagation of termination reason, long-lived-launch
+  scope split, manifest stub shipped, deciders and effectivity stated.
 depends-on: >-
   The shared argv runner (agents/core subprocess_runner, work item BR-001) currently on
   feat/macos-subproc-runner-certs (#2273/#2274, PR #2321 stacked on #2277). This ADR sets
   the target state; the runner landing on dev is the prerequisite for the rung-2/3
   migrations. Migration sequencing is owned by a separately maintained roadmap — this
-  ADR records direction only.
+  ADR records direction only; #2380 is the repo-visible tracking handle for sequencing
+  and manifest population, #2379 for the Decision-4 C wrapper.
 related: >-
   docs/agent-privilege-model.md (macOS agent is root, Windows LocalSystem today — the
   privilege context; and the Linux sudo-boundary rules Decision 8 preserves).
@@ -32,8 +47,11 @@ related: >-
   on making them a failing gate). agents/plugins/tar/src/tar_mapdrive_collector.cpp
   (the documented shell exception this ADR re-homes onto the runner).
   docs/yuzu-guardian-design-v1.1.md §restart-process (posix_spawn mandate — Decision 9's
-  evolution path). docs/tar-implementer.md (capture sources — already built at rung 1:
-  Endpoint Security, ETW).
+  evolution path; note the long-lived-launch scope split in Non-goals). docs/tar-implementer.md
+  (capture sources — already built at rung 1: Endpoint Security, ETW).
+  docs/agent-spawn-sink-manifest.md (the sink manifest — stub ships with this ADR).
+  docs/adr/0028-agent-component-inventory-collection.md (component_inventory — the first
+  plugin designed to be born on the ladder rather than migrated to it).
 ---
 
 # ADR-3002 — The acquisition ladder: how plugins and capture sources get data and act on endpoints
@@ -78,7 +96,12 @@ inside this rung: every in-process route bottoms out in the same syscall
 layer, differing only in how thick the supported wrapper is. Within the rung,
 ordinary engineering judgment prefers the lowest-dependency surface available
 (a kernel-published surface over a daemon-mediated framework call that can
-block on a wedged service) — a preference, not an evidence-gated step.
+block on a wedged service) — a preference, not an evidence-gated step. One
+hard requirement does apply inside the rung: where a daemon-mediated broker
+API offers a bounded call mode (WMI semisynchronous with timeouts,
+`sd_bus_call`'s timeout parameter), the bounded mode is used — an unbounded
+broker call can wedge on a stuck service at a rung that has no runner
+deadline, recreating the hang-forever mode this ADR exists to remove.
 Already ours in places: Windows plugins live here
 (`hardware`/`bitlocker`/`license_scan` via WMI), the TAR capture sources were
 built here from day one (ES on macOS, ETW on Windows — `ProcStreamCollector`
@@ -187,7 +210,9 @@ recognised categories:
   (Decisions 2 and 7). Rung-1 promotions close it harder still — a spawn
   that no longer exists cannot race.
 - **A shared runner now exists** (`agents/core` `subprocess_runner`, on
-  `feat/macos-subproc-runner-certs`): fixed argv, absolute-path `execv`, own
+  `feat/macos-subproc-runner-certs` — branch-level code citations in this ADR
+  verified as of #2321 @ `fcd539fb`; if that PR is re-cut, re-verify before
+  relying on line-level claims): fixed argv, absolute-path `execv`, own
   process group, deadline + SIGKILL + reap, line caps, exec-error pipe,
   cooperative cancel; in agent-core deliberately so its reaper thread
   survives plugin `dlclose()`. On that branch `filesystem` is fully migrated;
@@ -337,14 +362,26 @@ removes its spawn from the picture entirely.
    runner before any shell. Each descent's **rung evidence** is recorded in
    the code and in the sink manifest; a bare assertion is not evidence;
    reviewers reject any descent without it. Existing sites acquire their
-   evidence chain as the migration reaches them.
+   evidence chain as the migration reaches them — but until it does they are
+   **frozen, not extensible**: a PR that edits a function containing a
+   grandfathered raw spawn either migrates the site or records a reviewed
+   exception in the manifest, and a grandfathered site may never gain new
+   interpolated input. (Routing new operator- or attacker-influenceable data
+   into an existing `run_command` helper adds no new spawn token, so the
+   Decision-10 lexical gate cannot see it — this rule is what closes that
+   window.)
 2. **Plugins never spawn a process through a raw API.** No `popen()`,
-   `_popen()`, `system()`, raw `fork()`/`exec*`, or raw
+   `_popen()`, `system()`, raw `fork()`/`exec*`/`posix_spawn()`, or raw
    `CreateProcess`/`ShellExecute` in `agents/plugins/*`. Every subprocess —
    including the governed shell of Decisions 5 and 7 — goes through the shared
    agent-core argv runner once it lands on `dev`, so every spawn gets the fork
    lock, a deadline, output caps, and cancel support with no per-site
-   discipline required.
+   discipline required. **Interim rule for the window between ratification
+   and the runner landing on `dev`** (the runner is stacked, so the window
+   may be long, and the only rule otherwise in force there is the weaker
+   cpp-conventions exception regime this ADR replaces): no new spawn site
+   merges; any unavoidable interim site registers in the manifest with its
+   descent evidence and is first in line to migrate.
 3. **The runner is the single spawn path**: absolute-path argv exec by
    default, no PATH search, deadline mandatory, output capped, fork-lock
    covered. Per-plugin spawn helpers are deleted as their plugins migrate — no
@@ -358,8 +395,8 @@ removes its spawn from the picture entirely.
    C-compatible wrapper (argv pointer/count, POD options, host-owned result +
    destroy) comes first. Until that wrapper ships, out-of-tree plugin authors
    have **no sanctioned spawn path** — a deliberate, stated gap: this ADR's
-   structural guarantees cover bundled plugins, and the C wrapper is
-   scheduled as a named follow-up work item rather than implied.
+   structural guarantees cover bundled plugins, and the C wrapper is the
+   named follow-up work item **#2379**.
 5. **Interpreters are argv'd, not shelled.** Where an interpreter is genuinely
    the tool (`powershell -NoProfile -Command …`, `bash` in `script_exec`, or
    `/bin/sh` itself when a shell capability like `~username` expansion is
@@ -374,7 +411,12 @@ removes its spawn from the picture entirely.
    strings today, several from runtime values, and each is a payload CodeQL
    cannot inspect. The ladder shrinks this set too: PowerShell query sites
    with native WMI/COM equivalents should cease to exist rather than be
-   migrated.
+   migrated. **A site's rung is set by the deepest code interpreter
+   intentionally invoked, not by the outer spawn API**: `powershell -Command
+   <string>`, `bash -c <string>`, `python`/`osascript -e` expressions, and
+   `#!/usr/bin/env` shebang scripts are governed rung-3 interpreter sites
+   even though the outer process is argv-exec'd — presenting a script as a
+   rung-2 `argv[0]` does not bypass the interpreter ledger.
 6. **Argument hygiene remains mandatory — argv is not a licence to skip
    validation.** Every migrated site must handle option injection (pass `--`
    before positional values where supported, or reject leading-`-` values —
@@ -403,15 +445,20 @@ removes its spawn from the picture entirely.
    run-as-root conditional (sites skip `sudo` when `geteuid() == 0`), and
    (b) runs against a **live sudoers install** from
    `scripts/install-agent-user.sh`, not just a string comparison against the
-   grant text.
+   grant text. Future-proofing, not a ban: existing sudo-governed operations
+   retain their process boundary unless the privilege model separately
+   approves a brokered native replacement — this decision prefers the
+   shipped sudo boundary; it does not foreclose a future brokered-elevation
+   design that clears its own threat-model review.
 9. **Spawn-mechanism evolution: `posix_spawn` + `POSIX_SPAWN_CLOEXEC_DEFAULT`
    on macOS**, retiring the fork lock there, behind the unchanged
    `run_bounded_subprocess` API. Hedged: the flag is a public but Darwin-only,
    non-POSIX extension — adoption gates on compile-time availability and
    minimum-supported-macOS tests, with the current fork-lock design (correct
    today) as the standing fallback.
-10. **Enforcement: a per-PR lexical gate now, CodeQL as the deep net; review
-    gates the rung.** Two honest facts shape this: today's `codeql.yml` never
+10. **Enforcement: a per-PR lexical gate (to be built with the migration's
+    first wave), CodeQL as the deep net; review gates the rung.** Two honest
+    facts shape this: today's `codeql.yml` never
     runs C++ analysis on pull requests (the analyze job is gated to
     schedule/dispatch only), and the current queries are narrower than this
     ADR needs (non-literal arguments only; a path filter that misses the
@@ -419,10 +466,20 @@ removes its spawn from the picture entirely.
     allowlist mechanism; no executed query tests). Enforcement is therefore
     two-tier: (a) a **per-PR lexical gate** — a zero-cost script check in the
     PR pipeline (the `check-compose-versions.sh` pattern) that fails any PR
-    introducing a raw spawn token (`popen`, `_popen`, `system(`, `fork(`,
-    `exec*`, `posix_spawn`, `CreateProcess`, `ShellExecute`) in
-    `agents/plugins/*` or the covered agent-core paths outside the registered
-    allowlist — exceptions by call identity, never by file; and (b) **CodeQL
+    introducing a raw spawn token in `agents/plugins/*` or the covered
+    agent-core paths outside the registered allowlist — exceptions by call
+    identity, never by file. Because this is a plain-text gate, token
+    semantics are pinned so it is implementable without drowning in false
+    positives: **word-boundary matching**, with the exec family enumerated by
+    name (`execl`, `execlp`, `execle`, `execv`, `execvp`, `execvpe` — a bare
+    `exec*` glob would match every plugin's `execute(` method), with
+    `system`, `fork`, `posix_spawn`, `popen`, and `_popen` as bounded words
+    (never substring matches — `subsystem(` must not trip), and the Windows family
+    spelled out (`CreateProcess`, `CreateProcessAsUser`, `ShellExecute`,
+    `_spawn*`/`_wspawn*`). The runner's own implementation in
+    `agents/core` is the canonical registered allowlist entry for
+    `fork`/`execv`/`posix_spawn` — the single sanctioned spawner must not
+    trip its own gate. And (b) **CodeQL
     extended as the scheduled deep net** — widened paths, full spawn-API
     coverage, the call-identity allowlist, and executed query tests. Making
     CodeQL itself run per-PR is an explicit capacity decision (a full traced
@@ -469,6 +526,14 @@ is how "no site missed" is provable at any time. It is a **governance
 artifact, not a plan** — sequencing of the migration it describes is owned by
 the roadmap, outside this ADR.
 
+It is not hypothetical: the manifest lives at
+**`docs/agent-spawn-sink-manifest.md`** (stub ships with this ADR; owner
+@Doomgoose; population tracked in #2380). Each call site carries a **stable
+site ID** (`<plugin>/<function>#<n>`), and the manifest row keyed by that ID
+is the single authority for the site's evidence — the call site carries only
+the ID and a one-line rationale in a comment, so "in code and in the
+manifest" cannot drift into two competing authorities.
+
 ## Runner contract requirements
 
 Requirements this ADR places on the runner's contract — direction, not
@@ -482,12 +547,14 @@ schedule; ordering is owned by the roadmap:
   race); RAII on all handles; quoting edge-case tests (empty args, spaces,
   embedded quotes, trailing backslashes, Unicode, embedded-NUL rejection);
   integration tests for non-CRT parsers (`cmd.exe`, PowerShell). The Windows
-  runner additionally **rejects `.bat`/`.cmd`/`.com` as `argv[0]`** — batch
-  files are always parsed by `cmd.exe` regardless of spawn API, and safe
-  argument passing to them is unachievable by quoting (CVE-2024-24576);
-  batch needs go through the Decision-5/7 governed shape instead. Nothing in
-  `agents/` spawns batch today, so the ban costs nothing now — one check,
-  one test.
+  runner additionally **rejects `.bat`/`.cmd` as `argv[0]`** — batch files
+  are always parsed by `cmd.exe` regardless of spawn API, and safe argument
+  passing to them is unachievable by quoting (CVE-2024-24576); batch needs
+  go through the Decision-5/7 governed shape instead. `.com` is rejected
+  alongside as defense-in-depth (a legacy binary format with no legitimate
+  use in our tooling — not `cmd.exe`-parsed, so excluded from the CVE
+  rationale). Nothing in `agents/` spawns batch today, so the ban costs
+  nothing now — one check, one test.
 - **Honest termination reporting — an automation-correctness prerequisite,
   not hygiene.** An explicit termination reason (`exited` / `signaled` /
   `deadline` / `cancelled` / `line_limit` / `spawn_error`), and removal of
@@ -498,8 +565,20 @@ schedule; ordering is owned by the roadmap:
   is what lets an autonomous consumer distinguish "ran and failed" (retry)
   from "killed at deadline" (escalate) from "spawn error" (never retry), and
   a fabricated exit 0 from a killed process reads as a *succeeded
-  remediation* mid-chain. **Mutating sites must not migrate onto the runner
-  before this holds.**
+  remediation* mid-chain. **The reason must also survive to the wire**: it
+  maps onto the existing `CommandResponse.Status` vocabulary (`TIMEOUT`,
+  `REJECTED`, …) and the structured error detail — no new wire mechanism is
+  needed; the narrowing point to guard is the plugin `execute()` integer
+  return, which must not flatten the distinction before it reaches the
+  response. **Mutating sites must not migrate onto the runner before this
+  holds end-to-end.**
+- **Cancellation scoping — a per-invocation token, not only the global
+  flag.** The as-built cooperative cancel is a single process-global atomic
+  set at agent shutdown; as the sole mechanism it cannot cancel one hung
+  call without cancelling every in-flight run on the endpoint (including a
+  concurrent package mutation). The contract distinguishes the process-wide
+  shutdown token from a **per-invocation cancellation token**, with a test
+  proving one call's cancellation cannot affect another.
 - **Termination semantics for mutating tools** — an optional soft-terminate
   grace (`SIGTERM` → bounded wait → process-group `SIGKILL`;
   `CTRL_BREAK`/job-close on Windows) so a deadline firing mid-`dpkg`/`rpm`
@@ -537,7 +616,19 @@ schedule; ordering is owned by the roadmap:
 - This ADR covers `agents/plugins/*` and the agent-core spawn sites
   (collectors, trigger engine); existing rung-1 paths (Windows WMI/Win32,
   TAR ES/ETW capture sources, `/proc`//`sys` reads) are untouched — they are
-  already the target state.
+  already the target state. Plugins designed after the runner lands are
+  **born on the ladder** — no migration applies to them; ADR-0028's
+  `component_inventory` (not yet built) is the first such plugin, and its
+  design already converges on this discipline independently.
+- **Long-lived / ownership-transferring process launch is a separate
+  governed contract, out of scope for the bounded runner.** Decision 3's
+  runner owns a bounded lifecycle — deadline, kill, reap. A process meant to
+  *outlive* the initiating call (Guardian `restart-process` relaunching a
+  daemon via `posix_spawn`) cannot ride that contract without either waiting
+  on it, killing it at the deadline, or detaching it and breaking the reap
+  guarantee. Such launches get their own governed contract (exec-success
+  acknowledgement, explicit ownership transfer, no shell), which may share
+  hardened internals with the runner but is not this ADR's mechanism.
 - The Erlang gateway spawns no plugin subprocesses and is out of scope; the
   only interaction is budget arithmetic (an agent-side subprocess deadline
   must fit inside the command/gateway response budget, and a Reflex-step
@@ -560,8 +651,9 @@ schedule; ordering is owned by the roadmap:
   bundled plugins (out-of-tree plugins: see Decision 4's stated gap); every
   surviving spawn — shell exceptions included — gains a deadline, caps, group
   kill, honest termination reporting, and fork-lock coverage; 27 divergent
-  helpers collapse into one tested seam; the standard, the CI gates, and the
-  code finally agree; a future spawn-mechanism swap becomes a one-file
+  helpers collapse into one tested seam; once the migration and the
+  Decision-10 gates land, the standard, the CI gates, and the code agree for
+  the first time; a future spawn-mechanism swap becomes a one-file
   change. **Reflex and other autonomous consumers may be the biggest single
   beneficiaries**: today a hung tool wedges a plugin thread with no terminal
   state, so an autonomous remediation step can hang indefinitely — the
@@ -607,8 +699,14 @@ schedule; ordering is owned by the roadmap:
   un-excepted raw spawn sites in `agents/plugins/*` and the covered agent-core
   paths on the scheduled runs; the Decision-10 **per-PR lexical gate is
   demonstrated to actually fail a PR** that adds a raw spawn token outside
-  the registered allowlist; `grep -rn "popen\|system(" agents/plugins/`
-  matches only Decision-7 registered call sites. Manifest completeness: every
+  the registered allowlist, **and demonstrated not to false-positive on the
+  clean tree** (the gate runs green on unmodified plugin code — `execute(`
+  methods and `subsystem`-style identifiers do not trip it). End state:
+  `grep -rn "popen\|system(" agents/plugins/` finds **zero live call
+  sites** — Decision-7 exceptions execute through the runner's Decision-5
+  shape, so no raw `popen`/`system` call survives anywhere; the raw grep is
+  advisory only (a migration comment can legitimately trip a text match) and
+  CodeQL is the authoritative check. Manifest completeness: every
   row carries a rung and, where below rung 1, the evidence for every rung
   passed over.
 - Runner: `test_subprocess_runner.cpp` extended for the termination-reason
