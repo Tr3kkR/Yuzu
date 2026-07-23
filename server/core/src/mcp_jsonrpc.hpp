@@ -27,6 +27,8 @@ constexpr int kMcpUnknownSession     = -32007;  // unknown/expired/wrong-princip
 constexpr int kMcpOriginRejected     = -32008;  // Origin not in allowlist             → HTTP 403
 constexpr int kMcpBadProtocolVersion = -32009;  // MCP-Protocol-Version unsupported     → HTTP 400
 constexpr int kMcpSessionCap         = -32010;  // per-principal/global session cap hit → HTTP 429
+constexpr int kMcpNotAcceptable      = -32011;  // GET without Accept: text/event-stream → HTTP 406
+constexpr int kMcpStreamCap          = -32012;  // per-principal/global stream cap hit   → HTTP 429
 
 // ── Request ───────────────────────────────────────────────────────────────
 

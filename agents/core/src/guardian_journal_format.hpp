@@ -56,16 +56,58 @@ inline constexpr std::size_t kMaxJournalBytes = 32ull * 1024 * 1024; // 32 MiB
 /// accumulate outside the caps above.
 inline constexpr std::size_t kMaxQuarantineBatches = 100;
 
-/// Replay paging rate limiter (rev-4.1 #8): a process-lifetime token bucket bounds the
-/// STEADY-STATE redelivery bandwidth - re-send-all re-pages a sent+popped entry on every
-/// tick until retention, so the refill rate IS the per-agent redelivery rate. At this rate
-/// a fleet of N agents redelivers <= N * kJournalPageRefillPerSec batches/sec server-wide,
-/// each a cheap redelivered-quiet ingest; the DEFERRED server ack removes re-send-all
-/// entirely. Tunable.
+/// Replay pacing. This USED to double as the steady-state redelivery rate, because a delivered
+/// batch left the send window and window membership was the only "already delivered" test, so
+/// every cadence pass re-paged and re-sent it until retention. That is fixed: page_into_window
+/// consults the durable sent-label and re-offers a delivered batch only on a FORCED pass (boot
+/// replay, reconnect kick) - the events after which an in-flight send may actually have been
+/// lost (#2345 round 8). So this now bounds genuinely-new replay plus post-reconnect catch-up,
+/// NOT a permanent per-agent redelivery floor. The deferred server ack remains the proper fix
+/// for the residual case: a send the stream accepted but the server never ingested, on an agent
+/// that neither reboots nor reconnects. Tunable.
 inline constexpr double kJournalPageRefillPerSec = 0.1; // 1 batch / 10 s / agent
 inline constexpr double kJournalPageBurst = 5.0;        // small startup burst
 /// Bound per-pass paging work (reconstruct + membership scan) regardless of journal size.
 inline constexpr std::size_t kJournalPageMaxBatchesPerPass = 128;
+
+/// How far in the future a batch's ts_ms may plausibly sit before retention stops trusting it.
+///
+/// A batch stamped beyond this sorts FIRST for the count and byte ceilings - an ORDERING rule,
+/// NOT an expiry rule. The distinction is load-bearing and was arrived at the hard way: making
+/// such a batch "immediately expired" hands the whole journal to any clock reading in the past
+/// (an RTC that comes up at 1970 makes every real row look future-dated), which is the
+/// wholesale wipe the age guard exists to prevent - it failed 21 tests. Do not "simplify" this
+/// back to an expiry test. Without the ordering rule such a row is IMMORTAL - it can never be
+/// too old, and count eviction is oldest-first so it is never count-evicted either - and worse,
+/// it DISPLACES real evidence: once enough of them exist
+/// (a bad RTC for a week, a VM clone, a hand-edited kv_store.db), every genuine record written
+/// afterwards is the one evicted at the next prune, permanently. Precedent for the shape is
+/// server-side in app_perf_daily_store.cpp's kFutureSlackDays (#2345 Gate 2 security).
+///
+/// One day is generous for clock skew between an endpoint and its own next prune pass, while
+/// still bounding the damage a badly-set clock can do to the audit trail.
+inline constexpr std::int64_t kJournalFutureSlackMs = 24LL * 3600 * 1000;
+
+/// Batches a single retention pass may evict for AGE. Age is the one retention rule driven by
+/// an absolute reading of the wall clock, so one bad reading (a VM restored from snapshot, an
+/// NTP overshoot) marks every batch expired simultaneously and would delete the whole durable
+/// audit trail in one transaction. Capping the pass converts that into a paced ageing-out that
+/// an operator can notice and act on, rather than an instantaneous one.
+///
+/// It does NOT guarantee the paced batches are shipped first: at 64 per ~120 s pass this sheds
+/// roughly 32 batches/minute while replay refills at 0.1 batch/s (~6/minute), so deletion
+/// outruns delivery about five to one (#2345 Gate 2 performance). Lowering the cap to match the
+/// replay rate, or lifting the paging bucket while pacing, is tracked on #2364; what the cap
+/// buys today is time and a signal, not delivery.
+///
+/// It caps AGE eviction ONLY, and deliberately does not bound how fast a journal shrinks: the
+/// count and byte ceilings are uncapped and trim an over-ceiling journal back in a single pass
+/// regardless of this constant, so an over-cap journal converges as fast as it ever did. The
+/// pacing therefore applies to the case it was built for - a journal that is within its
+/// ceilings but suddenly entirely expired - and NOT, as an earlier version of this comment
+/// claimed, to "a full 2000-batch journal ageing out in about an hour": at 2000 batches the
+/// count ceiling is what evicts, and it evicts ~1000 in one pass (#2345 Gate 8 UP5-2).
+inline constexpr std::size_t kMaxAgeEvictionsPerPass = 64;
 
 /// Key prefixes within kJournalNamespace. A batch key is "lc:<nonce>:<seq12>";
 /// its sent-label is "sent:<nonce>:<seq12>"; a quarantined batch is

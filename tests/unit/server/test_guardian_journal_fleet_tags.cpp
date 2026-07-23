@@ -91,6 +91,10 @@ GuardianJournalStats all_nonzero_stats() {
     s.evicted_sent_unacked = 20;
     s.evicted_without_send_evidence = 21;
     s.maint_exceptions = 22;
+    s.page_read_failures = 23;
+    s.clock_jump_skips = 24;
+    s.drain_exceptions = 25;
+    s.sweep_exceptions = 26;
     return s;
 }
 
@@ -115,7 +119,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
     }
 
     // FIELD -> KEY BIND. The three checks around this one are all key-SET checks: they
-    // prove the writer and reader agree on WHICH 22 keys exist, and nothing more. Swap
+    // prove the writer and reader agree on WHICH 26 keys exist, and nothing more. Swap
     // two values in the emitter - put(<stage_dropped key>, s.stage_failures) - and the
     // emitted key set is byte-identical, so every one of them still passes while the
     // server sums one counter under another counter's gauge and the wrong fleet alert
@@ -144,6 +148,10 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_evicted_sent_unacked", "20"},
         {"yuzu.guardian_journal_evicted_no_send_evidence", "21"},
         {"yuzu.guardian_journal_maint_exceptions", "22"},
+        {"yuzu.guardian_journal_page_read_failures", "23"},
+        {"yuzu.guardian_journal_clock_jump_skips", "24"},
+        {"yuzu.guardian_drain_exceptions", "25"},
+        {"yuzu.guardian_sweep_exceptions", "26"},
     };
     // Per-key, NOT `CHECK(tags == expected)`. Catch2 has no StringMaker for
     // std::pair and neither CATCH_CONFIG_ENABLE_PAIR_STRINGMAKER nor

@@ -28,6 +28,26 @@ inline constexpr std::size_t kMaxApiTokenLength = 256;
 
 enum class Role { user, admin };
 
+/// Outcome of re-checking a credential that is already in use — the tri-state a
+/// HELD-OPEN connection needs and a request does not.
+///
+/// Ordinary request auth collapses "definitively gone" and "we cannot reach the
+/// store to find out" into one answer, because both mean 401. A long-lived
+/// stream cannot: a revocation must cut it immediately, while an unreachable
+/// auth store must NOT cut every stream on the fleet at the same instant
+/// (ADR-1005 Decision 15(c)/(i), chaos CH-4) — the consumer rides out an
+/// indeterminate answer for a bounded grace window instead.
+///
+/// The underlying type is pinned so this can be opaquely forward-declared by
+/// consumers (e.g. `mcp_stream.hpp`) without dragging in this header: a later
+/// `: std::uint8_t` here would otherwise silently name a different type in every
+/// TU that saw only the forward declaration — an ODR violation with no diagnostic.
+enum class CredentialCheck : int {
+    kValid,
+    kRevoked,       ///< definitive: signed out, expired, revoked, rebound, or absent
+    kIndeterminate, ///< the auth store could not answer — NOT evidence of revocation
+};
+
 struct UserEntry {
     std::string username;
     Role role;

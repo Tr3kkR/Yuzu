@@ -22,6 +22,7 @@
 #include <yuzu/plugin.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -71,6 +72,29 @@ enum class SendResult;
 } // namespace yuzu::agent
 
 namespace yuzu::agent {
+
+// Whether GuardianEngine::WorkerHostileMutex actually ENFORCES (aborts) rather than
+// compiling away. Defined here, not in the .cpp, so a test can skip instead of hanging on a
+// build where the guard is absent: without it a violating worker deadlocks, which to a test
+// harness is indistinguishable from a hang.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#    define YUZU_WORKER_MUTEX_GUARD 1
+#  endif
+#endif
+#if !defined(NDEBUG) || defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__) || \
+    defined(YUZU_FORCE_WORKER_MUTEX_GUARD)
+#  define YUZU_WORKER_MUTEX_GUARD 1
+#endif
+
+/// True iff taking GuardianEngine::mtx_ on a thread stop() joins aborts the process.
+[[nodiscard]] constexpr bool worker_mutex_guard_enabled() noexcept {
+#ifdef YUZU_WORKER_MUTEX_GUARD
+    return true;
+#else
+    return false;
+#endif
+}
 
 /// Result of dispatching a `__guard__` command. The caller (agent.cpp)
 /// converts this into a CommandResponse on the bidi stream.
@@ -135,17 +159,19 @@ public:
     /// to drain a buffered-events queue over the command stream.
     void sync_with_server();
 
-    /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7
-    /// PR-Ag). Two-phase (rev-4.1 #6): PHASE 1 under mtx_ retries any persist a prior
-    /// write left pending - this is what makes a failed write self-heal with NO new
-    /// push/reconnect (Sol BLOCKER-4); PHASE 2 (off mtx_) will page + prune (C4/C5).
+    /// Periodic durable-journal maintenance, driven by the agent heartbeat (item 7 PR-Ag).
+    /// SINGLE-PHASE since C0 (#2298 gate 1): under mtx_, retry any persist a prior write left
+    /// pending - this is what makes a failed write self-heal with NO new push/reconnect (Sol
+    /// BLOCKER-4). Retention prune + replay paging (the old off-mtx_ phase 2) moved to the
+    /// drain worker so neither can stall the heartbeat on a contended KvStore.
     /// prefer_spark_-gated; a no-op after stop(). Safe to call every heartbeat.
     void journal_maintenance_tick();
 
-    /// Replay the durable lifecycle journal into the send window (item 7 PR-Ag). Captures the
-    /// runtime + journal under mtx_ (brief), then pages OFF mtx_ (KvStore + paging-mutex +
-    /// outbox_mu_, never mtx_). prefer_spark_-gated; a no-op after stop() and while stopping.
-    /// Called from the reconnect hook (after set_event_sink) and the maintenance tick.
+    /// Ask for a prompt durable-journal replay into the send window (item 7 PR-Ag). Since C0
+    /// (#2298 gate 1) this KICKS the drain worker rather than paging inline: it takes mtx_
+    /// briefly, then notifies. The reconnect thread therefore never touches the KvStore.
+    /// prefer_spark_-gated; a no-op after stop() and before the worker is wired.
+    /// Called from the reconnect hook, after set_event_sink.
     void page_journal();
 
     /// A snapshot of the durable-journal integrity + activity counters (item 7 PR-Ag §8),
@@ -261,6 +287,22 @@ public:
         return lifecycle_journal_.get();
     }
 
+    /// TEST-ONLY: override the drain worker's periodic backstop and maintenance cadences.
+    /// MUST be called BEFORE wire_spark_engine(), which is what constructs the worker.
+    ///
+    /// Exists so a test can prove a journal page happened because of the reconnect KICK and
+    /// not because the backstop fired anyway: with the production 5 s bound the worker's
+    /// timer is already running during fixture setup, so any "it paged within 1 s" assertion
+    /// can pass for the wrong reason (#2298 governance quality-engineer BLOCKING-1).
+    /// 0 leaves the corresponding default in place. No production caller.
+    void set_drain_worker_timing_for_test(std::uint64_t periodic_bound_ms,
+                                          std::chrono::milliseconds page_interval = {},
+                                          std::chrono::milliseconds prune_interval = {}) {
+        test_periodic_bound_ms_ = periodic_bound_ms;
+        test_page_interval_ = page_interval;
+        test_prune_interval_ = prune_interval;
+    }
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -269,7 +311,43 @@ private:
     KvStore* kv_;
     std::string agent_id_;
 
-    mutable std::mutex mtx_;
+    /// A std::mutex that ABORTS if locked on any thread GuardianEngine::stop() joins.
+    ///
+    /// GuardianEngine::stop() holds mtx_ across its whole body AND joins BOTH the
+    /// ConvergenceScheduler lanes and the drain worker inside it, so any mtx_ acquisition
+    /// from any of them is a lock-vs-join deadlock -
+    /// a hung agent shutdown, fleet-wide. Everything the worker runs (journal prune/page,
+    /// and the INJECTED send, which is an arbitrary std::function supplied by agent.cpp)
+    /// must therefore stay off this lock. That was previously a review-only invariant
+    /// recorded in comments; here it fails loudly instead (#2298 governance A2).
+    /// BasicLockable, so every `std::lock_guard lock(mtx_)` site is unchanged by CTAD.
+    ///
+    /// Holds NO reference to the worker: it asks a thread-local role marker
+    /// (on_guardian_drain_worker_thread()) instead. A pointer to the worker would have to
+    /// be read here BEFORE mu_ is held - an unsynchronised cross-thread read - and wiring
+    /// rollback can destroy the worker while another thread holds that pointer, which made
+    /// the safety device itself a use-after-free (#2298 Sol review).
+    ///
+    /// Aborts rather than asserts: `assert` is a no-op under NDEBUG, so a release build
+    /// with sanitizers would have logged the violation and then walked into the deadlock.
+    class WorkerHostileMutex {
+    public:
+        void lock() {
+            abort_if_worker_thread();
+            mu_.lock();
+        }
+        bool try_lock() {
+            abort_if_worker_thread();
+            return mu_.try_lock();
+        }
+        void unlock() { mu_.unlock(); }
+
+    private:
+        static void abort_if_worker_thread() noexcept;
+        std::mutex mu_;
+    };
+
+    mutable WorkerHostileMutex mtx_;
     bool started_{false};
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
@@ -347,12 +425,16 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
-    /// Journal maintenance/page/final-flush exceptions swallowed to keep the bare heartbeat
-    /// thread + the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4).
+    /// Journal persist / final-flush exceptions swallowed to keep the bare heartbeat thread +
+    /// the (noexcept) destructor path from std::terminate (item 7 PR-Ag, review B4). Since C0
+    /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
+    /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
-    /// Heartbeat-tick counter (mtx_-guarded): retention prune runs every Nth tick, not every
-    /// heartbeat, to bound the per-tick full-journal read on the heartbeat thread (review N1).
-    std::uint64_t journal_tick_count_{0};
+    /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
+    /// 0 / zero-duration means "keep the production default".
+    std::uint64_t test_periodic_bound_ms_{0};
+    std::chrono::milliseconds test_page_interval_{0};
+    std::chrono::milliseconds test_prune_interval_{0};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
@@ -362,15 +444,19 @@ private:
     std::shared_ptr<GuardianStateReader> spark_reader_;
     std::shared_ptr<GuardianSparkEngineBackend> spark_backend_;
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
-    std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
-    std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
     /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
-    /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated. LIFETIME (review
-    /// N4): the drain-worker send-wrap captures this; declared after spark_drain_worker_ it is
-    /// destroyed FIRST, so its safety rests on stop() joining the drain worker before any member
-    /// destruction (~GuardianEngine calls stop()). That join is the load-bearing guarantee.
-    std::unique_ptr<GuardianLifecycleJournal> lifecycle_journal_;
+    /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.
+    ///
+    /// SHARED with the drain worker, which uses it for both the send-wrap's mark_batch_sent
+    /// and its prune/page maintenance pass. A shared_ptr rather than a unique_ptr + raw
+    /// borrow because that borrow made correctness depend on this member being declared
+    /// before spark_drain_worker_ - an ordering nothing would catch if changed
+    /// (#2298 governance A4). The declaration order below is still the tidy one, but it is
+    /// no longer load-bearing.
+    std::shared_ptr<GuardianLifecycleJournal> lifecycle_journal_;
+    std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
+    std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the

@@ -319,6 +319,63 @@ if you want notification that an engine principal is regularly hitting its
 cap (may indicate the cap is tuned too low for its workload, or a runaway
 caller).
 
+## Access review metrics
+
+Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
+access reviews") shipped with zero metrics; the hardening round added four
+bounded-label series wired at the REST handlers (`rest_api_v1.cpp`) only —
+the MCP twins are not double-counted.
+
+```
+# HELP yuzu_access_review_export_total Access review evidence exports (GET /api/v1/access-reviews/export), by format
+# TYPE yuzu_access_review_export_total counter
+yuzu_access_review_export_total{format="json"} 0
+yuzu_access_review_export_total{format="csv"} 0
+
+# HELP yuzu_access_review_export_duration_seconds Latency of the cross-principal grant-population read (build_access_review) behind GET /api/v1/access-reviews/export
+# TYPE yuzu_access_review_export_duration_seconds histogram
+
+# HELP yuzu_access_review_campaigns_opened_total Access review campaigns opened (POST /api/v1/access-reviews)
+# TYPE yuzu_access_review_campaigns_opened_total counter
+yuzu_access_review_campaigns_opened_total 0
+
+# HELP yuzu_access_review_attestations_total Access review reviewer decisions recorded (POST /api/v1/access-reviews/{id}/attestations), by decision
+# TYPE yuzu_access_review_attestations_total counter
+yuzu_access_review_attestations_total{decision="attested"} 0
+yuzu_access_review_attestations_total{decision="flagged_revoke"} 0
+```
+
+- **`yuzu_access_review_export_total{format}`** — counter, `format` ∈
+  {`json`, `csv`}, pre-seeded to `0` at startup. Increments once per
+  successful `GET /api/v1/access-reviews/export` call, split by which
+  format was requested — a sustained shift toward `csv` typically means an
+  auditor/spreadsheet workflow is in play.
+- **`yuzu_access_review_export_duration_seconds`** — histogram (default
+  bucket ladder, see "Histogram buckets" below), the wall-clock time of the
+  cross-principal grant-population read (`build_access_review`) behind the
+  export, timed regardless of success/failure outcome — a slow/failing read
+  is exactly what an operator debugging a `503` needs latency evidence for.
+- **`yuzu_access_review_campaigns_opened_total`** — counter, no labels.
+  Increments once per successful `POST /api/v1/access-reviews` — the rate
+  this fires at is the empirical "how often does the org actually run a
+  review" cadence signal (compare against the org's stated review policy).
+- **`yuzu_access_review_attestations_total{decision}`** — counter,
+  `decision` ∈ {`attested`, `flagged_revoke`}, pre-seeded to `0` at startup.
+  Increments once per successful `POST
+  /api/v1/access-reviews/{id}/attestations` call, split by the reviewer's
+  decision. `flagged_revoke` counts recorded evidence only — it never
+  itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
+  a rising `flagged_revoke` count is a worklist size for whoever acts on
+  the flags, not an automatic remediation trigger.
+
+None of the four carries `event="security"` — a review export or an
+attestation decision is expected, privileged, self-audited operator
+activity (own audit rows: `access_review.exported`, `.campaign_opened`,
+`.attested`/`.flagged`), not an anomaly signal. Bounded-label series
+(`format`, `decision`) are pre-seeded to `0` at startup per the standing
+convention in `docs/observability-conventions.md`, so `absent()`-style
+alerts stay meaningful.
+
 ## Histogram buckets
 
 Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom
@@ -459,8 +516,9 @@ label-exposure note under Security considerations before choosing a key.
 
 Published on every fleet-health sweep (~15 s), fed from the `yuzu.net_*`
 heartbeat tags (device-aggregate facts only — no per-destination data). A metric
-nobody reported is **absent**, never zero. **Linux and Windows agents emit
-network facts; macOS does not yet.** Windows reports throughput and an interval
+nobody reported is **absent**, never zero. **Linux, Windows, and macOS agents
+emit network facts** — macOS throughput only (retransmit + RTT deferred; see
+[Network Quality](network.md) → Platform coverage). Windows reports throughput and an interval
 retransmit rate but not RTT (per-connection RTT needs ESTATS — a later slice), so
 `yuzu_fleet_net_rtt_ms` stays Linux-only for now (see
 [Network Quality](network.md) → Platform coverage). The same numbers feed the
@@ -782,6 +840,75 @@ yuzu_fleet_agents_healthy
 sum by (plugin) (rate(yuzu_agent_commands_executed_total{status="failure"}[5m]))
 / sum by (plugin) (rate(yuzu_agent_commands_executed_total[5m])) * 100
 ```
+
+### Guardian durable-journal health (heartbeat `status_tags`)
+
+> **Not yet active in a shipped release.** The Guardian durable journal and the worker that
+> maintains it are wired but DORMANT: they run only once the Spark detection path becomes the
+> authoritative backend, and that flag is off in every released agent. Until then none of the
+> counters below can be anything but absent, and the failure modes described - a wedged journal,
+> a dead maintenance worker, a clock anomaly - are not reachable. This section is written for
+> the release that turns it on; treat it as reference, not as something to alert on today.
+
+The agent has no Prometheus endpoint, so the Guardian lifecycle journal reports through
+heartbeat `status_tags`. Emission is SPARSE - a quiescent or inert journal ships no tags at
+all, so absence means "nothing to report", not "not collected".
+
+| Tag | Meaning | What to do |
+|---|---|---|
+| `yuzu.guardian_journal_maint_exceptions` | Cumulative JOURNAL passes that threw and were firewalled: the heartbeat's retry-persist plus the drain worker's retention prune and replay paging. Convergence sweeps are NOT included - they have their own tag below. Nonzero means the journal path hit an exception (typically `bad_alloc` under memory pressure) and was contained rather than terminating the agent. It covers the firewalled journal paths - persist on the heartbeat, at boot re-arm, on rule-apply and at shutdown; the reconnect kick; and the worker's retention and replay passes - plus one increment for the drain worker's own loop terminating, which stops outbox DELIVERY too. That last case is named in a `critical` log line and, unlike the others, increments once and never again. | Investigate endpoint memory pressure. A steadily climbing value with a growing `yuzu.guardian_journal_bytes` means retention is not keeping up. A value that increments exactly once and then stays flat while the journal grows is the loop-termination case; check the agent log for the `critical` line and restart the daemon. |
+| `yuzu.guardian_journal_write_capacity_rejected` | Records refused because the journal is at its hard write ceiling. | Check whether prune is failing (`yuzu.guardian_journal_prune_failures`) or the store is unwritable. |
+| `yuzu.guardian_journal_prune_failures` | Retention passes that could not read the journal. | A sustained nonzero value means the shared `kv_store.db` is busy or corrupt. |
+| `yuzu.guardian_journal_page_read_failures` | Replay passes that could not read the journal. | Separate from `prune_failures` on purpose: retention can be succeeding while replay is stalled, in which case records are being deleted on schedule and shipped never. A sustained nonzero value with a healthy `prune_failures` is the worse of the two. |
+| `yuzu.guardian_journal_clock_jump_skips` | Retention passes that declined to age-evict because the pass would have aged out the ENTIRE journal at once. | NOT an error: the journal deliberately kept evidence it would otherwise have deleted. It fires when such a pass follows one that was not already working off a backlog, so it reports the ONSET of the condition, not every pass of it. The usual cause is a clock that moved - a VM restored from an old snapshot, or a bad NTP correction - but a legitimately long-offline endpoint whose whole (small) journal expired together looks identical. Check the endpoint's clock first. If it jumped forward, replay keeps ATTEMPTING delivery of the survivors either way - the paced ageing-out deliberately stops treating them as unshippable - but the per-pass cap keeps deleting the oldest ones out from under it, and deletion currently outruns replay by roughly five to one. Correcting the clock is what stops that race rather than what starts delivery, and it takes effect on the next retention pass. Expect a burst of redelivered events during a paced ageing-out; the server de-duplicates them. Note the cap applies to AGE only - if the journal is also over its COUNT ceiling, that ceiling is uncapped and trims the oldest batches in a single pass regardless. |
+| `yuzu.guardian_journal_evicted_no_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. A spike alongside `yuzu.guardian_journal_clock_jump_skips` means the endpoint's clock moved rather than that the link was down - check the clock before concluding evidence was genuinely lost. |
+| `yuzu.guardian_drain_exceptions` | Firewalled throws in the outbox DELIVERY machinery on the drain worker. | Events are buffered but not shipping. Distinct from the journal counter - delivery failing and retention failing need different responses. |
+| `yuzu.guardian_sweep_exceptions` | Firewalled throws in the convergence SWEEP lanes. | Drift DETECTION is degraded (the endpoint may miss policy violations); the audit trail itself is unaffected. |
+| `yuzu.guardian_journal_bytes` / `yuzu.guardian_journal_batch_count` | Current on-disk size and batch count of the journal. Gauges, not counters. | Not independently actionable - use them to interpret the rows above (a climbing size alongside `prune_failures` means retention is not keeping up). |
+
+**Known gap: none of these counters distinguish a healthy idle worker from one that died.**
+The tags are emitted sparsely - a zero is omitted - so a Guardian drain worker that stops before
+doing any work reads on the heartbeat exactly like one with nothing to do. An exception that
+kills the worker's loop is counted (under `yuzu.guardian_journal_maint_exceptions`, with a
+`critical` log line naming it) no matter which cycle it happens on. What is NOT counted is a
+worker that never starts, or one that HANGS rather than throwing - blocked indefinitely on a
+store call, say. Nothing throws, so the firewall has nothing to catch and every counter simply
+stays where it was. Until the "seconds since the last successful pass" gauge tracked for the `prefer_spark`
+cutover (#2298) ships, corroborate a suspected-dead worker with the agent's logs rather than
+with metrics alone. There is no restart primitive short of restarting the agent daemon, and a
+restart is not free: records already written to the journal survive it, but `GuardianEngine`'s
+shutdown holds its lock while it joins the drain worker, so a stop arriving while that worker is
+hung rather than dead can itself be cut short by a supervisor's stop timeout. Prefer a graceful
+stop, and confirm the process exited on its own rather than being killed.
+
+Note the tag KEY is not always the internal field name - the audit-gap row above is emitted
+as `..._evicted_no_send_evidence` though the field is `evicted_without_send_evidence`. Grep
+heartbeat payloads for the key in this table, not for the field name; the emitter in
+`agents/core/src/guardian_journal_heartbeat.hpp` is authoritative.
+
+This table covers the actionable subset. The emitter ships roughly twenty
+`yuzu.guardian_journal_*` tags in total (sparsely - only non-zero ones), so a tag absent from
+this table is not necessarily absent from the payload.
+
+Counters are cumulative for the agent process and reset on restart.
+
+### How long Guardian audit evidence is retained ON the endpoint
+
+The durable lifecycle journal keeps records locally until they are replayed to the server,
+bounded by whichever of these is reached first:
+
+| Cap | Value | Behaviour at the cap |
+|---|---|---|
+| Age | 7 days | Older batches are evicted on the next retention pass |
+| Batch count | 1000 (soft) / 2000 (hard ceiling) | Oldest-first eviction at the soft cap; writes are REFUSED at the hard ceiling |
+| Size | 32 MiB (soft) / 64 MiB (hard ceiling) | As above |
+
+Eviction is keyed off each batch's recorded wall-clock timestamp, so the window survives a
+reboot. This is the ENDPOINT-side window only - once records reach the server they follow the
+server's own retention (see `guaranteed-state.md`). An endpoint offline for longer than the
+age cap, or generating more than the count/size caps allow, will have the excess evicted
+locally; `yuzu.guardian_journal_evicted_no_send_evidence` counts the batches that aged out
+with no evidence of ever having been sent.
 
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
 

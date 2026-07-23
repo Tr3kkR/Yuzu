@@ -53,7 +53,7 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 21); // +SoftwareLicensing (ADR-0024)
+    REQUIRE(types.size() == 22); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -73,24 +73,28 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("GuaranteedState"));
     CHECK(has("Inventory"));
     CHECK(has("SoftwareLicensing")); // SLE securable (ADR-0024 Decision 9) — NOT `License`
+    CHECK(has("AccessReview")); // Periodic Access Reviews (SOC 2 CC6.2), dedicated + narrow
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
     RbacStore store(":memory:");
     auto ops = store.list_operations();
     // Read, Write, Execute, Delete, Approve, Push (Push added for Guardian
-    // distribute-rules-to-fleet operation; design v1.1 §9.2).
-    REQUIRE(ops.size() == 6);
+    // distribute-rules-to-fleet operation; design v1.1 §9.2), Attest (added
+    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off).
+    REQUIRE(ops.size() == 7);
 }
 
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 21 types * 5 CRUD ops = 105 permissions, plus a single targeted Push
-    // grant on GuaranteedState = 106 permissions total. Push is deliberately
-    // NOT cross-seeded on non-Guardian securables — see the rationale in
-    // rbac_store.cpp seed_defaults(). (21st type: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 106);
+    // 22 types * 5 CRUD ops = 110 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 111), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2) = 112 permissions total. Push and Attest
+    // are deliberately NOT cross-seeded on other securables — see the rationale
+    // in rbac_store.cpp seed_defaults(). (22nd type: AccessReview, SOC 2 CC6.2;
+    // 21st: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 112);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -962,6 +966,163 @@ TEST_CASE("RbacStore: v1 -> v2 migration adds indices without data loss",
         CHECK(index_exists(verify_db, "idx_groups_source"));
         CHECK(index_exists(verify_db, "idx_group_members_username"));
         sqlite3_close(verify_db);
+    }
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"));
+    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"));
+}
+
+// qa/governance hardening round (#2324): a dev/UAT rbac.db seeded under the
+// PRE-FIX access-review scheme (AuditLog:Read/AuditLog:Attest gating, before
+// the dedicated AccessReview securable) still carries the three now-retired
+// grants forever — `seed_defaults()`'s `INSERT OR IGNORE` only ever ADDS
+// rows. Migration v4 DELETEs exactly those three. Mirrors the v1->v2 test's
+// pattern: seed a v3-only schema directly with the runner (rbac_store's
+// historical shape immediately before v4 was introduced), insert data that
+// simulates the pre-fix grants, close, then reopen through the real
+// RbacStore constructor (which always runs the FULL migration list +
+// seed_defaults()) and check the retired rows are gone while everything
+// else survives.
+TEST_CASE("RbacStore: v3 -> v4 migration retires the pre-fix AuditLog access-review grants "
+         "without touching anything else",
+         "[rbac_store][migration]") {
+    const auto path = yuzu::test::unique_temp_path("rbac-migration-v4-");
+
+    // v1-through-v3-only migration list — exactly rbac_store's historical
+    // shape immediately before v4 (duplicated here, not #include'd, for the
+    // same drift-detection reason as kV1Only above).
+    static const std::vector<yuzu::server::Migration> kThroughV3 = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS securable_types (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS operations (
+                id          TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS roles (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
+                operation       TEXT NOT NULL REFERENCES operations(id),
+                effect          TEXT NOT NULL DEFAULT 'allow',
+                PRIMARY KEY (role_name, securable_type, operation)
+            );
+            CREATE TABLE IF NOT EXISTS principal_roles (
+                principal_type  TEXT NOT NULL,
+                principal_id    TEXT NOT NULL,
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                PRIMARY KEY (principal_type, principal_id, role_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
+                ON principal_roles(principal_type, principal_id);
+            CREATE TABLE IF NOT EXISTS groups (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                source      TEXT NOT NULL DEFAULT 'local',
+                external_id TEXT,
+                created_at  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+                username    TEXT NOT NULL,
+                PRIMARY KEY (group_name, username)
+            );
+            CREATE TABLE IF NOT EXISTS rbac_config (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            );
+        )"},
+        {2, R"(
+            CREATE INDEX IF NOT EXISTS idx_groups_source ON groups(source);
+            CREATE INDEX IF NOT EXISTS idx_group_members_username ON group_members(username);
+        )"},
+        {3, R"(
+            DELETE FROM group_members
+            WHERE group_name IN (SELECT name FROM groups WHERE source != 'local');
+        )"},
+    };
+
+    {
+        sqlite3* db = nullptr;
+        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                                nullptr) == SQLITE_OK);
+        REQUIRE(yuzu::server::MigrationRunner::run(db, "rbac_store", kThroughV3));
+        REQUIRE(yuzu::server::MigrationRunner::current_version(db, "rbac_store") == 3);
+
+        // Seed the parent rows + grants a pre-fix rbac.db would carry: the
+        // three retired AuditLog access-review grants, PLUS neighbours that
+        // must survive untouched — Administrator's other AuditLog ops,
+        // Operator's unrelated AuditLog:Read (auth-sample etc.).
+        sqlite3_exec(db,
+                    "INSERT INTO roles (name, description, is_system, created_at) VALUES "
+                    "('Administrator', 'd', 1, 0), ('Reviewer', 'd', 1, 0), ('Operator', 'd', 1, 0);"
+                    "INSERT INTO securable_types (name, description, is_system) VALUES "
+                    "('AuditLog', 'd', 1);"
+                    "INSERT INTO operations (id, description, is_system) VALUES "
+                    "('Read', 'd', 1), ('Write', 'd', 1), ('Attest', 'd', 1);"
+                    "INSERT INTO role_permissions (role_name, securable_type, operation, effect) "
+                    "VALUES "
+                    // The three retired grants (migration v4 must delete exactly these).
+                    "('Administrator', 'AuditLog', 'Attest', 'allow'),"
+                    "('Reviewer', 'AuditLog', 'Read', 'allow'),"
+                    "('Reviewer', 'AuditLog', 'Attest', 'allow'),"
+                    // Neighbours that must survive: Administrator's other AuditLog
+                    // ops, and Operator's unrelated AuditLog:Read.
+                    "('Administrator', 'AuditLog', 'Read', 'allow'),"
+                    "('Administrator', 'AuditLog', 'Write', 'allow'),"
+                    "('Operator', 'AuditLog', 'Read', 'allow');",
+                    nullptr, nullptr, nullptr);
+        sqlite3_close(db);
+    }
+
+    // Reopen through the production constructor — runs the FULL migration
+    // list (v4 retires the three grants) + seed_defaults() (adds the fresh
+    // AccessReview:Read/Attest grants).
+    {
+        RbacStore store(path);
+        REQUIRE(store.is_open());
+
+        auto admin_perms = store.get_role_permissions("Administrator");
+        auto reviewer_perms = store.get_role_permissions("Reviewer");
+        auto operator_perms = store.get_role_permissions("Operator");
+
+        auto has = [](const std::vector<Permission>& perms, const std::string& type,
+                     const std::string& op) {
+            for (auto& p : perms)
+                if (p.securable_type == type && p.operation == op)
+                    return true;
+            return false;
+        };
+
+        // The three retired grants are GONE.
+        CHECK_FALSE(has(admin_perms, "AuditLog", "Attest"));
+        CHECK_FALSE(has(reviewer_perms, "AuditLog", "Read"));
+        CHECK_FALSE(has(reviewer_perms, "AuditLog", "Attest"));
+
+        // Administrator's other AuditLog ops survive untouched.
+        CHECK(has(admin_perms, "AuditLog", "Read"));
+        CHECK(has(admin_perms, "AuditLog", "Write"));
+
+        // Operator's unrelated AuditLog:Read survives untouched.
+        CHECK(has(operator_perms, "AuditLog", "Read"));
+
+        // seed_defaults() converges the pre-fix DB onto the fresh-install
+        // AccessReview grant set — same shape a brand-new rbac.db gets.
+        CHECK(has(admin_perms, "AccessReview", "Attest"));
+        CHECK(has(admin_perms, "AccessReview", "Read")); // via the CRUD-types loop
+        CHECK(has(reviewer_perms, "AccessReview", "Read"));
+        CHECK(has(reviewer_perms, "AccessReview", "Attest"));
     }
 
     std::filesystem::remove(path);

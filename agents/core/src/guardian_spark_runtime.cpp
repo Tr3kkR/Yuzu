@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <limits>
 #include <optional>
 #include <random>
 #include <set>
@@ -49,7 +50,19 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
       boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
-      lifecycle_log_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)) {
+      // The LIFECYCLE window must be able to hold at least one maximum-size journal batch.
+      // Paging is all-or-nothing per batch, so a window smaller than kMaxJournalEntriesPerBatch
+      // makes large batches permanently unpageable - they are skipped every pass and then
+      // silently deleted at retention. That loss channel is SIZE-BIASED: the largest batches
+      // are mass arm/disarm bursts, i.e. the most security-relevant audit records, so it is
+      // strictly worse than a random one (#2345 Gate 5 CH-4 / Gate 4 UP-5+UP-15).
+      lifecycle_log_(std::max({kMinOutboxCapacity, cfg.outbox_capacity,
+                               kMaxJournalEntriesPerBatch})) {
+    if (cfg.outbox_capacity > 0 && cfg.outbox_capacity < kMaxJournalEntriesPerBatch)
+        spdlog::info("Guardian: lifecycle audit window raised from the configured {} to {} - a "
+                     "window smaller than one maximum-size journal batch makes large batches "
+                     "permanently unpageable",
+                     cfg.outbox_capacity, kMaxJournalEntriesPerBatch);
     // Reserve the staging vector ONCE - never from rule count. push_back then never
     // reallocates, which is what makes stage_pending_locked's noexcept contract real.
     pending_journal_.reserve(kMaxPendingJournalRecords);
@@ -547,13 +560,36 @@ void GuardianSparkRuntime::stage_pending_locked(std::shared_ptr<JournalRecord> r
     pending_journal_.push_back(std::move(record));
 }
 
-std::vector<std::shared_ptr<const JournalRecord>> GuardianSparkRuntime::snapshot_pending() const {
+GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    return {pending_journal_.begin(), pending_journal_.end()};
+    // The drop counter is read HERE, under the same lock as the snapshot. Reading it from the
+    // caller just before this call left a gap in which a drop could land: it would then be
+    // attributed to "after the snapshot", the erase would come up short, and a durably-written
+    // record would stay staged to be persisted again under a second key. That is the safe
+    // direction (a duplicate, which the server de-dupes) rather than loss - but it is the same
+    // read-outside-the-lock mistake this whole mechanism exists to fix (#2345 focused review).
+    return PendingSnapshot{{pending_journal_.begin(), pending_journal_.end()},
+                          journal_stage_dropped_.load(std::memory_order_relaxed)};
 }
 
-void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n) {
+void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot) {
     std::lock_guard<std::mutex> ob{outbox_mu_};
+    // The prefix must be identified by IDENTITY, not by position (#2345 Gate 8b). The caller
+    // snapshots under this lock, RELEASES it to do KvStore I/O, then comes back to erase what
+    // it wrote. In that window stage_pending_locked can hit kMaxPendingJournalRecords and
+    // drop from the FRONT - so slot 0 is no longer the record slot 0 was when the snapshot was
+    // taken, and erasing n positions deletes n records of which the last few were never
+    // written. That is silent, uncounted destruction of audit records, and it is worst exactly
+    // when it matters most: staging only fills when persist is failing or the link is dead.
+    //
+    // Front-drops remove a PREFIX of the same ordered sequence, so the count of drops since the
+    // snapshot is all that is needed to realign: those records are already gone, and they were
+    // the oldest - i.e. the front of what was just persisted.
+    const std::uint64_t dropped_since =
+        journal_stage_dropped_.load(std::memory_order_relaxed) - drops_at_snapshot;
+    if (dropped_since >= n)
+        return; // every record we persisted has already been dropped from staging
+    n -= static_cast<std::size_t>(dropped_since);
     n = std::min(n, pending_journal_.size());
     pending_journal_.erase(pending_journal_.begin(),
                            pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
@@ -564,26 +600,62 @@ std::size_t GuardianSparkRuntime::pending_journal_depth() const {
     return pending_journal_.size();
 }
 
-std::size_t GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+GuardianSparkRuntime::PageOutcome
+GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
+    PageOutcome out;
     if (entries.empty())
-        return 0;
+        return out;
     std::lock_guard<std::mutex> ob{outbox_mu_};
-    // Headroom gate (design §5): page the batch only if it fits whole; else leave it for a
-    // later pass once the window drains (never a partial page that splits a batch).
-    if (lifecycle_log_.headroom() < entries.size())
-        return 0;
-    std::size_t added = 0;
     // Build the window membership set ONCE (O(window)) rather than re-scanning the window per
     // record (O(records x window)); the latter runs on the heartbeat/run-loop thread and can
-    // starve heartbeats under a large backlog (review UP-12 / perf P-2). The batch's records
-    // carry distinct event_ids, so a static pre-batch set is correct here.
+    // starve heartbeats under a large backlog (review UP-12 / perf P-2).
+    // Scoped: `present` holds string_views borrowed from the window's own entries. They are
+    // valid here (the log's nodes are stable and nothing is erased under this lock), but the
+    // enqueue loop below moves entries, so keeping a borrowed view alive across it is one edit
+    // away from a use-after-free for no benefit (#2345 Gate 8 cpp-safety).
+    std::unordered_set<std::string> want;
+    {
     const auto present = lifecycle_log_.event_id_set();
-    for (auto& e : entries) {
-        if (!present.count(e.event_id)) // O(1) membership: skip a re-page of an entry in the window
-            if (lifecycle_log_.enqueue(std::move(e)))
-                ++added;
+
+    // Required headroom is the count of NET-NEW event_ids, not the raw batch size (#2345
+    // Gate 5 CH-7). Charging the raw size is not merely pessimistic, it can wedge replay:
+    // a 256-entry batch with 255 entries already in the window needs ONE slot, but reporting
+    // 256 makes the worker's refill re-arm wait for 256 free slots - room the window may
+    // never have while those same 255 entries are what is occupying it. The batch then never
+    // pages and its one unsent record is eventually pruned: a permanent, silent audit gap
+    // produced by the accounting rather than by any real shortage.
+    //
+    // Deduplicated, so a batch that repeats an event_id (a torn or hand-edited journal row)
+    // cannot inflate the requirement past what enqueue would actually consume, nor enqueue
+    // the same record twice against a membership set built before the loop.
+    want.reserve(entries.size());
+    for (const auto& e : entries)
+        if (!present.count(e.event_id))
+            want.insert(e.event_id);
     }
-    return added;
+    if (want.empty())
+        return out; // every entry is already windowed: nothing to do, and nothing is blocked
+
+    // Headroom gate (design §5): page the batch only if its net-new records fit whole; else
+    // leave it for a later pass once the window drains (never a partial page that splits a
+    // batch).
+    //
+    // Reporting WHY nothing was added has to happen here, under the lock. A caller's own
+    // pre-check can be stale by the time it gets here - a concurrent arm can consume the room
+    // in between - and if that case is misread as "already a member" the caller never learns a
+    // backlog is waiting and replay stalls for a whole cadence interval (#2345 Gate 3).
+    if (lifecycle_log_.headroom() < want.size()) {
+        out.blocked_for_headroom = true;
+        out.required = want.size();
+        return out;
+    }
+    for (auto& e : entries) {
+        if (want.erase(e.event_id) == 0) // already windowed, or an intra-batch duplicate
+            continue;
+        if (lifecycle_log_.enqueue(std::move(e)))
+            ++out.added;
+    }
+    return out;
 }
 
 void GuardianSparkRuntime::backfill_batch_provenance(const std::string& batch_key,
@@ -603,10 +675,25 @@ namespace {
 // item 4), then re-lock and pop the head ONLY if it is still the entry we sent. A
 // coalesce/drop during the unlocked window replaces or removes it; pop_front_if(event_id)
 // then no-ops and the current head is handled on the next pass.
+struct DrainPassLimits {
+    std::size_t budget{0};                            ///< decremented per successful send
+    std::chrono::steady_clock::time_point deadline{}; ///< zero-valued when unbounded
+    bool has_deadline{false};
+    const std::function<bool()>* should_stop{nullptr};
+    /// Sends allowed to proceed even past `deadline`. The wall slice alone guarantees only
+    /// that compliance gets to START, and only if the in-flight lifecycle send returns in
+    /// time - so a single send slower than the whole pass budget left compliance's restored
+    /// deadline permanently in the past and it shipped NOTHING, every pass, forever
+    /// (#2345 Gate 4 UP-3). This converts that into a hard floor. It does NOT bypass
+    /// should_stop: shutdown still wins immediately.
+    std::size_t guaranteed_attempts{0};
+};
+
 template <typename Log>
 std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
                                const std::function<SendResult(const OutboxEntry&)>& send,
-                               std::atomic<std::uint64_t>& send_exceptions) {
+                               std::atomic<std::uint64_t>& send_exceptions,
+                               DrainPassLimits& lim, bool& truncated) {
     std::size_t sent = 0;
     while (true) {
         OutboxEntry entry;
@@ -614,9 +701,28 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
             std::lock_guard<std::mutex> ob{mu};
             std::optional<OutboxEntry> front = log.front_copy();
             if (!front)
-                return sent; // drained
+                return sent; // drained - NOT truncated, whatever the budget says
             entry = std::move(*front);
         }
+        // Limits are evaluated only once an entry is known to exist, and always BEFORE the
+        // send: the point is to avoid STARTING work, since an in-flight send cannot be
+        // interrupted and the caller may be holding a lock across a thread join
+        // (#2298 Sol review). Checking them earlier would report a drained log as truncated.
+        // A guaranteed attempt overrides the DEADLINE only - never the budget, and never the
+        // stop predicate.
+        const bool guaranteed = lim.guaranteed_attempts > 0;
+        if (lim.should_stop && *lim.should_stop && (*lim.should_stop)()) {
+            truncated = true;
+            return sent;
+        }
+        if (lim.budget == 0 ||
+            (!guaranteed && lim.has_deadline &&
+             std::chrono::steady_clock::now() >= lim.deadline)) {
+            truncated = true;
+            return sent;
+        }
+        if (guaranteed)
+            --lim.guaranteed_attempts;
         SendResult r = SendResult::Retain;
         try {
             r = send(entry); // outbox_mu_ RELEASED here
@@ -642,15 +748,23 @@ std::size_t drain_log_unlocked(Log& log, std::mutex& mu,
             log.pop_front_if(entry.event_id); // remove IFF unchanged during the unlocked send
         }
         ++sent;
+        --lim.budget;
     }
 }
 } // namespace
 
+std::size_t GuardianSparkRuntime::lifecycle_headroom() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.headroom();
+}
+
+std::unordered_set<std::string> GuardianSparkRuntime::lifecycle_event_ids() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    const auto present = lifecycle_log_.event_id_set(); // borrowed views, valid under the lock
+    return std::unordered_set<std::string>(present.begin(), present.end());
+}
+
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {
-    // Single-drainer: the send runs with outbox_mu_ released, so two concurrent drainers
-    // could both peek+send the same head (duplicate delivery). drain_mu_ serialises them
-    // without blocking enqueuers (they take outbox_mu_, not drain_mu_).
-    std::lock_guard<std::mutex> dg{drain_mu_};
     // Drain lifecycle (audit) BEFORE compliance/health so a rule's "armed" precedes its
     // first drift on the wire in the common case (stream up, both drain fully). This is
     // BEST-EFFORT ordering, NOT a hard gate: an earlier version gated compliance on the
@@ -661,9 +775,134 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
     // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
     // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
-    std::size_t sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_);
-    sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_);
-    return sent;
+    DrainLimits unbounded;
+    return drain_bounded(send, unbounded).sent;
+}
+
+GuardianSparkRuntime::DrainOutcome
+GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
+                                    const DrainLimits& limits) {
+    std::lock_guard<std::mutex> dg{drain_mu_};
+    DrainOutcome out;
+
+    const bool unbounded = limits.max_entries == 0;
+    const std::size_t total =
+        unbounded ? std::numeric_limits<std::size_t>::max() : limits.max_entries;
+
+    // Reserve a share for compliance/health BEFORE lifecycle runs. Draining lifecycle first
+    // out of one shared budget means a busy lifecycle log can consume the entire pass and
+    // compliance never runs at all - which is the detection blackout the comment above says
+    // was removed for exactly that reason (Gate 4 UP-3), reintroduced in bounded form.
+    // Unused lifecycle allowance rolls over below, so this costs nothing when lifecycle is
+    // quiet, and the overall cap is still `total`.
+    // Normalise the reserve ratio ONCE, defensively: den == 0 (disabled), num > den
+    // (nonsensical), and the wall-only case where max_entries == 0 all have to land somewhere
+    // explicit rather than dividing by zero or over-reserving (Sol review).
+    // A ratio denominator beyond this is nonsense and only invites overflow in the wall
+    // arithmetic below; treat it as "no reserve" rather than trusting the cast.
+    constexpr std::size_t kMaxReserveRatio = 1'000'000;
+    const std::size_t reserve_den =
+        (limits.compliance_reserve_den > kMaxReserveRatio) ? 0 : limits.compliance_reserve_den;
+    const std::size_t reserve_num =
+        (reserve_den == 0) ? 0 : std::min(limits.compliance_reserve_num, reserve_den);
+
+    std::size_t reserve = 0;
+    if (!unbounded && reserve_den > 0) {
+        reserve = total / reserve_den * reserve_num;
+        if (reserve > total)
+            reserve = total;
+        // Integer division floors to 0 whenever total < den, which silently removes the
+        // reserve and reopens the starvation this exists to prevent - with no diagnostic
+        // (#2298 Gate 4 UP-8). Guarantee at least one slot whenever there is more than one
+        // to give; at total == 1 there is nothing to split and lifecycle keeps first claim.
+        if (reserve == 0 && total > 1 && reserve_num > 0)
+            reserve = 1;
+    }
+
+    DrainPassLimits lim;
+    lim.budget = total - reserve;
+    lim.should_stop = limits.should_stop ? &limits.should_stop : nullptr;
+
+    // Slice the WALL the same way the count is sliced. A single shared deadline made the
+    // count reserve dead on arrival under time pressure: drain_log_unlocked checks the
+    // deadline BEFORE the budget, so once lifecycle consumed the wall, compliance returned on
+    // entry without ever spending a reserved slot - the Gate-4 UP-3 detection blackout reached
+    // through the other limit (#2345 important-1).
+    //
+    // GUARANTEE, stated precisely: compliance gets an opportunity to START, provided the
+    // in-flight lifecycle send returns before the full-pass deadline. It is NOT "compliance
+    // gets time" - a lifecycle send begun just inside its slice can return after the full
+    // deadline, and no bound here can interrupt it. You cannot have both a hard pass deadline
+    // and a guaranteed compliance attempt while sends are uninterruptible (Sol review).
+    const auto pass_start = std::chrono::steady_clock::now();
+    if (limits.max_wall.count() > 0) {
+        lim.has_deadline = true;
+        // CLAMP BEFORE THE CAST. The count path clamps (min(num,den), reserve <= total) and an
+        // unclamped wall path recreated the very asymmetry this round exists to remove: with a
+        // pathological denominator the size_t->int64_t cast could yield a lifecycle slice
+        // LONGER than the whole pass, leaving compliance's restored deadline already in the
+        // past - zero compliance sends, i.e. the UP-3 detection blackout reached through a
+        // sign flip. Unreachable from the sole production caller (1/2), which is exactly why
+        // it needed a bound rather than an argument (#2345 Gate 2 sec-MEDIUM-1).
+        std::chrono::milliseconds lifecycle_wall = limits.max_wall;
+        // Gated on the WALL, not on max_entries: a {max_entries = 0, max_wall = X} config looks
+        // bounded but previously received neither the count reserve (skipped by !unbounded) nor
+        // a wall slice, i.e. the UP-3 blackout reachable purely by configuration
+        // (#2345 Gate 3 cpp-safety).
+        if (reserve_den > 0 && reserve_den <= kMaxReserveRatio) {
+            // DIVIDE FIRST. Multiplying max_wall by (den - num) before dividing overflows a
+            // signed 64-bit millisecond count for a large max_wall with a large denominator -
+            // undefined behaviour, not merely a wrong slice. Unreachable from the sole
+            // production caller, but the comment above claims a bound, so it needs to be one
+            // (#2345 Gate 8 security). Dividing first costs at most (den - 1) ms of slice.
+            lifecycle_wall = std::chrono::milliseconds{
+                limits.max_wall.count() / static_cast<std::int64_t>(reserve_den) *
+                static_cast<std::int64_t>(reserve_den - reserve_num)};
+        }
+        // Never longer than the pass itself, whatever the ratio said.
+        // FLOOR the slice, mirroring the count reserve's floor. Without it a small max_wall
+        // truncates lifecycle_wall to 0, lifecycle gets a deadline equal to pass_start and
+        // ships NOTHING - the same starve-a-lane bug this round fixed for compliance, simply
+        // pointed the other way (#2345 Gate 4 consistency S5). One millisecond is enough to
+        // guarantee an attempt; the count budget still bounds the work.
+        if (lifecycle_wall < std::chrono::milliseconds{1})
+            lifecycle_wall = std::chrono::milliseconds{1};
+        lim.deadline = pass_start + std::min(lifecycle_wall, limits.max_wall);
+    }
+
+    bool lifecycle_truncated = false;
+    out.sent = drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, lim,
+                                 lifecycle_truncated);
+    // Hand the compliance pass its reserve PLUS whatever lifecycle did not use, and restore
+    // the FULL pass deadline - lifecycle only ever held a slice of it.
+    lim.budget += reserve;
+    if (limits.max_wall.count() > 0)
+        lim.deadline = pass_start + limits.max_wall;
+    // Guarantee compliance at least one attempt even if lifecycle already overran the pass.
+    // Without this the "compliance gets to start" property is conditional on the in-flight
+    // lifecycle send returning in time, and a persistently slow send makes it never true.
+    lim.guaranteed_attempts = (reserve > 0) ? 1 : 0;
+    bool compliance_truncated = false;
+    out.sent += drain_log_unlocked(outbox_, outbox_mu_, send, send_exceptions_, lim,
+                                  compliance_truncated);
+
+    // Give any STILL-unused allowance back to lifecycle. Without this the transfer is
+    // one-directional and the reserve becomes a hard cap on lifecycle even when compliance
+    // is completely idle - which at a small budget throttles audit delivery for no benefit.
+    // Spend or drop the guaranteed attempt HERE. If the compliance log was empty the token is
+    // never consumed, and carrying it into the lifecycle retry below lets lifecycle start one
+    // send past the whole pass deadline - the deadline this exception exists to relax for
+    // COMPLIANCE only (#2345 Gate 8 security). should_stop still bounds shutdown either way.
+    lim.guaranteed_attempts = 0;
+    bool lifecycle_retry_truncated = false;
+    const bool retried = lifecycle_truncated && lim.budget > 0;
+    if (retried)
+        out.sent += drain_log_unlocked(lifecycle_log_, outbox_mu_, send, send_exceptions_, lim,
+                                      lifecycle_retry_truncated);
+
+    out.truncated =
+        compliance_truncated || (retried ? lifecycle_retry_truncated : lifecycle_truncated);
+    return out;
 }
 
 void GuardianSparkRuntime::begin_stop() {

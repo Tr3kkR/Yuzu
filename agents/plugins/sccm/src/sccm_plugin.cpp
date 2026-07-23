@@ -107,7 +107,12 @@ int do_client_version(yuzu::CommandContext& ctx) {
         ctx.write_output("service_status|not_found");
     }
 
+#elif defined(__APPLE__)
+    // macOS-specific honest sentinel (points at the real macOS alternative).
+    ctx.write_output("sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management");
 #else
+    // Linux/other: platform-neutral honest sentinel — do NOT name macOS
+    // tools on a Linux agent. Preserves the pre-batch Linux output shape.
     ctx.write_output("installed|false");
     ctx.write_output("error|platform not supported");
 #endif
@@ -161,7 +166,12 @@ int do_site(yuzu::CommandContext& ctx) {
         ctx.write_output("management_point|unknown");
     }
 
+#elif defined(__APPLE__)
+    // macOS-specific honest sentinel (points at the real macOS alternative).
+    ctx.write_output("sccm|unsupported|Windows SCCM/ConfigMgr client has no macOS equivalent; use Jamf/MDM for macOS device management");
 #else
+    // Linux/other: platform-neutral honest sentinel — do NOT name macOS
+    // tools on a Linux agent. Preserves the pre-batch Linux output shape.
     ctx.write_output("error|platform not supported");
 #endif
     return 0;

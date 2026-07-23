@@ -251,3 +251,47 @@ TEST_CASE("enqueue/enqueue_all reject a Lifecycle-domain entry", "[spark][outbox
     REQUIRE_FALSE(ob.enqueue_all(std::move(mixed)));
     REQUIRE(ob.size() == 0); // both-or-neither: the compliance entry is not buffered either
 }
+
+TEST_CASE("stamp_provenance withholds last-in-batch unless the whole batch is windowed",
+          "[spark][guardian][outbox][chaos]") {
+    // A record can be journalled but never windowed: the arm path stages to the journal
+    // unconditionally while enqueue may refuse on backpressure. Marking the batch's last entry
+    // last-in-batch regardless meant its send wrote a sent-label for a batch one of whose
+    // records had never been sent at all.
+    //
+    // That was survivable while replay re-offered every batch on every pass - the missing
+    // record was simply placed next time round. Once the sent-label began to SUPPRESS replay
+    // (#2345 round 8) it became silent, permanent loss of exactly the record that was already
+    // unlucky enough to be dropped. RED before the fix: e3 is marked last-in-batch.
+    GuardianLifecycleLog log{8};
+    auto mk = [](const std::string& id) {
+        return OutboxEntry::lifecycle("r", 1, id, 1'700'000'000'000'000'000, "armed", "file", "n");
+    };
+    // The batch is e1,e2,e3 - but only e2 and e3 ever reached the window (e1 was dropped on
+    // backpressure at arm time).
+    REQUIRE(log.enqueue(mk("e2")));
+    REQUIRE(log.enqueue(mk("e3")));
+
+    log.stamp_provenance("lc:nonce:000000000001", {"e1", "e2", "e3"}, "e3");
+
+    // No entry may claim to close the batch, so nothing writes a sent-label and the batch stays
+    // a replay candidate until a pass places the whole thing.
+    auto head = log.front_copy();
+    REQUIRE(head.has_value());
+    CHECK(head->journal_batch_key == "lc:nonce:000000000001"); // provenance still stamped
+    CHECK_FALSE(head->journal_last_in_batch);
+    REQUIRE(log.pop_front_if("e2"));
+    auto second = log.front_copy();
+    REQUIRE(second.has_value());
+    CHECK_FALSE(second->journal_last_in_batch); // e3 is the batch's last record, but e1 is missing
+
+    // Control: when every record IS windowed, the last one is marked as before.
+    GuardianLifecycleLog whole{8};
+    REQUIRE(whole.enqueue(mk("f1")));
+    REQUIRE(whole.enqueue(mk("f2")));
+    whole.stamp_provenance("lc:nonce:000000000002", {"f1", "f2"}, "f2");
+    REQUIRE(whole.pop_front_if("f1"));
+    auto last = whole.front_copy();
+    REQUIRE(last.has_value());
+    CHECK(last->journal_last_in_batch);
+}
