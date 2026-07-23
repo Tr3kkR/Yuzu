@@ -5,6 +5,7 @@
 /// Header-only — small enough that a separate TU adds no value.
 
 #include <cstddef>
+#include <cstdint>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -25,6 +26,14 @@ namespace yuzu::server::detail {
 struct SseEvent {
     std::string event_type;
     std::string data;
+    /// Optional SSE `id:` for routes that support `Last-Event-ID` resume. 0 = no id
+    /// (heartbeats and synthetics carry none — resuming onto a heartbeat's id would
+    /// skip real frames). Routes that predate this field packed the id into `data`
+    /// as a `"<id>\n<payload>"` prefix and re-parsed it in the provider; carrying it
+    /// as a field instead removes a throwing `stoull` from a content-provider
+    /// callback, which httplib runs on an UNGUARDED worker task — an escaped
+    /// exception there is `std::terminate`, not a 500 (#2037's failure class).
+    std::uint64_t id = 0;
 };
 
 // -- SSE Event Bus ------------------------------------------------------------
@@ -143,6 +152,14 @@ inline void enqueue_capped(const std::shared_ptr<SseSinkState>& state, SseEvent 
 // output cause silent truncation — only the first line reaches the browser.
 inline std::string format_sse(const SseEvent& ev) {
     std::string out;
+    // `id:` first, when the route sets one (0 = none). Emitted HERE rather than in a
+    // per-route wrapper so that a caller who populates SseEvent::id and reaches for the
+    // shared formatter gets the id on the wire instead of having it silently dropped.
+    if (ev.id != 0) {
+        out += "id: ";
+        out += std::to_string(ev.id);
+        out += '\n';
+    }
     out += "event: ";
     out += ev.event_type;
     out += '\n';
@@ -208,11 +225,44 @@ inline bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, siz
     return true;
 }
 
+/// `noexcept`, and that is STRUCTURAL, not decorative. This is the shared release helper
+/// for the legacy `GET /events` SSE surface, and httplib invokes a content-provider
+/// releaser from `~Response` — a destructor. An exception escaping here is therefore
+/// `std::terminate` (#2037's class), which no caller-side try/catch can intercept because
+/// the terminate happens inside the destructor before unwinding reaches any handler. The
+/// two throw sites — `std::lock_guard` construction (`std::system_error`, and this PR's
+/// lost-wakeup fix is what ADDED it: the store used to be a bare atomic) and
+/// `bus.unsubscribe` (locks `mu_`) — are contained AT THE SOURCE, the same way
+/// `QuotaSlot::reset` and `StreamBudget::Lease::release` are, so every caller is safe by
+/// construction rather than by remembering to wrap the call. The MCP / `/api/v1/events` /
+/// dashboard sibling releasers inline their own equivalent guards; this one is shared, so
+/// the guard lives in the shared function.
 inline void sse_resource_release(const std::shared_ptr<SseSinkState>& state, EventBus& bus,
-                                 bool /*success*/) {
-    state->closed.store(true);
-    state->cv.notify_all();
-    bus.unsubscribe(state->sub_id);
+                                 bool /*success*/) noexcept {
+    try {
+        // `closed` is the provider's wait PREDICATE, so it must be modified while owning
+        // the mutex: a store issued between the provider's predicate check and its atomic
+        // release-and-block is a lost wakeup, and the provider then sleeps a full 3 s tick
+        // before it notices. Being atomic does not help — ownership of the mutex during
+        // the modification is what orders it against the wait.
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->closed.store(true);
+    } catch (...) {
+        // A lock that cannot be taken means the sink is already unusable; contain it. A
+        // stalled provider is strictly better than aborting the whole process from a
+        // destructor.
+    }
+    // notify/unsubscribe are OUTSIDE the block above on purpose: publishers take the bus
+    // mutex and then the sink mutex, so unsubscribing while still holding `state->mu` would
+    // invert that order and deadlock. Do not move `unsubscribe` into the block.
+    state->cv.notify_all(); // noexcept
+    // `unsubscribe` in its OWN try so its throw cannot skip the notify above and cannot
+    // escape the destructor. A leaked subscription pins the sink for the process's life —
+    // a bounded leak, not a terminate.
+    try {
+        bus.unsubscribe(state->sub_id);
+    } catch (...) {
+    }
 }
 
 } // namespace yuzu::server::detail

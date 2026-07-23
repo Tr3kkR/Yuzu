@@ -73,14 +73,24 @@ class QuotaSlot {
     QuotaSlot(const QuotaSlot&) = delete;
     QuotaSlot& operator=(const QuotaSlot&) = delete;
 
-    ~QuotaSlot();
+    /// Implicitly noexcept already (all subobjects have non-throwing dtors); spelled
+    /// out so the guarantee is visible where callers reason about it.
+    ~QuotaSlot() noexcept;
 
     bool admitted() const { return decision_.admitted; }
     const QuotaDecision& decision() const { return decision_; }
 
     /// Release the held concurrency slot early (if any). Idempotent — safe
     /// to call multiple times, and safe on an empty/rejected slot (no-op).
-    void reset();
+    ///
+    /// `noexcept` is STRUCTURAL, not decorative (same rule as
+    /// StreamBudget::Lease::release). This runs from ~QuotaSlot, which is itself
+    /// noexcept, and ~QuotaSlot runs from an httplib content-provider releaser
+    /// invoked by ~Response — so a throw escaping here is std::terminate and NO
+    /// caller-side try/catch can intercept it: the terminate happens inside the
+    /// destructor, before unwinding reaches any handler. The containment therefore
+    /// has to live here, at the source, which is what makes it real.
+    void reset() noexcept;
 
   private:
     friend class PrincipalQuota;
@@ -199,7 +209,9 @@ class PrincipalQuota {
     // since been purged (defensive — purge_stale already guards against
     // purging a live in-flight principal, so this should not happen in
     // practice).
-    void release(const std::string& principal_id);
+    /// noexcept: called from QuotaSlot::reset(), which runs in destructors on
+    /// httplib's response-teardown path. See QuotaSlot::reset's comment.
+    void release(const std::string& principal_id) noexcept;
 
     PrincipalQuotaConfig cfg_;
     mutable std::mutex mu_;

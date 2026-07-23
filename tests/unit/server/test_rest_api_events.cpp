@@ -32,6 +32,7 @@
 #include "device_token_store.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "stream_budget.hpp"
 #include "execution_tracker.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_api_v1.hpp"
@@ -83,6 +84,10 @@ struct RestEventsHarness {
     SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
+    /// Optional shared admission budget (ADR-0034). nullptr keeps every pre-existing
+    /// test on the unmetered path; the admission tests pass one in.
+    yuzu::server::detail::StreamBudget* stream_budget{nullptr};
+
     fs::path tracker_db;
     std::unique_ptr<ExecutionTracker> tracker;
     // Bus outlives tracker — same invariant as production server.cpp
@@ -107,8 +112,9 @@ struct RestEventsHarness {
     /// bus so the 503-on-no-bus path can be exercised independently.
     /// `with_tracker=false` opts out of the tracker entirely (separate
     /// 503 path).
-    explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true)
-        : tracker_db(uniq("rest-events-tracker")) {
+    explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true,
+                               yuzu::server::detail::StreamBudget* budget = nullptr)
+        : stream_budget(budget), tracker_db(uniq("rest-events-tracker")) {
         fs::remove(tracker_db);
 
         if (with_tracker) {
@@ -179,7 +185,26 @@ struct RestEventsHarness {
                             /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr,
                             /*metrics_registry=*/&metrics,
-                            /*session_revoke_fn=*/{}, event_bus.get());
+                            /*session_revoke_fn=*/{}, event_bus.get(),
+                            // Everything from here to stream_budget is a defaulted
+                            // dependency this harness does not use. Spelled out because
+                            // the budget is the LAST parameter and C++ has no way to skip
+                            // to it — which is precisely how the production wiring came to
+                            // be omitted without anything noticing.
+                            /*result_set_store=*/nullptr,
+                            /*command_dispatch_fn=*/{},
+                            /*step_up_fn=*/{},
+                            /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{},
+                            /*net_perf_fn=*/{},
+                            /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr,
+                            /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr,
+                            /*inventory_scope_fn=*/{},
+                            /*response_scope_fn=*/{},
+                            /*app_perf_providers=*/{},
+                            /*engine_principal_store=*/nullptr, stream_budget);
     }
 
     ~RestEventsHarness() {
@@ -308,6 +333,112 @@ TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[events
     // are owned by the RBAC layer, mirroring the dashboard SSE sibling
     // (`/sse/executions/{id}`) policy.
     REQUIRE(h.audit_log.empty());
+}
+
+// ── ADR-0034 shared-budget admission (governance regression guards) ─────────
+//
+// This route's lease block was DEAD CODE on a real server: server.cpp never passed
+// the budget, the parameter defaults to nullptr, and nothing observed the gap — the
+// boot log, stream_budget.hpp and rest-api.md all asserted the opposite. Nothing in
+// this suite wired a budget in either, so the omission was unfalsifiable. These
+// tests make it falsifiable.
+
+TEST_CASE("GET /api/v1/events: 429 A4 envelope once the shared budget is exhausted",
+          "[events][admission][sse]") {
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalApiEvents);
+    REQUIRE(held.lease);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    // A REAL running execution: the handler validates the id BEFORE admission, which
+    // is the right order (a bogus id must not consume a lease), so a synthetic id
+    // would 404 and never reach the branch under test.
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 429);
+    // A4 envelope, not a bare status — this is an agentic-first surface.
+    CHECK(res->body.find(R"("code":429)") != std::string::npos);
+    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    // The remediation must name a flag that can actually resolve the rejection.
+    CHECK(res->body.find("--max-sse-streams") != std::string::npos);
+    // Retry-After header alongside the envelope (the platform 429 convention).
+    CHECK(res->get_header_value("Retry-After") == "5");
+    // A live stream is never evicted for a newcomer.
+    CHECK(budget.active() == 1);
+}
+
+TEST_CASE("GET /api/v1/events: a budget rejection leaves no subscriber and no gauge drift",
+          "[events][admission][sse]") {
+    // The lease is taken before BOTH the bus subscription and the active-gauge bump.
+    // Getting either order wrong is silent: a leaked listener is only visible in
+    // memory, and a leaked gauge increment only shows up as a slowly-rising number
+    // on the very dashboard the budget exists to make trustworthy.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
+    auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                   yuzu::server::detail::kPerPrincipalApiEvents);
+    REQUIRE(held.lease);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    const auto exec_id = h.make_exec("running");
+    const auto before = h.event_bus->subscribers_total();
+    for (int i = 0; i < 5; ++i) {
+        auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 429);
+    }
+    CHECK(h.event_bus->subscribers_total() == before);
+}
+
+TEST_CASE("GET /api/v1/events: the PER-PRINCIPAL cap is keyed on the authenticated identity",
+          "[events][admission][sse]") {
+    // Falsification guard the global-cap tests above cannot provide: they force a reject
+    // by pre-seeding a DIFFERENT principal, so they would still pass if the handler keyed
+    // its lease on a hardcoded literal instead of `session->username`. Here the reject can
+    // only fire if the handler keys on the SAME principal the harness authenticates as
+    // ("tester"). A generous global cap isolates the per-principal cap as the sole cause.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{/*global_cap=*/100}};
+    // Fill "tester"'s per-principal allowance (compile-time kPerPrincipalApiEvents).
+    std::vector<yuzu::server::detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < yuzu::server::detail::kPerPrincipalApiEvents; ++i) {
+        auto a = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "tester",
+                                    yuzu::server::detail::kPerPrincipalApiEvents);
+        REQUIRE(a.lease);
+        held.push_back(std::move(a.lease));
+    }
+    // Global budget still has plenty of room — only the per-principal cap is exhausted.
+    REQUIRE(budget.active() < 100);
+
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, &budget};
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    // If the handler used any principal string other than "tester", its key would have 0
+    // prior leases and it would be ADMITTED (200). The 429 proves it keyed on the session.
+    CHECK(res->status == 429);
+    // And the remediation must be the per-principal one (no --max-sse-streams, which would
+    // not resolve a per-principal reject).
+    CHECK(res->body.find("per-principal") != std::string::npos);
+    CHECK(res->body.find("--max-sse-streams") == std::string::npos);
+
+    // A different principal is unaffected — proves the cap is per-principal, not global.
+    auto other = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
+                                    yuzu::server::detail::kPerPrincipalApiEvents);
+    CHECK(other.lease);
+}
+
+TEST_CASE("GET /api/v1/events: an unmetered route still serves (nullptr budget is a seam)",
+          "[events][admission][sse]") {
+    // Guards against the admission tests above passing for the wrong reason.
+    RestEventsHarness h; // no budget
+    const auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status != 429);
 }
 
 // ── Input validation ────────────────────────────────────────────────────────

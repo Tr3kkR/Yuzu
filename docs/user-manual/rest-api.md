@@ -5527,7 +5527,14 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | 403 | RBAC `Execution:Read` denied |
 | 404 | `{id}` does not exist in the execution tracker |
 | 410 | Execution is already in a terminal status (succeeded / completed / cancelled / failed). Tells `EventSource` to stop reconnecting. |
+| 429 | Shared held-open-stream budget exhausted (ADR-0034). Body is plain text (`too many live streams open — close a tab and retry`) with a `Retry-After: 5` header — note this surface predates the A4 envelope and does not use it. |
 | 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
+
+This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
+from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, `GET /api/v1/events`, and the
+legacy `/events` stream (ADR-0034). That means enough open drawers — or enough traffic on any
+of the other three surfaces — can cause a *new* drawer to be refused with `429`. A live stream
+is never evicted to make room.
 
 **Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
@@ -5622,7 +5629,13 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 | 403 | (perm layer) | RBAC `Execution:Read` denied |
 | 404 | A4 envelope | Execution does not exist |
 | 410 | A4 envelope | Execution already terminal |
+| 429 | A4 envelope with `retry_after_ms:5000` | Shared held-open-stream budget exhausted (ADR-0034). Remediation text: `close an existing /api/v1/events stream, or raise --max-sse-streams` |
 | 503 | A4 envelope with `retry_after_ms:5000` | Tracker or event bus not initialised (server warmup window) |
+
+This endpoint holds an HTTP worker thread open for the life of the subscription, so it
+leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
+executions drawer, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+*new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
 
@@ -5926,6 +5939,47 @@ Uninstall a pack, removing all delegated items.
 ## MCP (Model Context Protocol)
 
 The MCP endpoint enables AI models and automation tools to interact with Yuzu via JSON-RPC 2.0. Authentication is via Bearer token with an MCP tier. See [Authentication > MCP Tokens](authentication.md#mcp-tokens) for token creation details.
+
+#### `GET /mcp/v1/`
+
+The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
+`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
+(`notifications/progress`) arrive with the next 2f rung.
+
+**Permission:** the same credential as `POST /mcp/v1/`, plus the session's
+`Mcp-Session-Id` header. The credential is re-checked on every heartbeat, so revoking it
+ends a *live* stream, not just future ones.
+
+**Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
+**Optional:** `Last-Event-ID` to resume.
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| `200` | SSE stream (`text/event-stream`, chunked, held open) |
+| `400` | `Mcp-Session-Id` absent (`-32600`) |
+| `404` | Session unknown, expired, another principal's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize |
+| `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
+| `405` | Streaming disabled (`--mcp-no-streaming`) |
+| `406` | `Accept` did not include `text/event-stream` (`-32011`) |
+| `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+     -H "Mcp-Session-Id: $SID" \
+     -H "Accept: text/event-stream" \
+     https://yuzu.example.com/mcp/v1/
+```
+
+Every error body carries the A4 envelope (`correlation_id`, nullable `retry_after_ms`,
+`remediation`). Streams end with a final `stream-closed` frame naming the reason.
+
+#### `DELETE /mcp/v1/`
+
+Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
+`404` if the session is unknown or belongs to another principal; `400` if the header is
+absent.
 
 #### `POST /mcp/v1/`
 

@@ -36,9 +36,9 @@ Key characteristics:
 
 - **Protocol**: JSON-RPC 2.0 over HTTP.
 - **Endpoint**: `POST /mcp/v1/` for all JSON-RPC calls. `GET`/`DELETE /mcp/v1/`
-  are also registered for the MCP Streamable HTTP transport (see
-  [Streamable HTTP sessions](#streamable-http-sessions) below); `GET` is a `405`
-  placeholder until the SSE channel ships (track 2f PR 2).
+  serve the MCP Streamable HTTP transport (see
+  [Streamable HTTP sessions](#streamable-http-sessions) below): `GET` is the
+  session's server→client SSE channel, `DELETE` ends a session.
 - **Protocol version**: negotiated on `initialize` — `2025-03-26` (default) or
   `2025-06-18`. A client that requests neither is answered `2025-03-26`; a
   present-but-unsupported `MCP-Protocol-Version` header is rejected with `400`.
@@ -176,20 +176,54 @@ change: a notification POST now answers `202` instead of `204`).
   is not allowlisted — see `--mcp-allowed-origin`); **`MCP-Protocol-Version`** is
   negotiated (`-32009` / `400` for an unsupported value); the per-principal/global
   session cap returns `-32010` / `429` on `initialize` when full.
-- **`GET /mcp/v1/`** returns `405` today — the SSE channel (`Last-Event-ID`
-  resume) and `notifications/progress` for long-running tools ship in the next 2f
-  rungs (see `docs/mcp-server.md`). **Forward guard:** when that channel lands,
-  it must adopt an engine principal's per-principal quota concurrency slot
-  into the stream's lifetime, the same as the three routes already covered
-  by the PR 4.4 quota cap — see `docs/user-manual/engine-principals.md`
-  "Per-principal quota cap" for the UP-1 rationale.
+- **`GET /mcp/v1/`** is the session's server→client **SSE channel**. It requires the
+  session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, or another
+  principal's) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
+  like `*/*` do not opt in). The stream sends heartbeats every ~3 s and supports
+  **`Last-Event-ID` resume**: reconnect with the last id you saw and the server replays
+  exactly the frames you missed from a bounded per-session ring. If your cursor has
+  already been evicted from that ring, the session is terminated and the request `404`s
+  — re-initialize; durable results remain fetchable by `execution_id`. There is never a
+  silent gap.
+  Concurrency is capped (`--max-sse-streams` globally, `--mcp-max-streams-per-principal`
+  per principal): a cap
+  hit returns `-32012` / `429` with an honest `retry_after_ms` and never evicts a live
+  stream. A second `GET` on the same session **takes over** (the older stream closes with
+  `superseded`), so a client reconnecting across a dead TCP connection is never locked
+  out by its own zombie.
+  The credential that opened a stream is re-checked on every heartbeat. On a
+  single-server deployment, revoking it ends the stream within one tick
+  (`credential_revoked`). On a **multi-replica** deployment, revocation of an
+  **API token** is not instantaneous: the token cache is per-process, so a revoke
+  handled by one replica does not reach a stream held by another until that replica's
+  own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
+  tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
+  stream simply does not exist on another replica; the bound above is an API-token
+  property.) Streams end with a final
+  `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
+  `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
+  auth store was unreachable for longer than the **60 s** grace window — the stream is not
+  cut the instant the store hiccups, but the exposure is bounded: a revoked credential
+  cannot outlive a coincident auth-store outage by more than that window).
+  Streams are held open, so a proxy in front of Yuzu must not buffer them. The server
+  sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare
+  need their own response-buffering opt-out.
+  In this release the channel carries heartbeats and replayed frames;
+  `notifications/progress` for long-running tools arrives in the next 2f rung (see
+  `docs/mcp-server.md`).
+  An engine principal's stream holds its per-principal quota **concurrency**
+  slot for the stream's whole lifetime, the same as the other streaming routes
+  covered by the PR 4.4 quota cap — so a long-lived stream counts against that
+  cap rather than releasing it at routing hand-off. See
+  `docs/user-manual/engine-principals.md` "Per-principal quota cap".
 - The session id is **transport affinity only** — never an auth credential;
   per-request token auth runs on every method regardless.
 
 The `--mcp-no-streaming` kill switch disables all of the above (no minting;
 `GET`/`DELETE` → `405`; plain POST only), useful behind a buffering reverse proxy.
 Session open/close and every denial are audited (`mcp.session.open` /
-`mcp.session.close` / `mcp.session.reject`).
+`mcp.session.close` / `mcp.session.reject`), and each stream attach/close is audited
+too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close reason).
 
 ---
 
@@ -841,6 +875,35 @@ never evicted to make room.
 > deployment gives each engine principal N x the configured cap) and is
 > metric-only — `yuzu_server_principal_quota_exhausted_total{side,limit}` —
 > with **no** audit row (see `docs/user-manual/audit-log.md`).
+
+### -32011: Not acceptable (HTTP 406)
+
+**Symptom**: `GET /mcp/v1/` returns `-32011` / HTTP `406`.
+
+**Cause**: The request did not ask for SSE. The GET channel is SSE-only and fails
+closed: it requires `Accept: text/event-stream` as an explicit whole media type.
+Wildcards (`*/*`, `text/*`) deliberately do **not** opt in — the server will not guess
+that a client which asked for anything wanted a held-open stream.
+
+**Fix**: Send `Accept: text/event-stream` on the GET.
+
+### -32012: Stream limit reached (HTTP 429)
+
+**Symptom**: `GET /mcp/v1/` returns `-32012` / HTTP `429` with a non-null
+`retry_after_ms` in the A4 `error.data`.
+
+**Cause**: One of two things, distinguished by the `remediation` text. Either the
+concurrent-stream cap is full (`--max-sse-streams`, shared with every other streaming
+surface, or the per-principal `--mcp-max-streams-per-principal`) — each held-open
+stream pins one HTTP worker, so this is a real resource limit, and a live stream is
+never evicted to admit a new one;
+or a previous stream on **this session** was superseded and its connection has not
+finished closing yet (`retry_after_ms` is short — the handover clears in well under a
+second).
+
+**Fix**: Honour `retry_after_ms`. Close a stream you no longer need (drop the GET
+connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
+in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
 
 ### -32004: MCP tier does not allow this operation
 

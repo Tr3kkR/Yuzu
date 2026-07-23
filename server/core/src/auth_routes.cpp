@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <shared_mutex>
 #include <string_view>
@@ -362,6 +363,128 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     }
 
     return std::nullopt;
+}
+
+auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token) const {
+    using R = auth::CredentialCheck;
+
+    // Mirrors the two gates synthesize_token_session applies AFTER the token row
+    // validates. Kept beside revalidate_stream deliberately: if that function only
+    // consults the api_tokens row, a live row is treated as live authority even
+    // though a fresh request carrying the same header would be refused.
+
+    // Gate 1: the principal_kind allowlist. An out-of-allowlist value means DB
+    // corruption or a bypassed CHECK constraint; synthesize_token_session refuses to
+    // mint a session for it, so an existing stream must not survive on it either.
+    if (token.principal_kind != "human" && token.principal_kind != "engine") {
+        return R::kRevoked;
+    }
+    if (token.principal_kind != "engine") {
+        return R::kValid; // human tokens have no further backing-principal gate
+    }
+
+    // Gate 2: the engine principal must still be Active. Unwired store = fail closed,
+    // matching synthesize_token_session (an engine token must never authenticate
+    // through an unwired store).
+    if (!engine_principal_store_) {
+        return R::kRevoked;
+    }
+    switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+    case EngineLookupStatus::Active:
+        return R::kValid;
+    case EngineLookupStatus::MissingOrRevoked:
+        // Terminal: the credential's backing principal is dead. Cut the stream now —
+        // this is the revocation path the per-tick re-validation exists for.
+        return R::kRevoked;
+    case EngineLookupStatus::StoreUnreachable:
+        // We asked and did not get an answer. Indeterminate, NOT revoked: the stream
+        // rides out its bounded grace window rather than every engine stream on the
+        // fleet dying together on a store blip (Decision 15(i), CH-4).
+        return R::kIndeterminate;
+    }
+    return R::kRevoked; // unreachable — fail closed on a future enum value
+}
+
+auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
+                                                    const std::string& expected_principal) {
+    using R = auth::CredentialCheck;
+
+    // The invariant: a stream lives iff a FRESH request carrying these same headers
+    // would still authenticate as `expected_principal`. So this must mirror
+    // resolve_session's precedence EXACTLY — including its fall-through. An earlier
+    // version returned kRevoked as soon as a cookie failed, which killed (every 3 s,
+    // in a reconnect loop) a perfectly good token-authenticated stream that happened
+    // to also carry a stale cookie from a browser jar or a cookie-injecting proxy.
+    // It failed closed, but it was still wrong.
+
+    // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
+    //    always DEFINITIVE — there is no backend that could be unavailable.
+    const auto cookie = extract_session_cookie(req);
+    if (cookie.size() > auth::kMaxSessionTokenLength) {
+        // resolve_session hard-rejects an oversized cookie rather than falling through,
+        // so a fresh request carrying one would 401. The stream must die for the same
+        // reason, or the "lives iff a fresh request would authenticate" invariant is a
+        // fiction.
+        return R::kRevoked;
+    }
+    if (!cookie.empty()) {
+        if (auto session = auth_mgr_.validate_session(cookie)) {
+            // A credential that now resolves to a DIFFERENT principal is a rebind, and
+            // a rebind revokes the stream's authority: the stream carries the original
+            // principal's messages and must not survive the change.
+            if (session->username == expected_principal)
+                return R::kValid;
+            return R::kRevoked;
+        }
+        // Cookie present but dead — fall through to the token headers, exactly as
+        // resolve_session does.
+    }
+
+    // 2. Authorization: Bearer <token>, then 3. X-Yuzu-Token — resolve_session's order.
+    // Both are tried: a request may carry a dead Bearer and a live X-Yuzu-Token.
+    std::array<std::string, 2> candidates{};
+    if (const auto header = req.get_header_value("Authorization");
+        header.size() > 7 && header.substr(0, 7) == "Bearer ") {
+        candidates[0] = header.substr(7);
+    }
+    candidates[1] = req.get_header_value("X-Yuzu-Token");
+
+    bool store_unavailable = false;
+    for (const auto& raw : candidates) {
+        if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
+            continue;
+        const auto checked = api_token_store_->validate_token_checked(raw);
+        switch (checked.status) {
+        case ApiTokenStore::TokenCheck::kValid:
+            if (checked.token && checked.token->principal_id == expected_principal) {
+                // A live token row is NOT sufficient. synthesize_token_session applies two
+                // further gates before it will mint a session, and the "a stream lives iff
+                // a fresh request would still authenticate" invariant is only true if this
+                // applies them too. Without them a DELETED OR REVOKED ENGINE PRINCIPAL kept
+                // its live MCP stream indefinitely — every fresh request 401'd, while the
+                // stream slid its own idle TTL forward on each tick and never expired.
+                if (const auto engine = engine_credential_state(*checked.token);
+                    engine != R::kValid) {
+                    return engine;
+                }
+                return R::kValid;
+            }
+            break; // a valid token for SOMEONE ELSE is not authority for this stream
+        case ApiTokenStore::TokenCheck::kUnavailable:
+            // The store could not answer. That is NOT evidence of revocation — remember
+            // it, but keep looking: another credential on the request may still say yes.
+            store_unavailable = true;
+            break;
+        case ApiTokenStore::TokenCheck::kInvalid:
+            break; // definitively not a credential — try the next one
+        }
+    }
+
+    // Nothing on this request authenticates as the stream's principal. If the store was
+    // unreachable while we looked, we genuinely do not KNOW — say so, and let the pump
+    // ride out its bounded grace window rather than cutting every stream on the fleet
+    // at the same instant (Decision 15(i), CH-4).
+    return store_unavailable ? R::kIndeterminate : R::kRevoked;
 }
 
 std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,
@@ -832,7 +955,8 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
                                          const std::string& principal_role,
                                          const std::string& target_type,
                                          const std::string& target_id,
-                                         const std::string& detail) {
+                                         const std::string& detail,
+                                         const std::string& principal_class_override) {
     if (!audit_store_)
         return true;
     AuditEvent event;
@@ -848,7 +972,12 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     // Actor class (ADR-1005 Phase 3a) — same basis as make_audit_event; this
     // constructor exists precisely for the pre-session sites (login/MFA/OIDC
     // callback), so the request itself is still the only signal available.
-    event.principal_class = std::string(principal_class_of(req));
+    event.principal_class = principal_class_override.empty()
+                                ? std::string(principal_class_of(req))
+                                : principal_class_override;
+    // Stamped like make_audit_event so a row written by this path carries the same
+    // session correlator. Empty at the pre-session login sites, which is correct there.
+    event.session_id = extract_session_cookie(req);
     auto ok = audit_store_->log(event);
     if (!ok) {
         spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "

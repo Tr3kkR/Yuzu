@@ -15,6 +15,7 @@
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "mcp_session.hpp"
+#include "mcp_stream.hpp" // GET SSE channel: StreamRevalidateFn, handle_get_tail (2f PR 2)
 #include "policy_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
@@ -281,13 +282,25 @@ public:
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
-    /// thread (#438), mirroring build_handler(). GET is a 405 placeholder in
-    /// PR 1 (PR 2 turns it into the real SSE channel); DELETE terminates a
-    /// principal-bound session. Both no-op to 405 when streaming is disabled and
-    /// to a kMcpDisabled JSON-RPC error when MCP is disabled.
+    /// thread (#438), mirroring build_handler(). GET is the SSE channel (PR 2:
+    /// heartbeats, Last-Event-ID resume, stream caps — the tail lives in
+    /// mcp_stream.cpp); DELETE terminates a principal-bound session. Both no-op
+    /// to 405 when streaming is disabled and to a kMcpDisabled JSON-RPC error
+    /// when MCP is disabled.
+    ///
+    /// `stream_budget` / `revalidate_fn` are trailing-defaulted for the test
+    /// seams; PRODUCTION MUST WIRE BOTH — without the budget there is no
+    /// admission control on held-open workers, and without re-validation a
+    /// revoked credential keeps its stream (register_routes warns if either is
+    /// missing while streaming is on).
     HandlerFn build_get_handler(AuthFn auth_fn, AuditFn audit_fn, const bool* mcp_disabled,
                                 const bool* streaming_disabled, McpSessionRegistry* sessions,
-                                std::vector<std::string> allowed_origins);
+                                std::vector<std::string> allowed_origins,
+                                yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+                                StreamRevalidateFn revalidate_fn = {},
+                                yuzu::MetricsRegistry* metrics = nullptr,
+                                std::size_t per_principal_cap = kMcpStreamsPerPrincipalDefault,
+                                StreamPrincipalAuditFn principal_audit_fn = {});
     HandlerFn build_delete_handler(AuthFn auth_fn, AuditFn audit_fn, const bool* mcp_disabled,
                                    const bool* streaming_disabled, McpSessionRegistry* sessions,
                                    std::vector<std::string> allowed_origins);
@@ -324,7 +337,22 @@ public:
                          SoftwareLicensingStore* software_licensing_store = nullptr,
                          // PR 4.2 (design §4.1): engine-principal role-assignment MCP
                          // twins (the 4.2 grant handlers capture this param).
-                         EnginePrincipalStore* engine_principal_store = nullptr);
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         // PR 2 (GET SSE channel): the SHARED held-open-stream budget
+                         // (one instance across every SSE surface on the httplib pool,
+                         // Decision 15(h)) and the per-tick credential re-validation
+                         // seam (Decision 15(c)/(i)).
+                         yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+                         StreamRevalidateFn revalidate_fn = {},
+                         // Operator's --mcp-max-streams-per-principal. Threaded from Config
+                         // rather than read as a constant at the attach site: without this
+                         // the flag parsed, validated and documented as a live control
+                         // while having no effect whatsoever.
+                         std::size_t mcp_max_streams_per_principal =
+                             kMcpStreamsPerPrincipalDefault,
+                         // Explicit-principal audit sink for mcp.stream.close (see
+                         // StreamPrincipalAuditFn). Empty falls back to the generic sink.
+                         StreamPrincipalAuditFn principal_audit_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
