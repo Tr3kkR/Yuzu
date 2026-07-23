@@ -32,7 +32,7 @@
 #include "audit_store.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -72,7 +72,7 @@ struct HardenedHarness {
     Config cfg{};
     yuzu::MetricsRegistry metrics; // wired so the CC6.3/CC6.6 SIEM counters fire (review #1735 LOW)
     auth::AuthManager auth_mgr{};
-    AuthDB auth_db;
+    yuzu::test::AuthDbPg auth_db;
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
@@ -87,18 +87,16 @@ struct HardenedHarness {
     yuzu::server::test::TestRouteSink sink;
 
     HardenedHarness(const std::string& auth_mode, const std::string& break_glass_user)
-        : tmp(yuzu::test::unique_temp_path("auth-hardened-")),
-          auth_db(tmp.path, /*cleanup_interval_secs=*/0) {
+        : tmp(yuzu::test::unique_temp_path("auth-hardened-")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         cfg.https_enabled = false; // no Secure cookie suffix
         cfg.auth_mode = auth_mode;
         cfg.break_glass_user = break_glass_user;
 
-        REQUIRE(auth_db.initialize().has_value());
         auth_mgr.load_config(cfg.auth_config_path);
         seed_user("admin", "adminpassword1", auth::Role::admin);
         seed_user("alice", "alicepassword1", auth::Role::user);
-        auth_mgr.set_auth_db(&auth_db);
+        auth_mgr.set_auth_db(auth_db.get());
         auth_mgr.set_metrics_registry(&metrics);
 
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
@@ -119,13 +117,13 @@ struct HardenedHarness {
         auto salt = auth::AuthManager::random_bytes(16);
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
         REQUIRE(auth_db
-                    .upsert_user(name, auth::AuthManager::pbkdf2_sha256(pw, salt, 100'000), salt_hex,
-                                 role)
+                    ->upsert_user(name, auth::AuthManager::pbkdf2_sha256(pw, salt, 100'000), salt_hex,
+                                  role)
                     .has_value());
     }
 
     void enroll_mfa(const std::string& name) {
-        auto init = auth_db.mfa_init_enrollment(name, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(name, "Yuzu");
         REQUIRE(init.has_value());
         // Complete enrollment with a code at the current counter. These tests
         // stop at the 202 challenge — they never submit a login TOTP — so the
@@ -134,11 +132,11 @@ struct HardenedHarness {
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db.mfa_verify_enrollment(name, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(name, code).has_value());
     }
 
     void arm(const std::string& name, int window_secs = 3600) {
-        REQUIRE(auth_db.arm_break_glass(name, window_secs).has_value());
+        REQUIRE(auth_db->arm_break_glass(name, window_secs).has_value());
     }
 
     int count_audits(const std::string& action, const std::string& principal = {}) {

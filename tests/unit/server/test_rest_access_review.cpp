@@ -59,7 +59,7 @@
 #include <string>
 #include <vector>
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 using namespace yuzu::server;
 
@@ -94,8 +94,7 @@ struct AuditRecord {
 struct AccessReviewHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    yuzu::test::TempDir auth_dir{"yuzu_test_access_review_rest_authdb-"};
-    AuthDB auth_db{auth_dir.path, /*cleanup_interval_secs=*/0};
+    yuzu::test::AuthDbPg auth_db;
 
     yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_rest_rbac-"};
     RbacStore rbac{rbac_file.path};
@@ -141,7 +140,6 @@ struct AccessReviewHarness {
     /// without needing a third harness type — mirrors `auth_db_available`
     /// above.
     explicit AccessReviewHarness(bool auth_db_available = true, bool store_available = true) {
-        REQUIRE(auth_db.initialize().has_value());
         REQUIRE(rbac.is_open());
 
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
@@ -157,7 +155,7 @@ struct AccessReviewHarness {
         REQUIRE(access_review_store->is_open());
         AccessReviewStore* ars_ptr = store_available ? access_review_store.get() : nullptr;
 
-        AuthDB* auth_db_ptr = auth_db_available ? &auth_db : nullptr;
+        AuthDB* auth_db_ptr = auth_db_available ? auth_db.get() : nullptr;
 
         auto rest_auth_fn = [this](const httplib::Request&,
                                    httplib::Response&) -> std::optional<auth::Session> {
@@ -513,7 +511,7 @@ TEST_CASE("access-reviews: a Reviewer-equivalent grant (AccessReview:Read + "
         return t == "AccessReview" && (op == "Read" || op == "Attest");
     };
     REQUIRE(h.rbac.create_role({.name = "ReviewerAllowRole", .description = "d"}).has_value());
-    REQUIRE(h.auth_db.upsert_user("revallow", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("revallow", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac.assign_role({"user", "revallow", "ReviewerAllowRole"}).has_value());
 
     auto export_res = h.sink.Get("/api/v1/access-reviews/export");
@@ -558,7 +556,7 @@ TEST_CASE("MCP: a Reviewer-equivalent grant (AccessReview:Read + AccessReview:At
         return t == "AccessReview" && (op == "Read" || op == "Attest");
     };
     REQUIRE(h.rbac.create_role({.name = "McpReviewerAllowRole", .description = "d"}).has_value());
-    REQUIRE(h.auth_db.upsert_user("mcprevallow", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("mcprevallow", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac.assign_role({"user", "mcprevallow", "McpReviewerAllowRole"}).has_value());
 
     auto export_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());
@@ -728,7 +726,7 @@ TEST_CASE("access-reviews: an audit-persist failure on open/attest/close still c
         AccessReviewHarness h;
         REQUIRE(h.rbac.create_role({.name = "AuditFailRole", .description = "d"}).has_value());
         REQUIRE(
-            h.auth_db.upsert_user("auditfailuser", "hash", "salt", auth::Role::user).has_value());
+            h.auth_db->upsert_user("auditfailuser", "hash", "salt", auth::Role::user).has_value());
         REQUIRE(h.rbac.assign_role({"user", "auditfailuser", "AuditFailRole"}).has_value());
         const auto cid = h.open_campaign_rest("audit fail attest");
 
@@ -862,7 +860,7 @@ TEST_CASE("attestations: decision=flagged_revoke records evidence only — the u
           "[access_review][rest][flag]") {
     AccessReviewHarness h;
     REQUIRE(h.rbac.create_role({.name = "SomeRole", .description = "d"}).has_value());
-    REQUIRE(h.auth_db.upsert_user("alice", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("alice", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac.assign_role({"user", "alice", "SomeRole"}).has_value());
     REQUIRE_FALSE(h.rbac.get_principal_roles("user", "alice").empty());
 
@@ -923,7 +921,7 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
           "[access_review][rest][audit]") {
     AccessReviewHarness h;
     REQUIRE(h.rbac.create_role({.name = "AuditRole", .description = "d"}).has_value());
-    REQUIRE(h.auth_db.upsert_user("bob", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("bob", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac.assign_role({"user", "bob", "AuditRole"}).has_value());
 
     auto export_res = h.sink.Get("/api/v1/access-reviews/export");
@@ -1021,7 +1019,7 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
           "[access_review][mcp][happy]") {
     AccessReviewHarness h;
     REQUIRE(h.rbac.create_role({.name = "McpRole", .description = "d"}).has_value());
-    REQUIRE(h.auth_db.upsert_user("mcpuser", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("mcpuser", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac.assign_role({"user", "mcpuser", "McpRole"}).has_value());
 
     // export_access_review — the granted principal appears in the export.
@@ -1251,7 +1249,7 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
 
     // A grant to freeze, so the attestation write below lands on a real row.
     REQUIRE(h.rbac.create_role({.name = "MetricsRole", .description = "d"}).has_value());
-    REQUIRE(h.auth_db.upsert_user("metricsuser", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.auth_db->upsert_user("metricsuser", "hash", "salt", auth::Role::user).has_value());
     REQUIRE(h.rbac.assign_role({"user", "metricsuser", "MetricsRole"}).has_value());
 
     // open_campaign increments campaigns_opened_total.

@@ -1,251 +1,235 @@
 #include "yuzu/server/scim_store.hpp"
 
-#include "yuzu/server/auth.hpp" // AuthManager::sha256_hex — reuses the shared hashing helper
-#include "migration_runner.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "secure_random.hpp" // random_hex — CSPRNG-backed scim_id generation
+
+#include <yuzu/server/auth.hpp> // AuthManager::sha256_hex — reuses the shared hashing helper
 
 #include <openssl/crypto.h> // CRYPTO_memcmp — constant-time token compare
 
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace yuzu::server {
 
 namespace {
 
-/// Column order shared by every SELECT/RETURNING clause below — keep in
-/// sync if the column list changes.
-ScimResource row_to_resource(sqlite3_stmt* stmt) {
-    ScimResource r;
-    // Explicit length, not implicit strlen() via the NUL-terminated char* —
-    // an IdP-supplied username/external_id containing an embedded NUL would
-    // otherwise silently truncate on READ even though the write path now
-    // stores every byte (UP-3, matches the write-side #2018 fix).
-    auto text_col = [&](int idx) -> std::string {
-        const unsigned char* t = sqlite3_column_text(stmt, idx);
-        return t ? std::string(reinterpret_cast<const char*>(t),
-                              static_cast<std::size_t>(sqlite3_column_bytes(stmt, idx)))
-                : std::string();
+constexpr const char* kStoreName = "scim_store";
+
+// Bounded acquires (ADR-0012 §2). SCIM is an admin/IdP-provisioning surface,
+// not a gRPC hot path, but every acquire still stays bounded per the
+// playbook — reads get a shorter budget than the transactional writes
+// (group replace / delete cascades two statements).
+constexpr std::chrono::milliseconds kReadTimeout{1500};
+constexpr std::chrono::milliseconds kWriteTimeout{2500};
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for
+    // the migration txn. Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE scim_resources ("
+         "  id            BIGSERIAL,"
+         "  scim_id       TEXT PRIMARY KEY,"
+         "  external_id   TEXT,"
+         "  username      TEXT NOT NULL UNIQUE,"
+         "  active        BOOLEAN NOT NULL DEFAULT TRUE,"
+         "  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),"
+         "  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),"
+         "  etag_version  BIGINT NOT NULL DEFAULT 1);"
+         "CREATE INDEX scim_resources_external_id_idx ON scim_resources (external_id);"
+         "CREATE INDEX scim_resources_id_idx ON scim_resources (id);"
+
+         "CREATE TABLE scim_tokens ("
+         "  id            BIGSERIAL PRIMARY KEY,"
+         "  token_hash    TEXT NOT NULL,"
+         "  label         TEXT,"
+         "  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),"
+         "  revoked_at    TIMESTAMPTZ);"
+         "CREATE INDEX scim_tokens_active_idx ON scim_tokens (revoked_at) WHERE revoked_at IS NULL;"},
+        // v2 (#2021, slice 2): SCIM Groups + membership join table.
+        {2,
+         "CREATE TABLE scim_groups ("
+         "  id            BIGSERIAL,"
+         "  scim_id       TEXT PRIMARY KEY,"
+         "  external_id   TEXT,"
+         "  display_name  TEXT NOT NULL,"
+         "  active        BOOLEAN NOT NULL DEFAULT TRUE,"
+         "  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),"
+         "  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),"
+         "  etag_version  BIGINT NOT NULL DEFAULT 1);"
+         "CREATE INDEX scim_groups_id_idx ON scim_groups (id);"
+
+         "CREATE TABLE scim_group_members ("
+         "  group_scim_id TEXT NOT NULL,"
+         "  user_scim_id  TEXT NOT NULL,"
+         "  PRIMARY KEY (group_scim_id, user_scim_id));"
+         "CREATE INDEX scim_group_members_user_idx ON scim_group_members (user_scim_id);"},
     };
-    r.scim_id = text_col(0);
-    r.external_id = text_col(1);
-    r.username = text_col(2);
-    r.active = sqlite3_column_int(stmt, 3) != 0;
-    r.created_at = text_col(4);
-    r.updated_at = text_col(5);
-    r.etag_version = sqlite3_column_int64(stmt, 6);
+    return kMigrations;
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
+bool to_bool(const char* s) {
+    return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1');
+}
+
+// Null-safe column read.
+std::string col(PGresult* res, int row, int c) {
+    return PQgetisnull(res, row, c) ? std::string() : std::string(PQgetvalue(res, row, c));
+}
+
+// Column projection shared by every SELECT/RETURNING on scim_resources —
+// keep in sync with `read_resource`'s column order. Timestamps are formatted
+// to ISO-8601 UTC text at read time (RFC 7643 meta.created/lastModified are
+// xsd:dateTime) rather than exposing the raw TIMESTAMPTZ wire format.
+constexpr const char* kResourceCols =
+    "scim_id, external_id, username, active, "
+    "to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), "
+    "to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), "
+    "etag_version";
+
+ScimResource read_resource(PGresult* res, int row) {
+    ScimResource r;
+    int c = 0;
+    r.scim_id = col(res, row, c++);
+    r.external_id = col(res, row, c++);
+    r.username = col(res, row, c++);
+    r.active = to_bool(PQgetisnull(res, row, c) ? nullptr : PQgetvalue(res, row, c));
+    ++c;
+    r.created_at = col(res, row, c++);
+    r.updated_at = col(res, row, c++);
+    r.etag_version = to_i64(PQgetisnull(res, row, c) ? nullptr : PQgetvalue(res, row, c));
+    ++c;
     return r;
 }
 
-constexpr const char* kResourceColumns =
-    "scim_id, external_id, username, active, created_at, updated_at, etag_version";
+// Column projection shared by every SELECT/RETURNING on scim_groups — keep
+// in sync with `read_group`'s column order.
+constexpr const char* kGroupCols =
+    "scim_id, external_id, display_name, active, "
+    "to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), "
+    "to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), "
+    "etag_version";
 
-/// Column order shared by every SELECT/RETURNING clause on scim_groups —
-/// keep in sync if the column list changes.
-ScimGroup row_to_group(sqlite3_stmt* stmt) {
+ScimGroup read_group(PGresult* res, int row) {
     ScimGroup g;
-    // Explicit length, not implicit strlen() via the NUL-terminated char* —
-    // an IdP-supplied display_name/external_id containing an embedded NUL
-    // would otherwise silently truncate on READ even though the write path
-    // now stores every byte (UP-3, matches the write-side #2018 fix).
-    auto text_col = [&](int idx) -> std::string {
-        const unsigned char* t = sqlite3_column_text(stmt, idx);
-        return t ? std::string(reinterpret_cast<const char*>(t),
-                              static_cast<std::size_t>(sqlite3_column_bytes(stmt, idx)))
-                : std::string();
-    };
-    g.scim_id = text_col(0);
-    g.external_id = text_col(1);
-    g.display_name = text_col(2);
-    g.active = sqlite3_column_int(stmt, 3) != 0;
-    g.created_at = text_col(4);
-    g.updated_at = text_col(5);
-    g.etag_version = sqlite3_column_int64(stmt, 6);
+    int c = 0;
+    g.scim_id = col(res, row, c++);
+    g.external_id = col(res, row, c++);
+    g.display_name = col(res, row, c++);
+    g.active = to_bool(PQgetisnull(res, row, c) ? nullptr : PQgetvalue(res, row, c));
+    ++c;
+    g.created_at = col(res, row, c++);
+    g.updated_at = col(res, row, c++);
+    g.etag_version = to_i64(PQgetisnull(res, row, c) ? nullptr : PQgetvalue(res, row, c));
+    ++c;
     return g;
 }
 
-constexpr const char* kGroupColumns =
-    "scim_id, external_id, display_name, active, created_at, updated_at, etag_version";
-
-/// RAII transaction scope guard (safety-S1, governance hardening round):
-/// issues ROLLBACK on destruction unless `commit()` was called first.
-/// Replaces a manual `rollback()`-at-every-early-return lambda, which is
-/// silently skipped if a future edit adds a throwing call between BEGIN
-/// IMMEDIATE and COMMIT — the guard's destructor still runs during stack
-/// unwinding. Construct immediately after a successful `BEGIN IMMEDIATE`;
-/// call `commit()` immediately after a successful `COMMIT`.
-class SqliteTxnGuard {
-public:
-    explicit SqliteTxnGuard(sqlite3* db) : db_(db) {}
-    ~SqliteTxnGuard() {
-        if (!committed_ && db_)
-            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-    }
-    SqliteTxnGuard(const SqliteTxnGuard&) = delete;
-    SqliteTxnGuard& operator=(const SqliteTxnGuard&) = delete;
-
-    void commit() { committed_ = true; }
-
-private:
-    sqlite3* db_;
-    bool committed_ = false;
-};
+// Binds `external_id` as SQL NULL when empty (an empty externalId is "the
+// IdP never sent one", not a meaningful stored value) — mirrors the
+// create_resource/create_group SQLite-era NULL-bind.
+std::optional<std::string> opt_ext(const std::string& external_id) {
+    if (external_id.empty())
+        return std::nullopt;
+    return external_id;
+}
 
 } // namespace
 
-ScimStore::ScimStore(const std::filesystem::path& db_path) {
-    // Deliberately NO SQLITE_OPEN_CREATE (S-DROP-CREATE, authdb LOW): AuthDB
-    // is the primary owner of this file and always creates it (chmod 0600)
-    // before ScimStore ever opens a connection to it (see server.cpp boot
-    // order). Without this, a boot-ordering bug could let ScimStore
-    // race-create auth.db first, leaving it world-readable at default umask.
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("ScimStore: failed to open {}: {}", db_path.string(),
-                      db_ ? sqlite3_errmsg(db_) : "unknown");
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+// ── Construction ─────────────────────────────────────────────────────────
+
+ScimStore::ScimStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error(
+            "ScimStore: no database connection at construction ({}) — SCIM store disabled",
+            pool_.last_error());
         return;
     }
-    // AuthDB is the primary owner of this file and already sets WAL mode on
-    // it; this second connection only needs its own busy_timeout so lock
-    // contention against AuthDB's writes resolves by waiting instead of an
-    // immediate SQLITE_BUSY.
-    sqlite3_busy_timeout(db_, 5000);
-    create_tables();
-    if (db_)
-        spdlog::info("ScimStore: opened {}", db_path.string());
-}
-
-ScimStore::~ScimStore() {
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("ScimStore: schema migration failed — SCIM store disabled");
+        return;
     }
+    open_ = true;
+    spdlog::info("ScimStore: opened (schema {})", kStoreName);
 }
 
 bool ScimStore::is_open() const noexcept {
-    return db_ != nullptr;
+    return open_;
 }
 
-void ScimStore::create_tables() {
-    const std::vector<Migration> kScimMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS scim_resources (
-                scim_id TEXT PRIMARY KEY,
-                external_id TEXT,
-                username TEXT NOT NULL UNIQUE,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                etag_version INTEGER NOT NULL DEFAULT 1
-            );
-            CREATE INDEX IF NOT EXISTS idx_scim_resources_external_id
-                ON scim_resources(external_id);
-
-            CREATE TABLE IF NOT EXISTS scim_tokens (
-                id INTEGER PRIMARY KEY,
-                token_hash TEXT NOT NULL,
-                label TEXT,
-                created_at TEXT NOT NULL,
-                revoked_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_scim_tokens_active
-                ON scim_tokens(revoked_at) WHERE revoked_at IS NULL;
-        )"},
-        {2, R"(
-            CREATE TABLE IF NOT EXISTS scim_groups (
-                scim_id TEXT PRIMARY KEY,
-                external_id TEXT,
-                display_name TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                etag_version INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS scim_group_members (
-                group_scim_id TEXT NOT NULL,
-                user_scim_id TEXT NOT NULL,
-                PRIMARY KEY (group_scim_id, user_scim_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_scim_group_members_user
-                ON scim_group_members(user_scim_id);
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "scim", kScimMigrations)) {
-        spdlog::error("ScimStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-}
-
-// ── Bearer token (SCIM credential) ───────────────────────────────────────────
+// ── Bearer token (SCIM credential) ──────────────────────────────────────
 
 bool ScimStore::set_token(const std::string& raw, const std::string& label) {
-    if (!db_ || raw.empty())
+    if (!open_ || raw.empty())
         return false;
 
     std::string hash = auth::AuthManager::sha256_hex(raw);
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
 
     // Upsert-by-label: revoke any existing active token sharing this label
     // first, so re-running config with the same label rotates the token
-    // instead of leaving the old one both active and orphaned.
-    {
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "UPDATE scim_tokens SET revoked_at = CURRENT_TIMESTAMP "
-                               "WHERE label = ?1 AND revoked_at IS NULL",
-                               -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, label.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
-    }
+    // instead of leaving the old one both active and orphaned. Best-effort
+    // (result not checked) — matches the SQLite-era behavior; the INSERT
+    // below is what this call's success/failure is judged on.
+    pg::exec_params(lease.get(),
+                    "UPDATE scim_store.scim_tokens SET revoked_at = now() "
+                    "WHERE label = $1 AND revoked_at IS NULL",
+                    std::vector<std::string>{label});
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO scim_tokens (token_hash, label, created_at) "
-                           "VALUES (?1, ?2, CURRENT_TIMESTAMP)",
-                           -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::set_token: prepare failed: {}", sqlite3_errmsg(db_));
-        return false;
-    }
-    sqlite3_bind_text(stmt, 1, hash.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, label.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.scim_tokens (token_hash, label, created_at) "
+        "VALUES ($1, $2, now()) RETURNING id",
+        std::vector<std::string>{hash, label});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
 }
 
 bool ScimStore::has_token() const {
-    if (!db_)
+    if (!open_)
         return false;
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT 1 FROM scim_tokens WHERE revoked_at IS NULL LIMIT 1", -1,
-                          &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return false;
-    bool exists = sqlite3_step(stmt) == SQLITE_ROW;
-    sqlite3_finalize(stmt);
-    return exists;
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT 1 FROM scim_store.scim_tokens WHERE revoked_at IS NULL LIMIT 1",
+        std::vector<std::string>{});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
 bool ScimStore::validate_token(const std::string& raw) const {
-    if (!db_ || raw.empty())
+    if (!open_ || raw.empty())
         return false;
 
     std::string hash = auth::AuthManager::sha256_hex(raw);
 
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT token_hash FROM scim_tokens WHERE revoked_at IS NULL", -1,
-                          &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return false;
+
+    pg::PgResult res =
+        pg::exec_params(lease.get(), "SELECT token_hash FROM scim_store.scim_tokens WHERE revoked_at IS NULL",
+                        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
         return false;
 
     // Scan every active hash rather than short-circuiting on first match —
@@ -253,26 +237,24 @@ bool ScimStore::validate_token(const std::string& raw) const {
     // early-returning keeps the total scan time independent of which row (if
     // any) matches.
     bool matched = false;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const unsigned char* text = sqlite3_column_text(stmt, 0);
-        std::string candidate =
-            text ? std::string(reinterpret_cast<const char*>(text),
-                              static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)))
-                : std::string();
-        if (candidate.size() == hash.size() &&
-            CRYPTO_memcmp(candidate.data(), hash.data(), hash.size()) == 0) {
+    const int rows = PQntuples(res.get());
+    for (int i = 0; i < rows; ++i) {
+        if (PQgetisnull(res.get(), i, 0))
+            continue;
+        const char* candidate = PQgetvalue(res.get(), i, 0);
+        const auto len = static_cast<std::size_t>(PQgetlength(res.get(), i, 0));
+        if (len == hash.size() && CRYPTO_memcmp(candidate, hash.data(), hash.size()) == 0) {
             matched = true;
         }
     }
-    sqlite3_finalize(stmt);
     return matched;
 }
 
-// ── SCIM resources ────────────────────────────────────────────────────────
+// ── SCIM resources ───────────────────────────────────────────────────────
 
 std::optional<ScimResource> ScimStore::create_resource(const std::string& username,
                                                         const std::string& external_id) {
-    if (!db_ || username.empty())
+    if (!open_ || username.empty())
         return std::nullopt;
 
     auto id_result = random_hex(16); // 16 CSPRNG bytes -> 32 hex chars
@@ -280,116 +262,86 @@ std::optional<ScimResource> ScimStore::create_resource(const std::string& userna
         return std::nullopt;
     std::string scim_id = *id_result;
 
-    std::lock_guard lock(db_mtx_);
-    std::string sql = std::string("INSERT INTO scim_resources (scim_id, external_id, username, "
-                                  "active, created_at, updated_at, etag_version) "
-                                  "VALUES (?1, ?2, ?3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1) "
-                                  "RETURNING ") +
-                     kResourceColumns;
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::create_resource: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return std::nullopt;
-    }
-    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (external_id.empty())
-        sqlite3_bind_null(stmt, 2);
-    else
-        // L1 (2026-07-08 review): explicit length, not -1 — external_id is
-        // IdP-supplied and a value containing an embedded NUL would
-        // otherwise silently truncate at sqlite3_bind_text's strlen() scan.
-        sqlite3_bind_text(stmt, 2, external_id.c_str(),
-                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, username.c_str(), -1, SQLITE_TRANSIENT);
 
-    std::optional<ScimResource> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_resource(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    std::string sql = std::string("INSERT INTO scim_store.scim_resources "
+                                  "(scim_id, external_id, username, active, created_at, updated_at, "
+                                  " etag_version) "
+                                  "VALUES ($1, $2, $3, TRUE, now(), now(), 1) RETURNING ") +
+                     kResourceCols;
+    std::vector<std::optional<std::string>> params{scim_id, opt_ext(external_id), username};
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_resource(res.get(), 0);
 }
 
 std::optional<ScimResource> ScimStore::get_by_scim_id(const std::string& scim_id) const {
-    if (!db_ || scim_id.empty())
+    if (!open_ || scim_id.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
     std::string sql =
-        std::string("SELECT ") + kResourceColumns + " FROM scim_resources WHERE scim_id = ?1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        std::string("SELECT ") + kResourceCols + " FROM scim_store.scim_resources WHERE scim_id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
-    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-
-    std::optional<ScimResource> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_resource(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    return read_resource(res.get(), 0);
 }
 
 std::optional<ScimResource> ScimStore::get_by_username(const std::string& username) const {
-    if (!db_ || username.empty())
+    if (!open_ || username.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
     std::string sql =
-        std::string("SELECT ") + kResourceColumns + " FROM scim_resources WHERE username = ?1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        std::string("SELECT ") + kResourceCols + " FROM scim_store.scim_resources WHERE username = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
-    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-
-    std::optional<ScimResource> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_resource(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    return read_resource(res.get(), 0);
 }
 
 std::optional<ScimResource> ScimStore::find_by_external_id(const std::string& external_id) const {
-    if (!db_ || external_id.empty())
+    if (!open_ || external_id.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
-    std::string sql = std::string("SELECT ") + kResourceColumns +
-                      " FROM scim_resources WHERE external_id = ?1 LIMIT 1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return std::nullopt;
-    // L1 (2026-07-08 review): explicit length, not -1 — see the matching
-    // comment in create_resource().
-    sqlite3_bind_text(stmt, 1, external_id.c_str(), static_cast<int>(external_id.size()),
-                      SQLITE_TRANSIENT);
 
-    std::optional<ScimResource> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_resource(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    std::string sql = std::string("SELECT ") + kResourceCols +
+                      " FROM scim_store.scim_resources WHERE external_id = $1 LIMIT 1";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{external_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_resource(res.get(), 0);
 }
 
 std::vector<ScimResource> ScimStore::list(int start_index, int count, int& total_out) const {
     total_out = 0;
     std::vector<ScimResource> results;
-    if (!db_)
+    if (!open_)
         return results;
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return results;
 
     {
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM scim_resources", -1, &stmt, nullptr) ==
-            SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                total_out = sqlite3_column_int(stmt, 0);
-            }
-            sqlite3_finalize(stmt);
-        }
+        pg::PgResult cres = pg::exec_params(
+            lease.get(), "SELECT COUNT(*) FROM scim_store.scim_resources", std::vector<std::string>{});
+        if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) == 1)
+            total_out = static_cast<int>(to_i64(PQgetvalue(cres.get(), 0, 0)));
     }
 
     if (count <= 0)
@@ -398,108 +350,85 @@ std::vector<ScimResource> ScimStore::list(int start_index, int count, int& total
     // (including 0/negative from a malformed caller) to the first page.
     int offset = start_index > 1 ? start_index - 1 : 0;
 
-    std::string sql = std::string("SELECT ") + kResourceColumns +
-                      " FROM scim_resources ORDER BY rowid ASC LIMIT ?1 OFFSET ?2";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    // ORDER BY the hidden monotonic `id` (BIGSERIAL) — the Postgres
+    // equivalent of SQLite's implicit `rowid` insertion order the original
+    // store paginated by.
+    std::string sql = std::string("SELECT ") + kResourceCols +
+                      " FROM scim_store.scim_resources ORDER BY id ASC LIMIT $1::bigint OFFSET $2::bigint";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(count), std::to_string(offset)});
+    if (res.status() != PGRES_TUPLES_OK)
         return results;
-    sqlite3_bind_int(stmt, 1, count);
-    sqlite3_bind_int(stmt, 2, offset);
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(row_to_resource(stmt));
-    }
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(read_resource(res.get(), i));
     return results;
 }
 
 bool ScimStore::set_active(const std::string& scim_id, bool active) {
-    if (!db_ || scim_id.empty())
+    if (!open_ || scim_id.empty())
         return false;
 
-    std::lock_guard lock(db_mtx_);
-    static const char* sql = R"(
-        UPDATE scim_resources
-        SET active = ?1, etag_version = etag_version + 1, updated_at = CURRENT_TIMESTAMP
-        WHERE scim_id = ?2
-        RETURNING scim_id
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::set_active: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return false;
-    }
-    sqlite3_bind_int(stmt, 1, active ? 1 : 0);
-    sqlite3_bind_text(stmt, 2, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_ROW;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE scim_store.scim_resources SET active = $1::boolean, etag_version = etag_version + 1, "
+        "updated_at = now() WHERE scim_id = $2 RETURNING scim_id",
+        std::vector<std::string>{active ? "true" : "false", scim_id});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
 }
 
 bool ScimStore::update_resource(const std::string& scim_id, const std::string& username,
                                 const std::string& external_id) {
-    if (!db_ || scim_id.empty() || username.empty())
+    if (!open_ || scim_id.empty() || username.empty())
         return false;
 
-    std::lock_guard lock(db_mtx_);
-    static const char* sql = R"(
-        UPDATE scim_resources
-        SET username = ?1, external_id = ?2, etag_version = etag_version + 1,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE scim_id = ?3
-        RETURNING scim_id
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::update_resource: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return false;
-    }
-    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-    if (external_id.empty())
-        sqlite3_bind_null(stmt, 2);
-    else
-        // L1 (2026-07-08 review): explicit length, not -1 — see the matching
-        // comment in create_resource().
-        sqlite3_bind_text(stmt, 2, external_id.c_str(),
-                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_ROW;
+
+    std::vector<std::optional<std::string>> params{username, opt_ext(external_id), scim_id};
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE scim_store.scim_resources SET username = $1, external_id = $2, "
+        "etag_version = etag_version + 1, updated_at = now() WHERE scim_id = $3 RETURNING scim_id",
+        params);
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
 }
 
 std::optional<bool> ScimStore::delete_by_scim_id(const std::string& scim_id) {
-    if (!db_ || scim_id.empty())
+    if (!open_ || scim_id.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
-    static const char* sql = "DELETE FROM scim_resources WHERE scim_id = ?1 RETURNING scim_id";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::delete_by_scim_id: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return std::nullopt;
-    }
-    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM scim_store.scim_resources WHERE scim_id = $1 RETURNING scim_id",
+        std::vector<std::string>{scim_id});
     // true = a row matched and was deleted; false = no row matched (already
     // gone) — a real, idempotent-success outcome, not an error; nullopt =
-    // a genuine step-time error (SQLITE_BUSY/LOCKED/IOERR/CORRUPT/...) —
-    // must NOT be collapsed into "already gone", or the caller 204s a
-    // failed teardown instead of 500ing it.
-    if (rc == SQLITE_ROW)
-        return true;
-    if (rc == SQLITE_DONE)
-        return false;
-    spdlog::error("ScimStore::delete_by_scim_id: step failed: {}", sqlite3_errmsg(db_));
-    return std::nullopt;
+    // a genuine query-time error (lease timeout / backend error) — must NOT
+    // be collapsed into "already gone", or the caller 204s a failed
+    // teardown instead of 500ing it.
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ScimStore::delete_by_scim_id: query failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    return PQntuples(res.get()) > 0;
 }
 
-// ── SCIM groups ───────────────────────────────────────────────────────────
+// ── SCIM groups ──────────────────────────────────────────────────────────
 
 std::optional<ScimGroup> ScimStore::create_group(const std::string& display_name,
                                                  const std::string& external_id) {
-    if (!db_ || display_name.empty())
+    if (!open_ || display_name.empty())
         return std::nullopt;
 
     auto id_result = random_hex(16); // 16 CSPRNG bytes -> 32 hex chars
@@ -507,102 +436,71 @@ std::optional<ScimGroup> ScimStore::create_group(const std::string& display_name
         return std::nullopt;
     std::string scim_id = *id_result;
 
-    std::lock_guard lock(db_mtx_);
-    std::string sql = std::string("INSERT INTO scim_groups (scim_id, external_id, display_name, "
-                                  "active, created_at, updated_at, etag_version) "
-                                  "VALUES (?1, ?2, ?3, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1) "
-                                  "RETURNING ") +
-                     kGroupColumns;
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::create_group: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return std::nullopt;
-    }
-    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (external_id.empty())
-        sqlite3_bind_null(stmt, 2);
-    else
-        // Explicit length, not -1 — external_id is IdP-supplied and a value
-        // containing an embedded NUL would otherwise silently truncate at
-        // sqlite3_bind_text's strlen() scan (matches create_resource()).
-        sqlite3_bind_text(stmt, 2, external_id.c_str(),
-                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
-    // Explicit length, not -1 — display_name is IdP-supplied and a value
-    // containing an embedded NUL would otherwise silently truncate at
-    // sqlite3_bind_text's strlen() scan (matches external_id above, #2018).
-    sqlite3_bind_text(stmt, 3, display_name.c_str(), static_cast<int>(display_name.size()),
-                      SQLITE_TRANSIENT);
 
-    std::optional<ScimGroup> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_group(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    std::string sql = std::string("INSERT INTO scim_store.scim_groups "
+                                  "(scim_id, external_id, display_name, active, created_at, "
+                                  " updated_at, etag_version) "
+                                  "VALUES ($1, $2, $3, TRUE, now(), now(), 1) RETURNING ") +
+                     kGroupCols;
+    std::vector<std::optional<std::string>> params{scim_id, opt_ext(external_id), display_name};
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_group(res.get(), 0);
 }
 
 std::optional<ScimGroup> ScimStore::get_group_by_id(const std::string& scim_id) const {
-    if (!db_ || scim_id.empty())
+    if (!open_ || scim_id.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
     std::string sql =
-        std::string("SELECT ") + kGroupColumns + " FROM scim_groups WHERE scim_id = ?1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        std::string("SELECT ") + kGroupCols + " FROM scim_store.scim_groups WHERE scim_id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
-    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-
-    std::optional<ScimGroup> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_group(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    return read_group(res.get(), 0);
 }
 
 std::optional<ScimGroup>
 ScimStore::get_group_by_display_name(const std::string& display_name) const {
-    if (!db_ || display_name.empty())
+    if (!open_ || display_name.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
     std::string sql =
-        std::string("SELECT ") + kGroupColumns + " FROM scim_groups WHERE display_name = ?1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        std::string("SELECT ") + kGroupCols + " FROM scim_store.scim_groups WHERE display_name = $1";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{display_name});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
-    // Explicit length, not -1 — display_name is IdP-supplied and a value
-    // containing an embedded NUL would otherwise silently truncate at
-    // sqlite3_bind_text's strlen() scan (matches external_id, #2018).
-    sqlite3_bind_text(stmt, 1, display_name.c_str(), static_cast<int>(display_name.size()),
-                      SQLITE_TRANSIENT);
-
-    std::optional<ScimGroup> result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = row_to_group(stmt);
-    }
-    sqlite3_finalize(stmt);
-    return result;
+    return read_group(res.get(), 0);
 }
 
 std::vector<ScimGroup> ScimStore::list_groups(int start_index, int count, int& total_out) const {
     total_out = 0;
     std::vector<ScimGroup> results;
-    if (!db_)
+    if (!open_)
         return results;
 
-    std::lock_guard lock(db_mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return results;
 
     {
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM scim_groups", -1, &stmt, nullptr) ==
-            SQLITE_OK) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) {
-                total_out = sqlite3_column_int(stmt, 0);
-            }
-            sqlite3_finalize(stmt);
-        }
+        pg::PgResult cres = pg::exec_params(
+            lease.get(), "SELECT COUNT(*) FROM scim_store.scim_groups", std::vector<std::string>{});
+        if (cres.status() == PGRES_TUPLES_OK && PQntuples(cres.get()) == 1)
+            total_out = static_cast<int>(to_i64(PQgetvalue(cres.get(), 0, 0)));
     }
 
     if (count <= 0)
@@ -611,393 +509,251 @@ std::vector<ScimGroup> ScimStore::list_groups(int start_index, int count, int& t
     // (including 0/negative from a malformed caller) to the first page.
     int offset = start_index > 1 ? start_index - 1 : 0;
 
-    std::string sql = std::string("SELECT ") + kGroupColumns +
-                      " FROM scim_groups ORDER BY rowid ASC LIMIT ?1 OFFSET ?2";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    std::string sql = std::string("SELECT ") + kGroupCols +
+                      " FROM scim_store.scim_groups ORDER BY id ASC LIMIT $1::bigint OFFSET $2::bigint";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(count), std::to_string(offset)});
+    if (res.status() != PGRES_TUPLES_OK)
         return results;
-    sqlite3_bind_int(stmt, 1, count);
-    sqlite3_bind_int(stmt, 2, offset);
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(row_to_group(stmt));
-    }
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(read_group(res.get(), i));
     return results;
 }
 
 int ScimStore::count_groups() const {
-    if (!db_)
+    if (!open_)
         return 0;
 
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM scim_groups", -1, &stmt, nullptr) !=
-        SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return 0;
-    int total = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        total = sqlite3_column_int(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
-    return total;
+
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT COUNT(*) FROM scim_store.scim_groups",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return 0;
+    return static_cast<int>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
 bool ScimStore::update_group(const std::string& scim_id, const std::string& display_name,
                              const std::string& external_id) {
-    if (!db_ || scim_id.empty() || display_name.empty())
+    if (!open_ || scim_id.empty() || display_name.empty())
         return false;
 
-    std::lock_guard lock(db_mtx_);
-    static const char* sql = R"(
-        UPDATE scim_groups
-        SET display_name = ?1, external_id = ?2, etag_version = etag_version + 1,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE scim_id = ?3
-        RETURNING scim_id
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::update_group: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return false;
-    }
-    // Explicit length, not -1 — display_name is IdP-supplied and a value
-    // containing an embedded NUL would otherwise silently truncate at
-    // sqlite3_bind_text's strlen() scan (matches external_id below, #2018).
-    sqlite3_bind_text(stmt, 1, display_name.c_str(), static_cast<int>(display_name.size()),
-                      SQLITE_TRANSIENT);
-    if (external_id.empty())
-        sqlite3_bind_null(stmt, 2);
-    else
-        sqlite3_bind_text(stmt, 2, external_id.c_str(),
-                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_ROW;
+
+    std::vector<std::optional<std::string>> params{display_name, opt_ext(external_id), scim_id};
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE scim_store.scim_groups SET display_name = $1, external_id = $2, "
+        "etag_version = etag_version + 1, updated_at = now() WHERE scim_id = $3 RETURNING scim_id",
+        params);
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
 }
 
 std::optional<bool> ScimStore::delete_group(const std::string& scim_id) {
-    if (!db_ || scim_id.empty())
+    if (!open_ || scim_id.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
+    bool matched = false;
+    // Both the group row's delete AND its members' delete commit in ONE
+    // transaction (or neither) — mirrors the SQLite-era BEGIN IMMEDIATE /
+    // COMMIT pairing, so the reverse lookup (list_group_display_names_for_user)
+    // never dangles on a mid-write failure.
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn, "DELETE FROM scim_store.scim_groups WHERE scim_id = $1 RETURNING scim_id",
+            std::vector<std::string>{scim_id});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        matched = PQntuples(res.get()) > 0;
 
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::delete_group: BEGIN failed: {}", sqlite3_errmsg(db_));
+        pg::PgResult mres = pg::exec_params(
+            conn, "DELETE FROM scim_store.scim_group_members WHERE group_scim_id = $1",
+            std::vector<std::string>{scim_id});
+        return mres.status() == PGRES_COMMAND_OK;
+    });
+    // !ok covers both "the transaction never committed" (genuine error,
+    // rolled back — `matched` is not a committed fact) and "no connection
+    // available in time" — either way nullopt, never collapsed into
+    // "already gone" (mirrors delete_by_scim_id).
+    if (!ok)
         return std::nullopt;
-    }
-    SqliteTxnGuard txn(db_);
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_groups WHERE scim_id = ?1 RETURNING scim_id",
-                          -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::delete_group: prepare failed: {}", sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    sqlite3_bind_text(stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    // true = a row matched and was deleted; false = no row matched (already
-    // gone) — a real, idempotent-success outcome, not an error; nullopt = a
-    // genuine step-time error — must NOT be collapsed into "already gone"
-    // (mirrors delete_by_scim_id).
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-        spdlog::error("ScimStore::delete_group: step failed: {}", sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    bool deleted = rc == SQLITE_ROW;
-
-    sqlite3_stmt* member_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
-                          &member_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::delete_group: member prepare failed: {}",
-                     sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    sqlite3_bind_text(member_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int member_rc = sqlite3_step(member_stmt);
-    sqlite3_finalize(member_stmt);
-    if (member_rc != SQLITE_DONE) {
-        spdlog::error("ScimStore::delete_group: member step failed: {}", sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::delete_group: COMMIT failed: {}", sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    txn.commit();
-    return deleted;
+    return matched;
 }
 
 bool ScimStore::set_group_members(const std::string& group_scim_id,
                                   const std::vector<std::string>& user_scim_ids) {
-    if (!db_ || group_scim_id.empty())
+    if (!open_ || group_scim_id.empty())
         return false;
 
-    std::lock_guard lock(db_mtx_);
-
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::set_group_members: BEGIN failed: {}", sqlite3_errmsg(db_));
-        return false;
-    }
-    SqliteTxnGuard txn(db_);
-
-    sqlite3_stmt* del_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
-                          &del_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::set_group_members: delete prepare failed: {}",
-                     sqlite3_errmsg(db_));
-        return false;
-    }
-    sqlite3_bind_text(del_stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int del_rc = sqlite3_step(del_stmt);
-    sqlite3_finalize(del_stmt);
-    if (del_rc != SQLITE_DONE) {
-        spdlog::error("ScimStore::set_group_members: delete step failed: {}",
-                     sqlite3_errmsg(db_));
-        return false;
-    }
-
-    if (!user_scim_ids.empty()) {
-        sqlite3_stmt* ins_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO scim_group_members (group_scim_id, "
-                               "user_scim_id) VALUES (?1, ?2)",
-                               -1, &ins_stmt, nullptr) != SQLITE_OK) {
-            spdlog::error("ScimStore::set_group_members: insert prepare failed: {}",
-                         sqlite3_errmsg(db_));
+    return pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult del = pg::exec_params(
+            conn, "DELETE FROM scim_store.scim_group_members WHERE group_scim_id = $1",
+            std::vector<std::string>{group_scim_id});
+        if (del.status() != PGRES_COMMAND_OK)
             return false;
-        }
-        for (const auto& user_scim_id : user_scim_ids) {
-            sqlite3_bind_text(ins_stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins_stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ins_stmt) != SQLITE_DONE) {
-                spdlog::error("ScimStore::set_group_members: insert step failed: {}",
-                             sqlite3_errmsg(db_));
-                sqlite3_finalize(ins_stmt);
-                return false;
-            }
-            sqlite3_reset(ins_stmt);
-        }
-        sqlite3_finalize(ins_stmt);
-    }
 
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::set_group_members: COMMIT failed: {}", sqlite3_errmsg(db_));
-        return false;
-    }
-    txn.commit();
-    return true;
+        for (const auto& user_scim_id : user_scim_ids) {
+            pg::PgResult ins = pg::exec_params(
+                conn,
+                "INSERT INTO scim_store.scim_group_members (group_scim_id, user_scim_id) "
+                "VALUES ($1, $2) ON CONFLICT (group_scim_id, user_scim_id) DO NOTHING",
+                std::vector<std::string>{group_scim_id, user_scim_id});
+            if (ins.status() != PGRES_COMMAND_OK)
+                return false;
+        }
+        return true;
+    });
 }
 
 std::optional<bool> ScimStore::replace_group_and_members(
     const std::string& scim_id, const std::string& display_name,
     const std::string& external_id, const std::vector<std::string>& member_user_scim_ids) {
-    if (!db_ || scim_id.empty() || display_name.empty())
+    if (!open_ || scim_id.empty() || display_name.empty())
         return std::nullopt;
 
-    std::lock_guard lock(db_mtx_);
+    bool matched = false;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        std::vector<std::optional<std::string>> params{display_name, opt_ext(external_id), scim_id};
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE scim_store.scim_groups SET display_name = $1, external_id = $2, "
+            "etag_version = etag_version + 1, updated_at = now() WHERE scim_id = $3 "
+            "RETURNING scim_id",
+            params);
+        if (upd.status() != PGRES_TUPLES_OK)
+            return false;
 
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::replace_group_and_members: BEGIN failed: {}",
-                     sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    SqliteTxnGuard txn(db_);
-
-    static const char* update_sql = R"(
-        UPDATE scim_groups
-        SET display_name = ?1, external_id = ?2, etag_version = etag_version + 1,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE scim_id = ?3
-        RETURNING scim_id
-    )";
-    sqlite3_stmt* update_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, update_sql, -1, &update_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::replace_group_and_members: update prepare failed: {}",
-                     sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    // Explicit length, not -1 — display_name/external_id are IdP-supplied and
-    // a value containing an embedded NUL would otherwise silently truncate at
-    // sqlite3_bind_text's strlen() scan (matches update_group/create_group,
-    // #2018).
-    sqlite3_bind_text(update_stmt, 1, display_name.c_str(),
-                      static_cast<int>(display_name.size()), SQLITE_TRANSIENT);
-    if (external_id.empty())
-        sqlite3_bind_null(update_stmt, 2);
-    else
-        sqlite3_bind_text(update_stmt, 2, external_id.c_str(),
-                          static_cast<int>(external_id.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(update_stmt, 3, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int update_rc = sqlite3_step(update_stmt);
-    sqlite3_finalize(update_stmt);
-
-    // No row matched -> group doesn't exist. Not an error (#1033-safe: no
-    // sqlite3_changes() call on this shared connection) — return false, the
-    // guard rolls back (nothing was written anyway).
-    if (update_rc == SQLITE_DONE)
-        return false;
-    if (update_rc != SQLITE_ROW) {
-        spdlog::error("ScimStore::replace_group_and_members: update step failed: {}",
-                     sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-
-    sqlite3_stmt* del_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM scim_group_members WHERE group_scim_id = ?1", -1,
-                          &del_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::replace_group_and_members: delete prepare failed: {}",
-                     sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-    sqlite3_bind_text(del_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int del_rc = sqlite3_step(del_stmt);
-    sqlite3_finalize(del_stmt);
-    if (del_rc != SQLITE_DONE) {
-        spdlog::error("ScimStore::replace_group_and_members: delete step failed: {}",
-                     sqlite3_errmsg(db_));
-        return std::nullopt;
-    }
-
-    if (!member_user_scim_ids.empty()) {
-        sqlite3_stmt* ins_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO scim_group_members (group_scim_id, "
-                               "user_scim_id) VALUES (?1, ?2)",
-                               -1, &ins_stmt, nullptr) != SQLITE_OK) {
-            spdlog::error("ScimStore::replace_group_and_members: insert prepare failed: {}",
-                         sqlite3_errmsg(db_));
-            return std::nullopt;
+        // No row matched -> group doesn't exist. Not an error: commit the
+        // (no-op) transaction and report "not found" via `matched=false`,
+        // mirroring the SQLite-era guard's "the guard rolls back (nothing
+        // was written anyway)" — nothing here writes either.
+        if (PQntuples(upd.get()) == 0) {
+            matched = false;
+            return true;
         }
+        matched = true;
+
+        pg::PgResult del = pg::exec_params(
+            conn, "DELETE FROM scim_store.scim_group_members WHERE group_scim_id = $1",
+            std::vector<std::string>{scim_id});
+        if (del.status() != PGRES_COMMAND_OK)
+            return false;
+
         for (const auto& user_scim_id : member_user_scim_ids) {
-            sqlite3_bind_text(ins_stmt, 1, scim_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins_stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ins_stmt) != SQLITE_DONE) {
-                spdlog::error("ScimStore::replace_group_and_members: insert step failed: {}",
-                             sqlite3_errmsg(db_));
-                sqlite3_finalize(ins_stmt);
-                return std::nullopt;
-            }
-            sqlite3_reset(ins_stmt);
+            pg::PgResult ins = pg::exec_params(
+                conn,
+                "INSERT INTO scim_store.scim_group_members (group_scim_id, user_scim_id) "
+                "VALUES ($1, $2) ON CONFLICT (group_scim_id, user_scim_id) DO NOTHING",
+                std::vector<std::string>{scim_id, user_scim_id});
+            if (ins.status() != PGRES_COMMAND_OK)
+                return false;
         }
-        sqlite3_finalize(ins_stmt);
-    }
+        return true;
+    });
 
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::replace_group_and_members: COMMIT failed: {}",
-                     sqlite3_errmsg(db_));
+    if (!ok)
         return std::nullopt;
-    }
-    txn.commit();
-    return true;
+    return matched;
 }
 
 bool ScimStore::add_group_member(const std::string& group_scim_id,
                                  const std::string& user_scim_id) {
-    if (!db_ || group_scim_id.empty() || user_scim_id.empty())
+    if (!open_ || group_scim_id.empty() || user_scim_id.empty())
         return false;
 
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT OR IGNORE INTO scim_group_members (group_scim_id, "
-                           "user_scim_id) VALUES (?1, ?2)",
-                           -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::add_group_member: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return false;
-    }
-    sqlite3_bind_text(stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    // INSERT OR IGNORE reports SQLITE_DONE whether it inserted a fresh row
-    // or silently ignored an existing one (idempotent add) — both are
-    // success from the caller's point of view.
-    return rc == SQLITE_DONE;
+
+    // ON CONFLICT DO NOTHING reports PGRES_COMMAND_OK whether it inserted a
+    // fresh row or silently ignored an existing one (idempotent add) — both
+    // are success from the caller's point of view.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.scim_group_members (group_scim_id, user_scim_id) VALUES ($1, $2) "
+        "ON CONFLICT (group_scim_id, user_scim_id) DO NOTHING",
+        std::vector<std::string>{group_scim_id, user_scim_id});
+    return res.status() == PGRES_COMMAND_OK;
 }
 
 bool ScimStore::remove_group_member(const std::string& group_scim_id,
                                     const std::string& user_scim_id) {
-    if (!db_ || group_scim_id.empty() || user_scim_id.empty())
+    if (!open_ || group_scim_id.empty() || user_scim_id.empty())
         return false;
 
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM scim_group_members WHERE group_scim_id = ?1 AND "
-                           "user_scim_id = ?2",
-                           -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("ScimStore::remove_group_member: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return false;
-    }
-    sqlite3_bind_text(stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    // DELETE reports SQLITE_DONE whether or not a row matched (idempotent
-    // remove) — both are success from the caller's point of view.
-    return rc == SQLITE_DONE;
+
+    // DELETE reports PGRES_COMMAND_OK whether or not a row matched
+    // (idempotent remove) — both are success from the caller's point of
+    // view.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM scim_store.scim_group_members WHERE group_scim_id = $1 AND user_scim_id = $2",
+        std::vector<std::string>{group_scim_id, user_scim_id});
+    return res.status() == PGRES_COMMAND_OK;
 }
 
 std::vector<std::string>
 ScimStore::list_group_member_user_scim_ids(const std::string& group_scim_id) const {
     std::vector<std::string> results;
-    if (!db_ || group_scim_id.empty())
+    if (!open_ || group_scim_id.empty())
         return results;
 
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT user_scim_id FROM scim_group_members WHERE group_scim_id = "
-                           "?1 ORDER BY user_scim_id ASC",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return results;
-    sqlite3_bind_text(stmt, 1, group_scim_id.c_str(), -1, SQLITE_TRANSIENT);
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const unsigned char* t = sqlite3_column_text(stmt, 0);
-        // Explicit length — see row_to_group's text_col doc comment (UP-3).
-        results.emplace_back(
-            t ? std::string(reinterpret_cast<const char*>(t),
-                            static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)))
-             : std::string());
-    }
-    sqlite3_finalize(stmt);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT user_scim_id FROM scim_store.scim_group_members WHERE group_scim_id = $1 "
+        "ORDER BY user_scim_id ASC",
+        std::vector<std::string>{group_scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return results;
+
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(col(res.get(), i, 0));
     return results;
 }
 
 std::vector<std::string>
 ScimStore::list_group_display_names_for_user(const std::string& user_scim_id) const {
     std::vector<std::string> results;
-    if (!db_ || user_scim_id.empty())
+    if (!open_ || user_scim_id.empty())
         return results;
 
-    std::lock_guard lock(db_mtx_);
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT g.display_name FROM scim_group_members m "
-                           "JOIN scim_groups g ON g.scim_id = m.group_scim_id "
-                           "WHERE m.user_scim_id = ?1 ORDER BY g.display_name ASC",
-                           -1, &stmt, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return results;
-    sqlite3_bind_text(stmt, 1, user_scim_id.c_str(), -1, SQLITE_TRANSIENT);
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const unsigned char* t = sqlite3_column_text(stmt, 0);
-        // Explicit length, not implicit strlen() — this is the read
-        // `resolve_role_from_groups` consumes; a display_name containing an
-        // embedded NUL must not silently truncate to a shorter, possibly
-        // admin-matching, name (UP-3 privilege-escalation vector).
-        results.emplace_back(
-            t ? std::string(reinterpret_cast<const char*>(t),
-                            static_cast<std::size_t>(sqlite3_column_bytes(stmt, 0)))
-             : std::string());
-    }
-    sqlite3_finalize(stmt);
+    // Read the role-application task consumes; a display_name containing an
+    // embedded NUL cannot be stored by Postgres text columns at all (the
+    // write fails closed rather than silently truncating — UP-3 does not
+    // apply the same way it did to SQLite).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT g.display_name FROM scim_store.scim_group_members m "
+        "JOIN scim_store.scim_groups g ON g.scim_id = m.group_scim_id "
+        "WHERE m.user_scim_id = $1 ORDER BY g.display_name ASC",
+        std::vector<std::string>{user_scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return results;
+
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(col(res.get(), i, 0));
     return results;
 }
 

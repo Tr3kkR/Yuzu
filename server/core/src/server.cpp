@@ -12,6 +12,7 @@
 #include "file_utils.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -55,6 +56,7 @@
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/secret_codec.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
@@ -1110,6 +1112,36 @@ public:
         metrics_.describe("yuzu_auth_sso_provision_total",
                           "Total durable SSO identity provision/refresh upserts, by source",
                           "counter");
+        // Fail-closed-path observability (governance hardening round,
+        // sre BLOCKING). Every 503 an operator/agentic worker sees from a
+        // `is_store_unavailable` guard on the auth/MFA surface increments
+        // this, labelled by the route that hit it — so a PG/KEK outage is
+        // visible as a metric spike distinct from ordinary 401/403 traffic,
+        // and SRE can tell WHICH fail-closed path is degraded. Bounded,
+        // pre-seeded closed label set (route) per
+        // docs/observability-conventions.md, so absent() alerts stay
+        // meaningful.
+        metrics_.describe("yuzu_auth_secret_unavailable_total",
+                          "Total requests refused 503 by an is_store_unavailable fail-closed "
+                          "guard on the auth/MFA surface, by route",
+                          "counter");
+        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
+            metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
+        }
+        // First-boot seed observability (authdb MEDIUM). Incremented exactly
+        // once, iff `seed_admin_if_empty` actually seeded the sole admin row
+        // (an empty `auth.users` table) — a no-op (table already populated,
+        // the common case on every restart) leaves this at 0. No labels: the
+        // event is binary and rare enough that a plain counter (0 forever, or
+        // 1 after the one genuine fresh-start boot) is the whole signal.
+        metrics_.describe("yuzu_auth_fresh_start_reset_total",
+                          "1 iff this boot seeded the sole admin user into an empty auth.users "
+                          "table (fresh-start), 0 otherwise",
+                          "counter");
+        metrics_.counter("yuzu_auth_fresh_start_reset_total");
+        if (cfg_.auth_fresh_start_seeded) {
+            metrics_.counter("yuzu_auth_fresh_start_reset_total").increment();
+        }
         // SCIM v2 provisioning observability (governance hardening round,
         // M-METRICS). Registered unconditionally (like every other describe()
         // in this constructor) even when --scim-enable is off, so Prometheus
@@ -1915,6 +1947,67 @@ public:
                                    ? engine_principal_store_->get_for_auth(id).status
                                    : EngineLookupStatus::StoreUnreachable;
                     });
+            }
+        }
+
+        // AuthDB — born-on-PG authentication persistence (ADR-0006 substrate
+        // migration). Same fail-CLOSED construction posture as every other
+        // born-on-PG store (ADR-0012 §1). Construction order is load-bearing
+        // (see the member-declaration comment): FileKeyProvider →
+        // SecretCodec (constructed only — NOT init'd yet) → AuthDB (this is
+        // what migrates `auth.users` AND registers `mfa_totp_secret` as a
+        // secret column) → SecretCodec::init() (runs AFTER AuthDB so the
+        // column it validates already exists) → ScimStore.
+        if (pg_pool_ && !startup_failed_) {
+            const std::filesystem::path key_dir =
+                cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+            auth_key_provider_ = std::make_unique<FileKeyProvider>(key_dir);
+            auth_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            auth_db_ = std::make_unique<AuthDB>(*pg_pool_, *auth_secret_codec_);
+            if (!auth_db_->is_open()) {
+                spdlog::error("[PG] Refusing to start: auth store (AuthDB) migration/open failed "
+                              "(database reachable but the auth schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                // Substrate-level boot init (ADR-0010 §2) — MUST run before any
+                // store attempts an encrypt/decrypt through auth_secret_codec_.
+                // AuthDB above is the only registrant on this codec instance
+                // today, but init() is where its column is actually verified.
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = auth_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: SecretCodec::init() failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        auth_mgr_.set_auth_db(auth_db_.get());
+                    }
+                }
+            }
+        }
+
+        // ScimStore — born-on-PG SCIM v2 store (ADR-0006). Constructed
+        // unconditionally (cheap to open; mirrors every other always-on
+        // born-on-PG store) — route registration + the configured bearer
+        // token stay gated on --scim-enable in start_web_server(), which
+        // reuses this member instead of constructing its own.
+        if (pg_pool_ && !startup_failed_) {
+            scim_store_ = std::make_unique<ScimStore>(*pg_pool_);
+            if (!scim_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: SCIM store migration/open failed "
+                              "(database reachable but the scim_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
             }
         }
 
@@ -4332,6 +4425,21 @@ public:
             mcp_stream_bridge_->shutdown();
             mcp_stream_bridge_.reset();
         }
+
+        // cpp-safety SHOULD (governance hardening round): `auth_mgr_` is
+        // owned by main.cpp and OUTLIVES this ServerImpl (unlike every store
+        // above, which this object owns) — it holds a raw `AuthDB*` set via
+        // set_auth_db() at construction. `auth_db_` destructs along with the
+        // rest of this object's members once stop() returns, so a stray
+        // post-shutdown call into `auth_mgr_` (host-CLI one-shot, a lingering
+        // reference) would otherwise dereference a dangling pointer. Both
+        // HTTP and gRPC handler threads are already quiesced by the drains
+        // above, so it is safe to null this now — belt-and-braces, same
+        // pattern as the tracker/cert-callback nulling just above (the
+        // TrackerScope contract, auth_db_'s destruct-before-drop still holds
+        // regardless — this only protects the OUTSIDE-owned raw pointer).
+        auth_mgr_.set_auth_db(nullptr);
+
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -7170,7 +7278,7 @@ private:
                        const std::string& tt, const std::string& ti, const std::string& d) {
                     return audit_log(r, a, rs, tt, ti, d);
                 },
-                action_label, cfg_.mfa_enforcement);
+                action_label, cfg_.mfa_enforcement, &metrics_);
         };
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
@@ -11697,9 +11805,11 @@ private:
             });
 
         // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
-        // Entirely inert when disabled: no store, no routes, no route table
-        // entries at all. main.cpp already refuses to start if --scim-enable is
-        // set without --scim-token or without HTTPS (CC6.2 fail-closed).
+        // Routes + the configured bearer token are entirely inert when
+        // disabled: no route table entries at all. scim_store_ itself was
+        // already constructed (born-on-PG, unconditional) in the ctor above
+        // — main.cpp already refuses to start if --scim-enable is set without
+        // --scim-token or without HTTPS (CC6.2 fail-closed).
         if (cfg_.scim_enable) {
             // sec-L3/UP-9 (governance hardening round): trim leading/trailing
             // ASCII whitespace from the admin-group config value — same
@@ -11710,8 +11820,7 @@ private:
             // trimmed value.
             cfg_.scim_admin_group = trim_ascii_whitespace(cfg_.scim_admin_group);
 
-            scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
-            if (!scim_store_->is_open()) {
+            if (!scim_store_ || !scim_store_->is_open()) {
                 // H3 (2026-07-08 review): previously logged-and-continued,
                 // which left /scim/v2/* permanently rejecting every request
                 // (require_bearer always fails against a closed store)
@@ -11725,8 +11834,8 @@ private:
                 // exits non-zero on startup_failed() — matching main.cpp's
                 // own "refuses to start without a token" fail-closed posture
                 // for this same feature.
-                spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
-                             "refusing to start.");
+                spdlog::error("SCIM: the SCIM resource/token store (scim_store schema) is not "
+                             "open — refusing to start.");
                 startup_failed_ = true;
             } else if (!scim_store_->set_token(cfg_.scim_token, "boot")) {
                 // H3: same reasoning — a persist failure here is just as
@@ -12809,10 +12918,29 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
-    // SCIM v2 provisioning (/scim/v2/*) — only constructed when --scim-enable.
-    // ScimStore opens its OWN connection to the SAME auth.db AuthDB manages
-    // (see scim_store.hpp); scim_routes_ borrows non-owning ScimStore*/
-    // AuthManager*/AuditStore* pointers, all of which outlive it.
+
+    // ── Postgres-backed AuthDB (ADR-0006 substrate migration) + its
+    // dependency chain ──────────────────────────────────────────────────
+    // Declared in this EXACT order — FileKeyProvider → SecretCodec → AuthDB
+    // → ScimStore — so reverse-declaration-order destruction is safe:
+    // AuthDB's background provisional-MFA reaper thread (started in its
+    // ctor) touches both secret_codec_ and pg_pool_, so it MUST stop before
+    // either goes away; declaring auth_db_ after auth_secret_codec_ (which
+    // is after auth_key_provider_) guarantees the reaper joins (~AuthDB)
+    // before the codec/provider destruct. Both auth_db_ and scim_store_
+    // borrow pg_pool_ (declared far above, near metrics_) by reference, so
+    // they must destruct before it — true here since every member below
+    // this point is declared, hence destructs, before pg_pool_ does.
+    std::unique_ptr<FileKeyProvider> auth_key_provider_;
+    std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
+    std::unique_ptr<AuthDB> auth_db_;
+    // SCIM v2 provisioning (/scim/v2/*) — the store is constructed
+    // unconditionally alongside AuthDB (born-on-PG, cheap to open); only
+    // route registration + the configured bearer token are gated on
+    // --scim-enable (start_web_server()). ScimStore holds its own
+    // independent PgPool lease per call (see scim_store.hpp — no shared-
+    // connection lock order with AuthDB); scim_routes_ borrows non-owning
+    // ScimStore*/AuthManager*/AuditStore* pointers, all of which outlive it.
     std::unique_ptr<ScimStore> scim_store_;
     std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)

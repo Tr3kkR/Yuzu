@@ -17,7 +17,7 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -33,27 +33,15 @@ using yuzu::server::auth::Role;
 namespace {
 
 struct BreakGlassFixture {
-    std::filesystem::path data_dir;
-    std::unique_ptr<AuthDB> db;
+    // AuthDbPg defaults to cleanup_interval_secs=0 — no background reaper
+    // jthread (matches the lockout fixture).
+    yuzu::test::AuthDbPg db;
 
     BreakGlassFixture() {
-        // cleanup_interval_secs=0 — no background reaper jthread (matches the
-        // lockout fixture; avoids the macOS-arm64 SIGSEGV of PR #1199).
-        data_dir = yuzu::test::unique_temp_path("yuzu-breakglass-");
-        std::filesystem::create_directories(data_dir);
-        db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(db->initialize().has_value());
-
         auto salt = AuthManager::random_bytes(16);
         auto salt_hex = AuthManager::bytes_to_hex(salt);
         auto hash = AuthManager::pbkdf2_sha256("pw", salt, 1000);
         REQUIRE(db->upsert_user("alice", hash, salt_hex, Role::admin).has_value());
-    }
-
-    ~BreakGlassFixture() {
-        db.reset();
-        std::error_code ec;
-        std::filesystem::remove_all(data_dir, ec);
     }
 
     // Complete a real MFA enrollment for `name` so break_glass_account_problem

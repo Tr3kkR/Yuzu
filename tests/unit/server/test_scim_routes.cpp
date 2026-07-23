@@ -2,9 +2,10 @@
  * test_scim_routes.cpp — HTTP-level coverage for the SCIM v2 provisioning
  * surface (/scim/v2/*, slice 3 of 3). Registers ScimRoutes against an
  * in-process TestRouteSink (no socket, no acceptor thread — TSan-safe,
- * #438) over a REAL AuthDB + ScimStore pair sharing one auth.db file, so
- * the AuthManager provisioning path (upsert_user/remove_user/
- * get_provisioning_source) is exercised for real rather than faked.
+ * #438) over a REAL (born-on-Postgres, ADR-0006) AuthDB + ScimStore pair
+ * sharing one PgPool/database, so the AuthManager provisioning path
+ * (upsert_user/remove_user/get_provisioning_source) is exercised for real
+ * rather than faked.
  *
  * Coverage: bearer gate (401 missing/wrong token), discovery documents,
  * POST provision (201 + Location/ETag, 409 duplicate userName), GET by id
@@ -17,6 +18,9 @@
  * account, even when a scim_resource row happens to reference it
  * (defense-in-depth — see scim_routes.cpp `provenance_ok`), including on
  * the reactivate path.
+ *
+ * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set but
+ * broken (test_helpers.hpp skip-vs-fail contract, via yuzu::test::AuthDbPg).
  */
 
 #include "scim_routes.hpp"
@@ -34,11 +38,13 @@
 #include <yuzu/server/scim_store.hpp>
 #include <yuzu/server/server.hpp>
 
-#include "../test_helpers.hpp"
+#include "pg/pg_raii.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
+
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <atomic>
@@ -56,13 +62,14 @@ using json = nlohmann::json;
 
 namespace {
 
-/// Wires ScimRoutes against a real AuthDB + ScimStore sharing one auth.db
-/// file (mirrors production: ScimStore opens a second connection to the
-/// SAME file AuthDB manages) plus a real AuditStore, all over an
-/// in-process TestRouteSink.
+/// Wires ScimRoutes against a real (born-on-PG) AuthDB + ScimStore SHARING
+/// ONE PgPool (mirrors production: ScimStore holds its own independent
+/// connection per call against the same database AuthDB manages — see
+/// scim_store.hpp) plus a real AuditStore, all over an in-process
+/// TestRouteSink. PG-gated: SKIPs when YUZU_TEST_POSTGRES_DSN is unset,
+/// FAILs when set but broken (via yuzu::test::AuthDbPg).
 struct Fixture {
-    std::filesystem::path data_dir{yuzu::test::unique_temp_path("yuzu-scim-routes-")};
-    std::unique_ptr<AuthDB> auth_db;
+    yuzu::test::AuthDbPg auth_db;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
     yuzu::test::TempDbFile audit_db_file{std::string_view{"yuzu-scim-routes-audit-"}};
@@ -80,12 +87,9 @@ struct Fixture {
     /// Groups->role) — empty (the default) means no SCIM group ever
     /// promotes to admin.
     explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {}) {
-        std::filesystem::create_directories(data_dir);
-        auth_db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(auth_db->initialize().has_value());
         auth_mgr.set_auth_db(auth_db.get());
 
-        scim_store = std::make_unique<ScimStore>(data_dir / "auth.db");
+        scim_store = std::make_unique<ScimStore>(auth_db.pool());
         REQUIRE(scim_store->is_open());
         REQUIRE(scim_store->set_token(token, "test"));
 
@@ -104,12 +108,9 @@ struct Fixture {
     }
 
     ~Fixture() {
-        std::error_code ec;
         routes.reset();
         audit_store.reset();
         scim_store.reset();
-        auth_db.reset();
-        std::filesystem::remove_all(data_dir, ec);
     }
 
     std::unordered_map<std::string, std::string> auth_header() const {
@@ -1639,8 +1640,13 @@ struct ScimIntegrationServer {
     httplib::Server svr;
     std::thread server_thread;
     int port{0};
-    std::filesystem::path data_dir{yuzu::test::unique_temp_path("yuzu-scim-integration-")};
-    std::unique_ptr<AuthDB> auth_db;
+    // PG-gated (yuzu::test::AuthDbPg): SKIPs the current TEST_CASE at
+    // construction time (before start() runs) when YUZU_TEST_POSTGRES_DSN
+    // is unset — every call site constructs `ScimIntegrationServer ts;`
+    // immediately followed by `ts.start();`, so folding AuthDB construction
+    // into this struct's own member-init (rather than deferring it inside
+    // start(), as the old SQLite AuthDB did) changes nothing observable.
+    yuzu::test::AuthDbPg auth_db;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
     yuzu::test::TempDbFile audit_db_file{std::string_view{"yuzu-scim-integration-audit-"}};
@@ -1655,12 +1661,9 @@ struct ScimIntegrationServer {
         : rate_limiter(rate_per_second), scim_admin_group(std::move(admin_group)) {}
 
     void start() {
-        std::filesystem::create_directories(data_dir);
-        auth_db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(auth_db->initialize().has_value());
         auth_mgr.set_auth_db(auth_db.get());
 
-        scim_store = std::make_unique<ScimStore>(data_dir / "auth.db");
+        scim_store = std::make_unique<ScimStore>(auth_db.pool());
         REQUIRE(scim_store->is_open());
         REQUIRE(scim_store->set_token(token, "test"));
 
@@ -1723,12 +1726,9 @@ struct ScimIntegrationServer {
         svr.stop();
         if (server_thread.joinable())
             server_thread.join();
-        std::error_code ec;
         routes.reset();
         audit_store.reset();
         scim_store.reset();
-        auth_db.reset();
-        std::filesystem::remove_all(data_dir, ec);
     }
 };
 
@@ -2381,14 +2381,18 @@ TEST_CASE("Groups integration: PATCH rename onto an existing group's displayName
     CHECK(json::parse(get_res->body)["displayName"] == "Group-D");
 }
 
-TEST_CASE("Groups integration: an embedded-NUL displayName is never truncated to the configured "
-         "admin group — no spurious promotion (UP-3)",
+TEST_CASE("Groups integration: an embedded-NUL displayName is rejected fail-closed — no spurious "
+         "promotion to the configured admin group (UP-3)",
          "[scim][routes][integration][groups][embedded-nul]") {
-    // "Admins\0decoy" — read-side truncation (the bug this guards) would
-    // silently turn this into the literal string "Admins", exactly
-    // matching --scim-admin-group and promoting the member to admin. The
-    // fixed read path returns the full 12 bytes, which != "Admins", so
-    // resolve_role_from_groups must not match.
+    // "Admins\0decoy" — PostgreSQL `text` columns cannot store an embedded
+    // NUL (pg::exec_params hands libpq a NUL-terminated C string regardless
+    // of declared length, so anything past the first NUL is silently
+    // dropped on write). Storing the truncated "Admins" would exactly match
+    // --scim-admin-group and spuriously promote the submitting member — so
+    // the fix REJECTS any SCIM text field containing an embedded NUL at the
+    // parse boundary (400 invalidValue), before it ever reaches the store.
+    // The group is never created, so there is nothing to truncate and no
+    // promotion.
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2405,18 +2409,11 @@ TEST_CASE("Groups integration: an embedded-NUL displayName is never truncated to
                     {"members", json::array({{{"value", user_id}}})}};
     auto group_post = cli.Post("/scim/v2/Groups", hdr, group_body.dump(), "application/scim+json");
     REQUIRE(group_post);
-    REQUIRE(group_post->status == 201);
-    auto group_id = json::parse(group_post->body)["id"].get<std::string>();
+    CHECK(group_post->status == 400);
+    CHECK(json::parse(group_post->body)["scimType"] == "invalidValue");
 
-    // No spurious promotion — the group's real name is NOT "Admins".
+    // No spurious promotion — the group was never created.
     CHECK(ts.auth_mgr.get_user_role("walt").value() == auth::Role::user);
-
-    // The stored/returned displayName is the full 12 bytes, not truncated.
-    auto get_res = cli.Get(("/scim/v2/Groups/" + group_id).c_str(), hdr);
-    REQUIRE(get_res);
-    auto returned_name = json::parse(get_res->body)["displayName"].get<std::string>();
-    CHECK(returned_name.size() == 12);
-    CHECK(returned_name == nul_name);
 
     // Control: a group actually named exactly "Admins" (no embedded NUL)
     // DOES promote — confirms the guard above is about truncation, not
@@ -2531,10 +2528,9 @@ TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 
 // elsewhere in this file; see the "NOTE (injection gap)" comment on the
 // revive-role-refusal test above). A raw SQL write error, however, is
 // reachable deterministically and without any race: plant a `BEFORE UPDATE
-// OF role` trigger (via a second raw sqlite3 connection to the SAME auth.db
-// file — an established pattern in this suite, e.g. test_auth_sso_identity.
-// cpp's pre-migration row seeding) that RAISEs on this one user's role
-// column. The reads (SELECTs) are entirely unaffected by the trigger; only
+// OF role` PL/pgSQL trigger (via a second libpq connection to the SAME
+// Postgres database AuthDB manages — ADR-0006) that RAISEs on this one
+// user's role column. The reads (SELECTs) are entirely unaffected; only
 // `AuthDB::update_role`'s UPDATE hits it and genuinely fails.
 TEST_CASE("Groups integration: a genuine update_role failure during recompute audits "
          "scim.user.role_changed/failure and bumps yuzu_scim_role_change_failures_total "
@@ -2560,19 +2556,23 @@ TEST_CASE("Groups integration: a genuine update_role failure during recompute au
     // reads (get_provisioning_source/db_authoritative_role, both plain
     // SELECTs) are untouched, so they resolve exactly as they would on the
     // happy path; only the subsequent `AuthDB::update_role` UPDATE fails.
+    // AuthDB is now Postgres-backed (ADR-0006), so this uses a PL/pgSQL
+    // BEFORE-UPDATE trigger over a second libpq connection to the SAME
+    // database, instead of the SQLite RAISE(ABORT) idiom.
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2((ts.data_dir / "auth.db").string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
-        char* err = nullptr;
-        int rc = sqlite3_exec(raw,
-                              "CREATE TRIGGER block_carol_role_update "
-                              "BEFORE UPDATE OF role ON users "
-                              "WHEN NEW.username = 'carol' "
-                              "BEGIN SELECT RAISE(ABORT, 'forced test write failure'); END;",
-                              nullptr, nullptr, &err);
-        REQUIRE(rc == SQLITE_OK);
-        sqlite3_close(raw);
+        yuzu::server::pg::PgConn conn{PQconnectdb(ts.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult fn{PQexec(
+            conn.get(), "CREATE OR REPLACE FUNCTION yuzu_test_block_carol_role_update() "
+                       "RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'forced test write "
+                       "failure'; END; $$ LANGUAGE plpgsql")};
+        REQUIRE(fn.ok());
+        yuzu::server::pg::PgResult trig{
+            PQexec(conn.get(), "CREATE TRIGGER block_carol_role_update "
+                              "BEFORE UPDATE OF role ON auth.users "
+                              "FOR EACH ROW WHEN (NEW.username = 'carol') "
+                              "EXECUTE FUNCTION yuzu_test_block_carol_role_update()")};
+        REQUIRE(trig.ok());
     }
 
     // The Group PATCH (add member) itself still succeeds — recompute
@@ -3248,17 +3248,24 @@ TEST_CASE("Groups integration: PATCH persist failure leaves displayName, members
                                                            /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
-    // Poison the EXISTING member's real scim_id.
+    // Poison the EXISTING member's real scim_id. ScimStore is now
+    // Postgres-backed (ADR-0006, schema `scim_store`) — plant a PL/pgSQL
+    // BEFORE-INSERT trigger over a second libpq connection to the SAME
+    // database, instead of the SQLite RAISE(ABORT) idiom.
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2((ts.data_dir / "auth.db").string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
+        yuzu::server::pg::PgConn conn{PQconnectdb(ts.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult fn{PQexec(
+            conn.get(), "CREATE OR REPLACE FUNCTION yuzu_test_poison_patch_persist() "
+                       "RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'induced failure'; "
+                       "END; $$ LANGUAGE plpgsql")};
+        REQUIRE(fn.ok());
         std::string trigger_sql =
-            "CREATE TRIGGER poison_patch_persist BEFORE INSERT ON scim_group_members WHEN "
-            "NEW.user_scim_id = '" +
-            member_id + "' BEGIN SELECT RAISE(ABORT, 'induced failure'); END;";
-        REQUIRE(sqlite3_exec(raw, trigger_sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(raw);
+            "CREATE TRIGGER poison_patch_persist BEFORE INSERT ON "
+            "scim_store.scim_group_members FOR EACH ROW WHEN (NEW.user_scim_id = '" +
+            member_id + "') EXECUTE FUNCTION yuzu_test_poison_patch_persist()";
+        yuzu::server::pg::PgResult trig{PQexec(conn.get(), trigger_sql.c_str())};
+        REQUIRE(trig.ok());
     }
 
     json rename_body{{"Operations",
@@ -3319,17 +3326,24 @@ TEST_CASE("Groups integration: PUT persist failure leaves displayName, membershi
                                                            /*mfa_verified=*/true);
     REQUIRE_FALSE(session_token.empty());
 
-    // Poison the EXISTING member's real scim_id.
+    // Poison the EXISTING member's real scim_id. ScimStore is now
+    // Postgres-backed (ADR-0006, schema `scim_store`) — plant a PL/pgSQL
+    // BEFORE-INSERT trigger over a second libpq connection to the SAME
+    // database, instead of the SQLite RAISE(ABORT) idiom.
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2((ts.data_dir / "auth.db").string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
+        yuzu::server::pg::PgConn conn{PQconnectdb(ts.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult fn{PQexec(
+            conn.get(), "CREATE OR REPLACE FUNCTION yuzu_test_poison_put_persist() "
+                       "RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'induced failure'; "
+                       "END; $$ LANGUAGE plpgsql")};
+        REQUIRE(fn.ok());
         std::string trigger_sql =
-            "CREATE TRIGGER poison_put_persist BEFORE INSERT ON scim_group_members WHEN "
-            "NEW.user_scim_id = '" +
-            member_id + "' BEGIN SELECT RAISE(ABORT, 'induced failure'); END;";
-        REQUIRE(sqlite3_exec(raw, trigger_sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(raw);
+            "CREATE TRIGGER poison_put_persist BEFORE INSERT ON "
+            "scim_store.scim_group_members FOR EACH ROW WHEN (NEW.user_scim_id = '" +
+            member_id + "') EXECUTE FUNCTION yuzu_test_poison_put_persist()";
+        yuzu::server::pg::PgResult trig{PQexec(conn.get(), trigger_sql.c_str())};
+        REQUIRE(trig.ok());
     }
 
     // PUT full-replace: rename, keep the SAME member (so the "intended"

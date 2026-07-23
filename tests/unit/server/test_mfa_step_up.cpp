@@ -25,7 +25,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -54,17 +54,11 @@ struct AuditCapture {
 };
 
 struct StepUpFixture {
-    fs::path data_dir;
-    std::unique_ptr<AuthDB> db;
+    yuzu::test::AuthDbPg db;
     std::vector<AuditCapture> audits;
     StepUpAuditFn audit_fn;
 
     StepUpFixture() {
-        data_dir = yuzu::test::unique_temp_path("mfa-stepup-");
-        fs::create_directories(data_dir);
-        db = std::make_unique<AuthDB>(data_dir, /*cleanup_interval_secs=*/0);
-        REQUIRE(db->initialize().has_value());
-
         // Seed alice (MFA-enrolled) + bob (not enrolled).
         auto salt_a = AuthManager::random_bytes(16);
         auto hash_a = AuthManager::pbkdf2_sha256("pw", salt_a, 1000);
@@ -92,12 +86,6 @@ struct StepUpFixture {
             audits.push_back({action, result, target_type, target_id, detail});
             return true;
         };
-    }
-
-    ~StepUpFixture() {
-        db.reset();
-        std::error_code ec;
-        fs::remove_all(data_dir, ec);
     }
 
     auth::Session make_session(const std::string& user, const std::string& source,

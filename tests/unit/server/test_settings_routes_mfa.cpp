@@ -34,7 +34,7 @@
 #include "test_route_sink.hpp"
 #include "update_registry.hpp"
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -84,7 +84,7 @@ struct MfaSettingsHarness {
     TmpDirGuard tmp;
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    AuthDB auth_db;
+    yuzu::test::AuthDbPg auth_db;
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -96,25 +96,22 @@ struct MfaSettingsHarness {
     auth::Role session_role{auth::Role::admin};
     std::vector<AuditCall> audit_calls;
 
-    MfaSettingsHarness()
-        : tmp(yuzu::test::unique_temp_path("settings-mfa-")),
-          auth_db(tmp.path, /*cleanup_interval_secs=*/0) {
+    MfaSettingsHarness() : tmp(yuzu::test::unique_temp_path("settings-mfa-")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         auth_mgr.load_config(cfg.auth_config_path);
-        REQUIRE(auth_db.initialize().has_value());
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
         REQUIRE(auth_mgr.upsert_user("bob", "bobpassword12", auth::Role::user));
         // Mirror admin / bob into AuthDB so the MFA accessor surface
-        // works (mfa_status / mfa_init_enrollment do is_active=1 reads).
+        // works (mfa_status / mfa_init_enrollment do is_active reads).
         auto salt = auth::AuthManager::random_bytes(16);
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
         REQUIRE(
             auth_db
-                .upsert_user("admin",
-                             auth::AuthManager::pbkdf2_sha256("adminpassword1", salt, 100'000),
-                             salt_hex, auth::Role::admin)
+                ->upsert_user("admin",
+                              auth::AuthManager::pbkdf2_sha256("adminpassword1", salt, 100'000),
+                              salt_hex, auth::Role::admin)
                 .has_value());
-        auth_mgr.set_auth_db(&auth_db);
+        auth_mgr.set_auth_db(auth_db.get());
         session_user = "admin";
 
         auto auth_fn =
@@ -227,13 +224,13 @@ TEST_CASE("POST /api/settings/mfa/init twice returns MfaAlreadyEnrolled with ope
     MfaSettingsHarness h;
     // Stand up an enrolled state through the AuthDB directly so the
     // second init hits the "already enrolled" branch.
-    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/init");
     REQUIRE(res);
@@ -247,13 +244,13 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     MfaSettingsHarness h;
     // Get into enrolled state via the same path the panel uses
     // server-side.
-    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
     REQUIRE(res);
@@ -268,13 +265,13 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
 TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
           "[mfa][routes][settings]") {
     MfaSettingsHarness h;
-    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
     REQUIRE(res);
@@ -286,7 +283,7 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
 
     // DB-side: secret cleared + recovery codes deleted (atomic via TxnGuard).
-    auto status = h.auth_db.mfa_status("admin");
+    auto status = h.auth_db->mfa_status("admin");
     REQUIRE(status.has_value());
     CHECK_FALSE(status->enrolled);
     CHECK(status->recovery_codes_remaining == 0);
@@ -296,13 +293,13 @@ TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement 
           "[mfa][routes][settings]") {
     MfaSettingsHarness h;
     // Enroll admin first.
-    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
 
     // Turn on enforcement (cfg is held by reference by SettingsRoutes).
     h.cfg.mfa_enforcement = "required";
@@ -316,7 +313,7 @@ TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement 
     CHECK(h.audit_detail("mfa.disabled").find("blocked: mfa_enforcement=required") !=
           std::string::npos);
     // Crucially, MFA is STILL enrolled — the disable did not take effect.
-    auto status = h.auth_db.mfa_status("admin");
+    auto status = h.auth_db->mfa_status("admin");
     REQUIRE(status.has_value());
     CHECK(status->enrolled);
 }
@@ -325,20 +322,20 @@ TEST_CASE("POST /api/settings/mfa/disable under admin-only blocks admins but the
           "role-scoped",
           "[mfa][routes][settings]") {
     MfaSettingsHarness h;
-    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
 
     h.cfg.mfa_enforcement = "admin-only";
     // Admin (session_role defaults to admin) is protected.
     auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
     REQUIRE(res);
     CHECK(res->body.find("required by policy") != std::string::npos);
-    auto status = h.auth_db.mfa_status("admin");
+    auto status = h.auth_db->mfa_status("admin");
     REQUIRE(status.has_value());
     CHECK(status->enrolled);
 }
