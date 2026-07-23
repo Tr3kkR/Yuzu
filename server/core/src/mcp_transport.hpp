@@ -36,8 +36,10 @@ bool origin_allowed(std::string_view origin, const std::vector<std::string>& all
 // i.e. lists `text/event-stream` as a whole media range (case-insensitive,
 // `;`-parameters and OWS ignored) — NOT a bare substring, so
 // `application/json; q=text/event-stream` and `not-text/event-stream` do not
-// match. Used from PR 2/3 (GET channel + SSE-on-POST); shipped here as the
-// transport module's stable API surface.
+// match. The `,` split honours RFC 9110 quoted-strings (#2073), so a comma
+// inside a quoted parameter value cannot forge a match; an unterminated quote
+// fails closed. Wildcards (`*/*`, `text/*`) do not match — SSE needs an
+// explicit opt-in. Gates the GET SSE channel (2f PR 2) and SSE-on-POST (PR 3).
 bool accept_wants_sse(std::string_view accept_header);
 
 }  // namespace yuzu::server::mcp::transport

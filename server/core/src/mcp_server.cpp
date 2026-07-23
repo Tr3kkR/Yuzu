@@ -15,11 +15,15 @@
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
+#include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
+#include "directory_sync.hpp"           // access-review read-model optional email enrichment
 
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
@@ -944,6 +948,95 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j",
      R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Query software licenses"})"},
+
+    // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
+    // /api/v1/access-reviews* (ADR-1005 parity). JSON only: the REST
+    // ?format=csv export path has no MCP twin — a worker that wants CSV
+    // evidence uses the REST endpoint directly.
+    {"export_access_review",
+     "Stateless cross-principal grant export (SOC 2 CC6.2) — every user/group/engine-"
+     "principal's DIRECT role grants right now, with effective_permission_count, last "
+     "activity, classification, lifecycle_state, and provenance. Mirrors GET "
+     "/api/v1/access-reviews/export exactly, JSON ONLY (the REST twin's ?format=csv has no "
+     "MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately "
+     "gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + "
+     "the Reviewer role, NOT AuditLog:Read), not a management-group-confined read — a scoped "
+     "slice would be useless as fleet-wide CC6.2 evidence. Self-audited as "
+     "access_review.exported. Requires AccessReview:Read.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}}},"required":["count","rows"]})j",
+     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Export access review evidence"})"},
+
+    {"open_access_review",
+     "Open a review campaign — freeze the CURRENT cross-principal grant population "
+     "(export_access_review expanded to one row per (principal, role) grant) into a new, "
+     "durable campaign for reviewer attestation. A grant created after this call returns is "
+     "out of scope for THIS campaign (review it in the next one); a grant revoked afterward "
+     "stays reviewable (frozen, not re-derived from live state). Mirrors POST "
+     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
+     "evidence and does not itself change any access grant — destructiveHint:false. "
+     "Requires AccessReview:Attest.",
+     R"j({"type":"object","properties":{)j"
+     R"j("title":{"type":"string","description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j(},"required":["title"]})j",
+     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j",
+     R"({"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"title":"Open access review campaign"})"},
+
+    {"record_attestation",
+     "Record one reviewer decision against a grant frozen into an open campaign — "
+     "'attested' (the reviewer confirms this grant is still appropriate) or "
+     "'flagged_revoke' (the reviewer believes it should be revoked). flag != revoke: this "
+     "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
+     "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
+     "engine-principal-revoke call an operator makes after reading this evidence. This is "
+     "an UPSERT: calling it again for the same (campaign_id, principal_type, principal_id, "
+     "role_name) OVERWRITES the prior reviewer's decision, reviewer, and justification — "
+     "the earlier evidence is not retained, so destructiveHint:true. Mirrors "
+     "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
+     "or access_review.flagged (by decision). Requires AccessReview:Attest.",
+     R"j({"type":"object","properties":{)j"
+     R"j("campaign_id":{"type":"string"},)j"
+     R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
+     R"j("principal_id":{"type":"string"},)j"
+     R"j("role_name":{"type":"string"},)j"
+     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
+     R"j("justification":{"type":"string"})j"
+     R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j",
+     R"({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false,"title":"Record access review attestation"})"},
+
+    {"get_access_review",
+     "Full evidentiary state of one review campaign: metadata plus every frozen "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. Mirrors GET "
+     "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
+     "AccessReview:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("campaign_id":{"type":"string"})j"
+     R"j(},"required":["campaign_id"]})j",
+     R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j",
+     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Get access review campaign"})"},
+
+    {"list_access_reviews",
+     "List every review campaign's metadata (NOT its attestations — use get_access_review "
+     "for those), newest-first, capped at the most recent 500. The surface an auditor "
+     "needs to prove reviews ran on cadence. Mirrors GET /api/v1/access-reviews. "
+     "Self-audited as access_review.list. Requires AccessReview:Read.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"}}}}},"required":["count","campaigns"]})j",
+     R"({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"List access review campaigns"})"},
+
+    {"close_access_review",
+     "Close an open review campaign. Does NOT require every attestation to be decided "
+     "first — a campaign closed with pending rows still outstanding is itself evidence, "
+     "not something this tool silently forces to completion. Mirrors POST "
+     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Finalizes "
+     "a campaign's lifecycle state — it does not destroy any evidence (attestation rows "
+     "are untouched), so destructiveHint:false. Requires AccessReview:Attest.",
+     R"j({"type":"object","properties":{)j"
+     R"j("campaign_id":{"type":"string"})j"
+     R"j(},"required":["campaign_id"]})j",
+     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j",
+     R"({"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"title":"Close access review campaign"})"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -967,6 +1060,11 @@ static const std::unordered_set<std::string> kWriteTools = {
     "transfer_engine_principal_owner", "confirm_engine_rotation",
     // PR 4.2 (design §4.1) — engine-principal role-assignment authoring.
     "assign_engine_role", "unassign_engine_role",
+    // Periodic Access Reviews (SOC 2 CC6.2) — campaign-opening, attestation, and
+    // close are mutations (persist a new campaign / a reviewer decision / a
+    // lifecycle transition); export/get/list are read-only and deliberately
+    // absent from this set.
+    "open_access_review", "record_attestation", "close_access_review",
 };
 
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
@@ -1077,6 +1175,16 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"discover_scope_kinds", {"Infrastructure", "Read"}},
     {"discover_plugins", {"Infrastructure", "Read"}},
     {"query_software_licenses", {"SoftwareLicensing", "Read"}},
+    // Periodic Access Reviews (SOC 2 CC6.2) — parity with the REST twins'
+    // AccessReview:Read (export/get/list) and AccessReview:Attest
+    // (open/attest/close) gates — a dedicated narrow securable, NOT AuditLog,
+    // seeded to Administrator + the Reviewer role only.
+    {"export_access_review", {"AccessReview", "Read"}},
+    {"open_access_review", {"AccessReview", "Attest"}},
+    {"record_attestation", {"AccessReview", "Attest"}},
+    {"get_access_review", {"AccessReview", "Read"}},
+    {"list_access_reviews", {"AccessReview", "Read"}},
+    {"close_access_review", {"AccessReview", "Attest"}},
 };
 
 // ── Resource definitions ──────────────────────────────────────────────────
@@ -1185,6 +1293,29 @@ int mcp_error_for_store_msg(const std::string& msg) {
     return kInternalError; // unreachable — all enum cases return above
 }
 
+// AccessReviewStore error → JSON-RPC code (mirrors rest_api_v1.cpp's
+// access_review_error_status(), translated into the JSON-RPC vocabulary).
+// The store's documented "not_found: " prefix (access_review_store.hpp —
+// machine-checkable) means a bad campaign_id, a grant never in the frozen
+// population, or an already-closed campaign: client input, not a server
+// fault, so it maps to kInvalidParams like the REST twin's 404. Any other
+// message is a genuine read/write failure → kInternalError (retryable).
+//
+// Contract pin: same binary posture as rest_api_v1.cpp's
+// access_review_error_status — every tool handler above pre-validates its
+// own required fields (title/decision/campaign_id/principal_type/
+// principal_id/role_name) BEFORE calling into AccessReviewStore, so the
+// store's own input-validation error strings never actually reach this
+// function today; they would otherwise land in the `else -> kInternalError`
+// arm, which is wrong (client error, not retryable). Callers MUST keep
+// pre-validating. If a future path reaches the store unvalidated, add a
+// `bad_request:` prefix to that store error and a kInvalidParams arm here
+// (and the matching 400 arm in rest_api_v1.cpp's access_review_error_status)
+// rather than letting it fall through to kInternalError.
+int mcp_error_for_access_review_msg(const std::string& msg) {
+    return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
+}
+
 } // anonymous namespace
 
 // ── Handler construction ─────────────────────────────────────────────────
@@ -1193,6 +1324,33 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // register_routes() and the in-process test fixtures call it; tests then
 // invoke the returned function directly without spinning up an httplib::Server
 // (see #438 — the acceptor thread crashes under TSan).
+
+namespace {
+
+// Present-but-unsupported MCP-Protocol-Version → 400. Shared by POST, GET and DELETE:
+// docs/user-manual/mcp.md states this rule for the /mcp/v1/ ENDPOINT, not for POST alone,
+// and a strict client that sends the header on a GET deserves the same answer it would get
+// on a POST rather than a stream. Returns true iff it filled in the denial.
+template <typename AuditFn>
+bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::Response& res,
+                                         const AuditFn& session_audit) {
+    const auto pv = req.get_header_value("MCP-Protocol-Version");
+    if (pv.empty() || transport::protocol_version_supported(pv)) {
+        return false; // absent → the caller assumes the default revision
+    }
+    const auto cid = yuzu::server::detail::make_correlation_id();
+    session_audit("mcp.session.reject", "failure", std::string{},
+                  "reason=protocol_version cid=" + cid);
+    res.status = 400;
+    res.set_content(
+        error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version", cid,
+                               "send MCP-Protocol-Version: 2025-06-18 (or omit the "
+                               "header to accept the 2025-03-26 default)"),
+        "application/json");
+    return true;
+}
+
+} // namespace
 
 McpServer::HandlerFn McpServer::build_handler(
     AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
@@ -1209,7 +1367,8 @@ McpServer::HandlerFn McpServer::build_handler(
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
+    AuthDB* auth_db, DirectorySync* directory_sync) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -1319,19 +1478,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     "application/json");
                 return;
             }
-            // MCP-Protocol-Version: absent → assume default; present-but-unsupported → 400.
-            const auto pv = req.get_header_value("MCP-Protocol-Version");
-            if (!pv.empty() && !transport::protocol_version_supported(pv)) {
-                const auto cid = yuzu::server::detail::make_correlation_id();
-                session_audit("mcp.session.reject", "failure", "",
-                              "reason=protocol_version cid=" + cid);
-                res.status = 400;
-                res.set_content(
-                    error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version",
-                                           cid,
-                                           "send MCP-Protocol-Version: 2025-06-18 (or omit the "
-                                           "header to accept the 2025-03-26 default)"),
-                    "application/json");
+            if (reject_unsupported_protocol_version(req, res, session_audit)) {
                 return;
             }
         }
@@ -6470,6 +6617,411 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
+            // /api/v1/access-reviews* (ADR-1005 parity). JSON only — the REST
+            // ?format=csv export path has no MCP twin. Every handler below runs
+            // deny_if_engine_session() (same §9-style structural belt as the
+            // engine-principal lifecycle tools above): an engine-classed session is
+            // not a human reviewer and must never mint or sign this evidence.
+
+            if (tool_name == "export_access_review") {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
+                                                    engine_credential_store_, directory_sync);
+                if (!rows_res) {
+                    // FAIL LOUD — never a silent partial/empty result. An empty
+                    // response on a CC6.2 evidence export reads as "nothing to
+                    // review" when the truth is "the read failed".
+                    mcp_audit("failure", rows_res.error());
+                    (void)audit_fn(req, "access_review.exported", "failure", "AccessReview", "",
+                                   rows_res.error());
+                    res.set_content(a4_error(kInternalError, rows_res.error(),
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto& rows = *rows_res;
+                JArr arr;
+                for (const auto& r : rows) {
+                    JArr roles;
+                    for (const auto& role : r.roles)
+                        roles.add(role);
+                    arr.add(JObj()
+                                .add("principal_type", r.principal_type)
+                                .add("principal_id", r.principal_id)
+                                .add("display_name", r.display_name)
+                                .add("owner_or_email", r.owner_or_email)
+                                .raw("roles", roles.str())
+                                .add("effective_permission_count", r.effective_permission_count)
+                                .add("last_activity_ms", r.last_activity_ms)
+                                .add("last_activity_kind", r.last_activity_kind)
+                                .add("classification", r.classification)
+                                .add("lifecycle_state", r.lifecycle_state)
+                                .add("source", r.source));
+                }
+                // Evidence access is itself auditable (CC6.2/CC7.2). Set-and-proceed
+                // (MCP has no response-header channel like REST's Sec-Audit-Failed) —
+                // a dropped audit row is surfaced via audit_persisted:false in the
+                // body instead, never silently swallowed.
+                const bool audit_ok = audit_fn(req, "access_review.exported", "success",
+                                               "AccessReview", "",
+                                               "rows=" + std::to_string(rows.size()));
+                JObj payload;
+                payload.add("count", static_cast<int64_t>(rows.size())).raw("rows", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "open_access_review") {
+                if (!tier_allows(tier, "AccessReview", "Attest")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Attest"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!access_review_store || !access_review_store->is_open()) {
+                    mcp_audit("failure", "access review store unavailable");
+                    res.set_content(a4_error(kInternalError, "access review store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto title = param_str(args, "title");
+                if (title.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "title is required"),
+                                    "application/json");
+                    return;
+                }
+                auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
+                                                    engine_credential_store_, directory_sync);
+                if (!rows_res) {
+                    mcp_audit("failure", rows_res.error());
+                    (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview",
+                                   "", rows_res.error());
+                    res.set_content(a4_error(kInternalError, rows_res.error(),
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                // Expand each row to one GrantRef per (principal, role) — the shape
+                // access_review_store.hpp's open_campaign requires — carrying an
+                // opaque JSON snapshot of the row's non-role fields as observed right
+                // now (freeze-time evidence; matches the REST twin exactly).
+                std::vector<GrantRef> frozen;
+                for (const auto& r : *rows_res) {
+                    std::string snapshot =
+                        JObj()
+                            .add("display_name", r.display_name)
+                            .add("owner_or_email", r.owner_or_email)
+                            .add("effective_permission_count", r.effective_permission_count)
+                            .add("last_activity_ms", r.last_activity_ms)
+                            .add("last_activity_kind", r.last_activity_kind)
+                            .add("classification", r.classification)
+                            .add("lifecycle_state", r.lifecycle_state)
+                            .add("source", r.source)
+                            .str();
+                    for (const auto& role : r.roles)
+                        frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
+                }
+                auto open_res = access_review_store->open_campaign(title, session->username, frozen);
+                if (!open_res) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview", "",
+                                open_res.error());
+                    mcp_audit("failure", open_res.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_access_review_msg(open_res.error()),
+                                       open_res.error(),
+                                       denied_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
+                            *open_res, "grants=" + std::to_string(frozen.size()));
+                JObj payload;
+                payload.add("campaign_id", *open_res)
+                    .add("grant_count", static_cast<int64_t>(frozen.size()));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", *open_res);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "record_attestation") {
+                if (!tier_allows(tier, "AccessReview", "Attest")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Attest"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!access_review_store || !access_review_store->is_open()) {
+                    mcp_audit("failure", "access review store unavailable");
+                    res.set_content(a4_error(kInternalError, "access review store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto campaign_id = param_str(args, "campaign_id");
+                const auto principal_type = param_str(args, "principal_type");
+                const auto principal_id = param_str(args, "principal_id");
+                const auto role_name = param_str(args, "role_name");
+                const auto decision = param_str(args, "decision");
+                const auto justification = param_str(args, "justification");
+                if (campaign_id.empty() || principal_type.empty() || principal_id.empty() ||
+                    role_name.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "campaign_id, principal_type, principal_id, and role_name are "
+                                 "all required"),
+                        "application/json");
+                    return;
+                }
+                if (decision != "attested" && decision != "flagged_revoke") {
+                    res.set_content(
+                        a4_error(kInvalidParams, "decision must be attested or flagged_revoke"),
+                        "application/json");
+                    return;
+                }
+                auto rec_res = access_review_store->record_attestation(
+                    campaign_id, principal_type, principal_id, role_name, decision,
+                    session->username, justification);
+                // decision selects the audit verb so the two outcomes are
+                // separately countable evidence, matching the REST twin exactly.
+                const std::string audit_action = decision == "flagged_revoke"
+                                                     ? "access_review.flagged"
+                                                     : "access_review.attested";
+                if (!rec_res) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
+                                rec_res.error());
+                    mcp_audit("failure", rec_res.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
+                                       rec_res.error(),
+                                       denied_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                // Evidence-only, by design: a "flagged_revoke" decision records that
+                // a reviewer believes this grant should be revoked. It NEVER itself
+                // revokes anything — no unassign_role / EnginePrincipal revoke call
+                // on this path (flag != revoke). Acting on the flag is a separate,
+                // explicit RBAC/EnginePrincipal write an operator performs after
+                // reading this evidence.
+                const bool audit_ok = audit_fn(
+                    req, audit_action, "success", "AccessReview",
+                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
+                    "decision=" + decision);
+                JObj payload;
+                payload.add("recorded", true);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", campaign_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_access_review") {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!access_review_store || !access_review_store->is_open()) {
+                    mcp_audit("failure", "access review store unavailable");
+                    res.set_content(a4_error(kInternalError, "access review store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto campaign_id = param_str(args, "campaign_id");
+                if (campaign_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto view_res = access_review_store->get_campaign(campaign_id);
+                if (!view_res) {
+                    mcp_audit("failure", view_res.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_access_review_msg(view_res.error()),
+                                       view_res.error()),
+                        "application/json");
+                    return;
+                }
+                const auto& view = *view_res;
+                JObj campaign;
+                campaign.add("campaign_id", view.campaign.campaign_id)
+                    .add("title", view.campaign.title)
+                    .add("status", view.campaign.status)
+                    .add("created_by", view.campaign.created_by)
+                    .add("created_at_ms", view.campaign.created_at_ms)
+                    .add("closed_by", view.campaign.closed_by)
+                    .add("closed_at_ms", view.campaign.closed_at_ms);
+                JArr attestations;
+                for (const auto& a : view.attestations) {
+                    // grant_snapshot is raw-embedded, not escaped: this store's only
+                    // writer (open_access_review/POST /api/v1/access-reviews) always
+                    // freezes it as a JObj().str() JSON object.
+                    attestations.add(
+                        JObj()
+                            .add("principal_type", a.principal_type)
+                            .add("principal_id", a.principal_id)
+                            .add("role_name", a.role_name)
+                            .add("decision", a.decision)
+                            .add("reviewer", a.reviewer)
+                            .add("decided_at_ms", a.decided_at_ms)
+                            .add("justification", a.justification)
+                            .raw("grant_snapshot",
+                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot));
+                }
+                (void)audit_fn(req, "access_review.get", "success", "AccessReview", campaign_id, "");
+                JObj payload;
+                payload.raw("campaign", campaign.str())
+                    .raw("attestations", attestations.str())
+                    .add("pending_count", view.pending_count);
+                mcp_audit("success", campaign_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_access_reviews") {
+                if (!tier_allows(tier, "AccessReview", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Read"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!access_review_store || !access_review_store->is_open()) {
+                    mcp_audit("failure", "access review store unavailable");
+                    res.set_content(a4_error(kInternalError, "access review store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                auto rows_res = access_review_store->list_campaigns();
+                if (!rows_res) {
+                    mcp_audit("failure", rows_res.error());
+                    (void)audit_fn(req, "access_review.list", "failure", "AccessReview", "",
+                                   rows_res.error());
+                    res.set_content(a4_error(kInternalError, rows_res.error(),
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& c : *rows_res) {
+                    arr.add(JObj()
+                                .add("campaign_id", c.campaign_id)
+                                .add("title", c.title)
+                                .add("status", c.status)
+                                .add("created_by", c.created_by)
+                                .add("created_at_ms", c.created_at_ms)
+                                .add("closed_by", c.closed_by)
+                                .add("closed_at_ms", c.closed_at_ms));
+                }
+                const bool audit_ok = audit_fn(req, "access_review.list", "success", "AccessReview",
+                                               "", "count=" + std::to_string(rows_res->size()));
+                JObj payload;
+                payload.add("count", static_cast<int64_t>(rows_res->size())).raw("campaigns", arr.str());
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "close_access_review") {
+                if (!tier_allows(tier, "AccessReview", "Attest")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "AccessReview", "Attest"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!access_review_store || !access_review_store->is_open()) {
+                    mcp_audit("failure", "access review store unavailable");
+                    res.set_content(a4_error(kInternalError, "access review store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto campaign_id = param_str(args, "campaign_id");
+                if (campaign_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto close_res = access_review_store->close_campaign(campaign_id, session->username);
+                if (!close_res) {
+                    const bool denied_audit_ok =
+                        audit_fn(req, "access_review.closed", "failure", "AccessReview", campaign_id,
+                                close_res.error());
+                    mcp_audit("failure", close_res.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_access_review_msg(close_res.error()),
+                                       close_res.error(),
+                                       denied_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "access_review.closed", "success", "AccessReview", campaign_id, "");
+                JObj payload;
+                payload.add("closed", true);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", campaign_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────
             // Each mirrors its GET /api/v1/discover/* REST sibling via the SAME
             // builder function in discover_routes.hpp — REST and MCP read the
@@ -6610,10 +7162,19 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                                                   const bool* mcp_disabled,
                                                   const bool* streaming_disabled,
                                                   McpSessionRegistry* sessions,
-                                                  std::vector<std::string> allowed_origins) {
+                                                  std::vector<std::string> allowed_origins,
+                                                  yuzu::server::detail::StreamBudget* stream_budget,
+                                                  StreamRevalidateFn revalidate_fn,
+                                                  yuzu::MetricsRegistry* metrics,
+                                                  std::size_t per_principal_cap,
+                                                  StreamPrincipalAuditFn principal_audit_fn) {
     const std::vector<std::string> origins = std::move(allowed_origins);
     return [=](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Content-Type", "application/json");
+        // NOTE: no up-front Content-Type here. httplib's set_header EMPLACES into a
+        // multimap without erasing, while set_chunked_content_provider only
+        // set_header's its own type — so an application/json set here would ride
+        // along on the SSE response as a SECOND Content-Type header. Every denial
+        // path below sets the JSON type through set_content (which erases first).
         auto session_audit = [&](const char* action, const char* result,
                                  const std::string& target_id, const std::string& detail) {
             (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, "McpSession",
@@ -6638,6 +7199,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
             const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
+            if (metrics != nullptr) {
+                metrics->counter("yuzu_mcp_stream_rejects_total", {{"reason", "origin"}})
+                    .increment();
+            }
             res.status = 403;
             res.set_content(
                 error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
@@ -6646,11 +7211,29 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                 "application/json");
             return;
         }
+        // Same transport pre-check as POST: the protocol-version contract is a property of
+        // the ENDPOINT, not of one method.
+        if (reject_unsupported_protocol_version(req, res, session_audit)) {
+            return;
+        }
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
-        // PR 1 placeholder — the real GET SSE channel is 2f PR 2.
-        res.status = 405;
+        // The SSE channel itself (session gate, Accept negotiation, replay, caps,
+        // provider) lives in mcp_stream.cpp — this file stays wiring.
+        // The actor is captured HERE, while the credential is still valid — the close
+        // audit runs at teardown, when it may not resolve at all. All three fields must
+        // come from the same live session, or the close row will disagree with the attach
+        // row about who acted: principal_class in particular is re-stamped from
+        // principal_kind at request time, so an engine principal reads "engine" there and
+        // would read "agent" from bare credential presentation here.
+        mcp::StreamAuditPrincipal actor{
+            .id = session->username,
+            .role = auth::role_to_string(auth::effective_role(*session)),
+            .cls = session->principal_kind == "engine" ? std::string("engine") : std::string{}};
+        handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
+                        metrics, audit_fn, per_principal_cap, std::move(actor),
+                        principal_audit_fn);
     };
 }
 
@@ -6693,6 +7276,11 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                 "application/json");
             return;
         }
+        // Same transport pre-check as POST/GET — the protocol-version contract belongs to
+        // the endpoint, not to one method.
+        if (reject_unsupported_protocol_version(req, res, session_audit)) {
+            return;
+        }
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
@@ -6711,12 +7299,18 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                 "application/json");
             return;
         }
+        // The session id is an attacker-controlled HEADER until it validates, so the
+        // prefix that reaches an audit row is sanitised — raw bytes could inject the
+        // `;`/`=` field separators audit tooling parses, or CR/LF. The GET sibling in
+        // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
+        // the same verbs and was passing it through raw.
+        const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
         if (sessions->terminate(sid, session->username)) {
-            session_audit("mcp.session.close", "success", sid.substr(0, 8), "");
+            session_audit("mcp.session.close", "success", audit_sid, "");
             res.status = 200;
         } else {
             const auto cid = yuzu::server::detail::make_correlation_id();
-            session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
+            session_audit("mcp.session.reject", "failure", audit_sid,
                           "reason=unknown_session cid=" + cid);
             res.status = 404;
             res.set_content(
@@ -6753,12 +7347,20 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool* mcp_streaming_disabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
-                                EnginePrincipalStore* engine_principal_store) {
+                                EnginePrincipalStore* engine_principal_store,
+                                AccessReviewStore* access_review_store, AuthDB* auth_db,
+                                DirectorySync* directory_sync,
+                                yuzu::server::detail::StreamBudget* stream_budget,
+                                StreamRevalidateFn revalidate_fn,
+                                std::size_t mcp_max_streams_per_principal,
+                                StreamPrincipalAuditFn principal_audit_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
     svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
-                                          sessions, allowed_origins));
+                                          sessions, allowed_origins, stream_budget, revalidate_fn,
+                                          metrics, mcp_max_streams_per_principal,
+                                          principal_audit_fn));
     svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
                                                 mcp_streaming_disabled, sessions, allowed_origins));
 
@@ -6775,7 +7377,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(app_perf_providers), quarantine_store,
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                            sessions, mcp_streaming_disabled, std::move(allowed_origins),
-                           software_licensing_store, engine_principal_store));
+                           software_licensing_store, engine_principal_store, access_review_store,
+                           auth_db, directory_sync));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
@@ -6785,6 +7388,25 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                  "({} tools, {} resources, {} prompts{}{})",
                  kToolCount, kResourceCount, kPromptCount, read_only_mode ? ", read-only mode" : "",
                  streaming_off ? ", streaming disabled" : "");
+    // A streaming-enabled endpoint with either seam unwired is a misconfiguration,
+    // not a mode: without the budget, held-open GET streams are admitted without
+    // limit onto the shared worker pool; without re-validation, a revoked
+    // credential keeps its live stream until the session TTL. Test seams omit
+    // them deliberately; a production registration must not.
+    if (!streaming_off && !principal_audit_fn) {
+        spdlog::warn("MCP: streaming enabled with NO explicit-principal audit sink — "
+                     "mcp.stream.close rows will re-derive the actor from a credential that "
+                     "no longer resolves on a revocation close, and will name nobody. Test "
+                     "seams omit it deliberately; a production server must not.");
+    }
+    if (!streaming_off && stream_budget == nullptr) {
+        spdlog::warn("MCP: streaming enabled with NO stream budget — concurrent GET SSE "
+                     "streams are uncapped on the shared HTTP worker pool");
+    }
+    if (!streaming_off && !revalidate_fn) {
+        spdlog::warn("MCP: streaming enabled with NO credential re-validation — a live GET SSE "
+                     "stream will survive revocation of the credential that opened it");
+    }
 }
 
 } // namespace yuzu::server::mcp

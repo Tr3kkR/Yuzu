@@ -238,11 +238,28 @@ agent_test_exe = executable(
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
+# Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
+# threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
+# ballooned under Big Tam filesystem contention (four CI jobs sharing one host's /tmp), where
+# one stalled ~8 minutes and timed the whole agent suite out (#2345). In a PLAIN build they
+# detect nothing (no instrumentation), so that cost buys no signal there - skip them. A
+# sanitizer build runs everything (ASan for use-after-free in the concurrent teardown, TSan
+# for the races they exist for), where the ~10x-larger job budget absorbs their cost as it did
+# before this change. The OTHER four [tsan] tests are cheap and bounded (no real SQLite, or a
+# fixed sleep) and stay in every build. A coverage build (b_coverage, no sanitizer) also skips
+# the two heavy tests; their concurrent code paths are line-covered by the sequential
+# prune/page/gauge tests and the cheap concurrent tests, so no meaningful line coverage is lost.
+# The residual risk that these two balloon on the shared Big Tam pool even under the sanitizer
+# budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
+# that route introduced its own flakiness (a busy main thread starving the workers it waited on)
+# and was backed out.
+agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
 test(
   'agent unit tests',
   agent_test_exe,
+  args: agent_test_args,
   suite: 'agent',
-  timeout: 240,
+  timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 
@@ -426,6 +443,9 @@ if build_server
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_access_review_model.cpp',
+      'unit/server/test_access_review_store.cpp',
+      'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
@@ -459,6 +479,7 @@ if build_server
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_spark_fleet_tags.cpp',
+      'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -478,6 +499,8 @@ if build_server
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
+      'unit/server/test_mcp_stream.cpp',
+      'unit/server/test_sse_saturation.cpp',
       'unit/server/test_mcp_transport.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
@@ -553,13 +576,15 @@ if build_server
       # table matches the agent parser (contract G9 drift guard). Header-only
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
-      # Spark tag-key pin: test_spark_fleet_tags.cpp includes the agent's
-      # spark_heartbeat.hpp (emit_spark_heartbeat_tags) to assert the agent's actual
-      # emitted keys equal the server-side spark_fleet_tags.hpp constants — a full
+      # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags), and
+      # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
+      # (emit_guardian_journal_heartbeat_tags), each asserting the agent's actual
+      # emitted keys equal the matching server-side *_fleet_tags.hpp table - a full
       # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
-      # template — no link to yuzu_agent_core, just the include path.
+      # templates - no link to yuzu_agent_core, just the include path.
       #
-      # CONSTRAINT (governance Gate-3 architect). This puts ~28 PRIVATE agent headers on
+      # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
       # zero CASE-INSENSITIVE basename collision (APFS/NTFS resolve case-insensitively,
       # so a Linux-only case-sensitive check under-detects) between agents/core/src/*.hpp
@@ -570,7 +595,16 @@ if build_server
       # NOT solve a future collision by having server PRODUCTION code include an agent
       # header: that would be an upward dependency edge (server → agent), which the build
       # graph does not have and must not gain. The durable fix is to hoist the shared tag
-      # keys into one source of truth at rung 2, when the wire contract changes anyway.
+      # keys into one source of truth. NOTE THE SCOPE: that hoist is triggered by spark's
+      # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL keys
+      # are not part of that wire-contract change, so a rung-2 hoist sweeping only spark
+      # would leave the 22 yuzu.guardian_journal_* literals behind while this comment
+      # still read as though it covered them. Both key families must move together; the
+      # journal side must be added to #2298's cutover-gate list (not yet filed there as of
+      # this commit). Concrete target when it
+      # happens: a hand-written header carried by proto/meson.build's
+      # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
+      # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
       include_directories('../agents/core/src'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on

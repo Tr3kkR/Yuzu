@@ -815,3 +815,247 @@ groups:
   #           population is gone (mass agent outage, gateway partition) or the server
   #           sweep stopped. Correlate with yuzu_fleet_net_*/agent-online gauges before
   #           reading this as a spark problem.
+
+  # ── yuzu-guardian-journal - DISABLED, and not only because the journal is inert ──
+  #
+  # #2298 gate 3. Two independent reasons this group is commented out; BOTH must clear
+  # before any rule here is enabled.
+  #
+  # REASON 1 - inert. The durable lifecycle-audit journal does not run until the
+  # prefer_spark cutover, so every yuzu_fleet_guardian_journal_* counter is provably 0
+  # in production today and an enabled rule could only fire on a FORGED heartbeat.
+  # (Same reason the spark group above is commented out at rung 1.)
+  #
+  # REASON 2 - NO CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. This one does
+  # not clear at the cutover. It clears only when a per-agent axis exists for the
+  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is not filed (see below).
+  # These are UNLABELLED fleet SUMS of per-agent CUMULATIVE counters over a CHURNING
+  # population, and all three candidate forms fail (governance Gate-4 unhappy-path +
+  # Gate-6 sre):
+  #
+  #   increase()/rate() - an agent ageing out or restarting reads as a counter reset
+  #     and manufactures a phantom increment; and a series that first APPEARS at a
+  #     non-zero value contributes no increase at all, so it misses the first-and-only
+  #     loss these counters exist to catch. (The spark preamble above records the same
+  #     analysis for the same reason.)
+  #
+  #   delta() - needs two samples inside the window. An absent -> non-zero series has
+  #     no earlier 0 to diff against: identical first-loss blind spot, different cause.
+  #
+  #   bare `> 0` - correct for ONE agent (a should-stay-0 monotonic that self-clears on
+  #     that agent's restart), WRONG for the fleet sum. The set "some agent, ever,
+  #     tripped this since its last restart" only grows as fleet-days accumulate and
+  #     only shrinks when that SPECIFIC agent restarts or leaves the 90s staleness
+  #     window. At 10k agents with weeks-long uptimes P(sum > 0) -> 1 for any counter
+  #     with a non-zero per-agent-week trip rate - and several here have known benign
+  #     trip modes - so the rule fires within hours of cutover, never clears,
+  #     and the operator silences the group - losing the signal entirely. An earlier
+  #     draft of this file shipped bare `> 0` here; that was wrong and is why the rules
+  #     below use the rising-edge form instead.
+  #
+  # THE RULES BELOW USE A RISING EDGE: `(X > 0) unless (X offset 15m > 0)`. That
+  # notifies once per absent->present transition rather than continuously, which is the
+  # closest to correct available today. One documented refinement to evaluate at enable
+  # time, not adopted here because nothing ships enabled: OR-ing in a rise detector,
+  # `((X - X offset 15m) > 0)`, would additionally catch a rise in an ALREADY-PRESENT
+  # series (a second agent breaking, or the same agent losing more), which the form
+  # below cannot see. It is NOT churn-immune, and an earlier draft of this note wrongly
+  # claimed it was: an agent RE-ENTERING the staleness window after a >15m absence
+  # (reconnect, partition heal, laptop wake) raises the sum by its whole latched value
+  # with no new loss, so it fires on reconnection churn - increase()'s disease, just
+  # narrower. It is also blind to first appearance on its own (the offset side is
+  # absent), so it complements rather than replaces the form below.
+  #
+  # NEITHER FORM CAN ATTRIBUTE A RISE. "A second agent also broke", "the same agent lost
+  # more" and "an agent reconnected" are indistinguishable, because there is no
+  # per-agent axis to separate on. That is REASON 2 in concrete form: it is why the loss
+  # rules stay disabled even once the cutover clears REASON 1, and it is separate again
+  # from prerequisites (a)-(d) below. Closing it needs the per-agent delta plus a
+  # server-owned monotonic counter - #2083 is the spark-scoped tracker, and the journal
+  # side belongs on #2298's cutover-gate list and is not yet filed there.
+  #
+  # UNTIL BOTH REASONS CLEAR THESE ARE MONITOR-ONLY: graph them, review them in
+  # post-incident analysis, do not page on them.
+  #
+  # ENABLE-TIME PREREQUISITES, all currently unmet:
+  #   (a) an operator surface exposing per-agent yuzu.guardian_journal_* tags - the
+  #       series are unlabelled by design, so a firing alert cannot name the affected
+  #       endpoints and the runbook advice to "identify the reporting agents" is
+  #       unactionable without it;
+  #   (b) the per-agent axis above (#2083-class work);
+  #   (c) a soak at fleet scale with all 22 families live concurrently with the
+  #       revocation sweep - the heartbeat tag-map grows by up to 22 entries per agent
+  #       the instant prefer_spark flips, which no pre-cutover soak can observe;
+  #   (d) runbooks at the docs.yuzu.io URLs below, which do not exist yet.
+  #
+  # SEVERITY: warning throughout. Values are agent-self-reported inside the heartbeat
+  # trust boundary - one forged or buggy agent can set any of these, and suppression
+  # (an agent that simply stops emitting) is indistinguishable from health - so a
+  # warning routes to a ticket, never a page. An agent leaving the 90s staleness window
+  # RESOLVES these without the underlying loss having healed, and a server outage longer
+  # than the 15m offset window re-notifies an already-known incident on recovery (a
+  # short restart is suppressed by the offset, not re-notified). The
+  # alert is the signal; the audit trail is the evidence.
+  #
+  # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
+  # published on EVERY sweep including at 0, unlike the 22 counters. They are the only
+  # rules here that CAN be sound, because they are server-owned counts rather than fleet
+  # sums of agent monotonics. They differ from each other: TagRejected is
+  # unconditionally sound, while TelemetryDark is sound only once Guardian is actually
+  # deployed fleet-wide, because its 0 also means "nothing journalled yet" (see its
+  # description below).
+  #
+  # - name: yuzu-guardian-journal
+  #   rules:
+  #     # ---- Pipeline health ---------------------------------------------------------
+  #     # These two differ: TagRejected is unconditionally sound; TelemetryDark is sound
+  #     # only once Guardian is deployed, because its 0 also means "nothing journalled yet".
+  #     - alert: YuzuGuardianJournalTelemetryDark
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_reporting == 0
+  #         and on() yuzu_fleet_agents_healthy > 0
+  #       for: 15m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "No agent is reporting Guardian journal telemetry"
+  #         description: >-
+  #           Agents are connected but none carried a parseable
+  #           yuzu.guardian_journal_* tag for 15m. READ THIS CAREFULLY: the writer is
+  #           SPARSE, so _reporting counts agents with a NON-ZERO counter, not agents
+  #           whose journal works. 0 therefore means EITHER the telemetry path is dark
+  #           OR nothing has been journalled anywhere since restart - a live journal on
+  #           a fleet with no deployed Guardian rules reads 0 legitimately. Enabling
+  #           this rule presumes Guardian is actually deployed fleet-wide. Expected to
+  #           fire continuously BEFORE the cutover; do not enable it until after.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-telemetry-dark"
+  #     - alert: YuzuGuardianJournalTagRejected
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_tag_rejected > 0
+  #       for: 15m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal heartbeat tags are being rejected as malformed"
+  #         description: >-
+  #           Some agent is shipping journal tag values that fail the forged-value
+  #           parse (non-numeric, negative, over 10 digits, or above the plausibility
+  #           ceiling). Those values are dropped, so that agent's counters are silently
+  #           missing from the fleet sums. Identify the agent, and re-check the ceiling
+  #           before raising it. This is a per-sweep count, not a latch.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-tag-rejected"
+  #     # ---- Loss / fault counters (rising edge; NOT sufficient - see REASON 2) -----
+  #     - alert: YuzuGuardianJournalIntegrityGap
+  #       expr: |
+  #         (yuzu_fleet_guardian_journal_evicted_no_send_evidence > 0)
+  #         unless
+  #         (yuzu_fleet_guardian_journal_evicted_no_send_evidence offset 15m > 0)
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian lifecycle batches aged out with no send evidence"
+  #         description: >-
+  #           Journal BATCHES (up to 256 records each) aged out with no evidence their
+  #           records were transmitted - which SUGGESTS lifecycle audit records were
+  #           lost between endpoint and server, but does not establish it. Treat as a
+  #           TICKET TO INVESTIGATE, not an
+  #           incident-register entry: classification is BEST-EFFORT, so a crash
+  #           between the send and the sent-label write counts a sent batch as
+  #           no-evidence, and a mass reboot or OTA manufactures a large benign step
+  #           roughly one retention window (7d) later. Do NOT escalate until agent-side
+  #           corroboration or magnitude analysis rules out that crash-timing artifact
+  #           class. No `for:` clause on purpose - the 90s staleness window means an
+  #           agent that reports a loss then dies is visible for less than one `for:`
+  #           period, and agent death is the strongest correlate of no-send-evidence.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-integrity-gap"
+  #     - alert: YuzuGuardianJournalRecordsDropped
+  #       expr: |
+  #         (yuzu_fleet_guardian_journal_stage_dropped > 0)
+  #         unless
+  #         (yuzu_fleet_guardian_journal_stage_dropped offset 15m > 0)
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian lifecycle records dropped at staging"
+  #         description: >-
+  #           The pending reserve overflowed under sustained write failure - records
+  #           never reached the journal; the audit trail has a hole. Correlate with
+  #           _write_failures and _pending on the same agents.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-stage-dropped"
+  #     - alert: YuzuGuardianJournalWriteFailures
+  #       expr: |
+  #         (yuzu_fleet_guardian_journal_write_failures > 0)
+  #         unless
+  #         (yuzu_fleet_guardian_journal_write_failures offset 15m > 0)
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal batch writes are failing"
+  #         description: >-
+  #           Records stay staged and retry, so this is not itself loss - but sustained
+  #           failure fills the pending reserve, after which staging overflow increments
+  #           _stage_dropped. It leads _stage_dropped on THAT path only: the loss
+  #           channels field_rejected and clock_rejected move without it, and the
+  #           capacity-refusal path can reach _stage_dropped without a single write
+  #           failure.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-write-failures"
+  #     - alert: YuzuGuardianJournalCapacityRefusal
+  #       expr: |
+  #         (yuzu_fleet_guardian_journal_write_capacity_rejected > 0)
+  #         unless
+  #         (yuzu_fleet_guardian_journal_write_capacity_rejected offset 15m > 0)
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal refusing writes at its capacity cap"
+  #         description: >-
+  #           The journal refused a batch at its cap. NOT itself loss - the batch stays
+  #           staged and the tick retries it once a prune frees capacity; loss only
+  #           follows if staging then overflows (_stage_dropped). Check _prune_failures
+  #           and the _bytes/_batch_count capacity gauges.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-capacity"
+  #     - alert: YuzuGuardianJournalForensicLoss
+  #       expr: |
+  #         (yuzu_fleet_guardian_journal_quarantine_capacity_evicted > 0)
+  #         unless
+  #         (yuzu_fleet_guardian_journal_quarantine_capacity_evicted offset 15m > 0)
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Quarantined Guardian journal batches shed at the quarantine cap"
+  #         description: >-
+  #           Terminal loss: corrupt BATCHES preserved for forensics have been deleted
+  #           to respect the quarantine bound (UP-7). Investigate the corruption source
+  #           before more evidence is shed.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-quarantine"
+  #     - alert: YuzuGuardianJournalAccountingBug
+  #       expr: |
+  #         (yuzu_fleet_guardian_journal_key_collisions > 0)
+  #         unless
+  #         (yuzu_fleet_guardian_journal_key_collisions offset 15m > 0)
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Guardian journal batch key collisions"
+  #         description: >-
+  #           Should stay 0 in correct operation; any value is an accounting or
+  #           id-generation bug surfacing. Investigate - do not threshold.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-key-collisions"
+  #
+  # The remaining should-stay-0 counters (_stage_failures, _field_rejected,
+  # _clock_rejected, _quarantined, _quarantine_failures, _prune_failures,
+  # _maint_exceptions) take the identical rising-edge shape, added per-counter at
+  # enable time if the soak shows them quiet enough to be actionable.
+  #
+  # _pending is NOT given a rule: it is a live depth gauge per agent, but the published
+  # series is a fleet SUM, so at 10k agents it is non-zero essentially always and a
+  # `> 0 for: 15m` rule would fire permanently on a healthy fleet. _bytes and
+  # _batch_count get no rule either - they are non-zero on any working journal between
+  # retention passes, so they are capacity watch signals, not alert conditions.
+  #
+  # The activity counters (_batches_written, _pruned, _pages, _records_paged,
+  # _sent_labels, _evicted_sent_unacked) are context, not alerts. Note _sent_labels is
+  # NOT a valid denominator for the eviction counters despite sharing the batch unit:
+  # labels are counted in the current agent process while evictions cover batches
+  # written up to 7 days earlier across a churning fleet, so after a restart the
+  # numerator can exceed it.

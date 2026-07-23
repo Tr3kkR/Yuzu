@@ -1,4 +1,7 @@
 #include "rest_api_v1.hpp"
+#include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
+#include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "directory_sync.hpp"      // access-review read-model optional email enrichment
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
@@ -265,6 +268,42 @@ static int engine_store_error_status(const std::string& err) {
         return 503;
     }
     return 503; // unreachable — all enum cases return above
+}
+
+// AccessReviewStore (Periodic Access Reviews, SOC 2 CC6.2) error mapping —
+// per access_review_store.hpp's documented contract, `get_campaign` /
+// `record_attestation` / `close_campaign` signal "no such campaign / no such
+// frozen grant / campaign not open" via an `unexpected` payload PREFIXED
+// `"not_found: "` (machine-checkable). That prefix maps to 404; every other
+// `unexpected` (a genuine write/read failure — lease timeout, query error) is
+// a transient 503, never a 400 — the caller did nothing wrong, the store did.
+//
+// Contract pin: this classifier is binary (not_found: -> 404, else -> 503)
+// because every route above pre-validates its own inputs (title/decision/
+// principal_type/principal_id/role_name all required) BEFORE ever calling
+// into the store, so the store's own input-validation error strings (e.g.
+// "title cannot be empty", "decision must be...") never actually reach this
+// function today — they would fall into the `else -> 503` arm, which is
+// wrong (client error, not a transient failure). Callers MUST keep
+// pre-validating those fields. If a future code path calls into
+// AccessReviewStore without pre-validating, add a machine-checkable
+// `bad_request:` prefix to that store error and a 400 arm here (and in the
+// MCP twin mcp_error_for_access_review_msg in mcp_server.cpp) rather than
+// letting it fall through to 503.
+static int access_review_error_status(const std::string& err) {
+    return err.starts_with("not_found:") ? 404 : 503;
+}
+
+// A present-but-wrong-typed JSON body field (e.g. {"title": 5}) must degrade
+// to the default rather than throw nlohmann's type_error.302 out of
+// `body.value(key, default)` (-> uncaught -> 500). Mirrors MCP's
+// param_str (mcp_server.cpp) so the REST and MCP twins agree on the same
+// wrong-typed-field -> clean-400 behavior.
+static std::string access_review_str_field(const nlohmann::json& body, const char* key,
+                                            const char* def = "") {
+    if (body.contains(key) && body[key].is_string())
+        return body[key].get<std::string>();
+    return def;
 }
 
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
@@ -910,6 +949,25 @@ const std::string& openapi_spec() {
     },
     "/discover/plugins": {
       "get": {"summary": "Plugin/action catalog observed across connected agents (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Wraps AgentRegistry::help_json() (deduplicated plugin metadata across all currently-connected agents, richest action list wins per plugin name) with a discovery envelope. NOT a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent. Action entries are bare {name, description} pairs; per-action PARAMETER schemas are NOT available from agents and the response says so explicitly (consult GET /discover/instructions for the subset of actions that also have a published InstructionDefinition with parameter_schema).", "responses": {"200": {"description": "{version, description, limitation, plugins[].{name, version, description, actions[].{name, description}}, commands[]}"}, "304": {"description": "Not Modified"}, "503": {"description": "Agent registry unavailable"}}}
+    })json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — Periodic
+        // Access Reviews (SOC 2 CC6.2) paths.
+        R"json(,
+    "/access-reviews/export": {
+      "get": {"summary": "Stateless cross-principal grant export (SOC 2 CC6.2)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every user/group/engine-principal's DIRECT role grants right now, with effective_permission_count, last activity, classification, lifecycle_state, and provenance (source). Deliberately gated on a GLOBAL AccessReview:Read (a dedicated securable seeded to Administrator + the Reviewer role, NOT AuditLog:Read), not the ADR-0017 confinement-filtered list gate — a scoped slice would be useless as fleet-wide CC6.2 evidence. Self-audited as access_review.exported.", "parameters": [{"name": "format", "in": "query", "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}], "responses": {"200": {"description": "JSON: data[].{principal_type, principal_id, display_name, owner_or_email, roles[], effective_permission_count, last_activity_ms, last_activity_kind, classification, lifecycle_state, source}. CSV: same fields, Content-Disposition: attachment.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the export succeeded but its own audit row failed to persist."}}}, "400": {"description": "format not json|csv"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "A read across users/groups/engine-principals/tokens failed — never a silent partial export"}}}
+    },
+    "/access-reviews": {
+      "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}], meta}"}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+    },
+    "/access-reviews/{id}": {
+      "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}"}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
+    },
+    "/access-reviews/{id}/attestations": {
+      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+    },
+    "/access-reviews/{id}/close": {
+      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     }
   }
 })json";
@@ -1146,7 +1204,8 @@ void RestApiV1::register_routes(
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
+    AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1159,7 +1218,8 @@ void RestApiV1::register_routes(
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
-                    std::move(app_perf_providers), engine_principal_store);
+                    std::move(app_perf_providers), engine_principal_store, access_review_store,
+                    auth_db, directory_sync, stream_budget);
 }
 
 void RestApiV1::register_routes(
@@ -1178,7 +1238,8 @@ void RestApiV1::register_routes(
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
+    AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -4389,6 +4450,522 @@ void RestApiV1::register_routes(
                                    .raw("meta", R"({"api_version":"v1"})")
                                    .str();
             res.set_content(body, "application/json");
+        });
+
+    // ── Periodic Access Reviews (/api/v1/access-reviews) — SOC 2 CC6.2 ─────
+    //
+    // Two halves: `GET .../export` is a stateless read of the CURRENT
+    // cross-principal grant population (access_review_model.hpp), for a quick
+    // evidence pull without opening a campaign. The remaining four routes are
+    // the campaign lifecycle (access_review_store.hpp) — freeze a population,
+    // record reviewer decisions against it, read it back, close it — the
+    // durable "who had access on this date, and did a reviewer sign off"
+    // evidence SOC 2 CC6.2 requires. Every route runs deny_engine_session (an
+    // engine-classed session is not a human reviewer and must never mint or
+    // sign this evidence) and every mutation is self-audited exactly like the
+    // auth-sample export above, INCLUDING surfacing a dropped audit row via
+    // Sec-Audit-Failed (never a silent evidence-chain gap).
+
+    // GET /api/v1/access-reviews/export — stateless cross-principal grant
+    // export, ?format=json|csv (default json).
+    //
+    // #2225 chokepoint note: this is a FLEET-WIDE read of per-*principal*
+    // authorization evidence (every user/group/engine-principal's direct role
+    // grants), gated on the dedicated `AccessReview:Read` securable — seeded
+    // to Administrator + the Reviewer role only — NOT the ADR-0017
+    // `authorize_list_read` admit-then-filter chokepoint every new
+    // per-*agent* list read must use. A management-group-confinement filter
+    // would make this export USELESS as CC6.2 evidence: a reviewer certifying
+    // the fleet must see the ENTIRE grant population, not one operator's
+    // confined slice of it. It remains a global/unconfined evidence read by
+    // design — the dedicated narrow securable now correctly scopes it so
+    // AuditLog:Read holders like Operator/PlatformEngineer can no longer pull
+    // the grant graph.
+    sink.Get(
+        "/api/v1/access-reviews/export",
+        [perm_fn, auth_fn, audit_fn, auth_db, rbac_store, eps, token_store, directory_sync,
+         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Read"))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "access_review.exported",
+                                    "AccessReview"))
+                return;
+
+            std::string format = req.get_param_value("format");
+            if (format.empty())
+                format = "json";
+            if (format != "json" && format != "csv") {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "format must be json or csv"),
+                                "application/json");
+                return;
+            }
+
+            // sre SHOULD (governance): time the underlying grant-population read
+            // regardless of outcome — a slow/failing build_access_review is exactly
+            // the signal an on-call needs, not just the happy path.
+            const auto build_start = std::chrono::steady_clock::now();
+            auto rows_res = build_access_review(auth_db, rbac_store, eps, token_store, directory_sync);
+            if (metrics_registry) {
+                const std::chrono::duration<double> elapsed =
+                    std::chrono::steady_clock::now() - build_start;
+                metrics_registry->histogram("yuzu_access_review_export_duration_seconds")
+                    .observe(elapsed.count());
+            }
+            if (!rows_res) {
+                // FAIL LOUD — never a silent partial/empty 200. On a CC6.2 evidence
+                // export, an empty result reads as "nothing to review" when the
+                // truth is "the read failed" (mirrors the auth-sample posture above).
+                res.status = 503;
+                res.set_content(detail::a4_error(res, rows_res.error(),
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                     .remediation = {},
+                                                                     .permission = {},
+                                                                     .approval_id = {},
+                                                                     .status_url = {}}),
+                                "application/json");
+                return;
+            }
+            const auto& rows = *rows_res;
+
+            // Evidence access is itself auditable (CC6.2/CC7.2): the export still
+            // proceeds if the audit row fails to persist, but the failure is made
+            // VISIBLE via Sec-Audit-Failed rather than silently swallowed — mirrors
+            // audit.auth_sample.exported above.
+            bool audit_emitted = false;
+            try {
+                audit_emitted =
+                    audit_fn(req, "access_review.exported", "success", "AccessReview", "",
+                            "format=" + format + " rows=" + std::to_string(rows.size()));
+            } catch (const std::exception& ex) {
+                spdlog::warn("access_review.exported audit emission threw: {}", ex.what());
+            }
+            if (!audit_emitted) {
+                spdlog::warn("access_review.exported did not persist — evidence-chain gap for "
+                             "an access-review export");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
+            if (metrics_registry)
+                metrics_registry->counter("yuzu_access_review_export_total", {{"format", format}})
+                    .increment();
+
+            if (format == "csv") {
+                res.set_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"access-review-" +
+                        std::to_string(static_cast<std::int64_t>(std::time(nullptr))) + ".csv\"");
+                res.set_content(to_csv(rows), "text/csv");
+                return;
+            }
+
+            JArr arr;
+            for (const auto& r : rows) {
+                JArr roles;
+                for (const auto& role : r.roles)
+                    roles.add(role);
+                arr.add(JObj()
+                            .add("principal_type", r.principal_type)
+                            .add("principal_id", r.principal_id)
+                            .add("display_name", r.display_name)
+                            .add("owner_or_email", r.owner_or_email)
+                            .raw("roles", roles.str())
+                            .add("effective_permission_count", r.effective_permission_count)
+                            .add("last_activity_ms", r.last_activity_ms)
+                            .add("last_activity_kind", r.last_activity_kind)
+                            .add("classification", r.classification)
+                            .add("lifecycle_state", r.lifecycle_state)
+                            .add("source", r.source));
+            }
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+                            "application/json");
+        });
+
+    // GET /api/v1/access-reviews — list every review campaign's metadata
+    // (NOT its attestations — call GET /api/v1/access-reviews/{id} for
+    // those), newest-first. This is the surface an auditor needs to prove
+    // reviews ran on cadence ("list every campaign that ever ran"); the
+    // store caps it at the most recent 500 (access_review_store.hpp). A
+    // literal path — registered before the GET /{id} regex below so it
+    // can never be swallowed by that pattern (mirrors the export-before-{id}
+    // ordering above).
+    sink.Get(
+        "/api/v1/access-reviews",
+        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
+                                                           httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Read"))
+                return;
+            if (!access_review_store || !access_review_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "access review store unavailable"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "access_review.list",
+                                    "AccessReview"))
+                return;
+
+            auto rows_res = access_review_store->list_campaigns();
+            if (!rows_res) {
+                res.status = access_review_error_status(rows_res.error());
+                res.set_content(detail::a4_error(res, rows_res.error(),
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                     .remediation = {},
+                                                                     .permission = {},
+                                                                     .approval_id = {},
+                                                                     .status_url = {}}),
+                                "application/json");
+                return;
+            }
+
+            JArr arr;
+            for (const auto& c : *rows_res) {
+                arr.add(JObj()
+                            .add("campaign_id", c.campaign_id)
+                            .add("title", c.title)
+                            .add("status", c.status)
+                            .add("created_by", c.created_by)
+                            .add("created_at_ms", c.created_at_ms)
+                            .add("closed_by", c.closed_by)
+                            .add("closed_at_ms", c.closed_at_ms));
+            }
+            (void)audit_fn(req, "access_review.list", "success", "AccessReview", "",
+                           "count=" + std::to_string(rows_res->size()));
+            res.set_content(ok_json(arr.str()), "application/json");
+        });
+
+    // POST /api/v1/access-reviews {title} — freeze the CURRENT grant
+    // population into a new review campaign (R3, access_review_store.hpp):
+    // every grant that exists right now gets one reviewable row; a grant
+    // created after this call returns is out of scope for THIS campaign.
+    sink.Post(
+        "/api/v1/access-reviews",
+        [perm_fn, auth_fn, audit_fn, access_review_store, auth_db, rbac_store, eps, token_store,
+         directory_sync, metrics_registry](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Attest"))
+                return;
+            if (!access_review_store || !access_review_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "access review store unavailable"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "access_review.campaign_opened",
+                                    "AccessReview"))
+                return;
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            auto title = access_review_str_field(body, "title");
+            if (title.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "title is required"), "application/json");
+                return;
+            }
+
+            auto rows_res = build_access_review(auth_db, rbac_store, eps, token_store, directory_sync);
+            if (!rows_res) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, rows_res.error(),
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                     .remediation = {},
+                                                                     .permission = {},
+                                                                     .approval_id = {},
+                                                                     .status_url = {}}),
+                                "application/json");
+                return;
+            }
+
+            // Expand each row to one GrantRef per (principal, role) pair — the
+            // shape access_review_store.hpp's open_campaign requires — carrying an
+            // opaque JSON snapshot of the row's non-role fields as observed right
+            // now (freeze-time evidence; a later grant revoke does not retroactively
+            // change this row).
+            std::vector<GrantRef> frozen;
+            for (const auto& r : *rows_res) {
+                std::string snapshot =
+                    JObj()
+                        .add("display_name", r.display_name)
+                        .add("owner_or_email", r.owner_or_email)
+                        .add("effective_permission_count", r.effective_permission_count)
+                        .add("last_activity_ms", r.last_activity_ms)
+                        .add("last_activity_kind", r.last_activity_kind)
+                        .add("classification", r.classification)
+                        .add("lifecycle_state", r.lifecycle_state)
+                        .add("source", r.source)
+                        .str();
+                for (const auto& role : r.roles)
+                    frozen.push_back(GrantRef{r.principal_type, r.principal_id, role, snapshot});
+            }
+
+            auto open_res = access_review_store->open_campaign(title, session->username, frozen);
+            if (!open_res) {
+                try {
+                    (void)audit_fn(req, "access_review.campaign_opened", "failure", "AccessReview",
+                                   "", open_res.error());
+                } catch (const std::exception& ex) {
+                    spdlog::warn("access_review.campaign_opened audit emission threw: {}",
+                                 ex.what());
+                }
+                res.status = access_review_error_status(open_res.error());
+                res.set_content(detail::a4_error(res, open_res.error()), "application/json");
+                return;
+            }
+            // The campaign was already opened — the audit row is evidence of that,
+            // never a gate on it. A failed audit surfaces via Sec-Audit-Failed and
+            // the response proceeds (mirrors the export path above).
+            bool open_audit_emitted = false;
+            try {
+                open_audit_emitted =
+                    audit_fn(req, "access_review.campaign_opened", "success", "AccessReview",
+                            *open_res, "grants=" + std::to_string(frozen.size()));
+            } catch (const std::exception& ex) {
+                spdlog::warn("access_review.campaign_opened audit emission threw: {}", ex.what());
+            }
+            if (!open_audit_emitted) {
+                spdlog::warn("access_review.campaign_opened did not persist — evidence-chain gap "
+                             "for an access-review campaign open");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
+            if (metrics_registry)
+                metrics_registry->counter("yuzu_access_review_campaigns_opened_total").increment();
+            res.status = 201;
+            res.set_content(ok_json(JObj()
+                                        .add("campaign_id", *open_res)
+                                        .add("grant_count", static_cast<int64_t>(frozen.size()))
+                                        .str()),
+                            "application/json");
+        });
+
+    // GET /api/v1/access-reviews/{id} — full evidentiary state of one
+    // campaign: metadata + every frozen attestation row + pending_count.
+    sink.Get(
+        R"(/api/v1/access-reviews/([^/]+))",
+        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
+                                                           httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Read"))
+                return;
+            if (!access_review_store || !access_review_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "access review store unavailable"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            auto campaign_id = req.matches[1].str();
+            if (deny_engine_session(*session, req, res, audit_fn, "access_review.get",
+                                    "AccessReview"))
+                return;
+
+            auto view_res = access_review_store->get_campaign(campaign_id);
+            if (!view_res) {
+                res.status = access_review_error_status(view_res.error());
+                res.set_content(detail::a4_error(res, view_res.error()), "application/json");
+                return;
+            }
+            const auto& view = *view_res;
+
+            JObj campaign;
+            campaign.add("campaign_id", view.campaign.campaign_id)
+                .add("title", view.campaign.title)
+                .add("status", view.campaign.status)
+                .add("created_by", view.campaign.created_by)
+                .add("created_at_ms", view.campaign.created_at_ms)
+                .add("closed_by", view.campaign.closed_by)
+                .add("closed_at_ms", view.campaign.closed_at_ms);
+
+            JArr attestations;
+            for (const auto& a : view.attestations) {
+                // grant_snapshot is raw-embedded, not escaped as a string: this
+                // store's only writer (the POST /api/v1/access-reviews handler
+                // above) always freezes it as a JObj().str() JSON object, so it is
+                // always valid JSON here — never caller-supplied text.
+                attestations.add(
+                    JObj()
+                        .add("principal_type", a.principal_type)
+                        .add("principal_id", a.principal_id)
+                        .add("role_name", a.role_name)
+                        .add("decision", a.decision)
+                        .add("reviewer", a.reviewer)
+                        .add("decided_at_ms", a.decided_at_ms)
+                        .add("justification", a.justification)
+                        .raw("grant_snapshot", a.grant_snapshot.empty() ? "null" : a.grant_snapshot));
+            }
+            (void)audit_fn(req, "access_review.get", "success", "AccessReview", campaign_id, "");
+            res.set_content(ok_json(JObj()
+                                        .raw("campaign", campaign.str())
+                                        .raw("attestations", attestations.str())
+                                        .add("pending_count", view.pending_count)
+                                        .str()),
+                            "application/json");
+        });
+
+    // POST /api/v1/access-reviews/{id}/attestations {principal_type,
+    // principal_id, role_name, decision, justification} — record one
+    // reviewer decision against a frozen grant.
+    sink.Post(
+        R"(/api/v1/access-reviews/([^/]+)/attestations)",
+        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Attest"))
+                return;
+            if (!access_review_store || !access_review_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "access review store unavailable"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            auto campaign_id = req.matches[1].str();
+            if (deny_engine_session(*session, req, res, audit_fn, "access_review.attested",
+                                    "AccessReview"))
+                return;
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            auto principal_type = access_review_str_field(body, "principal_type");
+            auto principal_id = access_review_str_field(body, "principal_id");
+            auto role_name = access_review_str_field(body, "role_name");
+            auto decision = access_review_str_field(body, "decision");
+            auto justification = access_review_str_field(body, "justification");
+            if (principal_type.empty() || principal_id.empty() || role_name.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(
+                                    res, "principal_type, principal_id, and role_name are required"),
+                                "application/json");
+                return;
+            }
+            if (decision != "attested" && decision != "flagged_revoke") {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, "decision must be attested or flagged_revoke"),
+                    "application/json");
+                return;
+            }
+
+            auto rec_res = access_review_store->record_attestation(
+                campaign_id, principal_type, principal_id, role_name, decision, session->username,
+                justification);
+            // decision selects the audit verb (access_review.attested vs
+            // access_review.flagged) so the two outcomes are separately
+            // countable/alertable evidence, not one verb with a buried field.
+            const std::string audit_action =
+                decision == "flagged_revoke" ? "access_review.flagged" : "access_review.attested";
+            if (!rec_res) {
+                try {
+                    (void)audit_fn(req, audit_action, "failure", "AccessReview", campaign_id,
+                                   rec_res.error());
+                } catch (const std::exception& ex) {
+                    spdlog::warn("{} audit emission threw: {}", audit_action, ex.what());
+                }
+                res.status = access_review_error_status(rec_res.error());
+                res.set_content(detail::a4_error(res, rec_res.error()), "application/json");
+                return;
+            }
+            // Evidence-only, by design: a "flagged_revoke" decision records that a
+            // reviewer believes this grant should be revoked. It NEVER itself
+            // revokes anything — no unassign_role / EnginePrincipal revoke call on
+            // this path. Acting on the flag is a separate, explicit RBAC/
+            // EnginePrincipal write an operator performs after reading this
+            // evidence (flag != revoke).
+            //
+            // The attestation was already recorded — the audit row is evidence of
+            // that, never a gate on it. A failed audit surfaces via
+            // Sec-Audit-Failed and the response proceeds (mirrors export above).
+            bool attest_audit_emitted = false;
+            try {
+                attest_audit_emitted = audit_fn(
+                    req, audit_action, "success", "AccessReview",
+                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
+                    "decision=" + decision);
+            } catch (const std::exception& ex) {
+                spdlog::warn("{} audit emission threw: {}", audit_action, ex.what());
+            }
+            if (!attest_audit_emitted) {
+                spdlog::warn("{} did not persist — evidence-chain gap for an access-review "
+                             "attestation",
+                             audit_action);
+                res.set_header("Sec-Audit-Failed", "true");
+            }
+            if (metrics_registry)
+                metrics_registry->counter("yuzu_access_review_attestations_total",
+                                          {{"decision", decision}})
+                    .increment();
+            res.set_content(ok_json(JObj().add("recorded", true).str()), "application/json");
+        });
+
+    // POST /api/v1/access-reviews/{id}/close — close an open campaign. Does
+    // NOT require every attestation to be decided (see access_review_store.hpp
+    // close_campaign doc) — an incomplete review is itself evidence, not
+    // something this route silently forces to completion.
+    sink.Post(
+        R"(/api/v1/access-reviews/([^/]+)/close)",
+        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
+                                                           httplib::Response& res) {
+            if (!perm_fn(req, res, "AccessReview", "Attest"))
+                return;
+            if (!access_review_store || !access_review_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "access review store unavailable"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            auto campaign_id = req.matches[1].str();
+            if (deny_engine_session(*session, req, res, audit_fn, "access_review.closed",
+                                    "AccessReview"))
+                return;
+
+            auto close_res = access_review_store->close_campaign(campaign_id, session->username);
+            if (!close_res) {
+                try {
+                    (void)audit_fn(req, "access_review.closed", "failure", "AccessReview",
+                                   campaign_id, close_res.error());
+                } catch (const std::exception& ex) {
+                    spdlog::warn("access_review.closed audit emission threw: {}", ex.what());
+                }
+                res.status = access_review_error_status(close_res.error());
+                res.set_content(detail::a4_error(res, close_res.error()), "application/json");
+                return;
+            }
+            // The campaign was already closed — the audit row is evidence of that,
+            // never a gate on it. A failed audit surfaces via Sec-Audit-Failed and
+            // the response proceeds (mirrors export above).
+            bool close_audit_emitted = false;
+            try {
+                close_audit_emitted =
+                    audit_fn(req, "access_review.closed", "success", "AccessReview", campaign_id, "");
+            } catch (const std::exception& ex) {
+                spdlog::warn("access_review.closed audit emission threw: {}", ex.what());
+            }
+            if (!close_audit_emitted) {
+                spdlog::warn("access_review.closed did not persist — evidence-chain gap for an "
+                             "access-review campaign close");
+                res.set_header("Sec-Audit-Failed", "true");
+            }
+            res.set_content(ok_json(JObj().add("closed", true).str()), "application/json");
         });
 
     // ── Inventory (/api/v1/inventory) ──────────────────────────────────
@@ -8815,8 +9392,8 @@ void RestApiV1::register_routes(
     // events; the dashboard sibling emits raw `ev.data` because the
     // browser already knows the channel from the URL path.
     sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
-                                metrics_registry](const httplib::Request& req,
-                                                  httplib::Response& res) {
+                                metrics_registry, stream_budget](const httplib::Request& req,
+                                                                 httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session) {
             // auth_fn already set 401 + body. Nothing to do.
@@ -8951,6 +9528,51 @@ void RestApiV1::register_routes(
             } catch (...) {
                 since_id = 0;
             }
+        }
+
+        // Admission control (ADR-0034). This response is about to hold an httplib worker for
+        // the life of the subscription, so it leases from the ONE budget every streaming
+        // surface shares. Held in a shared_ptr so the lease dies with the release lambda —
+        // the worker returns on every teardown path.
+        //
+        // Taken BEFORE the bus subscription so a rejected caller never leaves a listener
+        // behind, and BEFORE the gauge bump below: the 429 returns without installing the
+        // release callback that decrements, so incrementing first made
+        // yuzu_server_sse_api_active drift upward once per rejection — corrupting the very
+        // utilisation signal ADR-0034 Decision 3 depends on, under exactly the budget
+        // pressure it is meant to measure.
+        auto lease = std::make_shared<detail::StreamBudget::Lease>();
+        if (stream_budget != nullptr) {
+            auto admitted = stream_budget->try_acquire(detail::SseSurface::kApiEvents,
+                                                       session->username,
+                                                       detail::kPerPrincipalApiEvents);
+            if (!admitted.lease) {
+                res.status = 429;
+                // Retry-After alongside the A4 retry_after_ms — the platform 429
+                // convention in docs/user-manual/rest-api.md is both, in whole seconds.
+                res.set_header("Retry-After", "5");
+                // Name a remediation that can ACTUALLY resolve THIS reject. There is no
+                // operator flag for /api/v1/events' per-principal cap (it is compile-time
+                // kPerPrincipalApiEvents), so a per-principal reject can only be resolved
+                // by the caller closing one of its own streams — telling it to raise
+                // --max-sse-streams (the global cap) would be misleading.
+                const bool per_principal =
+                    admitted.reject_reason != nullptr &&
+                    std::string_view(admitted.reject_reason) ==
+                        detail::StreamBudget::kRejectPerPrincipal;
+                res.set_content(
+                    detail::error_json_a4(
+                        429, "too many concurrent event streams", cid,
+                        /*retry_after_ms=*/5000,
+                        per_principal
+                            ? "close one of your own /api/v1/events streams (this is a "
+                              "per-principal limit)"
+                            : "close an existing /api/v1/events stream, or raise "
+                              "--max-sse-streams"),
+                    "application/json");
+                return;
+            }
+            *lease = std::move(admitted.lease);
         }
 
         // Endpoint-scoped metric: subscription count.
@@ -9168,17 +9790,58 @@ void RestApiV1::register_routes(
                 return true;
             },
             detail::adopt_quota_slot_into_stream(
-                [sink_state, bus, exec_id_for_capture, metrics_registry](bool /*success*/) {
-                    sink_state->closed.store(true);
+                [sink_state, bus, exec_id_for_capture, metrics_registry,
+                 lease](bool /*success*/) noexcept {
+                    // noexcept + catch-all: this runs from ~Response, a DESTRUCTOR, so an
+                    // escaping exception is std::terminate regardless of what httplib does
+                    // (#2037's class). The lock_guard added here is the throw site that made
+                    // the guard necessary. Matches the MCP sibling.
+                    try {
+                    {
+                        // Under the sink mutex: `closed` is the provider's wait predicate,
+                        // and a store between its predicate check and its atomic
+                        // release-and-block is a lost wakeup. Matches the shared
+                        // sse_resource_release in event_bus.hpp — this site and the
+                        // dashboard sibling were the two remaining counter-examples to a
+                        // rule the rest of the tree now follows.
+                        std::lock_guard<std::mutex> lk(sink_state->mu);
+                        sink_state->closed.store(true);
+                    }
                     sink_state->cv.notify_all();
-                    bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+                    // unsubscribe stays OUTSIDE the sink lock (publishers take the bus mutex
+                    // then the sink mutex, so unsubscribing under `mu` inverts that order) and
+                    // in its OWN try so that unsubscribe's OWN throw cannot skip the steps
+                    // after it (the metrics decrement / lease return). A leaked subscription
+                    // pins the sink for the life of the process; contain it, do not propagate
+                    // it out of this ~Response-invoked releaser.
+                    try {
+                        bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+                    } catch (...) {
+                    }
                     if (metrics_registry) {
                         metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
                             .decrement();
                     }
+                    // `lease` dies here, returning the worker to the one shared budget.
+                    } catch (...) {
+                        // Contained — see the note above.
+                    }
                 }));
     });
 
+    // GET /api/v1/events holds an httplib worker for the life of its subscription, so an
+    // unwired budget means that surface is uncapped on the shared pool and the plain-REST
+    // reserve is not in fact reserved. The parameter is trailing-defaulted for test seams,
+    // which is exactly how the production wiring came to be omitted silently — the route
+    // registered, the try_acquire block became dead code, and nothing said so. Mirrors the
+    // MCP registration's warning; a boot line is the cheapest guard that survives, since no
+    // unit test can observe a missing argument at the server.cpp call site.
+    if (stream_budget == nullptr) {
+        spdlog::warn("REST API v1: GET /api/v1/events registered with NO stream budget — "
+                     "held-open event streams are uncapped on the shared HTTP worker pool "
+                     "(ADR-0034). Test seams omit it deliberately; a production server "
+                     "must not.");
+    }
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }
 

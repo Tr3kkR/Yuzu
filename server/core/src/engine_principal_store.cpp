@@ -340,6 +340,30 @@ std::vector<EnginePrincipalRow> EnginePrincipalStore::list_all(bool include_revo
     return rows;
 }
 
+std::expected<std::vector<EnginePrincipalRow>, std::string>
+EnginePrincipalStore::list_all_checked(bool include_revoked) const {
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("database unavailable — try again");
+    std::string sql = std::string("SELECT ") + kCols +
+                      " FROM engine_principal_store.engine_principals ";
+    if (!include_revoked)
+        sql += "WHERE lifecycle_state='active' ";
+    sql += "ORDER BY created_at";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("list_all_checked query failed: ") +
+                               PQerrorMessage(lease.get()));
+    std::vector<EnginePrincipalRow> rows;
+    int n = PQntuples(res.get());
+    rows.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        rows.push_back(read_row(res.get(), i));
+    return rows;
+}
+
 std::optional<std::size_t>
 EnginePrincipalStore::count_active_owned_by(const std::string& owner_username) const {
     if (!open_)

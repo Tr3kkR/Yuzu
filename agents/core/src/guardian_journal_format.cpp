@@ -193,6 +193,19 @@ std::expected<JournalBatch, JournalParseError> parse_journal_batch(std::string_v
 
     auto eit = j.find("entries");
     if (eit == j.end() || !eit->is_array()) return std::unexpected(JournalParseError::Malformed);
+    // A row larger than a batch can legally be is Malformed, so it is quarantined and counted
+    // rather than replayed (#2345 Gate 8 security/UP5-9). persist() never writes one, but the
+    // READ boundary is what has to enforce it: an oversized row - a torn write, a hand-edited
+    // kv_store.db, a future writer bug - can never fit the send window, which is floored at
+    // exactly kMaxJournalEntriesPerBatch. Left to page, such a row blocks on headroom forever
+    // and is retried every pass until retention deletes it, having consumed the journal's
+    // count and byte budget the whole time.
+    //
+    // NOTE: this makes kMaxJournalEntriesPerBatch an ON-DISK FORMAT CONTRACT. It may only ever
+    // INCREASE: lowering it in a later release would quarantine, and then capacity-shed,
+    // audit batches an earlier release wrote legitimately (#2345 Gate 2 security).
+    if (eit->size() > kMaxJournalEntriesPerBatch)
+        return std::unexpected(JournalParseError::Malformed);
 
     const auto req_str = [](const nlohmann::json& o, const char* key,
                             std::string& out) -> bool {

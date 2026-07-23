@@ -153,13 +153,24 @@ int PrincipalQuota::in_flight(const std::string& principal_id) const {
     return it == principals_.end() ? 0 : it->second.in_flight;
 }
 
-void PrincipalQuota::release(const std::string& principal_id) {
-    std::lock_guard lock(mu_);
-    auto it = principals_.find(principal_id);
-    if (it == principals_.end())
-        return;
-    if (it->second.in_flight > 0)
-        it->second.in_flight -= 1;
+void PrincipalQuota::release(const std::string& principal_id) noexcept {
+    // The lock acquisition is the one thing here that can throw (std::system_error).
+    // This function is reached from ~QuotaSlot -> an httplib releaser -> ~Response, and
+    // a destructor is implicitly noexcept, so such a throw would call std::terminate
+    // INSIDE the destructor — before unwinding could reach any caller's try/catch. A
+    // guard at the call site cannot fix that; containment only works here.
+    try {
+        std::lock_guard lock(mu_);
+        auto it = principals_.find(principal_id);
+        if (it == principals_.end())
+            return;
+        if (it->second.in_flight > 0)
+            it->second.in_flight -= 1;
+    } catch (...) {
+        // Nothing safe to do but contain it. Leaking one concurrency count is strictly
+        // better than aborting the process, and a mutex that cannot be locked means the
+        // quota accounting is already unreliable.
+    }
 }
 
 QuotaSlot::QuotaSlot(QuotaSlot&& other) noexcept
@@ -180,12 +191,15 @@ QuotaSlot& QuotaSlot::operator=(QuotaSlot&& other) noexcept {
     return *this;
 }
 
-QuotaSlot::~QuotaSlot() { reset(); }
+QuotaSlot::~QuotaSlot() noexcept { reset(); }
 
-void QuotaSlot::reset() {
+void QuotaSlot::reset() noexcept {
     if (owner_) {
-        owner_->release(principal_id_);
+        // owner_ is nulled FIRST so the slot is not re-released if release() somehow
+        // fails — idempotence must not depend on release() succeeding.
+        auto* owner = owner_;
         owner_ = nullptr;
+        owner->release(principal_id_);
     }
 }
 

@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -45,11 +46,12 @@ namespace yuzu::agent {
 class KvStore;
 class GuardianSparkRuntime;
 
-/// A monotonic token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT
-/// reset on reconnect, so a flapping agent cannot replay its whole backlog on every
-/// reconnect. It DELAYS, never skips - a batch the bucket defers pages on a later pass, and
-/// retention (not the bucket) is the only deletion path, so nothing is lost. now_ms is
-/// passed in, so the pacing is deterministic + testable.
+/// A token bucket for replay paging (rev-4.1 #8). PROCESS-LIFETIME: it is NOT reset on
+/// reconnect, so a flapping agent cannot replay its whole backlog on every reconnect. It
+/// DELAYS, never skips - a batch the bucket defers pages on a later pass, and retention (not
+/// the bucket) is the only deletion path. That holds only because refill() re-baselines on a
+/// BACKWARD clock step rather than waiting the step out; see the note there. now_ms is passed
+/// in, so the pacing is deterministic + testable.
 class YUZU_EXPORT JournalPagingBucket {
 public:
     JournalPagingBucket(double refill_per_sec, double burst)
@@ -70,8 +72,21 @@ private:
             last_ms_ = now_ms;
             return;
         }
+        // Clock stepped BACKWARD: re-baseline instead of waiting for wall time to climb back
+        // (#2345 round 7, Sol). Refilling only on now_ms > last_ms_ meant a backward step froze
+        // replay for the whole size of the step - hours, after a VM snapshot restore or an NTP
+        // correction - while retention's count and byte ceilings, which are clock-free, kept
+        // deleting on schedule. Replay stopped with deletion continuing is precisely the unsent
+        // loss this journal exists to prevent, and it is the one case the "DELAYS, never skips"
+        // note above did not hold for. Re-baselining grants no tokens, so the pacing bound is
+        // unchanged; it only stops the deferral from becoming unbounded.
+        if (now_ms < last_ms_) {
+            last_ms_ = now_ms;
+            return;
+        }
         if (now_ms > last_ms_) {
-            tokens_ = std::min(burst_, tokens_ + refill_per_sec_ *
+            // (std::min), not std::min: MSVC's min() macro would clobber it in a windows.h TU.
+            tokens_ = (std::min)(burst_, tokens_ + refill_per_sec_ *
                                                      static_cast<double>(now_ms - last_ms_) / 1000.0);
             last_ms_ = now_ms;
         }
@@ -86,6 +101,31 @@ private:
 struct JournalPageStats {
     std::size_t batches_paged{0}; ///< batches that contributed >=1 net-new record this pass
     std::size_t records_paged{0}; ///< records newly enqueued into the send window this pass
+    /// A candidate batch could not be placed because the window lacked room FOR THAT BATCH -
+    /// which is NOT the same as the window being full: headroom 255 blocks a 256-entry batch.
+    /// Distinct from placing nothing because every entry was already a member. Callers must not
+    /// conflate the two: the first means "a backlog is waiting on drain progress" and
+    /// justifies re-attempting once the drain frees room; the second is an idle steady state
+    /// where re-attempting is a full-journal rescan for nothing (#2298 Gate 4 UP-2).
+    bool headroom_blocked{false};
+    /// The pass did no work because the paging rate-limiter had no token. A FORCED page (a
+    /// reconnect kick) that lands on an empty bucket would otherwise be silently swallowed:
+    /// the pass returns clean, so the caller's "re-arm if the forced page failed" never fires
+    /// and replay waits out a whole cadence interval after the link came back (#2345 Gate 6).
+    bool deferred_no_token{false};
+    /// Entries the SMALLEST blocked batch needed. A caller must not re-attempt until at least
+    /// this much room exists; re-arming on any headroom at all meant a 1-slot opening
+    /// retriggered a full journal scan for a batch needing 256 (#2345).
+    std::size_t min_blocked_headroom{0};
+    /// Candidates skipped because they already carry a durable sent-label - in steady state,
+    /// the redundant redelivery that is no longer being generated. PER-PASS and diagnostic:
+    /// it is surfaced through GuardianMaintenanceResult for tests and callers, but has no
+    /// cumulative counter or heartbeat tag, so do not cite it as fleet-visible evidence.
+    std::size_t skipped_already_sent{0};
+    /// The sent-label scan failed, so this pass could not skip anything and fell back to
+    /// re-offering everything. Counted because that fallback is invisible otherwise: an agent
+    /// whose scan fails every pass silently returns to the old redelivery floor (#2345 Gate 8).
+    bool sent_scan_failed{false};
 };
 
 /// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the
@@ -129,7 +169,9 @@ public:
     /// sent-labels whose batch no longer survives. `now_ms` is the wall clock in ms
     /// (a parameter so age eviction is testable). Fail-safe: a read error counts
     /// prune_failures and returns, never throws, never fatal. Runs off mtx_ (KvStore
-    /// serialises itself); wired into the tick phase-2 + a boot barrier in C5.
+    /// serialises itself); wired into the drain worker's maintenance pass (C0 #2298) + a
+    /// boot barrier inside page_into_window. Honors request_stop() early and between the
+    /// per-evicted-key reads, so a stop never waits out a full retention pass.
     JournalPruneStats prune(std::int64_t now_ms);
 
     /// Replay the durable journal into `rt`'s send window (design §5; item 7 PR-Ag C5).
@@ -137,19 +179,31 @@ public:
     /// any candidate (the prune-before-page barrier). Reads unexpired batches (fallible),
     /// orders them by (ts_ms, key), and for each - rate-limited by a process-lifetime token
     /// bucket charged ONLY for net-new work - reconstructs wire-identical entries (with
-    /// replay provenance) and pages them via rt.try_page_batch. Re-send-all: nothing is
-    /// permanently skipped (membership is a window scan; retention is the only deletion).
+    /// replay provenance) and pages them via rt.try_page_batch. A batch carrying a durable
+    /// sent-label is SKIPPED unless `replay_sent` - so an ordinary pass no longer re-offers what
+    /// has already been delivered, and a labelled batch is permanently skipped until a forced
+    /// pass or retention.
     /// Takes KvStore.mu_ then outbox_mu_ SEQUENTIALLY, never nested, never the engine mtx_.
-    JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms);
+    /// `replay_sent` re-offers batches that already carry a durable sent-label. FALSE on the
+    /// ordinary cadence pass and TRUE on a forced one. Forced means every path that sets the
+    /// worker's force_page_: boot replay, the reconnect kick, AND the headroom-refill re-arm,
+    /// which fires during backlog recovery - enumerating only the first two was wrong in three
+    /// places (#2345 Gate 8).
+    JournalPageStats page_into_window(GuardianSparkRuntime& rt, std::int64_t now_ms,
+                                      bool replay_sent = false);
 
     /// Write the (best-effort) sent-label for a batch - called from the send path after the
     /// batch's LAST paged entry is delivered. Presence classifies eviction (sent-unacked vs
-    /// no-send-evidence); it never gates re-paging or deletion.
+    /// no-send-evidence) AND, since #2345 round 8, gates re-paging: page_into_window skips a
+    /// labelled batch on any non-forced pass. It still never gates deletion.
     void mark_batch_sent(const std::string& batch_key);
 
     /// Signal that shutdown has begun: a concurrent page_into_window pass observes this
     /// between batches and stops enqueuing, so a late page never mutates the send window
     /// after stop() joins the drain worker (rev-4.1 #7 stop-race gate). Idempotent, lock-free.
+    /// C0 (#2298) widened the gate: BOTH prune and page also check it on entry and at each
+    /// remaining KvStore-loop boundary, because both now run ON the drain-worker thread that
+    /// GuardianEngine::stop() joins - an unchecked full pass would become join latency.
     void request_stop() noexcept { stopping_.store(true, std::memory_order_release); }
 
     // Integrity counters (design §2 loss table). Lock-free.
@@ -170,6 +224,20 @@ public:
     }
     [[nodiscard]] std::uint64_t batches_pruned() const noexcept {
         return batches_pruned_.load(std::memory_order_relaxed);
+    }
+    /// page_into_window passes whose journal scan failed. The read is the same O(journal)
+    /// KvStore scan prune() counts under prune_failures(); without its own counter a page-side
+    /// read failure is invisible and replay silently does nothing (#2345 Gate 6 SRE).
+    [[nodiscard]] std::uint64_t page_read_failures() const noexcept {
+        return page_read_failures_.load(std::memory_order_relaxed);
+    }
+    /// Passes whose sent-label scan failed, so the pass re-offered already-delivered batches.
+    [[nodiscard]] std::uint64_t sent_scan_failures() const noexcept {
+        return sent_scan_failures_.load(std::memory_order_relaxed);
+    }
+    /// Retention passes that skipped age eviction due to an implausible forward clock jump.
+    [[nodiscard]] std::uint64_t clock_jump_skips() const noexcept {
+        return clock_jump_skips_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] std::uint64_t prune_failures() const noexcept {
         return prune_failures_.load(std::memory_order_relaxed);
@@ -262,6 +330,21 @@ public:
         inject_fail_reads_.store(n, std::memory_order_relaxed);
     }
 
+    /// TEST-ONLY: force the next `n` REPLAY scans (the list_entries at the head of
+    /// page_into_window) to fail. Deliberately a separate counter from the prune-side
+    /// injection: the point of page_read_failures() is that the two scans fail independently,
+    /// so a test that conflated them could not observe the difference. No production caller.
+    /// TEST-ONLY: force the next `n` SENT-LABEL scans to fail. Distinct from
+    /// inject_page_read_failures_for_test, which fails the candidate scan and returns before
+    /// the label read is ever reached - so without this the fallback branch is unreachable
+    /// from any test (#2345 Gate 8 QE).
+    void inject_sent_scan_failures_for_test(int n) noexcept {
+        inject_fail_sent_scans_.store(n, std::memory_order_relaxed);
+    }
+    void inject_page_read_failures_for_test(int n) noexcept {
+        inject_fail_page_reads_.store(n, std::memory_order_relaxed);
+    }
+
     /// TEST-ONLY: overwrite the size gauges directly, to stage a state the production
     /// paths reach only via a rare boot condition - e.g. the fail-closed boot seed that
     /// pins them at the hard ceiling. Used to prove a later successful prune REBASES them
@@ -346,12 +429,29 @@ private:
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
     std::atomic<int> inject_fail_reads_{0};             ///< test-only: force the next N prune scans to fail
+    std::atomic<int> inject_fail_page_reads_{0};        ///< test-only: force the next N replay scans to fail
     std::atomic<int> inject_fail_deletes_{0};           ///< test-only: force the next N retention deletes to fail
     // Paging state - all guarded by paging_mutex_ (paging is single-threaded per pass).
     std::mutex paging_mutex_;
     bool boot_pruned_{false}; ///< the prune-before-first-page barrier has run
     JournalPagingBucket page_bucket_{kJournalPageRefillPerSec, kJournalPageBurst};
     std::atomic<bool> stopping_{false}; ///< set by request_stop(); page_into_window bails on it
+    /// Last now_ms a retention pass observed, for the forward-clock-jump guard. Written only
+    /// under paging_mutex_ by prune_locked_, the single retention caller.
+    std::int64_t last_prune_now_ms_{0};
+    /// The age cutoff the last retention pass actually applied, and whether one has run.
+    /// page_into_window reuses it rather than deriving its own, so retention and replay can
+    /// never disagree about what "expired" means. Written only under paging_mutex_.
+    std::int64_t last_age_cutoff_{0};
+    bool pruned_cutoff_valid_{false};
+    /// True while the last pass declined a whole-journal age wipe, so the next one proceeds.
+    bool age_wipe_declined_{false};
+    /// Retention passes that declined to age-evict because the clock jumped implausibly far
+    /// forward. Nonzero means an endpoint's clock moved; it is NOT an error in itself.
+    std::atomic<std::uint64_t> clock_jump_skips_{0};
+    std::atomic<std::uint64_t> page_read_failures_{0};
+    std::atomic<std::uint64_t> sent_scan_failures_{0};
+    std::atomic<int> inject_fail_sent_scans_{0}; ///< test-only: fail the next N label scans
     /// Fair-rotation cursor (review B2): the last-CONSIDERED (ts_ms, key). Each pass resumes at
     /// the first candidate strictly greater and wraps, so the never-sent tail is reached instead
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT

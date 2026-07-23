@@ -69,6 +69,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Definitions](#definitions)
   - [Response Templates](#response-templates)
   - [Audit Log](#audit-log)
+  - [Access Reviews](#access-reviews)
   - [Policy Fragments](#policy-fragments)
   - [Policies](#policies)
   - [Compliance](#compliance)
@@ -2144,6 +2145,275 @@ carries a `Sec-Audit-Failed: true` header (the export still returns).
 
 ---
 
+### Access Reviews
+
+Periodic access reviews (SOC 2 **CC6.2**) — a fleet-wide export of every
+principal's current role grants, plus a durable attestation-campaign
+workflow so a reviewer (manager/security) can sign off on each grant or
+flag it for revocation. Covers all three RBAC principal types: **user**,
+**group**, and **engine**.
+
+> **#2225 chokepoint note.** These routes are deliberately gated on a
+> **GLOBAL** `AccessReview:Read`/`AccessReview:Attest`, **not** the ADR-0017
+> `authorize_list_read` admit-then-filter confinement chokepoint every new
+> per-agent list read must use. A management-group-confined slice of the
+> grant population would be **useless** as CC6.2 evidence — a reviewer
+> certifying the fleet must see the *entire* grant population, not one
+> operator's confined view of it. Access review is intentionally
+> admin/auditor-only and unconfined by design, not an oversight. See
+> `docs/auth-architecture.md` "Periodic access reviews" for the full
+> rationale. `AccessReview` is a **dedicated** securable type (not a reuse
+> of `AuditLog`) seeded only to `Administrator` and the `Reviewer` role — an
+> earlier round of this feature gated it on `AuditLog:Read`/`AuditLog:Attest`
+> instead, which over-disclosed the full grant population to the `Operator`
+> and `PlatformEngineer` roles (both seeded `AuditLog:Read` for unrelated
+> reasons, neither seeded `UserManagement:Read`/`Security:Read`, the
+> permissions gating the equivalent-sensitivity `/rbac/roles` and
+> `/engine-principals/{id}/roles` routes). See
+> `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2" for
+> the finding and fix.
+
+> **Engine-session denial, every route including reads.** Every route on
+> this surface — `GET`/list, `GET .../export`, `GET .../{id}`, and every
+> mutating route — structurally denies a caller whose *own* session is
+> engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`,
+> the same `deny_engine_session` belt the engine-principals surface uses):
+> an engine principal can never enumerate, read, or mutate any access-review
+> campaign or pull the export, not even one it opened itself via an
+> automation flow. A denied engine-classed caller gets `403`; the
+> corresponding audit verb is recorded with `result=denied` and
+> `detail="engine_session_denied"`.
+
+**Grant-table-driven completeness.** The export and every campaign freeze
+are driven by the grant table, not a roster walk — a principal with **zero**
+role grants produces no row (the export answers "who currently has access",
+not "who exists"), while a grant belonging to a principal that matches
+nothing in any roster (a since-deleted user, a stale IdP row, an OIDC/SSO
+principal minted outside every roster) is surfaced as a row with
+`source="orphan"`, `lifecycle_state="unknown"`, `display_name` equal to the
+raw `principal_id` — never silently dropped. See `docs/auth-architecture.md`
+"Periodic access reviews" → "Grant-table-driven completeness" for the full
+rationale and the non-atomic cross-substrate read caveat.
+
+#### `GET /api/v1/access-reviews/export`
+
+Stateless cross-principal grant export — every user/group/engine-principal's
+**direct** role grants right now (user rows do not include group-inherited
+access; that access appears on the group's own row). `?format=json|csv`
+(default `json`).
+
+**Permission:** `AccessReview:Read`.
+
+The export is itself audited as `access_review.exported`.
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `format` | string | No | `json` or `csv` (default `json`) |
+
+**Responses:** `200` — JSON: `data[]` of `{principal_type, principal_id,
+display_name, owner_or_email, roles[], effective_permission_count,
+last_activity_ms, last_activity_kind, classification, lifecycle_state,
+source}`. CSV: the same fields with a `Content-Disposition: attachment`
+header. `400` if `format` is not `json`/`csv`. `403` without
+`AccessReview:Read` (or an engine-classed caller — see the note above). `503` —
+**fail-loud**: a read across users, groups, engine-principals, or tokens
+failed. This endpoint never returns a silent partial export — an empty 200
+always means "no grants", never "the read partially failed". If the
+export's own audit row fails to persist, the response carries a
+`Sec-Audit-Failed: true` header (the export still returns).
+
+**CSV formula-injection neutralization.** Every CSV field is RFC-4180
+escaped, and any field whose first byte is one Excel/Sheets treats as a
+formula trigger (`=`, `+`, `-`, `@`, tab, CR) is additionally prefixed with
+a literal `'` **before** the RFC-4180 quoting pass (CWE-1236). Several
+fields on this export are influenceable by an external identity provider
+(SCIM `userName`, an engine principal's `display_name`) — this is not a
+theoretical input, and the neutralization applies unconditionally to every
+row, orphan rows included.
+
+Known scoping notes (accurate as shipped, not defects to "fix" reflexively):
+`last_activity_kind` is `"n/a"` for every user row today — `AuthDB` has no
+read accessor for last-login yet (a noted follow-up); `source="scim"` for
+users is forward-compat and not yet populated by any write path; an orphan
+row (grant with no matching roster entry — see "Grant-table-driven
+completeness" above) always carries `last_activity_kind="n/a"` and
+`classification=""` too, since there is no roster row to enrich it from. A
+**disabled** user who still holds a live grant is a normal, roster-matched
+row — `source="user"`, `lifecycle_state="disabled"` — never confused with
+an orphan row; it is exactly the kind of finding a periodic access review
+exists to surface.
+
+#### `GET /api/v1/access-reviews`
+
+List every review campaign's metadata (**not** its attestations — use
+`GET /api/v1/access-reviews/{id}` for those), newest-first, capped at the
+most recent 500. The surface an auditor needs to prove reviews ran on
+cadence without already knowing a `campaign_id` out-of-band.
+
+**Permission:** `AccessReview:Read`.
+
+**Responses:** `200` — `{data: [{campaign_id, title, status, created_by,
+created_at_ms, closed_by, closed_at_ms}], meta}`. `403` without
+`AccessReview:Read` (or an engine-classed caller). `503` — the access-review
+store is unavailable, or a genuine read failure.
+
+Audited as `access_review.list`.
+
+#### `POST /api/v1/access-reviews`
+
+Open a review campaign — freeze the **current** cross-principal grant
+population (the same rows `GET .../export` returns, expanded to one row per
+`(principal, role)` grant) into a new, durable campaign. A grant created
+after this call returns is out of scope for **this** campaign (review it in
+the next one); a grant revoked afterward stays reviewable — the frozen row
+is not re-derived from live state. This freeze-at-open property is what
+makes "every grant that existed when the campaign opened has a reviewable
+row" provable rather than assumed.
+
+**Permission:** `AccessReview:Attest`.
+
+**Request body:**
+
+```json
+{ "title": "Q3 2026 Access Review" }
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `title` | string | Yes | Human-readable campaign name |
+
+**Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
+or `title` missing/empty. `403` without `AccessReview:Attest` (or an
+engine-classed caller). `503` — the access-review store is unavailable, or
+the grant-population read failed.
+
+Audited as `access_review.campaign_opened` (`detail` carries `grants=<N>`
+on success).
+
+#### `GET /api/v1/access-reviews/{id}`
+
+Full evidentiary state of one review campaign: metadata plus every frozen
+attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
+(the review-completeness number).
+
+**Permission:** `AccessReview:Read`.
+
+**Responses:** `200` —
+
+```json
+{
+  "campaign": {
+    "campaign_id": "...", "title": "...", "status": "open",
+    "created_by": "alice", "created_at_ms": 0,
+    "closed_by": "", "closed_at_ms": 0
+  },
+  "attestations": [
+    {
+      "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
+      "decision": "pending", "reviewer": "", "decided_at_ms": 0,
+      "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." }
+    }
+  ],
+  "pending_count": 1
+}
+```
+
+`403` without `AccessReview:Read` (or an engine-classed caller). `404` — no
+campaign with that id. `503` — the access-review store is unavailable, or a
+genuine read failure.
+
+Audited as `access_review.get`.
+
+#### `POST /api/v1/access-reviews/{id}/attestations`
+
+Record one reviewer decision against a grant frozen into an open campaign.
+
+**Permission:** `AccessReview:Attest`.
+
+**Request body:**
+
+```json
+{
+  "principal_type": "user",
+  "principal_id": "bob",
+  "role_name": "Operator",
+  "decision": "attested",
+  "justification": "Confirmed still required for on-call rotation."
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `principal_type` | string | Yes | `user` \| `group` \| `engine` |
+| `principal_id` | string | Yes | Principal identifier |
+| `role_name` | string | Yes | Role being reviewed |
+| `decision` | string | Yes | `attested` \| `flagged_revoke` |
+| `justification` | string | No | Free-text reviewer note |
+
+**`flagged_revoke` records evidence ONLY — it never itself revokes the
+grant.** No RBAC/EnginePrincipal mutation happens on this path; acting on
+the flag (unassigning the role, revoking the engine principal, etc.) is a
+separate, explicit operator action performed after reading this evidence.
+flag ≠ revoke.
+
+**Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
+`principal_id`, or `role_name` missing, or `decision` is neither `attested`
+nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
+caller). `404` — no campaign with that id, no such frozen grant in it, or
+the campaign is already closed. `503` — the access-review store is
+unavailable, or a genuine write failure.
+
+**This route is an UPSERT — a second call for the same `(campaign_id,
+principal_type, principal_id, role_name)` overwrites the prior reviewer's
+decision, reviewer, and justification.** The earlier decision is not
+retained (mirrors `record_attestation`'s MCP `destructiveHint:true`, see
+`docs/mcp-server.md`).
+
+Audited as `access_review.attested` (decision `attested`) or
+`access_review.flagged` (decision `flagged_revoke`) — the two outcomes are
+separately countable/alertable, not one verb with a buried field.
+
+#### `POST /api/v1/access-reviews/{id}/close`
+
+Close an open review campaign. Does **not** require every attestation to be
+decided first — a campaign closed with `pending` rows still outstanding is
+itself evidence (an incomplete review), not something this route silently
+forces to completion.
+
+**Permission:** `AccessReview:Attest`.
+
+**Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
+(or an engine-classed caller). `404` — no campaign with that id, or already
+closed. `503` — the access-review store is unavailable, or a genuine write
+failure.
+
+Audited as `access_review.closed`.
+
+**Audit action names:**
+
+| Action | Description |
+|---|---|
+| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N>`. `result=success`. |
+| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews`. `target_type=AccessReview`. `result=success`. |
+| `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N>` on success. `result` ∈ {`success`, `failure`}. |
+| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
+| `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
+| `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
+| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}`. `target_id=<campaign_id>`. `result=success`. |
+
+Every `access_review.*` verb above additionally records `result=denied`
+(`detail="engine_session_denied"`) when the caller's own session is
+engine-classed — see the "Engine-session denial" note above.
+
+MCP twins (JSON only — the REST `?format=csv` export path has no MCP
+equivalent): `export_access_review`, `open_access_review`,
+`record_attestation`, `get_access_review`, `list_access_reviews`,
+`close_access_review`. See `docs/mcp-server.md`.
+
+---
+
 ### Policy Fragments
 
 Policy fragments are reusable check/fix/postCheck patterns that define compliance checks and auto-remediation actions.
@@ -3023,7 +3293,7 @@ RBAC permission catalog: every `securable_type` × `operation` pair the RBAC sto
   "version": 1,
   "description": "RBAC permission catalog: ...",
   "securable_types": ["Infrastructure", "InstructionDefinition", "Execution", "..."],
-  "operations": ["Read", "Write", "Execute", "Delete", "Push"],
+  "operations": ["Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"],
   "roles": [
     {
       "name": "Administrator",
@@ -5527,7 +5797,14 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | 403 | RBAC `Execution:Read` denied |
 | 404 | `{id}` does not exist in the execution tracker |
 | 410 | Execution is already in a terminal status (succeeded / completed / cancelled / failed). Tells `EventSource` to stop reconnecting. |
+| 429 | Shared held-open-stream budget exhausted (ADR-0034). Body is plain text (`too many live streams open — close a tab and retry`) with a `Retry-After: 5` header — note this surface predates the A4 envelope and does not use it. |
 | 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
+
+This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
+from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, `GET /api/v1/events`, and the
+legacy `/events` stream (ADR-0034). That means enough open drawers — or enough traffic on any
+of the other three surfaces — can cause a *new* drawer to be refused with `429`. A live stream
+is never evicted to make room.
 
 **Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
@@ -5622,7 +5899,13 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 | 403 | (perm layer) | RBAC `Execution:Read` denied |
 | 404 | A4 envelope | Execution does not exist |
 | 410 | A4 envelope | Execution already terminal |
+| 429 | A4 envelope with `retry_after_ms:5000` | Shared held-open-stream budget exhausted (ADR-0034). Remediation text: `close an existing /api/v1/events stream, or raise --max-sse-streams` |
 | 503 | A4 envelope with `retry_after_ms:5000` | Tracker or event bus not initialised (server warmup window) |
+
+This endpoint holds an HTTP worker thread open for the life of the subscription, so it
+leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
+executions drawer, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+*new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
 
@@ -5926,6 +6209,47 @@ Uninstall a pack, removing all delegated items.
 ## MCP (Model Context Protocol)
 
 The MCP endpoint enables AI models and automation tools to interact with Yuzu via JSON-RPC 2.0. Authentication is via Bearer token with an MCP tier. See [Authentication > MCP Tokens](authentication.md#mcp-tokens) for token creation details.
+
+#### `GET /mcp/v1/`
+
+The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
+`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
+(`notifications/progress`) arrive with the next 2f rung.
+
+**Permission:** the same credential as `POST /mcp/v1/`, plus the session's
+`Mcp-Session-Id` header. The credential is re-checked on every heartbeat, so revoking it
+ends a *live* stream, not just future ones.
+
+**Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
+**Optional:** `Last-Event-ID` to resume.
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| `200` | SSE stream (`text/event-stream`, chunked, held open) |
+| `400` | `Mcp-Session-Id` absent (`-32600`) |
+| `404` | Session unknown, expired, another principal's, **or** the `Last-Event-ID` cursor is outside the replay window (`-32007`) — re-initialize |
+| `403` | `Origin` not in `--mcp-allowed-origin` (`-32008`) |
+| `405` | Streaming disabled (`--mcp-no-streaming`) |
+| `406` | `Accept` did not include `text/event-stream` (`-32011`) |
+| `429` | Concurrent-stream cap, or a superseded stream on this session is still closing (`-32012`; honour `retry_after_ms`) |
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+     -H "Mcp-Session-Id: $SID" \
+     -H "Accept: text/event-stream" \
+     https://yuzu.example.com/mcp/v1/
+```
+
+Every error body carries the A4 envelope (`correlation_id`, nullable `retry_after_ms`,
+`remediation`). Streams end with a final `stream-closed` frame naming the reason.
+
+#### `DELETE /mcp/v1/`
+
+Ends the session named by `Mcp-Session-Id` (and closes its stream). `200` on success;
+`404` if the session is unknown or belongs to another principal; `400` if the header is
+absent.
 
 #### `POST /mcp/v1/`
 
