@@ -17,6 +17,7 @@
 #include "agent_registry.hpp"
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
@@ -626,6 +627,12 @@ struct McpTestServer {
     bool crl_publish_succeeds_{true};
     int crl_publish_calls_{0};
 
+    /// #2384: optionally wire an ApiTokenStore as the engine-credential store so
+    /// rotate_engine_credential / confirm_engine_rotation can be exercised
+    /// end-to-end at the MCP surface. Default nullptr keeps every existing test
+    /// on the "engine credential store unavailable" path.
+    yuzu::server::ApiTokenStore* engine_credential_store_for_test{nullptr};
+
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
     /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
     /// exercised. Default nullptr keeps every existing test on the no-store path
@@ -859,6 +866,11 @@ private:
                                            {"arch", "x64"},
                                            {"agent_version", "0.1.3"}}});
         };
+
+        // #2384: the engine-credential store rides a setter, not a
+        // build_handler param — wire before the handlers are built.
+        if (engine_credential_store_for_test)
+            mcp.set_engine_credential_store(engine_credential_store_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -1220,6 +1232,90 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
                 token_id_required = true;
         CHECK(token_id_required);
     }
+}
+
+// #2384: the confirm token_id pin, exercised end-to-end at the MCP surface —
+// rotate returns the STRUCTURAL successor's token_id, confirm requires it,
+// a wrong/missing id rejects with zero mutation, and the success audit binds
+// the attestation to the confirmed credential id. Mirrors the REST pin test
+// in test_engine_principal_lifecycle.cpp so audit-log.md's "on both REST and
+// MCP" claim is test-backed on both surfaces.
+TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
+          "[mcp][pg][engine_principal][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-pin";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start(); // tier "" -> tier_allows defers to RBAC; mock perm allows
+
+    // Rotate via the MCP tool; the response's token_id must be the STRUCTURAL
+    // successor (the row whose supersedes_token_id links to the predecessor).
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-pin"}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_body = nlohmann::json::parse(rot->body);
+    REQUIRE(rot_body.contains("result"));
+    auto rot_payload =
+        nlohmann::json::parse(rot_body["result"]["content"][0]["text"].get<std::string>());
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+    std::string structural_successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            structural_successor_id = t.token_id;
+    CHECK(successor_token_id == structural_successor_id);
+
+    // Missing token_id -> kInvalidParams with remediation, nothing consumed.
+    auto missing = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+        R"("params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:mcp-confirm-pin"}}})");
+    REQUIRE(missing->status == 200);
+    CHECK(missing->body.find("token_id is required") != std::string::npos);
+
+    // Mismatched id -> Conflict-classed rejection, both credentials intact.
+    auto mismatch = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+        R"("params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:mcp-confirm-pin","token_id":"feedfacefeedfacefeedface"}}})");
+    REQUIRE(mismatch->status == 200);
+    CHECK(mismatch->body.find("does not match the pending rotation") != std::string::npos);
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+
+    // Correct id -> confirmed; predecessor revoked; the success audit detail
+    // binds the attestation to the confirmed credential id.
+    auto ok = ts.call(
+        nlohmann::json{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 93},
+            {"params",
+             {{"name", "confirm_engine_rotation"},
+              {"arguments",
+               {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+            .dump());
+    REQUIRE(ok->status == 200);
+    auto ok_body = nlohmann::json::parse(ok->body);
+    REQUIRE(ok_body.contains("result"));
+    auto ok_payload =
+        nlohmann::json::parse(ok_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(ok_payload["confirmed"].get<bool>() == true);
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+    bool audit_bound = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("token_id=" + successor_token_id) != std::string::npos)
+            audit_bound = true;
+    CHECK(audit_bound);
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────

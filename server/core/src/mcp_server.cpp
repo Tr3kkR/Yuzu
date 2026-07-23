@@ -6494,9 +6494,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 bool found_successor = false;
                 for (const auto& t :
                     engine_credential_store_->list_active_for_principal(principal_id)) {
+                    // At most one active row links (the store clears
+                    // supersedes_token_id at cutover, revoke-resolution, and
+                    // sweep), so first match is THE successor.
                     if (!t.supersedes_token_id.empty()) {
                         successor = t;
                         found_successor = true;
+                        break;
                     }
                 }
                 // §7: every reveal — the original successor mint OR a within-grace-

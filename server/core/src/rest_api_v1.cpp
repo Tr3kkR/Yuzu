@@ -2950,10 +2950,14 @@ void RestApiV1::register_routes(
             int64_t successor_expires_at = 0;
             int64_t successor_overlap_expires_at = 0;
             for (const auto& t : token_store->list_active_for_principal(principal_id)) {
+                // At most one active row links (the store clears
+                // supersedes_token_id at cutover, revoke-resolution, and
+                // sweep), so first match is THE successor.
                 if (!t.supersedes_token_id.empty()) {
                     successor_token_id = t.token_id;
                     successor_expires_at = t.expires_at;
                     successor_overlap_expires_at = t.overlap_expires_at;
+                    break;
                 }
             }
             // G5 (secret hygiene) — same no-store contract as the mint route.
@@ -3012,7 +3016,10 @@ void RestApiV1::register_routes(
                 confirm_token_id = body["token_id"].get<std::string>();
             if (confirm_token_id.empty()) {
                 res.status = 400;
-                res.set_content(detail::a4_error(res, "token_id required"), "application/json");
+                res.set_content(detail::a4_error(res, "token_id required",
+                                                 {.remediation = "pass the token_id returned by "
+                                                                 "the rotate response"}),
+                                "application/json");
                 (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
                                "EnginePrincipal", principal_id, "token_id required");
                 return;
