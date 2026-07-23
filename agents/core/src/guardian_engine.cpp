@@ -467,6 +467,8 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.field_rejected = spark_runtime_->journal_field_rejected();
         s.clock_rejected = spark_runtime_->journal_clock_rejected();
         s.pending_depth = spark_runtime_->pending_journal_depth();
+        s.send_exceptions = spark_runtime_->send_exception_count();
+        s.lifecycle_backpressure_drops = spark_runtime_->lifecycle_backpressure_drops();
     }
     if (lifecycle_journal_) {
         s.batches_written = lifecycle_journal_->batches_written();

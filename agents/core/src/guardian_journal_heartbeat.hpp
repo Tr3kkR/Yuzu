@@ -64,6 +64,12 @@ struct GuardianJournalStats {
     /// them leaves an operator unable to tell "audit trail at risk" from "detection
     /// degraded" - the two have different urgency and different remediation.
     std::uint64_t sweep_exceptions{0};
+    // Lifecycle-audit outbox DELIVERY channel (GuardianSparkRuntime), surfaced by flip item
+    // UP-4 (governance ledger): both had accessors but reached no heartbeat tag. send_exceptions
+    // spans the lifecycle log AND the general outbox (sibling to drain_exceptions above);
+    // lifecycle_backpressure_drops is lifecycle-specific (a staging LOSS, sibling to stage_dropped).
+    std::uint64_t send_exceptions{0};              ///< a per-entry drain send THREW; head retained, that log's drain stops
+    std::uint64_t lifecycle_backpressure_drops{0}; ///< lifecycle audit entries rejected at outbox enqueue for capacity (LOSS)
 };
 
 /// Populate `tags` with the (sparse) journal telemetry. `TagMap` is any map with a string
@@ -101,6 +107,8 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_maint_exceptions", s.maint_exceptions);
     put("yuzu.guardian_drain_exceptions", s.drain_exceptions);
     put("yuzu.guardian_sweep_exceptions", s.sweep_exceptions);
+    put("yuzu.guardian_send_exceptions", s.send_exceptions);
+    put("yuzu.guardian_journal_backpressure_drops", s.lifecycle_backpressure_drops);
 }
 
 } // namespace yuzu::agent

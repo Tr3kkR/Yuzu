@@ -25,7 +25,7 @@
 /// shape `yuzu_fleet_net_*` / `yuzu_fleet_perf_*` use (design item 9,
 /// "unlabeled/low-cardinality"). These are integrity and loss signals, not
 /// distributions: the fleet question is "did ANY endpoint lose a lifecycle record",
-/// which a sum answers and a percentile obscures. 27 families, 27 series, no
+/// which a sum answers and a percentile obscures. 29 families, 29 series, no
 /// agent-controlled label anywhere - so no cardinality exposure at all (contrast the
 /// `os`-labelled families, which need an allowlist).
 ///
@@ -37,7 +37,7 @@
 /// readings against.
 ///
 /// The writer is SPARSE: a counter that is 0 ships no tag.
-/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 27 at the top of
+/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 29 at the top of
 /// every sweep and re-publishes only those at least one retained agent reported this
 /// cycle. So an absent family means: no retained agent's latest heartbeat carried a
 /// value for it that PASSED the forged-value parse. Note both edges, each pinned by a
@@ -54,13 +54,6 @@
 /// `yuzu_server_reaper_sweep_duration_seconds` for sweep liveness. An earlier revision
 /// of this header claimed `absent()` covered a stall; it does not, and the comment at
 /// the publish site in agent_registry.cpp ("never goes stale") is exactly why.
-///
-/// ── NOT HERE YET ─────────────────────────────────────────────────────────────────
-/// `gauge_underflow` (GuardianLifecycleJournal::gauge_underflow()) is deliberately
-/// absent: it is not in GuardianJournalStats or the heartbeat emit yet, and wiring it
-/// there is cutover-gated on `prefer_spark` (commit 1ffa4299). When it lands, adding
-/// it here is ONE table row - the clear, accumulate, publish and describe loops are
-/// all driven off this table.
 
 #include <charconv>
 #include <cstddef>
@@ -104,7 +97,7 @@ struct GuardianJournalMetric {
 /// agents/core/src/guardian_journal_heartbeat.hpp for reviewability; nothing depends
 /// on it.
 ///
-/// TYPE-HONESTY. All 27 are exported as `gauge` because that is what they are
+/// TYPE-HONESTY. All 29 are exported as `gauge` because that is what they are
 /// server-side - a per-sweep recomputed fleet sum, cleared and rebuilt, never
 /// monotonic: it drops when an agent ages out or restarts, and a family nobody reports
 /// goes absent.
@@ -264,6 +257,18 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "Fleet sum of firewalled throws in the outbox DELIVERY machinery. Distinct from the "
      "journal counters beside it: events are buffered but not shipping, which is a "
      "delivery fault, not a retention or audit-trail fault"},
+    {"yuzu.guardian_send_exceptions", "yuzu_fleet_guardian_send_exceptions",
+     "Fleet sum of per-entry drain SENDS that threw (UP-4). Finer-grained than "
+     "drain_exceptions above: a single entry could not be serialized/sent, so the head is "
+     "retained and that log's drain STOPS - a permanently-failing entry jams delivery for "
+     "everything behind it, distinct from a stream-down retry. Spans the lifecycle log AND "
+     "the general outbox"},
+    {"yuzu.guardian_journal_backpressure_drops", "yuzu_fleet_guardian_journal_backpressure_drops",
+     "Fleet sum of lifecycle-audit entries REJECTED at outbox enqueue because it was at "
+     "capacity (UP-4). A LOSS channel: the arm/disarm itself still succeeds - the audit "
+     "trail never blocks a real detection-capability change - but the record of it is "
+     "dropped, so a non-zero value means the audit trail is missing lifecycle edges under "
+     "sustained delivery backpressure"},
     {"yuzu.guardian_sweep_exceptions", "yuzu_fleet_guardian_sweep_exceptions",
      "Fleet sum of firewalled throws in the convergence SWEEP lanes. Drift DETECTION is "
      "degraded - the endpoint may miss policy violations - while the audit trail itself "
