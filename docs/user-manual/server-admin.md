@@ -206,7 +206,10 @@ tier + maker-checker approval gate is unchanged and remains the enforcement.
 Because MCP advertises `tools.listChanged:false`, long-lived clients should
 reconnect after this deploy to pick up the corrected hints. Not a breaking change
 (no previously-working call is rejected). Full detail: `docs/user-manual/mcp.md`
-"Available Tools".
+"Available Tools". *(Since superseded for `confirm_engine_rotation`: #2384 added
+a required `token_id` argument that pins the confirm to the exact pending
+rotation, so its `idempotentHint` is corrected back to `true` — and the new
+required argument IS a breaking change for that one unreleased tool/route.)*
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
