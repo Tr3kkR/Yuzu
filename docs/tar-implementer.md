@@ -347,3 +347,42 @@ header):
     OS rows; opt-in sources in the `default_enabled=false` cross-check),
     `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
     `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.
+
+### 8.1 Streaming sources and the `ProcStreamCollector` contract
+
+Most sources are snapshot-and-diff pollers (above). A **streaming source**
+instead consumes a live kernel event feed (ETW, Endpoint Security, an nstat
+kctl socket). The standing rule is: a streaming source implements the
+`ProcStreamCollector` lifecycle contract — `start()` returns false → caller
+degrades to the poll; `drain()` moves buffered events out each fast tick;
+`dropped()`/`kernel_dropped()` for backpressure visibility; `stalled()` +
+idle-fallback; `method_name()` for the status field — reusing the shared
+`EventRing<T>` bounded ring, **never a hand-rolled parallel ring/retry path**.
+
+The interface is **not required to be `ProcStreamCollector` itself** when the
+drained event type is not `ProcEvent`. The established precedent is
+`ImageStreamCollector` (module loads, `docs/tar-module-loads.md` §M1): a
+**sibling interface with the identical lifecycle contract**, because its
+drained type is `ModuleEvent`. The contract, not the base class, is the
+invariant.
+
+**`NstatClient` (`tar_netqual_nstat.*`) is the second such case and a
+deliberate, documented exception to a literal `ProcStreamCollector` subclass:**
+
+- Its drained lifecycle type is `NstatFlowEvent` (a TCP 4-tuple open/close),
+  not `ProcEvent`, so — exactly like `ImageStreamCollector` — it cannot be a
+  `ProcStreamCollector` subclass without templating that base on its event
+  type.
+- It carries **one extra verb the streaming contract has no room for**:
+  `snapshot_quality()`, a repeatable live-table read (no drain) that feeds the
+  `netqual` quality leg. One kctl socket backs **two** consumer surfaces (the
+  tcp lifecycle stream *and* the netqual snapshot), which the single-stream
+  `ProcStreamCollector` shape does not model.
+- It nonetheless **honours the contract verbatim**: `EventRing<NstatFlowEvent>`
+  reused (not forked), the same `start()/drain()/dropped()/kernel_dropped()/
+  stalled()/method_name()` surface, the same degrade-to-poll fallback. It adds
+  no parallel backpressure or retry idiom.
+
+If a future streaming source's drained type *is* `ProcEvent`, subclass
+`ProcStreamCollector` — do not add a third parallel interface. A new sibling
+interface is justified only by a genuinely different drained type, as here.

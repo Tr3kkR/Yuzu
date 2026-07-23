@@ -36,9 +36,9 @@ Key characteristics:
 
 - **Protocol**: JSON-RPC 2.0 over HTTP.
 - **Endpoint**: `POST /mcp/v1/` for all JSON-RPC calls. `GET`/`DELETE /mcp/v1/`
-  are also registered for the MCP Streamable HTTP transport (see
-  [Streamable HTTP sessions](#streamable-http-sessions) below); `GET` is a `405`
-  placeholder until the SSE channel ships (track 2f PR 2).
+  serve the MCP Streamable HTTP transport (see
+  [Streamable HTTP sessions](#streamable-http-sessions) below): `GET` is the
+  session's server→client SSE channel, `DELETE` ends a session.
 - **Protocol version**: negotiated on `initialize` — `2025-03-26` (default) or
   `2025-06-18`. A client that requests neither is answered `2025-03-26`; a
   present-but-unsupported `MCP-Protocol-Version` header is rejected with `400`.
@@ -176,20 +176,54 @@ change: a notification POST now answers `202` instead of `204`).
   is not allowlisted — see `--mcp-allowed-origin`); **`MCP-Protocol-Version`** is
   negotiated (`-32009` / `400` for an unsupported value); the per-principal/global
   session cap returns `-32010` / `429` on `initialize` when full.
-- **`GET /mcp/v1/`** returns `405` today — the SSE channel (`Last-Event-ID`
-  resume) and `notifications/progress` for long-running tools ship in the next 2f
-  rungs (see `docs/mcp-server.md`). **Forward guard:** when that channel lands,
-  it must adopt an engine principal's per-principal quota concurrency slot
-  into the stream's lifetime, the same as the three routes already covered
-  by the PR 4.4 quota cap — see `docs/user-manual/engine-principals.md`
-  "Per-principal quota cap" for the UP-1 rationale.
+- **`GET /mcp/v1/`** is the session's server→client **SSE channel**. It requires the
+  session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, or another
+  principal's) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
+  like `*/*` do not opt in). The stream sends heartbeats every ~3 s and supports
+  **`Last-Event-ID` resume**: reconnect with the last id you saw and the server replays
+  exactly the frames you missed from a bounded per-session ring. If your cursor has
+  already been evicted from that ring, the session is terminated and the request `404`s
+  — re-initialize; durable results remain fetchable by `execution_id`. There is never a
+  silent gap.
+  Concurrency is capped (`--max-sse-streams` globally, `--mcp-max-streams-per-principal`
+  per principal): a cap
+  hit returns `-32012` / `429` with an honest `retry_after_ms` and never evicts a live
+  stream. A second `GET` on the same session **takes over** (the older stream closes with
+  `superseded`), so a client reconnecting across a dead TCP connection is never locked
+  out by its own zombie.
+  The credential that opened a stream is re-checked on every heartbeat. On a
+  single-server deployment, revoking it ends the stream within one tick
+  (`credential_revoked`). On a **multi-replica** deployment, revocation of an
+  **API token** is not instantaneous: the token cache is per-process, so a revoke
+  handled by one replica does not reach a stream held by another until that replica's
+  own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
+  tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
+  stream simply does not exist on another replica; the bound above is an API-token
+  property.) Streams end with a final
+  `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
+  `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
+  auth store was unreachable for longer than the **60 s** grace window — the stream is not
+  cut the instant the store hiccups, but the exposure is bounded: a revoked credential
+  cannot outlive a coincident auth-store outage by more than that window).
+  Streams are held open, so a proxy in front of Yuzu must not buffer them. The server
+  sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare
+  need their own response-buffering opt-out.
+  In this release the channel carries heartbeats and replayed frames;
+  `notifications/progress` for long-running tools arrives in the next 2f rung (see
+  `docs/mcp-server.md`).
+  An engine principal's stream holds its per-principal quota **concurrency**
+  slot for the stream's whole lifetime, the same as the other streaming routes
+  covered by the PR 4.4 quota cap — so a long-lived stream counts against that
+  cap rather than releasing it at routing hand-off. See
+  `docs/user-manual/engine-principals.md` "Per-principal quota cap".
 - The session id is **transport affinity only** — never an auth credential;
   per-request token auth runs on every method regardless.
 
 The `--mcp-no-streaming` kill switch disables all of the above (no minting;
 `GET`/`DELETE` → `405`; plain POST only), useful behind a buffering reverse proxy.
 Session open/close and every denial are audited (`mcp.session.open` /
-`mcp.session.close` / `mcp.session.reject`).
+`mcp.session.close` / `mcp.session.reject`), and each stream attach/close is audited
+too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close reason).
 
 ---
 
@@ -296,6 +330,41 @@ catalogue). Each tool maps to a specific RBAC
 securable type and operation. The tier check and RBAC check both must pass
 for the tool to execute.
 
+> **Tool annotations (2g PR 2).** Every tool now advertises the four standard
+> MCP annotation hints — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+> `openWorldHint` — plus a human-readable `title`. They are generated from a
+> single-source classification (`kToolAnnotation` in `mcp_server.cpp`), so the
+> served hints cannot drift from the reviewed table, and a CI cross-check test
+> enforces their presence and coherence with each tool's dispatch class on every
+> merge. `destructiveHint` means "may overwrite, remove, or irreversibly
+> transition existing state" — it is deliberately **independent of approval
+> tier** (an approval-gated tool can be additive, e.g. `create_engine_principal`;
+> a destructive tool need not be approval-gated, e.g. `record_attestation`). The
+> hint is **advisory UX only** — the tier + maker-checker approval gate is the
+> enforcement, and a client that ignores every hint still cannot run an
+> approval-gated tool without a ticket.
+>
+> **Upgrade note — confirmation UX.** A connected agentic worker that renders a
+> confirmation prompt off `destructiveHint` will, for the first time, prompt on
+> the write tools that previously carried no annotation (`execute_instruction`,
+> `execute_bundle`, `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+> `quarantine_device`, `revoke_certificate`). This PR also **corrects three
+> shipped false-safe hints** — `confirm_engine_rotation` (`destructiveHint`
+> `false`→`true`, `idempotentHint` `true`→`false`; it revokes the predecessor
+> credential and does not pin the rotation) and `close_access_review`
+> (`destructiveHint` `false`→`true`) — and downgrades two over-warnings
+> (`create_engine_principal`, `mint_engine_credential` `destructiveHint`
+> `true`→`false`; both are additive).
+>
+> Because MCP advertises `tools.listChanged:false`, an already-connected client
+> that cached `tools/list` keeps the old (pre-fix) hints until it reconnects —
+> **long-lived MCP clients should reconnect after this deploy** to pick up the
+> corrected hints. Separately, the non-standard `safety` annotation key
+> previously present on nine read tools (`get_fleet_posture_fast`,
+> `classify_operational_question`, `get_incident_playbook`,
+> `summarize_working_set`, and the five `discover_*` tools) is **removed**; its
+> guidance now lives in those tools' descriptions.
+
 | # | Tool | Description | RBAC Permission |
 |---|------|-------------|-----------------|
 | 1 | `list_agents` | List all connected agents with hostname, OS, architecture, and version. | `Infrastructure:Read` |
@@ -323,9 +392,9 @@ for the tool to execute.
 | 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
 | 24 | `list_issued_certs` | List certificates issued by the internal CA (serial, subject, purpose, status, expiry, revocation). MCP mirror of `GET /api/v1/ca/issued`. `limit`/`offset` args. | `Security:Read` |
 | 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. | `Security:Delete` |
-| 26 | `list_dex_signals` | DEX catalogue rollup: every observation type in the window with count, blast radius, last seen. Mirrors `GET /api/v1/dex/signals`. | `GuaranteedState:Read` |
+| 26 | `list_dex_signals` | DEX catalogue rollup: every observation type in the window with count, blast radius, last seen. Optional `os` (`all`/`windows`/`linux`/`macos`) narrows to one OS's signals. Mirrors `GET /api/v1/dex/signals`. | `GuaranteedState:Read` |
 | 27 | `get_dex_signal_scope` | DEX per-OS signal coverage (distinct types + total events per platform). Mirrors `GET /api/v1/dex/scope`. | `GuaranteedState:Read` |
-| 28 | `get_dex_signal_detail` | One DEX signal's drill-down (subjects, OS split, most-affected devices, trend). Behavioral — every call emits `dex.signal.view`. Mirrors `GET /api/v1/dex/signals/{obs_type}`. | `GuaranteedState:Read` |
+| 28 | `get_dex_signal_detail` | One DEX signal's drill-down (subjects, OS split, most-affected devices, trend). Optional `os` scopes subjects/devices/by_day (echoed in the result; OS split stays cross-OS). Behavioral — every call emits `dex.signal.view`. Mirrors `GET /api/v1/dex/signals/{obs_type}`. | `GuaranteedState:Read` |
 | 29 | `get_dex_perf_fleet` | Fleet device-performance now-stats (avg/p50/p90/max + reporting population; null = nobody reported). Mirrors `GET /api/v1/dex/perf/fleet`. | `GuaranteedState:Read` |
 | 30 | `get_dex_perf_cohorts` | Fleet-relative perf percentiles per cohort of a tag key (10-device floor, untagged residual, `available_keys`). Mirrors `GET /api/v1/dex/perf/cohorts`. | `GuaranteedState:Read` |
 | 31 | `get_dex_perf_cohort_diff` | Direct A-vs-B cohort comparison (e.g. `image_type` vanilla vs layered) — diffs two cohorts head-to-head where `get_dex_perf_cohorts` benchmarks each against the fleet. `delta_pct` is A's p50 relative to B's (B the baseline), null unless both cohorts clear the floor. Mirrors `GET /api/v1/dex/perf/cohort-diff`. | `GuaranteedState:Read` |
@@ -361,6 +430,12 @@ for the tool to execute.
 | 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 62 | `transfer_engine_principal_owner` | Reassign an engine principal's named responsible owner. Admin-forced — independent of the outgoing owner's cooperation. `new_owner` is FK-validated against the user store. Mirrors `POST /api/v1/engine-principals/{id}/transfer-owner`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 63 | `audit_engine_no_admin` | Auditor-runnable proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — joins `principal_type=engine` against each principal's resolved role assignments AND effective permissions, and reports any violating row (literal admin/system role, or a full securable × operation wildcard grant). A `503`/internal-error result means the RBAC reference data needed to compute the wildcard bound could not be resolved — treat as "unable to verify," never as "clean." Mirrors `GET /api/v1/engine-principals/audit/no-admin` exactly (same checks — the two auditors must never diverge). | `AuditLog:Read` |
+| 64 | `export_access_review` (SOC 2 CC6.2) | Stateless cross-principal grant export — every user/group/engine-principal's **direct** role grants right now, with `effective_permission_count`, last activity, `classification`, `lifecycle_state`, and `source` (provenance). Mirrors `GET /api/v1/access-reviews/export` exactly, JSON only (the REST twin's `?format=csv` has no MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately gated on a **global** `AccessReview:Read`, not a management-group-confined read — a scoped slice would be useless as fleet-wide CC6.2 evidence (#2225). Self-audited as `access_review.exported`. | `AccessReview:Read` |
+| 65 | `open_access_review` (SOC 2 CC6.2) | Open a review campaign — freeze the CURRENT cross-principal grant population (`export_access_review` expanded to one row per `(principal, role)` grant) into a new, durable campaign for reviewer attestation. A grant created after this call returns is out of scope for **this** campaign (review it in the next one); a grant revoked afterward stays reviewable (frozen, not re-derived from live state). Mirrors `POST /api/v1/access-reviews`. Records evidence and does not itself change any access grant. Self-audited as `access_review.campaign_opened`. Requires the `title` arg. | `AccessReview:Attest` |
+| 66 | `record_attestation` (SOC 2 CC6.2) | Record one reviewer decision against a grant frozen into an open campaign — `attested` (still appropriate) or `flagged_revoke` (should be revoked). **flag ≠ revoke: this tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant.** Acting on a `flagged_revoke` decision is a separate, explicit role-unassignment or engine-principal-revoke call an operator makes after reading this evidence. **UPSERT — `destructiveHint:true`:** a second call for the same `(campaign_id, principal_type, principal_id, role_name)` overwrites the prior reviewer's decision/reviewer/justification; the earlier decision is not retained. Mirrors `POST /api/v1/access-reviews/{id}/attestations`. Self-audited as `access_review.attested` or `access_review.flagged` (by decision). | `AccessReview:Attest` |
+| 67 | `get_access_review` (SOC 2 CC6.2) | Full evidentiary state of one review campaign: metadata plus every frozen attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`. Mirrors `GET /api/v1/access-reviews/{id}`. Self-audited as `access_review.get`. | `AccessReview:Read` |
+| 68 | `list_access_reviews` (SOC 2 CC6.2) | List every review campaign's metadata (**not** its attestations — use `get_access_review` for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence without already knowing a `campaign_id` out-of-band. Mirrors `GET /api/v1/access-reviews`. Self-audited as `access_review.list`. | `AccessReview:Read` |
+| 69 | `close_access_review` (SOC 2 CC6.2) | Close an open review campaign. Does **not** require every attestation to be decided first — a campaign closed with `pending` rows still outstanding is itself evidence (an incomplete review), not something this tool silently forces to completion. Closing is a **one-way lifecycle transition** (there is no reopen path) that permanently freezes every still-`pending` attestation — `destructiveHint:true`. It deletes no evidence (attestation rows are untouched), but the campaign's own `open`→`closed` state is irreversibly transitioned, which is what the hint reflects (corrected from a shipped `destructiveHint:false` — 2g PR 2). Mirrors `POST /api/v1/access-reviews/{id}/close`. Self-audited as `access_review.closed`. | `AccessReview:Attest` |
 
 > **Engine-principal tools — tier behavior (ADR-1005 item 2b, plan PR 4.3):**
 > the six **mutating** tools (`create_engine_principal`, `revoke_engine_principal`,
@@ -451,6 +526,9 @@ for the tool to execute.
 
 > **A2 discovery tools (`discover_permissions`/`discover_instructions`/`discover_routes`/`discover_scope_kinds`/`discover_plugins`) — roadmap Issue 17.1:**
 > Each is a read-only mirror of its `GET /api/v1/discover/*` REST sibling (see `docs/user-manual/rest-api.md` → Discovery (A2) for the full response shapes) — both surfaces call the SAME builder function internally, so they cannot drift from each other. Take no arguments. `discover_scope_kinds` and `discover_routes` are compiled-in/self-contained and always answer; `discover_permissions`/`discover_instructions`/`discover_plugins` return a JSON-RPC error if the underlying store/agent registry is unavailable server-side (there is no HTTP-status channel in JSON-RPC for the REST siblings' `503`). None of the five write anything or require an audit-worthy per-device read, so none is gated by MCP tier beyond the standard RBAC permission check, and none appears in the executions drawer.
+
+> **Periodic access review tools (`export_access_review`/`open_access_review`/`record_attestation`/`get_access_review`/`list_access_reviews`/`close_access_review`) — SOC 2 CC6.2:**
+> Full REST + concept doc: `docs/user-manual/rest-api.md` → Access Reviews, `docs/auth-architecture.md` → "Periodic access reviews". `export_access_review`, `get_access_review`, and `list_access_reviews` are `readOnlyHint:true`. **`record_attestation` carries `destructiveHint:true`** — it is an UPSERT: a second call for the same `(campaign_id, principal_type, principal_id, role_name)` overwrites the prior reviewer's decision/reviewer/justification, with no retained history of the earlier decision. `close_access_review` also carries `destructiveHint:true` — closing is a one-way lifecycle transition (no reopen path) that permanently freezes outstanding attestations. The other four (`export_access_review`, `open_access_review`, `get_access_review`, `list_access_reviews`) are `destructiveHint:false` — `open_access_review` mints campaign evidence but never touches a live access grant. **flag ≠ revoke:** `record_attestation`'s `decision:"flagged_revoke"` records that a reviewer believes a grant should be revoked — it never itself unassigns a role or revokes an engine principal; acting on the flag is a separate, explicit operator action (the destructive part of the annotation is the decision-overwrite, not a live grant mutation). JSON only — the REST `?format=csv` export path has no MCP twin; use the REST endpoint directly for a CSV download. All six tools are gated on a **global**, **dedicated** `AccessReview:Read`/`AccessReview:Attest` (not `AuditLog:*` — an earlier round gated on the latter, which over-disclosed the fleet-wide grant population; see `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2"), deliberately not the ADR-0017 confinement-filtered list gate — a scoped slice of the grant population would be useless as fleet-wide CC6.2 evidence (#2225) — and every one of them, reads included, structurally denies a caller whose own session is engine-classed.
 
 ### Tool parameters
 
@@ -841,6 +919,35 @@ never evicted to make room.
 > deployment gives each engine principal N x the configured cap) and is
 > metric-only — `yuzu_server_principal_quota_exhausted_total{side,limit}` —
 > with **no** audit row (see `docs/user-manual/audit-log.md`).
+
+### -32011: Not acceptable (HTTP 406)
+
+**Symptom**: `GET /mcp/v1/` returns `-32011` / HTTP `406`.
+
+**Cause**: The request did not ask for SSE. The GET channel is SSE-only and fails
+closed: it requires `Accept: text/event-stream` as an explicit whole media type.
+Wildcards (`*/*`, `text/*`) deliberately do **not** opt in — the server will not guess
+that a client which asked for anything wanted a held-open stream.
+
+**Fix**: Send `Accept: text/event-stream` on the GET.
+
+### -32012: Stream limit reached (HTTP 429)
+
+**Symptom**: `GET /mcp/v1/` returns `-32012` / HTTP `429` with a non-null
+`retry_after_ms` in the A4 `error.data`.
+
+**Cause**: One of two things, distinguished by the `remediation` text. Either the
+concurrent-stream cap is full (`--max-sse-streams`, shared with every other streaming
+surface, or the per-principal `--mcp-max-streams-per-principal`) — each held-open
+stream pins one HTTP worker, so this is a real resource limit, and a live stream is
+never evicted to admit a new one;
+or a previous stream on **this session** was superseded and its connection has not
+finished closing yet (`retry_after_ms` is short — the handover clears in well under a
+second).
+
+**Fix**: Honour `retry_after_ms`. Close a stream you no longer need (drop the GET
+connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
+in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
 
 ### -32004: MCP tier does not allow this operation
 

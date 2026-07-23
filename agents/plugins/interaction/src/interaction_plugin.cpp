@@ -47,6 +47,8 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#else
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (arch-L1)
 #endif
 
 namespace {
@@ -112,22 +114,22 @@ bool require_param(yuzu::CommandContext& ctx, std::string_view value,
 }
 
 #if !defined(_WIN32)
+// A generous per-call wall-clock bound for the interaction shell-outs. osascript
+// dialogs are interactive and can legitimately block on a user, so this is
+// deliberately long — it only fires on a genuinely wedged invocation.
+constexpr std::chrono::seconds kInteractionCmdDeadline{120};
+
 /**
- * Run a command via popen and capture the first line of output.
- * Returns the output string (may be empty).
+ * Run a command and capture its output. Routed through the bounded,
+ * fork-lock-covered, CLOEXEC-pipe runner (arch-L1) instead of a raw popen, whose
+ * pipe is never CLOEXEC and whose fork is unserialized against the agent's other
+ * launchers. `/bin/sh -c` preserves the exact shell semantics popen used.
  */
 std::string run_command(const std::string& cmd) {
-    std::string output;
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return output;
-
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
-    }
-    pclose(pipe);
-
-    // Trim trailing newline
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
+    std::string output = res.output;
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
         output.pop_back();
     }
@@ -135,27 +137,53 @@ std::string run_command(const std::string& cmd) {
 }
 
 /**
- * Run a command via popen and return the exit code.
+ * Run a command and return its exit code. Runner-backed (arch-L1). Returns the
+ * -1 signal-death sentinel on a deadline/cancel kill, matching the old
+ * pclose(!WIFEXITED) path.
  */
 int run_command_status(const std::string& cmd) {
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return -1;
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
+    return res.exit_code;
+}
 
-    // Drain output
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        // discard
+/**
+ * Result of run_command_capture(): the captured output plus the process
+ * exit code, from a single run_bounded_subprocess round trip.
+ */
+struct CommandResult {
+    std::string output;
+    int exit_code = -1;
+};
+
+/**
+ * Run a command via popen, capturing both its output and its exit status
+ * in one invocation (unlike calling run_command() + run_command_status()
+ * separately, which would run an interactive command — e.g. an osascript
+ * dialog — twice).
+ *
+ * Used on macOS to tell "osascript ran and produced this text" apart from
+ * "osascript failed" (non-zero exit, e.g. no reachable GUI session for the
+ * daemon to display a dialog on) so failure is never mistaken for a
+ * successful-but-unrecognized response.
+ */
+CommandResult run_command_capture(const std::string& cmd) {
+    // One runner invocation yields both output and exit code (arch-L1) — the
+    // same single-round-trip contract the popen version had, now bounded,
+    // fork-lock-covered, and with CLOEXEC pipes. exit_code is WEXITSTATUS on a
+    // natural exit, -1 on a deadline/cancel signal-kill.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
+    CommandResult result;
+    result.output = res.output;
+    result.exit_code = res.exit_code;
+    while (!result.output.empty() &&
+           (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
     }
-    int status = pclose(pipe);
-#if defined(__linux__) || defined(__APPLE__)
-    // pclose returns the wait status; extract exit code
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return -1;
-#else
-    return status;
-#endif
+    return result;
 }
 #endif // !_WIN32
 
@@ -225,10 +253,17 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
     int rc = run_command_status(cmd);
     if (rc == 0) {
         ctx.write_output("status|ok");
-    } else {
-        ctx.write_output("status|error|osascript failed");
+        return 0;
     }
-    return 0;
+    // Non-zero exit from osascript on a daemon most often means there is
+    // no reachable GUI session to post the notification to. Report that
+    // honestly rather than a bare "failed" (which reads like a bug in
+    // this plugin rather than an environment limitation) — but still
+    // return non-zero so the agent core records this command as a
+    // terminal FAILURE rather than SUCCESS, since nothing was ever shown
+    // to the user.
+    ctx.write_output("status|unavailable|no reachable GUI session");
+    return 1;
 }
 
 #elif defined(__linux__)
@@ -356,9 +391,14 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
         break;
     case yuzu::interaction::DialogOutcome::not_reachable:
         // No GUI session / TCC denial / osascript failure — honest status,
-        // never a fabricated button. Rides the new `status` result column.
+        // never a fabricated button. Rides the new `status` result column AND
+        // returns terminal FAILURE so a generic success/failure consumer (the
+        // executions drawer, retry/automation logic) does not read a dialog
+        // that was never shown as SUCCESS. This matches the sibling actions
+        // notify/input/survey, which already return 1 for the identical
+        // undeliverable-session condition.
         ctx.write_output("status|not_reachable");
-        break;
+        return 1;
     }
     return 0;
 }
@@ -459,20 +499,28 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
     std::string safe_prompt = sanitize(prompt);
     std::string safe_default = sanitize(default_value);
 
+    // "on error number err_num" + re-raising every code other than -128
+    // (the AppleScript "User canceled" error) ensures only a genuine Cancel
+    // click is converted to the "##CANCELLED##" sentinel at exit 0; any
+    // other failure (e.g. no reachable GUI session) propagates as a
+    // non-zero osascript exit so it is never misreported as cancellation.
     std::string cmd = std::format(
         "osascript -e 'try' -e 'set result to text returned of "
         "(display dialog \"{}\" with title \"{}\" default answer \"{}\")' "
-        "-e 'return result' -e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
+        "-e 'return result' -e 'on error number err_num' "
+        "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+        "-e 'error number err_num' -e 'end try' 2>&1",
         safe_prompt, safe_title, safe_default);
 
-    std::string output = run_command(cmd);
+    auto result = run_command_capture(cmd);
 
-    if (output == "##CANCELLED##") {
-        ctx.write_output("cancelled|true");
-    } else {
-        ctx.write_output(std::format("response|{}", output));
-    }
-    return 0;
+    // The exit-code/output decision is the pure classify_input_capture (qe-L2,
+    // unit-tested): a non-zero exit is a delivery failure reported as an honest
+    // status|unavailable (never the error text wrapped as a response), the
+    // ##CANCELLED## sentinel is a user cancel, everything else is real input.
+    auto decision = yuzu::interaction::classify_input_capture(result.exit_code, result.output);
+    ctx.write_output(decision.output_line);
+    return decision.rc;
 }
 
 #elif defined(__linux__)
@@ -731,9 +779,10 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                     const std::vector<SurveyQuestion>& questions) {
-    // macOS: sequential osascript dialogs for each question
-    ctx.write_output("cancelled|false");
-
+    // macOS: sequential osascript dialogs for each question. "cancelled|false"
+    // is emitted only after every question below has succeeded (see the tail
+    // of this function) — emitting it up front here would contradict a later
+    // "status|unavailable" or "cancelled|true" for the very same survey.
     for (size_t i = 0; i < questions.size(); ++i) {
         const auto& q = questions[i];
         std::string safe_prompt = sanitize(q.prompt);
@@ -744,51 +793,107 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 "osascript -e 'try' -e 'set r to button returned of "
                 "(display dialog \"{}\" with title \"{}\" buttons {{\"No\", \"Yes\"}} "
                 "default button \"Yes\")' -e 'return r' "
-                "-e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
+                "-e 'on error number err_num' "
+                "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+                "-e 'error number err_num' -e 'end try' 2>&1",
                 safe_prompt, safe_title);
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            auto result = run_command_capture(cmd);
+            if (result.exit_code != 0) {
+                // osascript failed outright (not the AppleScript-level "on
+                // error", which exits 0) — no reachable GUI session. Stop
+                // the survey rather than fabricate an answer. Non-zero
+                // return so the agent core records this command as a
+                // terminal FAILURE rather than SUCCESS.
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 1;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i,
-                out.find("Yes") != std::string::npos ? "yes" : "no"));
+            // The AppleScript's button set is exactly {"No", "Yes"}, so a
+            // successful invocation should return exactly one of those two
+            // labels. Match exactly rather than by substring — anything
+            // else is unrecognized output, not a "no" answer, so it is
+            // reported honestly (non-zero) instead of fabricated.
+            if (result.output == "Yes") {
+                ctx.write_output(std::format("answer_{}|yes", i));
+            } else if (result.output == "No") {
+                ctx.write_output(std::format("answer_{}|no", i));
+            } else {
+                ctx.write_output("status|unavailable|unrecognized osascript response");
+                return 1;
+            }
 
         } else if (q.type == "choice" && !q.choices.empty()) {
             // Build AppleScript choose from list
             std::string items;
+            std::vector<std::string> safe_choices;
+            safe_choices.reserve(q.choices.size());
             for (size_t ci = 0; ci < q.choices.size(); ++ci) {
                 if (ci > 0) items += ", ";
-                items += "\"" + sanitize(q.choices[ci]) + "\"";
+                safe_choices.push_back(sanitize(q.choices[ci]));
+                items += "\"" + safe_choices.back() + "\"";
             }
             std::string cmd =
                 "osascript -e 'try' -e 'set r to choose from list {" + items +
                 "} with title \"" + safe_title + "\" with prompt \"" + safe_prompt +
                 "\"' -e 'if r is false then' -e 'return \"##CANCELLED##\"' "
                 "-e 'else' -e 'return item 1 of r' -e 'end if' "
-                "-e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1";
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+                "-e 'on error number err_num' "
+                "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+                "-e 'error number err_num' -e 'end try' 2>&1";
+            auto result = run_command_capture(cmd);
+            if (result.exit_code != 0) {
+                // Non-zero return so the agent core records this command
+                // as a terminal FAILURE rather than SUCCESS.
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 1;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, out));
+            // "choose from list" can only return an item from the list we
+            // supplied. Confirm the output matches one of the sanitized
+            // choices we offered rather than trusting it blindly — output
+            // that matches none of them is unrecognized, not a genuine
+            // selection, so it is reported honestly (non-zero) instead of
+            // fabricated.
+            bool recognized = std::find(safe_choices.begin(), safe_choices.end(),
+                                        result.output) != safe_choices.end();
+            if (!recognized) {
+                ctx.write_output("status|unavailable|unrecognized osascript response");
+                return 1;
+            }
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
 
         } else {
             // text input
             std::string cmd = std::format(
                 "osascript -e 'try' -e 'set r to text returned of "
                 "(display dialog \"{}\" with title \"{}\" default answer \"\")' "
-                "-e 'return r' -e 'on error' -e 'return \"##CANCELLED##\"' -e 'end try' 2>&1",
+                "-e 'return r' -e 'on error number err_num' "
+                "-e 'if err_num is -128 then return \"##CANCELLED##\"' "
+                "-e 'error number err_num' -e 'end try' 2>&1",
                 safe_prompt, safe_title);
-            std::string out = run_command(cmd);
-            if (out == "##CANCELLED##") {
+            auto result = run_command_capture(cmd);
+            if (result.exit_code != 0) {
+                // Non-zero return so the agent core records this command
+                // as a terminal FAILURE rather than SUCCESS.
+                ctx.write_output("status|unavailable|no reachable GUI session");
+                return 1;
+            }
+            if (result.output == "##CANCELLED##") {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, out));
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
         }
     }
+    // All questions completed without failure or cancellation — only now is
+    // it accurate to report the survey as not cancelled.
+    ctx.write_output("cancelled|false");
     ctx.write_output(std::format("question_count|{}", questions.size()));
     return 0;
 }

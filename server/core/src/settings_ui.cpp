@@ -361,6 +361,26 @@ extern const char* const kSettingsHtml =
 
 )HTM"
     R"HTM(
+    <!-- ── Access Reviews (SOC 2 CC6.2) ──────────────────── -->
+    <div class="section">
+      <div class="section-header">Access Reviews</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Periodic review evidence for every user/group/engine-principal's direct role grants.
+          This panel is a convenience view — the REST API (<code>/api/v1/access-reviews*</code>)
+          and MCP twins are the primary surface.
+        </p>
+        <div id="access-review-section"
+             hx-get="/fragments/settings/access-reviews"
+             hx-trigger="load, refreshAccessReview from:body"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+)HTM"
+    R"HTM(
     <!-- ── Auto-Approve Policies ─────────────────────────── -->
     <div class="section">
       <div class="section-header">Auto-Approve Policies</div>

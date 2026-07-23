@@ -20,6 +20,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -27,7 +29,15 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -151,7 +161,9 @@ struct SparkReconcileFixture {
     std::mutex sent_mu;
     std::vector<OutboxEntry> sent;
 
-    SparkReconcileFixture() {
+    /// `periodic_bound_ms > 0` pins the drain worker's backstop before it is constructed,
+    /// so a test can attribute a page to the reconnect kick rather than the backstop.
+    explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -163,6 +175,8 @@ struct SparkReconcileFixture {
 
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
         REQUIRE(engine->start_local().has_value());
+        if (periodic_bound_ms > 0)
+            engine->set_drain_worker_timing_for_test(periodic_bound_ms);
         engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
                                   [this](const OutboxEntry& e) {
                                       std::lock_guard<std::mutex> lk{sent_mu};
@@ -513,11 +527,33 @@ TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left 
     CHECK_FALSE(rows->empty()); // durable after stop's final flush
 }
 
-TEST_CASE("prefer_spark=true: page_journal runs a paging pass", "[spark][guardian][reconcile][journal]") {
-    SparkReconcileFixture f;
-    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 0);
+TEST_CASE("prefer_spark=true: page_journal kicks the drain worker into a paging pass",
+          "[spark][guardian][reconcile][journal]") {
+    // C0 (#2298 gate 1): page_journal no longer pages INLINE on the caller's (reconnect)
+    // thread - it wakes the drain worker, which runs the pass. Same observable replay, minus
+    // a full KvStore scan on the thread that has just re-established the stream.
+    //
+    // The worker's backstop is pinned to an hour BEFORE it is constructed, and the page
+    // cadence defaults to 30 s, so within this test's window the ONLY thing that can cause a
+    // paging pass is the kick. Without that pin the production 5 s backstop is already
+    // ticking through fixture setup and could fire inside the assertion window, letting this
+    // pass for the wrong reason (Gate 3 quality-engineer BLOCKING-1).
+    SparkReconcileFixture f{/*periodic_bound_ms=*/3'600'000};
+    auto* journal = f.engine->lifecycle_journal_for_test();
+
+    // The worker forces one page on its first cycle (boot replay); wait that out first so the
+    // assertion below is attributable solely to the kick.
+    const auto deadline0 = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (journal->pages() == 0 && std::chrono::steady_clock::now() < deadline0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(journal->pages() >= 1);
+
+    const auto before = journal->pages();
     f.engine->page_journal();
-    CHECK(f.engine->lifecycle_journal_for_test()->pages() == 1); // it paged (not gated out)
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (journal->pages() == before && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(journal->pages() > before); // only the kick could have caused this
 }
 
 TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal untouched)",
@@ -578,5 +614,303 @@ TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertnes
     CHECK(tags.empty());
 
     engine.stop();
+    spark_engine.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Death test: the drain worker taking GuardianEngine::mtx_ must ABORT, not hang.
+// ---------------------------------------------------------------------------
+#ifndef _WIN32
+
+TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
+          "[spark][guardian][reconcile][journal][death]") {
+    // The invariant under test is the one that hangs a fleet: GuardianEngine::stop() holds
+    // mtx_ across its whole body AND joins the drain worker inside it, so an mtx_ acquisition
+    // on that worker deadlocks agent shutdown. WorkerHostileMutex is supposed to turn that
+    // into a loud crash. Until now that abort was wired and its predicate was tested, but the
+    // abort itself never executed - so this proves the actual failure mode, in a subprocess,
+    // because a passing run necessarily kills the process it happens in.
+    //
+    // The hostile call is placed in the INJECTED SEND, deliberately: that is the real
+    // exposure (an arbitrary std::function supplied from agent.cpp), not the journal pointer
+    // the first hardening round guarded.
+    if constexpr (!yuzu::agent::worker_mutex_guard_enabled()) {
+        SUCCEED("WorkerHostileMutex is compiled out in this build; nothing to prove");
+        return;
+    }
+
+    // fork() WITHOUT exec. Safe here because Catch2 runs test cases sequentially and this one
+    // starts no threads before forking, so no other thread can hold a libc lock at fork time.
+    // The child is short-lived and aborts; it never returns to the harness.
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+
+    if (pid == 0) {
+        // ---- child ----
+        // Hand SIGABRT back to the default handler first. Catch2 installs its own fatal-signal
+        // handler, which would intercept the abort, print a spurious "FAILED ... SIGABRT" from
+        // the child into the parent's output, and make a PASSING run look like a failure.
+        // With SIG_DFL the child dies silently and the parent observes the signal, which is
+        // the whole assertion.
+        ::signal(SIGABRT, SIG_DFL);
+
+        auto opened = KvStore::open(unique_kv_path());
+        if (!opened)
+            ::_exit(90); // distinct codes so the parent can tell setup failure from no-abort
+        KvStore kv{std::move(*opened)};
+
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        if (!spark_engine.register_mechanism(SparkType::Service, std::move(mech)))
+            ::_exit(91);
+        spark_engine.start();
+
+        GuardianEngine engine{&kv, "agent-death", /*prefer_spark=*/true};
+        if (!engine.start_local())
+            ::_exit(92);
+
+        // The send runs ON the worker thread and reaches for mtx_ via journal_stats().
+        engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                                 [&engine](const OutboxEntry&) {
+                                     (void)engine.journal_stats(); // takes mtx_ -> must abort
+                                     return SendResult::Sent;
+                                 });
+        if (engine.spark_availability() != GuardianEngine::SparkAvailability::Available)
+            ::_exit(93);
+
+        // Arm a rule so an "armed" lifecycle entry enters the outbox and the worker drains it
+        // through the hostile send.
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        *p.add_rules() = make_service_rule("r1");
+        (void)yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
+
+        // If the guard works we never get here - the worker aborts the whole process. Give it
+        // a bounded window, then report "no abort" with a distinct code.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        ::_exit(94);
+    }
+
+    // ---- parent ----
+    // Poll rather than blocking in waitpid: if the guard has regressed, the child DEADLOCKS
+    // (that being the bug) and a blocking wait would hang the whole suite instead of failing.
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(r == 0); // -1 would be a wait error, not a still-running child
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited: the worker took mtx_ and DEADLOCKED instead of aborting - "
+             "exactly the fleet-wide shutdown hang WorkerHostileMutex exists to prevent");
+    }
+
+    INFO("child exit code (if it exited normally): " << (WIFEXITED(status) ? WEXITSTATUS(status)
+                                                                          : -1));
+    REQUIRE(WIFSIGNALED(status));            // died by signal, not a clean exit
+    CHECK(WTERMSIG(status) == SIGABRT);      // and specifically via std::abort()
+}
+
+#endif // !_WIN32
+
+TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
+          "[spark][guardian][reconcile][journal][boot]") {
+    // Every other test here (and SparkReconcileFixture itself) calls start_local() BEFORE
+    // wire_spark_engine(). Production does the reverse - agent.cpp:969-1001 wires first and
+    // documents it as a header contract - so the order that actually ships was untested
+    // (#2298 Sol review).
+    //
+    // It matters because of C0: wire_spark_engine() start()s the drain worker, whose first
+    // cycle runs IMMEDIATELY and does journal maintenance against the KvStore. start_local()
+    // then loads cached rules and re-arms them from the SAME single-mutex KvStore. If that
+    // contention delayed or broke the pre-network re-arm, it would mean enforcement gaps at
+    // boot on every endpoint after the prefer_spark flip.
+    const auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{kv_path};
+
+    // Phase 1: an engine that persists cached rules AND a durable journal, then goes away.
+    {
+        auto opened = KvStore::open(kv_path);
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                                std::make_unique<FakeServiceMechanism>())
+                    .has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Retain; });
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        for (int i = 0; i < 5; ++i)
+            *p.add_rules() = make_service_rule("r" + std::to_string(i));
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
+                    .exit_code == 0);
+        engine.journal_maintenance_tick(); // force the pending records durable
+        engine.stop();
+        spark_engine.stop();
+    }
+
+    // Phase 2: a fresh boot in PRODUCTION order over that same store.
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    // WIRE FIRST - the worker starts here and immediately begins journal maintenance.
+    engine.wire_spark_engine(&spark_engine, false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    // ...and only THEN the pre-network re-arm, racing that maintenance on one KvStore.
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(engine.start_local().has_value());
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // The re-arm must not have been starved by the boot maintenance scan. The KvStore busy
+    // timeout is 5 s, so anything approaching it means the two are serialising badly.
+    CHECK(elapsed < std::chrono::seconds(2));
+    CHECK(engine.rule_count() == 5); // every cached rule came back
+
+    // And the journal side still did its work rather than being crowded out.
+    auto* journal = engine.lifecycle_journal_for_test();
+    REQUIRE(journal != nullptr);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (journal->pages() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(journal->pages() >= 1);
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins the drain worker",
+          "[spark][guardian][reconcile][journal][chaos]") {
+    // stop() joins the drain worker, and that join is a blocking wait on a send that may be
+    // blackholed. A persist placed only AFTER the join never runs if a supervisor's stop
+    // timeout or an operator kill lands in that window, and the staged records are destroyed -
+    // real loss of an audit record, not the at-least-once redelivery the design guarantees.
+    //
+    // The observable has to be taken WHILE the join is still blocked; asserting after stop()
+    // returns cannot tell the two orderings apart, because the post-join flush persists the
+    // same record either way. RED with the pre-join persist removed: the journal is still
+    // empty on disk at the moment the join is stuck.
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+
+    std::mutex send_mu;
+    std::condition_variable send_cv;
+    bool in_send = false;   ///< the worker is parked inside a send
+    bool release = false;   ///< test lets it finish
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [&](const OutboxEntry&) {
+                                 std::unique_lock<std::mutex> lk{send_mu};
+                                 in_send = true;
+                                 send_cv.notify_all();
+                                 send_cv.wait(lk, [&] { return release; });
+                                 return SendResult::Sent;
+                             });
+
+    // RAII safety net (mirrors OrphanExitGuard in agents/core/src/hard_exit.hpp):
+    // the send callback above parks the drain worker on `release`. If a REQUIRE
+    // below fires while the worker is en route to (or already parked in) that
+    // callback, Catch2 unwinds this scope; without releasing the worker first,
+    // ~GuardianEngine's stop()-join blocks on a `release` that never flips and
+    // the still-live worker races the destruction of these stack-local sync
+    // primitives - the #1648 non-Catch2 process exit (42) that defeats
+    // flake-retry classification and hard-blocks the whole agent suite. Declared
+    // AFTER `engine` so reverse-declaration-order destruction runs this FIRST:
+    // the worker is released (then joined by ~GuardianEngine) while send_mu/
+    // send_cv/release are still alive, so any assertion failure exits as an
+    // ordinary, classifiable Catch2 failure instead of a crash.
+    struct ReleaseParkedWorker {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release_flag;
+        ~ReleaseParkedWorker() {
+            {
+                std::lock_guard<std::mutex> lk{mu};
+                release_flag = true;
+            }
+            cv.notify_all();
+        }
+    } release_parked_worker{send_mu, send_cv, release};
+
+    // One injected write failure leaves the armed rule's record PENDING rather than durable,
+    // so what reaches disk later is attributable to a stop()-path persist and nothing else.
+    engine.lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    gpb::GuaranteedStatePush push;
+    push.set_full_sync(true);
+    *push.add_rules() = make_service_rule("r1");
+    engine.apply_rules(push);
+    REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
+
+    {   // Park the worker inside a send, so the join below cannot complete.
+        // Generous deadline: on a saturated Windows CI runner the drain worker can
+        // be starved well past its ~5 s periodic backstop before it reaches the
+        // send callback (box-contention flake, not a logic bug - see the WeeTam
+        // agent-suite timeouts). The deadline is NOT shrunk by pinning the
+        // backstop cadence: a short backstop would let the worker persist the
+        // pending record on its own timer BEFORE the stop()-path persist, which
+        // would defeat this test's whole attribution. If the worker still misses
+        // this window, ReleaseParkedWorker above makes the failure exit cleanly.
+        std::unique_lock<std::mutex> lk{send_mu};
+        REQUIRE(send_cv.wait_for(lk, std::chrono::seconds(30), [&] { return in_send; }));
+    }
+
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper{[&] {
+        engine.stop();
+        stop_returned.store(true, std::memory_order_release);
+    }};
+
+    // The assertion: the record reaches disk while stop() is still stuck in the join.
+    bool durable_during_join = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto rows = kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+        if (rows.has_value() && !rows->empty()) {
+            // Confirm the join really is still outstanding, so this cannot pass by observing
+            // the POST-join flush of a stop() that had already returned.
+            durable_during_join = !stop_returned.load(std::memory_order_acquire);
+            break;
+        }
+        if (stop_returned.load(std::memory_order_acquire))
+            break; // stop() finished with nothing on disk: the pre-join persist did not happen
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(durable_during_join);
+
+    {
+        std::lock_guard<std::mutex> lk{send_mu};
+        release = true;
+    }
+    send_cv.notify_all();
+    stopper.join();
     spark_engine.stop();
 }

@@ -1,5 +1,9 @@
 #include "guardian_convergence_scheduler.hpp"
 
+#include "guardian_joined_thread_role.hpp"
+
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 
 namespace yuzu::agent {
@@ -65,8 +69,27 @@ std::chrono::milliseconds ConvergenceScheduler::jittered(std::uint64_t base_ms,
     return std::chrono::milliseconds{std::max<std::int64_t>(1, ms)};
 }
 
+void ConvergenceScheduler::firewalled_sweep(const std::function<void()>& fn) {
+    try {
+        fn();
+    } catch (...) {
+        const auto n = sweep_exceptions_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1) {
+            try {
+                spdlog::error("Guardian convergence lane: sweep threw (firewalled; agent "
+                              "survives, the lane keeps running). Further occurrences counted "
+                              "only.");
+            } catch (...) {
+            }
+        }
+    }
+}
+
 void ConvergenceScheduler::lane_loop(SparkType type, std::uint64_t cadence_ms,
                                      std::uint64_t rng_offset) {
+    // stop() joins this thread while GuardianEngine::stop() holds mtx_, so mtx_ must never
+    // be taken from here - same hazard as the drain worker (#2298 Gate 4).
+    const GuardianJoinedThreadRole role_marker;
     std::mt19937 rng{static_cast<std::uint32_t>(cfg_.rng_seed + rng_offset)};
     while (true) {
         {
@@ -77,11 +100,12 @@ void ConvergenceScheduler::lane_loop(SparkType type, std::uint64_t cadence_ms,
             if (sig_->stopping)
                 return;
         }
-        sweep_lane(type);
+        firewalled_sweep([this, type] { sweep_lane(type); });
     }
 }
 
 void ConvergenceScheduler::priority_loop() {
+    const GuardianJoinedThreadRole role_marker;
     std::mt19937 rng{static_cast<std::uint32_t>(cfg_.rng_seed + 99)};
     std::uint64_t seen = 0;
     while (true) {
@@ -93,7 +117,7 @@ void ConvergenceScheduler::priority_loop() {
                 return;
             seen = sig_->priority_gen;
         }
-        sweep_pending_initial();
+        firewalled_sweep([this] { sweep_pending_initial(); });
     }
 }
 

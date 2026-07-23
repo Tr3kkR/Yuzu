@@ -503,6 +503,9 @@ std::string history_detail(const GuardianObservationRow& r) {
 // logic as the dashboard fragments — no second copy of the 24h/7d/30d/all mapping.
 int dex_window_to_days(const std::string& window) { return window_to_days(window); }
 std::string dex_iso_since(int days) { return iso_days_ago(days); }
+std::string dex_normalize_os_filter(const std::string& os) {
+    return (os == "windows" || os == "linux" || os == "macos") ? os : std::string{};
+}
 
 // Canonical window token from the (already-validated) window_days — safe to put
 // into hx-get attributes (no raw param reaches markup; Gate-8 XSS discipline).
@@ -593,7 +596,6 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     if (!store)
         return placeholder("Catalogue unavailable", "The signal observation store is not open.");
     const std::string w = dex_window_token(window_days);
-    const auto signals = store->dex_signal_summary(since);
 
     // -- Coverage scope: which platforms are in view ("all" = connected fleet) --
     auto norm = [](std::string o) -> std::string {
@@ -603,9 +605,21 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
         if (o.starts_with("lin")) return "linux";
         return o;
     };
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" || os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token
+    // ("all" when unscoped).
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
+
+    // -- Per-OS scoping (#1746): "all" keeps the established all-connected
+    // composite (windows_online + the all-OS signal rollup) — byte-unchanged. A
+    // single-OS chip scores that OS against its OWN online count and its OWN
+    // signals, so a Linux/macOS family score is never silently Windows-derived. --
+    const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
+                             : osf == "macos" ? fleet.macos_online
+                                               : fleet.windows_online; // "all" or "windows"
+    const auto signals_scoped = store->dex_signal_summary(since, plat);
+
     std::vector<std::string> scope;
     if (osf == "all") {
         for (const auto& o : fleet.connected_os) {
@@ -628,8 +642,10 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     // -- Per-family health score: the ONE canonical composite, projected per family
     // (score = 100 − that family's deduction; same formula as dex_compute_health).
-    // Windows-denominated today (the existing fleet composite); a per-OS read is the
-    // shared follow-up. --
+    // Scoped per #1746: the "all" chip stays the fleet-wide composite
+    // (windows_online + all-OS signals); a single-OS chip is now scored against
+    // n_scoped/signals_scoped ABOVE — that OS's own online count and own signals,
+    // never a Windows-derived number read under a Linux/macOS heading. --
     std::size_t total_types = dex_catalogued_type_count();
     std::size_t mon_types = 0;
     for (const auto& g : dex_signal_groups())
@@ -665,16 +681,16 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
 
     h += "<div class=\"gp-fgrid\">";
     for (const auto& g : dex_signal_groups()) {
-        const auto r = dex_family_rollup(g, signals);
+        const auto r = dex_family_rollup(g, signals_scoped);
         int mon = 0;
         for (const char* t : g.types)
             if (monitored(t))
                 ++mon;
         const bool dark = (mon == 0);
         double score = -1.0;
-        if (!dark && fleet.windows_online > 0)
+        if (!dark && n_scoped > 0)
             score = std::clamp(
-                100.0 - dex_family_health_deduction(g, signals, fleet.windows_online), 0.0, 100.0);
+                100.0 - dex_family_health_deduction(g, signals_scoped, n_scoped), 0.0, 100.0);
         const char* tone =
             score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
         h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +
@@ -683,15 +699,26 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
         h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(mon) + " of " +
              num(static_cast<int64_t>(g.types.size())) + " monitored</span></div>";
+        // UP-8: three distinct states, not two. `dark` = the family is not
+        // monitored on any connected platform. `no_data` = it IS monitored but
+        // no online agent is reporting (an absent denominator: n_scoped == 0),
+        // which is a "come back when a device is online" state, NOT "healthy"
+        // and NOT "unmonitored". Only a real, scored family shows a number.
+        const bool no_data = !dark && score < 0;
         if (score < 0)
             h += "<div class=\"fev\">&mdash;</div>";
         else
             h += "<div class=\"fev " + std::string(tone) + "\">" +
                  std::to_string(static_cast<int>(score + 0.5)) + "</div>";
         h += "<div class=\"fmeta\">" +
-             std::string(dark ? "not collected on your fleet" : "health score") + "</div>";
+             std::string(dark        ? "not collected on your fleet"
+                         : no_data   ? "no online agents reporting"
+                                     : "health score") +
+             "</div>";
         if (dark)
             h += "<div class=\"ftop\">no connected platform watches these</div>";
+        else if (no_data)
+            h += "<div class=\"ftop\">monitored, but no device is online to report</div>";
         else if (r.events > 0 && r.top)
             h += "<div class=\"ftop\"><b>" + dex_signal_label(r.top->obs_type) + "</b> &middot; " +
                  num(r.events) + " events</div>";
@@ -712,7 +739,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     // so nothing the fleet reports is silently dropped.)
     {
         std::vector<const DexSignalCount*> extras;
-        for (const auto& sig : signals) {
+        for (const auto& sig : signals_scoped) {
             bool known = false;
             for (const auto& g : dex_signal_groups()) {
                 for (const char* t : g.types)
@@ -766,14 +793,6 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         return placeholder("Unknown family", "No such signal family: " + esc(group_name));
 
     const std::string w = dex_window_token(window_days);
-    const auto signals = store->dex_signal_summary(since);
-    const auto r = dex_family_rollup(*grp, signals);
-    auto find_sig = [&](const char* t) -> const DexSignalCount* {
-        for (const auto& s : signals)
-            if (s.obs_type == t)
-                return &s;
-        return nullptr;
-    };
 
     // -- Coverage scope (mirrors the grid: a type is MONITORED when an in-scope
     // connected platform collects it — not merely when it fired). This is the
@@ -785,10 +804,25 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         if (o.starts_with("lin")) return "linux";
         return o;
     };
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token.
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
+
+    // -- Per-OS scoping (#1746 BR-001): resolved BEFORE the summary read so the
+    // drill-down reads the SAME lens as the grid — "all" keeps the fleet-wide
+    // rollup (byte-unchanged); a single-OS chip reads only that OS's signals.
+    // This single read flows into the family rollup, the per-signal table rows,
+    // AND the score below, so the whole drill-down is OS-consistent with View 1. --
+    const auto signals = store->dex_signal_summary(since, plat);
+    const auto r = dex_family_rollup(*grp, signals);
+    auto find_sig = [&](const char* t) -> const DexSignalCount* {
+        for (const auto& s : signals)
+            if (s.obs_type == t)
+                return &s;
+        return nullptr;
+    };
+
     std::vector<std::string> scope;
     if (osf == "all") {
         for (const auto& o : fleet.connected_os) {
@@ -870,9 +904,15 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
     // Coverage + activity tiles. Health score = this family's slice of the fleet
     // composite (same formula as the grid card), shown when something is monitored.
     h += "<div class=\"gp-tiles\">";
+    // Per-OS denominator (#1746 BR-001), same lens as the grid: a single-OS chip
+    // scores against THAT OS's own online count, never a Windows-derived number
+    // read under a Linux/macOS heading.
+    const int64_t n_scoped = osf == "linux"  ? fleet.linux_online
+                             : osf == "macos" ? fleet.macos_online
+                                               : fleet.windows_online; // "all" or "windows"
     double score = -1.0;
-    if (mon > 0 && fleet.windows_online > 0)
-        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, fleet.windows_online),
+    if (mon > 0 && n_scoped > 0)
+        score = std::clamp(100.0 - dex_family_health_deduction(*grp, signals, n_scoped),
                            0.0, 100.0);
     if (score >= 0)
         h += tile(score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"),
@@ -950,10 +990,10 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
     if (obs_type.empty())
         return placeholder("No signal selected", "Pick a signal type from a family.");
     const std::string w = dex_window_token(window_days);
-    const std::string osf = (os_filter == "windows" || os_filter == "linux" ||
-                             os_filter == "macos")
-                                ? os_filter
-                                : "all";
+    // Shared normalisation with the REST/MCP surfaces (dex_normalize_os_filter):
+    // plat = store-ready platform ("" = all-OS), osf = the display/URL token.
+    const std::string plat = dex_normalize_os_filter(os_filter);
+    const std::string osf = plat.empty() ? "all" : plat;
 
     const char* family = nullptr;
     for (const auto& g : dex_signal_groups()) {
@@ -966,13 +1006,22 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
             break;
     }
 
-    const auto subjects = store->dex_signal_subjects(obs_type, since, 15);
+    // OS-scope the detail lists to the selected lens (#C-DEX-1): a single-OS
+    // filter must not show cross-OS subjects/devices/days. `by_os` is deliberately
+    // left cross-OS — it IS the OS-split chart, so it always spans every OS.
+    // (`plat` computed above via the shared normaliser.)
+    const auto subjects = store->dex_signal_subjects(obs_type, since, 15, plat);
     const auto by_os = store->dex_signal_by_os(obs_type, since);
-    const auto devices = store->dex_signal_devices(obs_type, since, 15);
-    const auto by_day = store->dex_signal_by_day(obs_type, since);
+    const auto devices = store->dex_signal_devices(obs_type, since, 15, plat);
+    const auto by_day = store->dex_signal_by_day(obs_type, since, plat);
 
+    // Headline totals follow the same lens as the detail lists: sum the whole
+    // cross-OS split for "all", or just the selected OS's row otherwise — so the
+    // "Events"/"Devices" tiles never disagree with the (now OS-scoped) lists.
     int64_t events = 0, devs = 0;
     for (const auto& o : by_os) {
+        if (!plat.empty() && o.platform != plat)
+            continue;
         events += o.crashes; // generic event count
         devs += o.distinct_devices;
     }
@@ -1235,7 +1284,11 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
             : "default";
 
     const auto signals = store->dex_signal_summary(since);
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): the crash-free headline is denominated over
+    // reporting Windows agents (N below), so the numerator must be Windows
+    // crashes only — otherwise macOS process.crashed events (now emitted) would
+    // inflate the rate against the Windows fleet.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const int64_t N = fleet.windows_online; // scored over reporting Windows agents
 
     std::string h;
@@ -1417,7 +1470,9 @@ std::string render_dex_trends_fragment(const GuaranteedStateStore* store, const 
         return placeholder("Trends unavailable", "The signal observation store is not open.");
     const auto scope = store->dex_os_signal_scope(since);
     const auto matrix = store->dex_signal_day_matrix(since);
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): the crash-free number below is capped at and
+    // divided by fleet.windows_online, so the crash numerator is Windows-only.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const int64_t total_types = static_cast<int64_t>(dex_catalogued_type_count());
 
     auto scope_of = [&](const char* p) -> const DexOsScope* {
@@ -1574,7 +1629,11 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     // not (zero counts are real data: "monitored, nothing happened").
     const auto signals = store->dex_signal_summary(since);
 
-    const auto summary = store->dex_crash_summary(since);
+    // Windows-scoped (#C-DEX-1): every tile below (crash-free %, crashes/1k,
+    // devices impacted) and the per-OS table's Windows row are denominated over
+    // reporting Windows agents, so the crash counts must be Windows-only — the
+    // all-OS summary would divide macOS crashes into the Windows fleet.
+    const auto summary = store->dex_crash_summary(since, "windows");
     const auto apps = store->dex_top_apps(since, 8);
     const auto devices = store->dex_top_devices(since, 8);
     const auto by_day = store->dex_crashes_by_day(since);

@@ -11,6 +11,7 @@
 
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
+#include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
@@ -625,8 +626,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"network_diag.listening", "List listening TCP ports"},
         {"network_diag.connections", "List established TCP connections"},
         // msi_packages
-        {"msi_packages.list", "List all installed MSI packages"},
-        {"msi_packages.product_codes", "Compact list of installed MSI product code GUIDs"},
+        {"msi_packages.list", "List installed packages (Windows MSI / macOS pkgutil receipts)"},
+        {"msi_packages.product_codes",
+         "Compact list of installed package identifiers (Windows MSI GUIDs / macOS pkgutil "
+         "reverse-domain IDs)"},
         // sccm
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
@@ -1334,6 +1337,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_spark_watch_rejected");
     metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
     metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
+    // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Same rule, and it
+    // bites hardest here: the writer is sparse (a 0 counter ships no tag), so on a
+    // healthy or inert fleet NOBODY reports and every family must be ABSENT. A
+    // fabricated 0 on e.g. _evicted_no_send_evidence would read as "checked, no audit
+    // records lost" on a fleet whose journal is not even running.
+    for (const auto& m : kGuardianJournalMetrics)
+        metrics.clear_gauge_family(m.gauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1406,6 +1416,46 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         for (std::size_t mi = 0; mi < kNMech; ++mi)
             for (std::size_t ki = 0; ki < kNMetric; ++ki)
                 keys[mi][ki] = spark_type_metric_tag(kSparkMechTokens[mi], kSparkMetricTokens[ki]);
+        return keys;
+    }();
+    // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Table-driven off
+    // kGuardianJournalMetrics so the clear (above), the accumulate (in the loop) and
+    // the publish (below) can never drift out of step with each other or with the
+    // describe() block in server.cpp - adding a signal is ONE table row.
+    //
+    // UNLABELLED fleet sums: these are integrity/loss signals, so the question is "did
+    // ANY endpoint lose a record", which a flat sum answers. No `os` split (contrast
+    // the net/spark families) means no agent-controlled label and so no cardinality
+    // exposure at all.
+    //
+    // `reported` is tracked SEPARATELY from the sum rather than inferring "sum > 0 ->
+    // somebody reported". They differ in exactly one case: a non-conforming agent that
+    // emits an explicit "0" (the real writer is sparse and never does). That IS a
+    // report of zero and publishing 0 is the honest reading; inferring from the sum
+    // would suppress it and misreport a reporting fleet as absent.
+    std::array<double, kNGuardianJournalMetrics> gj_sum{};
+    std::array<bool, kNGuardianJournalMetrics> gj_reported{};
+    // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
+    // unconditionally, including at 0, unlike the 22 - they are server-owned counts
+    // that always have a true value, so 0 is a measurement, not a fabricated zero.
+    // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
+    // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
+    // `gj_tag_rejected` makes the forged-value parse's drop visible: a rejected value
+    // used to vanish silently, and if the rejected agent were the only reporter its
+    // family went absent, which reads as clean (governance Gate-4 UP-16 / Gate-5 CH-6).
+    int gj_reporting = 0;
+    int gj_tag_rejected = 0;
+    // std::string twins of the table's C-string tag keys: get_view takes
+    // const std::string&, so passing the char* directly would heap-construct a
+    // temporary key per lookup - 22 per agent per sweep. Built once (same pattern,
+    // and the same governance finding, as spark_mech_metric_keys above). It IS
+    // registered for static destruction (non-trivial destructor), which is safe only
+    // because health_recompute_thread_ - the sole production reader - is joined in
+    // ServerImpl::stop() before exit; there is no std::exit/abort shutdown path.
+    static const std::array<std::string, kNGuardianJournalMetrics> gj_keys = [] {
+        std::array<std::string, kNGuardianJournalMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
+            keys[i] = kGuardianJournalMetrics[i].tag;
         return keys;
     }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
@@ -1623,6 +1673,41 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 break; // garbage discriminator — page on neither
             }
         }
+
+        // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Unconditional -
+        // unlike spark there is no posture/denominator tag to gate on: the writer is
+        // sparse, so simply having a key IS the report. Reads go through get_view() so
+        // an agent-controlled value is never copied, and every value goes through the
+        // forged-value-safe parse (non-finite is impossible for an integer parse;
+        // negative, overlong, garbage and implausible all become "did not report",
+        // never 0 - one rogue agent must not poison a fleet integrity gauge).
+        bool journal_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i) {
+            const auto raw = get_view(gj_keys[i]);
+            // An ABSENT tag is the sparse writer's "nothing to report" and is not a
+            // rejection; a PRESENT value that fails the parse is. The parse returns
+            // nullopt for both, so the emptiness test is what separates them - do not
+            // collapse these two branches.
+            //
+            // ONE GAP, ACCEPTED: get_view returns an empty view for a missing key AND
+            // for a key present with an empty value, so an agent shipping
+            // `"yuzu.guardian_journal_stage_dropped": ""` lands here and is counted as
+            // neither reporting nor rejected. Closing it needs a find()-based presence
+            // test. Not worth it: an empty value buys a hostile agent exactly what
+            // omitting the tag buys (invisible either way), so it opens no evasion the
+            // heartbeat trust boundary does not already concede.
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_journal_count(raw)) {
+                gj_sum[i] += *v;
+                gj_reported[i] = true;
+                journal_reported_any = true;
+            } else {
+                ++gj_tag_rejected;
+            }
+        }
+        if (journal_reported_any)
+            ++gj_reporting;
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1738,6 +1823,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_mech_gauge("yuzu_fleet_spark_watch_rejected", spark_watch_rejected_om);
     set_mech_gauge("yuzu_fleet_spark_quarantined", spark_quarantined_om);
     set_mech_gauge("yuzu_fleet_spark_slow_op", spark_slow_op_om);
+
+    // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
+    // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
+    // healthy, quiescent or inert fleet that is ALL 22, which is the correct reading:
+    // the journal has nothing to report, and "nothing to report" must not be
+    // presentable as "checked and clean".
+    for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
+        if (gj_reported[i])
+            metrics.gauge(kGuardianJournalMetrics[i].gauge).set(gj_sum[i]);
+    // The two meta-signals publish ALWAYS, including 0 - that is the point of them.
+    // Not cleared above either: a family that is always written never goes stale.
+    metrics.gauge(kGuardianJournalReportingGauge).set(static_cast<double>(gj_reporting));
+    metrics.gauge(kGuardianJournalTagRejectedGauge)
+        .set(static_cast<double>(gj_tag_rejected));
 }
 
 } // namespace yuzu::server::detail

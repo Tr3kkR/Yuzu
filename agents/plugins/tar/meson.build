@@ -55,6 +55,7 @@ shared_library(
     'src/tar_module_stream.cpp',
     'src/tar_proc_etw.cpp',
     'src/tar_proc_es.cpp',
+    'src/tar_netqual_nstat.cpp',
     'src/tar_module_etw.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',

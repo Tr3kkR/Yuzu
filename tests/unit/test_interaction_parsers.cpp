@@ -89,3 +89,32 @@ TEST_CASE("build_dialog_command: btn_spec is threaded through verbatim per butto
         CHECK(cmd.contains("-e 'return \"##ERR##\" & errNum' "));
     }
 }
+
+TEST_CASE("interaction input/survey capture: exit-code/output decision (qe-L2)", "[interaction]") {
+    using yuzu::interaction::classify_input_capture;
+
+    SECTION("non-zero exit is an honest delivery failure, never wrapped as a response") {
+        auto d = classify_input_capture(1, "no reachable GUI session");
+        CHECK(d.output_line == "status|unavailable|no reachable GUI session");
+        CHECK(d.rc == 1);
+        // Even output that looks like a button/answer must not become a response
+        // when the tool exited non-zero.
+        auto d2 = classify_input_capture(2, "hello");
+        CHECK(d2.output_line == "status|unavailable|no reachable GUI session");
+        CHECK(d2.rc == 1);
+    }
+    SECTION("the ##CANCELLED## sentinel on a clean exit is a user cancel") {
+        auto d = classify_input_capture(0, "##CANCELLED##");
+        CHECK(d.output_line == "cancelled|true");
+        CHECK(d.rc == 0);
+    }
+    SECTION("any other clean-exit output is genuine user input") {
+        auto d = classify_input_capture(0, "Alice");
+        CHECK(d.output_line == "response|Alice");
+        CHECK(d.rc == 0);
+        // Empty input on a clean exit is a real (empty) answer, not a cancel.
+        auto d2 = classify_input_capture(0, "");
+        CHECK(d2.output_line == "response|");
+        CHECK(d2.rc == 0);
+    }
+}

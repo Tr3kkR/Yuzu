@@ -39,6 +39,7 @@
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
+#include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
 #include "on_behalf_guard.hpp"
@@ -104,6 +105,7 @@
 #include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "vuln_finding_store.hpp"
+#include "access_review_store.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — campaign persistence
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -115,6 +117,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
+#include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
@@ -361,10 +364,10 @@ public:
         // startup, matching yuzu_onbehalf_rejected_total below). method/status
         // are NOT closed sets, so a single representative GET/200 point per
         // class is the seed — not a cross-product, which would be unbounded.
-        // "engine" is deliberately excluded: it is Phase-4-reserved and never
-        // emitted today (principal_class.hpp), so pre-seeding it now would
-        // advertise a series that cannot occur until that phase ships.
-        for (auto pc : {"human", "agent", "none"}) {
+        // "engine" is now included (PR 4.5 — principal_class_resolved makes it
+        // live, emitted for a resolved engine-principal session): the closed
+        // set is human/agent/none/engine and every value gets its 0-point.
+        for (auto pc : {"human", "agent", "none", "engine"}) {
             metrics_.counter("yuzu_http_requests_total",
                              {{"method", "GET"}, {"status", "200"}, {"principal_class", pc}});
         }
@@ -389,8 +392,8 @@ public:
         // an attack signal. side="operator" is dormant until Phase 5
         // (delegation debits the operator side); it is pre-seeded anyway,
         // deliberately, because it is a real documented QuotaSide dimension
-        // (unlike the withheld principal_class="engine" pre-seed above,
-        // which is reserved but not yet a live enum value).
+        // (same reasoning as the principal_class="engine" pre-seed above,
+        // which is now a live enum value as of PR 4.5).
         metrics_.describe("yuzu_server_principal_quota_exhausted_total",
                           "Per-principal quota-cap exhaustions by side and limit dimension",
                           "counter");
@@ -414,6 +417,118 @@ public:
                           "counter");
         for (auto side : {"engine", "operator"}) {
             metrics_.counter("yuzu_server_principal_quota_admits_total", {{"side", side}});
+        }
+        // Periodic Access Reviews (SOC 2 CC6.2) feature metrics — sre SHOULD
+        // (governance): the feature previously carried zero metrics. Bounded
+        // labels only (format and decision are both closed 2-value sets),
+        // pre-seeded per docs/observability-conventions.md so absent()
+        // alerts stay meaningful. Wired at the REST handlers in
+        // rest_api_v1.cpp — the MCP twins (export_access_review,
+        // open_access_review, record_attestation) are not double-counted
+        // here.
+        metrics_.describe("yuzu_access_review_export_total",
+                          "Access review evidence exports (GET /api/v1/access-reviews/export), "
+                          "by format",
+                          "counter");
+        for (auto format : {"json", "csv"}) {
+            metrics_.counter("yuzu_access_review_export_total", {{"format", format}});
+        }
+        metrics_.describe("yuzu_access_review_export_duration_seconds",
+                          "Latency of the cross-principal grant-population read "
+                          "(build_access_review) behind GET /api/v1/access-reviews/export",
+                          "histogram");
+        metrics_.histogram("yuzu_access_review_export_duration_seconds");
+        metrics_.describe("yuzu_access_review_campaigns_opened_total",
+                          "Access review campaigns opened (POST /api/v1/access-reviews)",
+                          "counter");
+        metrics_.counter("yuzu_access_review_campaigns_opened_total");
+        metrics_.describe("yuzu_access_review_attestations_total",
+                          "Access review reviewer decisions recorded (POST "
+                          "/api/v1/access-reviews/{id}/attestations), by decision",
+                          "counter");
+        for (auto decision : {"attested", "flagged_revoke"}) {
+            metrics_.counter("yuzu_access_review_attestations_total", {{"decision", decision}});
+        }
+        // MCP Streamable HTTP transport (ADR-1005 Decision 15(k) — the family was
+        // NAMED in the decision, not left to implementer discretion, so alerts can
+        // be authored against it before every rung has landed). Pre-seeded to 0 per
+        // docs/observability-conventions.md so absent() alerts stay meaningful, and
+        // `reason` is a CLOSED set — every value is seeded here and no label value
+        // is ever derived from caller-controlled input.
+        metrics_.describe("yuzu_mcp_sessions_active", "MCP Streamable HTTP sessions currently live",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_sessions_opened_total",
+                          "MCP Streamable HTTP sessions minted on initialize", "counter");
+        metrics_.describe("yuzu_mcp_streams_active",
+                          "MCP GET SSE streams currently held open (each pins one HTTP worker)",
+                          "gauge");
+        metrics_.describe("yuzu_http_held_open_responses",
+                          "SSE responses held open right now across ALL surfaces (MCP GET, "
+                          "/api/v1/events, dashboard drawer, legacy /events) — each pins one "
+                          "HTTP worker thread",
+                          "gauge");
+        metrics_.describe("yuzu_http_held_open_capacity",
+                          "Held-open responses this server is sized for (--max-sse-streams, "
+                          "clamped to the worker pool). Utilisation = responses / capacity",
+                          "gauge");
+        metrics_.describe("yuzu_http_worker_pool_size", "Shared HTTP worker pool size", "gauge");
+        metrics_.gauge("yuzu_http_held_open_responses").set(0);
+        metrics_.describe("yuzu_mcp_streams_handover_pending",
+                          "Superseded MCP SSE streams still draining — each still pins a worker",
+                          "gauge");
+        // The EFFECTIVE cap, after the boot-time clamp. Without this an operator who set
+        // --max-sse-streams and is being rejected at 12 has only a boot log line to
+        // tell them why.
+        metrics_.describe("yuzu_mcp_streams_cap",
+                          "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
+                          "Frames dropped before reaching a connection's per-connection queue — "
+                          "usually a slow consumer's queue overflow, also a rare producer-side "
+                          "post-commit allocation failure (#2366); recoverable via Last-Event-ID",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_frames_too_large_total",
+                          "Frames replaced by a frame_too_large notice because they exceeded the "
+                          "per-session replay-ring byte budget",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_replay_ring_evictions_total",
+                          "Frames evicted from a session's bounded replay ring — a client whose "
+                          "cursor falls behind gets a 404 and must re-initialize",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_rejects_total",
+                          "MCP GET SSE stream attach denials by reason", "counter");
+        metrics_.describe("yuzu_mcp_initialize_protocol_total",
+                          "MCP initialize handshakes by negotiated protocol revision", "counter");
+        metrics_.describe("yuzu_mcp_stream_publish_failures_total",
+                          "publish() exception-boundary catches — a producer's frame "
+                          "construction failed before commit (#2366); the frame was never "
+                          "published and no event id was consumed",
+                          "counter");
+        metrics_.gauge("yuzu_mcp_sessions_active").set(0);
+        metrics_.counter("yuzu_mcp_sessions_opened_total");
+        metrics_.gauge("yuzu_mcp_streams_active").set(0);
+        metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
+        metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
+        metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
+        metrics_.counter("yuzu_mcp_stream_publish_failures_total");
+        for (auto reason : {"client_disconnect", "superseded", "session_terminated",
+                            "credential_revoked", "auth_unavailable", "internal_error"}) {
+            metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
+        }
+        metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
+        for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
+                            "per_principal_stream_cap", "global_stream_cap",
+                            "stream_handover_pending", "replay_window_exceeded", "origin"}) {
+            metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
+        }
+        // Pre-seed both supported MCP protocol revisions to 0 so a
+        // revision-deprecation dashboard reads "0" (not absent) for an unused
+        // revision (observability-conventions.md; 2g PR 1). Values mirror the
+        // supported set in mcp_transport.cpp (protocol_version_supported).
+        for (auto revision : {"2025-03-26", "2025-06-18"}) {
+            metrics_.counter("yuzu_mcp_initialize_protocol_total", {{"revision", revision}});
         }
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed
@@ -706,6 +821,23 @@ public:
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
                           "(a stalled watcher)", "gauge");
+        // Guardian durable lifecycle-journal fleet rollup (#2298 gate 3). Registered from
+        // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
+        // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
+        // no HELP, or with HELP that drifts from what the rollup actually computes.
+        // Unlabelled by design; all 22 are ABSENT until some agent's journal reports.
+        // Read the type-honesty note on kGuardianJournalMetrics before writing an
+        // alert: no sound alerting form exists over these fleet sums yet (neither
+        // increase() nor bare `> 0` survives a churning population), so the 22 are
+        // MONITOR-ONLY until a per-agent axis lands (#2083-class; see the note).
+        for (const auto& m : detail::kGuardianJournalMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        // The two meta-signals are NOT in that table (it is pinned 1:1 to the agent's
+        // GuardianJournalStats) and are published every sweep including at 0.
+        metrics_.describe(detail::kGuardianJournalReportingGauge,
+                          detail::kGuardianJournalReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianJournalTagRejectedGauge,
+                          detail::kGuardianJournalTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -1565,6 +1697,20 @@ public:
             if (!vuln_finding_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: vuln-finding store migration/open failed "
                               "(database reachable but the vuln_finding_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // AccessReviewStore — born-on-PG campaign persistence for Periodic Access
+        // Reviews (SOC 2 CC6.2). Same fail-CLOSED construction posture as the
+        // other born-on-PG stores (ADR-0012 §1) — this is compliance evidence, so
+        // a reachable database whose schema can't migrate must not serve degraded.
+        if (pg_pool_ && !startup_failed_) {
+            access_review_store_ = std::make_unique<AccessReviewStore>(*pg_pool_);
+            if (!access_review_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: access-review store migration/open failed "
+                              "(database reachable but the access_review_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -3334,6 +3480,14 @@ public:
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
+                // Held-open responses across EVERY streaming surface, against the capacity the
+                // worker pool was sized for (ADR-0034 Decision 3). This is THE number: it is
+                // what says "raise --max-sse-streams", and no per-surface gauge can express
+                // it, because the pool is what they all share.
+                if (stream_budget_) {
+                    metrics_.gauge("yuzu_http_held_open_responses")
+                        .set(static_cast<double>(stream_budget_->active()));
+                }
                 if (pg_pool_) {
                     metrics_.gauge("yuzu_pg_pool_in_use")
                         .set(static_cast<double>(pg_pool_->in_use()));
@@ -4041,6 +4195,11 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // AccessReviewStore borrows pg_pool_ — drop before the pool. No background
+        // thread borrows it (only rest_api_v1_/mcp_server_ hold a raw pointer, and
+        // every HTTP/MCP handler thread is already quiesced by the drain above);
+        // keep the ADR-0012 teardown discipline so a future consumer can't UAF.
+        access_review_store_.reset();
         // ApiTokenStore borrows pg_pool_ — drop before the pool. No background
         // thread borrows it (only auth_routes_/settings_routes_/rest_api_v1_
         // hold a raw pointer, and every HTTP handler thread is already
@@ -5375,6 +5534,89 @@ private:
         web_server_->set_read_timeout(30);
         web_server_->set_write_timeout(30);
 
+        // -- Worker pool + held-open-stream budget (ADR-1005 Decision 15(h)) ---
+        //
+        // Every held-open SSE response pins ONE worker for the life of the stream
+        // (the content provider blocks in cv.wait_for). Until now the pool was
+        // httplib's implicit default and nothing capped concurrent streams, so a
+        // fleet of agentic clients could occupy every worker and starve plain REST.
+        //
+        // The arrow points FROM the workload TO the pool (ADR-0034). It used to point the
+        // other way: the pool was httplib's accidental default (32 threads on an 8-core box)
+        // and the stream cap fell out of it at 12 — on a platform whose own design notes size
+        // it for "hundreds of agentic clients per server". A cap two orders of magnitude below
+        // the workload is not a safety feature, it is a self-inflicted scarcity.
+        //
+        // A held-open stream costs a BLOCKED thread: ~8-16 KB resident (the 8 MB stack is
+        // virtual), zero CPU, one wakeup per heartbeat. Sizing for hundreds is cheap; refusing
+        // to serve them is not.
+        const std::size_t target_streams = cfg_.max_sse_streams > 0
+                                               ? cfg_.max_sse_streams
+                                               : detail::kTargetHeldOpenStreamsDefault;
+        std::size_t pool_base =
+            detail::derive_worker_pool(target_streams, detail::kPlainRestReserveDefault);
+        if (cfg_.http_worker_threads > 0) {
+            // An operator who pins the pool by hand overrides the derivation — and then the
+            // stream target is clamped to what their pool can actually carry, not the reverse.
+            pool_base = std::max(cfg_.http_worker_threads, detail::kMinHttpWorkerThreads);
+        }
+        // Bound the ASK, then create the pool eagerly and in full.
+        //
+        // Eager is the SAFE direction, and the lazy-growth version of this was worse.
+        // httplib's ThreadPool constructor spawns its base count with no try/catch, so a
+        // pthread_create failure there unwinds over joinable threads and terminates — but
+        // that happens at BOOT, with no traffic, so a host that cannot carry the pool never
+        // enters service. Deferring the spawn (base < max) instead activates httplib's
+        // dynamic branch, which does `jobs_.push_back(...)` and THEN
+        // `dynamic_threads_.emplace_back(std::thread(...))` inside enqueue's lock
+        // (httplib.h:9792-9798), called from the accept loop with no handler
+        // (httplib.h:11322). The same terminate then becomes reachable at RUNTIME, under
+        // load, pre-auth — the server boots healthy and aborts later. Lower probability,
+        // far worse blast radius. Note also that a wrapper catching there and returning
+        // false is NOT a fix: the job capturing the socket is already queued, so the
+        // caller's close_socket() races a worker that will still run it (fd reuse).
+        //
+        // The real hazard was only ever the SIZE of the ask — `--max-sse-streams 4096`
+        // derives 8200 threads — so bound it. 2048 threads affords 1020 streams; a target
+        // beyond that is clamped by derive_stream_budget and warned about below, exactly
+        // like any other pool the operator's target outruns.
+        if (pool_base > detail::kMaxHttpWorkerThreads) {
+            spdlog::warn("HTTP worker pool of {} exceeds the {} ceiling; clamping. Concurrent "
+                         "held-open streams are clamped to match.",
+                         pool_base, detail::kMaxHttpWorkerThreads);
+            pool_base = detail::kMaxHttpWorkerThreads;
+        }
+        const std::size_t pool_max = pool_base; // the pool IS the budget: capacity == pool_max
+        web_server_->new_task_queue = [pool_max] {
+            // base == max: httplib's dynamic-growth branch stays dead by construction.
+            return new httplib::ThreadPool(pool_max, pool_max);
+        };
+        const std::size_t effective_streams = detail::derive_stream_budget(
+            pool_max, detail::kPlainRestReserveDefault, target_streams);
+        if (effective_streams < target_streams) {
+            spdlog::warn("--max-sse-streams {} exceeds what a pool of {} can carry; clamped to "
+                         "{} (plain-REST reserve {}, {} workers per stream for takeover "
+                         "handover). Raise --http-worker-threads or lower the target.",
+                         target_streams, pool_max, effective_streams,
+                         detail::kPlainRestReserveDefault, detail::kMaxProvidersPerStream);
+        }
+        stream_budget_ =
+            std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{effective_streams});
+        metrics_.gauge("yuzu_http_held_open_capacity")
+            .set(static_cast<double>(effective_streams));
+        // Described at startup but never set, so the series existed in metadata tooling
+        // and never in /metrics — worse than absent, because the describe() text sells it
+        // as the answer to "why am I being rejected below my configured cap". Set beside
+        // its sibling above, from the same post-clamp number.
+        metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
+        metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
+                     "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
+                     "GET /mcp/v1/, GET /api/v1/events, the dashboard executions drawer, and the "
+                     "legacy /events stream. Watch yuzu_http_held_open_responses / "
+                     "yuzu_http_held_open_capacity; the ceiling is thread-count (ADR-0034).",
+                     pool_max, effective_streams, detail::kPlainRestReserveDefault);
+
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler([this](const httplib::Request& req,
                                                     httplib::Response& res)
@@ -5393,6 +5635,22 @@ private:
             // protocol limitation). See detail::tls_quota_slot()'s doc
             // comment.
             detail::tls_quota_slot().reset();
+
+            // principal_class metric (PR 4.5) — defensive reset at the TOP of
+            // pre-routing, before all early returns, mirroring the quota
+            // slot reset immediately above. Set true further down, right
+            // after session resolution, when the RESOLVED session is an
+            // engine principal; read at the post-routing metric emission.
+            // The PRIMARY clear is the post-routing handler's
+            // EngineClassStashClear scope guard, which fires on every exit
+            // from that lambda (incl. throw) — including the requests
+            // httplib rejects BEFORE pre-routing ever runs (malformed
+            // request line, URI too long, bad Range), which never reach
+            // this reset. This one is defense-in-depth for requests that
+            // DO make it through pre-routing. See principal_class.hpp's
+            // detail::tls_engine_principal() doc comment for the full
+            // contract.
+            detail::tls_engine_principal() = false;
 
             // Lightweight probes — always allowed, no auth, no rate limit.
             // /health and /api/health are included here (governance Gate 7,
@@ -5554,6 +5812,19 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // principal_class metric (PR 4.5) — stash whether this RESOLVED
+            // session is an engine principal, for the post-routing metric
+            // emission (principal_class.hpp's principal_class_resolved).
+            // INDEPENDENT of the quota-gate outcome below: a 429'd engine
+            // request still classifies as "engine" — the traffic shape was
+            // still engine-shaped even though it got rejected. Session::is_engine()
+            // is the canonical predicate, mirroring the sibling belts in
+            // principal_quota_gate.hpp's apply_engine_quota_gate (also
+            // mcp_server.cpp's deny_if_engine_session / rest_api_v1.cpp's
+            // deny_engine_session) so a future engine auth path can't
+            // silently miss one copy.
+            detail::tls_engine_principal() = session->is_engine();
+
             // Per-principal quota cap (PR 4.4, ADR-1005 class engine
             // principals) — THE single pre-routing chokepoint gate (#2225
             // ADR-0017); no separate route, no bypass. Runs AFTER session
@@ -5617,6 +5888,28 @@ private:
         spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
         web_server_->set_post_routing_handler([this, security_headers](const httplib::Request& req,
                                                                        httplib::Response& res) {
+            // principal_class metric (PR 4.5) — clear the engine-class stash on EVERY
+            // exit from this handler, via a guard whose destructor runs AFTER the
+            // metric emission below (never clears before the read — cf. the reset
+            // ordering) AND even if that emission throws. Load-bearing, not just
+            // hygiene: httplib runs post-routing for requests it rejects BEFORE
+            // pre-routing (malformed request line->400, URI>8K->414, bad Range->416;
+            // httplib.h write_response_core), which never hit the top-of-pre-routing
+            // reset — so a leaked `true` from a post-routing throw would mislabel the
+            // next such parse-error response on the same keep-alive worker as
+            // "engine". (governance unhappy-path F1/F2.)
+            //
+            // ORDERING IS LOAD-BEARING: this guard MUST remain the FIRST local
+            // declared in this lambda. C++ destroys locals in reverse
+            // construction order, so being declared first makes it destruct
+            // LAST — after the metric emission reads the stash below. Declaring
+            // any local before it would move its destructor ahead of the read
+            // and clear the stash too early (the exact reset-before-read hazard
+            // this design avoids). Do not add a local above this line.
+            struct EngineClassStashClear {
+                ~EngineClassStashClear() { detail::tls_engine_principal() = false; }
+            } engine_class_stash_clear;
+
             // Per-principal quota (PR 4.4) — release the concurrency slot
             // (if any) admitted for this request at pre-routing. A no-op for
             // denied/streaming/non-engine requests, which never stash one.
@@ -5650,14 +5943,17 @@ private:
                 res.set_header("Access-Control-Max-Age", "86400");
             }
 
-            // principal_class: bounded presentation-level actor class (ADR-1005,
-            // execution-plan PR 1.2) — human / agent / none today, engine reserved for
-            // Phase 4. See principal_class.hpp for the classification contract.
+            // principal_class: bounded actor class (ADR-1005, execution-plan
+            // PR 1.2) — human / agent / none / engine. "engine" is live as of
+            // PR 4.5: principal_class_resolved reads the stash set by the
+            // pre-routing chokepoint from the RESOLVED session, falling back
+            // to presentation-based principal_class_of otherwise. See
+            // principal_class.hpp for the full hybrid-basis contract.
             metrics_
                 .counter("yuzu_http_requests_total",
                          {{"method", req.method},
                           {"status", std::to_string(res.status)},
-                          {"principal_class", std::string(principal_class_of(req))}})
+                          {"principal_class", std::string(principal_class_resolved(req))}})
                 .increment();
         });
 
@@ -5964,6 +6260,14 @@ private:
                 // silently no-op findings persistence — surface it (Pattern E).
                 {"vuln_finding_store",
                  vuln_finding_store_ && vuln_finding_store_->is_open()},
+                // Periodic Access Reviews (SOC 2 CC6.2) born-on-PG store. AUTHORITATIVE
+                // per ADR-0012 §1 — the /api/v1/access-reviews campaign lifecycle
+                // (open/attest/close) is dead without it. The read-only export route
+                // does not depend on this store, but the campaign-based evidence surface
+                // is the feature's core deliverable, so a not-open state must be visible
+                // at /readyz, not just returning 503 per-request unnoticed.
+                {"access_review_store",
+                 access_review_store_ && access_review_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
@@ -6675,6 +6979,20 @@ private:
         if (engine_principal_store_) {
             settings_routes_->set_engine_principal_store(engine_principal_store_.get());
         }
+        // Access-review (CC6.2) Settings fragment deps — nullable, same
+        // deferred-wiring posture as set_engine_principal_store above: an
+        // unwired store leaves the fragment rendering an "unavailable" notice
+        // rather than crashing. auth_db comes from auth_mgr_; api_token_store_
+        // + engine_principal_store_ are already wired above/via register_routes.
+        if (rbac_store_) {
+            settings_routes_->set_rbac_store(rbac_store_.get());
+        }
+        if (access_review_store_) {
+            settings_routes_->set_access_review_store(access_review_store_.get());
+        }
+        if (directory_sync_) {
+            settings_routes_->set_access_review_directory_sync(directory_sync_.get());
+        }
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -6714,7 +7032,41 @@ private:
         });
 
         // SSE endpoint
-        web_server_->Get("/events", [this](const httplib::Request&, httplib::Response& res) {
+        web_server_->Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
+            // ADMISSION CONTROL (ADR-0034). Every connection holds an httplib worker for
+            // its whole life, so it takes a lease like every other streaming surface.
+            // This route IS session-gated: `/events` is not in `is_login_exempt_path`,
+            // and the pre-routing chokepoint 401s a caller with no session by name
+            // (alongside `/api/` and `/mcp/`), so the handler only ever runs for an
+            // authenticated operator. What the lease bounds here is therefore an
+            // AUTHENTICATED thread-pinning path, not a pre-auth one.
+            // The anonymous branch below is unreachable today and kept only as
+            // defence-in-depth against a future change to the exempt list — it must not
+            // be read as evidence that this surface is open. The residual defect on this
+            // route is the missing per-connection queue cap (`/api/v1/events` opts into
+            // `kPerConnectionQueueCapDefault`; this one does not), which the lease does
+            // NOT address — see ADR-0034 Decision 1.
+            std::string principal = "anonymous";
+            std::size_t per_principal = detail::kPerPrincipalAnonymous;
+            if (auth_routes_) {
+                if (auto sess = auth_routes_->resolve_session(req)) {
+                    principal = sess->username;
+                    per_principal = detail::kPerPrincipalDashboard;
+                }
+            }
+            auto lease = std::make_shared<detail::StreamBudget::Lease>();
+            if (stream_budget_) {
+                auto admitted = stream_budget_->try_acquire(detail::SseSurface::kLegacyEvents,
+                                                            principal, per_principal);
+                if (!admitted.lease) {
+                    res.status = 429;
+                    res.set_header("Retry-After", "5");
+                    res.set_content("too many live streams open", "text/plain; charset=utf-8");
+                    return;
+                }
+                *lease = std::move(admitted.lease);
+            }
+
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
 
@@ -6745,8 +7097,12 @@ private:
                     return detail::sse_content_provider(sink_state, offset, sink);
                 },
                 detail::adopt_quota_slot_into_stream(
-                    [sink_state, bus](bool success) {
+                    [sink_state, bus, lease](bool success) noexcept {
+                        // noexcept for parity with the three sibling releasers: this runs
+                        // from ~Response, and sse_resource_release is now noexcept at source
+                        // (event_bus.hpp), so the whole chain is terminate-safe.
                         detail::sse_resource_release(sink_state, *bus, success);
+                        // `lease` dies here — the worker returns to the one shared budget.
                     }));
         });
 
@@ -10290,6 +10646,14 @@ private:
                         // (G4 UP-1; pre-existing here, fixed with the sibling).
                         if (os.starts_with("win"))
                             ++f.windows_online;
+                        // Per-OS online denominators (#1746) — same coverage-honest
+                        // count as windows_online, so the Catalogue's single-OS
+                        // filter can score a family against THAT OS's own fleet.
+                        if (os.starts_with("lin"))
+                            ++f.linux_online;
+                        if (os.starts_with("darwin") || os.starts_with("macos"))
+                            ++f.macos_online; // prefix, like win/lin — keep in
+                                              // step with the store's write canon
                         // Distinct connected OS tokens → the Catalogue's "All
                         // connected" coverage scope (render normalises darwin→macos).
                         if (!os.empty() && std::find(f.connected_os.begin(),
@@ -11085,6 +11449,7 @@ private:
         // the bus; ExecutionTracker publishes onto it; SSE handler
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
+        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
@@ -11504,7 +11869,21 @@ private:
             // DEX app-perf-over-time read providers (slice 2) — fleet trend + picker.
             app_perf_providers,
             // PR 4.2 — fleet-wide engine role-assignment authoring surface.
-            engine_principal_store_.get());
+            engine_principal_store_.get(),
+            // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
+            // read-model deps build_access_review needs beyond the ones already
+            // threaded above (rbac_store_, engine_principal_store_, api_token_store_).
+            access_review_store_.get(), auth_mgr_.auth_db_ptr(), directory_sync_.get(),
+            // ADR-0034: the ONE held-open-response budget. GET /api/v1/events pins an
+            // httplib worker for the life of its subscription, so it leases like every
+            // other streaming surface. This wiring was MISSING: the parameter defaults
+            // to nullptr, so the route's try_acquire block was dead code on a real
+            // server while the boot log ("EVERY streaming surface leases from one
+            // budget"), stream_budget.hpp's own "a surface that held a worker without a
+            // lease would make the arithmetic here a fiction", and the documented 429 in
+            // rest-api.md all asserted the opposite — and the plain-REST reserve was not
+            // in fact reserved.
+            stream_budget_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -11528,7 +11907,8 @@ private:
             // stop() joins the web server's worker threads (~ServerImpl → stop()
             // → web_server_->stop()) before any member destructs — no handler
             // runs after the join, so member-destruction order is irrelevant.
-            mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>();
+            mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>(
+                mcp::McpSessionRegistry::Config{}, mcp::McpSessionRegistry::ClockFn{}, &metrics_);
             // PR 4.3 (T13): wire the engine-principal store + the SAME
             // engine-credential store (api_token_store_) + the shared
             // owner-existence predicate the 8 engine tools need. Setters
@@ -11720,7 +12100,41 @@ private:
                 // per-user user_ref PII stays on the audited REST drill).
                 software_licensing_store_.get(),
                 // PR 4.2 — engine role-assignment MCP twins.
-                engine_principal_store_.get());
+                engine_principal_store_.get(),
+                // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
+                // read-model deps the export/open_access_review twins need beyond what's
+                // already threaded above (rbac_store_, engine_principal_store_,
+                // api_token_store_ via set_engine_credential_store).
+                access_review_store_.get(), auth_mgr_.auth_db_ptr(), directory_sync_.get(),
+                // PR 2 (GET SSE channel): the SHARED held-open-stream budget (one
+                // instance across every SSE surface on this worker pool) and the
+                // per-tick credential re-validation seam. Both are raw borrows of
+                // ServerImpl members — same lifetime argument as mcp_sessions_ above
+                // (stop() joins the workers before any member destructs).
+                stream_budget_.get(),
+                [this](const httplib::Request& req,
+                       const std::string& principal) -> mcp::StreamRevalidate {
+                    return auth_routes_->revalidate_stream(req, principal);
+                },
+                // The operator's --mcp-max-streams-per-principal. Passing it is what
+                // makes the flag mean anything: the attach site previously read the
+                // compile-time default, so raising or lowering the flag was a no-op
+                // on a control that parses, validates, logs and is documented.
+                cfg_.mcp_max_streams_per_principal,
+                // Explicit-principal audit sink for mcp.stream.close. The generic sink
+                // re-derives the actor by resolving the request's credential when the row
+                // is written; a close row is written at teardown, so on a
+                // credential_revoked close that resolution fails BY DEFINITION and the row
+                // naming the revoked principal would name nobody. Routed to
+                // audit_log_for_principal, which stamps values captured at attach time.
+                [this](const httplib::Request& req, const std::string& action,
+                       const std::string& result, const mcp::StreamAuditPrincipal& principal,
+                       const std::string& target_type, const std::string& target_id,
+                       const std::string& detail) -> bool {
+                    return auth_routes_->audit_log_for_principal(req, action, result, principal.id,
+                                                                 principal.role, target_type,
+                                                                 target_id, detail, principal.cls);
+                });
         }
 
         // -- Listen -----------------------------------------------------------
@@ -11972,6 +12386,9 @@ private:
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.
     std::unique_ptr<VulnFindingStore> vuln_finding_store_;
+    /// Born-on-PG campaign persistence for Periodic Access Reviews (SOC 2 CC6.2).
+    /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
+    std::unique_ptr<AccessReviewStore> access_review_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 
@@ -12077,6 +12494,20 @@ private:
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
+    // Shared admission budget for held-open SSE responses (2f PR 2, Decision 15(h)).
+    // ONE instance for the whole web server — the streamed-POST channel (2f PR 3) and
+    // /api/v1/events (#2056) take leases from THIS object rather than minting their own
+    // counters, or the shared worker pool can still be starved by whichever surface
+    // opted out.
+    //
+    // DECLARED BEFORE mcp_sessions_ ON PURPOSE: every Lease borrows this budget, and a
+    // Lease is reachable both from a session's stream state and from a provider closure
+    // living on a worker stack. Members destruct in reverse declaration order, so the
+    // budget must be declared FIRST to outlive its borrowers. NOTE the borrowers on
+    // worker stacks are only reaped when web_server_'s pool is joined — that join is
+    // load-bearing and this ordering is defence in depth behind it, not a replacement
+    // for it (web_server_ is declared earlier still, so it destructs after this).
+    std::unique_ptr<detail::StreamBudget> stream_budget_;
     // MCP Streamable HTTP session registry (2f). Captured by raw pointer into the
     // /mcp/v1/ handlers; safe because stop() joins web_server_ before members
     // destruct (see ~ServerImpl → stop() → web_server_->stop()).

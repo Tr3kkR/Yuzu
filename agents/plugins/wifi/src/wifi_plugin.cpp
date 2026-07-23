@@ -12,10 +12,12 @@
  * Platform implementations:
  *   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList / WlanQueryInterface
  *   Linux:   nmcli device wifi list / nmcli device wifi show
- *   macOS:   airport -s / airport -I
+ *   macOS:   list_networks — airport -s / system_profiler (legacy; airport gone in 14+)
+ *            connected     — CoreWLAN (wifi_corewlan.mm)
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-H1)
 
 #include <array>
 #include <cstdio>
@@ -24,6 +26,15 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#ifdef __APPLE__
+#include "wifi_corewlan.hpp"  // CoreWLAN current-connection query (first .mm TU)
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <chrono>
+#include <yuzu/agent/subprocess_runner.hpp> // bounded runner for the Linux nmcli/iw shell-out (review blocker)
+#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -40,19 +51,24 @@
 
 namespace {
 
+// Row-safe wrapper for the free-text fields (SSID / security / BSSID / raw scan
+// blobs) that come from tool output or an AP beacon. `wifi` is NOT a key|value
+// plugin server-side, so an unescaped '|' shifts columns and a '\n' injects a
+// row (plg-H1). Applied at every emission site below, all platforms.
+inline std::string sof(std::string_view v) { return yuzu::util::safe_output_field(v); }
+
 // ── subprocess helper (Linux / macOS) ──────────────────────────────────────
 
 #if defined(__linux__) || defined(__APPLE__)
 std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
+    // Bounded, fork-lock-covered runner (review blocker) instead of a raw,
+    // deadline-less popen that bypassed both the fork lock and any timeout.
+    // `/bin/sh -c` preserves the shell semantics the `nmcli`/`iw` callers rely
+    // on; the runner drains and caps stdout.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    std::string result = std::move(res.output);
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
@@ -144,8 +160,8 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             auto bss_type = bss_type_to_string(net.dot11BssType);
             bool connected = (net.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0;
 
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", ssid, signal, security, bss_type,
-                                         connected ? "true" : "false"));
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid), signal, sof(security),
+                                         sof(bss_type), connected ? "true" : "false"));
         }
         WlanFreeMemory(net_list);
     }
@@ -178,9 +194,10 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             if (security.empty())
                 security = "Open";
 
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", ssid, signal.empty() ? "0" : signal,
-                                         security, channel.empty() ? "0" : channel,
-                                         bssid.empty() ? "-" : bssid));
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid),
+                                         signal.empty() ? "0" : signal, sof(security),
+                                         channel.empty() ? "0" : channel,
+                                         bssid.empty() ? "-" : sof(bssid)));
         }
     } else {
         // Fallback: try iw
@@ -196,7 +213,7 @@ int do_list_networks(yuzu::CommandContext& ctx) {
                                 iface)
                         .c_str());
                 if (!scan.empty()) {
-                    ctx.write_output(std::format("wifi|scan_output|{}", scan));
+                    ctx.write_output(std::format("wifi|scan_output|{}", sof(scan)));
                 }
             }
         } else {
@@ -280,9 +297,10 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             if (security.empty())
                 security = "Open";
 
-            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", ssid, rssi.empty() ? "0" : rssi,
-                                         security, channel.empty() ? "0" : channel,
-                                         bssid.empty() ? "-" : bssid));
+            ctx.write_output(std::format("wifi|{}|{}|{}|{}|{}", sof(ssid),
+                                         rssi.empty() ? "0" : rssi, sof(security),
+                                         channel.empty() ? "0" : channel,
+                                         bssid.empty() ? "-" : sof(bssid)));
         }
     } else {
         // Fallback: system_profiler SPAirPortDataType. The textual form is
@@ -299,8 +317,9 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             auto flush = [&]() {
                 if (ssid.empty())
                     return;
-                ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", ssid, rssi.empty() ? "0" : rssi,
-                                             security.empty() ? "Unknown" : security,
+                ctx.write_output(std::format("wifi|{}|{}|{}|{}|-", sof(ssid),
+                                             rssi.empty() ? "0" : rssi,
+                                             security.empty() ? "Unknown" : sof(security),
                                              channel.empty() ? "0" : channel));
                 emitted = true;
                 ssid.clear();
@@ -402,7 +421,8 @@ int do_connected(yuzu::CommandContext& ctx) {
         auto iface_name = from_wide(iface.strInterfaceDescription);
 
         ctx.write_output(
-            std::format("connected|{}|{}|{}|{}|{}", ssid, signal, security, bssid_str, iface_name));
+            std::format("connected|{}|{}|{}|{}|{}", sof(ssid), signal, sof(security), bssid_str,
+                        sof(iface_name)));
         found = true;
 
         WlanFreeMemory(conn_attrs);
@@ -444,14 +464,16 @@ int do_connected(yuzu::CommandContext& ctx) {
 
         if (!ssid.empty()) {
             ctx.write_output(
-                std::format("connected|{}|{}|{}|{}|{}", ssid, signal.empty() ? "0" : signal,
-                            security.empty() ? "Open" : security, bssid.empty() ? "-" : bssid,
-                            connection.empty() ? "-" : connection));
+                std::format("connected|{}|{}|{}|{}|{}", sof(ssid),
+                            signal.empty() ? "0" : signal,
+                            security.empty() ? "Open" : sof(security),
+                            bssid.empty() ? "-" : sof(bssid),
+                            connection.empty() ? "-" : sof(connection)));
         } else {
             // Fallback: iwconfig
             auto iw_out = run_command("iwconfig 2>/dev/null | grep -E 'ESSID|Signal'");
             if (!iw_out.empty() && iw_out.find("ESSID:off") == std::string::npos) {
-                ctx.write_output(std::format("connected|{}|0|unknown|-|-", iw_out));
+                ctx.write_output(std::format("connected|{}|0|unknown|-|-", sof(iw_out)));
             } else {
                 ctx.write_output("connected|none|Not connected|0|none|none");
             }
@@ -461,43 +483,22 @@ int do_connected(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto airport_out = run_command(
-        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport "
-        "-I 2>/dev/null");
-    if (!airport_out.empty()) {
-        std::istringstream ss(airport_out);
-        std::string line;
-        std::string ssid, rssi, security, bssid, channel;
-        while (std::getline(ss, line)) {
-            // Trim leading whitespace
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            auto trimmed = line.substr(start);
-
-            if (trimmed.starts_with("SSID: "))
-                ssid = trimmed.substr(6);
-            else if (trimmed.starts_with("agrCtlRSSI: "))
-                rssi = trimmed.substr(12);
-            else if (trimmed.starts_with("link auth: "))
-                security = trimmed.substr(11);
-            else if (trimmed.starts_with("BSSID: "))
-                bssid = trimmed.substr(7);
-            else if (trimmed.starts_with("channel: "))
-                channel = trimmed.substr(9);
-        }
-
-        if (!ssid.empty()) {
-            ctx.write_output(
-                std::format("connected|{}|{}|{}|{}|{}", ssid, rssi.empty() ? "0" : rssi,
-                            security.empty() ? "Open" : security, bssid.empty() ? "-" : bssid,
-                            channel.empty() ? "0" : channel));
-        } else {
-            ctx.write_output("connected|none|Not connected|0|none|none");
-        }
-    } else {
-        ctx.write_output("connected|none|Not connected|0|none|none");
-    }
+    // CoreWLAN, not `airport -I`: the private airport binary was removed in
+    // macOS 14 (Sonoma), so the old shell-out returned nothing and we always
+    // reported "Not connected" even while associated. Fields stay in the
+    // established macOS order: SSID | RSSI | Security | BSSID | Channel.
+    //
+    // Location Services (macOS 14+) withholds SSID/BSSID from a background
+    // daemon, but the association, RSSI, channel and security are still
+    // readable — so an authorised-withheld SSID becomes an honest
+    // "<ssid-withheld>" marker on a real connection, never a false
+    // "Not connected".
+    // A fresh struct each call; corewlan_current_connection leaves it at its
+    // default (associated == false → "Not connected") when there is no Wi-Fi
+    // interface, so format_connected_record is the single output path.
+    yuzu::wifi::WifiConnection conn;
+    yuzu::wifi::corewlan_current_connection(conn);
+    ctx.write_output(yuzu::wifi::format_connected_record(conn));
 #endif
     return 0;
 }

@@ -126,8 +126,16 @@ constexpr std::size_t kMaxLiveRows = 20000;
 // parsers (REST parity); the rest parse the dashboard-only wire shapes inline. All
 // agent fields are HTML-escaped at render.
 std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
-                               const std::string& output, const std::string& output2) {
+                               const std::string& output, const std::string& output2,
+                               const std::string& agent_os = "") {
     const auto lines = yuzu::server::live::split_lines(output);
+    // The agent's own OS (authoritative, from the device record) disambiguates
+    // same-arity service-row shapes (K-4): "darwin"/"macos" → macOS. Empty when
+    // the lookup was unavailable, in which case the services branch falls back
+    // to content-sniffing the pid column.
+    const std::string os_lc = to_lower(agent_os);
+    const bool os_is_macos = os_lc == "darwin" || os_lc == "macos";
+    const bool os_known = !os_lc.empty();
 
     if (kind == "uptime") { // KPI-only (the shell's hidden loader fills the Uptime KPI)
         const auto u = yuzu::server::live::parse_uptime(output);
@@ -185,23 +193,40 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
         return body;
     }
 
-    if (kind == "services") { // Windows: svc|name|display|status|startup; Linux: svc|name|status|desc
+    if (kind == "services") { // Windows: svc|name|display|status|startup; Linux: svc|name|status|desc; macOS: svc|label|pid|status|startup
         std::vector<LiveService> rows;
         int running = 0;
         for (const auto& l : lines) {
             if (!l.starts_with("svc|")) continue;
             auto f = pipe_fields(l);
             LiveService s;
-            if (f.size() >= 5) { // Windows: svc|name|display|status|startup
-                s.name = f[1]; s.display = f[2]; s.status = f[3]; s.startup = f[4];
+            if (f.size() >= 5) {
+                // Two distinct 5-field shapes share this arity: Windows
+                // svc|name|display|status|startup and macOS (C-1.12, P10 fix)
+                // svc|label|pid|status|startup. Prefer the agent's authoritative
+                // OS (K-4) so a Windows service whose display name is all digits
+                // (or "-") is never misread as a macOS PID. When the OS is
+                // unknown (device record unavailable — rare, transient), default
+                // to Windows rather than content-sniffing the pid column
+                // (UP-5): a 5-field row with a display name is historically the
+                // Windows shape, and the sniff is exactly what dropped a numeric
+                // Windows display name in the K-4 bug.
+                const bool macos = os_known ? os_is_macos : false;
+                s.name = f[1];
+                if (macos) { s.status = f[3]; s.startup = f[4]; }               // svc|label|pid|status|startup
+                else { s.display = f[2]; s.status = f[3]; s.startup = f[4]; }   // svc|name|display|status|startup
             } else if (f.size() == 4) {
                 // Two distinct 4-field shapes share this arity: Linux svc|name|status|description
-                // and macOS svc|label|pid|status. Disambiguate on the numeric pid column so the
-                // macOS State cell shows the status, not the PID (consistency B1).
+                // and macOS svc|label|pid|status. Prefer the agent's authoritative OS (K-4);
+                // fall back to sniffing the pid column when unknown, so the macOS State cell
+                // shows the status, not the PID (consistency B1). A stopped launchd service
+                // reports pid "-", not a number, so the sentinel counts as macOS in the fallback.
                 s.name = f[1];
-                const bool macos = !f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
-                    return std::isdigit(ch) != 0;
-                });
+                const bool macos = os_known
+                    ? os_is_macos
+                    : (f[2] == "-" || (!f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
+                          return std::isdigit(ch) != 0;
+                      })));
                 if (macos) { s.status = f[3]; }            // svc|label|pid|status
                 else { s.status = f[2]; s.display = f[3]; } // svc|name|status|description
             } else {
@@ -799,13 +824,39 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 if (r.agent_id == id && !r.output.empty() && !r.output.starts_with("error|"))
                     output2 = r.output;
         }
+        // Authoritative agent OS for row-shape disambiguation (K-4), resolved
+        // lazily so the pending re-poll path pays nothing; empty when the device
+        // record is unavailable, in which case render_live_result falls back to
+        // content-sniffing.
+        auto agent_os = [this, &id]() -> std::string {
+            return lookup_fn_
+                       ? lookup_fn_(id).transform([](const DeviceRow& d) { return d.os; }).value_or("")
+                       : std::string{};
+        };
+        // Behavioural-PII access-audit chokepoint (#1647/#1703). The RESULT poll
+        // is where the real process-tree / DNS / connections / users output
+        // actually reaches the operator — the /run dispatch audit above records
+        // the request, but only THIS route renders the PII, so the access must be
+        // audited here too or the read is unaccountable (a works-council /
+        // usage-class concern). Dashboard set-and-proceed posture matching /run:
+        // a transient audit-store outage still renders the lens but raises
+        // Sec-Audit-Failed for the SIEM (REST fail-closed is a separate seam).
+        // Only fires on a branch that actually serves rendered output, never on
+        // the error/failure/timeout notes.
+        auto audit_live_result = [&](const char* result) {
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, lk->audit_action, result, "Agent", id,
+                lk->plugin + "/" + lk->action + " kind=" + kind +
+                    " command_id=" + command_id);
+        };
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
                 note(res, "The device reported an error: " +
                               html_escape(with_output->output.substr(6, 200)));
                 return;
             }
-            res.set_content(render_live_result(kind, *lk, with_output->output, output2),
+            audit_live_result("rendered");
+            res.set_content(render_live_result(kind, *lk, with_output->output, output2, agent_os()),
                             "text/html; charset=utf-8");
             return;
         }
@@ -817,7 +868,8 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                               html_escape(terminal->error_detail.substr(0, 200)));
                 return;
             }
-            res.set_content(render_live_result(kind, *lk, "", output2), "text/html; charset=utf-8");
+            audit_live_result("rendered_empty");
+            res.set_content(render_live_result(kind, *lk, "", output2, agent_os()), "text/html; charset=utf-8");
             return;
         }
         if (attempt >= kMaxAttempts) {

@@ -81,14 +81,12 @@ namespace yuzu::server::detail {
 /// workflow_routes.cpp, and rest_api_v1.cpp, plus the MCP GET SSE stream
 /// registration in mcp_server.cpp.
 ///
-/// FORWARD GUARD (2f / track "SSE-over-GET-or-POST"): GET /mcp/v1/ is a 405
-/// placeholder today (`mcp_server.cpp`'s `build_get_handler` — no content
-/// provider is ever set, so nothing streams and nothing needs to adopt a
-/// slot yet). When the real Streamable HTTP GET SSE channel lands, its
-/// handler MUST call `adopt_quota_slot_into_stream` at the point it starts
-/// the stream, exactly like the three routes below — otherwise it silently
-/// reintroduces UP-1 for MCP engine principals specifically (the surface
-/// this cap exists to protect).
+/// The MCP GET SSE channel (`GET /mcp/v1/`) is now live and DOES adopt the slot:
+/// `mcp_stream.cpp`'s `handle_get_tail` wraps its content-provider releaser in
+/// `adopt_quota_slot_into_stream`, exactly like the three routes below, so an engine
+/// principal's stream holds its concurrency reservation for the stream's whole life
+/// rather than releasing it early at post-routing (the UP-1 hazard this guard exists to
+/// prevent). Any FUTURE streaming route added to `is_streaming_path` MUST do the same.
 [[nodiscard]] inline bool is_streaming_path(const httplib::Request& req) {
     if (req.method != "GET")
         return false;
