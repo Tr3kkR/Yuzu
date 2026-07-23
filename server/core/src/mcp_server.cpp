@@ -1525,9 +1525,11 @@ McpServer::HandlerFn McpServer::build_handler(
         // ── initialize ────────────────────────────────────────────────────
         if (method == "initialize") {
             // Negotiate the protocol revision: echo the client's requested version
-            // when supported, else fall back to the default baseline. (2g PR 1
-            // records the negotiated revision + strict-client handling; PR 1 only
-            // clamps to the supported set.)
+            // when supported, else fall back to the default baseline (the clamp
+            // shipped with 2f PR 1). 2g PR 1 records the negotiated revision on a
+            // labeled counter below so a future revision deprecation has data, not
+            // guesswork; the label is drawn only from the supported set, never a
+            // raw client string.
             std::string negotiated{transport::kProtocolDefault};
             if (params.contains("protocolVersion") && params["protocolVersion"].is_string()) {
                 const auto req_pv = params["protocolVersion"].get<std::string>();
@@ -1563,6 +1565,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // open→close (governance CONS-N2).
                 session_audit("mcp.session.open", "success", mint.session_id.substr(0, 8), "");
             }
+
+            // Record the negotiated protocol revision (2g PR 1). Fires on every
+            // successful initialize in BOTH stateless and streaming modes — unlike
+            // the mcp.session.open audit, which only fires when streaming mints a
+            // session — so revision-deprecation planning sees stateless handshakes
+            // too. `negotiated` is always a member of the supported set (clamped
+            // above), so the label cardinality is bounded by construction.
+            if (metrics != nullptr)
+                metrics->counter("yuzu_mcp_initialize_protocol_total", {{"revision", negotiated}})
+                    .increment();
 
             auto result =
                 JObj()
