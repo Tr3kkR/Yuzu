@@ -11,6 +11,7 @@
  */
 
 #include "mcp_jsonrpc.hpp"
+#include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
 
 #include "agent_registry.hpp"
@@ -896,7 +897,7 @@ private:
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
             /*inventory_scope_fn=*/inventory_scope_fn_for_test,
-            /*metrics=*/nullptr,
+            /*metrics=*/metrics_for_test,
             /*app_perf_providers=*/app_perf_providers_for_test,
             /*quarantine_store=*/quarantine_store_for_test,
             /*tag_push_fn=*/
@@ -938,6 +939,118 @@ TEST_CASE("MCP Integration: initialize handshake", "[mcp][integration]") {
     CHECK(result["capabilities"].contains("tools"));
     CHECK(result["capabilities"].contains("resources"));
     CHECK(result["capabilities"].contains("prompts"));
+}
+
+// ── 1b. 2g PR 1: initialize.instructions orientation blob ───────────────────
+
+TEST_CASE("MCP 2g: initialize returns a non-empty instructions orientation blob",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["result"].contains("instructions"));
+    const auto blob = body["result"]["instructions"].get<std::string>();
+    CHECK_FALSE(blob.empty());
+    // Single-source proof: the handshake blob CONTAINS the two resource texts
+    // verbatim, so yuzu://about / yuzu://operating-model cannot drift from it.
+    CHECK(blob.find(std::string(mcp::about_text())) != std::string::npos);
+    CHECK(blob.find(std::string(mcp::operating_model_text())) != std::string::npos);
+    // The blob returned over the wire is exactly the shared source.
+    CHECK(blob == mcp::initialize_instructions());
+}
+
+TEST_CASE("MCP 2g: yuzu://about and yuzu://operating-model are single-sourced with the blob",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto about = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":1,"params":{"uri":"yuzu://about"}})");
+    auto ab = nlohmann::json::parse(about->body);
+    CHECK(ab["result"]["contents"][0]["text"].get<std::string>() == std::string(mcp::about_text()));
+
+    auto om = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":2,"params":{"uri":"yuzu://operating-model"}})");
+    auto ob = nlohmann::json::parse(om->body);
+    CHECK(ob["result"]["contents"][0]["text"].get<std::string>() ==
+          std::string(mcp::operating_model_text()));
+}
+
+TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    const auto blob = nlohmann::json::parse(res->body)["result"]["instructions"].get<std::string>();
+    for (const auto& fam : mcp::tool_families())
+        CHECK(blob.find(std::string(fam.name)) != std::string::npos);
+}
+
+TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness tether B)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    // Every tool belongs to exactly one family (no dup across families).
+    std::set<std::string> family_tools;
+    for (const auto& fam : mcp::tool_families())
+        for (const auto& t : fam.tools)
+            CHECK(family_tools.insert(std::string(t)).second);
+
+    // The advertised surface (tools/list is tier-independent — it iterates all
+    // kTools[]) must match the family union exactly. A new tool with no family
+    // (or a family listing a removed tool) fails HERE, mechanically.
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::set<std::string> live;
+    for (const auto& t : tools)
+        live.insert(t["name"].get<std::string>());
+    CHECK(family_tools == live);
+}
+
+TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labeled counter",
+          "[mcp][2g]") {
+    const std::string kCtr = "yuzu_mcp_initialize_protocol_total";
+
+    SECTION("supported client revision is echoed and counted") {
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.start();
+        ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 0.0);
+    }
+    SECTION("absent/unsupported revision counts under the baseline") {
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.start();
+        ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{"protocolVersion":"2099-01-01"}})");
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 2.0);
+    }
+    SECTION("a 429 session-cap reject is NOT counted") {
+        yuzu::MetricsRegistry reg;
+        mcp::McpSessionRegistry sreg({.per_principal_cap = 1, .global_cap = 8});
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.session_registry_for_test = &sreg;
+        ts.start();
+        auto first = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        CHECK(first->status == 200); // mints the one allowed session → counts once
+        auto rejected = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{}})");
+        CHECK(rejected->status == 429);
+        // Still 1: the reject returned before the counter increment.
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 1.0);
+    }
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────
