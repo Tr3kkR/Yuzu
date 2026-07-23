@@ -1,4 +1,6 @@
 #include "mcp_server.hpp"
+
+#include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_jsonrpc.hpp"
@@ -7553,10 +7555,11 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     }
 }
 
-// Test-only accessor for the internal kToolSecurity map (2g PR 2). The map has
-// internal linkage in the anonymous namespace above but is visible here in the
-// same translation unit; this exposes a copy so the annotation cross-check test
-// (a separate TU) can assert the served hints against each tool's operation.
+// Test-only accessor for the internal kToolSecurity map (decls in
+// mcp_server_testonly.hpp, #2385). The map has internal linkage in the
+// anonymous namespace above but is visible here in the same translation unit;
+// this exposes a copy so the annotation cross-check test (a separate TU) can
+// assert the served hints against each tool's operation.
 std::vector<ToolSecurityRow> tool_security_rows_for_test() {
     std::vector<ToolSecurityRow> rows;
     rows.reserve(kToolSecurity.size());
