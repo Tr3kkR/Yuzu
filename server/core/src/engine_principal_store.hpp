@@ -180,6 +180,16 @@ public:
     /// state).
     [[nodiscard]] std::vector<EnginePrincipalRow> list_all(bool include_revoked = true) const;
 
+    /// Authoritative variant of `list_all` (ADR-0012 §1 read posture) for
+    /// consumers that must NOT treat a lease/query failure as "zero engine
+    /// principals exist" — e.g. the periodic-access-review export
+    /// (`access_review_model.cpp`), where exporting a partial principal
+    /// population as if it were complete is a SOC 2 evidence bug.
+    /// `unexpected(msg)` on a closed store or a lease/query failure; a value
+    /// (possibly empty) is a genuine, fully-read result.
+    [[nodiscard]] std::expected<std::vector<EnginePrincipalRow>, std::string>
+    list_all_checked(bool include_revoked = true) const;
+
     /// Count of ACTIVE engine principals owned by `owner_username` (uses
     /// `engine_principals_owner_idx`). Backs the owner-delete guard: a user
     /// cannot be deleted while owning an active engine principal. Returns

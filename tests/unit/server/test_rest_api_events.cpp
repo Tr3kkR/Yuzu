@@ -204,7 +204,9 @@ struct RestEventsHarness {
                             /*inventory_scope_fn=*/{},
                             /*response_scope_fn=*/{},
                             /*app_perf_providers=*/{},
-                            /*engine_principal_store=*/nullptr, stream_budget);
+                            /*engine_principal_store=*/nullptr,
+                            /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
+                            /*directory_sync=*/nullptr, stream_budget);
     }
 
     ~RestEventsHarness() {

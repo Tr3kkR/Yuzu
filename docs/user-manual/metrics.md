@@ -319,6 +319,63 @@ if you want notification that an engine principal is regularly hitting its
 cap (may indicate the cap is tuned too low for its workload, or a runaway
 caller).
 
+## Access review metrics
+
+Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
+access reviews") shipped with zero metrics; the hardening round added four
+bounded-label series wired at the REST handlers (`rest_api_v1.cpp`) only —
+the MCP twins are not double-counted.
+
+```
+# HELP yuzu_access_review_export_total Access review evidence exports (GET /api/v1/access-reviews/export), by format
+# TYPE yuzu_access_review_export_total counter
+yuzu_access_review_export_total{format="json"} 0
+yuzu_access_review_export_total{format="csv"} 0
+
+# HELP yuzu_access_review_export_duration_seconds Latency of the cross-principal grant-population read (build_access_review) behind GET /api/v1/access-reviews/export
+# TYPE yuzu_access_review_export_duration_seconds histogram
+
+# HELP yuzu_access_review_campaigns_opened_total Access review campaigns opened (POST /api/v1/access-reviews)
+# TYPE yuzu_access_review_campaigns_opened_total counter
+yuzu_access_review_campaigns_opened_total 0
+
+# HELP yuzu_access_review_attestations_total Access review reviewer decisions recorded (POST /api/v1/access-reviews/{id}/attestations), by decision
+# TYPE yuzu_access_review_attestations_total counter
+yuzu_access_review_attestations_total{decision="attested"} 0
+yuzu_access_review_attestations_total{decision="flagged_revoke"} 0
+```
+
+- **`yuzu_access_review_export_total{format}`** — counter, `format` ∈
+  {`json`, `csv`}, pre-seeded to `0` at startup. Increments once per
+  successful `GET /api/v1/access-reviews/export` call, split by which
+  format was requested — a sustained shift toward `csv` typically means an
+  auditor/spreadsheet workflow is in play.
+- **`yuzu_access_review_export_duration_seconds`** — histogram (default
+  bucket ladder, see "Histogram buckets" below), the wall-clock time of the
+  cross-principal grant-population read (`build_access_review`) behind the
+  export, timed regardless of success/failure outcome — a slow/failing read
+  is exactly what an operator debugging a `503` needs latency evidence for.
+- **`yuzu_access_review_campaigns_opened_total`** — counter, no labels.
+  Increments once per successful `POST /api/v1/access-reviews` — the rate
+  this fires at is the empirical "how often does the org actually run a
+  review" cadence signal (compare against the org's stated review policy).
+- **`yuzu_access_review_attestations_total{decision}`** — counter,
+  `decision` ∈ {`attested`, `flagged_revoke`}, pre-seeded to `0` at startup.
+  Increments once per successful `POST
+  /api/v1/access-reviews/{id}/attestations` call, split by the reviewer's
+  decision. `flagged_revoke` counts recorded evidence only — it never
+  itself revokes anything (flag ≠ revoke, see `docs/auth-architecture.md`);
+  a rising `flagged_revoke` count is a worklist size for whoever acts on
+  the flags, not an automatic remediation trigger.
+
+None of the four carries `event="security"` — a review export or an
+attestation decision is expected, privileged, self-audited operator
+activity (own audit rows: `access_review.exported`, `.campaign_opened`,
+`.attested`/`.flagged`), not an anomaly signal. Bounded-label series
+(`format`, `decision`) are pre-seeded to `0` at startup per the standing
+convention in `docs/observability-conventions.md`, so `absent()`-style
+alerts stay meaningful.
+
 ## Histogram buckets
 
 Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom

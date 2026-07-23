@@ -105,6 +105,7 @@
 #include "verify_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "vuln_finding_store.hpp"
+#include "access_review_store.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — campaign persistence
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -416,6 +417,37 @@ public:
                           "counter");
         for (auto side : {"engine", "operator"}) {
             metrics_.counter("yuzu_server_principal_quota_admits_total", {{"side", side}});
+        }
+        // Periodic Access Reviews (SOC 2 CC6.2) feature metrics — sre SHOULD
+        // (governance): the feature previously carried zero metrics. Bounded
+        // labels only (format and decision are both closed 2-value sets),
+        // pre-seeded per docs/observability-conventions.md so absent()
+        // alerts stay meaningful. Wired at the REST handlers in
+        // rest_api_v1.cpp — the MCP twins (export_access_review,
+        // open_access_review, record_attestation) are not double-counted
+        // here.
+        metrics_.describe("yuzu_access_review_export_total",
+                          "Access review evidence exports (GET /api/v1/access-reviews/export), "
+                          "by format",
+                          "counter");
+        for (auto format : {"json", "csv"}) {
+            metrics_.counter("yuzu_access_review_export_total", {{"format", format}});
+        }
+        metrics_.describe("yuzu_access_review_export_duration_seconds",
+                          "Latency of the cross-principal grant-population read "
+                          "(build_access_review) behind GET /api/v1/access-reviews/export",
+                          "histogram");
+        metrics_.histogram("yuzu_access_review_export_duration_seconds");
+        metrics_.describe("yuzu_access_review_campaigns_opened_total",
+                          "Access review campaigns opened (POST /api/v1/access-reviews)",
+                          "counter");
+        metrics_.counter("yuzu_access_review_campaigns_opened_total");
+        metrics_.describe("yuzu_access_review_attestations_total",
+                          "Access review reviewer decisions recorded (POST "
+                          "/api/v1/access-reviews/{id}/attestations), by decision",
+                          "counter");
+        for (auto decision : {"attested", "flagged_revoke"}) {
+            metrics_.counter("yuzu_access_review_attestations_total", {{"decision", decision}});
         }
         // MCP Streamable HTTP transport (ADR-1005 Decision 15(k) — the family was
         // NAMED in the decision, not left to implementer discretion, so alerts can
@@ -1647,6 +1679,20 @@ public:
             if (!vuln_finding_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: vuln-finding store migration/open failed "
                               "(database reachable but the vuln_finding_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // AccessReviewStore — born-on-PG campaign persistence for Periodic Access
+        // Reviews (SOC 2 CC6.2). Same fail-CLOSED construction posture as the
+        // other born-on-PG stores (ADR-0012 §1) — this is compliance evidence, so
+        // a reachable database whose schema can't migrate must not serve degraded.
+        if (pg_pool_ && !startup_failed_) {
+            access_review_store_ = std::make_unique<AccessReviewStore>(*pg_pool_);
+            if (!access_review_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: access-review store migration/open failed "
+                              "(database reachable but the access_review_store schema could not be "
                               "created/opened)");
                 startup_failed_ = true;
             }
@@ -4131,6 +4177,11 @@ public:
         // thread this PR; keep the ADR-0012 teardown discipline so a future engine
         // can't UAF).
         vuln_finding_store_.reset();
+        // AccessReviewStore borrows pg_pool_ — drop before the pool. No background
+        // thread borrows it (only rest_api_v1_/mcp_server_ hold a raw pointer, and
+        // every HTTP/MCP handler thread is already quiesced by the drain above);
+        // keep the ADR-0012 teardown discipline so a future consumer can't UAF.
+        access_review_store_.reset();
         // ApiTokenStore borrows pg_pool_ — drop before the pool. No background
         // thread borrows it (only auth_routes_/settings_routes_/rest_api_v1_
         // hold a raw pointer, and every HTTP handler thread is already
@@ -6191,6 +6242,14 @@ private:
                 // silently no-op findings persistence — surface it (Pattern E).
                 {"vuln_finding_store",
                  vuln_finding_store_ && vuln_finding_store_->is_open()},
+                // Periodic Access Reviews (SOC 2 CC6.2) born-on-PG store. AUTHORITATIVE
+                // per ADR-0012 §1 — the /api/v1/access-reviews campaign lifecycle
+                // (open/attest/close) is dead without it. The read-only export route
+                // does not depend on this store, but the campaign-based evidence surface
+                // is the feature's core deliverable, so a not-open state must be visible
+                // at /readyz, not just returning 503 per-request unnoticed.
+                {"access_review_store",
+                 access_review_store_ && access_review_store_->is_open()},
                 {"app_perf_daily_store",
                  app_perf_daily_store_ && app_perf_daily_store_->is_open()},
                 {"app_perf_fleet_store",
@@ -6901,6 +6960,20 @@ private:
         // every other optional-store wiring in this file.
         if (engine_principal_store_) {
             settings_routes_->set_engine_principal_store(engine_principal_store_.get());
+        }
+        // Access-review (CC6.2) Settings fragment deps — nullable, same
+        // deferred-wiring posture as set_engine_principal_store above: an
+        // unwired store leaves the fragment rendering an "unavailable" notice
+        // rather than crashing. auth_db comes from auth_mgr_; api_token_store_
+        // + engine_principal_store_ are already wired above/via register_routes.
+        if (rbac_store_) {
+            settings_routes_->set_rbac_store(rbac_store_.get());
+        }
+        if (access_review_store_) {
+            settings_routes_->set_access_review_store(access_review_store_.get());
+        }
+        if (directory_sync_) {
+            settings_routes_->set_access_review_directory_sync(directory_sync_.get());
         }
         settings_routes_->register_routes(
             *web_server_,
@@ -11771,6 +11844,10 @@ private:
             app_perf_providers,
             // PR 4.2 — fleet-wide engine role-assignment authoring surface.
             engine_principal_store_.get(),
+            // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
+            // read-model deps build_access_review needs beyond the ones already
+            // threaded above (rbac_store_, engine_principal_store_, api_token_store_).
+            access_review_store_.get(), auth_mgr_.auth_db_ptr(), directory_sync_.get(),
             // ADR-0034: the ONE held-open-response budget. GET /api/v1/events pins an
             // httplib worker for the life of its subscription, so it leases like every
             // other streaming surface. This wiring was MISSING: the parameter defaults
@@ -11998,6 +12075,11 @@ private:
                 software_licensing_store_.get(),
                 // PR 4.2 — engine role-assignment MCP twins.
                 engine_principal_store_.get(),
+                // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
+                // read-model deps the export/open_access_review twins need beyond what's
+                // already threaded above (rbac_store_, engine_principal_store_,
+                // api_token_store_ via set_engine_credential_store).
+                access_review_store_.get(), auth_mgr_.auth_db_ptr(), directory_sync_.get(),
                 // PR 2 (GET SSE channel): the SHARED held-open-stream budget (one
                 // instance across every SSE surface on this worker pool) and the
                 // per-tick credential re-validation seam. Both are raw borrows of
@@ -12278,6 +12360,9 @@ private:
     /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
     /// DORMANT this PR: constructed + wired into /readyz+/healthz, no engine yet.
     std::unique_ptr<VulnFindingStore> vuln_finding_store_;
+    /// Born-on-PG campaign persistence for Periodic Access Reviews (SOC 2 CC6.2).
+    /// Borrows pg_pool_ → declared after it; reset in stop() before the pool.
+    std::unique_ptr<AccessReviewStore> access_review_store_;
     std::unique_ptr<AuditStore> audit_store_;
     std::unique_ptr<TagStore> tag_store_;
 

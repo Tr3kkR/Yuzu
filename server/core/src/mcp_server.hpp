@@ -43,6 +43,12 @@ class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licens
 // engine-principal lifecycle tools (ADR-1005 item 2b). Forward-declared
 // (pointer-only here); the .cpp includes engine_principal_store.hpp.
 class EnginePrincipalStore;
+// Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
+// optional read-model enrichment dep. Forward-declared (pointer-only in
+// build_handler/register_routes); the .cpp includes access_review_store.hpp /
+// directory_sync.hpp. AuthDB is already forward-declared via <yuzu/server/auth.hpp>.
+class AccessReviewStore;
+class DirectorySync;
 }
 
 namespace yuzu::server::detail {
@@ -278,7 +284,15 @@ public:
                             // Trailing optional dep; nullptr leaves assign/unassign
                             // answering an internal-error JSON-RPC response (list still
                             // works if rbac_store is wired).
-                            EnginePrincipalStore* engine_principal_store = nullptr);
+                            EnginePrincipalStore* engine_principal_store = nullptr,
+                            // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store
+                            // plus the read-model deps build_access_review needs beyond
+                            // rbac_store/engine_principal_store above and
+                            // engine_credential_store_ (member, ApiTokenStore). Trailing
+                            // optional deps; access_review_store == nullptr leaves the
+                            // whole access-review tool family answering "unavailable".
+                            AccessReviewStore* access_review_store = nullptr,
+                            AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -338,6 +352,10 @@ public:
                          // PR 4.2 (design §4.1): engine-principal role-assignment MCP
                          // twins (the 4.2 grant handlers capture this param).
                          EnginePrincipalStore* engine_principal_store = nullptr,
+                         // Periodic Access Reviews (SOC 2 CC6.2) — see build_handler's
+                         // doc comment above; identical trailing-optional-dep contract.
+                         AccessReviewStore* access_review_store = nullptr,
+                         AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
                          // PR 2 (GET SSE channel): the SHARED held-open-stream budget
                          // (one instance across every SSE surface on the httplib pool,
                          // Decision 15(h)) and the per-tick credential re-validation

@@ -79,6 +79,32 @@ public:
 
     // ── Permissions CRUD ─────────────────────────────────────────────────
     std::vector<Permission> get_role_permissions(const std::string& role_name) const;
+
+    /// Authoritative variant of `get_role_permissions` (ADR-0012 read
+    /// posture) for bulk-read consumers — e.g. the periodic-access-review
+    /// export (`access_review_model.cpp`) — that must distinguish "this role
+    /// genuinely grants no permissions" from "the query failed". A bare
+    /// vector conflates the two; `unexpected(msg)` here is a closed store,
+    /// prepare failure, or a step that terminated on anything other than
+    /// `SQLITE_DONE`. A value (possibly empty) is a genuine, fully-read
+    /// result.
+    std::expected<std::vector<Permission>, std::string>
+    get_role_permissions_checked(const std::string& role_name) const;
+
+    /// Bulk variant of `get_role_permissions_checked` — every row in
+    /// `role_permissions`, for every role, in ONE query. Added for the
+    /// grant-table-driven periodic-access-review export
+    /// (`access_review_model.cpp`, governance UP-1): the export memoizes this
+    /// single read into a `role_name -> permission set` map once, rather than
+    /// re-querying per role per principal (the N×M fan-out the prior
+    /// per-principal-type walk incurred). Same fail-closed posture as the
+    /// other `_checked` accessors: `unexpected(msg)` on a closed store,
+    /// prepare failure, or a step that terminated on anything other than
+    /// `SQLITE_DONE`; a value (possibly empty) is a genuine, fully-read
+    /// result.
+    std::expected<std::vector<Permission>, std::string>
+    list_all_role_permissions_checked() const;
+
     std::expected<void, std::string> set_permission(const Permission& perm);
     std::expected<void, std::string> remove_permission(const std::string& role_name,
                                                        const std::string& securable_type,
@@ -87,6 +113,33 @@ public:
     // ── Principal-role assignments ────────────────────────────────────────
     std::vector<PrincipalRole> get_principal_roles(const std::string& principal_type,
                                                    const std::string& principal_id) const;
+
+    /// Authoritative variant of `get_principal_roles` — same posture as
+    /// `get_role_permissions_checked` above. `unexpected(msg)` is a closed
+    /// store or a mid-scan SQLite error; a value (possibly empty) is a
+    /// genuine, fully-read result (the principal really has no role grants).
+    std::expected<std::vector<PrincipalRole>, std::string>
+    get_principal_roles_checked(const std::string& principal_type,
+                                const std::string& principal_id) const;
+
+    /// Bulk variant of `get_principal_roles_checked` — EVERY `(principal_type,
+    /// principal_id, role_name)` grant row on record, across all three
+    /// principal types, in ONE query. This is the authoritative set: the
+    /// grant table, not any roster (`users`/`groups`/engine-principal list),
+    /// is the source of truth for "who currently holds a role" — a roster
+    /// walk can silently miss a since-deleted user, a stale IdP-provisioned
+    /// row, or an OIDC/SSO principal (`oidc:<iss>#<sub>`) that was never
+    /// materialized into a roster. Added for the grant-table-driven
+    /// periodic-access-review export (`access_review_model.cpp`, governance
+    /// UP-1), which pivots to this call as its spine instead of walking the
+    /// rosters and asking RBAC per member. Same fail-closed posture as the
+    /// other `_checked` accessors: `unexpected(msg)` on a closed store,
+    /// prepare failure, or a step that terminated on anything other than
+    /// `SQLITE_DONE`; a value (possibly empty) is a genuine, fully-read
+    /// result (no grants exist at all).
+    std::expected<std::vector<PrincipalRole>, std::string>
+    list_all_principal_roles_checked() const;
+
     std::vector<PrincipalRole> get_role_members(const std::string& role_name) const;
 
     /// Shared assignment guard called by BOTH `RbacStore::assign_role` AND
@@ -118,6 +171,15 @@ public:
 
     // ── Groups CRUD (minimal — for future AD/Entra) ──────────────────────
     std::vector<RbacGroup> list_groups() const;
+
+    /// Authoritative variant of `list_groups` — same posture as
+    /// `get_role_permissions_checked` above. `unexpected(msg)` is a closed
+    /// store, prepare failure, or a step that terminated on anything other
+    /// than `SQLITE_DONE`; a value (possibly empty) is a genuine, fully-read
+    /// result (no groups exist yet). Added for the periodic-access-review
+    /// export (`access_review_model.cpp`), which must never export a
+    /// partial grant set as if it were complete.
+    std::expected<std::vector<RbacGroup>, std::string> list_groups_checked() const;
 
     /// Rejects a `source=="local"` create whose `name` collides with a reserved
     /// IdP or engine-principal namespace prefix (`local:`/`entra:`/`saml:`/
