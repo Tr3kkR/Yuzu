@@ -2991,11 +2991,13 @@ private:
             snapshot_pump_thread_.join();
         // LIFETIME INVARIANT (Guardian lifecycle journal, item 7 PR-Ag): the heartbeat thread
         // (guardian_->journal_maintenance_tick / journal_stats) and the run-loop reconnect hook
-        // (guardian_->page_journal) capture a RAW GuardianLifecycleJournal* under the engine mtx_
-        // and use it OFF-lock. That pointer stays valid ONLY because these threads are joined HERE,
-        // before guardian_ is destroyed (declared later, destroyed earlier). Do NOT reorder a
-        // guardian_ teardown ahead of these joins, and keep new guardian_-touching threads joined
-        // in this block.
+        // (guardian_->page_journal) call INTO the engine, so neither may run after guardian_ is
+        // destroyed (declared later, destroyed earlier). They stay safe ONLY because these
+        // threads are joined HERE, first. Do NOT reorder a guardian_ teardown ahead of these
+        // joins, and keep new guardian_-touching threads joined in this block. (Since C0 #2298
+        // neither call carries a raw journal pointer off-lock any more - prune/page moved onto
+        // the engine's own drain worker, which the engine itself joins - but the join order is
+        // unchanged: page_journal still takes the engine mtx_ and wakes that worker.)
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
         sync_stop_.store(true, std::memory_order_release);

@@ -52,6 +52,7 @@
 #include "guardian_outbox.hpp"
 #include "guardian_rule_eval.hpp"
 
+#include <algorithm> // (std::min) in drop_oldest_pending_for_test
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -62,6 +63,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -226,7 +228,57 @@ public:
     /// blocks enqueuers/heartbeat. The drain trigger (sink publication + reconnect +
     /// live wake-on-enqueue) is wired at rung 7; this is the mechanism. Returns the
     /// number SENT (not removed - a coalesced head counts as sent but is not popped).
+    ///
+    /// `limits` bounds ONE pass. Bounding exists because the caller's thread may carry
+    /// OTHER periodic work (C0 #2298: the drain worker also runs journal retention).
+    /// Unbounded, a slow stream drains the whole window - up to 4096 lifecycle entries -
+    /// head-of-line blocking that work; on a slow link that starves retention until the
+    /// journal hits its write ceiling and DROPS audit records. A caller that bounds a pass
+    /// should re-drain immediately while `truncated` comes back true.
+    struct DrainLimits {
+        /// 0 = unbounded (the historical behaviour).
+        std::size_t max_entries{0};
+        /// Wall-clock cap on one pass, checked between sends. 0 = unbounded. A COUNT bound
+        /// alone is not a safety bound: one slow-but-succeeding send makes an N-entry pass
+        /// arbitrarily long, and the caller may be holding up a join (#2298 Sol review).
+        std::chrono::milliseconds max_wall{0};
+        /// Checked BEFORE every send. Lets a caller stop starting new sends the moment
+        /// shutdown is requested rather than at the end of a whole bounded pass. The
+        /// in-flight send is not interruptible; no further one begins.
+        std::function<bool()> should_stop{};
+        /// Fraction reserved for the compliance/health outbox so a busy lifecycle log cannot
+        /// consume the entire pass. Applies to BOTH dimensions: the entry count and (gated on
+        /// `max_wall > 0`, not on `max_entries`) the wall clock. The guarantee is that
+        /// compliance gets an opportunity to START - not a slice of time, since an in-flight
+        /// send cannot be interrupted. Unused lifecycle allowance rolls
+        /// over, so this costs nothing when lifecycle is quiet. Load-bearing: draining
+        /// lifecycle first with a SHARED budget silently recreated the detection blackout
+        /// that Gate 4 UP-3 removed - compliance simply never ran (#2298 Sol review).
+        std::size_t compliance_reserve_num{1};
+        std::size_t compliance_reserve_den{2};
+    };
+    struct DrainOutcome {
+        std::size_t sent{0};
+        /// A limit cut the pass short (count, wall-clock, or should_stop) and entries may
+        /// remain. The caller should re-drain without waiting rather than sleep.
+        bool truncated{false};
+    };
+    /// Free slots in the lifecycle send window, sampled without a lock held by the caller.
+    /// Used by the replay path as a pure OPTIMISATION - to avoid building entries for a batch
+    /// that plainly cannot fit. It is NOT the authority on whether a batch was blocked: that
+    /// comes back from try_page_batch's PageOutcome, decided under outbox_mu_, because this
+    /// value can be stale by the time the attempt happens (#2345).
+    [[nodiscard]] std::size_t lifecycle_headroom() const;
+    /// Snapshot of the event_ids currently in the lifecycle send window, taken ONCE per replay
+    /// pass. Lets the replay path size a candidate by its NET-NEW records rather than its raw
+    /// entry count without taking outbox_mu_ per candidate. Same status as lifecycle_headroom():
+    /// an optimisation, stale the moment it returns, never the authority - try_page_batch's
+    /// PageOutcome decides under the lock (#2345 Gate 8 QE).
+    [[nodiscard]] std::unordered_set<std::string> lifecycle_event_ids() const;
+
     std::size_t drain(const std::function<SendResult(const OutboxEntry&)>& send);
+    DrainOutcome drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
+                               const DrainLimits& limits);
 
     // --- Durable lifecycle journal - staging seam (item 7 PR-Ag) ------------
     // Staging lives HERE (co-located with lifecycle_log_ under outbox_mu_) because
@@ -239,19 +291,56 @@ public:
     /// A FIFO copy of the currently-staged (built + validated, not-yet-persisted)
     /// records. Immutable view; the caller serialises + writes them, then calls
     /// erase_persisted_prefix() for the count it durably wrote.
-    [[nodiscard]] std::vector<std::shared_ptr<const JournalRecord>> snapshot_pending() const;
+    /// A staging snapshot and the overflow-drop count observed WITH it, under one lock. The
+    /// pair travels together because erase_persisted_prefix needs both to identify the prefix
+    /// it wrote rather than trust an index a concurrent overflow drop can shift; returning
+    /// them as one value is what stops a caller taking the snapshot and forgetting the count,
+    /// which is the mistake that produced the bug in the first place.
+    struct PendingSnapshot {
+        std::vector<std::shared_ptr<const JournalRecord>> records;
+        std::uint64_t drops_at_snapshot{0};
+    };
+    [[nodiscard]] PendingSnapshot snapshot_pending() const;
 
     /// Drop the oldest `n` staged records (those a persist just durably wrote).
     /// Clamped to the current size.
-    void erase_persisted_prefix(std::size_t n);
+    /// TEST-ONLY: perform `n` overflow drop-oldest steps exactly as stage_pending_locked does
+    /// at kMaxPendingJournalRecords (erase the front, count it). Reaching the real 4096-record
+    /// ceiling from a test would need 4096 arms, which is why the interleaving that this
+    /// models - a front-drop landing between snapshot_pending() and erase_persisted_prefix() -
+    /// had no coverage. No production caller.
+    void drop_oldest_pending_for_test(std::size_t n) {
+        std::lock_guard<std::mutex> ob{outbox_mu_};
+        // (std::min), not std::min: MSVC's min() macro would clobber it in a windows.h TU.
+        n = (std::min)(n, pending_journal_.size());
+        pending_journal_.erase(pending_journal_.begin(),
+                               pending_journal_.begin() + static_cast<std::ptrdiff_t>(n));
+        journal_stage_dropped_.fetch_add(n, std::memory_order_relaxed);
+    }
 
-    /// Page a REPLAYED batch into the send window: iff the window has >= batch-size
-    /// headroom, enqueue each entry NOT already present (window-scan membership, no
-    /// allocating set). Returns the count newly enqueued - 0 if deferred for headroom or
-    /// every entry was already present. Paged entries enter lifecycle_log_ ONLY (they are
-    /// already durable - never pending_journal_). Does NOT wake the drain; the caller (the
-    /// reconnect / low-water / tick hook, C6) drives sending.
-    [[nodiscard]] std::size_t try_page_batch(std::vector<OutboxEntry> entries);
+    /// `drops_at_snapshot` is journal_stage_dropped() as read WITH the snapshot. It is what
+    /// makes the erase identify the prefix rather than trust an index that a concurrent
+    /// overflow drop can shift underneath it.
+    void erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot);
+
+    /// Outcome of a page attempt, decided UNDER outbox_mu_ so it reflects the window as it
+    /// actually was. A bare count could not distinguish "the window had no room for this
+    /// batch" from "every entry was already a member" - opposite situations, and the caller
+    /// needs the first to know a backlog is waiting (#2345 Gate 3).
+    struct PageOutcome {
+        std::size_t added{0};          ///< entries newly enqueued
+        bool blocked_for_headroom{false}; ///< the batch did not fit, atomically observed
+        std::size_t required{0};       ///< entries the batch needed when blocked
+    };
+    /// Page a REPLAYED batch into the send window: iff the window has >= batch-size headroom,
+    /// enqueue each entry NOT already present (window-scan membership, no allocating set).
+    /// Paged entries enter lifecycle_log_ ONLY (they are already durable - never
+    /// pending_journal_). Does NOT wake the drain; the caller drives sending.
+    ///
+    /// Reports WHY nothing was added via PageOutcome above: a bare count could not separate
+    /// "no room for this batch" from "every entry already a member", and the caller needs the
+    /// first to know a backlog is waiting (#2345).
+    [[nodiscard]] PageOutcome try_page_batch(std::vector<OutboxEntry> entries);
 
     /// Back-fill provenance onto the LIVE window entries of a just-persisted batch (review M3),
     /// so a live send writes its sent-label rather than the batch later ageing out counted

@@ -2459,6 +2459,28 @@ This would be a Phase 15+ addition, not a rearchitecture of the current Phases A
 Pulled out of CLAUDE.md so the design doc carries them. Every PR in the
 Guardian ladder must check these.
 
+- **No thread `GuardianEngine::stop()` joins may take `GuardianEngine::mtx_`.**
+  `stop()` holds `mtx_` across its whole body AND joins BOTH the
+  `ConvergenceScheduler` lanes and the outbox drain worker inside it, so an
+  `mtx_` acquisition on any of those threads is a lock-vs-join deadlock — a hung
+  agent shutdown, fleet-wide. Everything those threads run is in scope: the
+  journal's prune/page maintenance, the convergence sweeps, and the INJECTED
+  `send`, which is an arbitrary `std::function` supplied from `agent.cpp` and is
+  the easiest place to reintroduce it. Collaborators are handed to the workers as
+  pre-resolved handles at construction, never re-read off the engine under its
+  lock. `mtx_` is a `WorkerHostileMutex` that ABORTS on violation in
+  debug/sanitizer builds, keyed on the thread-local marker in
+  `guardian_joined_thread_role.hpp` — but the abort is a backstop, not a licence
+  to reason loosely, and it compiles out of a plain release build. (C0, #2298
+  gate 1 + Gate 4.)
+- **Journal maintenance is paced by TIME, never by wake count.** The drain
+  worker wakes on every outbox enqueue, and a paging pass is a full
+  `list_entries` + parse + `validate_record` sweep of the journal.
+  `JournalPagingBucket` does NOT bound that — it charges a token only when a
+  batch pages net-new work, so with a full send window it never throttles at
+  all. It is a wire limiter, not a scan limiter. Any future maintenance work
+  added to this worker must carry its own `steady_clock` cadence, or it becomes
+  O(event rate x journal size) on every managed endpoint. (C0, #2298 gate 1.)
 - **RBAC `Push` seed is Guardian-only.** `rbac_store.cpp` has TWO operation
   arrays: `ops[]` (the full catalogue, 6 entries including `Push`) and
   `crud_ops[]` (the 5 ops cross-seeded to every securable type in the
