@@ -83,6 +83,7 @@ GuardianJournalStats all_nonzero_stats() {
     s.batches_pruned = 12;
     s.prune_failures = 13;
     s.write_capacity_rejected = 14;
+    s.gauge_underflow = 27;
     s.journal_bytes = 15;
     s.journal_batch_count = 16;
     s.pages = 17;
@@ -140,6 +141,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_pruned", "12"},
         {"yuzu.guardian_journal_prune_failures", "13"},
         {"yuzu.guardian_journal_write_capacity_rejected", "14"},
+        {"yuzu.guardian_journal_gauge_underflow", "27"},
         {"yuzu.guardian_journal_bytes", "15"},
         {"yuzu.guardian_journal_batch_count", "16"},
         {"yuzu.guardian_journal_pages", "17"},

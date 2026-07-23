@@ -44,6 +44,7 @@ struct GuardianJournalStats {
     /// journal deliberately kept evidence it would otherwise have deleted.
     std::uint64_t clock_jump_skips{0};
     std::uint64_t write_capacity_rejected{0}; ///< new batch refused: journal at its byte/count cap (UP-1)
+    std::uint64_t gauge_underflow{0};         ///< write-ceiling size gauge read NEGATIVE; persist failed CLOSED (UP-2/#2303)
     std::uint64_t journal_bytes{0};           ///< current live journal size estimate (gauge)
     std::uint64_t journal_batch_count{0};     ///< current live batch count (gauge)
     // Replay (component).
@@ -89,6 +90,7 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_journal_page_read_failures", s.page_read_failures);
     put("yuzu.guardian_journal_clock_jump_skips", s.clock_jump_skips);
     put("yuzu.guardian_journal_write_capacity_rejected", s.write_capacity_rejected);
+    put("yuzu.guardian_journal_gauge_underflow", s.gauge_underflow);
     put("yuzu.guardian_journal_bytes", s.journal_bytes);
     put("yuzu.guardian_journal_batch_count", s.journal_batch_count);
     put("yuzu.guardian_journal_pages", s.pages);

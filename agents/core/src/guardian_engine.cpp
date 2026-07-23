@@ -480,6 +480,7 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.page_read_failures = lifecycle_journal_->page_read_failures();
         s.clock_jump_skips = lifecycle_journal_->clock_jump_skips();
         s.write_capacity_rejected = lifecycle_journal_->write_capacity_rejected();
+        s.gauge_underflow = lifecycle_journal_->gauge_underflow();
         s.journal_bytes = lifecycle_journal_->journal_bytes();
         s.journal_batch_count = lifecycle_journal_->journal_batch_count();
         s.pages = lifecycle_journal_->pages();
