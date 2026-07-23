@@ -253,6 +253,15 @@ public:
     ///    next publish assigns the id this call would have. 0 is never a valid frame id
     ///    (ids start at 1).
     ///
+    /// CALLER OBLIGATION (asymmetric — a `0` is client-INVISIBLE): a pre-commit `0` bumps
+    /// no `dropped_total`, so no `events-dropped` synthetic fires and no replay recovers
+    /// the frame — it simply never existed. That is correct for a fire-and-forget progress
+    /// delta. It is NOT sufficient for a TERMINAL/completion frame: a producer of one MUST
+    /// NOT treat `publish()` as the delivery guarantee, because a `0` there leaves the
+    /// client with no terminal and no gap signal. The durable `execution_id` fetch
+    /// (Decision 15(f)) is the backstop, and track 2f PR 3 must wire it to a `0` return
+    /// explicitly, not rely on general stream-death recovery.
+    ///
     /// CONTRACT (Decision 15(b) — LOAD-BEARING): a published frame MUST be a message
     /// arising from THIS session's own requests. The GET channel is exempt from
     /// per-tool tier/RBAC gating precisely because it carries nothing else; a

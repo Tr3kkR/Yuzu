@@ -16,6 +16,7 @@
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <atomic>
@@ -862,9 +863,12 @@ TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and 
     }
     CHECK(attached.sink->sse->dropped_total.load() == 1); // ...and that is COUNTED
 
-    // The counted drop rides the existing slow-consumer machinery: the pump's next tick
-    // tells the client frames were lost, and the ring still holds the frame so a
-    // Last-Event-ID resume recovers it. No silent gap in either direction.
+    // The counted drop rides the existing machinery: the pump tells the client frames
+    // were lost, and the ring still holds the frame so a Last-Event-ID resume recovers
+    // it. NOTE this is the empty-queue lone-drop case: dropped_total==1 with an EMPTY
+    // queue is the interaction #2366 introduced (pre-#2366 a drop always rode alongside
+    // a real push_back), and the pump's wait predicate now includes dropped_total so this
+    // wakes promptly on the publish's notify rather than deferring a full tick.
     mcp::McpStreamPump pump{attached.sink, state, attached.generation,
                             [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
                             fast_cfg()};
@@ -878,4 +882,50 @@ TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and 
     REQUIRE(resumed.sink->sse->queue.size() == 1);
     CHECK(resumed.sink->sse->queue.front().id == 1);
     CHECK(resumed.sink->sse->queue.front().data == "missed");
+}
+
+TEST_CASE("McpStreamState: an injected publish fault is one-shot — never persists (#2366)",
+          "[mcp][stream]") {
+    // A leaked fault flag would silently drop a later REAL frame. kSinkEnqueue is the
+    // sharp case: it is consumed only when a sink is live, so injecting it with NO live
+    // sink must still clear it up front — otherwise it fires on the next client's first
+    // frame. (The fault is now read-and-cleared via std::exchange before the sink check.)
+    auto state = std::make_shared<mcp::McpStreamState>();
+
+    // (a) kSinkEnqueue injected with NO live sink: consumed anyway, not left armed.
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    CHECK(state->publish("message", "no-sink") == 1); // committed; nothing to drop
+    // Attach at cursor 1 so the replay serves nothing — we want to observe ONLY the next
+    // live publish, not the pre-attach frame.
+    auto attached = state->attach_and_replay(1, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    state->publish("message", "first-real"); // would be dropped if the fault had persisted
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        REQUIRE(attached.sink->sse->queue.size() == 1);
+        CHECK(attached.sink->sse->queue.front().data == "first-real");
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 0); // never armed against a real frame
+
+    // (b) kSinkEnqueue with a live sink: consumed once, the very next publish delivers.
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    state->publish("message", "dropped-once");
+    CHECK(attached.sink->sse->dropped_total.load() == 1);
+    state->publish("message", "delivered");
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        CHECK(attached.sink->sse->queue.back().data == "delivered");
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 1); // still 1 — no second drop
+}
+
+TEST_CASE("McpStreamState: a pre-commit failure increments the publish-failures counter (#2366)",
+          "[mcp][stream]") {
+    // Exercises the boundary's catch with a LIVE registry (not the nullptr default the
+    // other cases use), so the nested-guarded counter increment runs on the real path.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    CHECK(state.publish("message", "lost") == 0);
+    CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
 }
