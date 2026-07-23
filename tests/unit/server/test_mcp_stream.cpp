@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility> // std::declval — the publish() noexcept static_assert
 #include <vector>
@@ -811,10 +812,21 @@ TEST_CASE("McpStreamState: an oversized frame is replaced, not corrupted",
 
 TEST_CASE("McpStreamState: publish is a noexcept boundary — structural, not decorative",
           "[mcp][stream]") {
+    // Assert on LVALUE arguments, not rvalue temporaries. The realistic PR 3 caller is
+    // `publish(event.event_type, event.data)` — lvalue members of the bus event. With a
+    // by-value `std::string` parameter that copy happens in the CALLER's frame and can
+    // throw bad_alloc BEFORE the boundary's try, escaping the unguarded listener; the old
+    // assertion used `std::string{}` rvalues (which move, noexcept) and so missed the hole
+    // entirely. `string_view` params make the whole call expression non-throwing.
     static_assert(
-        noexcept(std::declval<mcp::McpStreamState&>().publish(std::string{}, std::string{})),
-        "#2366: publish() must be a hard exception boundary — PR 3's progress bridge "
-        "calls it from an unguarded ExecutionEventBus listener (the #2037 class)");
+        noexcept(std::declval<mcp::McpStreamState&>().publish(
+            std::declval<const std::string&>(), std::declval<const std::string&>())),
+        "#2366: publish() must be a hard exception boundary for LVALUE callers — PR 3's "
+        "progress bridge calls it from an unguarded ExecutionEventBus listener (#2037)");
+    // And for string_view / string-literal call sites.
+    static_assert(noexcept(std::declval<mcp::McpStreamState&>().publish(
+                      std::string_view{}, std::string_view{})),
+                  "#2366: the boundary must also hold for string_view callers");
     SUCCEED();
 }
 

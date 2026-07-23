@@ -175,7 +175,7 @@ McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metr
     }
 }
 
-std::uint64_t McpStreamState::publish(std::string event_type, std::string data) noexcept {
+std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_view data) noexcept {
     // HARD exception boundary (#2366) — the pump_once/pump_once_impl pattern. PR 3's
     // progress bridge calls this from an ExecutionEventBus listener on a worker task
     // httplib's routing try/catch never sees, so an escaped throw is std::terminate
@@ -183,8 +183,13 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
     // exception reaching this catch proves the ring and next_id_ are untouched — 0
     // ("not published, no id consumed") is the honest answer, and the caller's frame
     // simply never happened rather than silently gapping Last-Event-ID.
+    //
+    // string_view params (not by-value std::string): a by-value parameter is
+    // copy-constructed in the CALLER's frame for an lvalue arg, so a bad_alloc there
+    // would escape to the unguarded listener BEFORE this try. The views convert without
+    // allocating; publish_impl owns them inside the guard.
     try {
-        return publish_impl(std::move(event_type), std::move(data));
+        return publish_impl(event_type, data);
     } catch (...) {
         // Best-effort observability only — the metric lookup and the log line both
         // allocate, and under bad_alloc a throw from THIS handler would propagate
@@ -205,7 +210,14 @@ void McpStreamState::inject_publish_fault_for_test(PublishFault fault) {
     publish_fault_ = fault;
 }
 
-std::uint64_t McpStreamState::publish_impl(std::string event_type, std::string data) {
+std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
+                                           std::string_view data_view) {
+    // Own the payload INSIDE the boundary. These two copies are the caller-visible
+    // allocations that used to happen in the caller's frame (by-value params); doing them
+    // here means a bad_alloc is caught by publish()'s guard as a clean pre-commit 0
+    // (nothing mutated yet), never an escape to the unguarded ExecutionEventBus listener.
+    std::string event_type{event_type_view};
+    std::string data{data_view};
     std::shared_ptr<McpStreamSink> live;
     std::uint64_t id = 0;
     std::uint64_t evicted = 0;
@@ -307,8 +319,17 @@ std::uint64_t McpStreamState::publish_impl(std::string event_type, std::string d
                 // bump, so the events-dropped synthetic wakes deterministically on the
                 // notify_one below rather than only on the next tick. Lock order mu_ →
                 // sink mu (we hold mu_ here) — identical to enqueue_capped's own acquire.
-                {
+                //
+                // std::mutex::lock() can itself throw std::system_error (a broken mutex —
+                // essentially never). Contain it: the frame is ALREADY committed to the
+                // ring, so letting that throw reach publish()'s boundary catch would
+                // return 0 for a committed frame — the one thing the contract forbids.
+                // Fall back to a bare atomic bump (still counts the drop; the wakeup
+                // degrades to bounded-by-tick, acceptable for a degenerate mutex fault).
+                try {
                     std::lock_guard<std::mutex> sink_lk(live->sse->mu);
+                    live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
                     live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
                 }
                 sink_enqueue_failed = true;

@@ -485,7 +485,10 @@ public:
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
-                          "Frames dropped from a slow consumer's per-connection queue", "counter");
+                          "Frames dropped before reaching a connection's per-connection queue — "
+                          "usually a slow consumer's queue overflow, also a rare producer-side "
+                          "post-commit allocation failure (#2366); recoverable via Last-Event-ID",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_frames_too_large_total",
                           "Frames replaced by a frame_too_large notice because they exceeded the "
                           "per-session replay-ring byte budget",

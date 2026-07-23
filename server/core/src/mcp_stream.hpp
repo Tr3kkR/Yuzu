@@ -42,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <httplib.h>
 
@@ -243,6 +244,15 @@ public:
     /// not decorative (the stream_budget.hpp precedent): the boundary cannot be quietly
     /// dropped by a future edit without this signature failing loudly.
     ///
+    /// Parameters are `string_view`, NOT `std::string` by value: a by-value parameter is
+    /// copy-constructed in the CALLER's frame for an lvalue argument (the realistic PR 3
+    /// call `publish(event.event_type, event.data)`), and a std::bad_alloc from that copy
+    /// would escape to the unguarded listener BEFORE this function's body — bypassing the
+    /// boundary entirely. `string_view` makes the caller-side conversion non-throwing; the
+    /// owned copies happen inside publish_impl's try, where a bad_alloc is a clean
+    /// pre-commit 0. The caller MUST keep the referenced storage alive across the call
+    /// (publish copies synchronously before returning; it captures no view).
+    ///
     /// Return contract:
     ///  - > 0: the frame is COMMITTED to the in-memory ring under this per-session id.
     ///    A post-commit failure (live-sink enqueue allocation, metrics) never un-commits:
@@ -270,7 +280,7 @@ public:
     ///
     /// Drop-oldest at the frame AND byte caps; every eviction is counted (a client
     /// whose cursor falls behind the ring is 404'd on resume, never silently gapped).
-    std::uint64_t publish(std::string event_type, std::string data) noexcept;
+    std::uint64_t publish(std::string_view event_type, std::string_view data) noexcept;
 
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
     /// inside publish_impl are internal string/deque allocations with no callback to
@@ -347,11 +357,12 @@ private:
     static void close_sink(const std::shared_ptr<McpStreamSink>& sink, McpStreamClose reason);
     static std::size_t frame_bytes(const McpStreamEvent& ev);
 
-    /// The throwing body publish() guards. May throw ONLY before the frame is
-    /// committed (ring push + next_id_ advance); every post-commit step is either
-    /// noexcept or locally contained, so a throw reaching publish()'s catch proves
-    /// nothing was committed and 0 is the honest return.
-    std::uint64_t publish_impl(std::string event_type, std::string data);
+    /// The throwing body publish() guards. Owns the payload from the caller's views up
+    /// front (those copies may throw — pre-commit, so a bad_alloc there is a clean 0).
+    /// After the ring push + next_id_ advance, every step is either noexcept or locally
+    /// contained, so a throw reaching publish()'s catch proves nothing was committed and
+    /// 0 is the honest return.
+    std::uint64_t publish_impl(std::string_view event_type, std::string_view data);
 
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
