@@ -315,3 +315,84 @@ TEST_CASE("execution_event_bus — snapshot is a copy, not a view",
     auto first = only_event(snap1);
     CHECK(first.event_type == "agent-transition");
 }
+
+TEST_CASE("execution_event_bus — subscribe_and_replay delivers buffered then live, once each",
+          "[execution_event_bus][pr3][2f]") {
+    ExecutionEventBus bus;
+    bus.publish("exec-1", "execution-progress", R"({"n":1})");
+    bus.publish("exec-1", "execution-progress", R"({"n":2})");
+    bus.publish("exec-1", "execution-progress", R"({"n":3})");
+
+    std::vector<ExecutionEvent> received;
+    SECTION("since_id=0 replays the whole buffer, then live events follow") {
+        auto sub = bus.subscribe_and_replay("exec-1", 0,
+                                            [&](const ExecutionEvent& ev) { received.push_back(ev); });
+        REQUIRE(sub != 0);
+        REQUIRE(received.size() == 3); // 1,2,3 replayed synchronously under the lock
+        CHECK(received[0].id == 1);
+        CHECK(received[2].id == 3);
+
+        bus.publish("exec-1", "execution-completed", R"({"n":4})");
+        REQUIRE(received.size() == 4); // 4 arrives live, exactly once (not re-replayed)
+        CHECK(received[3].id == 4);
+        CHECK(received[3].event_type == "execution-completed");
+    }
+    SECTION("since_id past the head replays nothing but still installs the listener") {
+        bus.subscribe_and_replay("exec-1", 3,
+                                 [&](const ExecutionEvent& ev) { received.push_back(ev); });
+        CHECK(received.empty()); // ids 1..3 are <= cursor
+        bus.publish("exec-1", "execution-completed", R"({"n":4})");
+        REQUIRE(received.size() == 1);
+        CHECK(received[0].id == 4);
+    }
+    SECTION("a fresh channel installs the listener and delivers subsequent events") {
+        bus.subscribe_and_replay("exec-new", 0,
+                                 [&](const ExecutionEvent& ev) { received.push_back(ev); });
+        CHECK(received.empty());
+        bus.publish("exec-new", "agent-transition", R"({"n":1})");
+        REQUIRE(received.size() == 1);
+        CHECK(received[0].id == 1);
+    }
+}
+
+TEST_CASE("execution_event_bus — subscribe_and_replay closes the replay->subscribe race",
+          "[execution_event_bus][pr3][2f][concurrency]") {
+    // The property that motivates the primitive (Sol S6 / K3): a subscriber that joins
+    // WHILE a publisher is running must see EVERY event from since_id+1 onward exactly once,
+    // with no gap at the subscribe boundary and no duplicate. With since_id=0 and a total
+    // below kBufferCap, the buffer never evicts, so the received id set must be exactly
+    // {1..N} — and this holds for EVERY interleaving (subscribe landing early, mid, or late
+    // in the stream), so the test is deterministic, never flaky: an event is either already
+    // buffered (replayed) or published after the listener is installed (live) — never both,
+    // because a publisher needs the same channel mutex the install+replay holds.
+    ExecutionEventBus bus;
+    constexpr int kTotal = 500; // < kBufferCap (1000), so nothing is evicted
+    std::mutex recv_mu;
+    std::vector<std::uint64_t> received;
+
+    std::atomic<bool> go{false};
+    std::thread publisher([&] {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (int i = 0; i < kTotal; ++i) {
+            bus.publish("exec-1", "execution-progress", "{}");
+        }
+    });
+
+    go.store(true, std::memory_order_release);
+    // Join mid-stream: the publisher is already racing us, so the subscribe lands at an
+    // arbitrary point in the 1..kTotal sequence.
+    bus.subscribe_and_replay("exec-1", 0, [&](const ExecutionEvent& ev) {
+        std::lock_guard<std::mutex> lk(recv_mu);
+        received.push_back(ev.id);
+    });
+    publisher.join();
+
+    std::lock_guard<std::mutex> lk(recv_mu);
+    std::sort(received.begin(), received.end());
+    REQUIRE(received.size() == static_cast<std::size_t>(kTotal)); // no loss, no duplicate
+    for (std::size_t i = 0; i < received.size(); ++i) {
+        CHECK(received[i] == i + 1); // contiguous 1..kTotal — no gap at the subscribe boundary
+    }
+}
