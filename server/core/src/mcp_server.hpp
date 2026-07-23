@@ -61,6 +61,10 @@ class AgentRegistry;
 
 namespace yuzu::server::mcp {
 
+// Progress bridge core (track 2f PR 3a). Forward-declared (pointer-only here,
+// injected via set_stream_bridge); the .cpp includes mcp_stream_bridge.hpp.
+class McpStreamBridge;
+
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
 /// Mirrors the RestApiV1 pattern: receives store pointers + auth/perm/audit callbacks.
 class McpServer {
@@ -228,6 +232,14 @@ public:
     void set_engine_credential_store(ApiTokenStore* store) { engine_credential_store_ = store; }
     void set_owner_exists_fn(OwnerExistsFn fn) { owner_exists_fn_ = std::move(fn); }
 
+    /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
+    /// set_engine_principal_store above (the handler's `[=]` lambda captures
+    /// `this`, so the injection is a live read on the next request). Nullable:
+    /// unset ⇒ execute_instruction never reserves a bridge record and the
+    /// pre-bridge behaviour is byte-identical. server.cpp wires the ServerImpl-
+    /// owned bridge; tests inject their own.
+    void set_stream_bridge(McpStreamBridge* bridge) { stream_bridge_ = bridge; }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -390,6 +402,8 @@ private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     ApiTokenStore* engine_credential_store_{nullptr};
     OwnerExistsFn owner_exists_fn_;
+    // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
+    McpStreamBridge* stream_bridge_{nullptr};
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

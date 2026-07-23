@@ -13,6 +13,10 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
+#include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
+#include "mcp_session.hpp"         // 2f PR 3a
+#include "mcp_stream.hpp"          // 2f PR 3a: ring inspection
+#include "mcp_stream_bridge.hpp"   // 2f PR 3a
 
 #include "agent_registry.hpp"
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
@@ -6696,4 +6700,267 @@ TEST_CASE("MCP 2f/15(j): session cap hit rejects initialize with 429 (never evic
     // the live session survived the cap rejection
     CHECK(reg.validate_and_touch(first, "test-user") ==
           mcp::McpSessionRegistry::ValidateResult::kValid);
+}
+
+// ── 2f PR 3a - execute_instruction progress bridge, GET-only mode ─────────
+//
+// The bridge is injected via McpServer::set_stream_bridge (the setter takes
+// live effect on the next request - the handler captures `this`). Every
+// section asserts the LOAD-BEARING plain-path property first: the POST
+// response is byte-shape-identical with and without a bridge record, and
+// GET-only mode never emits a second final response onto the stream.
+
+namespace {
+
+/// Local poll helper - the bridge projector is asynchronous.
+template <typename F> bool bridge_poll(F&& f, std::chrono::milliseconds d = std::chrono::seconds(5)) {
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < until) {
+        if (f()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return f();
+}
+
+/// Snapshot the session ring (attach at 0, copy, detach).
+std::vector<yuzu::server::mcp::sse_bus::SseEvent>
+bridge_ring(yuzu::server::mcp::McpStreamState& st, const std::string& principal) {
+    auto att = st.attach_and_replay(0, nullptr, principal);
+    REQUIRE(att.status == yuzu::server::mcp::McpStreamState::AttachStatus::kAttached);
+    std::vector<yuzu::server::mcp::sse_bus::SseEvent> out;
+    {
+        std::lock_guard<std::mutex> lk(att.sink->sse->mu);
+        out.assign(att.sink->sse->queue.begin(), att.sink->sse->queue.end());
+    }
+    st.detach(att.sink);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode (2f PR 3a)",
+          "[mcp][integration][execute][bridge][2f]") {
+    namespace smcp = yuzu::server::mcp;
+
+    // Real tracker (SQLite) + bus + session registry + bridge, mock everything else.
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-bridge-tracker-");
+    std::filesystem::remove(db_path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+
+    auto minted = sessions.mint("test-user"); // harness auth_fn's username
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    auto stream = sessions.stream_for(sid, "test-user");
+    REQUIRE(stream != nullptr);
+
+    const auto call_exec = [&](const std::string& body) {
+        return ts.call_raw("POST", body, {{"Mcp-Session-Id", sid}});
+    };
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+
+    SECTION("plain response byte-shape identical; progress live; no second final; kDone") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-bridge", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res_bridged = call_exec(exec_body(500, /*with_token=*/true));
+        REQUIRE(res_bridged->status == 200);
+        REQUIRE(bridge.record_count() == 1);
+        auto ph = bridge.phase_for(sid, nlohmann::json(500));
+        REQUIRE(ph.has_value());
+        CHECK(*ph == smcp::McpStreamBridge::Phase::kArmedGetOnly);
+
+        // Same request WITHOUT a token: no reservation, and the response body
+        // must be IDENTICAL once the (necessarily fresh) execution_id is
+        // normalized out - the bridge must never change the plain POST bytes.
+        auto res_plain = call_exec(exec_body(500, /*with_token=*/false));
+        REQUIRE(res_plain->status == 200);
+        CHECK(bridge.record_count() == 1); // still just the first record
+        auto exec_of = [](const std::string& body) {
+            auto j = nlohmann::json::parse(body);
+            auto text =
+                nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+            return text["execution_id"].get<std::string>();
+        };
+        const auto exec_bridged = exec_of(res_bridged->body);
+        const auto exec_plain = exec_of(res_plain->body);
+        REQUIRE(!exec_bridged.empty());
+        auto normalize = [](std::string s, const std::string& from) {
+            for (std::size_t pos = s.find(from); pos != std::string::npos;
+                 pos = s.find(from, pos)) {
+                s.replace(pos, from.size(), "EXEC");
+            }
+            return s;
+        };
+        CHECK(normalize(res_bridged->body, exec_bridged) ==
+              normalize(res_plain->body, exec_plain));
+
+        // Progress reaches the session's GET ring LIVE, token echoed verbatim,
+        // execution_id in _meta.
+        bus.publish(exec_bridged, "execution-progress",
+                    R"({"agents_responded":1,"agents_targeted":2})");
+        REQUIRE(bridge_poll([&] { return stream->next_event_id() > 1; }));
+        {
+            auto frames = bridge_ring(*stream, "test-user");
+            REQUIRE(frames.size() == 1);
+            auto j = nlohmann::json::parse(frames[0].data);
+            CHECK(j["method"] == "notifications/progress");
+            CHECK(j["params"]["progressToken"] == "tok-1");
+            CHECK(j["params"]["_meta"]["yuzu.execution_id"] == exec_bridged);
+        }
+
+        // Terminal (via the real tracker: the second agent responds) - GET-only
+        // mode emits NO final frame and NO pin; the record settles to kDone.
+        yuzu::server::AgentExecStatus a1;
+        a1.agent_id = "agent-001";
+        a1.status = "success";
+        tracker.update_agent_status(exec_bridged, a1);
+        yuzu::server::AgentExecStatus a2;
+        a2.agent_id = "agent-002";
+        a2.status = "success";
+        tracker.update_agent_status(exec_bridged, a2);
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(500));
+            return p.has_value() && *p == smcp::McpStreamBridge::Phase::kDone;
+        }));
+        CHECK(stream->pinned_count() == 0);
+        for (const auto& f : bridge_ring(*stream, "test-user")) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            CHECK((j.is_object() && !j.contains("result"))); // never a second final
+        }
+        bridge.sweep();
+        CHECK(bridge.record_count() == 0);
+    }
+
+    SECTION("duplicate request id degrades silently, counted") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-dup", 1};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto r1 = call_exec(exec_body(7, true));
+        REQUIRE(r1->status == 200);
+        auto r2 = call_exec(exec_body(7, true)); // same jsonrpc id ⇒ dup key
+        REQUIRE(r2->status == 200);              // silent degrade - still a success
+        CHECK(nlohmann::json::parse(r2->body).contains("result"));
+        CHECK(bridge.record_count() == 1);
+        CHECK(metrics
+                  .counter("yuzu_mcp_bridge_degrade_total",
+                           {{"reason", "duplicate_request_id"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("dispatch throw abandons the record; error bytes unchanged") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            throw std::runtime_error("boom");
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(8, true));
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == smcp::kInternalError);
+        CHECK(j["error"]["message"] == "dispatch failed");
+        CHECK(bridge.record_count() == 0); // abandoned, key + caps freed
+    }
+
+    SECTION("zero agents reached abandons the record; response unchanged") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-zero", 0};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(9, true));
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text["status"] == "no_agents_reached");
+        CHECK(bridge.record_count() == 0);
+    }
+
+    SECTION("S4.5: all agents responding before set_agents_targeted still terminates") {
+        // The starvation shape: responses land DURING dispatch (agents_targeted
+        // still 0, so update_agent_status cannot transition the row), and
+        // set_agents_targeted publishes nothing. Without the refresh_counts
+        // chain the row stays `running` forever with no bus terminal.
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string& execution_id) -> std::pair<std::string, int> {
+            yuzu::server::AgentExecStatus a;
+            a.agent_id = "agent-001";
+            a.status = "success";
+            tracker.update_agent_status(execution_id, a);
+            return {"cmd-early", 1};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(10, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        const auto exec_id = text["execution_id"].get<std::string>();
+        REQUIRE(!exec_id.empty());
+
+        auto exec = tracker.get_execution(exec_id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "succeeded"); // refresh_counts rescued the terminal
+        // …and the bridge record saw that terminal: GET-only settles to kDone.
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(10));
+            return p.has_value() && *p == smcp::McpStreamBridge::Phase::kDone;
+        }));
+    }
 }

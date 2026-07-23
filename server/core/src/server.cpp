@@ -117,6 +117,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
+#include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "offload_routes.hpp"
@@ -513,10 +514,40 @@ public:
                           "bypassed; alert on > 0 "
                           "(docs/ops-runbooks/mcp-tool-registration-recovery.md)",
                           "counter");
+        // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
+        // degrade reason is a static literal inside the bridge, never derived
+        // from caller input.
+        metrics_.describe("yuzu_mcp_bridge_records_active",
+                          "Progress-bridge correlation records currently live (global cap 256)",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_bridge_reject_total",
+                          "Progress-bridge reservation rejections by reason", "counter");
+        metrics_.describe("yuzu_mcp_bridge_degrade_total",
+                          "execute_instruction progress requests silently degraded to the plain "
+                          "path, by reason (the plain response is self-sufficient - it carries "
+                          "execution_id)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_listener_failures_total",
+                          "Bus-listener copy failures contained at the noexcept boundary - the "
+                          "event was not latched; the terminal backstop is the durable "
+                          "execution_id fetch",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_mailbox_drops_total",
+                          "Oldest-progress frames dropped from a record's bounded arming mailbox "
+                          "(terminals are never dropped)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
+                          "Terminal-frame publish failures seen by the bridge's "
+                          "publish_final → fallback → poison ladder (Decision 15(f))",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
+        metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
+        metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
+        metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
@@ -3680,6 +3711,19 @@ public:
                     metrics_.gauge("yuzu_server_sse_gc_channels_total")
                         .set(static_cast<double>(execution_event_bus_->gc_channels_total()));
                 }
+                // 2f PR 3a - the bridge sweep tick: pin-ack teardown, session-
+                // death teardown, and the ring-only pressure hatch all advance
+                // here. PAIRED with registry gc ON PURPOSE: the bridge's
+                // non-touching exists() classifies a dead session but never
+                // destroys its stream, so without this gc() an idle server
+                // would hold an expired session's stream (and its pinned
+                // finals) until the next client request happened to run one.
+                if (mcp_stream_bridge_) {
+                    mcp_stream_bridge_->sweep();
+                    if (mcp_sessions_) {
+                        mcp_sessions_->gc();
+                    }
+                }
                 // Guardian scalars + cumulative write/reap counters. Use
                 // gauges for the count-now values (SQL COUNT(*)) and for the
                 // cumulative-but-serialized-as-gauge counters exposed by
@@ -4175,6 +4219,14 @@ public:
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
 
+        // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
+        // session registry - shut it down and release it BEFORE the tracker/bus
+        // reset below ([BRIDGE-AFTER-SESSIONS]). shutdown() is idempotent, so
+        // the dtor's call becomes a no-op.
+        if (mcp_stream_bridge_) {
+            mcp_stream_bridge_->shutdown();
+            mcp_stream_bridge_.reset();
+        }
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -11922,6 +11974,37 @@ private:
             // runs after the join, so member-destruction order is irrelevant.
             mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>(
                 mcp::McpSessionRegistry::Config{}, mcp::McpSessionRegistry::ClockFn{}, &metrics_);
+            // Progress bridge core (2f PR 3a). Constructed only when the
+            // execution bus exists (no instruction DB ⇒ no bus ⇒ bridge stays
+            // null and execute_instruction never reserves - today's behavior).
+            // Borrows the bus + registry raw; safe because stop() shuts the
+            // bridge down and resets it BEFORE the bus resets, and the member
+            // is declared after mcp_sessions_ ([BRIDGE-AFTER-SESSIONS]) so the
+            // no-stop() teardown order is bridge → registry → (much earlier
+            // decl) bus. The audit sink is request-free (G1 - the bridge's
+            // lifecycle events fire from sweeps/projector, not a handler);
+            // principal "system" marks them as server-side maintenance rows.
+            if (execution_event_bus_) {
+                mcp_stream_bridge_ = std::make_unique<mcp::McpStreamBridge>(
+                    execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
+                    [this](const std::string& action, const std::string& execution_id,
+                           const std::string& detail) {
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                            ev.principal = "system";
+                            ev.action = action;
+                            ev.target_type = "Execution";
+                            ev.target_id = execution_id;
+                            ev.detail = detail;
+                            ev.result = "success";
+                            (void)audit_store_->log(ev);
+                        }
+                    });
+                mcp_server_->set_stream_bridge(mcp_stream_bridge_.get());
+            }
             // PR 4.3 (T13): wire the engine-principal store + the SAME
             // engine-credential store (api_token_store_) + the shared
             // owner-existence predicate the 8 engine tools need. Setters
@@ -12525,6 +12608,17 @@ private:
     // /mcp/v1/ handlers; safe because stop() joins web_server_ before members
     // destruct (see ~ServerImpl → stop() → web_server_->stop()).
     std::unique_ptr<mcp::McpSessionRegistry> mcp_sessions_;
+    // [BRIDGE-AFTER-SESSIONS] - DO NOT reorder these two members or insert a new
+    // member between them. The progress bridge (2f PR 3a) borrows BOTH the
+    // registry (stream_for/exists) and the execution bus (subscribe/unsubscribe)
+    // by raw pointer; members destruct in reverse declaration order, so the
+    // bridge declared AFTER mcp_sessions_ destructs FIRST (its dtor runs the
+    // idempotent shutdown(): joins the projector and unsubscribes from the bus
+    // while both borrows are still alive - the bus is declared far earlier and
+    // destructs later still). The explicit stop() path mirrors this: bridge
+    // shutdown+reset BEFORE execution_tracker_/bus reset. Same contract family
+    // as [BUS-BEFORE-TRACKER]; grep both tags before touching this block.
+    std::unique_ptr<mcp::McpStreamBridge> mcp_stream_bridge_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;
