@@ -193,6 +193,8 @@ spec:
         type: string
       - name: cancelled
         type: bool
+      - name: status
+        type: string
 
   readablePayload: "Show input dialog: {{title}}"
 

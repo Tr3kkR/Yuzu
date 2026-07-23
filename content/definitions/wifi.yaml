@@ -5,7 +5,7 @@
 ## Sources by platform:
 ##   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList + WlanQueryInterface
 ##   Linux:   nmcli device wifi list / nmcli device show (fallback: iw/iwlist)
-##   macOS:   airport -s / airport -I
+##   macOS:   list_networks: airport -s (legacy) / system_profiler · connected: CoreWLAN
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -19,7 +19,8 @@ metadata:
     signal strength (0-100%), security type (WPA2-PSK, Open, etc.),
     network type or channel, and BSSID or connection status.
     On Windows uses WlanGetAvailableNetworkList, on Linux uses
-    nmcli device wifi list, on macOS uses the airport utility.
+    nmcli device wifi list, on macOS uses `airport -s` (legacy) or
+    system_profiler.
   tags: [wifi, network, wireless, inventory, security]
 
 spec:
@@ -78,7 +79,9 @@ metadata:
     Reports information about the currently connected WiFi network,
     including SSID, signal strength, security type, BSSID, and the
     wireless interface or channel. On Windows uses WlanQueryInterface,
-    on Linux uses nmcli or iwconfig, on macOS uses airport -I.
+    on Linux uses nmcli or iwconfig, on macOS uses CoreWLAN (macOS 14+
+    withholds SSID/BSSID behind Location Services, reported as
+    "<ssid-withheld>" on an otherwise-live connection).
     Returns "Not connected" if no WiFi connection is active.
   tags: [wifi, network, wireless, connectivity, inventory]
 

@@ -166,7 +166,8 @@ TEST_CASE("TAR schema: accepted_capture_methods_for_os is OS-specific (#540)",
     CHECK_FALSE(contains(win_ok, "procfs"));
 
     auto mac_ok = accepted_capture_methods_for_os("tcp", "macos");
-    CHECK(contains(mac_ok, "proc_pidfdinfo"));
+    CHECK(contains(mac_ok, "proc_pidfdinfo")); // fallback/seed poll
+    CHECK(contains(mac_ok, "nstat"));          // primary tcp-lifecycle source (roadmap 2.2)
     CHECK_FALSE(contains(mac_ok, "iphlpapi"));
 
     // An unknown OS yields an empty accept-list (everything rejected, fail-safe).
@@ -353,7 +354,9 @@ TEST_CASE("TAR schema: netqual Windows is kSupportedConstrained via estats (ADR-
     REQUIRE(it != sources.end());
 
     // Windows graduated kPlanned -> kSupportedConstrained (elevation-gated, ms
-    // RTT, since-enable lifetimes); Linux stays fully supported; macOS planned.
+    // RTT, since-enable lifetimes); Linux stays fully supported; macOS graduated
+    // kPlanned -> kSupportedConstrained too (roadmap 2.2, nstat — root needed for
+    // system-wide flow visibility).
     for (const auto& os : it->os_support) {
         INFO("netqual os=" << os.os);
         if (os.os == "windows") {
@@ -362,11 +365,15 @@ TEST_CASE("TAR schema: netqual Windows is kSupportedConstrained via estats (ADR-
         } else if (os.os == "linux") {
             CHECK(os.status == OsSupportStatus::kSupported);
         } else {
-            CHECK(os.status == OsSupportStatus::kPlanned);
+            CHECK(os.os == "macos");
+            CHECK(os.status == OsSupportStatus::kSupportedConstrained);
+            CHECK(os.capture_method == "nstat");
         }
     }
     auto win_methods = accepted_capture_methods_for_os("netqual", "windows");
     CHECK(std::find(win_methods.begin(), win_methods.end(), "estats") != win_methods.end());
+    auto mac_methods = accepted_capture_methods_for_os("netqual", "macos");
+    CHECK(std::find(mac_methods.begin(), mac_methods.end(), "nstat") != mac_methods.end());
 
     // live + the per-boot retrospective baseline tier.
     REQUIRE(it->granularities.size() == 2);

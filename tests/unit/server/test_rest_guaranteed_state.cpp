@@ -871,6 +871,39 @@ TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audite
     CHECK(h.audit_log.empty());
 }
 
+TEST_CASE("REST dex.signals: os filter scopes the catalogue rollup to one OS (A1 parity)",
+          "[rest][dex][signals]") {
+    RestGsHarness h;
+    h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
+
+    // macOS lens: only the macOS-sourced signal type.
+    auto mac = h.sink.Get("/api/v1/dex/signals?window=all&os=macos");
+    REQUIRE(mac);
+    auto jm = nlohmann::json::parse(mac->body);
+    bool mac_has_storage = false, mac_has_crashed = false;
+    for (const auto& r : jm["data"]) {
+        const auto t = r["obs_type"].get<std::string>();
+        if (t == "storage.low") mac_has_storage = true;
+        if (t == "process.crashed") mac_has_crashed = true;
+    }
+    CHECK(mac_has_storage);
+    CHECK_FALSE(mac_has_crashed); // Windows-sourced signal scoped out
+
+    // No os param = all-OS: both signals present.
+    auto all = h.sink.Get("/api/v1/dex/signals?window=all");
+    REQUIRE(all);
+    auto ja = nlohmann::json::parse(all->body);
+    bool all_has_storage = false, all_has_crashed = false;
+    for (const auto& r : ja["data"]) {
+        const auto t = r["obs_type"].get<std::string>();
+        if (t == "storage.low") all_has_storage = true;
+        if (t == "process.crashed") all_has_crashed = true;
+    }
+    CHECK(all_has_storage);
+    CHECK(all_has_crashed);
+}
+
 TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device's signals, audited",
           "[rest][dex][device]") {
     RestGsHarness h;
@@ -1746,6 +1779,50 @@ TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + ret
     CHECK(a.result == "success");
     CHECK(a.target_type == "ObsType");
     CHECK(a.target_id == "process.crashed");
+}
+
+TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1 parity)",
+          "[rest][dex][signals]") {
+    RestGsHarness h;
+    h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("w2", "WS-2", "process.crashed", "outlook.exe", "windows", "2026-06-10T11:00:00Z");
+    h.seed_obs("m1", "MAC-1", "process.crashed", "Safari", "macos", "2026-06-10T12:00:00Z");
+
+    // Windows lens: subjects/devices/by_day all Windows-only, never MAC-1/Safari.
+    auto win = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=windows");
+    REQUIRE(win);
+    CHECK(win->status == 200);
+    auto jw = nlohmann::json::parse(win->body);
+    CHECK(jw["data"]["os"].get<std::string>() == "windows");
+    REQUIRE(jw["data"]["devices"].size() == 2);
+    for (const auto& d : jw["data"]["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "MAC-1");
+    bool win_has_safari = false;
+    for (const auto& s : jw["data"]["subjects"])
+        if (s["subject"].get<std::string>() == "Safari") win_has_safari = true;
+    CHECK_FALSE(win_has_safari);                 // subjects scoped
+    REQUIRE(jw["data"]["by_day"].size() == 1);   // all on 06-10
+    CHECK(jw["data"]["by_day"][0]["count"].get<int64_t>() == 2); // 2 Windows events, not 3
+    CHECK(jw["data"]["by_os"].size() == 2);      // by_os stays cross-OS even under a filter
+
+    // macOS lens: subjects/devices/by_day all macOS-only.
+    auto mac = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all&os=macos");
+    REQUIRE(mac);
+    auto jm = nlohmann::json::parse(mac->body);
+    CHECK(jm["data"]["os"].get<std::string>() == "macos");
+    REQUIRE(jm["data"]["devices"].size() == 1);
+    CHECK(jm["data"]["devices"][0]["agent_id"].get<std::string>() == "MAC-1");
+    REQUIRE(jm["data"]["subjects"].size() == 1);
+    CHECK(jm["data"]["subjects"][0]["subject"].get<std::string>() == "Safari");
+    REQUIRE(jm["data"]["by_day"].size() == 1);
+    CHECK(jm["data"]["by_day"][0]["count"].get<int64_t>() == 1);
+
+    // No os param = all-OS (backward compatible).
+    auto all = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
+    REQUIRE(all);
+    auto ja = nlohmann::json::parse(all->body);
+    CHECK(ja["data"]["os"].get<std::string>() == "all");
+    CHECK(ja["data"]["devices"].size() == 3);
 }
 
 TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty arrays (still audited)",

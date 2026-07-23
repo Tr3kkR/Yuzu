@@ -512,10 +512,10 @@ being structural.
 4. **Extract presentation** into its own Drogon binary against that seam (after G10), with sessions
    and replay moved behind the boundary (their durability and location are G6/G7).
 5. **Extract the engine** — the cheapest of the five, because it is new code with no in-process
-   store access to unwind. **It is not free, and it is not first.** Engine principals are a
-   *reserved* `principal_class` that is **never emitted today** (`principal_class.hpp`), the
-   engine's GUI must go (superseding 2c D2), and no engine code path may ship before ADR-0032's
-   interlock (a)–(d) and (h) have landed.
+   store access to unwind. **It is not free, and it is not first.** Engine principals held a
+   *reserved* `principal_class` that was **never emitted until execution-plan PR 4.5**, which made
+   it live (`principal_class.hpp`); the engine's GUI must still go (superseding 2c D2), and no
+   engine code path may ship before ADR-0032's interlock (a)–(d) and (h) have landed.
 
 ### The acceptance tests live in ADR-0032
 

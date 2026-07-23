@@ -1,4 +1,4 @@
-network_config_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+network_config_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
 shared_library(
   'network_config',

@@ -36,7 +36,10 @@
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
+#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
+
 #include <openssl/evp.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -343,9 +346,30 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
     argv.push_back(nullptr);
 
     // Create pipe for stdout capture
+    //
+    // BR-001: hold the process-wide fork lock across [pipe()..fork()] --
+    // macOS/BSD has no pipe2(), so an unrelated thread's fork() landing in
+    // this window could inherit these still-inheritable fds. Released in
+    // the PARENT right after fork() returns; the child inherits it locked
+    // and never touches it (see fork_lock.hpp's contract).
+    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
+
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         output = "failed to create pipe";
+        return -1;
+    }
+
+    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC on
+    // both pipe ends before the lock is released, so a concurrent locked
+    // launcher forking in the unlock->close window can never inherit a live,
+    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
+    // failed pipe() above rather than silently forking with a leaky fd.
+    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        output = "failed to set pipe close-on-exec";
         return -1;
     }
 
@@ -367,6 +391,10 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
         execvp(exe_str.c_str(), const_cast<char* const*>(argv.data()));
         _exit(127); // execvp failed
     }
+
+    // Parent: fork() has returned and this is not the child branch --
+    // release the fork lock now (see fork_lock.hpp's contract).
+    fork_pipe_lock.unlock();
 
     // Parent
     close(pipefd[1]); // close write end

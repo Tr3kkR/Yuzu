@@ -81,6 +81,12 @@ public:
     ApiTokenStorePg(ApiTokenStorePg&&) = delete;
     ApiTokenStorePg& operator=(ApiTokenStorePg&&) = delete;
 
+    /// Connection string of the ephemeral database backing this store. Needed by
+    /// tests that must act on the store's data from a SECOND connection — e.g.
+    /// breaking the schema underneath a live store to exercise the "could not
+    /// read" branch, which has no test-only hook on the production store.
+    [[nodiscard]] std::string dsn() const { return db_->dsn(); }
+
     [[nodiscard]] yuzu::server::ApiTokenStore* get() const noexcept { return store_.get(); }
     yuzu::server::ApiTokenStore* operator->() const noexcept { return store_.get(); }
     yuzu::server::ApiTokenStore& operator*() const noexcept { return *store_; }

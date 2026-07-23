@@ -8,6 +8,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-L1)
 
 #include <array>
 #include <cstdio>
@@ -16,29 +17,62 @@
 #include <string>
 #include <string_view>
 
+#ifndef _WIN32
+#include <chrono>
+#include <spdlog/spdlog.h>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#endif
+
+#ifdef __APPLE__
+#include "bitlocker_macos_apfs.hpp"
+#endif
+
 namespace {
 
+#ifndef _WIN32
+// A generous per-call wall-clock bound for the local disk-encryption tools
+// (fdesetup/diskutil/lsblk/cryptsetup). Long enough never to fire in practice,
+// short enough that a wedged tool cannot pin the instruction worker forever.
+constexpr std::chrono::seconds kBitlockerCmdDeadline{20};
+#endif
+
 std::string run_command(const char* cmd) {
+#ifdef _WIN32
     std::string result;
     std::array<char, 256> buf{};
-#ifdef _WIN32
     FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-#ifdef _WIN32
     _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
+#else
+    // Route through the bounded, fork-lock-covered runner instead of a raw,
+    // deadline-less popen (K-7/CDX-07). `/bin/sh -c` preserves the exact shell
+    // semantics popen used (the commands rely on `2>/dev/null` redirects), so
+    // the returned stdout blob is byte-identical to the old path — only now it
+    // carries a hard deadline, an output cap, and the global fork-lock. stderr
+    // already goes to /dev/null (merge_stderr=false), matching the commands.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = kBitlockerCmdDeadline});
+    // A deadline-killed or exec-failed tool returns empty/partial output that
+    // would otherwise parse as a legitimate "FileVault absent / no volumes" —
+    // a silent false-negative. Warn so an operator can tell a cut-short scan
+    // from a genuinely empty result (sre-M1; mirrors the event_logs pattern).
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("bitlocker: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+    }
+    std::string result = res.output;
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    return result;
+#endif
 }
 
 #ifdef _WIN32
@@ -145,6 +179,50 @@ void list_luks_volumes(yuzu::CommandContext& ctx) {
     }
 }
 
+#elif defined(__APPLE__)
+
+// Emits the honest per-volume FileVault/encryption status. Two signals:
+//  - `fdesetup status` — a global on/off read, retained unconditionally as a
+//    corroborating signal AND as the fallback when diskutil parsing below
+//    yields no volumes (e.g. diskutil unavailable, unexpected output shape).
+//  - `diskutil apfs list` — enumerated per APFS volume, parsed by the pure
+//    header so it stays fixture-testable. Encryption is binary
+//    (encrypted/not_encrypted/unknown) — APFS has no meaningful
+//    percentage-encrypted to report, unlike BitLocker's conversion-in-
+//    progress state, so none is fabricated here.
+void report_filevault_status(yuzu::CommandContext& ctx) {
+    auto fdesetup_output = run_command("fdesetup status 2>/dev/null");
+    if (fdesetup_output.find("On") != std::string::npos ||
+        fdesetup_output.find("FileVault is On") != std::string::npos) {
+        ctx.write_output("filevault|enabled");
+    } else if (fdesetup_output.find("Off") != std::string::npos ||
+               fdesetup_output.find("FileVault is Off") != std::string::npos) {
+        ctx.write_output("filevault|disabled");
+    } else {
+        // Route the raw fdesetup text through safe_output_field (plg-L1): even
+        // though bitlocker is a key|value plugin (a literal '|' stays in the
+        // value), a multi-line fdesetup diagnostic would otherwise inject a row
+        // past write_output's newline framing.
+        ctx.write_output(
+            std::format("filevault|unknown|{}", yuzu::util::safe_output_field(fdesetup_output)));
+    }
+
+    auto diskutil_output = run_command("diskutil apfs list 2>/dev/null");
+    auto volumes = yuzu::bitlocker::macos::parse_diskutil_apfs_list(diskutil_output);
+    for (const auto& vol : volumes) {
+        // plg-L1 (round-4 review): escape every dynamic field before the positional
+        // `volume|...` protocol — an APFS volume label/type/state with a '|' or
+        // newline would otherwise shift columns or inject a row (same fix already
+        // applied to the fdesetup diagnostic row above).
+        ctx.write_output(
+            std::format("volume|{}|{}|{}", yuzu::util::safe_output_field(yuzu::bitlocker::macos::volume_label(vol)),
+                        yuzu::util::safe_output_field(yuzu::bitlocker::macos::volume_type(vol)),
+                        yuzu::util::safe_output_field(vol.encrypted_state)));
+    }
+    // If diskutil yielded nothing parseable, the fdesetup row above already
+    // served as the fallback signal — no synthetic "no volumes" row needed.
+}
+
 #endif
 
 } // namespace
@@ -179,16 +257,7 @@ public:
 #elif defined(__linux__)
             list_luks_volumes(ctx);
 #elif defined(__APPLE__)
-            auto output = run_command("fdesetup status 2>/dev/null");
-            if (output.find("On") != std::string::npos ||
-                output.find("FileVault is On") != std::string::npos) {
-                ctx.write_output("filevault|enabled");
-            } else if (output.find("Off") != std::string::npos ||
-                       output.find("FileVault is Off") != std::string::npos) {
-                ctx.write_output("filevault|disabled");
-            } else {
-                ctx.write_output(std::format("filevault|unknown|{}", output));
-            }
+            report_filevault_status(ctx);
 #endif
             return 0;
         }

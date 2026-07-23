@@ -413,13 +413,29 @@ public:
     /// the batch's LAST record last-in-batch, so a live send writes the sent-label instead of the
     /// batch later ageing out counted evicted_without_send_evidence. The window drains FIFO, so
     /// the last-in-batch entry sends after the earlier ones and the label is never premature.
+    ///
+    /// The last-in-batch mark is withheld unless EVERY record of the batch is present in the
+    /// window (#2345 Gate 8 F1). A record can be journalled but never windowed - the arm path
+    /// stages to the journal unconditionally while `enqueue` may refuse on backpressure - and
+    /// marking the last entry regardless meant its send wrote a sent-label for a batch one of
+    /// whose records had never been sent at all. That was survivable while replay re-offered
+    /// every batch on every pass, because the missing record was simply placed next time round;
+    /// once the sent-label began to SUPPRESS replay it became silent, permanent loss of exactly
+    /// the record that was already unlucky. Withholding the mark keeps the batch unlabelled, so
+    /// it stays a replay candidate until a pass does place the whole thing - self-healing, and
+    /// it costs only a delayed label.
     void stamp_provenance(const std::string& batch_key,
                           const std::unordered_set<std::string>& event_ids,
                           const std::string& last_event_id) {
+        std::size_t matched = 0;
+        for (const auto& e : pending_)
+            if (event_ids.count(e.event_id))
+                ++matched;
+        const bool whole_batch_windowed = matched == event_ids.size();
         for (auto& e : pending_) {
             if (event_ids.count(e.event_id)) {
                 e.journal_batch_key = batch_key;
-                e.journal_last_in_batch = (e.event_id == last_event_id);
+                e.journal_last_in_batch = whole_batch_windowed && (e.event_id == last_event_id);
             }
         }
     }

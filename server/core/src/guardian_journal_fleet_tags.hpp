@@ -25,7 +25,7 @@
 /// shape `yuzu_fleet_net_*` / `yuzu_fleet_perf_*` use (design item 9,
 /// "unlabeled/low-cardinality"). These are integrity and loss signals, not
 /// distributions: the fleet question is "did ANY endpoint lose a lifecycle record",
-/// which a sum answers and a percentile obscures. 22 families, 22 series, no
+/// which a sum answers and a percentile obscures. 26 families, 26 series, no
 /// agent-controlled label anywhere - so no cardinality exposure at all (contrast the
 /// `os`-labelled families, which need an allowlist).
 ///
@@ -37,7 +37,7 @@
 /// readings against.
 ///
 /// The writer is SPARSE: a counter that is 0 ships no tag.
-/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 22 at the top of
+/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 26 at the top of
 /// every sweep and re-publishes only those at least one retained agent reported this
 /// cycle. So an absent family means: no retained agent's latest heartbeat carried a
 /// value for it that PASSED the forged-value parse. Note both edges, each pinned by a
@@ -193,6 +193,19 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "Fleet sum of retention prune failures. Retention not running means the journal "
      "grows toward its byte/count cap, where new writes start being refused - see "
      "write_capacity_rejected"},
+    {"yuzu.guardian_journal_page_read_failures",
+     "yuzu_fleet_guardian_journal_page_read_failures",
+     "Fleet sum of REPLAY passes whose journal scan failed. Kept separate from "
+     "prune_failures because the two fail independently and the pairing is what carries "
+     "the meaning: retention succeeding while replay is stalled means records are being "
+     "deleted on schedule and shipped never"},
+    {"yuzu.guardian_journal_clock_jump_skips",
+     "yuzu_fleet_guardian_journal_clock_jump_skips",
+     "Fleet sum of retention passes that declined to age-evict because the endpoint's "
+     "wall clock had moved further than the whole retention window. Not itself an error - "
+     "the journal deliberately kept evidence it would otherwise have deleted - but it "
+     "means an endpoint clock moved, and it is the differential diagnosis for a spike in "
+     "evicted_no_send_evidence"},
     {"yuzu.guardian_journal_write_capacity_rejected",
      "yuzu_fleet_guardian_journal_write_capacity_rejected",
      "Fleet sum of new batches REFUSED because the journal is at its byte/count cap "
@@ -238,6 +251,15 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "crash-timing artifact class. MONITOR-ONLY - see the alerting note; neither "
      "increase() nor bare > 0 is sound over a fleet sum. NOTE the unit is BATCHES, each "
      "holding up to 256 records, so this UNDERSTATES the record count"},
+    {"yuzu.guardian_drain_exceptions", "yuzu_fleet_guardian_drain_exceptions",
+     "Fleet sum of firewalled throws in the outbox DELIVERY machinery. Distinct from the "
+     "journal counters beside it: events are buffered but not shipping, which is a "
+     "delivery fault, not a retention or audit-trail fault"},
+    {"yuzu.guardian_sweep_exceptions", "yuzu_fleet_guardian_sweep_exceptions",
+     "Fleet sum of firewalled throws in the convergence SWEEP lanes. Drift DETECTION is "
+     "degraded - the endpoint may miss policy violations - while the audit trail itself "
+     "is unaffected. Deliberately not folded into the journal counters: different failure "
+     "domain, different response"},
     {"yuzu.guardian_journal_maint_exceptions", "yuzu_fleet_guardian_journal_maint_exceptions",
      "Fleet sum of exceptions swallowed by the journal maintenance tick (page/flush). "
      "Swallowed on purpose so maintenance cannot kill the agent, which is exactly why "
