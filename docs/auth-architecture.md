@@ -1714,11 +1714,14 @@ only (CSV stays a REST-only presentation of the same export).
 `record_attestation` carries `destructiveHint:true` — a second call for the
 same `(campaign_id, principal_type, principal_id, role_name)` **overwrites**
 the prior reviewer's decision, reviewer, and justification (an UPSERT with
-no retained history of the earlier decision); every other twin is
+no retained history of the earlier decision). `close_access_review` also
+carries `destructiveHint:true` — a one-way `open`->`closed` lifecycle
+transition (no reopen path) that permanently freezes outstanding attestations
+(corrected 2g PR 2, was shipped `false`). The other four are
 `destructiveHint:false` (`export_access_review`/`get_access_review`/
-`list_access_reviews` are additionally `readOnlyHint:true`; `open_access_review`/
-`close_access_review` mutate campaign evidence but never a live access
-grant). See `docs/mcp-server.md` and `docs/user-manual/mcp.md`
+`list_access_reviews` are additionally `readOnlyHint:true`; `open_access_review`
+mints campaign evidence but never a live access grant). See `docs/mcp-server.md`
+and `docs/user-manual/mcp.md`
 "Available Tools".
 
 ## Granular RBAC (Phase 3)
