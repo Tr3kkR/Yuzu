@@ -724,12 +724,15 @@ static const ToolDef kTools[] = {
      "installed by its consumer (design doc §7 follow-on). Distinct from rotate_engine_credential "
      "itself — rotate is the 'here is the secret' reveal step; confirm is a SEPARATE attestation "
      "that closes the loop, gated behind its own Security:Write check rather than being inferred "
-     "from a successful rotate call. Mirrors POST "
+     "from a successful rotate call. Requires the successor token_id the rotate call returned — "
+     "the confirm is pinned to that exact rotation and a stale or mismatched id is rejected with "
+     "no state change, so a blind retry can never confirm a later rotation. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
-     R"j(},"required":["principal_id"]})j",
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
+     R"j(},"required":["principal_id","token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
     {"transfer_engine_principal_owner",
@@ -1285,10 +1288,15 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"mint_engine_credential", {ToolEffect::Additive, false, "Mint engine credential"}},
     {"rotate_engine_credential", {ToolEffect::Destructive, false, "Rotate engine credential"}},
     // confirm_engine_rotation: revokes the predecessor credential in the confirm
-    // txn (api_token_store.cpp) → Destructive; only takes principal_id (does not
-    // pin the rotation), so a blind retry can confirm a LATER rotation early →
-    // NOT idempotent. Both were shipped wrong (2g PR 2 fix).
-    {"confirm_engine_rotation", {ToolEffect::Destructive, false, "Confirm engine credential rotation"}},
+    // txn (api_token_store.cpp) → Destructive. Since #2384 the required
+    // token_id arg pins the confirm to the exact pending successor, so a
+    // same-args replay can only ever target the pair it was issued for: while
+    // pending it confirms it (once); after cutover or once a later rotation is
+    // in flight the stale id mismatches and NOTHING is written → idempotent
+    // per the MCP hint's no-additional-effect semantics (the replay errors,
+    // but errors safely). Pre-#2384 this was false (unpinned blind retry could
+    // confirm a LATER rotation early).
+    {"confirm_engine_rotation", {ToolEffect::Destructive, true, "Confirm engine credential rotation"}},
     // assign/unassign_engine_role: INSERT OR IGNORE (additive) vs DELETE grant
     // (destructive). Both reach a fixed end state on retry → idempotent.
     {"assign_engine_role", {ToolEffect::Additive, true, "Assign fleet-wide role to engine principal"}},
@@ -6478,15 +6486,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // rotate_engine_credential returns only the raw secret; look up the
-                // successor (the newest active credential) for its token_id +
-                // overlap_expires_at.
+                // successor for its token_id + overlap_expires_at. Selected
+                // STRUCTURALLY (the row whose supersedes_token_id links back to
+                // the predecessor), NOT by newest created_at — created_at is
+                // second-resolution, so a same-second mint→rotate ties and the
+                // newest-scan could return the predecessor's id, which would
+                // break the #2384 confirm token_id pin.
                 ApiToken successor;
                 bool found_successor = false;
                 for (const auto& t :
                     engine_credential_store_->list_active_for_principal(principal_id)) {
-                    if (!found_successor || t.created_at > successor.created_at) {
+                    // At most one active row links (the store clears
+                    // supersedes_token_id at cutover, revoke-resolution, and
+                    // sweep), so first match is THE successor.
+                    if (!t.supersedes_token_id.empty()) {
                         successor = t;
                         found_successor = true;
+                        break;
                     }
                 }
                 // §7: every reveal — the original successor mint OR a within-grace-
@@ -6538,8 +6554,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto confirmed = engine_credential_store_->confirm_rotation(principal_id,
-                                                                            session->username);
+                // #2384: the successor token_id from the rotate response pins
+                // the exact rotation being confirmed (defense in depth — the
+                // store re-checks it against the pending pair under the lock).
+                const auto confirm_token_id = param_str(args, "token_id");
+                if (confirm_token_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "token_id is required",
+                                             "pass the token_id returned by "
+                                             "rotate_engine_credential"),
+                                    "application/json");
+                    return;
+                }
+                auto confirmed = engine_credential_store_->confirm_rotation(
+                    principal_id, confirm_token_id, session->username);
                 if (!confirmed) {
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.confirm", "failure",
@@ -6552,8 +6579,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Success detail records WHICH credential was confirmed — the
+                // store validated confirm_token_id equals the pending
+                // successor's token_id, so this is server-verified (not a
+                // caller-supplied echo) and it is not the raw secret.
                 const bool audit_ok = audit_fn(req, "engine_principal.credential.confirm", "success",
-                                               "EnginePrincipal", principal_id, "");
+                                               "EnginePrincipal", principal_id,
+                                               "token_id=" + confirm_token_id);
                 JObj payload;
                 payload.add("confirmed", true).add("principal_id", principal_id);
                 if (!audit_ok)
