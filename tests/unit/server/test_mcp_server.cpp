@@ -1053,6 +1053,101 @@ TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labe
     }
 }
 
+// ── 1c. 2g PR 2: tool annotations present + truthful (cross-check) ───────────
+
+TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with the dispatch class",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+
+    // operation per tool, straight from the internal dispatch table
+    std::unordered_map<std::string, std::string> op;
+    for (const auto& r : mcp::tool_security_rows_for_test())
+        op[std::string(r.name)] = std::string(r.operation);
+
+    std::set<std::string> listed;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        listed.insert(name);
+        INFO("tool = " << name);
+
+        // Coverage: every listed tool has a dispatch-class entry.
+        REQUIRE(op.count(name) == 1);
+        const std::string& operation = op[name];
+
+        // Presence: all four spec hints, as booleans. MCP's absent-defaults are
+        // wrong-direction (openWorldHint + destructiveHint both default true), so
+        // an omitted hint is a FAILURE — this is the CI backstop for every future
+        // tool, governed or not.
+        REQUIRE(t.contains("annotations"));
+        const auto& a = t["annotations"];
+        for (const char* key :
+             {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"}) {
+            INFO("hint = " << key);
+            REQUIRE(a.contains(key));
+            REQUIRE(a[key].is_boolean());
+        }
+        const bool read_only = a["readOnlyHint"];
+        const bool destructive = a["destructiveHint"];
+        const bool idempotent = a["idempotentHint"];
+        const bool open_world = a["openWorldHint"];
+
+        // Closed managed fleet: never open-world.
+        CHECK(open_world == false);
+        // readOnlyHint is mechanically the Read operation.
+        CHECK(read_only == (operation == "Read"));
+        // Coherence: a read-only tool is neither destructive, and reads are idempotent.
+        if (read_only) {
+            CHECK(destructive == false);
+            CHECK(idempotent == true);
+        }
+        // Safe-direction floor (a RULE, not a per-tool count): Delete and Execute
+        // operations are always destructive, so a future Delete/Execute tool can
+        // never ship annotated non-destructive.
+        if (operation == "Delete" || operation == "Execute")
+            CHECK(destructive == true);
+        // Prose must not contradict the hint: a tool the machine calls
+        // non-destructive may not advertise itself as "Destructive" in prose.
+        if (!destructive) {
+            const auto desc = t["description"].get<std::string>();
+            INFO("description = " << desc);
+            CHECK(desc.find("Destructive") == std::string::npos);
+        }
+    }
+
+    // Coverage the other direction: every dispatch-class tool is advertised.
+    for (const auto& [name, _op] : op) {
+        INFO("dispatch tool = " << name);
+        CHECK(listed.count(name) == 1);
+    }
+
+    // Every advertised tool is EXPLICITLY classified in kToolAnnotation (no tool
+    // rides the generator's safe fallback) — so a new tool cannot merge
+    // unclassified and coast on a coincidentally-coherent default.
+    std::set<std::string> classified;
+    for (const auto sv : mcp::tool_annotation_names_for_test())
+        classified.insert(std::string(sv));
+    CHECK(classified == listed);
+
+    // The four merged-annotation corrections this PR ships, asserted by name so a
+    // regression is caught explicitly (two were BLOCKING false-safes on dev).
+    auto ann = [&](const std::string& n) -> nlohmann::json {
+        for (const auto& t : tools)
+            if (t["name"] == n)
+                return t["annotations"];
+        REQUIRE(false); // the tool must exist
+        return {};
+    };
+    CHECK(ann("confirm_engine_rotation")["destructiveHint"] == true); // was false (false-safe)
+    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false); // was true (false-safe)
+    CHECK(ann("close_access_review")["destructiveHint"] == true);     // was false (false-safe)
+    CHECK(ann("create_engine_principal")["destructiveHint"] == false); // was true (over-warn)
+    CHECK(ann("mint_engine_credential")["destructiveHint"] == false);  // was true (over-warn)
+}
+
 // ── 2. ping ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
