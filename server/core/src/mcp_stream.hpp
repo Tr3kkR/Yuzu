@@ -32,6 +32,7 @@
 #include "event_bus.hpp"
 #include "stream_budget.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -127,6 +128,13 @@ inline constexpr std::size_t kMinRingBytesCap = 256;
 /// protected by the budget's global cap alone. This one exists to stop a single agentic
 /// token monopolising the channel, not to ration capacity.
 inline constexpr std::size_t kMcpStreamsPerPrincipalDefault = 4;
+
+/// Max concurrent STREAMED-POST requests per session, and therefore the max eviction-exempt
+/// (pinned) final-response frames the ring can hold at once (Decision 15(f): "one pending
+/// response per streamed request"). The 2f progress bridge caps streamed records per session
+/// at this number at ADMISSION, so publish_final never runs short of a pin slot; the
+/// fixed-size pin array here is the ring-side enforcement of the same bound.
+inline constexpr std::size_t kMaxStreamedPostsPerSession = 4;
 
 /// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
 /// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
@@ -282,6 +290,28 @@ public:
     /// whose cursor falls behind the ring is 404'd on resume, never silently gapped).
     std::uint64_t publish(std::string_view event_type, std::string_view data) noexcept;
 
+    /// Commit a frame to the ring for RESUME replay WITHOUT handing it to the live GET sink.
+    ///
+    /// Track 2f PR 3, Decision 15 + the MCP Streamable HTTP spec ("MUST NOT broadcast the
+    /// same message across multiple streams"): a streamed POST delivers its frames on the
+    /// POST stream, so publishing them onto a concurrently-live GET sink too would be a
+    /// broadcast violation. The ring commit is purely so a GET resume (Last-Event-ID) can
+    /// replay them — never a second live copy. Same return contract and boundary as publish().
+    std::uint64_t publish_ring_only(std::string_view event_type, std::string_view data) noexcept;
+
+    /// Commit a streamed request's FINAL response frame: ring-only (as publish_ring_only)
+    /// AND eviction-EXEMPT (pinned) while the session lives, so a resume always recovers the
+    /// terminal even after the ring wraps (Decision 15(f), bounded one pending per streamed
+    /// request by kMaxStreamedPostsPerSession).
+    ///
+    /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
+    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected —
+    /// the bridge caps streamed records at the pin count) still commits, unpinned, rather
+    /// than losing a real terminal. The pin is released by unpin() (final written on the POST
+    /// wire), by attach_and_replay when a cursor proves consumption (Last-Event-ID >= its id),
+    /// or with the whole object. Same return contract and boundary as publish().
+    std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
+
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
     /// inside publish_impl are internal string/deque allocations with no callback to
     /// throw through (the repo's usual injection idiom), so the THREE failure phases the
@@ -315,6 +345,7 @@ public:
         kGap,              ///< cursor outside the ring window → caller 404s, client re-initializes
         kStreamCapHit,     ///< budget rejected → caller 429s
         kHandoverPending,  ///< a superseded provider has not drained yet → caller 429s
+        kPoisoned,         ///< terminal delivery failed twice → caller 410s, fetch by execution_id
     };
 
     struct AttachResult {
@@ -359,6 +390,24 @@ public:
     /// for the worker THAT sink was pinning. Idempotent.
     void detach(const std::shared_ptr<McpStreamSink>& sink);
 
+    /// Release the eviction-exemption on a pinned final frame (unpin rule (a): the final was
+    /// written on the POST wire). Idempotent — an unknown/already-cleared id is a no-op.
+    void unpin(std::uint64_t id);
+
+    /// True while `id` is a pinned (eviction-exempt) final frame. The 2f bridge sweep polls
+    /// this: a parked (ring-only) record whose pin has gone — consumed via a GET resume that
+    /// acked past it — can be torn down. Const, cheap (scans the fixed pin array under mu_).
+    bool is_pinned(std::uint64_t id) const;
+
+    /// Poison the session stream: no terminal frame could be delivered (publish_final failed
+    /// twice) and the durable result must be fetched by execution_id instead. Sets a sticky
+    /// flag so every FUTURE attach fast-fails (AttachStatus::kPoisoned → 410 + remediation)
+    /// rather than a client re-attaching and heart-beating forever for a terminal that will
+    /// never arrive, and closes any currently-live sink with kInternalError. Idempotent.
+    void poison_terminal();
+
+    std::size_t pinned_count() const;  ///< eviction-exempt frames currently held (observability/tests)
+
     std::uint64_t current_generation() const;
     std::uint64_t next_event_id() const;    ///< id the next publish will assign
     std::uint64_t evictions_total() const;  ///< frames dropped from the ring (observability/tests)
@@ -373,12 +422,24 @@ private:
     static void close_sink(const std::shared_ptr<McpStreamSink>& sink, McpStreamClose reason);
     static std::size_t frame_bytes(const McpStreamEvent& ev);
 
-    /// The throwing body publish() guards. Owns the payload from the caller's views up
-    /// front (those copies may throw — pre-commit, so a bad_alloc there is a clean 0).
+    /// The shared noexcept boundary for publish() / publish_ring_only() / publish_final().
+    /// `deliver_live` hands the frame to the live GET sink (false = ring-only, for streamed
+    /// POST frames); `pinned` marks a committed final eviction-exempt. One implementation of
+    /// the #2366 hard boundary so the three public seams cannot drift.
+    std::uint64_t publish_guarded(std::string_view event_type, std::string_view data,
+                                  bool deliver_live, bool pinned) noexcept;
+
+    /// The throwing body publish_guarded() guards. Owns the payload from the caller's views
+    /// up front (those copies may throw — pre-commit, so a bad_alloc there is a clean 0).
     /// After the ring push + next_id_ advance, every step is either noexcept or locally
-    /// contained, so a throw reaching publish()'s catch proves nothing was committed and
+    /// contained, so a throw reaching the guard's catch proves nothing was committed and
     /// 0 is the honest return.
-    std::uint64_t publish_impl(std::string_view event_type, std::string_view data);
+    std::uint64_t publish_impl(std::string_view event_type, std::string_view data,
+                               bool deliver_live, bool pinned);
+
+    /// True if `id` is a pinned final. Assumes mu_ is held (the eviction path and the public
+    /// is_pinned() both funnel through it). Scans the fixed pin array — O(pin count).
+    bool is_pinned_locked(std::uint64_t id) const;
 
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
@@ -392,6 +453,10 @@ private:
     // Write-once at mint before the stream is shared (set_log_context contract); read
     // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.
     std::string log_context_;
+    // Eviction-exempt (pinned) final-frame ids; 0 = empty slot. Fixed size = the per-session
+    // streamed-request bound. All access under mu_. Decision 15(f).
+    std::array<std::uint64_t, kMaxStreamedPostsPerSession> pinned_ids_{};
+    bool terminal_poisoned_ = false;  ///< sticky; every future attach 410s (guarded by mu_)
     std::shared_ptr<McpStreamSink> live_;
     std::shared_ptr<McpStreamSink> draining_;  ///< superseded, still pinning its worker
     yuzu::MetricsRegistry* metrics_ = nullptr;

@@ -1014,6 +1014,144 @@ TEST_CASE("McpStreamState: set_log_context does not weaken the publish boundary 
     CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
 }
 
+TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decision 15(f))",
+          "[mcp][stream]") {
+    // The eviction-exemption backbone: publish_final pins the terminal frame, then a flood of
+    // ordinary frames wraps the ring many times over. The pinned final must still be in the
+    // ring so a late GET resume recovers it — the whole point of 15(f).
+    mcp::McpStreamState state{/*ring_cap=*/5};
+    REQUIRE(state.publish_final("message", "FINAL") == 1); // id 1, pinned
+    CHECK(state.is_pinned(1));
+    CHECK(state.pinned_count() == 1);
+    for (int i = 0; i < 20; ++i) {
+        state.publish("message", "flood-" + std::to_string(i)); // wraps the 5-frame ring 4x
+    }
+    CHECK(state.is_pinned(1)); // never evicted
+
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    // The oldest surviving frame is the pinned final, ahead of the newest unpinned window.
+    REQUIRE(!attached.sink->sse->queue.empty());
+    CHECK(attached.sink->sse->queue.front().id == 1);
+    CHECK(attached.sink->sse->queue.front().data == "FINAL");
+}
+
+TEST_CASE("McpStreamState: publish_ring_only commits to the ring but not the live sink",
+          "[mcp][stream]") {
+    // A streamed POST's frames ride the POST stream; publishing them onto a concurrent live
+    // GET too would be the spec's forbidden broadcast. publish_ring_only commits for resume
+    // ONLY — the live sink stays empty — while a normal publish still delivers live.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    REQUIRE(state->publish_ring_only("message", "post-bound") == 1);
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        CHECK(attached.sink->sse->queue.empty()); // NOT delivered live
+    }
+    CHECK(state->next_event_id() == 2); // but it IS committed (id consumed)
+
+    state->publish("message", "get-bound"); // a normal publish still reaches the live sink
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        REQUIRE(attached.sink->sse->queue.size() == 1);
+        CHECK(attached.sink->sse->queue.front().data == "get-bound");
+    }
+
+    // The ring-only frame is recoverable by resume — a fresh attach from cursor 0 replays it.
+    auto resumed = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(resumed.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(resumed.sink->sse->mu);
+    REQUIRE(resumed.sink->sse->queue.size() == 2);
+    CHECK(resumed.sink->sse->queue.front().data == "post-bound"); // id 1 still in the ring
+}
+
+TEST_CASE("McpStreamState: unpin makes a former final evictable again", "[mcp][stream]") {
+    mcp::McpStreamState state{/*ring_cap=*/2};
+    REQUIRE(state.publish_final("message", "FINAL") == 1); // pinned
+    for (int i = 0; i < 5; ++i) state.publish("message", "x");
+    REQUIRE(state.is_pinned(1)); // survived while pinned
+
+    state.unpin(1);
+    CHECK_FALSE(state.is_pinned(1));
+    CHECK(state.pinned_count() == 0);
+    state.unpin(1); // idempotent — a second unpin is a no-op
+    CHECK(state.pinned_count() == 0);
+
+    for (int i = 0; i < 5; ++i) state.publish("message", "y"); // now id 1 can be evicted
+    // Cursor 0 replays the surviving window; id 1 is gone (no longer protected).
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    for (const auto& ev : attached.sink->sse->queue) {
+        CHECK(ev.id != 1);
+    }
+}
+
+TEST_CASE("McpStreamState: attach unpins finals the cursor proves consumed (unpin rule b)",
+          "[mcp][stream]") {
+    mcp::McpStreamState state;
+    REQUIRE(state.publish_final("message", "FINAL") == 1); // pinned
+    state.publish("message", "after");
+    REQUIRE(state.is_pinned(1));
+
+    // A resume whose Last-Event-ID is at/after the pinned id proves the client consumed it —
+    // the exemption is released on attach.
+    auto attached = state.attach_and_replay(/*last_event_id=*/1, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    CHECK_FALSE(state.is_pinned(1));
+    CHECK(state.pinned_count() == 0);
+}
+
+TEST_CASE("McpStreamState: poison_terminal fails every future attach with kPoisoned",
+          "[mcp][stream]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->poison_terminal();
+    // The live sink is closed honestly rather than left waiting for a terminal.
+    CHECK(attached.sink->sse->closed.load());
+
+    // Every subsequent attach fast-fails — regardless of cursor — so a client is told to
+    // fetch by execution_id, never left heart-beating forever.
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+    state->poison_terminal(); // idempotent
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
+TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and consumes no id",
+          "[mcp][stream]") {
+    mcp::McpStreamState state;
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    CHECK(state.publish_final("message", "lost") == 0); // pre-commit failure
+    CHECK(state.pinned_count() == 0);                   // no ghost pin
+    CHECK(state.next_event_id() == 1);                  // no id consumed
+}
+
+TEST_CASE("McpStreamState: a final past the pin bound commits unpinned rather than lose it",
+          "[mcp][stream]") {
+    // The pin array is sized to the per-session streamed-request cap; the bridge enforces the
+    // same cap at admission, so this is defence-in-depth. If it is ever hit, the final is kept
+    // (committed, evictable) rather than dropped, and the drift is counted.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
+        REQUIRE(state.publish_final("message", "final") != 0);
+    }
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // slots full
+
+    const auto overflow_id = state.publish_final("message", "one-too-many");
+    REQUIRE(overflow_id != 0);                 // committed — never lost
+    CHECK_FALSE(state.is_pinned(overflow_id)); // but not pinned
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession);
+    CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 1.0);
+}
+
 TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the tick (#2382)",
           "[mcp][stream]") {
     // The deferred #2366 follow-up: prove the DETERMINISTIC condvar handoff, not just the
