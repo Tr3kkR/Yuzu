@@ -568,9 +568,13 @@ Whichever PR flips `prefer_spark` MUST also:
    without its gauge is a BUILD failure, not a silently dead metric. Merging this branch into
    it tripped exactly that guard on four fields - fix it by adding the row, never by relaxing
    the assert.
-5. **Surface `gauge_underflow_`** (pre-existing #2303, self-flagged in
+5. ~~**Surface `gauge_underflow_`** (pre-existing #2303, self-flagged in
    `guardian_lifecycle_journal.hpp` as needing to land WITH the cutover): the accounting bug it
-   detects camouflages as a healthy empty journal because `journal_batch_count` clamps to 0.
+   detects camouflages as a healthy empty journal because `journal_batch_count` clamps to 0.~~ -
+   **DONE** on branch `feat/guardian-journal-observability` (mirrors `write_capacity_rejected`:
+   struct field + `journal_stats()` + emit + fleet row + metrics.md; landed pre-flip and inert).
+   The same PR also delivered the ledger's **UP-4** (`send_exceptions` /
+   `lifecycle_backpressure_drops` reached no heartbeat tag) as two more journal-family counters.
 6. **Add a "seconds since last successful page/prune pass" gauge** (Gate 6 sre). It is the only
    viable liveness signal for the two wall-clock hazards AND for a release-build deadlock,
    where the `mtx_` guard compiles out and a wedged worker is indistinguishable from an idle

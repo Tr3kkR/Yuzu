@@ -46,9 +46,10 @@ using yuzu::agent::GuardianJournalStats;
 // dead metric into a build break - the strongest bind available without server
 // production code including an agent header.
 //
-// When the cutover wires `gauge_underflow` into GuardianJournalStats + the emit
-// function (deliberately deferred, commit 1ffa4299), THIS is what will fail: fix it by
-// adding one row to kGuardianJournalMetrics, not by relaxing the assert.
+// `gauge_underflow` was wired in exactly this way (flip item 5, #2298), and the UP-4
+// send_exceptions / backpressure_drops pair followed. When the NEXT journal counter is
+// added, THIS is what fails if its fleet row is forgotten: fix it by adding one row to
+// kGuardianJournalMetrics, not by relaxing the assert.
 static_assert(sizeof(GuardianJournalStats) ==
                   detail::kNGuardianJournalMetrics * sizeof(std::uint64_t),
               "GuardianJournalStats field count != kGuardianJournalMetrics row count - a "
@@ -83,6 +84,7 @@ GuardianJournalStats all_nonzero_stats() {
     s.batches_pruned = 12;
     s.prune_failures = 13;
     s.write_capacity_rejected = 14;
+    s.gauge_underflow = 27;
     s.journal_bytes = 15;
     s.journal_batch_count = 16;
     s.pages = 17;
@@ -95,6 +97,8 @@ GuardianJournalStats all_nonzero_stats() {
     s.clock_jump_skips = 24;
     s.drain_exceptions = 25;
     s.sweep_exceptions = 26;
+    s.send_exceptions = 28;
+    s.lifecycle_backpressure_drops = 29;
     return s;
 }
 
@@ -140,6 +144,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_pruned", "12"},
         {"yuzu.guardian_journal_prune_failures", "13"},
         {"yuzu.guardian_journal_write_capacity_rejected", "14"},
+        {"yuzu.guardian_journal_gauge_underflow", "27"},
         {"yuzu.guardian_journal_bytes", "15"},
         {"yuzu.guardian_journal_batch_count", "16"},
         {"yuzu.guardian_journal_pages", "17"},
@@ -152,6 +157,8 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_clock_jump_skips", "24"},
         {"yuzu.guardian_drain_exceptions", "25"},
         {"yuzu.guardian_sweep_exceptions", "26"},
+        {"yuzu.guardian_send_exceptions", "28"},
+        {"yuzu.guardian_journal_backpressure_drops", "29"},
     };
     // Per-key, NOT `CHECK(tags == expected)`. Catch2 has no StringMaker for
     // std::pair and neither CATCH_CONFIG_ENABLE_PAIR_STRINGMAKER nor
