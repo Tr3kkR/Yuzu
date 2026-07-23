@@ -190,4 +190,62 @@ inline std::string error_response_null_a4(int code, std::string_view message,
                              retry_after_ms);
 }
 
+// ── Progress (track 2f PR 3, notifications/progress) ──────────────────────
+
+/// Extract a caller-supplied `_meta.progressToken` from a tools/call params object.
+///
+/// MCP Streamable HTTP: `progressToken` is `string | integer`. It is opaque and echoed
+/// verbatim in every `notifications/progress`. Anything else — absent, a non-object
+/// `_meta`, or a token that is neither a string nor an integer (e.g. a float, bool, null,
+/// object) — returns nullopt, which the caller treats as "no progress requested" (the spec
+/// lets a server decline to emit progress, so an unusable token is simply ignored, never an
+/// error). Returned by value so the token outlives the parsed request document.
+inline std::optional<nlohmann::json> extract_progress_token(const nlohmann::json& params) {
+    if (!params.is_object()) {
+        return std::nullopt;
+    }
+    auto meta_it = params.find("_meta");
+    if (meta_it == params.end() || !meta_it->is_object()) {
+        return std::nullopt;
+    }
+    auto tok_it = meta_it->find("progressToken");
+    if (tok_it == meta_it->end()) {
+        return std::nullopt;
+    }
+    // is_number_integer() is true for both signed and unsigned integers; floats are rejected.
+    if (tok_it->is_string() || tok_it->is_number_integer()) {
+        // emplace, not `return *tok_it`: nlohmann's implicit `operator ValueType()` makes the
+        // json -> optional<json> conversion ambiguous; an in-place copy-construct is explicit.
+        std::optional<nlohmann::json> out;
+        out.emplace(*tok_it);
+        return out;
+    }
+    return std::nullopt;
+}
+
+/// Build a JSON-RPC `notifications/progress` message for a streamed tool call.
+///
+/// `progress_token` is echoed verbatim (dump()) so a string token stays a string and an
+/// integer token stays an integer — never stringified. `progress`/`total` are the monotone
+/// agents-responded / agents-targeted counts. `execution_id` is carried in `_meta` so the
+/// client holds the durable fetch handle (get_execution_status / query_responses) BEFORE any
+/// terminal or close frame — a broken stream is then always recoverable (K3 H5).
+inline std::string progress_notification(const nlohmann::json& progress_token,
+                                         std::uint64_t progress, std::uint64_t total,
+                                         std::string_view message, std::string_view execution_id) {
+    std::string r =
+        R"({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":)";
+    r += progress_token.dump();
+    r += R"(,"progress":)";
+    r += std::to_string(progress);
+    r += R"(,"total":)";
+    r += std::to_string(total);
+    r += R"(,"message":)";
+    r += detail::json_quoted(message);
+    r += R"(,"_meta":{"yuzu.execution_id":)";
+    r += detail::json_quoted(execution_id);
+    r += R"(}}})";
+    return r;
+}
+
 } // namespace yuzu::server::mcp
