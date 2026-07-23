@@ -299,7 +299,18 @@ std::uint64_t McpStreamState::publish_impl(std::string event_type, std::string d
                 // WARN is emitted post-lock (below) — unlike a routine slow-consumer
                 // overflow this is an anomalous server-side allocation fault worth a log
                 // line, and it is rare enough that it cannot flood.
-                live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
+                //
+                // Bump dropped_total UNDER the sink mutex — the same synchronization the
+                // enqueue path (enqueue_capped, just above) already uses for its
+                // push_back. This makes the pump's wait predicate a proper condvar
+                // handoff: a waiter cannot check the predicate false and then miss this
+                // bump, so the events-dropped synthetic wakes deterministically on the
+                // notify_one below rather than only on the next tick. Lock order mu_ →
+                // sink mu (we hold mu_ here) — identical to enqueue_capped's own acquire.
+                {
+                    std::lock_guard<std::mutex> sink_lk(live->sse->mu);
+                    live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
+                }
                 sink_enqueue_failed = true;
             }
         }
@@ -631,14 +642,10 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
             // bump dropped_total WITHOUT enqueueing a frame (the by-value copy threw after
             // the ring commit), so `queue.empty()` alone would keep the synthetic waiting a
             // full tick. Before #2366 every drop rode alongside a real push_back, so this
-            // case could not arise. NOTE the wakeup is prompt in the common case but not
-            // fully deterministic: the bump is under McpStreamState::mu_, not this sink
-            // mutex, so in the narrow window where the bump+notify lands between this
-            // predicate check and the wait() sleep, emission is still bounded by one tick
-            // (deferred, never lost — the next tick re-evaluates and drains it). Making it
-            // deterministic = bump dropped_total under the sink mutex (lock order mu_ → sink
-            // mu already permits it); deferred to PR 3, where a real producer makes the
-            // sub-tick latency observable and a TSan pass over a concurrent publisher pays.
+            // case could not arise. The bump is done UNDER this sink mutex (see the
+            // publish() containment catch), so this is a proper condvar handoff — a waiter
+            // cannot check the predicate false and miss the bump, and the publish's
+            // notify_one wakes it deterministically rather than on the next tick.
             return !sink_->sse->queue.empty() || sink_->sse->closed.load() ||
                    sink_->sse->pre_emit.has_value() ||
                    sink_->sse->dropped_total.load(std::memory_order_relaxed) > 0;
