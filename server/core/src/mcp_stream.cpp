@@ -577,10 +577,18 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
                     // guards nothing.
                     static thread_local std::minstd_rand rng{static_cast<std::uint32_t>(
                         std::chrono::steady_clock::now().time_since_epoch().count())};
-                    const auto span = static_cast<std::minstd_rand::result_type>(
-                        cfg_.revalidate_grace_jitter_max.count());
-                    jitter =
-                        std::chrono::milliseconds{static_cast<std::int64_t>(rng() % (span + 1))};
+                    // The modulo is done in the int64 (chrono::rep) domain and the span is
+                    // clamped to a sane ceiling FIRST. The knob is hardwired to grace/2
+                    // today, but if it ever becomes operator-controlled, a raw
+                    // `static_cast<uint32>(count()) + 1` could wrap to 0 (div-by-zero) on a
+                    // 32-bit result_type, or silently truncate a > UINT32_MAX-ms value.
+                    // Contain it at the source now, not when the wiring lands.
+                    constexpr std::int64_t kMaxJitterMs = 3600 * 1000; // one hour is plenty
+                    const std::int64_t span =
+                        std::min<std::int64_t>(cfg_.revalidate_grace_jitter_max.count(),
+                                               kMaxJitterMs);
+                    jitter = std::chrono::milliseconds{
+                        static_cast<std::int64_t>(rng()) % (span + 1)};
                 }
                 grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
             } else if (now() > *grace_deadline_) {
