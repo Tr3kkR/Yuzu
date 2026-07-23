@@ -131,6 +131,38 @@ groups:
             the proxy. Diagnose via the throttled [ADR-1005] warn lines.
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
 
+  - name: yuzu-mcp
+    rules:
+      - alert: YuzuMcpProgressBridgeAtCapacity
+        expr: |
+          rate(yuzu_mcp_bridge_reject_total{reason="global_cap"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress bridge is rejecting at its record cap"
+          description: >-
+            yuzu_mcp_bridge_reject_total{reason="global_cap"} is moving - the
+            256-record correlation table is full, so new execute_instruction
+            progress requests are silently degrading to the plain (poll) path.
+            Functional (clients that poll are unaffected) but live progress is
+            unavailable. Check for a client holding many warm sessions with
+            never-terminating executions, or raise capacity when 3b lands.
+      - alert: YuzuMcpStreamTerminalPublishFailures
+        expr: |
+          rate(yuzu_mcp_stream_terminal_publish_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCP terminal-frame delivery is failing (poison ladder engaged)"
+          description: >-
+            yuzu_mcp_stream_terminal_publish_failures_total is moving - a
+            client-visible terminal result could not be published on the stream
+            and the publish_final → fallback → poison ladder engaged (a double
+            failure poisons that session's stream). Results remain durably
+            fetchable by execution_id, but the streaming surface is degraded;
+            this is an allocation-pressure or stream-state signal worth paging.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon

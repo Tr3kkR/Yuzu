@@ -21,6 +21,7 @@ constexpr const char* kMetricRecordsActive = "yuzu_mcp_bridge_records_active";
 constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
 constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
+constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
 // Shared with mcp_stream's poison path by NAME (one operator-facing series for
 // "a terminal could not be delivered", whichever layer detected it).
 constexpr const char* kMetricTerminalPublishFailures =
@@ -230,6 +231,9 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
         count_reject("unknown_session");
         return {false, "unknown_session"};
     }
+    if (reserve_fault_.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc{};  // test seam: model an allocation failure post-admission
+    }
     // Allocate outside bridge_mu_ (the mint precedent - construction is cheap
     // to discard on a reject and must not serialize against the map).
     auto rec = std::make_shared<BridgeRecord>();
@@ -238,6 +242,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     rec->jsonrpc_id = jsonrpc_id;
     rec->key = make_key(session_id, jsonrpc_id);
     rec->streamed_intent = streamed_intent;
+    rec->created = now();
     rec->stream = std::move(stream);
     rec->progress_token = std::move(progress_token);
 
@@ -298,11 +303,20 @@ bool McpStreamBridge::subscribe(const std::string& session_id, const nlohmann::j
     if (!rec) {
         return false;
     }
+    if (subscribe_fault_.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc{};  // test seam: model a subscribe allocation failure
+    }
     {
         // Written before any listener exists; immutable afterwards.
         std::lock_guard<std::mutex> rlk(rec->mu);
         rec->execution_id = execution_id;
     }
+    // ORDERING INVARIANT (governance performance/UP-5): the caller MUST invoke
+    // subscribe() BEFORE dispatch / the first refresh_counts, so the bus channel
+    // has no buffered events yet and this inline replay-under-bridge_mu_ is O(0).
+    // If a future refactor moved subscribe() after progress began, this would
+    // hold bridge_mu_ across an O(buffer, up to kBufferCap=1000) replay, stalling
+    // every reserve/arm/abandon/sweep behind it.
     const auto sub_id = bus_->subscribe_and_replay(execution_id, 0, make_listener(rec, core_));
     rec->sub_id = sub_id;
     rec->subscribed = true;
@@ -342,7 +356,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
 
     bool consumed_cancel = false;
     bool release_streamed_charge = false;
-    ArmOutcome outcome;
+    ArmOutcome outcome = ArmOutcome::kArmed;  // defensively initialised; assigned below
     {
         // The ONE record-mutex hold (H2): noexcept moves, arbitration, flip,
         // handoff wake. A concurrent listener append lands pre-flip (drained by
@@ -538,6 +552,11 @@ void McpStreamBridge::run_projector() {
                 flush_record_obs(*rec);
             }
             flush_core_obs();
+            // Event-driven liveness signal (governance sre): a flat rate here
+            // while records_active > 0 means the projector is wedged.
+            if (metrics_ != nullptr) {
+                obs_guard([&] { metrics_->counter(kMetricProjectorCycles).increment(); });
+            }
         } catch (...) {  // NOLINT(bugprone-empty-catch) - see the boundary note above
         }
     }
@@ -583,6 +602,12 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     // Settle-or-restore guard (B4/C4): whatever exits this scope, an unsettled
     // terminal payload goes BACK into the slot (terminal_accepted is sticky and
     // never cleared, so no listener can have refilled it) and the claim clears.
+    //
+    // ORDERING (load-bearing, governance cpp-expert): `guard` is declared HERE,
+    // OUTSIDE the per-branch `lock_guard(rec->mu)` scopes below. Destructors run
+    // in reverse order, so on any branch exit the inner lock_guard releases
+    // rec->mu FIRST, then ~ClaimGuard re-locks it - never a same-thread double
+    // lock. Do not move this declaration inside a locked scope.
     struct ClaimGuard {
         const std::shared_ptr<BridgeRecord>& rec;
         std::optional<MailboxEntry>& term;
@@ -607,10 +632,23 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
             std::string frame;
             try {
                 const auto counts = parse_progress(batch[i].data);
-                const std::string msg = std::to_string(counts.responded) + "/" +
+                // UP-4: skip a frame with no meaningful denominator. An
+                // execution-progress event published BEFORE set_agents_targeted
+                // (an agent responding during dispatch) carries agents_targeted=0;
+                // latched during kArming, it would otherwise drain into a
+                // `total:0` progress notification, which a strict MCP client can
+                // reject. `total` is monotone-meaningful only once targeted>0.
+                if (counts.targeted == 0) {
+                    continue;
+                }
+                // Defensive clamp: responded must never exceed targeted on the
+                // wire (a transient count skew between the two COUNT(*) subqueries
+                // must not surface as progress>total).
+                const std::uint64_t responded = std::min(counts.responded, counts.targeted);
+                const std::string msg = std::to_string(responded) + "/" +
                                         std::to_string(counts.targeted) + " agents responded";
-                frame = progress_notification(*rec->progress_token, counts.responded,
-                                              counts.targeted, msg, rec->execution_id);
+                frame = progress_notification(*rec->progress_token, responded, counts.targeted,
+                                              msg, rec->execution_id);
             } catch (...) {
                 // C4: drop this batch's remainder, keep going to terminal
                 // settlement. A malformed/unbuildable progress delta is
@@ -694,6 +732,13 @@ std::string McpStreamBridge::build_real_final(const BridgeRecord& rec,
     // B5: result_base is the serialized JSON-RPC *result object* exactly as
     // today's plain path built it; the additive fields are TOP-LEVEL result
     // keys, never folded into content[0].text.
+    //
+    // This is the one place the bridge uses nlohmann for OUTPUT (parse-merge-
+    // reserialize), against the MCP surface's usual JObj/JArr-build convention
+    // (governance security-LOW): a genuine three-way merge of an opaque
+    // caller-shaped result object + two additive keys needs a real JSON DOM, and
+    // dump() escapes correctly, so there is no injection risk. Reached ONLY on
+    // the kRingOnly path, which is 3b-dead in production today.
     nlohmann::json base = rec.result_base.empty() ? nlohmann::json::object()
                                                   : nlohmann::json::parse(rec.result_base);
     if (!base.is_object()) {
@@ -763,6 +808,20 @@ void McpStreamBridge::sweep() {
         if (ph == Phase::kDone) {
             claim = true;
             action = "mcp.bridge.done_reap";
+        } else if (ph == Phase::kArming) {
+            // A record still kArming long past its synchronous handler's return
+            // is orphaned: the double-bad_alloc corner (arm's fallback build
+            // threw, then abandon's make_key ALSO threw under OOM) leaves it
+            // stranded, and sweep otherwise never reclaims kArming. Reap it to
+            // stop a monotonic global-slot leak (governance cpp-safety SHOULD).
+            // `created` is write-once (immutable after reserve, before the record
+            // is shared), so a lock-free read is safe; a concurrent arm() that
+            // moves the phase off kArming makes the claim re-check below fail and
+            // defer to the live handler.
+            if (now() - rec->created > cfg_.arming_reap_after) {
+                claim = true;
+                action = "mcp.bridge.arming_reaped";
+            }
         } else if (ph == Phase::kArmedGetOnly || ph == Phase::kRingOnly) {
             // Registry leaf, no locks held. Non-touching: a parked record must
             // never extend session life.
@@ -803,11 +862,16 @@ void McpStreamBridge::sweep() {
             }
             if (cur != ph && cur != Phase::kDone) {
                 // Moved on since the evidence was gathered (a kDone settle in
-                // between is still reapable); anything else waits for the next
-                // sweep with fresh evidence.
+                // between is still reapable; a kArming record a concurrent arm()
+                // just flipped falls here and is skipped - the live handler owns
+                // it); anything else waits for the next sweep with fresh evidence.
                 continue;
             }
-            rec->phase.store(Phase::kDone, std::memory_order_release);
+            // A reaped kArming record ends in kAborted (pre-dispatch failure
+            // class); every other claim ends in kDone. teardown_claimed does not
+            // inspect the phase value - only the torn_down/erase bookkeeping.
+            rec->phase.store(ph == Phase::kArming ? Phase::kAborted : Phase::kDone,
+                             std::memory_order_release);
             rec->torn_down = true;
             claimed = true;
         }
@@ -867,7 +931,7 @@ void McpStreamBridge::sweep() {
         // Stage 2: quiesce - after unsubscribe returns, no listener can be
         // in flight for this record and none will ever run again.
         //
-        // KNOWN GAP - 3b-gated (Sol code-review finding, 2026-07-23). Once
+        // KNOWN GAP - 3b-gated (tracked in issue #2409; Sol code-review). Once
         // unsubscribe() removes the listener, a terminal published to the BUS in
         // the window before the revalidate below is no longer latched into
         // terminal_slot (there is no listener to do it), so the revalidate's
@@ -1138,5 +1202,15 @@ void McpStreamBridge::inject_observability_fault_for_test(int times) {
 void McpStreamBridge::inject_arm_fault_for_test() {
     arm_fault_.store(true, std::memory_order_release);
 }
+
+void McpStreamBridge::inject_reserve_fault_for_test() {
+    reserve_fault_.store(true, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_subscribe_fault_for_test() {
+    subscribe_fault_.store(true, std::memory_order_release);
+}
+
+void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }
 
 }  // namespace yuzu::server::mcp

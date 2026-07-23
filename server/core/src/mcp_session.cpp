@@ -124,7 +124,7 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
                 const auto t = now();
                 // Attribute this stream's rare publish() WARN lines to the session. Set
                 // WHILE the stream is still exclusively owned by this local (before the
-                // emplace hands it to the map under mu_) — that is the write-once-before-
+                // emplace hands it to the map under mu_) - that is the write-once-before-
                 // shared contract set_log_context relies on. An 8-char prefix is enough to
                 // correlate against the audit log without putting the full session id in
                 // application logs.

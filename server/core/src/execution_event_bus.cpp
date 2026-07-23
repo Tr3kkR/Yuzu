@@ -40,7 +40,7 @@ std::size_t ExecutionEventBus::subscribe_and_replay(const std::string& execution
                                                     std::uint64_t since_id, Listener listener) {
     auto ch = get_or_create(execution_id);
     std::lock_guard<std::mutex> g(ch->mu);
-    // Install FIRST — the emplace is the only allocating step, so an insertion failure
+    // Install FIRST - the emplace is the only allocating step, so an insertion failure
     // throws before any replay side effect. Then replay under the SAME lock so no publisher
     // can interleave between the install and the replay (the race replay_since+subscribe
     // leaves open). `it` stays valid for the loop: nothing rehashes the map while we hold mu.

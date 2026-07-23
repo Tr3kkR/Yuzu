@@ -1,8 +1,8 @@
-// MCP progress bridge (track 2f PR 3) — the consumer-side projection of the
+// MCP progress bridge (track 2f PR 3) - the consumer-side projection of the
 // ExecutionEventBus onto the MCP session's SSE surfaces.
 //
 // Part 1: the pure JSON-RPC helpers (progressToken extraction, the
-// notifications/progress builder). Part 2: the McpStreamBridge core — records,
+// notifications/progress builder). Part 2: the McpStreamBridge core - records,
 // copy-only listener, projector thread, arm/cancel/abandon arbitration, sweep
 // (pin-ack / session-death / pressure), charge accounting, shutdown. The
 // concurrency-heavy cases (flip-drain, arm-vs-abandon race, pressure-vs-terminal
@@ -32,7 +32,7 @@
 namespace mcp = yuzu::server::mcp;
 using nlohmann::json;
 
-TEST_CASE("extract_progress_token — accepts string and integer tokens verbatim",
+TEST_CASE("extract_progress_token - accepts string and integer tokens verbatim",
           "[mcp][bridge][2f]") {
     SECTION("string token") {
         auto p = json::parse(R"({"_meta":{"progressToken":"abc-123"}})");
@@ -56,10 +56,10 @@ TEST_CASE("extract_progress_token — accepts string and integer tokens verbatim
     }
 }
 
-TEST_CASE("extract_progress_token — anything not string|integer is ignored (no error)",
+TEST_CASE("extract_progress_token - anything not string|integer is ignored (no error)",
           "[mcp][bridge][2f]") {
     // The spec lets a server decline to emit progress, so an unusable or absent token is
-    // simply "no progress requested" — never a parse failure.
+    // simply "no progress requested" - never a parse failure.
     CHECK_FALSE(mcp::extract_progress_token(json::parse(R"({})")).has_value());
     CHECK_FALSE(mcp::extract_progress_token(json::parse(R"({"_meta":{}})")).has_value());
     CHECK_FALSE(mcp::extract_progress_token(json::parse(R"({"_meta":42})")).has_value());
@@ -74,7 +74,7 @@ TEST_CASE("extract_progress_token — anything not string|integer is ignored (no
     CHECK_FALSE(mcp::extract_progress_token(json::parse(R"([1,2,3])")).has_value()); // non-object
 }
 
-TEST_CASE("progress_notification — token echoed verbatim, shape is valid JSON-RPC",
+TEST_CASE("progress_notification - token echoed verbatim, shape is valid JSON-RPC",
           "[mcp][bridge][2f]") {
     SECTION("string token stays a string; execution_id in _meta") {
         auto tok = json("tok-abc");
@@ -583,14 +583,21 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
             fx.bus.publish("exec-r", "execution-progress", kProgress13);
         }
         REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        // Bounded sweeper: a regression that never reaps must FAIL FAST (a wall-
+        // clock deadline), not hang CI forever (governance quality).
         auto sweeper = std::async(std::launch::async, [&] {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (fx.bridge->record_count() != 0) {
+                if (std::chrono::steady_clock::now() >= until) {
+                    return false;
+                }
                 fx.bridge->sweep();
                 std::this_thread::yield();
             }
+            return true;
         });
         fx.bus.publish("exec-r", "execution-completed", kCompleted, /*is_terminal=*/true);
-        sweeper.get();
+        REQUIRE(sweeper.get());  // reaped within the deadline
         auto frames = ring_frames(*s.stream, "alice");
         CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
         CHECK(count_results(frames) == 1);
@@ -881,4 +888,132 @@ TEST_CASE("bridge arm() throw leaves the record cleanly abandonable (Sol finding
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-af2"));
     CHECK(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+}
+
+TEST_CASE("bridge reserve()/subscribe() throw is contained by the caller (Sol/quality)",
+          "[mcp][bridge][2f]") {
+    // The reserve/subscribe fault seams model an allocation failure; the bridge
+    // methods propagate (the execute_instruction handler catches + degrades - see
+    // the handler test). Bridge-level: prove the throw leaves no half-state.
+    Fx fx;
+    auto s = fx.make_session();
+    SECTION("reserve throw leaves no record") {
+        fx.bridge->inject_reserve_fault_for_test();
+        CHECK_THROWS_AS(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false),
+                        std::bad_alloc);
+        CHECK(fx.bridge->record_count() == 0);  // threw after admission, before insert
+        // one-shot cleared: a fresh reserve succeeds
+        CHECK(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    }
+    SECTION("subscribe throw leaves the record unsubscribed (caller abandons)") {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
+        fx.bridge->inject_subscribe_fault_for_test();
+        CHECK_THROWS_AS(fx.bridge->subscribe(s.id, json(2), "exec-sf"), std::bad_alloc);
+        CHECK(fx.bus.subscriber_count("exec-sf") == 0);  // no listener installed
+        // The record is still kArming; abandon cleans it (the handler's path).
+        REQUIRE(fx.bridge->abandon(s.id, json(2)));
+        CHECK(fx.bridge->record_count() == 0);
+    }
+}
+
+TEST_CASE("bridge kArming reaper - an orphaned reserved record is reclaimed (cpp-safety)",
+          "[mcp][bridge][2f]") {
+    // Models the double-bad_alloc corner: a record reserved but never armed (its
+    // handler died between reserve and abandon). sweep() must reap it once it
+    // ages past arming_reap_after, so the global slot is not leaked forever.
+    Fx fx{Bridge::Config{.global_record_cap = 256,
+                         .ring_only_pressure_cap = 64,
+                         .arming_reap_after = std::chrono::seconds(100)}};
+    // Injected clock so the age test is deterministic (no real sleep).
+    auto base = std::chrono::steady_clock::now();
+    auto offset = std::make_shared<std::atomic<std::int64_t>>(0);
+    fx.bridge->set_clock_for_test(
+        [base, offset] { return base + std::chrono::seconds(offset->load()); });
+
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-orphan"));
+    // Never armed. Before the threshold, sweep leaves it (it's "in flight").
+    fx.bridge->sweep();
+    CHECK(fx.bridge->record_count() == 1);
+    auto ph = fx.bridge->phase_for(s.id, json(1));
+    REQUIRE(ph.has_value());
+    CHECK(*ph == Bridge::Phase::kArming);
+
+    // Advance past the reap threshold: sweep reclaims it (unsubscribed, erased).
+    offset->store(101);
+    fx.bridge->sweep();
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.bus.subscriber_count("exec-orphan") == 0);
+    CHECK(fx.audit_count("mcp.bridge.arming_reaped") == 1);
+
+    // A record that IS armed within the window is never reaped by age.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
+    REQUIRE(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+    offset->store(500);
+    fx.bridge->sweep();  // kArmedGetOnly is NOT kArming - age reaper does not touch it
+    auto ph2 = fx.bridge->phase_for(s.id, json(2));
+    REQUIRE(ph2.has_value());
+    CHECK(*ph2 != Bridge::Phase::kAborted);
+}
+
+TEST_CASE("bridge concurrent publish during shutdown - unsubscribe waits out listeners (TSan)",
+          "[mcp][bridge][2f]") {
+    // The teardown safety argument ("unsubscribe() waits out in-flight listeners")
+    // under REAL contention: a publisher hammers the bus while the bridge is
+    // destroyed. Primary value is the TSan leg (no UAF, no race, no lost throw).
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cs"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+
+    std::atomic<bool> stop{false};
+    auto flood = std::async(std::launch::async, [&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            fx.bus.publish("exec-cs", "execution-progress", kProgress13);
+        }
+    });
+    // Let some frames flow, then destroy the bridge concurrently with the flood.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    fx.bridge.reset();  // ~McpStreamBridge -> shutdown(): joins projector, unsubscribes
+    stop.store(true, std::memory_order_release);
+    flood.get();
+    CHECK(fx.bus.subscriber_count("exec-cs") == 0);  // unsubscribed cleanly
+}
+
+TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan)",
+          "[mcp][bridge][2f]") {
+    // The streamed-charge ledger is exercised only on the kRingOnly path (3b-dead
+    // in production, test-reachable). Race sweep against the projector settling a
+    // real terminal on such a record: no double-teardown, no lost/duplicate
+    // final, charge released exactly once. TSan is the point.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);  // streamed_intent
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cr"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly, charged
+
+    auto sweeper = std::async(std::launch::async, [&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (fx.bridge->record_count() != 0 && std::chrono::steady_clock::now() < until) {
+            fx.bridge->sweep();
+            std::this_thread::yield();
+        }
+    });
+    fx.bus.publish("exec-cr", "execution-completed", kCompleted, /*is_terminal=*/true);
+    sweeper.get();
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_results(frames) == 1);        // exactly one real final
+    CHECK(s.stream->pinned_count() == 1);     // its pin survives the torn-down record (spec E3)
+    // Charge released EXACTLY ONCE. Admission = pinned_count() + streamed_unpinned:
+    // the 1 orphan pin holds one slot, so EXACTLY 3 fresh streamed reserves fit
+    // (1 + 3 == cap 4) and the 4th is rejected. If the charge had leaked (stuck
+    // held) only 2 would fit; if double-released, the accounting would be wrong.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
+          "pin_slots");
 }

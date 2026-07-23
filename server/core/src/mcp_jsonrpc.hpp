@@ -194,14 +194,23 @@ inline std::string error_response_null_a4(int code, std::string_view message,
 
 // ── Progress (track 2f PR 3, notifications/progress) ──────────────────────
 
+/// Longest string `progressToken` accepted. The token is opaque and echoed verbatim into
+/// EVERY notifications/progress frame; an unbounded token would inflate every frame (and,
+/// once oversized, trip the ring's frame-size cap so live progress silently never works)
+/// and is stored per bridge record. A caller-controlled amplifier, so it is bounded at
+/// extraction: an over-long token reads as "no progress requested" (governance security-LOW
+/// / unhappy-path UP-1). 512 bytes is far beyond any real correlation id.
+inline constexpr std::size_t kMaxProgressTokenBytes = 512;
+
 /// Extract a caller-supplied `_meta.progressToken` from a tools/call params object.
 ///
 /// MCP Streamable HTTP: `progressToken` is `string | integer`. It is opaque and echoed
-/// verbatim in every `notifications/progress`. Anything else — absent, a non-object
-/// `_meta`, or a token that is neither a string nor an integer (e.g. a float, bool, null,
-/// object) — returns nullopt, which the caller treats as "no progress requested" (the spec
-/// lets a server decline to emit progress, so an unusable token is simply ignored, never an
-/// error). Returned by value so the token outlives the parsed request document.
+/// verbatim in every `notifications/progress`. Anything else - absent, a non-object
+/// `_meta`, a token that is neither a string nor an integer (e.g. a float, bool, null,
+/// object), or a string longer than kMaxProgressTokenBytes - returns nullopt, which the
+/// caller treats as "no progress requested" (the spec lets a server decline to emit
+/// progress, so an unusable token is simply ignored, never an error). Returned by value so
+/// the token outlives the parsed request document.
 inline std::optional<nlohmann::json> extract_progress_token(const nlohmann::json& params) {
     if (!params.is_object()) {
         return std::nullopt;
@@ -215,7 +224,15 @@ inline std::optional<nlohmann::json> extract_progress_token(const nlohmann::json
         return std::nullopt;
     }
     // is_number_integer() is true for both signed and unsigned integers; floats are rejected.
-    if (tok_it->is_string() || tok_it->is_number_integer()) {
+    if (tok_it->is_string()) {
+        if (tok_it->get_ref<const nlohmann::json::string_t&>().size() > kMaxProgressTokenBytes) {
+            return std::nullopt;  // caller-controlled amplifier - decline oversize (UP-1)
+        }
+        std::optional<nlohmann::json> out;
+        out.emplace(*tok_it);
+        return out;
+    }
+    if (tok_it->is_number_integer()) {
         // emplace, not `return *tok_it`: nlohmann's implicit `operator ValueType()` makes the
         // json -> optional<json> conversion ambiguous; an in-place copy-construct is explicit.
         std::optional<nlohmann::json> out;
@@ -228,10 +245,10 @@ inline std::optional<nlohmann::json> extract_progress_token(const nlohmann::json
 /// Build a JSON-RPC `notifications/progress` message for a streamed tool call.
 ///
 /// `progress_token` is echoed verbatim (dump()) so a string token stays a string and an
-/// integer token stays an integer — never stringified. `progress`/`total` are the monotone
+/// integer token stays an integer - never stringified. `progress`/`total` are the monotone
 /// agents-responded / agents-targeted counts. `execution_id` is carried in `_meta` so the
 /// client holds the durable fetch handle (get_execution_status / query_responses) BEFORE any
-/// terminal or close frame — a broken stream is then always recoverable (K3 H5).
+/// terminal or close frame - a broken stream is then always recoverable (K3 H5).
 inline std::string progress_notification(const nlohmann::json& progress_token,
                                          std::uint64_t progress, std::uint64_t total,
                                          std::string_view message, std::string_view execution_id) {

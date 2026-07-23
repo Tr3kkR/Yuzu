@@ -316,7 +316,7 @@ TEST_CASE("execution_event_bus — snapshot is a copy, not a view",
     CHECK(first.event_type == "agent-transition");
 }
 
-TEST_CASE("execution_event_bus — subscribe_and_replay delivers buffered then live, once each",
+TEST_CASE("execution_event_bus - subscribe_and_replay delivers buffered then live, once each",
           "[execution_event_bus][pr3][2f]") {
     ExecutionEventBus bus;
     bus.publish("exec-1", "execution-progress", R"({"n":1})");
@@ -355,15 +355,15 @@ TEST_CASE("execution_event_bus — subscribe_and_replay delivers buffered then l
     }
 }
 
-TEST_CASE("execution_event_bus — subscribe_and_replay closes the replay->subscribe race",
+TEST_CASE("execution_event_bus - subscribe_and_replay closes the replay->subscribe race",
           "[execution_event_bus][pr3][2f][concurrency]") {
     // The property that motivates the primitive (Sol S6 / K3): a subscriber that joins
     // WHILE a publisher is running must see EVERY event from since_id+1 onward exactly once,
     // with no gap at the subscribe boundary and no duplicate. With since_id=0 and a total
     // below kBufferCap, the buffer never evicts, so the received id set must be exactly
-    // {1..N} — and this holds for EVERY interleaving (subscribe landing early, mid, or late
+    // {1..N} - and this holds for EVERY interleaving (subscribe landing early, mid, or late
     // in the stream), so the test is deterministic, never flaky: an event is either already
-    // buffered (replayed) or published after the listener is installed (live) — never both,
+    // buffered (replayed) or published after the listener is installed (live) - never both,
     // because a publisher needs the same channel mutex the install+replay holds.
     ExecutionEventBus bus;
     constexpr int kTotal = 500; // < kBufferCap (1000), so nothing is evicted
@@ -393,6 +393,6 @@ TEST_CASE("execution_event_bus — subscribe_and_replay closes the replay->subsc
     std::sort(received.begin(), received.end());
     REQUIRE(received.size() == static_cast<std::size_t>(kTotal)); // no loss, no duplicate
     for (std::size_t i = 0; i < received.size(); ++i) {
-        CHECK(received[i] == i + 1); // contiguous 1..kTotal — no gap at the subscribe boundary
+        CHECK(received[i] == i + 1); // contiguous 1..kTotal - no gap at the subscribe boundary
     }
 }

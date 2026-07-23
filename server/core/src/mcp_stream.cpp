@@ -52,7 +52,7 @@ constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
 constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
 constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large_total";
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
-// A committed final response found no free pin slot — never expected (the bridge caps
+// A committed final response found no free pin slot - never expected (the bridge caps
 // streamed records per session at the pin count); the frame is kept unpinned rather than
 // lost. A non-zero value means the pin bound and the admission cap have drifted.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
@@ -185,7 +185,7 @@ std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_v
 
 std::uint64_t McpStreamState::publish_ring_only(std::string_view event_type,
                                                 std::string_view data) noexcept {
-    // Ring commit for resume replay, but NO live-GET-sink copy — a streamed POST's frames
+    // Ring commit for resume replay, but NO live-GET-sink copy - a streamed POST's frames
     // ride the POST stream, and duplicating them onto a concurrent GET would be the spec's
     // "MUST NOT broadcast the same message across multiple streams".
     return publish_guarded(event_type, data, /*deliver_live=*/false, /*pinned=*/false);
@@ -200,12 +200,12 @@ std::uint64_t McpStreamState::publish_final(std::string_view event_type,
 
 std::uint64_t McpStreamState::publish_guarded(std::string_view event_type, std::string_view data,
                                               bool deliver_live, bool pinned) noexcept {
-    // HARD exception boundary (#2366) — the pump_once/pump_once_impl pattern, shared by all
+    // HARD exception boundary (#2366) - the pump_once/pump_once_impl pattern, shared by all
     // three publish seams so they cannot drift. PR 3's progress bridge calls these from an
     // ExecutionEventBus listener on a worker task httplib's routing try/catch never sees, so
     // an escaped throw is std::terminate (the #2037 class). publish_impl contains every
     // post-commit fault itself, so an exception reaching this catch proves the ring and
-    // next_id_ are untouched — 0 ("not published, no id consumed") is the honest answer, and
+    // next_id_ are untouched - 0 ("not published, no id consumed") is the honest answer, and
     // the caller's frame simply never happened rather than silently gapping Last-Event-ID.
     //
     // string_view params (not by-value std::string): a by-value parameter is
@@ -223,7 +223,7 @@ std::uint64_t McpStreamState::publish_guarded(std::string_view event_type, std::
                 metrics_->counter(kMetricPublishFailures).increment();
             }
             // Enriched so an operator can attribute the loss: the session (log_context_,
-            // set once at mint — safe to read unlocked) and the event_type that never
+            // set once at mint - safe to read unlocked) and the event_type that never
             // reached the ring. Both the format and the metric lookup allocate; the nested
             // guard contains a bad_alloc from either.
             spdlog::warn("MCP stream publish [{}]: frame dropped pre-commit "
@@ -243,7 +243,7 @@ void McpStreamState::inject_publish_fault_for_test(PublishFault fault, int times
 
 void McpStreamState::set_log_context(std::string context) {
     // No lock: write-once at mint before the stream is shared (see the header contract).
-    // Locking here would give false comfort — publish()'s reads are unlocked by design and
+    // Locking here would give false comfort - publish()'s reads are unlocked by design and
     // are made safe by the mint-time happens-before edge, not by this write's own lock.
     log_context_ = std::move(context);
 }
@@ -337,7 +337,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
                 ++victim;
             }
             if (victim == last) {
-                // Only pinned frames plus the newest remain — stop even if still over the
+                // Only pinned frames plus the newest remain - stop even if still over the
                 // byte cap. The overshoot is BOUNDED: at most kMaxStreamedPostsPerSession
                 // pinned finals, each bridge-clamped small, above the nominal cap.
                 break;
@@ -351,8 +351,8 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
 
         // Pin the committed final AFTER the commit + eviction (it is the newest frame, which
         // eviction never touches). Writing the id only now means a pre-commit push_back throw
-        // leaves no ghost pin. A missing slot is not expected — the bridge caps streamed
-        // records per session at the pin count — so commit the final unpinned rather than
+        // leaves no ghost pin. A missing slot is not expected - the bridge caps streamed
+        // records per session at the pin count - so commit the final unpinned rather than
         // lose a real terminal, and count it.
         if (pinned) {
             bool slotted = false;
@@ -438,7 +438,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     try {
         // TEST SEAM: model the observability block itself throwing (a metric increment or
         // WARN format allocating under memory pressure) AFTER the frame is committed. The
-        // enclosing catch is the #2366 guarantee under test — a fault here must NOT turn a
+        // enclosing catch is the #2366 guarantee under test - a fault here must NOT turn a
         // committed publish into a 0 return, so publish_impl still returns `id`.
         if (post_commit_obs_fault) {
             throw std::bad_alloc{};
@@ -449,7 +449,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
             // via events-dropped; this is the server-side breadcrumb an operator correlates
             // with memory pressure. Enriched with the session and the committed frame id
             // (event_type was moved into the ring above; the id is the useful handle here).
-            spdlog::warn("MCP stream publish [{}]: live-sink enqueue failed post-commit — "
+            spdlog::warn("MCP stream publish [{}]: live-sink enqueue failed post-commit - "
                          "frame id={} is in the ring, client resyncs via events-dropped",
                          log_context_, id);
         }
@@ -478,7 +478,7 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         std::lock_guard<std::mutex> lk(mu_);
 
         // 0. Poison. A terminal frame could not be delivered (publish_final failed twice),
-        //    so this stream will never carry its final — fail every attach fast with a 410
+        //    so this stream will never carry its final - fail every attach fast with a 410
         //    + fetch-by-execution_id remediation rather than let a client re-attach and
         //    heart-beat forever. Checked BEFORE resumability: a poisoned stream is gone
         //    regardless of cursor.
@@ -503,7 +503,7 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
 
         // 1b. Unpin acknowledged finals (unpin rule (b)): a cursor at or past a pinned
         //     final's id proves the client already consumed it, so it no longer needs the
-        //     eviction exemption — release it and let its ring space be reclaimed. (A pinned
+        //     eviction exemption - release it and let its ring space be reclaimed. (A pinned
         //     final is only replayed to a cursor strictly below its id, so unpinning one at
         //     or below the cursor never drops a frame this attach would have served.)
         if (last_event_id != 0) {
@@ -695,7 +695,7 @@ void McpStreamState::unpin(std::uint64_t id) {
     for (auto& slot : pinned_ids_) {
         if (slot == id) {
             slot = 0; // now evictable; a later publish may reclaim its ring space
-            return;   // ids are unique — at most one slot holds it
+            return;   // ids are unique - at most one slot holds it
         }
     }
 }
@@ -715,7 +715,7 @@ void McpStreamState::poison_terminal() {
     std::shared_ptr<McpStreamSink> live;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        terminal_poisoned_ = true; // sticky — every future attach_and_replay 410s
+        terminal_poisoned_ = true; // sticky - every future attach_and_replay 410s
         live = live_;
     }
     // Close any currently-live GET sink honestly rather than leave it heart-beating for a
@@ -1095,7 +1095,7 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     }
     if (attached.status == McpStreamState::AttachStatus::kPoisoned) {
         // A terminal frame could not be delivered on this stream (publish_final failed
-        // twice). It will never carry its final, so a re-attach would heart-beat forever —
+        // twice). It will never carry its final, so a re-attach would heart-beat forever -
         // 410 Gone with the durable-fetch remediation, the same honest posture the
         // /api/v1/events terminal path takes. The execution result stays fetchable by
         // execution_id (get_execution_status / query_responses).

@@ -6835,17 +6835,38 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
               normalize(res_plain->body, exec_plain));
 
         // Progress reaches the session's GET ring LIVE, token echoed verbatim,
-        // execution_id in _meta.
+        // execution_id in _meta. NOTE (governance happy-path): S4.5's
+        // refresh_counts already published an automatic "0/2" frame DURING
+        // dispatch, so the ring ends up with two progress frames once this "1/2"
+        // is projected. Poll for the specific 1/2 frame (not just "any frame"),
+        // and assert on the value, so the test cannot pass on the wrong frame or
+        // flake on projector timing.
         bus.publish(exec_bridged, "execution-progress",
                     R"({"agents_responded":1,"agents_targeted":2})");
-        REQUIRE(bridge_poll([&] { return stream->next_event_id() > 1; }));
+        REQUIRE(bridge_poll([&] {
+            for (const auto& f : bridge_ring(*stream, "test-user")) {
+                auto j = nlohmann::json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+                if (j.is_object() && j.contains("params") && j["params"]["progress"] == 1) {
+                    return true;
+                }
+            }
+            return false;
+        }));
         {
             auto frames = bridge_ring(*stream, "test-user");
-            REQUIRE(frames.size() == 1);
-            auto j = nlohmann::json::parse(frames[0].data);
-            CHECK(j["method"] == "notifications/progress");
-            CHECK(j["params"]["progressToken"] == "tok-1");
-            CHECK(j["params"]["_meta"]["yuzu.execution_id"] == exec_bridged);
+            bool saw_one_of_two = false;
+            for (const auto& f : frames) {
+                auto j = nlohmann::json::parse(f.data);
+                CHECK(j["method"] == "notifications/progress");
+                CHECK(j["params"]["progressToken"] == "tok-1");
+                CHECK(j["params"]["_meta"]["yuzu.execution_id"] == exec_bridged);
+                CHECK(j["params"]["total"] == 2);          // never total:0 (UP-4 clamp)
+                CHECK(j["params"]["progress"] <= 2);       // monotone, never > total
+                if (j["params"]["progress"] == 1) {
+                    saw_one_of_two = true;
+                }
+            }
+            CHECK(saw_one_of_two);  // the 1/2 frame we published actually landed
         }
 
         // Terminal (via the real tracker: the second agent responds) - GET-only
@@ -6991,5 +7012,52 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(bridge.record_count() == 0);
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}}).value() ==
               1.0);
+    }
+
+    SECTION("reserve() allocation failure degrades to the plain path, counted") {
+        // The reserve guard (governance quality): a bad_alloc in reserve (before
+        // create_execution) must degrade silently - the command still dispatches
+        // and returns the plain success, no bridge record.
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-resvfault", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        bridge.inject_reserve_fault_for_test();
+        auto res = call_exec(exec_body(12, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text["command_id"] == "cmd-resvfault");  // dispatch still happened
+        CHECK(bridge.record_count() == 0);             // no record - degraded before insert
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("subscribe() allocation failure abandons the record, degrades, counted") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-subfault", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        bridge.inject_subscribe_fault_for_test();
+        auto res = call_exec(exec_body(13, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text["command_id"] == "cmd-subfault");
+        CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
+                  .value() == 1.0);
     }
 }

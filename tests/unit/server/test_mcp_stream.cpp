@@ -968,7 +968,7 @@ TEST_CASE("McpStreamState: a post-commit observability fault never un-commits th
     // The #2366 boundary must distinguish PRE-commit from POST-commit failure. A throw from
     // the observability block (a metric increment or the enriched WARN format allocating
     // under memory pressure) fires AFTER the frame is committed, so it must be swallowed and
-    // the committed id returned — never converted into a 0 the caller reads as "not
+    // the committed id returned - never converted into a 0 the caller reads as "not
     // published" (the asymmetric caller-obligation the contract turns on). Live registry so
     // the innermost catch runs on the real path, not the nullptr short-circuit.
     yuzu::MetricsRegistry reg;
@@ -982,10 +982,10 @@ TEST_CASE("McpStreamState: a post-commit observability fault never un-commits th
     std::uint64_t id = 0;
     CHECK_NOTHROW(id = state->publish("message", "committed-despite-obs-fault"));
     CHECK(id == 1);                     // committed id returned, NOT 0
-    CHECK(state->next_event_id() == 2); // the id was consumed — the frame IS in the ring
+    CHECK(state->next_event_id() == 2); // the id was consumed - the frame IS in the ring
 
     // The frame reached the sink BEFORE the observability throw (enqueue is under mu_; the
-    // observability block runs post-lock), so delivery is entirely unaffected — this is a
+    // observability block runs post-lock), so delivery is entirely unaffected - this is a
     // swallowed server-side breadcrumb fault, not a dropped frame.
     {
         std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
@@ -994,7 +994,7 @@ TEST_CASE("McpStreamState: a post-commit observability fault never un-commits th
     }
     CHECK(attached.sink->sse->dropped_total.load() == 0);
 
-    // One-shot: the fault does not linger — the very next publish takes id 2 cleanly.
+    // One-shot: the fault does not linger - the very next publish takes id 2 cleanly.
     CHECK(state->publish("message", "clean") == 2);
 }
 
@@ -1003,7 +1003,7 @@ TEST_CASE("McpStreamState: set_log_context does not weaken the publish boundary 
     // The enriched WARN lines interpolate the session context and the event_type; that
     // format + metric lookup allocates and runs inside the boundary's nested guard. So even
     // a pre-commit failure with a context set must still return a clean 0 and count the
-    // failure — the enrichment must never become an escape hatch out of the boundary.
+    // failure - the enrichment must never become an escape hatch out of the boundary.
     yuzu::MetricsRegistry reg;
     mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
     state.set_log_context("sid=cafef00d");
@@ -1018,7 +1018,7 @@ TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decis
           "[mcp][stream]") {
     // The eviction-exemption backbone: publish_final pins the terminal frame, then a flood of
     // ordinary frames wraps the ring many times over. The pinned final must still be in the
-    // ring so a late GET resume recovers it — the whole point of 15(f).
+    // ring so a late GET resume recovers it - the whole point of 15(f).
     mcp::McpStreamState state{/*ring_cap=*/5};
     REQUIRE(state.publish_final("message", "FINAL") == 1); // id 1, pinned
     CHECK(state.is_pinned(1));
@@ -1041,7 +1041,7 @@ TEST_CASE("McpStreamState: publish_ring_only commits to the ring but not the liv
           "[mcp][stream]") {
     // A streamed POST's frames ride the POST stream; publishing them onto a concurrent live
     // GET too would be the spec's forbidden broadcast. publish_ring_only commits for resume
-    // ONLY — the live sink stays empty — while a normal publish still delivers live.
+    // ONLY - the live sink stays empty - while a normal publish still delivers live.
     auto state = std::make_shared<mcp::McpStreamState>();
     auto attached = state->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
@@ -1060,7 +1060,7 @@ TEST_CASE("McpStreamState: publish_ring_only commits to the ring but not the liv
         CHECK(attached.sink->sse->queue.front().data == "get-bound");
     }
 
-    // The ring-only frame is recoverable by resume — a fresh attach from cursor 0 replays it.
+    // The ring-only frame is recoverable by resume - a fresh attach from cursor 0 replays it.
     auto resumed = state->attach_and_replay(0, nullptr, "alice");
     REQUIRE(resumed.status == mcp::McpStreamState::AttachStatus::kAttached);
     std::lock_guard<std::mutex> lk(resumed.sink->sse->mu);
@@ -1077,7 +1077,7 @@ TEST_CASE("McpStreamState: unpin makes a former final evictable again", "[mcp][s
     state.unpin(1);
     CHECK_FALSE(state.is_pinned(1));
     CHECK(state.pinned_count() == 0);
-    state.unpin(1); // idempotent — a second unpin is a no-op
+    state.unpin(1); // idempotent - a second unpin is a no-op
     CHECK(state.pinned_count() == 0);
 
     for (int i = 0; i < 5; ++i) state.publish("message", "y"); // now id 1 can be evicted
@@ -1097,7 +1097,7 @@ TEST_CASE("McpStreamState: attach unpins finals the cursor proves consumed (unpi
     state.publish("message", "after");
     REQUIRE(state.is_pinned(1));
 
-    // A resume whose Last-Event-ID is at/after the pinned id proves the client consumed it —
+    // A resume whose Last-Event-ID is at/after the pinned id proves the client consumed it -
     // the exemption is released on attach.
     auto attached = state.attach_and_replay(/*last_event_id=*/1, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
@@ -1115,7 +1115,7 @@ TEST_CASE("McpStreamState: poison_terminal fails every future attach with kPoiso
     // The live sink is closed honestly rather than left waiting for a terminal.
     CHECK(attached.sink->sse->closed.load());
 
-    // Every subsequent attach fast-fails — regardless of cursor — so a client is told to
+    // Every subsequent attach fast-fails - regardless of cursor - so a client is told to
     // fetch by execution_id, never left heart-beating forever.
     CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
           mcp::McpStreamState::AttachStatus::kPoisoned);
@@ -1146,7 +1146,7 @@ TEST_CASE("McpStreamState: a final past the pin bound commits unpinned rather th
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // slots full
 
     const auto overflow_id = state.publish_final("message", "one-too-many");
-    REQUIRE(overflow_id != 0);                 // committed — never lost
+    REQUIRE(overflow_id != 0);                 // committed - never lost
     CHECK_FALSE(state.is_pinned(overflow_id)); // but not pinned
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession);
     CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 1.0);
@@ -1156,7 +1156,7 @@ TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the
           "[mcp][stream]") {
     // The deferred #2366 follow-up: prove the DETERMINISTIC condvar handoff, not just the
     // outcome. The existing sink-enqueue test runs pump_once on the SAME thread after the
-    // fault, so the predicate is already true on entry and the pump never parks — it cannot
+    // fault, so the predicate is already true on entry and the pump never parks - it cannot
     // distinguish "woken by notify" from "predicate true on arrival". Here a second thread
     // parks the pump in wait_for, then this thread faults+publishes: the containment path
     // bumps dropped_total UNDER the sink mutex and notify_one's, so a parked waiter wakes at
@@ -1164,14 +1164,14 @@ TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the
     //
     // The discriminator is timing, and ONLY timing: even a broken notify would eventually
     // emit events-dropped when the tick fires (the predicate also tests dropped_total). So
-    // the tick is set to 30 s — far beyond any wakeup latency — and the assertion is "the
+    // the tick is set to 30 s - far beyond any wakeup latency - and the assertion is "the
     // pump returned well within a 5 s safety window", i.e. it woke on the notify, not the
     // 30 s tick. This is a generous margin, not a tight latency bound.
     //
     // Never false-RED: if this thread happens to publish BEFORE the pump reaches wait_for,
     // the predicate is simply true on entry and the pump returns fast anyway (a PASS that
     // did not exercise the notify). The test can only FAIL if the pump parked AND the notify
-    // failed to wake it — exactly the regression it guards. The atomic handshake biases
+    // failed to wake it - exactly the regression it guards. The atomic handshake biases
     // heavily toward the parked-first interleaving so CI actually exercises the notify.
     auto state = std::make_shared<mcp::McpStreamState>();
     auto attached = state->attach_and_replay(0, nullptr, "alice");
@@ -1198,8 +1198,8 @@ TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the
     state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
     REQUIRE(state->publish("message", "missed") == 1); // committed under id 1
 
-    // Woken by the notify — ready in milliseconds, nowhere near the 30 s tick.
+    // Woken by the notify - ready in milliseconds, nowhere near the 30 s tick.
     REQUIRE(pumped.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
-    CHECK(pumped.get()); // pump_once returned true — the stream continues
+    CHECK(pumped.get()); // pump_once returned true - the stream continues
     CHECK(wire.contains("event: events-dropped"));
 }

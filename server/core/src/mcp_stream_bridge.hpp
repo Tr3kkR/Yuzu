@@ -91,6 +91,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -125,7 +126,22 @@ public:
         /// Parked (kRingOnly) records tolerated before the pressure escape hatch
         /// force-expires the oldest (see the class comment).
         std::size_t ring_only_pressure_cap = 64;
+        /// A kArming record is normally sub-millisecond (reserve→subscribe→arm
+        /// all happen in ONE synchronous execute_instruction handler call). A
+        /// record still kArming after this long is orphaned - its handler died
+        /// between reserve and arm (the double-`bad_alloc` corner: arm's fallback
+        /// build throws, then abandon()'s make_key ALSO throws under OOM), which
+        /// sweep would otherwise never reclaim because it deliberately skips
+        /// kArming (governance cpp-safety SHOULD). The threshold is generous -
+        /// dispatch is a fire-and-forget fan-out (it does not wait for agents),
+        /// so the reserve→arm window is milliseconds; 5 min is many orders of
+        /// margin, so a live handler is never reaped.
+        std::chrono::seconds arming_reap_after{300};
     };
+
+    /// Injectable steady clock for the kArming reaper (deterministic tests).
+    /// Defaults to steady_clock::now(); only the DIFFERENCE between calls matters.
+    using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
 
     /// httplib-free audit sink (G1): (action, execution_id, detail). Wired by
     /// 3a.7; empty = no audit. Every invocation is exception-contained (C5) -
@@ -257,6 +273,14 @@ public:
     /// execute_instruction handler's guard degrades to the plain path and leaks
     /// no kArming record.
     void inject_arm_fault_for_test();
+    /// One-shot: the NEXT reserve() (after admission) / subscribe() throws
+    /// std::bad_alloc, modelling an allocation failure. Proves the handler's
+    /// reserve/subscribe guards degrade to the plain path (governance quality).
+    void inject_reserve_fault_for_test();
+    void inject_subscribe_fault_for_test();
+    /// Override the reaper clock for deterministic age tests (default:
+    /// steady_clock::now). Only the difference between calls matters.
+    void set_clock_for_test(ClockFn clock);
 
 private:
     /// One latched bus event. Nothrow-movable - load-bearing for the projector's
@@ -295,6 +319,7 @@ private:
         std::string key;               ///< session_id + '\n' + jsonrpc_id.dump()
         bool streamed_intent = false;
         std::uint64_t seq = 0;         ///< reservation order
+        std::chrono::steady_clock::time_point created;  ///< set at reserve; the kArming reaper's age base
         std::shared_ptr<McpStreamState> stream;  ///< taken at reserve via stream_for
         std::optional<nlohmann::json> progress_token;
         std::string execution_id;      ///< set at subscribe(), before any listener exists
@@ -362,7 +387,8 @@ private:
     /// Build the parked real final from the bus terminal payload + result_base (B5).
     static std::string build_real_final(const BridgeRecord& rec, const std::string& terminal_data);
     /// The publish_final → retry-fallback → poison ladder (A6). Returns the
-    /// committed id (0 ⇒ poisoned). `frame` may be moved from.
+    /// committed id (0 ⇒ poisoned). `frame` is only viewed (passed as a
+    /// string_view to publish_final); the retry uses the record's fallback_final.
     std::uint64_t publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
                                           std::string frame);
 
@@ -404,6 +430,13 @@ private:
     std::atomic<bool> shutdown_called_{false};
     std::atomic<int> obs_fault_remaining_{0};  ///< C5 fault seam
     std::atomic<bool> arm_fault_{false};       ///< one-shot arm() throw seam
+    std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
+    std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
+    ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
+
+    std::chrono::steady_clock::time_point now() const {
+        return clock_ ? clock_() : std::chrono::steady_clock::now();
+    }
 };
 
 }  // namespace yuzu::server::mcp

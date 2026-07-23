@@ -540,6 +540,10 @@ public:
                           "Terminal-frame publish failures seen by the bridge's "
                           "publish_final → fallback → poison ladder (Decision 15(f))",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_projector_cycles_total",
+                          "Progress-bridge projector wake cycles. An event-driven liveness signal: "
+                          "records_active > 0 with a flat rate here means the projector is wedged",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
@@ -547,7 +551,18 @@ public:
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
+        // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
+        // meaningful on a healthy/idle server (observability-conventions; the
+        // reason literals mirror the bridge's reject/degrade taxonomies).
+        for (auto reason : {"disabled", "unknown_session", "shutdown", "duplicate_request_id",
+                            "global_cap", "pin_slots"}) {
+            metrics_.counter("yuzu_mcp_bridge_reject_total", {{"reason", reason}});
+        }
+        for (auto reason : {"reserve_threw", "no_execution_row", "subscribe_failed", "arm_threw"}) {
+            metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
+        }
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
@@ -3712,12 +3727,17 @@ public:
                         .set(static_cast<double>(execution_event_bus_->gc_channels_total()));
                 }
                 // 2f PR 3a - the bridge sweep tick: pin-ack teardown, session-
-                // death teardown, and the ring-only pressure hatch all advance
-                // here. PAIRED with registry gc ON PURPOSE: the bridge's
-                // non-touching exists() classifies a dead session but never
-                // destroys its stream, so without this gc() an idle server
-                // would hold an expired session's stream (and its pinned
-                // finals) until the next client request happened to run one.
+                // death teardown, the kArming age-reaper, and the ring-only
+                // pressure hatch all advance here. PAIRED with registry gc ON
+                // PURPOSE: the bridge's non-touching exists() classifies a dead
+                // session but never destroys its stream, so without this gc() an
+                // idle server would hold an expired session's stream (and its
+                // pinned finals) until the next client request happened to run
+                // one. BOUNDED WORK (governance sre): this shares the
+                // security-relevant serial health-recompute budget, so both
+                // calls are O(records ≤256) / O(sessions) in-memory scans placed
+                // AFTER the CRL/stale-agent sweep (no same-tick delay to it) -
+                // microseconds at the 15s cadence, no request-path contention.
                 if (mcp_stream_bridge_) {
                     mcp_stream_bridge_->sweep();
                     if (mcp_sessions_) {

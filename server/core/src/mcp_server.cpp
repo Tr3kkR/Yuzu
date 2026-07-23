@@ -564,12 +564,15 @@ static const ToolDef kTools[] = {
      "LIVE PROGRESS: on a Streamable HTTP session, include _meta.progressToken (string|int) in "
      "the tools/call params and notifications/progress frames (agents responded / targeted, with "
      "the execution_id in _meta under \"yuzu.execution_id\") arrive on this session's GET SSE "
-     "stream as the fleet responds. FALLBACK when not streaming: poll query_responses with the "
-     "returned execution_id — an EMPTY result means the run is still in flight, so wait ~2-5s "
+     "stream as the fleet responds. Progress is always BEST-EFFORT: even after supplying a "
+     "token you MUST still be prepared to poll (a reservation can silently degrade under load "
+     "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "FALLBACK when not streaming: poll query_responses with the "
+     "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
      "and retry a few times (or call get_execution_status to confirm a terminal state), or "
      "subscribe to live JSON events via GET /api/v1/events?execution_id=<id>. Find valid "
      "plugin/action names AND their parameters via discover_plugins (parameter_schema is inline "
-     "for actions with a published definition) or discover_instructions — do not guess action "
+     "for actions with a published definition) or discover_instructions - do not guess action "
      "names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
@@ -588,9 +591,9 @@ static const ToolDef kTools[] = {
      "Fan one instruction out into several plugin actions on ONE device, async. The server "
      "dispatches each step as an ordinary command under a shared correlation id and returns "
      "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
-     "bundle_id for the collated result — bundles do NOT emit notifications/progress "
-     "(no _meta.progressToken support; polling is the contract here, a recorded ADR-1005 "
-     "exception). Use this instead of N execute_instruction calls when refreshing a device "
+     "bundle_id for the collated result - bundles do NOT emit notifications/progress "
+     "(no _meta.progressToken support in the 2f scope; polling is the contract here). Use "
+     "this instead of N execute_instruction calls when refreshing a device "
      "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
      "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
@@ -5237,8 +5240,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // no bus terminal. Re-evaluating here publishes fresh counts
                     // and, when everyone already responded, the terminal. The
                     // zero-agents path returned above, so this never fires with
-                    // targeted==0. (REST sibling hole tracked separately -
-                    // workflow_routes.cpp:1525-1530.)
+                    // targeted==0. (The identical REST/scheduled sibling holes -
+                    // workflow_routes.cpp, rest_api_v1.cpp, schedule_runner.cpp -
+                    // are tracked in issue #2408.)
                     execution_tracker->refresh_counts(execution_id);
                 }
 

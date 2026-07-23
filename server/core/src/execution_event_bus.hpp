@@ -123,7 +123,7 @@ public:
     /// This closes the replay→subscribe race the `/api/v1/events` sibling documents and
     /// lives with (a frame published between its separate `replay_since` and `subscribe`
     /// calls reaches neither): here a publisher needs the same channel mutex, so nothing
-    /// can land in the gap. Each event reaches the listener EXACTLY once — buffered events
+    /// can land in the gap. Each event reaches the listener EXACTLY once - buffered events
     /// came from publishes that completed before this lock was held (the listener missed
     /// their live fan-out) and are delivered by the replay; events published after this
     /// returns get the live fan-out and are past the replay cursor.

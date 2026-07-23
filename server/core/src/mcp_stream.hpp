@@ -296,7 +296,7 @@ public:
     /// same message across multiple streams"): a streamed POST delivers its frames on the
     /// POST stream, so publishing them onto a concurrently-live GET sink too would be a
     /// broadcast violation. The ring commit is purely so a GET resume (Last-Event-ID) can
-    /// replay them — never a second live copy. Same return contract and boundary as publish().
+    /// replay them - never a second live copy. Same return contract and boundary as publish().
     std::uint64_t publish_ring_only(std::string_view event_type, std::string_view data) noexcept;
 
     /// Commit a streamed request's FINAL response frame: ring-only (as publish_ring_only)
@@ -305,7 +305,7 @@ public:
     /// request by kMaxStreamedPostsPerSession).
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected —
+    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected -
     /// the bridge caps streamed records at the pin count) still commits, unpinned, rather
     /// than losing a real terminal. The pin is released by unpin() (final written on the POST
     /// wire), by attach_and_replay when a cursor proves consumption (Last-Event-ID >= its id),
@@ -323,7 +323,7 @@ public:
         kSinkEnqueue,  ///< models the live-sink enqueue copy failing (frame already committed)
         /// Models the POST-COMMIT observability block (metric increment / WARN format)
         /// throwing after the frame is committed. Exercises publish_impl's innermost
-        /// `catch(...)` — the guarantee that a metrics/log allocation fault never turns a
+        /// `catch(...)` - the guarantee that a metrics/log allocation fault never turns a
         /// committed publish into a 0 return. Fires inside that try, so it never reaches
         /// publish()'s outer boundary: publish returns the committed id.
         kPostCommitObservability,
@@ -339,7 +339,7 @@ public:
     ///
     /// Threading: WRITE-ONCE, called at mint BEFORE the stream is shared with any other
     /// thread (McpSessionRegistry::mint, before the Entry is emplaced). Effectively
-    /// immutable thereafter, so publish()'s reads need no lock — the registry mutex + the
+    /// immutable thereafter, so publish()'s reads need no lock - the registry mutex + the
     /// shared_ptr handoff at emplace are the happens-before edge to every later reader.
     /// Do NOT call it after the stream is live.
     void set_log_context(std::string context);
@@ -395,12 +395,12 @@ public:
     void detach(const std::shared_ptr<McpStreamSink>& sink);
 
     /// Release the eviction-exemption on a pinned final frame (unpin rule (a): the final was
-    /// written on the POST wire). Idempotent — an unknown/already-cleared id is a no-op.
+    /// written on the POST wire). Idempotent - an unknown/already-cleared id is a no-op.
     void unpin(std::uint64_t id);
 
     /// True while `id` is a pinned (eviction-exempt) final frame. The 2f bridge sweep polls
-    /// this: a parked (ring-only) record whose pin has gone — consumed via a GET resume that
-    /// acked past it — can be torn down. Const, cheap (scans the fixed pin array under mu_).
+    /// this: a parked (ring-only) record whose pin has gone - consumed via a GET resume that
+    /// acked past it - can be torn down. Const, cheap (scans the fixed pin array under mu_).
     bool is_pinned(std::uint64_t id) const;
 
     /// Poison the session stream: no terminal frame could be delivered (publish_final failed
@@ -434,7 +434,7 @@ private:
                                   bool deliver_live, bool pinned) noexcept;
 
     /// The throwing body publish_guarded() guards. Owns the payload from the caller's views
-    /// up front (those copies may throw — pre-commit, so a bad_alloc there is a clean 0).
+    /// up front (those copies may throw - pre-commit, so a bad_alloc there is a clean 0).
     /// After the ring push + next_id_ advance, every step is either noexcept or locally
     /// contained, so a throw reaching the guard's catch proves nothing was committed and
     /// 0 is the honest return.
@@ -442,7 +442,7 @@ private:
                                bool deliver_live, bool pinned);
 
     /// True if `id` is a pinned final. Assumes mu_ is held (the eviction path and the public
-    /// is_pinned() both funnel through it). Scans the fixed pin array — O(pin count).
+    /// is_pinned() both funnel through it). Scans the fixed pin array - O(pin count).
     bool is_pinned_locked(std::uint64_t id) const;
 
     mutable std::mutex mu_;
