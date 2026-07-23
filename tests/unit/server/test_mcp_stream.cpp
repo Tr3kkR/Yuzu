@@ -21,6 +21,7 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <utility> // std::declval — the publish() noexcept static_assert
 #include <vector>
 
 namespace mcp = yuzu::server::mcp;
@@ -799,4 +800,82 @@ TEST_CASE("McpStreamState: an oversized frame is replaced, not corrupted",
     CHECK(frame.data.find("execution_id") != std::string::npos);
     CHECK(frame.data.size() <= 256);
     CHECK(frame.data.find(std::string(64, 'x')) == std::string::npos); // no raw payload
+}
+
+// ── publish() exception boundary (#2366) ────────────────────────────────────
+// PR 3's progress bridge invokes publish() from an ExecutionEventBus listener on a
+// worker task no routing try/catch ever sees — an escaped throw is std::terminate.
+// The throw sites are internal string/deque allocations (no callback seam to throw
+// through), so these tests trip the two failure phases via the explicit test seam.
+
+TEST_CASE("McpStreamState: publish is a noexcept boundary — structural, not decorative",
+          "[mcp][stream]") {
+    static_assert(
+        noexcept(std::declval<mcp::McpStreamState&>().publish(std::string{}, std::string{})),
+        "#2366: publish() must be a hard exception boundary — PR 3's progress bridge "
+        "calls it from an unguarded ExecutionEventBus listener (the #2037 class)");
+    SUCCEED();
+}
+
+TEST_CASE("McpStreamState: a pre-commit publish failure consumes NO id and gaps nothing (#2366)",
+          "[mcp][stream]") {
+    mcp::McpStreamState state;
+    REQUIRE(state.publish("message", "one") == 1);
+
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    std::uint64_t id = 99;
+    CHECK_NOTHROW(id = state.publish("message", "lost"));
+    CHECK(id == 0);                    // 0 = "not published" — never a valid frame id
+    CHECK(state.next_event_id() == 2); // the id was NOT consumed: no permanent hole
+
+    // The next publish takes exactly the id the failed one would have had, and a full
+    // replay shows a contiguous stream — a resume can never 404 on a gap the failure
+    // silently created (the old `id = next_id_++` before the push did exactly that).
+    CHECK(state.publish("message", "two") == 2);
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    REQUIRE(attached.sink->sse->queue.size() == 2);
+    CHECK(attached.sink->sse->queue.front().id == 1);
+    CHECK(attached.sink->sse->queue.back().id == 2);
+    CHECK(attached.sink->sse->queue.back().data == "two");
+}
+
+TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and counts "
+          "the gap (#2366)",
+          "[mcp][stream]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    std::uint64_t id = 0;
+    CHECK_NOTHROW(id = state->publish("message", "missed"));
+    // COMMITTED: the frame is in the ring under its id. Returning 0 here would claim
+    // it never happened while every future replay faithfully serves it.
+    CHECK(id == 1);
+    CHECK(state->next_event_id() == 2);
+
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        CHECK(attached.sink->sse->queue.empty()); // the frame never reached the sink...
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 1); // ...and that is COUNTED
+
+    // The counted drop rides the existing slow-consumer machinery: the pump's next tick
+    // tells the client frames were lost, and the ring still holds the frame so a
+    // Last-Event-ID resume recovers it. No silent gap in either direction.
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK(pump.pump_once(wire.writer()));
+    CHECK(wire.contains("event: events-dropped"));
+
+    auto resumed = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(resumed.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(resumed.sink->sse->mu);
+    REQUIRE(resumed.sink->sse->queue.size() == 1);
+    CHECK(resumed.sink->sse->queue.front().id == 1);
+    CHECK(resumed.sink->sse->queue.front().data == "missed");
 }
