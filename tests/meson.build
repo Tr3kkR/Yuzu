@@ -429,6 +429,8 @@ if build_server
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
+      'unit/server/test_mcp_stream.cpp',
+      'unit/server/test_sse_saturation.cpp',
       'unit/server/test_mcp_transport.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',

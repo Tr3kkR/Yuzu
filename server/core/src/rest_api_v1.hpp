@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stream_budget.hpp"
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
@@ -290,7 +292,11 @@ public:
         // optional dep; nullptr leaves the assign/unassign routes answering
         // 503 (list still works if rbac_store is wired — it doesn't need
         // this store).
-        EnginePrincipalStore* engine_principal_store = nullptr);
+        EnginePrincipalStore* engine_principal_store = nullptr,
+        // ADR-0034: THE shared admission budget for held-open responses. GET /api/v1/events
+        // pins an httplib worker for the life of the subscription, so it leases from the same
+        // counter as every other streaming surface. nullptr = no admission control (tests).
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -342,7 +348,9 @@ public:
         // param. COEXISTENCE (4.2→4.3 rebase): the 4.3 lifecycle routes use the
         // `engine_principal_store_` MEMBER (set via set_engine_principal_store);
         // server.cpp wires BOTH. Follow-up: unify onto the member.
-        EnginePrincipalStore* engine_principal_store = nullptr);
+        EnginePrincipalStore* engine_principal_store = nullptr,
+        // ADR-0034: the shared held-open-response budget (see the overload above).
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

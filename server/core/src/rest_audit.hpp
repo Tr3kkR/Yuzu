@@ -43,6 +43,7 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include <exception>
 #include <string>
 #include <type_traits>
 
@@ -86,6 +87,42 @@ template <class AuditFn>
         spdlog::warn("audit_fn threw (non-std exception) on behavioural-data route action={} "
                      "target={}",
                      action, target_id);
+    }
+    return false;
+}
+
+/// Same guarantees as `try_persist_audit`, for a sink that STAMPS the principal
+/// explicitly rather than re-deriving it from the request.
+///
+/// Needed wherever the audit row is written at a moment when the request's credential
+/// no longer resolves — the motivating case is `mcp.stream.close` on a
+/// `credential_revoked` teardown, where re-deriving would leave the actor blank on
+/// precisely the rows that evidence the revocation control.
+template <typename PrincipalAuditFn, typename PrincipalT>
+[[nodiscard]] inline bool
+try_persist_audit_for_principal(const PrincipalAuditFn& audit_fn, const httplib::Request& req,
+                                const std::string& action, const std::string& result,
+                                const PrincipalT& principal, const std::string& target_type,
+                                const std::string& target_id, const std::string& detail) {
+    // NOTE the actor is a distinct STRUCT type, not more strings. That is what makes this
+    // assert meaningful: is_invocable_r_v checks arity and return type only, so a sink whose
+    // same-typed string parameters were transposed would satisfy it silently.
+    static_assert(std::is_invocable_r_v<bool, const PrincipalAuditFn&, const httplib::Request&,
+                                        const std::string&, const std::string&, const PrincipalT&,
+                                        const std::string&, const std::string&,
+                                        const std::string&>,
+                  "PrincipalAuditFn must be bool(const httplib::Request&, action, result, "
+                  "principal-struct, target_type, target_id, detail)");
+    if (!audit_fn)
+        return true; // audit-off deployment — not a persist failure; serve.
+    try {
+        return audit_fn(req, action, result, principal, target_type, target_id, detail);
+    } catch (const std::exception& e) {
+        spdlog::warn("principal audit_fn threw action={} target={}: {}", action, target_id,
+                     e.what());
+    } catch (...) {
+        spdlog::warn("principal audit_fn threw (non-std exception) action={} target={}", action,
+                     target_id);
     }
     return false;
 }

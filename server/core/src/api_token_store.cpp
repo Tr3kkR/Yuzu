@@ -411,6 +411,92 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     return t;
 }
 
+ApiTokenStore::CheckedToken ApiTokenStore::validate_token_checked(const std::string& raw_token) {
+    if (raw_token.empty())
+        return {TokenCheck::kInvalid, std::nullopt};  // definitive: no credential is no credential
+    if (!open_)
+        return {TokenCheck::kUnavailable, std::nullopt};  // store closed → we cannot know
+
+    // This does its OWN status-aware lookup rather than calling validate_token and
+    // inferring from its nullopt. An earlier version did exactly that, then probed
+    // the store with a *different* trivial statement to decide whether the negative
+    // answer was real — and that is wrong in the precise case this function exists
+    // for: `validate_token` folds "could not acquire a connection" and "the query
+    // errored" into the same nullopt as "no such row", while the probe statement can
+    // still succeed on a merely-contended store. The result was a healthy stream
+    // being killed as `credential_revoked` because the backend was busy — the 60 s
+    // grace window (Decision 15(i)) unreachable for the most likely auth-store fault.
+    // Only the status of the actual lookup can distinguish the two. (The reasoning
+    // was written against SQLite's BUSY/IOERR rc and survives the Postgres port
+    // unchanged: a failed lease and a non-TUPLES_OK result are the same class of
+    // "we asked and did not get an answer", and zero rows is the same definitive no.)
+    const auto hash = sha256_hex(raw_token);
+    const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
+
+    {
+        std::lock_guard cache_lock(cache_mtx_);
+        auto it = token_cache_.find(hash);
+        if (it != token_cache_.end()) {
+            if (std::chrono::steady_clock::now() - it->second.cached_at < kTokenCacheTtl) {
+                const auto& cached = it->second.token;
+                const auto now = now_epoch();
+                if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
+                    token_cache_.erase(it);
+                    cache_misses_.fetch_add(1, std::memory_order_relaxed);
+                    return {TokenCheck::kInvalid, std::nullopt}; // definitive
+                }
+                cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                return {TokenCheck::kValid, cached};
+            }
+            token_cache_.erase(it);
+        }
+    }
+    cache_misses_.fetch_add(1, std::memory_order_relaxed);
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        // No connection inside the timeout: we could not even ask. NOT evidence of
+        // revocation — the caller rides out its bounded grace window instead.
+        return {TokenCheck::kUnavailable, std::nullopt};
+    }
+
+    const std::string sql = std::string("SELECT token_id, token_hash, ") + kTokenColsTail +
+                            " FROM api_token_store.api_tokens WHERE token_hash = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{hash});
+    if (res.status() != PGRES_TUPLES_OK) {
+        // We asked and did not get an answer (backend error, connection dropped
+        // mid-query, ...). Fail-safe: indeterminate never GRANTS access, it only
+        // defers the decision to cut an already-authenticated stream.
+        return {TokenCheck::kUnavailable, std::nullopt};
+    }
+    if (PQntuples(res.get()) == 0)
+        return {TokenCheck::kInvalid, std::nullopt}; // the row genuinely is not there
+
+    ApiToken t = read_token(res.get(), 0);
+
+    if (t.revoked || (t.expires_at > 0 && now_epoch() > t.expires_at))
+        return {TokenCheck::kInvalid, std::nullopt}; // definitive
+
+    // Deliberately NO `UPDATE last_used_at` here. This runs on every heartbeat tick of
+    // every live stream: writing would (a) make last_used_at track heartbeats rather
+    // than actual calls, and (b) put a write on a pooled connection every time a
+    // stream's cache entry expires — with streams' TTLs aligned by attach time, that is
+    // a thundering herd of writes that every token-authenticated request on the server
+    // then queues behind. Re-validation is a READ.
+    //
+    // The generation re-check is taken UNDER cache_mtx_, matching validate_token: a
+    // check-then-lock ordering leaves a window where a racing revoke's erase runs
+    // between the check and the insert, leaving a revoked=false entry alive for a full
+    // kTokenCacheTtl — which on this path would keep a revoked credential's stream up.
+    {
+        std::lock_guard cache_lock(cache_mtx_);
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            token_cache_[hash] = CachedToken{t, std::chrono::steady_clock::now()};
+        }
+    }
+    return {TokenCheck::kValid, std::move(t)};
+}
+
 void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
     std::lock_guard cache_lock(cache_mtx_);
     token_cache_.erase(token_hash);

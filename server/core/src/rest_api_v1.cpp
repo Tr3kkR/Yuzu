@@ -1146,7 +1146,8 @@ void RestApiV1::register_routes(
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store,
+    detail::StreamBudget* stream_budget) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1159,7 +1160,7 @@ void RestApiV1::register_routes(
                     std::move(net_perf_fn), std::move(lockout_clear_fn), baseline_store,
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
-                    std::move(app_perf_providers), engine_principal_store);
+                    std::move(app_perf_providers), engine_principal_store, stream_budget);
 }
 
 void RestApiV1::register_routes(
@@ -1178,7 +1179,8 @@ void RestApiV1::register_routes(
     LockoutClearFn lockout_clear_fn, BaselineStore* baseline_store, ScopedPermFn scoped_perm_fn,
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
-    EnginePrincipalStore* engine_principal_store) {
+    EnginePrincipalStore* engine_principal_store,
+    detail::StreamBudget* stream_budget) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -8803,8 +8805,8 @@ void RestApiV1::register_routes(
     // events; the dashboard sibling emits raw `ev.data` because the
     // browser already knows the channel from the URL path.
     sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
-                                metrics_registry](const httplib::Request& req,
-                                                  httplib::Response& res) {
+                                metrics_registry, stream_budget](const httplib::Request& req,
+                                                                 httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session) {
             // auth_fn already set 401 + body. Nothing to do.
@@ -8939,6 +8941,51 @@ void RestApiV1::register_routes(
             } catch (...) {
                 since_id = 0;
             }
+        }
+
+        // Admission control (ADR-0034). This response is about to hold an httplib worker for
+        // the life of the subscription, so it leases from the ONE budget every streaming
+        // surface shares. Held in a shared_ptr so the lease dies with the release lambda —
+        // the worker returns on every teardown path.
+        //
+        // Taken BEFORE the bus subscription so a rejected caller never leaves a listener
+        // behind, and BEFORE the gauge bump below: the 429 returns without installing the
+        // release callback that decrements, so incrementing first made
+        // yuzu_server_sse_api_active drift upward once per rejection — corrupting the very
+        // utilisation signal ADR-0034 Decision 3 depends on, under exactly the budget
+        // pressure it is meant to measure.
+        auto lease = std::make_shared<detail::StreamBudget::Lease>();
+        if (stream_budget != nullptr) {
+            auto admitted = stream_budget->try_acquire(detail::SseSurface::kApiEvents,
+                                                       session->username,
+                                                       detail::kPerPrincipalApiEvents);
+            if (!admitted.lease) {
+                res.status = 429;
+                // Retry-After alongside the A4 retry_after_ms — the platform 429
+                // convention in docs/user-manual/rest-api.md is both, in whole seconds.
+                res.set_header("Retry-After", "5");
+                // Name a remediation that can ACTUALLY resolve THIS reject. There is no
+                // operator flag for /api/v1/events' per-principal cap (it is compile-time
+                // kPerPrincipalApiEvents), so a per-principal reject can only be resolved
+                // by the caller closing one of its own streams — telling it to raise
+                // --max-sse-streams (the global cap) would be misleading.
+                const bool per_principal =
+                    admitted.reject_reason != nullptr &&
+                    std::string_view(admitted.reject_reason) ==
+                        detail::StreamBudget::kRejectPerPrincipal;
+                res.set_content(
+                    detail::error_json_a4(
+                        429, "too many concurrent event streams", cid,
+                        /*retry_after_ms=*/5000,
+                        per_principal
+                            ? "close one of your own /api/v1/events streams (this is a "
+                              "per-principal limit)"
+                            : "close an existing /api/v1/events stream, or raise "
+                              "--max-sse-streams"),
+                    "application/json");
+                return;
+            }
+            *lease = std::move(admitted.lease);
         }
 
         // Endpoint-scoped metric: subscription count.
@@ -9156,17 +9203,58 @@ void RestApiV1::register_routes(
                 return true;
             },
             detail::adopt_quota_slot_into_stream(
-                [sink_state, bus, exec_id_for_capture, metrics_registry](bool /*success*/) {
-                    sink_state->closed.store(true);
+                [sink_state, bus, exec_id_for_capture, metrics_registry,
+                 lease](bool /*success*/) noexcept {
+                    // noexcept + catch-all: this runs from ~Response, a DESTRUCTOR, so an
+                    // escaping exception is std::terminate regardless of what httplib does
+                    // (#2037's class). The lock_guard added here is the throw site that made
+                    // the guard necessary. Matches the MCP sibling.
+                    try {
+                    {
+                        // Under the sink mutex: `closed` is the provider's wait predicate,
+                        // and a store between its predicate check and its atomic
+                        // release-and-block is a lost wakeup. Matches the shared
+                        // sse_resource_release in event_bus.hpp — this site and the
+                        // dashboard sibling were the two remaining counter-examples to a
+                        // rule the rest of the tree now follows.
+                        std::lock_guard<std::mutex> lk(sink_state->mu);
+                        sink_state->closed.store(true);
+                    }
                     sink_state->cv.notify_all();
-                    bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+                    // unsubscribe stays OUTSIDE the sink lock (publishers take the bus mutex
+                    // then the sink mutex, so unsubscribing under `mu` inverts that order) and
+                    // in its OWN try so that unsubscribe's OWN throw cannot skip the steps
+                    // after it (the metrics decrement / lease return). A leaked subscription
+                    // pins the sink for the life of the process; contain it, do not propagate
+                    // it out of this ~Response-invoked releaser.
+                    try {
+                        bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+                    } catch (...) {
+                    }
                     if (metrics_registry) {
                         metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
                             .decrement();
                     }
+                    // `lease` dies here, returning the worker to the one shared budget.
+                    } catch (...) {
+                        // Contained — see the note above.
+                    }
                 }));
     });
 
+    // GET /api/v1/events holds an httplib worker for the life of its subscription, so an
+    // unwired budget means that surface is uncapped on the shared pool and the plain-REST
+    // reserve is not in fact reserved. The parameter is trailing-defaulted for test seams,
+    // which is exactly how the production wiring came to be omitted silently — the route
+    // registered, the try_acquire block became dead code, and nothing said so. Mirrors the
+    // MCP registration's warning; a boot line is the cheapest guard that survives, since no
+    // unit test can observe a missing argument at the server.cpp call site.
+    if (stream_budget == nullptr) {
+        spdlog::warn("REST API v1: GET /api/v1/events registered with NO stream budget — "
+                     "held-open event streams are uncapped on the shared HTTP worker pool "
+                     "(ADR-0034). Test seams omit it deliberately; a production server "
+                     "must not.");
+    }
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }
 
