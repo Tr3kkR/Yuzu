@@ -575,10 +575,16 @@ Whichever PR flips `prefer_spark` MUST also:
    struct field + `journal_stats()` + emit + fleet row + metrics.md; landed pre-flip and inert).
    The same PR also delivered the ledger's **UP-4** (`send_exceptions` /
    `lifecycle_backpressure_drops` reached no heartbeat tag) as two more journal-family counters.
-6. **Add a "seconds since last successful page/prune pass" gauge** (Gate 6 sre). It is the only
+6. ~~**Add a "seconds since last successful page/prune pass" gauge** (Gate 6 sre). It is the only
    viable liveness signal for the two wall-clock hazards AND for a release-build deadlock,
    where the `mtx_` guard compiles out and a wedged worker is indistinguishable from an idle
-   healthy one.
+   healthy one.~~ - **DONE** on branch `feat/guardian-journal-age-observability`:
+   `yuzu.guardian_journal_page_stale_seconds` + `..._prune_stale_seconds`, success stamps seeded
+   at worker `start()` and re-stamped only by a non-throwing pass, emitted every heartbeat
+   INCLUDING 0 while live and absent while dormant (dormancy = `journal_age_stats()` nullopt,
+   never a fabricated zero), fleet rollup as a NEW **MAX** family
+   (`yuzu_fleet_guardian_journal_*_seconds_max` - the first non-SUM rollup; a fleet sum of ages
+   is meaningless). This also closes item 14 (see its note).
 7. **Run chaos scenario CH-5** (live-event latency under KvStore contention, UAT rig). It is
    the only scenario that measures the thing C0 was built to fix, so it is the flip's genuine
    go/no-go rather than a formality. Run it at the journal's HARD ceiling (2000 batches /
@@ -594,10 +600,20 @@ Whichever PR flips `prefer_spark` MUST also:
    persists before signalling the workers as well as after them; the post-join flush stays,
    because `persist()` erases the durably-written prefix so a record can never land under two
    keys. They were right that offering the two as equals was the error.
-9. **Resolve or explicitly risk-accept the size-biased replay loss (#2364)**, and land its
-   telemetry first: the age of the oldest currently headroom-blocked batch, alongside item 4's
-   fleet rollup. Four mechanisms for this were built and reverted in this PR; the lesson
-   recorded there is that the channel needs measuring before it is engineered.
+9. **Resolve or explicitly risk-accept the size-biased replay loss (#2364)** - the resolve/
+   risk-accept half remains OPEN (decided 2026-07-23: risk-accept at the flip, with pre-agreed
+   quantitative thresholds written before CH-5). ~~and land its telemetry first: the age of the
+   oldest currently headroom-blocked batch, alongside item 4's fleet rollup.~~ - **telemetry
+   DONE** on branch `feat/guardian-journal-age-observability`:
+   `yuzu.guardian_journal_headroom_blocked_seconds`, an EPISODE age maintained at pass
+   granularity in `GuardianLifecycleJournal` (set-if-unset on any observed block; cleared only
+   after accumulated block-free coverage of the full candidate set - clear-on-clean-PASS was
+   rejected in review because a pass is a 128-candidate slice and the sawtooth would zero the
+   gauge in exactly the starvation regime; sparse, dormant-absent, fleet rollup MAX). NOTE for
+   CH-5: this gauge has never fired outside unit tests - the CH-5 record must include a
+   forced-blocking sanity step, or a 0 reading is ambiguous (no-block vs gauge-broken). Four
+   mechanisms for the loss itself were built and reverted in this PR; the lesson recorded there
+   is that the channel needs measuring before it is engineered.
 10. **Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
     ~668 ms per pass at the byte ceiling, 97% of it in `parse_journal_batch`, with `rows` (raw)
@@ -625,10 +641,12 @@ Whichever PR flips `prefer_spark` MUST also:
     pending record reaches disk *while the join is still outstanding*. Asserting after `stop()`
     returns cannot distinguish the two orderings, because the post-join flush persists the same
     record either way - which is why deleting the call used to leave the suite green.
-14. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
-   Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
-   is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
-   before doing any work still reads identically to a healthy idle one. Item 6's staleness gauge
-   is the real fix; this note records that the counter is a partial mitigation, not a closure.
+14. ~~**Give the drain worker a liveness signal that does not rely on a counter incrementing.**~~
+   - **DONE, closed by item 6** (as this note always said it would be): the staleness stamps are
+   seeded at worker `start()` and advanced only by a completed non-throwing pass, so a worker
+   that starts and then dies - or hangs without throwing - reads as an ever-growing age from its
+   first heartbeat, and the emit-including-0 posture means "fresh" is a real reading rather than
+   an absence. (Historical note kept: round 5's loop-catch increment made an *exception-killed*
+   worker visible; it was a partial mitigation, not a closure.)
 
 Tracked on #2298, which is the cutover gate list.

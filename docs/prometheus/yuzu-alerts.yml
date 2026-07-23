@@ -944,6 +944,47 @@ groups:
   #           missing from the fleet sums. Identify the agent, and re-check the ceiling
   #           before raising it. This is a per-sweep count, not a latch.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-tag-rejected"
+  #     # ---- Worker staleness (MAX-rollup ages; flip item 6 + #2364) -----------------
+  #     # STRUCTURALLY DIFFERENT from every counter rule in this group: the _seconds_max
+  #     # gauges are a fleet MAX of live per-endpoint ages with a meaningful absolute
+  #     # threshold, so a plain `> X for: Y` is sound - none of REASON 2's
+  #     # increase()/rate()-over-a-churning-sum failure modes apply, and agent churn can
+  #     # only LOWER the max (a dropped stale agent stops contributing, which is the
+  #     # honest reading). The writer emits the staleness pair including 0 while the
+  #     # worker is live and nothing while dormant, so pre-cutover these series are
+  #     # ABSENT and the rules below would simply never fire - they stay commented
+  #     # anyway so the group enables as one reviewed unit at the cutover (#2390).
+  #     - alert: YuzuGuardianJournalPageStale
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_page_stale_seconds_max > 300
+  #       for: 10m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "A Guardian journal replay worker has not completed a page pass in >5m"
+  #         description: >-
+  #           The worst endpoint's time since its last successful replay page pass
+  #           exceeds 10x the 30 s cadence. The worker there is dead, hung, or throwing
+  #           on every pass (climbing maint_exceptions alongside means throwing NOW; a
+  #           flat value means hung, OR the loop died earlier - loop death increments
+  #           the counter exactly once and logs a `critical` line, so check the agent
+  #           log): journalled lifecycle records are not being replayed to the server
+  #           from that endpoint.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
+  #     - alert: YuzuGuardianJournalPruneStale
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_prune_stale_seconds_max > 1200
+  #       for: 10m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "A Guardian journal retention prune has not completed in >20m"
+  #         description: >-
+  #           The worst endpoint's time since its last successful retention prune
+  #           exceeds 10x the 120 s cadence. Retention is not running there: the
+  #           journal grows toward its write ceiling, where new audit batches start
+  #           being refused (write_capacity_rejected).
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
   #     # ---- Loss / fault counters (rising edge; NOT sufficient - see REASON 2) -----
   #     - alert: YuzuGuardianJournalIntegrityGap
   #       expr: |

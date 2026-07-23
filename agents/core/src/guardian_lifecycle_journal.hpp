@@ -38,6 +38,7 @@
 #include <vector>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <type_traits>
 #include <utility>
 
@@ -293,6 +294,19 @@ public:
     [[nodiscard]] std::uint64_t journal_batch_count() const noexcept {
         return clamp_nonneg(journal_batch_count_.load(std::memory_order_relaxed));
     }
+    /// Age in ms of the current headroom-blocked replay-congestion EPISODE (#2364 step-1
+    /// telemetry); 0 = no current episode. `now_steady_ms` is the caller's steady_clock
+    /// reading (a parameter for testability, and so one heartbeat samples every age off one
+    /// `now`). Saturates to 0 if `now` reads at-or-before the stored episode start (a
+    /// concurrent new episode between the caller's clock read and this load), so a transient
+    /// race can under-report one sample but never wraps unsigned. Lock-free - see the member
+    /// comment for the episode's set/clear rules.
+    [[nodiscard]] std::uint64_t headroom_blocked_age_ms(std::int64_t now_steady_ms) const noexcept {
+        const auto since = headroom_blocked_since_steady_ms_.load(std::memory_order_relaxed);
+        if (since < 0 || now_steady_ms <= since)
+            return 0;
+        return static_cast<std::uint64_t>(now_steady_ms - since);
+    }
 
     /// TEST-ONLY: force the next `n` batch writes to fail (as if KvStore returned
     /// Error), exercising the per-push circuit breaker and the maintenance-tick
@@ -320,6 +334,23 @@ public:
     void set_write_ceiling_for_test(std::size_t max_batches, std::size_t max_bytes) noexcept {
         hard_max_batches_ = max_batches;
         hard_max_bytes_ = max_bytes;
+    }
+
+    /// TEST-ONLY: the raw #2364 episode stamp (-1 = no episode). Lets a test assert the
+    /// set-if-unset / rotation-sticky-clear transitions exactly (e.g. "a second blocked pass
+    /// did NOT re-stamp") without racing the real steady_clock the production stamp reads.
+    /// No production caller - production reads ages via headroom_blocked_age_ms().
+    [[nodiscard]] std::int64_t headroom_blocked_since_for_test() const noexcept {
+        return headroom_blocked_since_steady_ms_.load(std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: invoked by page_into_window once per examined candidate, BEFORE its
+    /// disposition. Exists so a test can land request_stop() BETWEEN candidates and drive
+    /// the mid-loop stop-truncation path - the branch that protects the episode state from
+    /// counting an incomplete pass, which no external sequence can hit deterministically.
+    /// Null in production.
+    void set_post_classify_hook_for_test(std::function<void()> hook) {
+        post_classify_hook_ = std::move(hook);
     }
 
     /// TEST-ONLY: force the next `n` journal SCANS (the list_entries at the head of a prune
@@ -426,6 +457,7 @@ private:
     std::atomic<bool> size_seeded_{false};              ///< seed_size_gauges_ call-once guard (UP-7)
     std::function<void()> post_scan_hook_;              ///< test-only prune interleaving seam (null in prod)
     std::function<void()> pre_scan_hook_;               ///< test-only pre-list_entries interleaving seam (UP-3)
+    std::function<void()> post_classify_hook_;          ///< test-only per-candidate seam (mid-loop stop, null in prod)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
     std::atomic<int> inject_fail_reads_{0};             ///< test-only: force the next N prune scans to fail
@@ -457,6 +489,23 @@ private:
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT
     /// persisted): a restart re-sends the whole unexpired journal, which is correct.
     std::optional<std::pair<std::int64_t, std::string>> page_cursor_;
+    /// #2364 episode state: steady_clock ms when headroom blocking was first observed in the
+    /// current replay-congestion episode; -1 = no current episode. -1 (not 0) because
+    /// steady_clock's epoch is unspecified (commonly boot) and an honest reading near 0 must
+    /// not be mistaken for the sentinel. WRITTEN only at the end of page_into_window (single
+    /// writer under paging_mutex_); ATOMIC for the lock-free heartbeat read - the heartbeat
+    /// must never queue behind an in-flight O(journal) pass. Process-local like the cursor:
+    /// a restart starts a fresh episode (documented in the tag's semantics).
+    std::atomic<std::int64_t> headroom_blocked_since_steady_ms_{-1};
+    /// Batch keys observed block-free since the last blocked observation - the coverage
+    /// record that gates CLEARING the episode (see page_into_window's transition-rule
+    /// comment). A DISTINCT-KEY set, deliberately not a count: a count compared against the
+    /// current set size clears early under shrink-churn (prune evicts already-counted
+    /// candidates, the count survives, the bar drops - Fable review, 2026-07-23), which
+    /// sawtooths the gauge in exactly the #2364 starvation regime. Bounded by the journal's
+    /// hard batch cap; populated only while an episode is active; cleared on every block and
+    /// on episode clear. Plain member: only touched under paging_mutex_.
+    std::unordered_set<std::string> clean_keys_since_block_;
     // Retention (SOFT) caps - default to the production constants; a test may shrink them.
     int retention_days_{kJournalRetentionDays};
     std::size_t max_batches_{kMaxJournalBatches};

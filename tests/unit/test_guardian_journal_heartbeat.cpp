@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <string>
@@ -161,7 +162,13 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     s.page_read_failures = s.clock_jump_skips = s.gauge_underflow = 1;
     s.send_exceptions = s.lifecycle_backpressure_drops = 1;
     emit_guardian_journal_heartbeat_tags(emitted, s);
-    REQUIRE(emitted.size() > 10); // the emitter really did populate
+    // Union in the AGE emitter's keys (item 6 + #2364): its tags share the
+    // yuzu.guardian_ namespace this check scrapes, so documenting them without this
+    // union would go red here despite being correct.
+    GuardianJournalAgeStats ages;
+    ages.page_stale_seconds = ages.prune_stale_seconds = ages.headroom_blocked_seconds = 1;
+    emit_guardian_journal_age_tags(emitted, std::optional{ages});
+    REQUIRE(emitted.size() > 10); // the emitters really did populate
 
     std::ifstream in(doc);
     const std::string text((std::istreambuf_iterator<char>(in)),

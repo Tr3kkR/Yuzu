@@ -432,6 +432,46 @@ TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spa
     spark_engine.stop();
 }
 
+// ── Journal AGE gauges: dormancy is an ABSENCE (item 6 + #2364) ───────────────
+
+TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt when dormant",
+          "[spark][guardian][reconcile][journal]") {
+    // prefer_spark=true + wired: the drain worker STARTED, its stamps are seeded, so the
+    // age stats are PRESENT - including all-zero ages on a fresh worker (0 is a real
+    // reading here; the emit layer ships the staleness pair including 0).
+    {
+        SparkReconcileFixture f;
+        const auto ages = f.engine->journal_age_stats();
+        REQUIRE(ages.has_value());
+        // Fresh worker: ages in seconds must be tiny (the stamps were just seeded), and
+        // no headroom episode exists.
+        CHECK(ages->page_stale_seconds < 60);
+        CHECK(ages->prune_stale_seconds < 60);
+        CHECK(ages->headroom_blocked_seconds == 0);
+    }
+    // prefer_spark=false + wired: the worker is CONSTRUCTED but never started (the flag
+    // gates start()), and the ages must be ABSENT - not zero. This is the dormancy
+    // posture that keeps a pre-flip fleet from paging on a "stale" inert journal: a
+    // fabricated 0 would be wrong the other way (it claims a live fresh worker).
+    {
+        auto opened = KvStore::open(unique_kv_path());
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+        CHECK_FALSE(engine.journal_age_stats().has_value());
+        engine.stop();
+        spark_engine.stop();
+    }
+}
+
 // ── Durable-journal persist boundary + inertness (item 7 PR-Ag C2) ───────────
 
 TEST_CASE("prefer_spark=true: an armed rule's record is persisted to the durable journal",
