@@ -190,7 +190,7 @@ post_same_origin(yuzu::server::test::TestRouteSink& sink, const std::string& pat
 } // namespace
 
 TEST_CASE("GET /fragments/settings/mfa renders 'Not enrolled' panel for fresh admin",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto res = h.sink.Get("/fragments/settings/mfa");
     REQUIRE(res);
@@ -202,7 +202,7 @@ TEST_CASE("GET /fragments/settings/mfa renders 'Not enrolled' panel for fresh ad
 }
 
 TEST_CASE("POST /api/settings/mfa/init reveals secret with Cache-Control: no-store",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto res = post_same_origin(h.sink, "/api/settings/mfa/init");
     REQUIRE(res);
@@ -220,7 +220,7 @@ TEST_CASE("POST /api/settings/mfa/init reveals secret with Cache-Control: no-sto
 }
 
 TEST_CASE("POST /api/settings/mfa/init twice returns MfaAlreadyEnrolled with operator message",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     // Stand up an enrolled state through the AuthDB directly so the
     // second init hits the "already enrolled" branch.
@@ -240,7 +240,7 @@ TEST_CASE("POST /api/settings/mfa/init twice returns MfaAlreadyEnrolled with ope
 }
 
 TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache headers",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     // Get into enrolled state via the same path the panel uses
     // server-side.
@@ -263,7 +263,7 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
 }
 
 TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
@@ -290,7 +290,7 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
 }
 
 TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     // Enroll admin first.
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
@@ -320,7 +320,7 @@ TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement 
 
 TEST_CASE("POST /api/settings/mfa/disable under admin-only blocks admins but the gate is "
           "role-scoped",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
     REQUIRE(init.has_value());
@@ -341,7 +341,7 @@ TEST_CASE("POST /api/settings/mfa/disable under admin-only blocks admins but the
 }
 
 TEST_CASE("Non-admin same-origin POST: 403 from admin_fn after origin_safe passes",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     h.session_role = auth::Role::user; // bob
     h.session_user = "bob";
@@ -357,7 +357,7 @@ TEST_CASE("Non-admin same-origin POST: 403 from admin_fn after origin_safe passe
 }
 
 TEST_CASE("Cross-origin POST is rejected 403 with csrf.denied audit on every MFA route",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     // qe Gate 3 S-2 follow-up: previously only /disable carried a
     // cross-origin reject case. Each of the 4 mutating MFA routes now
     // has its own assertion so a regression that drops origin_safe from
@@ -377,7 +377,7 @@ TEST_CASE("Cross-origin POST is rejected 403 with csrf.denied audit on every MFA
 }
 
 TEST_CASE("Default-port normalisation: Origin :443 matches Host without port",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto res =
         h.sink.dispatch("POST", "/api/settings/mfa/init", {}, "application/x-www-form-urlencoded",
@@ -390,7 +390,7 @@ TEST_CASE("Default-port normalisation: Origin :443 matches Host without port",
 }
 
 TEST_CASE("Userinfo (`@`) in Origin is rejected per RFC 6454",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto res =
         h.sink.dispatch("POST", "/api/settings/mfa/init", {}, "application/x-www-form-urlencoded",
@@ -401,7 +401,7 @@ TEST_CASE("Userinfo (`@`) in Origin is rejected per RFC 6454",
 }
 
 TEST_CASE("Non-browser caller with neither Origin nor Referer passes through",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto res = h.sink.dispatch("POST", "/api/settings/mfa/init", {}, "application/x-www-form-urlencoded",
                            {{"Host", "yuzu.example"}});
@@ -411,7 +411,7 @@ TEST_CASE("Non-browser caller with neither Origin nor Referer passes through",
 }
 
 TEST_CASE("csrf.denied audit detail captures Origin / Referer / Host for SIEM",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     // Audit-detail sanitisation (control + high-bit byte stripping +
     // 128 B per-field cap) is implemented as an inline lambda inside
     // SettingsRoutes::register_routes and verified by code review +
@@ -441,7 +441,7 @@ TEST_CASE("csrf.denied audit detail captures Origin / Referer / Host for SIEM",
 }
 
 TEST_CASE("Referer fallback also evaluated when Origin is absent",
-          "[mfa][routes][settings]") {
+          "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     auto good =
         h.sink.dispatch("POST", "/api/settings/mfa/init", {}, "application/x-www-form-urlencoded",

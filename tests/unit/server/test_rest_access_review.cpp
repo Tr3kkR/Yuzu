@@ -353,7 +353,7 @@ struct AccessReviewHarness {
 
 TEST_CASE("access-reviews: read routes require AccessReview:Read, write routes require "
           "AccessReview:Attest — denied without the right permission",
-          "[access_review][rest][gate]") {
+          "[pg][access_review][rest][gate]") {
     AccessReviewHarness h;
 
     SECTION("export denied without AccessReview:Read") {
@@ -405,7 +405,7 @@ TEST_CASE("access-reviews: read routes require AccessReview:Read, write routes r
 }
 
 TEST_CASE("access-reviews: a session with only AccessReview:Read can export but not attest",
-          "[access_review][rest][gate]") {
+          "[pg][access_review][rest][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AccessReview" && op == "Read"; // ONLY Read is granted
@@ -433,7 +433,7 @@ TEST_CASE("access-reviews: a session with only AccessReview:Read can export but 
 TEST_CASE("access-reviews: an AuditLog:Read-only principal is denied all six ops — the "
           "over-disclosure #2225 round 2 closes (Operator/PlatformEngineer no longer pull "
           "the grant graph via their unrelated AuditLog:Read grant)",
-          "[access_review][rest][gate]") {
+          "[pg][access_review][rest][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AuditLog" && op == "Read"; // AuditLog:Read only — NOT AccessReview
@@ -468,7 +468,7 @@ TEST_CASE("access-reviews: an AuditLog:Read-only principal is denied all six ops
 
 TEST_CASE("MCP: an AuditLog:Read-only principal is denied all six access-review tools — the "
           "over-disclosure #2225 round 2 closes, MCP twin",
-          "[access_review][mcp][gate]") {
+          "[pg][access_review][mcp][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AuditLog" && op == "Read"; // AuditLog:Read only — NOT AccessReview
@@ -505,7 +505,7 @@ TEST_CASE("MCP: an AuditLog:Read-only principal is denied all six access-review 
 
 TEST_CASE("access-reviews: a Reviewer-equivalent grant (AccessReview:Read + "
           "AccessReview:Attest) can perform all six ops — the seeded Reviewer role's shape",
-          "[access_review][rest][gate]") {
+          "[pg][access_review][rest][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AccessReview" && (op == "Read" || op == "Attest");
@@ -550,7 +550,7 @@ TEST_CASE("access-reviews: a Reviewer-equivalent grant (AccessReview:Read + "
 
 TEST_CASE("MCP: a Reviewer-equivalent grant (AccessReview:Read + AccessReview:Attest) can "
           "perform all six access-review tools",
-          "[access_review][mcp][gate]") {
+          "[pg][access_review][mcp][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AccessReview" && (op == "Read" || op == "Attest");
@@ -600,7 +600,7 @@ TEST_CASE("MCP: a Reviewer-equivalent grant (AccessReview:Read + AccessReview:At
 // ── Engine-classed session structural deny belt ─────────────────────────────
 
 TEST_CASE("access-reviews: an engine-classed session is denied on every route",
-          "[access_review][rest][engine_deny]") {
+          "[pg][access_review][rest][engine_deny]") {
     AccessReviewHarness h;
     h.session_principal_kind = "engine"; // perm_fn stays permissive (nullptr override)
 
@@ -631,7 +631,7 @@ TEST_CASE("access-reviews: an engine-classed session is denied on every route",
 
 TEST_CASE("export: fails loud with 503 when a source store is unavailable, never a silent "
           "200-empty",
-          "[access_review][rest][503]") {
+          "[pg][access_review][rest][503]") {
     AccessReviewHarness h{/*auth_db_available=*/false};
     auto res = h.sink.Get("/api/v1/access-reviews/export");
     REQUIRE(res);
@@ -644,7 +644,7 @@ TEST_CASE("export: fails loud with 503 when a source store is unavailable, never
 // ── decision enum ────────────────────────────────────────────────────────────
 
 TEST_CASE("attestations: decision outside {attested,flagged_revoke} -> 400",
-          "[access_review][rest][decision]") {
+          "[pg][access_review][rest][decision]") {
     AccessReviewHarness h;
     auto res = h.sink.Post("/api/v1/access-reviews/whatever/attestations",
                            R"({"principal_type":"user","principal_id":"a","role_name":"R",)"
@@ -659,7 +659,7 @@ TEST_CASE("attestations: decision outside {attested,flagged_revoke} -> 400",
 // type_error, so these hit the ordinary "required field missing" 400 path.
 
 TEST_CASE("open campaign: wrong-typed title degrades to 400, never 500",
-          "[access_review][rest][badtype]") {
+          "[pg][access_review][rest][badtype]") {
     AccessReviewHarness h;
     for (const std::string body : {R"({"title":123})", R"({"title":[]})", R"({"title":null})"}) {
         INFO("body=" << body);
@@ -670,7 +670,7 @@ TEST_CASE("open campaign: wrong-typed title degrades to 400, never 500",
 }
 
 TEST_CASE("attestations: wrong-typed decision/principal_type degrades to 400, never 500",
-          "[access_review][rest][badtype]") {
+          "[pg][access_review][rest][badtype]") {
     AccessReviewHarness h;
 
     SECTION("decision not a string") {
@@ -702,7 +702,7 @@ TEST_CASE("attestations: wrong-typed decision/principal_type degrades to 400, ne
 
 TEST_CASE("access-reviews: an audit-persist failure on open/attest/close still commits the "
           "mutation and surfaces Sec-Audit-Failed",
-          "[access_review][rest][audit][secauditfailed]") {
+          "[pg][access_review][rest][audit][secauditfailed]") {
     SECTION("open") {
         AccessReviewHarness h;
         h.audit_fail_action = "access_review.campaign_opened";
@@ -770,7 +770,7 @@ TEST_CASE("access-reviews: an audit-persist failure on open/attest/close still c
 // ── format enum (REST-only — MCP export has no format concept) #2291 ───────
 
 TEST_CASE("export: format classifier — json|csv 200, anything else 400",
-          "[access_review][rest][format][2291]") {
+          "[pg][access_review][rest][format][2291]") {
     AccessReviewHarness h;
 
     auto json_res = h.sink.Get("/api/v1/access-reviews/export?format=json");
@@ -795,7 +795,7 @@ TEST_CASE("export: format classifier — json|csv 200, anything else 400",
 // ── decision enum parity across REST and MCP twins #2291 ───────────────────
 
 TEST_CASE("record_attestation decision validity is consistent across REST and the MCP twin",
-          "[access_review][rest][mcp][decision][2291]") {
+          "[pg][access_review][rest][mcp][decision][2291]") {
     AccessReviewHarness h;
 
     SECTION("valid decisions -> not a 400/invalid-params rejection on either transport") {
@@ -857,7 +857,7 @@ TEST_CASE("record_attestation decision validity is consistent across REST and th
 
 TEST_CASE("attestations: decision=flagged_revoke records evidence only — the underlying grant "
           "is never mutated",
-          "[access_review][rest][flag]") {
+          "[pg][access_review][rest][flag]") {
     AccessReviewHarness h;
     REQUIRE(h.rbac.create_role({.name = "SomeRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("alice", "hash", "salt", auth::Role::user).has_value());
@@ -893,7 +893,7 @@ TEST_CASE("attestations: decision=flagged_revoke records evidence only — the u
 // ── not_found -> 404, never 503 ─────────────────────────────────────────────
 
 TEST_CASE("attest/get/close on an unknown campaign_id -> 404, not 503",
-          "[access_review][rest][not_found]") {
+          "[pg][access_review][rest][not_found]") {
     AccessReviewHarness h;
 
     auto get_res = h.sink.Get("/api/v1/access-reviews/no-such-campaign");
@@ -918,7 +918,7 @@ TEST_CASE("attest/get/close on an unknown campaign_id -> 404, not 503",
 // ── Self-audit ───────────────────────────────────────────────────────────────
 
 TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
-          "[access_review][rest][audit]") {
+          "[pg][access_review][rest][audit]") {
     AccessReviewHarness h;
     REQUIRE(h.rbac.create_role({.name = "AuditRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("bob", "hash", "salt", auth::Role::user).has_value());
@@ -973,7 +973,7 @@ TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
 
 // ── GET /api/v1/access-reviews (list campaigns, H-2) ────────────────────────
 
-TEST_CASE("GET /access-reviews: happy path returns opened campaigns", "[access_review][rest][list]") {
+TEST_CASE("GET /access-reviews: happy path returns opened campaigns", "[pg][access_review][rest][list]") {
     AccessReviewHarness h;
     const auto cid = h.open_campaign_rest("List me");
 
@@ -984,7 +984,7 @@ TEST_CASE("GET /access-reviews: happy path returns opened campaigns", "[access_r
     CHECK(res->body.find("\"List me\"") != std::string::npos);
 }
 
-TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[access_review][rest][list]") {
+TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[pg][access_review][rest][list]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return !(t == "AccessReview" && op == "Read");
@@ -995,7 +995,7 @@ TEST_CASE("GET /access-reviews: 403 without AccessReview:Read", "[access_review]
 }
 
 TEST_CASE("GET /access-reviews: an engine-classed session is denied",
-          "[access_review][rest][list][engine_deny]") {
+          "[pg][access_review][rest][list][engine_deny]") {
     AccessReviewHarness h;
     h.session_principal_kind = "engine";
     auto res = h.sink.Get("/api/v1/access-reviews");
@@ -1005,7 +1005,7 @@ TEST_CASE("GET /access-reviews: an engine-classed session is denied",
 
 TEST_CASE("GET /access-reviews: 503 when the access review store is unavailable, never a "
           "silent 200-empty",
-          "[access_review][rest][list][503]") {
+          "[pg][access_review][rest][list][503]") {
     AccessReviewHarness h{/*auth_db_available=*/true, /*store_available=*/false};
     auto res = h.sink.Get("/api/v1/access-reviews");
     REQUIRE(res);
@@ -1016,7 +1016,7 @@ TEST_CASE("GET /access-reviews: 503 when the access review store is unavailable,
 
 TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / "
           "list_access_reviews / close_access_review happy paths, end to end",
-          "[access_review][mcp][happy]") {
+          "[pg][access_review][mcp][happy]") {
     AccessReviewHarness h;
     REQUIRE(h.rbac.create_role({.name = "McpRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("mcpuser", "hash", "salt", auth::Role::user).has_value());
@@ -1100,7 +1100,7 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
 
 TEST_CASE("MCP: close_access_review — not_found maps to kInvalidParams, store-down maps to "
           "kInternalError",
-          "[access_review][mcp][close]") {
+          "[pg][access_review][mcp][close]") {
     SECTION("not_found -> kInvalidParams (mirrors the REST twin's 404, never 503-shaped)") {
         AccessReviewHarness h;
         auto res = h.mcp_call_tool("close_access_review", {{"campaign_id", "no-such-campaign"}});
@@ -1126,7 +1126,7 @@ TEST_CASE("MCP: close_access_review — not_found maps to kInvalidParams, store-
 
 TEST_CASE("MCP: a session with only AccessReview:Read can export/get/list but not "
           "open/attest/close",
-          "[access_review][mcp][gate]") {
+          "[pg][access_review][mcp][gate]") {
     AccessReviewHarness h;
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AccessReview" && op == "Read"; // ONLY Read granted
@@ -1170,7 +1170,7 @@ TEST_CASE("MCP: a session with only AccessReview:Read can export/get/list but no
 }
 
 TEST_CASE("MCP: an engine-classed session is denied (kTierDenied) on every access-review tool",
-          "[access_review][mcp][engine_deny]") {
+          "[pg][access_review][mcp][engine_deny]") {
     AccessReviewHarness h;
     h.session_principal_kind = "engine"; // perm_fn stays permissive (nullptr override)
 
@@ -1203,7 +1203,7 @@ TEST_CASE("MCP: an engine-classed session is denied (kTierDenied) on every acces
 TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names/labels and "
           "increment on their respective operation (REST-only — server.cpp's own wiring "
           "comment says the MCP twins are deliberately not double-counted)",
-          "[access_review][rest][metrics]") {
+          "[pg][access_review][rest][metrics]") {
     AccessReviewHarness h;
     // Pre-seed exactly as server.cpp does at startup (the "Periodic Access
     // Reviews (SOC 2 CC6.2) feature metrics" block) — rest_api_v1.cpp's

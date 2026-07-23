@@ -138,7 +138,7 @@ struct Fixture {
 
 // ── Bearer gate ──────────────────────────────────────────────────────────
 
-TEST_CASE("ScimRoutes: 401 without a bearer token", "[scim][routes][auth]") {
+TEST_CASE("ScimRoutes: 401 without a bearer token", "[pg][scim][routes][auth]") {
     Fixture f;
     auto res = f.sink.dispatch("GET", "/scim/v2/Users");
     REQUIRE(res);
@@ -147,7 +147,7 @@ TEST_CASE("ScimRoutes: 401 without a bearer token", "[scim][routes][auth]") {
     CHECK(json::parse(res->body)["status"] == "401");
 }
 
-TEST_CASE("ScimRoutes: 401 with the wrong bearer token", "[scim][routes][auth]") {
+TEST_CASE("ScimRoutes: 401 with the wrong bearer token", "[pg][scim][routes][auth]") {
     Fixture f;
     auto res = f.sink.dispatch("GET", "/scim/v2/Users", "", "application/json",
                                {{"Authorization", "Bearer wrong-token"}});
@@ -157,7 +157,7 @@ TEST_CASE("ScimRoutes: 401 with the wrong bearer token", "[scim][routes][auth]")
 
 // ── Discovery ─────────────────────────────────────────────────────────────
 
-TEST_CASE("ScimRoutes: discovery endpoints return the right schemas", "[scim][routes][discovery]") {
+TEST_CASE("ScimRoutes: discovery endpoints return the right schemas", "[pg][scim][routes][discovery]") {
     Fixture f;
 
     auto spc = f.get("/scim/v2/ServiceProviderConfig");
@@ -182,7 +182,7 @@ TEST_CASE("ScimRoutes: discovery endpoints return the right schemas", "[scim][ro
 
 // ── POST /Users (provision) ────────────────────────────────────────────────
 
-TEST_CASE("ScimRoutes: POST provisions a user — 201 + Location + ETag", "[scim][routes][post]") {
+TEST_CASE("ScimRoutes: POST provisions a user — 201 + Location + ETag", "[pg][scim][routes][post]") {
     Fixture f;
     auto res = f.post("/scim/v2/Users", {{"userName", "alice"}, {"externalId", "ext-1"}});
     REQUIRE(res);
@@ -208,7 +208,7 @@ TEST_CASE("ScimRoutes: POST provisions a user — 201 + Location + ETag", "[scim
 }
 
 TEST_CASE("ScimRoutes: POST duplicate userName — 409, existing account untouched",
-         "[scim][routes][post]") {
+         "[pg][scim][routes][post]") {
     Fixture f;
     auto first = f.post("/scim/v2/Users", {{"userName", "bob"}});
     REQUIRE(first);
@@ -227,7 +227,7 @@ TEST_CASE("ScimRoutes: POST duplicate userName — 409, existing account untouch
 
 // ── GET /Users/{id}, GET /Users?filter= ────────────────────────────────────
 
-TEST_CASE("ScimRoutes: GET /Users/{id} — 200 known, 404 unknown", "[scim][routes][get]") {
+TEST_CASE("ScimRoutes: GET /Users/{id} — 200 known, 404 unknown", "[pg][scim][routes][get]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "carol"}})->body);
     auto id = created["id"].get<std::string>();
@@ -243,7 +243,7 @@ TEST_CASE("ScimRoutes: GET /Users/{id} — 200 known, 404 unknown", "[scim][rout
 }
 
 TEST_CASE("ScimRoutes: GET ?filter=userName eq \"x\" returns the one match",
-         "[scim][routes][get][filter]") {
+         "[pg][scim][routes][get][filter]") {
     Fixture f;
     REQUIRE(f.post("/scim/v2/Users", {{"userName", "dave"}})->status == 201);
     REQUIRE(f.post("/scim/v2/Users", {{"userName", "erin"}})->status == 201);
@@ -259,7 +259,7 @@ TEST_CASE("ScimRoutes: GET ?filter=userName eq \"x\" returns the one match",
 // ── PATCH — the critical deprovision path ──────────────────────────────────
 
 TEST_CASE("ScimRoutes: PATCH active=false deactivates the auth account",
-         "[scim][routes][patch][deprovision]") {
+         "[pg][scim][routes][patch][deprovision]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "frank"}})->body);
     auto id = created["id"].get<std::string>();
@@ -282,7 +282,7 @@ TEST_CASE("ScimRoutes: PATCH active=false deactivates the auth account",
 
 TEST_CASE("ScimRoutes: PATCH active=false -> active=true round-trips (deprovision then "
          "reactivate), clearing stale lockout state",
-         "[scim][routes][patch][reactivate]") {
+         "[pg][scim][routes][patch][reactivate]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "grace"}})->body);
     auto id = created["id"].get<std::string>();
@@ -333,7 +333,7 @@ TEST_CASE("ScimRoutes: PATCH active=false -> active=true round-trips (deprovisio
 }
 
 TEST_CASE("ScimRoutes: PATCH active=true is a no-op when the resource is already active",
-         "[scim][routes][patch][reactivate]") {
+         "[pg][scim][routes][patch][reactivate]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "heidi2"}})->body);
     auto id = created["id"].get<std::string>();
@@ -354,7 +354,7 @@ TEST_CASE("ScimRoutes: PATCH active=true is a no-op when the resource is already
 // exact "IdP believes terminated, account is not" gap the fix closes.
 TEST_CASE("ScimRoutes: PATCH active=false re-runs deactivation when the mirror is desynced "
          "from a still-live auth account",
-         "[scim][routes][patch][deprovision]") {
+         "[pg][scim][routes][patch][deprovision]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ivan"}})->body);
     auto id = created["id"].get<std::string>();
@@ -385,7 +385,7 @@ TEST_CASE("ScimRoutes: PATCH active=false re-runs deactivation when the mirror i
 
 TEST_CASE("ScimRoutes: PATCH active=false stays a clean no-op when the account is genuinely "
          "already inactive",
-         "[scim][routes][patch][deprovision]") {
+         "[pg][scim][routes][patch][deprovision]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ivan2"}})->body);
     auto id = created["id"].get<std::string>();
@@ -412,7 +412,7 @@ TEST_CASE("ScimRoutes: PATCH active=false stays a clean no-op when the account i
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
 
-TEST_CASE("ScimRoutes: DELETE — 204 + account soft-deleted", "[scim][routes][delete]") {
+TEST_CASE("ScimRoutes: DELETE — 204 + account soft-deleted", "[pg][scim][routes][delete]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "heidi"}})->body);
     auto id = created["id"].get<std::string>();
@@ -428,7 +428,7 @@ TEST_CASE("ScimRoutes: DELETE — 204 + account soft-deleted", "[scim][routes][d
 
 TEST_CASE("ScimRoutes: concurrent DELETE on the same id never 500s on an already-gone mapping "
          "row (UP-N4)",
-         "[scim][routes][delete][race]") {
+         "[pg][scim][routes][delete][race]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "wren"}})->body);
     auto id = created["id"].get<std::string>();
@@ -478,7 +478,7 @@ TEST_CASE("ScimRoutes: concurrent DELETE on the same id never 500s on an already
 // ── Provenance guard (LOAD-BEARING) ────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: provenance guard — SCIM cannot touch a locally-created account",
-         "[scim][routes][provenance]") {
+         "[pg][scim][routes][provenance]") {
     Fixture f;
     // A local admin, created OUTSIDE the SCIM path (upsert_user directly —
     // mirrors first-run-setup / an operator-run `yuzu-server --add-user`).
@@ -522,7 +522,7 @@ TEST_CASE("ScimRoutes: provenance guard — SCIM cannot touch a locally-created 
 }
 
 TEST_CASE("ScimRoutes: POST refuses to adopt a SOFT-DELETED local account (S-UNIQUE-DBREAD)",
-         "[scim][routes][provenance]") {
+         "[pg][scim][routes][provenance]") {
     Fixture f;
     // A local admin, soft-deleted via the ordinary human /api/settings/users
     // DELETE path (remove_user) — no longer visible via get_user_role, the
@@ -543,7 +543,7 @@ TEST_CASE("ScimRoutes: POST refuses to adopt a SOFT-DELETED local account (S-UNI
 // ── M-LIFECYCLE — revive-on-reprovision ─────────────────────────────────
 
 TEST_CASE("ScimRoutes: DELETE then re-POST the same userName revives the account",
-         "[scim][routes][revive]") {
+         "[pg][scim][routes][revive]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "olga"}})->body);
     auto old_id = created["id"].get<std::string>();
@@ -590,7 +590,7 @@ TEST_CASE("ScimRoutes: DELETE then re-POST the same userName revives the account
 
 TEST_CASE("ScimRoutes: concurrent revive race — the create_resource-conflict rollback must not "
          "deactivate the winner (UP-N1)",
-         "[scim][routes][revive][race]") {
+         "[pg][scim][routes][revive][race]") {
     Fixture f;
     // Leave "vic" as a tombstoned SCIM account: auth row soft-deleted,
     // provisioning_source == "scim", no scim_resource row — exactly the
@@ -651,7 +651,7 @@ TEST_CASE("ScimRoutes: concurrent revive race — the create_resource-conflict r
 
 TEST_CASE("ScimRoutes: concurrent duplicate POST for a brand-new userName — exactly one 201, "
          "one 409 (UP-9, store layer race)",
-         "[scim][routes][post][race]") {
+         "[pg][scim][routes][post][race]") {
     Fixture f;
     std::atomic<int> created{0};
     std::atomic<int> conflicted{0};
@@ -691,7 +691,7 @@ TEST_CASE("ScimRoutes: concurrent duplicate POST for a brand-new userName — ex
 
 TEST_CASE("ScimRoutes: concurrent Group PATCH-promote + User DELETE on the same SCIM user — no "
          "crash, no torn state",
-         "[scim][routes][groups][race]") {
+         "[pg][scim][routes][groups][race]") {
     // Not a provenance-guard test (that's covered elsewhere — a group can
     // only ever elevate a SCIM-provenanced account in the first place) —
     // this purely proves the two mutations racing on the same user_scim_id
@@ -755,7 +755,7 @@ TEST_CASE("ScimRoutes: concurrent Group PATCH-promote + User DELETE on the same 
 TEST_CASE("ScimRoutes: concurrent conflicting Group membership ops on the same user never leave "
          "the durable role out of sync with the final committed membership (TOCTOU role-drift "
          "fix, recompute_scim_user_role serialization)",
-         "[scim][routes][groups][race][role_drift]") {
+         "[pg][scim][routes][groups][race][role_drift]") {
     // Stress-based (not a fully deterministic repro — see NOTE at the end of
     // this file's Groups-concurrency section): fires an add-to-admin-group
     // PATCH and a remove-from-admin-group PATCH concurrently against the
@@ -809,7 +809,7 @@ TEST_CASE("ScimRoutes: concurrent conflicting Group membership ops on the same u
 TEST_CASE("ScimRoutes: two concurrent identical Group-add PATCHes promoting the same user write "
          "exactly one scim.user.role_changed success row — no duplicate audit from a racing "
          "no-op recompute",
-         "[scim][routes][groups][race][role_drift]") {
+         "[pg][scim][routes][groups][race][role_drift]") {
     // Before the fix, both concurrent recomputes could observe current=user
     // (both reading before either had applied update_role) and both apply +
     // audit the user->admin transition, producing a duplicate success row.
@@ -857,7 +857,7 @@ TEST_CASE("ScimRoutes: two concurrent identical Group-add PATCHes promoting the 
 
 TEST_CASE("ScimRoutes: concurrent Group PATCHes adding DIFFERENT members never lose one "
          "(read-modify-write lost-update fix, kGroupMutationMu serialization)",
-         "[scim][routes][groups][race][group-concurrency]") {
+         "[pg][scim][routes][groups][race][group-concurrency]") {
     // Regression coverage for the atomic-replace rework: PUT/PATCH compute
     // the final membership set by reading current members, folding ops, then
     // persisting the WHOLE set via replace_group_and_members. That
@@ -933,7 +933,7 @@ TEST_CASE("ScimRoutes: concurrent Group PATCHes adding DIFFERENT members never l
 
 TEST_CASE("ScimRoutes: concurrent Group PATCH remove + add on DIFFERENT members never leave the "
          "removal lost (read-modify-write lost-update fix, kGroupMutationMu serialization)",
-         "[scim][routes][groups][race][group-concurrency]") {
+         "[pg][scim][routes][groups][race][group-concurrency]") {
     // Same regression as above, but the racing pair is a REMOVE and an ADD
     // rather than two ADDs — this is the privilege-retention-shaped case
     // called out in the regression: a lost REMOVAL leaves a member who
@@ -1008,7 +1008,7 @@ TEST_CASE("ScimRoutes: concurrent Group PATCH remove + add on DIFFERENT members 
 // ── M-DEPROV-ROLE ────────────────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM account to admin",
-         "[scim][routes][deprov_role]") {
+         "[pg][scim][routes][deprov_role]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "noah"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1034,7 +1034,7 @@ TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM ac
 
 TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a COLD "
          "AuthManager cache (H2, 2026-07-08 review — fail-closed, not fail-open)",
-         "[scim][routes][deprov_role][cold_cache]") {
+         "[pg][scim][routes][deprov_role][cold_cache]") {
     // H2: AuthManager::get_user_role only ever reads the in-memory `users_`
     // cache, which nothing preloads at construction. A freshly-started
     // process (modeled here by a SECOND AuthManager wired to the SAME
@@ -1112,7 +1112,7 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
          "the remove_user() undo leaves the account INACTIVE, not reactivated-at-elevated-role "
          "(UP-N5/FIX-5, Gate-8 round-2)",
-         "[scim][routes][revive][role_refusal]") {
+         "[pg][scim][routes][revive][role_refusal]") {
     // Gate-8 round-2 MEDIUM (privilege fail-open): the revive path
     // (POST re-provisioning a tombstoned SCIM account) reactivates the
     // underlying auth row FIRST, then refuses if the role isn't 'user',
@@ -1168,7 +1168,7 @@ TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated accoun
 // ── M-OPTDEREF ───────────────────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: PATCH after DELETE on the same id — 404, no crash",
-         "[scim][routes][optderef]") {
+         "[pg][scim][routes][optderef]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "rex"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1200,7 +1200,7 @@ TEST_CASE("ScimRoutes: PATCH after DELETE on the same id — 404, no crash",
 // on every failure, independent of the caller's response).
 
 TEST_CASE("ScimRoutes: audit write failure on a non-termination action — set-and-proceed (201)",
-         "[scim][routes][audit]") {
+         "[pg][scim][routes][audit]") {
     Fixture f{/*broken_audit=*/true};
     auto res = f.post("/scim/v2/Users", {{"userName", "sam"}});
     REQUIRE(res);
@@ -1209,7 +1209,7 @@ TEST_CASE("ScimRoutes: audit write failure on a non-termination action — set-a
 }
 
 TEST_CASE("ScimRoutes: audit write failure on a termination action — set-and-proceed (200)",
-         "[scim][routes][audit]") {
+         "[pg][scim][routes][audit]") {
     Fixture f{/*broken_audit=*/true};
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "tara"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1228,7 +1228,7 @@ TEST_CASE("ScimRoutes: audit write failure on a termination action — set-and-p
 }
 
 TEST_CASE("ScimRoutes: audit write failure on DELETE — set-and-proceed (204)",
-         "[scim][routes][audit]") {
+         "[pg][scim][routes][audit]") {
     Fixture f{/*broken_audit=*/true};
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "uri"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1241,7 +1241,7 @@ TEST_CASE("ScimRoutes: audit write failure on DELETE — set-and-proceed (204)",
 
 // ── PUT /scim/v2/Users/{id} — full replace ──────────────────────────────
 
-TEST_CASE("ScimRoutes: PUT identity replace — 200, externalId updated", "[scim][routes][put]") {
+TEST_CASE("ScimRoutes: PUT identity replace — 200, externalId updated", "[pg][scim][routes][put]") {
     Fixture f;
     auto created =
         json::parse(f.post("/scim/v2/Users", {{"userName", "ivy"}, {"externalId", "ext-old"}})
@@ -1258,7 +1258,7 @@ TEST_CASE("ScimRoutes: PUT identity replace — 200, externalId updated", "[scim
 }
 
 TEST_CASE("ScimRoutes: PUT userName change — 400 mutability, account untouched",
-         "[scim][routes][put]") {
+         "[pg][scim][routes][put]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "jack"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1270,7 +1270,7 @@ TEST_CASE("ScimRoutes: PUT userName change — 400 mutability, account untouched
     CHECK(f.auth_mgr.get_user_role("jack").has_value());
 }
 
-TEST_CASE("ScimRoutes: PUT unknown id — 404", "[scim][routes][put]") {
+TEST_CASE("ScimRoutes: PUT unknown id — 404", "[pg][scim][routes][put]") {
     Fixture f;
     auto res = f.put("/scim/v2/Users/deadbeefdeadbeefdeadbeefdeadbeef", {{"userName", "nobody"}});
     REQUIRE(res);
@@ -1278,7 +1278,7 @@ TEST_CASE("ScimRoutes: PUT unknown id — 404", "[scim][routes][put]") {
 }
 
 TEST_CASE("ScimRoutes: PUT active=false then active=true round-trips the auth account",
-         "[scim][routes][put]") {
+         "[pg][scim][routes][put]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "kate"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1301,7 +1301,7 @@ TEST_CASE("ScimRoutes: PUT active=false then active=true round-trips the auth ac
 // test above.
 TEST_CASE("ScimRoutes: PUT active=false re-runs deactivation when the mirror is desynced "
          "from a still-live auth account",
-         "[scim][routes][put]") {
+         "[pg][scim][routes][put]") {
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "laura"}})->body);
     auto id = created["id"].get<std::string>();
@@ -1319,7 +1319,7 @@ TEST_CASE("ScimRoutes: PUT active=false re-runs deactivation when the mirror is 
 
 // ── Malformed body handling ──────────────────────────────────────────────
 
-TEST_CASE("ScimRoutes: malformed JSON body — 400 on POST/PATCH", "[scim][routes][malformed]") {
+TEST_CASE("ScimRoutes: malformed JSON body — 400 on POST/PATCH", "[pg][scim][routes][malformed]") {
     Fixture f;
     auto post_res = f.sink.dispatch("POST", "/scim/v2/Users", "{not json",
                                     "application/scim+json", f.auth_header());
@@ -1335,7 +1335,7 @@ TEST_CASE("ScimRoutes: malformed JSON body — 400 on POST/PATCH", "[scim][route
 }
 
 TEST_CASE("ScimRoutes: POST with a non-string userName/externalId — 400, not 500 (FIX-3)",
-         "[scim][routes][malformed]") {
+         "[pg][scim][routes][malformed]") {
     // Confirms the route path that calls scim::parse_user() propagates its
     // std::expected 400 cleanly rather than an nlohmann::json::type_error
     // unwinding to an unhandled 500.
@@ -1353,7 +1353,7 @@ TEST_CASE("ScimRoutes: POST with a non-string userName/externalId — 400, not 5
     CHECK(body2["scimType"] == "invalidValue");
 }
 
-TEST_CASE("ScimRoutes: oversized body — 413 on POST/PATCH", "[scim][routes][malformed]") {
+TEST_CASE("ScimRoutes: oversized body — 413 on POST/PATCH", "[pg][scim][routes][malformed]") {
     Fixture f;
     std::string huge_body = R"({"userName":")" + std::string(70 * 1024, 'x') + R"("})";
     auto post_res = f.sink.dispatch("POST", "/scim/v2/Users", huge_body, "application/scim+json",
@@ -1372,7 +1372,7 @@ TEST_CASE("ScimRoutes: oversized body — 413 on POST/PATCH", "[scim][routes][ma
 // ── S-POST-REFETCH ───────────────────────────────────────────────────────
 
 TEST_CASE("ScimRoutes: POST active:false — 201 body's ETag matches a following GET",
-         "[scim][routes][post]") {
+         "[pg][scim][routes][post]") {
     Fixture f;
     auto res = f.post("/scim/v2/Users", {{"userName", "uma"}, {"active", false}});
     REQUIRE(res);
@@ -1393,7 +1393,7 @@ TEST_CASE("ScimRoutes: POST active:false — 201 body's ETag matches a following
 
 TEST_CASE("ScimRoutes: POST active:false — the underlying account is ACTUALLY deactivated "
          "(FIX-1)",
-         "[scim][routes][post]") {
+         "[pg][scim][routes][post]") {
     // Hermes MEDIUM (fail-open): honouring active:false on create previously
     // only LOGGED a remove_user() failure and fell through to set_active(),
     // so a failed deactivation could ship a 201 with active:false while the
@@ -1422,7 +1422,7 @@ TEST_CASE("ScimRoutes: POST active:false — the underlying account is ACTUALLY 
 
 // ── S-CLAMP-COUNT ────────────────────────────────────────────────────────
 
-TEST_CASE("ScimRoutes: GET list clamps count to maxResults", "[scim][routes][list]") {
+TEST_CASE("ScimRoutes: GET list clamps count to maxResults", "[pg][scim][routes][list]") {
     Fixture f;
     // Seed scim_resource rows directly at the store layer (cheap — no
     // PBKDF2/AuthDB write per row) so this test can exceed maxResults
@@ -1443,7 +1443,7 @@ TEST_CASE("ScimRoutes: GET list clamps count to maxResults", "[scim][routes][lis
 // fail cleanly with a SCIM 400 `invalidValue`, never an unhandled
 // std::stoi exception escaping to a 500.
 TEST_CASE("ScimRoutes: GET list — non-numeric startIndex is a 400, not a 500",
-         "[scim][routes][list]") {
+         "[pg][scim][routes][list]") {
     Fixture f;
     auto res = f.get("/scim/v2/Users?startIndex=abc");
     REQUIRE(res);
@@ -1453,7 +1453,7 @@ TEST_CASE("ScimRoutes: GET list — non-numeric startIndex is a 400, not a 500",
 }
 
 TEST_CASE("ScimRoutes: GET list — an absurdly long startIndex is a 400, not a 500",
-         "[scim][routes][list]") {
+         "[pg][scim][routes][list]") {
     Fixture f;
     auto res = f.get("/scim/v2/Users?startIndex=" + std::string(40, '9'));
     REQUIRE(res);
@@ -1463,7 +1463,7 @@ TEST_CASE("ScimRoutes: GET list — an absurdly long startIndex is a 400, not a 
 }
 
 TEST_CASE("ScimRoutes: GET list — a malformed count is a 400, not a 500",
-         "[scim][routes][list]") {
+         "[pg][scim][routes][list]") {
     Fixture f;
     auto res = f.get("/scim/v2/Users?count=" + std::string(40, '9'));
     REQUIRE(res);
@@ -1473,7 +1473,7 @@ TEST_CASE("ScimRoutes: GET list — a malformed count is a 400, not a 500",
 }
 
 TEST_CASE("ScimRoutes: GET list — a negative startIndex is clamped to 1, not a 400",
-         "[scim][routes][list]") {
+         "[pg][scim][routes][list]") {
     Fixture f;
     REQUIRE(f.scim_store->create_resource("negidxuser").has_value());
 
@@ -1484,7 +1484,7 @@ TEST_CASE("ScimRoutes: GET list — a negative startIndex is clamped to 1, not a
     CHECK(body["startIndex"] == 1);
 }
 
-TEST_CASE("ScimRoutes: GET list — a valid startIndex/count still works", "[scim][routes][list]") {
+TEST_CASE("ScimRoutes: GET list — a valid startIndex/count still works", "[pg][scim][routes][list]") {
     Fixture f;
     for (int i = 0; i < 10; ++i)
         REQUIRE(f.scim_store->create_resource("pageuser" + std::to_string(i)).has_value());
@@ -1749,7 +1749,7 @@ std::string create_scim_user_over_wire(httplib::Client& cli, const std::string& 
 
 TEST_CASE("H1 integration: /scim/v2/Users with a valid bearer provisions over real HTTP — "
          "201, not a login redirect",
-         "[scim][routes][integration][h1]") {
+         "[pg][scim][routes][integration][h1]") {
     ScimIntegrationServer ts;
     ts.start();
 
@@ -1766,7 +1766,7 @@ TEST_CASE("H1 integration: /scim/v2/Users with a valid bearer provisions over re
 }
 
 TEST_CASE("H1 integration: a bogus bearer against /scim/v2/Users is 401, NEVER a 302 to /login",
-         "[scim][routes][integration][h1]") {
+         "[pg][scim][routes][integration][h1]") {
     ScimIntegrationServer ts;
     ts.start();
 
@@ -1789,7 +1789,7 @@ TEST_CASE("H1 integration: a bogus bearer against /scim/v2/Users is 401, NEVER a
 }
 
 TEST_CASE("H1 integration: a missing bearer against /scim/v2/Users is 401, not a redirect",
-         "[scim][routes][integration][h1]") {
+         "[pg][scim][routes][integration][h1]") {
     ScimIntegrationServer ts;
     ts.start();
 
@@ -1806,7 +1806,7 @@ TEST_CASE("H1 integration: a missing bearer against /scim/v2/Users is 401, not a
 TEST_CASE("H1 integration: a non-exempt API path with no session still gets the ordinary "
          "unauthenticated-API 401 (control — the SCIM exemption did not broaden beyond "
          "/scim/v2/*)",
-         "[scim][routes][integration][h1]") {
+         "[pg][scim][routes][integration][h1]") {
     ScimIntegrationServer ts;
     ts.start();
 
@@ -1821,7 +1821,7 @@ TEST_CASE("H1 integration: a non-exempt API path with no session still gets the 
 
 TEST_CASE("H1 integration: rate limiting is RETAINED for /scim/v2/* despite the login "
          "exemption (ordering: the limiter runs before the exempt-path check)",
-         "[scim][routes][integration][h1][ratelimit]") {
+         "[pg][scim][routes][integration][h1][ratelimit]") {
     ScimIntegrationServer ts(/*rate_per_second=*/1);
     ts.start();
 
@@ -1845,7 +1845,7 @@ TEST_CASE("H1 integration: rate limiting is RETAINED for /scim/v2/* despite the 
 TEST_CASE("H1 integration: a reserved on-behalf-of header against /scim/v2/* is 403 per "
          "ADR-1005, even with an otherwise-valid SCIM bearer token (the SCIM login-exemption "
          "does not strip the on-behalf-of guard)",
-         "[scim][routes][integration][h1][adr1005][onbehalf]") {
+         "[pg][scim][routes][integration][h1][adr1005][onbehalf]") {
     ScimIntegrationServer ts;
     ts.start();
 
@@ -1882,7 +1882,7 @@ TEST_CASE("H1 integration: a reserved on-behalf-of header against /scim/v2/* is 
 
 TEST_CASE("Groups integration: POST creates a group — 201, GET finds it, unknown id is 404 not "
          "403",
-         "[scim][routes][integration][groups]") {
+         "[pg][scim][routes][integration][groups]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -1917,7 +1917,7 @@ TEST_CASE("Groups integration: POST creates a group — 201, GET finds it, unkno
 
 TEST_CASE("Groups integration: bogus bearer against /scim/v2/Groups is 401, missing bearer is "
          "401",
-         "[scim][routes][integration][groups][auth]") {
+         "[pg][scim][routes][integration][groups][auth]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -1937,7 +1937,7 @@ TEST_CASE("Groups integration: bogus bearer against /scim/v2/Groups is 401, miss
 
 TEST_CASE("Groups integration: promotion — PATCH-adding a SCIM user to the admin group promotes "
          "them, removing demotes them back",
-         "[scim][routes][integration][groups][promotion]") {
+         "[pg][scim][routes][integration][groups][promotion]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -1980,7 +1980,7 @@ TEST_CASE("Groups integration: promotion — PATCH-adding a SCIM user to the adm
 TEST_CASE("Groups integration: PROVENANCE — a group member value mapping to a local (non-SCIM) "
          "admin never changes that account's role, and never audits scim.user.role_changed for "
          "it",
-         "[scim][routes][integration][groups][provenance]") {
+         "[pg][scim][routes][integration][groups][provenance]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2063,7 +2063,7 @@ TEST_CASE("Groups integration: PROVENANCE — a group member value mapping to a 
 
 TEST_CASE("Groups integration: deprovision ordering — a group-elevated admin cannot be SCIM-"
          "deprovisioned until the IdP removes them from the admin group",
-         "[scim][routes][integration][groups][deprovision-ordering]") {
+         "[pg][scim][routes][integration][groups][deprovision-ordering]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2114,7 +2114,7 @@ TEST_CASE("Groups integration: deprovision ordering — a group-elevated admin c
 
 TEST_CASE("Groups integration: --scim-admin-group unset (empty) — group membership never "
          "promotes anyone",
-         "[scim][routes][integration][groups][admin-group-unset]") {
+         "[pg][scim][routes][integration][groups][admin-group-unset]") {
     ScimIntegrationServer ts; // no admin_group argument — empty by default
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2145,7 +2145,7 @@ TEST_CASE("Groups integration: --scim-admin-group unset (empty) — group member
 }
 
 TEST_CASE("Groups integration: DELETE demotes every member and audits the demotion (qa-4)",
-          "[scim][routes][integration][groups][delete]") {
+          "[pg][scim][routes][integration][groups][delete]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2202,7 +2202,7 @@ TEST_CASE("Groups integration: DELETE demotes every member and audits the demoti
 
 TEST_CASE("Groups integration: PUT full-replace — dropped member demoted, added member promoted "
           "(qa-5)",
-          "[scim][routes][integration][groups][put]") {
+          "[pg][scim][routes][integration][groups][put]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2245,7 +2245,7 @@ TEST_CASE("Groups integration: PUT full-replace — dropped member demoted, adde
 
 TEST_CASE("Groups integration: PATCH with both replace and add/remove ops — replace wins "
           "because it comes LAST in this body's op order (qa-6, updated for #2127 rework)",
-          "[scim][routes][integration][groups][patch-precedence]") {
+          "[pg][scim][routes][integration][groups][patch-precedence]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2295,7 +2295,7 @@ TEST_CASE("Groups integration: PATCH with both replace and add/remove ops — re
 
 TEST_CASE("Groups integration: PUT rename onto an existing group's displayName 409s, B unchanged "
           "(arch-S4/UP-2)",
-          "[scim][routes][integration][groups][rename-409]") {
+          "[pg][scim][routes][integration][groups][rename-409]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2339,7 +2339,7 @@ TEST_CASE("Groups integration: PUT rename onto an existing group's displayName 4
 
 TEST_CASE("Groups integration: PATCH rename onto an existing group's displayName 409s, B "
           "unchanged (arch-S4/UP-2)",
-          "[scim][routes][integration][groups][rename-409]") {
+          "[pg][scim][routes][integration][groups][rename-409]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2383,7 +2383,7 @@ TEST_CASE("Groups integration: PATCH rename onto an existing group's displayName
 
 TEST_CASE("Groups integration: an embedded-NUL displayName is rejected fail-closed — no spurious "
          "promotion to the configured admin group (UP-3)",
-         "[scim][routes][integration][groups][embedded-nul]") {
+         "[pg][scim][routes][integration][groups][embedded-nul]") {
     // "Admins\0decoy" — PostgreSQL `text` columns cannot store an embedded
     // NUL (pg::exec_params hands libpq a NUL-terminated C string regardless
     // of declared length, so anything past the first NUL is silently
@@ -2436,7 +2436,7 @@ TEST_CASE("Groups integration: an embedded-NUL displayName is rejected fail-clos
 
 TEST_CASE("Groups integration: sec-L3 caps over HTTP — oversized displayName on POST and PATCH "
           "400s",
-          "[scim][routes][integration][groups][caps]") {
+          "[pg][scim][routes][integration][groups][caps]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2472,7 +2472,7 @@ TEST_CASE("Groups integration: sec-L3 caps over HTTP — oversized displayName o
 }
 
 TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 400s + denied",
-          "[scim][routes][integration][groups][caps][members]") {
+          "[pg][scim][routes][integration][groups][caps][members]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2535,7 +2535,7 @@ TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 
 TEST_CASE("Groups integration: a genuine update_role failure during recompute audits "
          "scim.user.role_changed/failure and bumps yuzu_scim_role_change_failures_total "
          "(C1 remediation)",
-         "[scim][routes][integration][groups][role_change_failure]") {
+         "[pg][scim][routes][integration][groups][role_change_failure]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.auth_mgr.set_metrics_registry(&ts.metrics);
     ts.start();
@@ -2626,7 +2626,7 @@ TEST_CASE("Groups integration: a genuine update_role failure during recompute au
 
 TEST_CASE("Groups integration: PATCH rename OFF the admin group demotes every current member "
          "(reviewer falsifier, PR #2127)",
-         "[scim][routes][integration][groups][patch][rename-recompute]") {
+         "[pg][scim][routes][integration][groups][patch][rename-recompute]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2694,7 +2694,7 @@ TEST_CASE("Groups integration: PATCH rename OFF the admin group demotes every cu
 
 TEST_CASE("Groups integration: PATCH rename ONTO the admin group promotes every current member "
          "(inverse of the reviewer falsifier)",
-         "[scim][routes][integration][groups][patch][rename-recompute]") {
+         "[pg][scim][routes][integration][groups][patch][rename-recompute]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2728,7 +2728,7 @@ TEST_CASE("Groups integration: PATCH rename ONTO the admin group promotes every 
 
 TEST_CASE("Groups integration: PATCH mixing a rename with a member add recomputes BOTH the "
          "pre-existing members and the newly-added one, exactly once each",
-         "[scim][routes][integration][groups][patch][rename-recompute]") {
+         "[pg][scim][routes][integration][groups][patch][rename-recompute]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2800,7 +2800,7 @@ TEST_CASE("Groups integration: PATCH mixing a rename with a member add recompute
 // chance to interleave both ways under the scheduler.
 TEST_CASE("Groups integration: concurrent membership-only PATCH never reverts a concurrent "
          "rename (metadata TOCTOU re-review MEDIUM, PR #2127)",
-         "[scim][routes][integration][groups][patch][group-concurrency]") {
+         "[pg][scim][routes][integration][groups][patch][group-concurrency]") {
     ScimIntegrationServer ts(/*rate_per_second=*/1000, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client setup_cli("127.0.0.1", ts.port);
@@ -2911,7 +2911,7 @@ TEST_CASE("Groups integration: concurrent membership-only PATCH never reverts a 
 
 TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit a "
          "co-submitted displayName rename (re-review MEDIUM, PR #2127)",
-         "[scim][routes][integration][groups][patch][rename-recompute][member-cap]") {
+         "[pg][scim][routes][integration][groups][patch][rename-recompute][member-cap]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -2987,7 +2987,7 @@ TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit 
 // bulk-rename audit flood).
 TEST_CASE("Groups integration: PATCH rename over a non-SCIM member bumps "
          "yuzu_scim_provenance_denied_total (Minor #3)",
-         "[scim][routes][integration][groups][patch][provenance]") {
+         "[pg][scim][routes][integration][groups][patch][provenance]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.auth_mgr.set_metrics_registry(&ts.metrics);
     ts.start();
@@ -3035,7 +3035,7 @@ TEST_CASE("Groups integration: PATCH rename over a non-SCIM member bumps "
 
 TEST_CASE("Groups integration: PATCH [{add:U},{remove:U}] leaves U NOT a member and NOT "
          "promoted (HIGH falsifier, PR #2127)",
-         "[scim][routes][integration][groups][patch][ordered-ops]") {
+         "[pg][scim][routes][integration][groups][patch][ordered-ops]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -3072,7 +3072,7 @@ TEST_CASE("Groups integration: PATCH [{add:U},{remove:U}] leaves U NOT a member 
 
 TEST_CASE("Groups integration: PATCH [{remove:U},{add:U}] leaves U a member and PROMOTED "
          "(reverse of the HIGH falsifier, PR #2127)",
-         "[scim][routes][integration][groups][patch][ordered-ops]") {
+         "[pg][scim][routes][integration][groups][patch][ordered-ops]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -3119,7 +3119,7 @@ TEST_CASE("Groups integration: PATCH [{remove:U},{add:U}] leaves U a member and 
 
 TEST_CASE("Groups integration: PATCH with bogus removes cannot buy cap headroom for real "
          "adds (cap-bypass, MEDIUM finding #2, PR #2127)",
-         "[scim][routes][integration][groups][patch][member-cap][cap-bypass]") {
+         "[pg][scim][routes][integration][groups][patch][member-cap][cap-bypass]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -3170,7 +3170,7 @@ TEST_CASE("Groups integration: PATCH with bogus removes cannot buy cap headroom 
 
 TEST_CASE("Groups integration: PATCH whose net final size stays within cap succeeds even "
          "when it names bogus removes (cap-bypass inverse, PR #2127)",
-         "[scim][routes][integration][groups][patch][member-cap][cap-bypass]") {
+         "[pg][scim][routes][integration][groups][patch][member-cap][cap-bypass]") {
     ScimIntegrationServer ts;
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -3223,7 +3223,7 @@ TEST_CASE("Groups integration: PATCH whose net final size stays within cap succe
 
 TEST_CASE("Groups integration: PATCH persist failure leaves displayName, membership, and "
          "roles UNCHANGED — no partial commit (MEDIUM finding #3, PR #2127)",
-         "[scim][routes][integration][groups][patch][persist-fail]") {
+         "[pg][scim][routes][integration][groups][patch][persist-fail]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);
@@ -3301,7 +3301,7 @@ TEST_CASE("Groups integration: PATCH persist failure leaves displayName, members
 
 TEST_CASE("Groups integration: PUT persist failure leaves displayName, membership, and "
          "roles UNCHANGED — no partial commit (MEDIUM finding #3, PR #2127)",
-         "[scim][routes][integration][groups][put][persist-fail]") {
+         "[pg][scim][routes][integration][groups][put][persist-fail]") {
     ScimIntegrationServer ts(/*rate_per_second=*/100, /*admin_group=*/"Yuzu-Admins");
     ts.start();
     httplib::Client cli("127.0.0.1", ts.port);

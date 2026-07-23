@@ -104,7 +104,7 @@ struct StepUpFixture {
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: window_secs <= 0 returns true (escape hatch)",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -124,7 +124,7 @@ TEST_CASE_METHOD(StepUpFixture,
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: SAML session is denied with honest 403 (not api-token "
                  "message, not mfa_status lookup) — gate stays CLOSED",
-                 "[mfa][stepup][saml]") {
+                 "[pg][mfa][stepup][saml]") {
     // F3 regression guard: SAML sessions have no local users row.  Before
     // this fix the gate fell through to mfa_status() which returned an
     // error (UserNotFound → fail-closed), producing a confusing
@@ -162,7 +162,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: api_token / mcp_token principals bypass the gate",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -180,7 +180,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: non-enrolled user (bob) bypasses the gate",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -195,7 +195,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: MFA-enrolled session with no proof yields 401",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -229,7 +229,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: fresh proof within window passes the gate",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -243,7 +243,7 @@ TEST_CASE_METHOD(StepUpFixture,
 }
 
 TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window yields 401",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -271,7 +271,7 @@ TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window 
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: mfa_status store error fails CLOSED (UP-4)",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     // Tear down auth_db so mfa_status() returns an error → helper must
     // emit a 401 with the mfa_status_unavailable detail, not silently
     // bypass the gate. Governance Gate 4 unhappy-path UP-4 / qe Gate 3
@@ -302,7 +302,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: empty audit_fn does not crash on the deny path",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -320,7 +320,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC session with fresh amr-seeded proof passes",
-                 "[mfa][stepup][oidc]") {
+                 "[pg][mfa][stepup][oidc]") {
     // PR3: OIDC sessions are no longer blanket-exempt. /auth/callback seeds
     // mfa_verified_at from the IdP `amr` claim. A session whose IdP login
     // attested MFA recently clears the gate WITHOUT a local users-row
@@ -340,7 +340,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC session WITHOUT MFA proof PASSES (UP-5 regression)",
-                 "[mfa][stepup][oidc]") {
+                 "[pg][mfa][stepup][oidc]") {
     // GOVERNANCE UP-5 regression. An SSO login from an IdP that did not
     // attest MFA (no amr → mfa_verified_at default) has no second factor to
     // step up against — it must PASS, exactly like an un-enrolled local
@@ -365,7 +365,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC no-proof is GATED under enforcement (A4/B1)",
-                 "[mfa][stepup][oidc][enforce]") {
+                 "[pg][mfa][stepup][oidc][enforce]") {
     // Hermes adversarial + cyber A4/B1 + governance UP-6: under enforcement
     // that protects the principal's role, an SSO login the IdP did not MFA
     // must step up (re-SSO), symmetric with a local user being forced to
@@ -417,7 +417,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: window boundary — age == window passes, age > window fails",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     // The comparison is inclusive (`age <= window_secs`). A local enrolled
     // session proven exactly `window_secs` ago passes; one second past
     // fails. Guards the boundary against an off-by-one regression.
@@ -439,7 +439,7 @@ TEST_CASE_METHOD(StepUpFixture,
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: OIDC session with stale amr proof is gated",
-                 "[mfa][stepup][oidc]") {
+                 "[pg][mfa][stepup][oidc]") {
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
@@ -509,7 +509,7 @@ TEST_CASE("amr_asserts_mfa: MFA-bearing methods are recognised, password-only is
 
 TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: per-call correlation_id is unique across calls",
-                 "[mfa][stepup]") {
+                 "[pg][mfa][stepup]") {
     httplib::Request req;
     auto session = make_session("alice", "local");
 

@@ -63,7 +63,7 @@ struct MfaFixture {
 
 } // namespace
 
-TEST_CASE_METHOD(MfaFixture, "mfa_status on never-enrolled user", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_status on never-enrolled user", "[pg][mfa][store]") {
     auto s = db->mfa_status("alice");
     REQUIRE(s.has_value());
     REQUIRE_FALSE(s->enrolled);
@@ -72,7 +72,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_status on never-enrolled user", "[mfa][store]"
     REQUIRE(s->recovery_codes_remaining == 0);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment provides URI and secret", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment provides URI and secret", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     REQUIRE_FALSE(init->secret_base32.empty());
@@ -86,7 +86,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_init_enrollment provides URI and secret", "[mf
 }
 
 TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment with valid code enrolls and issues codes",
-                 "[mfa][store]") {
+                 "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -101,7 +101,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment with valid code enrolls and 
     REQUIRE(s->recovery_codes_remaining == 10);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
 
@@ -114,7 +114,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[mfa][
 }
 
 TEST_CASE_METHOD(MfaFixture, "double init reuses the provisional secret (no rotation, #1227)",
-                 "[mfa][store]") {
+                 "[pg][mfa][store]") {
     auto first = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(first.has_value());
     auto second = db->mfa_init_enrollment("alice", "Yuzu");
@@ -133,7 +133,7 @@ TEST_CASE_METHOD(MfaFixture, "double init reuses the provisional secret (no rota
     CHECK(db->mfa_verify_enrollment("alice", code).has_value());
 }
 
-TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -144,7 +144,7 @@ TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[mfa][store]")
     REQUIRE(reinit.error() == AuthDBError::MfaAlreadyEnrolled);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -158,7 +158,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[mfa][st
 
 TEST_CASE_METHOD(MfaFixture,
                  "mfa_verify_login_code stamps last_counter so a successful login cannot be replayed",
-                 "[mfa][store]") {
+                 "[pg][mfa][store]") {
     // security Gate 2 LOW follow-up: the route-test `totp_at(offset=1)`
     // workaround sidesteps the post-enrollment floor. To prove that the
     // *post-login* floor is also enforced, drive a login that succeeds
@@ -186,7 +186,7 @@ TEST_CASE_METHOD(MfaFixture,
     REQUIRE_FALSE(*replay);
 }
 
-TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -201,7 +201,7 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[mfa][sto
     REQUIRE_FALSE(*r2);
 }
 
-TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[mfa][store][recovery]") {
+TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
     auto code = code_for_now(init->secret_base32);
@@ -224,7 +224,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes are single-use", "[mfa][store][reco
 }
 
 TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
-                 "[mfa][store][recovery]") {
+                 "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     auto recovery_res = db->mfa_verify_enrollment("alice", code);
@@ -251,7 +251,7 @@ TEST_CASE_METHOD(MfaFixture, "recovery codes normalise separator and case",
     REQUIRE(*matched);
 }
 
-TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[mfa][store][recovery]") {
+TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[pg][mfa][store][recovery]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     auto first_set = db->mfa_verify_enrollment("alice", code);
@@ -272,7 +272,7 @@ TEST_CASE_METHOD(MfaFixture, "regenerate replaces all codes", "[mfa][store][reco
     REQUIRE(*fresh);
 }
 
-TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
@@ -297,7 +297,7 @@ TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[mfa][
     CHECK(db->mfa_verify_enrollment("alice", new_code).has_value());
 }
 
-TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", "[pg][mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     auto code = code_for_now(init->secret_base32);
     REQUIRE(db->mfa_verify_enrollment("alice", code).has_value());
