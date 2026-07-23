@@ -836,18 +836,9 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
                                  return SendResult::Sent;
                              });
 
-    // RAII safety net (mirrors OrphanExitGuard in agents/core/src/hard_exit.hpp):
-    // the send callback above parks the drain worker on `release`. If a REQUIRE
-    // below fires while the worker is en route to (or already parked in) that
-    // callback, Catch2 unwinds this scope; without releasing the worker first,
-    // ~GuardianEngine's stop()-join blocks on a `release` that never flips and
-    // the still-live worker races the destruction of these stack-local sync
-    // primitives - the #1648 non-Catch2 process exit (42) that defeats
-    // flake-retry classification and hard-blocks the whole agent suite. Declared
-    // AFTER `engine` so reverse-declaration-order destruction runs this FIRST:
-    // the worker is released (then joined by ~GuardianEngine) while send_mu/
-    // send_cv/release are still alive, so any assertion failure exits as an
-    // ordinary, classifiable Catch2 failure instead of a crash.
+    // A fatal assertion at the wait boundary can unwind while the worker is racing into
+    // the parked callback. Declared after engine so this releases the worker before
+    // ~GuardianEngine joins it, while send_mu/send_cv/release are still alive.
     struct ReleaseParkedWorker {
         std::mutex& mu;
         std::condition_variable& cv;
@@ -867,7 +858,10 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     gpb::GuaranteedStatePush push;
     push.set_full_sync(true);
     *push.add_rules() = make_service_rule("r1");
-    engine.apply_rules(push);
+    // Serialize-then-dispatch because the rule carries a protobuf Map; see the fixture's
+    // apply() helper above for the Windows EXE/DLL abseil hash-seed boundary.
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, push.SerializeAsString())
+                .exit_code == 0);
     REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
 
     {   // Park the worker inside a send, so the join below cannot complete.
