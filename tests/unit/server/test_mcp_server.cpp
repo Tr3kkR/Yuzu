@@ -1017,7 +1017,10 @@ TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labe
           "[mcp][2g]") {
     const std::string kCtr = "yuzu_mcp_initialize_protocol_total";
 
-    SECTION("supported client revision is echoed and counted") {
+    // Sections 1-2 wire NO session registry -> streaming OFF -> the STATELESS
+    // initialize path. Section "streaming mode..." wires one to prove the counter
+    // also fires on the streaming/session-minting path (the source claims both).
+    SECTION("supported client revision is echoed and counted (stateless)") {
         yuzu::MetricsRegistry reg;
         McpTestServer ts;
         ts.metrics_for_test = &reg;
@@ -1026,6 +1029,19 @@ TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labe
             R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
         CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
         CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 0.0);
+    }
+    SECTION("streaming mode also counts on a successful mint") {
+        yuzu::MetricsRegistry reg;
+        mcp::McpSessionRegistry sreg({.per_principal_cap = 4, .global_cap = 8});
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.session_registry_for_test = &sreg; // streaming ON
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Mcp-Session-Id").size() == 32); // minted -> streaming path
+        CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
     }
     SECTION("absent/unsupported revision counts under the baseline") {
         yuzu::MetricsRegistry reg;
@@ -1109,13 +1125,20 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         // never ship annotated non-destructive.
         if (operation == "Delete" || operation == "Execute")
             CHECK(destructive == true);
-        // Prose must not contradict the hint: a tool the machine calls
-        // non-destructive may not advertise itself as "Destructive" in prose.
-        if (!destructive) {
-            const auto desc = t["description"].get<std::string>();
-            INFO("description = " << desc);
+        // Prose must not contradict the hint, BOTH directions. Forward: a tool the
+        // machine calls non-destructive may not advertise itself as "Destructive".
+        // Reverse: an embedded literal "destructiveHint:<bool>" claim in the
+        // description must match the served hint — this catches the
+        // close_access_review-class reverse-drift (a destructive tool whose prose
+        // still says destructiveHint:false) that the forward check alone misses.
+        const auto desc = t["description"].get<std::string>();
+        INFO("description = " << desc);
+        if (!destructive)
             CHECK(desc.find("Destructive") == std::string::npos);
-        }
+        if (desc.find("destructiveHint:true") != std::string::npos)
+            CHECK(destructive == true);
+        if (desc.find("destructiveHint:false") != std::string::npos)
+            CHECK(destructive == false);
     }
 
     // Coverage the other direction: every dispatch-class tool is advertised.
@@ -1132,8 +1155,18 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         classified.insert(std::string(sv));
     CHECK(classified == listed);
 
-    // The four merged-annotation corrections this PR ships, asserted by name so a
-    // regression is caught explicitly (two were BLOCKING false-safes on dev).
+    // kWriteTools (the --mcp-read-only proactive guard set) must equal the non-Read
+    // dispatch class exactly, or a mutating tool could execute on a read-only
+    // server. Bind it here like the annotation table, closing the one keyed
+    // structure the surface otherwise leaves ungoverned (arch / consistency SHOULD).
+    std::set<std::string> write_tools, non_read;
+    for (const auto sv : mcp::write_tool_names_for_test())
+        write_tools.insert(std::string(sv));
+    for (const auto& [name, operation] : op)
+        if (operation != "Read")
+            non_read.insert(name);
+    CHECK(write_tools == non_read);
+
     auto ann = [&](const std::string& n) -> nlohmann::json {
         for (const auto& t : tools)
             if (t["name"] == n)
@@ -1141,11 +1174,33 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         REQUIRE(false); // the tool must exist
         return {};
     };
-    CHECK(ann("confirm_engine_rotation")["destructiveHint"] == true); // was false (false-safe)
-    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false); // was true (false-safe)
-    CHECK(ann("close_access_review")["destructiveHint"] == true);     // was false (false-safe)
-    CHECK(ann("create_engine_principal")["destructiveHint"] == false); // was true (over-warn)
-    CHECK(ann("mint_engine_credential")["destructiveHint"] == false);  // was true (over-warn)
+
+    // Write/Attest tools have NO mechanical destructive-floor (unlike Delete/Execute),
+    // so their destructiveHint truth rests on human + security-guardian review of the
+    // kToolAnnotation classification against each store's actual side effects. Pin
+    // every one by name here so a false-safe flip on this exact class (the A5-BLOCKING
+    // case, e.g. the confirm_engine_rotation / close_access_review bugs this PR fixed)
+    // is caught mechanically, not only in review (qa / unhappy-path SHOULD).
+    const struct {
+        const char* name;
+        bool destructive;
+    } kWriteAttestExpect[] = {
+        {"set_tag", true},          {"approve_request", true},
+        {"reject_request", true},   {"create_engine_principal", false}, // additive
+        {"revoke_engine_principal", true}, {"transfer_engine_principal_owner", true},
+        {"mint_engine_credential", false}, // additive
+        {"rotate_engine_credential", true}, {"confirm_engine_rotation", true}, // was false-safe
+        {"assign_engine_role", false},     // additive (INSERT OR IGNORE)
+        {"unassign_engine_role", true},    {"open_access_review", false}, // additive
+        {"record_attestation", true},      {"close_access_review", true}, // was false-safe
+    };
+    for (const auto& e : kWriteAttestExpect) {
+        INFO("write/attest tool = " << e.name);
+        CHECK(ann(e.name)["destructiveHint"] == e.destructive);
+    }
+    // confirm_engine_rotation is non-idempotent (takes only principal_id, does not
+    // pin the rotation) — the other shipped false-safe this PR corrected.
+    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false);
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────

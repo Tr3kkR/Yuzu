@@ -994,9 +994,11 @@ static const ToolDef kTools[] = {
      "Close an open review campaign. Does NOT require every attestation to be decided "
      "first — a campaign closed with pending rows still outstanding is itself evidence, "
      "not something this tool silently forces to completion. Mirrors POST "
-     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Finalizes "
-     "a campaign's lifecycle state — it does not destroy any evidence (attestation rows "
-     "are untouched), so destructiveHint:false. Requires AccessReview:Attest.",
+     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Closing is a "
+     "one-way lifecycle transition (no reopen path) that permanently freezes every still-pending "
+     "attestation, so destructiveHint:true; it deletes no evidence (attestation rows are "
+     "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
+     "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
      R"j("campaign_id":{"type":"string"})j"
      R"j(},"required":["campaign_id"]})j",
@@ -1292,8 +1294,16 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 // fires in a shipped build.
 std::string build_tool_annotations(const char* name) {
     auto it = kToolAnnotation.find(name);
-    if (it == kToolAnnotation.end())
+    if (it == kToolAnnotation.end()) {
+        // Unclassified tool -> fail SAFE (over-warn). Dead in a shipped build (the
+        // cross-check test asserts every kTools[] entry is classified), so a fire
+        // here means a tool reached production unclassified: log loudly (UP-1)
+        // rather than emit a silent over-warn.
+        spdlog::warn("MCP: tool '{}' has no kToolAnnotation entry; serving safe-fallback "
+                     "annotations (readOnly=false, destructive=true). Add it to kToolAnnotation.",
+                     name);
         return R"({"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false})";
+    }
     const ToolAnnotation& a = it->second;
     return JObj()
         .add("title", a.title)
@@ -7539,6 +7549,14 @@ std::vector<std::string_view> tool_annotation_names_for_test() {
     names.reserve(kToolAnnotation.size());
     for (const auto& [name, _ann] : kToolAnnotation)
         names.push_back(name);
+    return names;
+}
+
+std::vector<std::string_view> write_tool_names_for_test() {
+    std::vector<std::string_view> names;
+    names.reserve(kWriteTools.size());
+    for (const auto& n : kWriteTools)
+        names.push_back(n);
     return names;
 }
 
