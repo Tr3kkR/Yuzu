@@ -1198,9 +1198,28 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         INFO("write/attest tool = " << e.name);
         CHECK(ann(e.name)["destructiveHint"] == e.destructive);
     }
-    // confirm_engine_rotation is non-idempotent (takes only principal_id, does not
-    // pin the rotation) — the other shipped false-safe this PR corrected.
-    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false);
+    // confirm_engine_rotation is idempotent since #2384: the required token_id
+    // pins the confirm to the exact pending successor, so a same-args replay
+    // can only target the pair it was issued for — retry-while-pending
+    // confirms it (once); retry-after-cutover or across a later rotation is
+    // REJECTED with zero mutation (it errors, but errors safely — the MCP
+    // hint's no-additional-effect semantics, not same-response semantics).
+    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == true);
+
+    // The pin itself is part of the served contract: token_id must be present
+    // in confirm's input schema AND required — an agentic caller must not be
+    // able to discover an unpinned confirm.
+    for (const auto& t : tools) {
+        if (t["name"].get<std::string>() != "confirm_engine_rotation")
+            continue;
+        const auto& schema = t["inputSchema"];
+        REQUIRE(schema["properties"].contains("token_id"));
+        bool token_id_required = false;
+        for (const auto& r : schema["required"])
+            if (r.get<std::string>() == "token_id")
+                token_id_required = true;
+        CHECK(token_id_required);
+    }
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────

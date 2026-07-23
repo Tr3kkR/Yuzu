@@ -690,7 +690,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation confirmation unavailable, or initiated by a different operator"}, "503": {"description": "Store unavailable, or no in-flight rotation to confirm (ambiguous with a transient store read failure — retry, or rotate first if genuinely absent)"}}}
+      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "The required token_id pins the confirm to the exact pending rotation — pass the successor token_id the rotate response returned; a stale or mismatched id is rejected with no state change.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id"], "properties": {"token_id": {"type": "string", "maxLength": 64, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id missing, empty, or not a string"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "token_id does not match the pending rotation successor, rotation confirmation unavailable, or initiated by a different operator"}, "503": {"description": "Store unavailable, or no in-flight rotation to confirm (ambiguous with a transient store read failure — retry, or rotate first if genuinely absent)"}}}
     },
     "/engine-principals/{id}/transfer-owner": {
       "post": {"summary": "Admin-forced ownership reassignment of an engine principal", "tags": ["Security"], "description": "Never depends on the outgoing owner's cooperation (design §3.1).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_owner"], "properties": {"new_owner": {"type": "string", "description": "Must reference an existing user"}}}}}}, "responses": {"200": {"description": "Transferred; {transferred:true}"}, "400": {"description": "Bad JSON, or new_owner missing/does not reference an existing user"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active"}, "503": {"description": "Store unavailable"}}}
@@ -2937,18 +2937,20 @@ void RestApiV1::register_routes(
             (void)audit_fn(req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
                            principal_id, "rotate");
             // rotate_engine_credential returns only the raw secret; look up
-            // the successor (the newest active credential) for its token_id +
-            // expires_at/overlap_expires_at — mirrors the MCP
-            // rotate_engine_credential twin's correlation logic
-            // (mcp_server.cpp) so a pure-REST caller can correlate the
-            // credential it just minted without a follow-up GET.
+            // the successor for its token_id + expires_at/overlap_expires_at
+            // — mirrors the MCP rotate_engine_credential twin's correlation
+            // logic (mcp_server.cpp) so a pure-REST caller can correlate the
+            // credential it just minted without a follow-up GET. Selected
+            // STRUCTURALLY (the row whose supersedes_token_id links back to
+            // the predecessor), NOT by newest created_at — created_at is
+            // second-resolution, so a same-second mint→rotate ties and the
+            // newest-scan could return the predecessor's id, which would
+            // break the #2384 confirm token_id pin.
             std::string successor_token_id;
-            int64_t successor_created_at = -1;
             int64_t successor_expires_at = 0;
             int64_t successor_overlap_expires_at = 0;
             for (const auto& t : token_store->list_active_for_principal(principal_id)) {
-                if (t.created_at > successor_created_at) {
-                    successor_created_at = t.created_at;
+                if (!t.supersedes_token_id.empty()) {
                     successor_token_id = t.token_id;
                     successor_expires_at = t.expires_at;
                     successor_overlap_expires_at = t.overlap_expires_at;
@@ -2997,7 +2999,26 @@ void RestApiV1::register_routes(
                 return;
 
             auto principal_id = req.matches[1].str();
-            auto confirmed = token_store->confirm_rotation(principal_id, session->username);
+            // #2384: the caller must pin the exact rotation being confirmed
+            // with the successor token_id the rotate response returned.
+            // Parsed AFTER the perm/auth/deny/step-up belt above so body
+            // validation can never become an unauthenticated oracle. Robust
+            // against non-object JSON and wrong-typed values — body.value()
+            // alone would throw on those.
+            const auto body = nlohmann::json::parse(req.body, nullptr, false);
+            std::string confirm_token_id;
+            if (!body.is_discarded() && body.is_object() && body.contains("token_id") &&
+                body["token_id"].is_string())
+                confirm_token_id = body["token_id"].get<std::string>();
+            if (confirm_token_id.empty()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "token_id required"), "application/json");
+                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
+                               "EnginePrincipal", principal_id, "token_id required");
+                return;
+            }
+            auto confirmed =
+                token_store->confirm_rotation(principal_id, confirm_token_id, session->username);
             if (!confirmed) {
                 res.status = engine_store_error_status(confirmed.error());
                 res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
@@ -3005,8 +3026,11 @@ void RestApiV1::register_routes(
                                "EnginePrincipal", principal_id, confirmed.error());
                 return;
             }
+            // Success detail records WHICH credential was confirmed — the
+            // store validated confirm_token_id equals the pending successor's
+            // token_id, so this is server-verified and not the raw secret.
             (void)audit_fn(req, "engine_principal.credential.confirm", "success", "EnginePrincipal",
-                           principal_id, "");
+                           principal_id, "token_id=" + confirm_token_id);
             res.set_content(ok_json(JObj().add("confirmed", true).str()), "application/json");
         });
 

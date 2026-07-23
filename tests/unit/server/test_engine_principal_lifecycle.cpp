@@ -290,9 +290,18 @@ struct RestEngineHarness {
 
     auto list() { return sink.Get("/api/v1/engine-principals"); }
 
+    /// No-body variant kept deliberately: the 403/engine-deny/step-up order
+    /// tests post "{}" to prove the denial belt fires BEFORE body validation
+    /// (#2384 added the required token_id, parsed after the belt).
     auto confirm(const std::string& principal_id) {
         return sink.Post(
             "/api/v1/engine-principals/" + principal_id + "/credentials/confirm", "{}");
+    }
+
+    auto confirm(const std::string& principal_id, const std::string& token_id) {
+        nlohmann::json body{{"token_id", token_id}};
+        return sink.Post(
+            "/api/v1/engine-principals/" + principal_id + "/credentials/confirm", body.dump());
     }
 
     auto no_admin_audit() { return sink.Get("/api/v1/engine-principals/audit/no-admin"); }
@@ -345,6 +354,19 @@ TEST_CASE("Engine-principal REST: 401 without step-up on a mutating route",
     h.step_up_allow = false;
 
     auto res = h.create("gate-test");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+}
+
+TEST_CASE("Engine-principal REST: confirm's step-up denial precedes body validation — "
+          "an empty body still 401s, never a 400 oracle (#2384)",
+          "[pg][rest][engine_principal][gate][confirm]") {
+    RestEngineHarness h;
+    h.step_up_allow = false;
+
+    // "{}" body is missing the now-required token_id, but the step-up gate
+    // must fire FIRST — body validation is parsed after the full denial belt.
+    auto res = h.confirm("engine:whatever");
     REQUIRE(res);
     CHECK(res->status == 401);
 }
@@ -863,8 +885,15 @@ TEST_CASE("Engine-principal REST: POST .../credentials/confirm dispatched throug
     REQUIRE(rot->status == 200);
     CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2); // overlap pair live
 
-    // Same operator ("alice") who initiated the rotation confirms it.
-    auto res = h.confirm(principal_id);
+    // The rotate response returns the successor token_id — the value the
+    // #2384 pin requires the confirm caller to pass back.
+    const auto successor_token_id =
+        nlohmann::json::parse(rot->body)["data"]["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    // Same operator ("alice") who initiated the rotation confirms it,
+    // pinning the exact rotation with the successor id from the response.
+    auto res = h.confirm(principal_id, successor_token_id);
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
@@ -877,13 +906,81 @@ TEST_CASE("Engine-principal REST: POST .../credentials/confirm dispatched throug
     auto active = h.token_store->list_active_for_principal(principal_id);
     REQUIRE(active.size() == 1);
     CHECK(active[0].rotation_group.empty());
+    CHECK(active[0].token_id == successor_token_id); // rotate returned the REAL successor
 
     bool found_audit = false;
     for (const auto& a : h.audit_log) {
-        if (a.action == "engine_principal.credential.confirm" && a.result == "success")
+        if (a.action == "engine_principal.credential.confirm" && a.result == "success" &&
+            a.detail.find("token_id=" + successor_token_id) != std::string::npos)
             found_audit = true;
     }
     CHECK(found_audit);
+}
+
+TEST_CASE("Engine-principal REST: confirm with a mismatched or missing token_id is "
+          "rejected without touching the rotation (#2384 pin)",
+          "[pg][rest][engine_principal][confirm]") {
+    RestEngineHarness h;
+    auto [principal_id, raw1] = h.create_and_mint("confirm-pin");
+    (void)raw1;
+    h.session_user = "alice";
+
+    auto rot = h.rotate(principal_id);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    const auto successor_token_id =
+        nlohmann::json::parse(rot->body)["data"]["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    // Regression (#2384): the rotate response must return the STRUCTURAL
+    // successor (supersedes_token_id links to the predecessor), never the
+    // newest-created_at row — mint→rotate in this test runs within one
+    // second, so created_at ties and the old newest-scan could return the
+    // predecessor's id, which would break the confirm pin below.
+    std::string structural_successor_id;
+    for (const auto& t : h.token_store->list_active_for_principal(principal_id))
+        if (!t.supersedes_token_id.empty())
+            structural_successor_id = t.token_id;
+    CHECK(successor_token_id == structural_successor_id);
+
+    // Mismatched id → 409 Conflict + failure audit; both credentials intact.
+    auto mismatch = h.confirm(principal_id, "feedfacefeedfacefeedface");
+    REQUIRE(mismatch);
+    CHECK(mismatch->status == 409);
+    CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
+    bool found_fail_audit = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "engine_principal.credential.confirm" && a.result == "failure" &&
+            a.detail.find("does not match the pending rotation") != std::string::npos)
+            found_fail_audit = true;
+    }
+    CHECK(found_fail_audit);
+
+    // Missing token_id ("{}" body) → 400; malformed / non-object / wrong-typed
+    // bodies take the same 400 path (parse hardening, never a throw).
+    auto missing = h.confirm(principal_id);
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+    auto malformed = h.sink.Post(
+        "/api/v1/engine-principals/" + principal_id + "/credentials/confirm", "not json{");
+    REQUIRE(malformed);
+    CHECK(malformed->status == 400);
+    auto non_object = h.sink.Post(
+        "/api/v1/engine-principals/" + principal_id + "/credentials/confirm", R"(["x"])");
+    REQUIRE(non_object);
+    CHECK(non_object->status == 400);
+    auto wrong_type = h.sink.Post(
+        "/api/v1/engine-principals/" + principal_id + "/credentials/confirm",
+        R"({"token_id": 5})");
+    REQUIRE(wrong_type);
+    CHECK(wrong_type->status == 400);
+
+    // The rotation is untouched by all of the above — the correct id still
+    // confirms it.
+    CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
+    auto res = h.confirm(principal_id, successor_token_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 TEST_CASE("Engine-principal REST: transfer-owner 200 success path (previously "
