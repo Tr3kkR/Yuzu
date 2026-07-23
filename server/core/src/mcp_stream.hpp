@@ -284,15 +284,31 @@ public:
 
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
     /// inside publish_impl are internal string/deque allocations with no callback to
-    /// throw through (the repo's usual injection idiom), so the two failure phases the
+    /// throw through (the repo's usual injection idiom), so the THREE failure phases the
     /// #2366 boundary distinguishes get explicit trip points instead. One-shot: the
     /// fault fires on the next publish and resets to kNone.
     enum class PublishFault {
         kNone,
         kPreCommit,    ///< models the ring push_back allocation failing (nothing committed)
         kSinkEnqueue,  ///< models the live-sink enqueue copy failing (frame already committed)
+        /// Models the POST-COMMIT observability block (metric increment / WARN format)
+        /// throwing after the frame is committed. Exercises publish_impl's innermost
+        /// `catch(...)` — the guarantee that a metrics/log allocation fault never turns a
+        /// committed publish into a 0 return. Fires inside that try, so it never reaches
+        /// publish()'s outer boundary: publish returns the committed id.
+        kPostCommitObservability,
     };
     void inject_publish_fault_for_test(PublishFault fault);
+
+    /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s
+    /// rare WARN lines so an operator can attribute a dropped/anomalous frame to a session.
+    ///
+    /// Threading: WRITE-ONCE, called at mint BEFORE the stream is shared with any other
+    /// thread (McpSessionRegistry::mint, before the Entry is emplaced). Effectively
+    /// immutable thereafter, so publish()'s reads need no lock — the registry mutex + the
+    /// shared_ptr handoff at emplace are the happens-before edge to every later reader.
+    /// Do NOT call it after the stream is live.
+    void set_log_context(std::string context);
 
     enum class AttachStatus {
         kAttached,
@@ -373,6 +389,9 @@ private:
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
     PublishFault publish_fault_ = PublishFault::kNone;  ///< test seam; guarded by mu_
+    // Write-once at mint before the stream is shared (set_log_context contract); read
+    // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.
+    std::string log_context_;
     std::shared_ptr<McpStreamSink> live_;
     std::shared_ptr<McpStreamSink> draining_;  ///< superseded, still pinning its worker
     yuzu::MetricsRegistry* metrics_ = nullptr;

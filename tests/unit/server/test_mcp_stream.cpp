@@ -960,3 +960,54 @@ TEST_CASE("McpStreamState: a pre-commit failure increments the publish-failures 
     CHECK(state.publish("message", "lost") == 0);
     CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
 }
+
+TEST_CASE("McpStreamState: a post-commit observability fault never un-commits the frame (#2366)",
+          "[mcp][stream]") {
+    // The #2366 boundary must distinguish PRE-commit from POST-commit failure. A throw from
+    // the observability block (a metric increment or the enriched WARN format allocating
+    // under memory pressure) fires AFTER the frame is committed, so it must be swallowed and
+    // the committed id returned — never converted into a 0 the caller reads as "not
+    // published" (the asymmetric caller-obligation the contract turns on). Live registry so
+    // the innermost catch runs on the real path, not the nullptr short-circuit.
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    state->set_log_context("sid=deadbeef");
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_publish_fault_for_test(
+        mcp::McpStreamState::PublishFault::kPostCommitObservability);
+    std::uint64_t id = 0;
+    CHECK_NOTHROW(id = state->publish("message", "committed-despite-obs-fault"));
+    CHECK(id == 1);                     // committed id returned, NOT 0
+    CHECK(state->next_event_id() == 2); // the id was consumed — the frame IS in the ring
+
+    // The frame reached the sink BEFORE the observability throw (enqueue is under mu_; the
+    // observability block runs post-lock), so delivery is entirely unaffected — this is a
+    // swallowed server-side breadcrumb fault, not a dropped frame.
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        REQUIRE(attached.sink->sse->queue.size() == 1);
+        CHECK(attached.sink->sse->queue.front().data == "committed-despite-obs-fault");
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 0);
+
+    // One-shot: the fault does not linger — the very next publish takes id 2 cleanly.
+    CHECK(state->publish("message", "clean") == 2);
+}
+
+TEST_CASE("McpStreamState: set_log_context does not weaken the publish boundary (#2366)",
+          "[mcp][stream]") {
+    // The enriched WARN lines interpolate the session context and the event_type; that
+    // format + metric lookup allocates and runs inside the boundary's nested guard. So even
+    // a pre-commit failure with a context set must still return a clean 0 and count the
+    // failure — the enrichment must never become an escape hatch out of the boundary.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    state.set_log_context("sid=cafef00d");
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    std::uint64_t id = 7;
+    CHECK_NOTHROW(id = state.publish("progress", "lost"));
+    CHECK(id == 0);
+    CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
+}

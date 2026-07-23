@@ -198,7 +198,13 @@ std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_v
             if (metrics_ != nullptr) {
                 metrics_->counter(kMetricPublishFailures).increment();
             }
-            spdlog::warn("MCP stream publish: frame dropped pre-commit (exception contained)");
+            // Enriched so an operator can attribute the loss: the session (log_context_,
+            // set once at mint — safe to read unlocked) and the event_type that never
+            // reached the ring. Both the format and the metric lookup allocate; the nested
+            // guard contains a bad_alloc from either.
+            spdlog::warn("MCP stream publish [{}]: frame dropped pre-commit "
+                         "(event_type={}, exception contained)",
+                         log_context_, event_type);
         } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
         }
         return 0;
@@ -208,6 +214,13 @@ std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_v
 void McpStreamState::inject_publish_fault_for_test(PublishFault fault) {
     std::lock_guard<std::mutex> lk(mu_);
     publish_fault_ = fault;
+}
+
+void McpStreamState::set_log_context(std::string context) {
+    // No lock: write-once at mint before the stream is shared (see the header contract).
+    // Locking here would give false comfort — publish()'s reads are unlocked by design and
+    // are made safe by the mint-time happens-before edge, not by this write's own lock.
+    log_context_ = std::move(context);
 }
 
 std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
@@ -223,6 +236,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     std::uint64_t evicted = 0;
     bool oversized = false;
     bool sink_enqueue_failed = false;
+    bool post_commit_obs_fault = false;  // test seam; tripped inside the post-commit try
     {
         // A single frame must not exceed the ring's byte budget, or the "always keep the
         // newest frame" rule below would admit it whole and the byte cap would bound
@@ -256,6 +270,10 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         if (fault == PublishFault::kPreCommit) {
             throw std::bad_alloc{};
         }
+        // Latched out of the block so it can trip the POST-COMMIT observability try below
+        // (after the frame is committed), not here. `fault` is block-scoped and consumed
+        // one-shot above, so carry the intent in a bool like sink_enqueue_failed.
+        post_commit_obs_fault = (fault == PublishFault::kPostCommitObservability);
         // Ordering is the fix for #2366 (the stream_budget.hpp "every allocating step
         // happens before any counter moves" template): read next_id_ WITHOUT
         // incrementing, do every allocating step (sanitize, frame construction, the
@@ -343,13 +361,22 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     // takes the registry lock — a throw here must not turn a committed publish into a
     // 0 return (the boundary's catch cannot tell it apart from a pre-commit failure).
     try {
+        // TEST SEAM: model the observability block itself throwing (a metric increment or
+        // WARN format allocating under memory pressure) AFTER the frame is committed. The
+        // enclosing catch is the #2366 guarantee under test — a fault here must NOT turn a
+        // committed publish into a 0 return, so publish_impl still returns `id`.
+        if (post_commit_obs_fault) {
+            throw std::bad_alloc{};
+        }
         if (sink_enqueue_failed) {
             // Cause-honest and rare: a post-commit allocation fault, NOT a slow consumer
             // (which is counted silently per-event). The client already learns of the gap
             // via events-dropped; this is the server-side breadcrumb an operator correlates
-            // with memory pressure.
-            spdlog::warn("MCP stream publish: live-sink enqueue failed post-commit — frame "
-                         "is in the ring, client resyncs via events-dropped");
+            // with memory pressure. Enriched with the session and the committed frame id
+            // (event_type was moved into the ring above; the id is the useful handle here).
+            spdlog::warn("MCP stream publish [{}]: live-sink enqueue failed post-commit — "
+                         "frame id={} is in the ring, client resyncs via events-dropped",
+                         log_context_, id);
         }
         if (evicted > 0 && metrics_ != nullptr) {
             metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
