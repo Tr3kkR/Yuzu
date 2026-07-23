@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <new> // std::bad_alloc — the publish() fault-injection seam throws it
 #include <random>
 #include <functional>
 #include <string_view>
@@ -50,6 +51,7 @@ constexpr const char* kMetricStreamRejects = "yuzu_mcp_stream_rejects_total";
 constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
 constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
 constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large_total";
+constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -173,7 +175,37 @@ McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metr
     }
 }
 
-std::uint64_t McpStreamState::publish(std::string event_type, std::string data) {
+std::uint64_t McpStreamState::publish(std::string event_type, std::string data) noexcept {
+    // HARD exception boundary (#2366) — the pump_once/pump_once_impl pattern. PR 3's
+    // progress bridge calls this from an ExecutionEventBus listener on a worker task
+    // httplib's routing try/catch never sees, so an escaped throw is std::terminate
+    // (the #2037 class). publish_impl contains every post-commit fault itself, so an
+    // exception reaching this catch proves the ring and next_id_ are untouched — 0
+    // ("not published, no id consumed") is the honest answer, and the caller's frame
+    // simply never happened rather than silently gapping Last-Event-ID.
+    try {
+        return publish_impl(std::move(event_type), std::move(data));
+    } catch (...) {
+        // Best-effort observability only — the metric lookup and the log line both
+        // allocate, and under bad_alloc a throw from THIS handler would propagate
+        // straight out of the boundary it implements. Nested guard, same as pump_once.
+        try {
+            if (metrics_ != nullptr) {
+                metrics_->counter(kMetricPublishFailures).increment();
+            }
+            spdlog::warn("MCP stream publish: frame dropped pre-commit (exception contained)");
+        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
+        }
+        return 0;
+    }
+}
+
+void McpStreamState::inject_publish_fault_for_test(PublishFault fault) {
+    std::lock_guard<std::mutex> lk(mu_);
+    publish_fault_ = fault;
+}
+
+std::uint64_t McpStreamState::publish_impl(std::string event_type, std::string data) {
     std::shared_ptr<McpStreamSink> live;
     std::uint64_t id = 0;
     std::uint64_t evicted = 0;
@@ -201,9 +233,22 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
             oversized = true;
         }
         std::lock_guard<std::mutex> lk(mu_);
-        id = next_id_++;
+        if (publish_fault_ == PublishFault::kPreCommit) {
+            publish_fault_ = PublishFault::kNone;  // one-shot
+            throw std::bad_alloc{};
+        }
+        // Ordering is the fix for #2366 (the stream_budget.hpp "every allocating step
+        // happens before any counter moves" template): read next_id_ WITHOUT
+        // incrementing, do every allocating step (sanitize, frame construction, the
+        // deque node push), and only then advance the id. A throw from push_back
+        // (strong guarantee — deque unchanged) therefore leaves next_id_ untouched too:
+        // no permanent hole in the id space, no silent Last-Event-ID gap. The old
+        // `id = next_id_++` BEFORE the push consumed the id even when the push failed.
+        id = next_id_;
         ring_.push_back(sse_bus::SseEvent{sanitize_event_type(std::move(event_type)),
                                           std::move(data), id});
+        // ── COMMITTED from here: everything below is noexcept or locally contained. ──
+        ++next_id_;
         while (ring_.size() > ring_cap_ ||
                (ring_bytes_ + frame_bytes(ring_.back()) > ring_bytes_cap_ && ring_.size() > 1)) {
             // Bounded on BOTH axes (Decision 15(d)). The frame count alone is not a memory
@@ -225,19 +270,43 @@ std::uint64_t McpStreamState::publish(std::string event_type, std::string data) 
         // never blocks on I/O or calls back into us.
         live = live_;
         if (live) {
-            sse_bus::enqueue_capped(live->sse, ring_.back(), ring_cap_);
+            // Post-commit containment (#2366): enqueue_capped takes the SseEvent BY
+            // VALUE, so the copy of ring_.back() at the call boundary is itself an
+            // allocation that can throw — with the frame already committed to the ring.
+            // Contain it HERE and convert it into the existing slow-consumer gap signal:
+            // dropped_total is a lock-free atomic the pump already turns into the
+            // `events-dropped` synthetic on its next tick, so the client learns a frame
+            // never reached the wire and recovers it via Last-Event-ID replay (the ring
+            // still holds it). Letting the throw escape instead would return 0 for a
+            // frame that IS in the ring — a lie in both directions.
+            try {
+                if (publish_fault_ == PublishFault::kSinkEnqueue) {
+                    publish_fault_ = PublishFault::kNone;  // one-shot
+                    throw std::bad_alloc{};
+                }
+                sse_bus::enqueue_capped(live->sse, ring_.back(), ring_cap_);
+            } catch (...) {
+                live->sse->dropped_total.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     if (live) {
         live->sse->cv.notify_one(); // outside mu_ — no need to hold it to wake a waiter
     }
-    if (evicted > 0 && metrics_ != nullptr) {
-        metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
-    }
-    if (oversized && metrics_ != nullptr) {
-        // Counted, not just logged: an unbounded warn-per-publish is a log-flood vector,
-        // and a new failure mode nobody can alert on is a failure mode nobody sees.
-        metrics_->counter(kMetricFramesTruncated).increment();
+    // Post-commit best-effort: Counter::increment allocates on a family's first use and
+    // takes the registry lock — a throw here must not turn a committed publish into a
+    // 0 return (the boundary's catch cannot tell it apart from a pre-commit failure).
+    try {
+        if (evicted > 0 && metrics_ != nullptr) {
+            metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
+        }
+        if (oversized && metrics_ != nullptr) {
+            // Counted, not just logged: an unbounded warn-per-publish is a log-flood
+            // vector, and a new failure mode nobody can alert on is a failure mode
+            // nobody sees.
+            metrics_->counter(kMetricFramesTruncated).increment();
+        }
+    } catch (...) {  // NOLINT(bugprone-empty-catch) — observability must not un-commit
     }
     return id;
 }
