@@ -330,6 +330,32 @@ catalogue). Each tool maps to a specific RBAC
 securable type and operation. The tier check and RBAC check both must pass
 for the tool to execute.
 
+> **Tool annotations (2g PR 2).** Every tool now advertises the four standard
+> MCP annotation hints — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+> `openWorldHint` — plus a human-readable `title`. They are generated from a
+> single-source classification (`kToolAnnotation` in `mcp_server.cpp`), so the
+> served hints cannot drift from the reviewed table, and a CI cross-check test
+> enforces their presence and coherence with each tool's dispatch class on every
+> merge. `destructiveHint` means "may overwrite, remove, or irreversibly
+> transition existing state" — it is deliberately **independent of approval
+> tier** (an approval-gated tool can be additive, e.g. `create_engine_principal`;
+> a destructive tool need not be approval-gated, e.g. `record_attestation`). The
+> hint is **advisory UX only** — the tier + maker-checker approval gate is the
+> enforcement, and a client that ignores every hint still cannot run an
+> approval-gated tool without a ticket.
+>
+> **Upgrade note — confirmation UX.** A connected agentic worker that renders a
+> confirmation prompt off `destructiveHint` will, for the first time, prompt on
+> the write tools that previously carried no annotation (`execute_instruction`,
+> `execute_bundle`, `set_tag`, `delete_tag`, `approve_request`, `reject_request`,
+> `quarantine_device`, `revoke_certificate`). This PR also **corrects three
+> shipped false-safe hints** — `confirm_engine_rotation` (`destructiveHint`
+> `false`→`true`, `idempotentHint` `true`→`false`; it revokes the predecessor
+> credential and does not pin the rotation) and `close_access_review`
+> (`destructiveHint` `false`→`true`) — and downgrades two over-warnings
+> (`create_engine_principal`, `mint_engine_credential` `destructiveHint`
+> `true`→`false`; both are additive).
+
 | # | Tool | Description | RBAC Permission |
 |---|------|-------------|-----------------|
 | 1 | `list_agents` | List all connected agents with hostname, OS, architecture, and version. | `Infrastructure:Read` |
@@ -400,7 +426,7 @@ for the tool to execute.
 | 66 | `record_attestation` (SOC 2 CC6.2) | Record one reviewer decision against a grant frozen into an open campaign — `attested` (still appropriate) or `flagged_revoke` (should be revoked). **flag ≠ revoke: this tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant.** Acting on a `flagged_revoke` decision is a separate, explicit role-unassignment or engine-principal-revoke call an operator makes after reading this evidence. **UPSERT — `destructiveHint:true`:** a second call for the same `(campaign_id, principal_type, principal_id, role_name)` overwrites the prior reviewer's decision/reviewer/justification; the earlier decision is not retained. Mirrors `POST /api/v1/access-reviews/{id}/attestations`. Self-audited as `access_review.attested` or `access_review.flagged` (by decision). | `AuditLog:Attest` |
 | 67 | `get_access_review` (SOC 2 CC6.2) | Full evidentiary state of one review campaign: metadata plus every frozen attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`. Mirrors `GET /api/v1/access-reviews/{id}`. Self-audited as `access_review.get`. | `AuditLog:Read` |
 | 68 | `list_access_reviews` (SOC 2 CC6.2) | List every review campaign's metadata (**not** its attestations — use `get_access_review` for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence without already knowing a `campaign_id` out-of-band. Mirrors `GET /api/v1/access-reviews`. Self-audited as `access_review.list`. | `AuditLog:Read` |
-| 69 | `close_access_review` (SOC 2 CC6.2) | Close an open review campaign. Does **not** require every attestation to be decided first — a campaign closed with `pending` rows still outstanding is itself evidence (an incomplete review), not something this tool silently forces to completion. Does not destroy any evidence (attestation rows are untouched) — `destructiveHint:false`. Mirrors `POST /api/v1/access-reviews/{id}/close`. Self-audited as `access_review.closed`. | `AuditLog:Attest` |
+| 69 | `close_access_review` (SOC 2 CC6.2) | Close an open review campaign. Does **not** require every attestation to be decided first — a campaign closed with `pending` rows still outstanding is itself evidence (an incomplete review), not something this tool silently forces to completion. Closing is a **one-way lifecycle transition** (there is no reopen path) that permanently freezes every still-`pending` attestation — `destructiveHint:true`. It deletes no evidence (attestation rows are untouched), but the campaign's own `open`→`closed` state is irreversibly transitioned, which is what the hint reflects (corrected from a shipped `destructiveHint:false` — 2g PR 2). Mirrors `POST /api/v1/access-reviews/{id}/close`. Self-audited as `access_review.closed`. | `AuditLog:Attest` |
 
 > **Engine-principal tools — tier behavior (ADR-1005 item 2b, plan PR 4.3):**
 > the six **mutating** tools (`create_engine_principal`, `revoke_engine_principal`,
@@ -493,7 +519,7 @@ for the tool to execute.
 > Each is a read-only mirror of its `GET /api/v1/discover/*` REST sibling (see `docs/user-manual/rest-api.md` → Discovery (A2) for the full response shapes) — both surfaces call the SAME builder function internally, so they cannot drift from each other. Take no arguments. `discover_scope_kinds` and `discover_routes` are compiled-in/self-contained and always answer; `discover_permissions`/`discover_instructions`/`discover_plugins` return a JSON-RPC error if the underlying store/agent registry is unavailable server-side (there is no HTTP-status channel in JSON-RPC for the REST siblings' `503`). None of the five write anything or require an audit-worthy per-device read, so none is gated by MCP tier beyond the standard RBAC permission check, and none appears in the executions drawer.
 
 > **Periodic access review tools (`export_access_review`/`open_access_review`/`record_attestation`/`get_access_review`/`list_access_reviews`/`close_access_review`) — SOC 2 CC6.2:**
-> Full REST + concept doc: `docs/user-manual/rest-api.md` → Access Reviews, `docs/auth-architecture.md` → "Periodic access reviews". `export_access_review`, `get_access_review`, and `list_access_reviews` are `readOnlyHint:true`. **`record_attestation` carries `destructiveHint:true`** — it is an UPSERT: a second call for the same `(campaign_id, principal_type, principal_id, role_name)` overwrites the prior reviewer's decision/reviewer/justification, with no retained history of the earlier decision. Every other tool (`export_access_review`, `open_access_review`, `get_access_review`, `list_access_reviews`, `close_access_review`) is `destructiveHint:false` — `open_access_review` and `close_access_review` mint/finalize campaign evidence but never touch a live access grant. **flag ≠ revoke:** `record_attestation`'s `decision:"flagged_revoke"` records that a reviewer believes a grant should be revoked — it never itself unassigns a role or revokes an engine principal; acting on the flag is a separate, explicit operator action (the destructive part of the annotation is the decision-overwrite, not a live grant mutation). JSON only — the REST `?format=csv` export path has no MCP twin; use the REST endpoint directly for a CSV download. All six tools are gated on a **global** `AuditLog:Read`/`AuditLog:Attest`, deliberately not the ADR-0017 confinement-filtered list gate — a scoped slice of the grant population would be useless as fleet-wide CC6.2 evidence (#2225) — and every one of them, reads included, structurally denies a caller whose own session is engine-classed.
+> Full REST + concept doc: `docs/user-manual/rest-api.md` → Access Reviews, `docs/auth-architecture.md` → "Periodic access reviews". `export_access_review`, `get_access_review`, and `list_access_reviews` are `readOnlyHint:true`. **`record_attestation` carries `destructiveHint:true`** — it is an UPSERT: a second call for the same `(campaign_id, principal_type, principal_id, role_name)` overwrites the prior reviewer's decision/reviewer/justification, with no retained history of the earlier decision. `close_access_review` also carries `destructiveHint:true` — closing is a one-way lifecycle transition (no reopen path) that permanently freezes outstanding attestations. The other four (`export_access_review`, `open_access_review`, `get_access_review`, `list_access_reviews`) are `destructiveHint:false` — `open_access_review` mints campaign evidence but never touches a live access grant. **flag ≠ revoke:** `record_attestation`'s `decision:"flagged_revoke"` records that a reviewer believes a grant should be revoked — it never itself unassigns a role or revokes an engine principal; acting on the flag is a separate, explicit operator action (the destructive part of the annotation is the decision-overwrite, not a live grant mutation). JSON only — the REST `?format=csv` export path has no MCP twin; use the REST endpoint directly for a CSV download. All six tools are gated on a **global** `AuditLog:Read`/`AuditLog:Attest`, deliberately not the ADR-0017 confinement-filtered list gate — a scoped slice of the grant population would be useless as fleet-wide CC6.2 evidence (#2225) — and every one of them, reads included, structurally denies a caller whose own session is engine-classed.
 
 ### Tool parameters
 
