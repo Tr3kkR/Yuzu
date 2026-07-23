@@ -11,6 +11,7 @@
  */
 
 #include "mcp_jsonrpc.hpp"
+#include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
 
 #include "agent_registry.hpp"
@@ -896,7 +897,7 @@ private:
             /*response_scope_fn=*/response_scope_fn_for_test,
             /*software_inventory_store=*/software_inventory_store_for_test,
             /*inventory_scope_fn=*/inventory_scope_fn_for_test,
-            /*metrics=*/nullptr,
+            /*metrics=*/metrics_for_test,
             /*app_perf_providers=*/app_perf_providers_for_test,
             /*quarantine_store=*/quarantine_store_for_test,
             /*tag_push_fn=*/
@@ -938,6 +939,268 @@ TEST_CASE("MCP Integration: initialize handshake", "[mcp][integration]") {
     CHECK(result["capabilities"].contains("tools"));
     CHECK(result["capabilities"].contains("resources"));
     CHECK(result["capabilities"].contains("prompts"));
+}
+
+// ── 1b. 2g PR 1: initialize.instructions orientation blob ───────────────────
+
+TEST_CASE("MCP 2g: initialize returns a non-empty instructions orientation blob",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["result"].contains("instructions"));
+    const auto blob = body["result"]["instructions"].get<std::string>();
+    CHECK_FALSE(blob.empty());
+    // Single-source proof: the handshake blob CONTAINS the two resource texts
+    // verbatim, so yuzu://about / yuzu://operating-model cannot drift from it.
+    CHECK(blob.find(std::string(mcp::about_text())) != std::string::npos);
+    CHECK(blob.find(std::string(mcp::operating_model_text())) != std::string::npos);
+    // The blob returned over the wire is exactly the shared source.
+    CHECK(blob == mcp::initialize_instructions());
+}
+
+TEST_CASE("MCP 2g: yuzu://about and yuzu://operating-model are single-sourced with the blob",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto about = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":1,"params":{"uri":"yuzu://about"}})");
+    auto ab = nlohmann::json::parse(about->body);
+    CHECK(ab["result"]["contents"][0]["text"].get<std::string>() == std::string(mcp::about_text()));
+
+    auto om = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":2,"params":{"uri":"yuzu://operating-model"}})");
+    auto ob = nlohmann::json::parse(om->body);
+    CHECK(ob["result"]["contents"][0]["text"].get<std::string>() ==
+          std::string(mcp::operating_model_text()));
+}
+
+TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    const auto blob = nlohmann::json::parse(res->body)["result"]["instructions"].get<std::string>();
+    for (const auto& fam : mcp::tool_families())
+        CHECK(blob.find(std::string(fam.name)) != std::string::npos);
+}
+
+TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness tether B)",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    // Every tool belongs to exactly one family (no dup across families).
+    std::set<std::string> family_tools;
+    for (const auto& fam : mcp::tool_families())
+        for (const auto& t : fam.tools)
+            CHECK(family_tools.insert(std::string(t)).second);
+
+    // The advertised surface (tools/list is tier-independent — it iterates all
+    // kTools[]) must match the family union exactly. A new tool with no family
+    // (or a family listing a removed tool) fails HERE, mechanically.
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::set<std::string> live;
+    for (const auto& t : tools)
+        live.insert(t["name"].get<std::string>());
+    CHECK(family_tools == live);
+}
+
+TEST_CASE("MCP 2g: initialize records the negotiated protocol revision on a labeled counter",
+          "[mcp][2g]") {
+    const std::string kCtr = "yuzu_mcp_initialize_protocol_total";
+
+    // Sections 1-2 wire NO session registry -> streaming OFF -> the STATELESS
+    // initialize path. Section "streaming mode..." wires one to prove the counter
+    // also fires on the streaming/session-minting path (the source claims both).
+    SECTION("supported client revision is echoed and counted (stateless)") {
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.start();
+        ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 0.0);
+    }
+    SECTION("streaming mode also counts on a successful mint") {
+        yuzu::MetricsRegistry reg;
+        mcp::McpSessionRegistry sreg({.per_principal_cap = 4, .global_cap = 8});
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.session_registry_for_test = &sreg; // streaming ON
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18"}})");
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Mcp-Session-Id").size() == 32); // minted -> streaming path
+        CHECK(reg.counter(kCtr, {{"revision", "2025-06-18"}}).value() == 1.0);
+    }
+    SECTION("absent/unsupported revision counts under the baseline") {
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.start();
+        ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        ts.call(
+            R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{"protocolVersion":"2099-01-01"}})");
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 2.0);
+    }
+    SECTION("a 429 session-cap reject is NOT counted") {
+        yuzu::MetricsRegistry reg;
+        mcp::McpSessionRegistry sreg({.per_principal_cap = 1, .global_cap = 8});
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.session_registry_for_test = &sreg;
+        ts.start();
+        auto first = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+        CHECK(first->status == 200); // mints the one allowed session → counts once
+        auto rejected = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":2,"params":{}})");
+        CHECK(rejected->status == 429);
+        // Still 1: the reject returned before the counter increment.
+        CHECK(reg.counter(kCtr, {{"revision", "2025-03-26"}}).value() == 1.0);
+    }
+}
+
+// ── 1c. 2g PR 2: tool annotations present + truthful (cross-check) ───────────
+
+TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with the dispatch class",
+          "[mcp][2g]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+
+    // operation per tool, straight from the internal dispatch table
+    std::unordered_map<std::string, std::string> op;
+    for (const auto& r : mcp::tool_security_rows_for_test())
+        op[std::string(r.name)] = std::string(r.operation);
+
+    std::set<std::string> listed;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        listed.insert(name);
+        INFO("tool = " << name);
+
+        // Coverage: every listed tool has a dispatch-class entry.
+        REQUIRE(op.count(name) == 1);
+        const std::string& operation = op[name];
+
+        // Presence: all four spec hints, as booleans. MCP's absent-defaults are
+        // wrong-direction (openWorldHint + destructiveHint both default true), so
+        // an omitted hint is a FAILURE — this is the CI backstop for every future
+        // tool, governed or not.
+        REQUIRE(t.contains("annotations"));
+        const auto& a = t["annotations"];
+        for (const char* key :
+             {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"}) {
+            INFO("hint = " << key);
+            REQUIRE(a.contains(key));
+            REQUIRE(a[key].is_boolean());
+        }
+        const bool read_only = a["readOnlyHint"];
+        const bool destructive = a["destructiveHint"];
+        const bool idempotent = a["idempotentHint"];
+        const bool open_world = a["openWorldHint"];
+
+        // Closed managed fleet: never open-world.
+        CHECK(open_world == false);
+        // readOnlyHint is mechanically the Read operation.
+        CHECK(read_only == (operation == "Read"));
+        // Coherence: a read-only tool is neither destructive, and reads are idempotent.
+        if (read_only) {
+            CHECK(destructive == false);
+            CHECK(idempotent == true);
+        }
+        // Safe-direction floor (a RULE, not a per-tool count): Delete and Execute
+        // operations are always destructive, so a future Delete/Execute tool can
+        // never ship annotated non-destructive.
+        if (operation == "Delete" || operation == "Execute")
+            CHECK(destructive == true);
+        // Prose must not contradict the hint, BOTH directions. Forward: a tool the
+        // machine calls non-destructive may not advertise itself as "Destructive".
+        // Reverse: an embedded literal "destructiveHint:<bool>" claim in the
+        // description must match the served hint — this catches the
+        // close_access_review-class reverse-drift (a destructive tool whose prose
+        // still says destructiveHint:false) that the forward check alone misses.
+        const auto desc = t["description"].get<std::string>();
+        INFO("description = " << desc);
+        if (!destructive)
+            CHECK(desc.find("Destructive") == std::string::npos);
+        if (desc.find("destructiveHint:true") != std::string::npos)
+            CHECK(destructive == true);
+        if (desc.find("destructiveHint:false") != std::string::npos)
+            CHECK(destructive == false);
+    }
+
+    // Coverage the other direction: every dispatch-class tool is advertised.
+    for (const auto& [name, _op] : op) {
+        INFO("dispatch tool = " << name);
+        CHECK(listed.count(name) == 1);
+    }
+
+    // Every advertised tool is EXPLICITLY classified in kToolAnnotation (no tool
+    // rides the generator's safe fallback) — so a new tool cannot merge
+    // unclassified and coast on a coincidentally-coherent default.
+    std::set<std::string> classified;
+    for (const auto sv : mcp::tool_annotation_names_for_test())
+        classified.insert(std::string(sv));
+    CHECK(classified == listed);
+
+    // kWriteTools (the --mcp-read-only proactive guard set) must equal the non-Read
+    // dispatch class exactly, or a mutating tool could execute on a read-only
+    // server. Bind it here like the annotation table, closing the one keyed
+    // structure the surface otherwise leaves ungoverned (arch / consistency SHOULD).
+    std::set<std::string> write_tools, non_read;
+    for (const auto sv : mcp::write_tool_names_for_test())
+        write_tools.insert(std::string(sv));
+    for (const auto& [name, operation] : op)
+        if (operation != "Read")
+            non_read.insert(name);
+    CHECK(write_tools == non_read);
+
+    auto ann = [&](const std::string& n) -> nlohmann::json {
+        for (const auto& t : tools)
+            if (t["name"] == n)
+                return t["annotations"];
+        REQUIRE(false); // the tool must exist
+        return {};
+    };
+
+    // Write/Attest tools have NO mechanical destructive-floor (unlike Delete/Execute),
+    // so their destructiveHint truth rests on human + security-guardian review of the
+    // kToolAnnotation classification against each store's actual side effects. Pin
+    // every one by name here so a false-safe flip on this exact class (the A5-BLOCKING
+    // case, e.g. the confirm_engine_rotation / close_access_review bugs this PR fixed)
+    // is caught mechanically, not only in review (qa / unhappy-path SHOULD).
+    const struct {
+        const char* name;
+        bool destructive;
+    } kWriteAttestExpect[] = {
+        {"set_tag", true},          {"approve_request", true},
+        {"reject_request", true},   {"create_engine_principal", false}, // additive
+        {"revoke_engine_principal", true}, {"transfer_engine_principal_owner", true},
+        {"mint_engine_credential", false}, // additive
+        {"rotate_engine_credential", true}, {"confirm_engine_rotation", true}, // was false-safe
+        {"assign_engine_role", false},     // additive (INSERT OR IGNORE)
+        {"unassign_engine_role", true},    {"open_access_review", false}, // additive
+        {"record_attestation", true},      {"close_access_review", true}, // was false-safe
+    };
+    for (const auto& e : kWriteAttestExpect) {
+        INFO("write/attest tool = " << e.name);
+        CHECK(ann(e.name)["destructiveHint"] == e.destructive);
+    }
+    // confirm_engine_rotation is non-idempotent (takes only principal_id, does not
+    // pin the rotation) — the other shipped false-safe this PR corrected.
+    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false);
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────
