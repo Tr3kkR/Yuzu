@@ -191,6 +191,23 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — MCP tool annotations are now truthful; write tools carry `destructiveHint:true` for the first time
+
+Track 2g PR 2. Every MCP tool now advertises the four standard annotation hints
+(`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`), generated
+from a single-source classification and enforced truthful by a CI cross-check
+test. Operator-visible effect: an agentic worker that renders a confirmation
+prompt off `destructiveHint` will, for the first time, prompt on the write tools
+that previously carried no annotation (`execute_instruction`, `execute_bundle`,
+`set_tag`, `delete_tag`, `quarantine_device`, `revoke_certificate`, and more),
+and three previously false-safe hints (`confirm_engine_rotation`,
+`close_access_review`) are corrected. The hints are **advisory UX only** — the
+tier + maker-checker approval gate is unchanged and remains the enforcement.
+Because MCP advertises `tools.listChanged:false`, long-lived clients should
+reconnect after this deploy to pick up the corrected hints. Not a breaking change
+(no previously-working call is rejected). Full detail: `docs/user-manual/mcp.md`
+"Available Tools".
+
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
 The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`

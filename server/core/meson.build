@@ -436,6 +436,7 @@ yuzu_server_core_lib = static_library(
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
+    'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',
     'src/mcp_transport.cpp',

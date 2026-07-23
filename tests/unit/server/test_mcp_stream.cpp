@@ -16,11 +16,14 @@
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility> // std::declval — the publish() noexcept static_assert
 #include <vector>
 
 namespace mcp = yuzu::server::mcp;
@@ -799,4 +802,161 @@ TEST_CASE("McpStreamState: an oversized frame is replaced, not corrupted",
     CHECK(frame.data.find("execution_id") != std::string::npos);
     CHECK(frame.data.size() <= 256);
     CHECK(frame.data.find(std::string(64, 'x')) == std::string::npos); // no raw payload
+}
+
+// ── publish() exception boundary (#2366) ────────────────────────────────────
+// PR 3's progress bridge invokes publish() from an ExecutionEventBus listener on a
+// worker task no routing try/catch ever sees — an escaped throw is std::terminate.
+// The throw sites are internal string/deque allocations (no callback seam to throw
+// through), so these tests trip the two failure phases via the explicit test seam.
+//
+// DISCLOSED COVERAGE GAPS (all the same "unreachable without a fault-injection harness
+// this repo does not have" class, none load-bearing): (1) a real allocator-level
+// bad_alloc — modelled deterministically by the PublishFault seam instead; (2) the
+// boundary's nested catch when the metric/log call ITSELF throws (no throwing-metrics
+// mock); (3) the recovery std::lock_guard's std::mutex::lock() throwing std::system_error
+// (a broken mutex — practically unreachable on glibc; the code contains it by falling
+// back to a bare atomic bump). The noexcept static_assert + the seam-driven tests below
+// are the regression guard for the reachable paths.
+
+TEST_CASE("McpStreamState: publish is a noexcept boundary — structural, not decorative",
+          "[mcp][stream]") {
+    // Assert on LVALUE arguments, not rvalue temporaries. The realistic PR 3 caller is
+    // `publish(event.event_type, event.data)` — lvalue members of the bus event. With a
+    // by-value `std::string` parameter that copy happens in the CALLER's frame and can
+    // throw bad_alloc BEFORE the boundary's try, escaping the unguarded listener; the old
+    // assertion used `std::string{}` rvalues (which move, noexcept) and so missed the hole
+    // entirely. `string_view` params make the whole call expression non-throwing.
+    static_assert(
+        noexcept(std::declval<mcp::McpStreamState&>().publish(
+            std::declval<const std::string&>(), std::declval<const std::string&>())),
+        "#2366: publish() must be a hard exception boundary for LVALUE callers — PR 3's "
+        "progress bridge calls it from an unguarded ExecutionEventBus listener (#2037)");
+    // And for string_view / string-literal call sites.
+    static_assert(noexcept(std::declval<mcp::McpStreamState&>().publish(
+                      std::string_view{}, std::string_view{})),
+                  "#2366: the boundary must also hold for string_view callers");
+    SUCCEED();
+}
+
+TEST_CASE("McpStreamState: a pre-commit publish failure consumes NO id and gaps nothing (#2366)",
+          "[mcp][stream]") {
+    mcp::McpStreamState state;
+    REQUIRE(state.publish("message", "one") == 1);
+
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    std::uint64_t id = 99;
+    CHECK_NOTHROW(id = state.publish("message", "lost"));
+    CHECK(id == 0);                    // 0 = "not published" — never a valid frame id
+    CHECK(state.next_event_id() == 2); // the id was NOT consumed: no permanent hole
+
+    // The next publish takes exactly the id the failed one would have had, and a full
+    // replay shows a contiguous stream — a resume can never 404 on a gap the failure
+    // silently created (the old `id = next_id_++` before the push did exactly that).
+    CHECK(state.publish("message", "two") == 2);
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    REQUIRE(attached.sink->sse->queue.size() == 2);
+    CHECK(attached.sink->sse->queue.front().id == 1);
+    CHECK(attached.sink->sse->queue.back().id == 2);
+    CHECK(attached.sink->sse->queue.back().data == "two");
+}
+
+TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and counts "
+          "the gap (#2366)",
+          "[mcp][stream]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    std::uint64_t id = 0;
+    CHECK_NOTHROW(id = state->publish("message", "missed"));
+    // COMMITTED: the frame is in the ring under its id. Returning 0 here would claim
+    // it never happened while every future replay faithfully serves it.
+    CHECK(id == 1);
+    CHECK(state->next_event_id() == 2);
+
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        CHECK(attached.sink->sse->queue.empty()); // the frame never reached the sink...
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 1); // ...and that is COUNTED
+
+    // The counted drop rides the existing machinery: the pump tells the client frames
+    // were lost, and the ring still holds the frame so a Last-Event-ID resume recovers
+    // it. NOTE this is the empty-queue lone-drop case: dropped_total==1 with an EMPTY
+    // queue is the interaction #2366 introduced (pre-#2366 a drop always rode alongside
+    // a real push_back).
+    //
+    // SCOPE OF THIS ASSERTION (honest): this pump_once runs on THIS thread AFTER the
+    // faulting publish, so the wait predicate is already true on entry — the call never
+    // parks and is never woken by notify_one. It therefore verifies the OUTCOME (an
+    // empty-queue drop is reported as events-dropped, and the ring still replays the
+    // frame), NOT the notify-driven wakeup timing. The deterministic condvar handoff
+    // (bump under the sink mutex; predicate includes dropped_total) is verified by
+    // cpp-safety inspection, not here. A genuine two-thread handshake test that parks the
+    // pump in wait_for first, then faults+publishes, and asserts prompt emission without a
+    // wall-clock bound is the correct exercise — filed as a track-2f PR-3 follow-up, where
+    // a real producer makes the sub-tick latency reachable.
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK(pump.pump_once(wire.writer()));
+    CHECK(wire.contains("event: events-dropped"));
+
+    auto resumed = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(resumed.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(resumed.sink->sse->mu);
+    REQUIRE(resumed.sink->sse->queue.size() == 1);
+    CHECK(resumed.sink->sse->queue.front().id == 1);
+    CHECK(resumed.sink->sse->queue.front().data == "missed");
+}
+
+TEST_CASE("McpStreamState: an injected publish fault is one-shot — never persists (#2366)",
+          "[mcp][stream]") {
+    // A leaked fault flag would silently drop a later REAL frame. kSinkEnqueue is the
+    // sharp case: it is consumed only when a sink is live, so injecting it with NO live
+    // sink must still clear it up front — otherwise it fires on the next client's first
+    // frame. (The fault is now read-and-cleared via std::exchange before the sink check.)
+    auto state = std::make_shared<mcp::McpStreamState>();
+
+    // (a) kSinkEnqueue injected with NO live sink: consumed anyway, not left armed.
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    CHECK(state->publish("message", "no-sink") == 1); // committed; nothing to drop
+    // Attach at cursor 1 so the replay serves nothing — we want to observe ONLY the next
+    // live publish, not the pre-attach frame.
+    auto attached = state->attach_and_replay(1, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    state->publish("message", "first-real"); // would be dropped if the fault had persisted
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        REQUIRE(attached.sink->sse->queue.size() == 1);
+        CHECK(attached.sink->sse->queue.front().data == "first-real");
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 0); // never armed against a real frame
+
+    // (b) kSinkEnqueue with a live sink: consumed once, the very next publish delivers.
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    state->publish("message", "dropped-once");
+    CHECK(attached.sink->sse->dropped_total.load() == 1);
+    state->publish("message", "delivered");
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        CHECK(attached.sink->sse->queue.back().data == "delivered");
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 1); // still 1 — no second drop
+}
+
+TEST_CASE("McpStreamState: a pre-commit failure increments the publish-failures counter (#2366)",
+          "[mcp][stream]") {
+    // Exercises the boundary's catch with a LIVE registry (not the nullptr default the
+    // other cases use), so the nested-guarded counter increment runs on the real path.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    CHECK(state.publish("message", "lost") == 0);
+    CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
 }

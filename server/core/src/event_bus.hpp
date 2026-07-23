@@ -93,11 +93,13 @@ struct SseSinkState {
     std::deque<SseEvent> queue;
     std::atomic<bool> closed = false;
     std::size_t sub_id = 0;
-    /// Total events dropped from the per-connection queue (drop-oldest
-    /// on cap overflow). Routes that enforce a cap use this counter to
-    /// emit a synthetic `events-dropped` envelope on the next provider
-    /// invocation so the client knows a gap exists. Routes that do NOT
-    /// enforce a cap leave this at 0. Atomic so the listener
+    /// Total events dropped before reaching this per-connection queue.
+    /// Usually a drop-oldest on cap overflow (a slow consumer); the MCP
+    /// stream also feeds it a rare producer-side post-commit enqueue
+    /// allocation failure (#2366) — same recovery either way. Routes that
+    /// enforce a cap use this counter to emit a synthetic `events-dropped`
+    /// envelope on the next provider invocation so the client knows a gap
+    /// exists. Routes that do NOT enforce a cap leave this at 0. Atomic so the listener
     /// (publisher thread) and provider (httplib worker thread) can both
     /// touch it without taking `mu`.
     std::atomic<std::uint64_t> dropped_total{0};

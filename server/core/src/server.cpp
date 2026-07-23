@@ -485,7 +485,10 @@ public:
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
-                          "Frames dropped from a slow consumer's per-connection queue", "counter");
+                          "Frames dropped before reaching a connection's per-connection queue — "
+                          "usually a slow consumer's queue overflow, also a rare producer-side "
+                          "post-commit allocation failure (#2366); recoverable via Last-Event-ID",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_frames_too_large_total",
                           "Frames replaced by a frame_too_large notice because they exceeded the "
                           "per-session replay-ring byte budget",
@@ -496,12 +499,20 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_stream_rejects_total",
                           "MCP GET SSE stream attach denials by reason", "counter");
+        metrics_.describe("yuzu_mcp_initialize_protocol_total",
+                          "MCP initialize handshakes by negotiated protocol revision", "counter");
+        metrics_.describe("yuzu_mcp_stream_publish_failures_total",
+                          "publish() exception-boundary catches — a producer's frame "
+                          "construction failed before commit (#2366); the frame was never "
+                          "published and no event id was consumed",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
+        metrics_.counter("yuzu_mcp_stream_publish_failures_total");
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
@@ -511,6 +522,13 @@ public:
                             "per_principal_stream_cap", "global_stream_cap",
                             "stream_handover_pending", "replay_window_exceeded", "origin"}) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
+        }
+        // Pre-seed both supported MCP protocol revisions to 0 so a
+        // revision-deprecation dashboard reads "0" (not absent) for an unused
+        // revision (observability-conventions.md; 2g PR 1). Values mirror the
+        // supported set in mcp_transport.cpp (protocol_version_supported).
+        for (auto revision : {"2025-03-26", "2025-06-18"}) {
+            metrics_.counter("yuzu_mcp_initialize_protocol_total", {{"revision", revision}});
         }
         // PostgreSQL substrate pool metrics (#1320 PR 3 / #1368 observability).
         // Gauges are sampled every recompute cycle; counters/histogram are fed

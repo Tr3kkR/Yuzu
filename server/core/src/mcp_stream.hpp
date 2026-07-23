@@ -42,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <httplib.h>
 
@@ -236,7 +237,40 @@ public:
 
     /// Append a frame to the ring and hand it to the live sink, if any. The
     /// producer seam for track 2f PR 3 (progress bridge) and for tests.
-    /// Returns the assigned per-session event id.
+    ///
+    /// HARD exception boundary (#2366). PR 3's progress bridge invokes this from an
+    /// ExecutionEventBus listener running on a worker with no routing try/catch, so an
+    /// escaped throw here is std::terminate (the #2037 class). `noexcept` is structural,
+    /// not decorative (the stream_budget.hpp precedent): the boundary cannot be quietly
+    /// dropped by a future edit without this signature failing loudly.
+    ///
+    /// Parameters are `string_view`, NOT `std::string` by value: a by-value parameter is
+    /// copy-constructed in the CALLER's frame for an lvalue argument (the realistic PR 3
+    /// call `publish(event.event_type, event.data)`), and a std::bad_alloc from that copy
+    /// would escape to the unguarded listener BEFORE this function's body — bypassing the
+    /// boundary entirely. `string_view` makes the caller-side conversion non-throwing; the
+    /// owned copies happen inside publish_impl's try, where a bad_alloc is a clean
+    /// pre-commit 0. The caller MUST keep the referenced storage alive across the call
+    /// (publish copies synchronously before returning; it captures no view).
+    ///
+    /// Return contract:
+    ///  - > 0: the frame is COMMITTED to the in-memory ring under this per-session id.
+    ///    A post-commit failure (live-sink enqueue allocation, metrics) never un-commits:
+    ///    the id is still returned, the frame stays replayable via Last-Event-ID, and a
+    ///    sink-enqueue failure is made visible by bumping the sink's `dropped_total`
+    ///    (the pump's existing `events-dropped` synthetic) — never a silent gap.
+    ///  - == 0: pre-commit failure. Ring AND `next_id_` are untouched — no id hole, the
+    ///    next publish assigns the id this call would have. 0 is never a valid frame id
+    ///    (ids start at 1).
+    ///
+    /// CALLER OBLIGATION (asymmetric — a `0` is client-INVISIBLE): a pre-commit `0` bumps
+    /// no `dropped_total`, so no `events-dropped` synthetic fires and no replay recovers
+    /// the frame — it simply never existed. That is correct for a fire-and-forget progress
+    /// delta. It is NOT sufficient for a TERMINAL/completion frame: a producer of one MUST
+    /// NOT treat `publish()` as the delivery guarantee, because a `0` there leaves the
+    /// client with no terminal and no gap signal. The durable `execution_id` fetch
+    /// (Decision 15(f)) is the backstop, and track 2f PR 3 must wire it to a `0` return
+    /// explicitly, not rely on general stream-death recovery.
     ///
     /// CONTRACT (Decision 15(b) — LOAD-BEARING): a published frame MUST be a message
     /// arising from THIS session's own requests. The GET channel is exempt from
@@ -246,7 +280,19 @@ public:
     ///
     /// Drop-oldest at the frame AND byte caps; every eviction is counted (a client
     /// whose cursor falls behind the ring is 404'd on resume, never silently gapped).
-    std::uint64_t publish(std::string event_type, std::string data);
+    std::uint64_t publish(std::string_view event_type, std::string_view data) noexcept;
+
+    /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
+    /// inside publish_impl are internal string/deque allocations with no callback to
+    /// throw through (the repo's usual injection idiom), so the two failure phases the
+    /// #2366 boundary distinguishes get explicit trip points instead. One-shot: the
+    /// fault fires on the next publish and resets to kNone.
+    enum class PublishFault {
+        kNone,
+        kPreCommit,    ///< models the ring push_back allocation failing (nothing committed)
+        kSinkEnqueue,  ///< models the live-sink enqueue copy failing (frame already committed)
+    };
+    void inject_publish_fault_for_test(PublishFault fault);
 
     enum class AttachStatus {
         kAttached,
@@ -311,6 +357,13 @@ private:
     static void close_sink(const std::shared_ptr<McpStreamSink>& sink, McpStreamClose reason);
     static std::size_t frame_bytes(const McpStreamEvent& ev);
 
+    /// The throwing body publish() guards. Owns the payload from the caller's views up
+    /// front (those copies may throw — pre-commit, so a bad_alloc there is a clean 0).
+    /// After the ring push + next_id_ advance, every step is either noexcept or locally
+    /// contained, so a throw reaching publish()'s catch proves nothing was committed and
+    /// 0 is the honest return.
+    std::uint64_t publish_impl(std::string_view event_type, std::string_view data);
+
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
     std::size_t ring_cap_;
@@ -319,6 +372,7 @@ private:
     std::uint64_t next_id_ = 1;  ///< CH-3: per-session, starts at 1
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
+    PublishFault publish_fault_ = PublishFault::kNone;  ///< test seam; guarded by mu_
     std::shared_ptr<McpStreamSink> live_;
     std::shared_ptr<McpStreamSink> draining_;  ///< superseded, still pinning its worker
     yuzu::MetricsRegistry* metrics_ = nullptr;

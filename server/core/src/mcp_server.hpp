@@ -30,6 +30,8 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace yuzu {
 class MetricsRegistry; // optional bundle-metrics sink (yuzu_bundle_*)
@@ -383,5 +385,26 @@ private:
     ApiTokenStore* engine_credential_store_{nullptr};
     OwnerExistsFn owner_exists_fn_;
 };
+
+// Test-only accessor (2g PR 2): the (tool, securable, operation) dispatch rows
+// from the internal kToolSecurity map, so the annotation cross-check test can
+// assert readOnlyHint/destructiveHint against the dispatch class without
+// duplicating the map. Defined in mcp_server.cpp.
+struct ToolSecurityRow {
+    std::string_view name;
+    std::string_view securable;
+    std::string_view operation;
+};
+std::vector<ToolSecurityRow> tool_security_rows_for_test();
+
+// Test-only accessor (2g PR 2): the names explicitly classified in the internal
+// kToolAnnotation table, so the cross-check test can prove every tool is
+// classified rather than relying on the generator's safe fallback.
+std::vector<std::string_view> tool_annotation_names_for_test();
+
+// Test-only accessor (2g PR 2): the --mcp-read-only guard's write-tool set, so
+// the cross-check test can bind it to the non-Read dispatch class (a mutating
+// tool missing from kWriteTools would silently execute under read-only mode).
+std::vector<std::string_view> write_tool_names_for_test();
 
 } // namespace yuzu::server::mcp
