@@ -276,15 +276,29 @@ the `push:` trigger keeps its docs `paths-ignore`.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
-ADR-0006 decision 8: every tier that runs server tests gets a real
-PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
-**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
-+ GHA-macOS legs test against it; the server SQL is version-agnostic (13+), so
-a runner-native cluster on an older major still exercises the suites
-correctly. One script implements it everywhere —
-`scripts/ci/ensure-postgres.sh`, inserted as an `Ensure Postgres (server
-tests)` step between Build and Test in ci.yml (linux / windows / macos) and
-nightly.yml (asan / tsan / coverage).
+ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
+real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
+**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker +
+Windows legs test against it; the server SQL is version-agnostic (13+), so a
+runner-native cluster on an older major still exercises the suites correctly.
+One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
+as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
+(linux / windows) and nightly.yml (asan / tsan / coverage).
+
+**macOS does NOT run the server `[pg]` suite (ADR-0035; #2394).** The Yuzu
+server is a Linux-only component (macOS/Windows are agent-only platforms), and
+GHA-hosted macos-15 runs a *single* brew Postgres cluster. After the
+auth→Postgres migration (ADR-0006) roughly doubled the `[pg]` population to
+~660 clone-bound cases (`CREATE DATABASE … TEMPLATE` + `DROP … FORCE` per
+case), one slow cluster cannot service that within the per-suite meson budget,
+and sharding does not help — parallel shards contend on the one cluster (both
+hit their timeout). So the macOS leg deliberately **does not provision Postgres
+/ export the DSN**: every `[pg]` server test then SKIPS (env-unset → skip, the
+same contract the Catch2 PG fixtures use), completing in milliseconds, while
+the non-PG server suite (`~[pg]`), the agent suite, and the Apple-Clang compile
+still run. Linux + Windows keep full `[pg]` coverage. Re-enabling it requires
+first solving the single-cluster capacity problem (per-shard clusters or a
+cheaper per-test isolation model than database-per-test).
 Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
