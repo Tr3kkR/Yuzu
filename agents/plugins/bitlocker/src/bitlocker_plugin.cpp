@@ -210,10 +210,14 @@ void report_filevault_status(yuzu::CommandContext& ctx) {
     auto diskutil_output = run_command("diskutil apfs list 2>/dev/null");
     auto volumes = yuzu::bitlocker::macos::parse_diskutil_apfs_list(diskutil_output);
     for (const auto& vol : volumes) {
-        ctx.write_output(std::format("volume|{}|{}|{}",
-                                     yuzu::bitlocker::macos::volume_label(vol),
-                                     yuzu::bitlocker::macos::volume_type(vol),
-                                     vol.encrypted_state));
+        // plg-L1 (round-4 review): escape every dynamic field before the positional
+        // `volume|...` protocol — an APFS volume label/type/state with a '|' or
+        // newline would otherwise shift columns or inject a row (same fix already
+        // applied to the fdesetup diagnostic row above).
+        ctx.write_output(
+            std::format("volume|{}|{}|{}", yuzu::util::safe_output_field(yuzu::bitlocker::macos::volume_label(vol)),
+                        yuzu::util::safe_output_field(yuzu::bitlocker::macos::volume_type(vol)),
+                        yuzu::util::safe_output_field(vol.encrypted_state)));
     }
     // If diskutil yielded nothing parseable, the fdesetup row above already
     // served as the fallback signal — no synthetic "no volumes" row needed.

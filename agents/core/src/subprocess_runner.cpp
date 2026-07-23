@@ -66,15 +66,15 @@
 #include <cassert>
 #include <cerrno>
 #include <csignal>
-#include <cstdlib> // std::strtol (parse /proc/self/fd, /dev/fd entries in the parent)
+#include <cstdio> // std::fopen/std::fscanf — read Linux fs.nr_open for the fd ceiling
 #include <ctime>
-#include <dirent.h> // opendir/readdir/dirfd/closedir — parent-side inherited-fd enumeration
 #include <fcntl.h>
-#include <limits>
 #include <mutex>
 #include <sys/resource.h>
 #include <sys/wait.h>
-#include <vector>
+#if defined(__APPLE__)
+#include <sys/sysctl.h> // sysctlbyname(kern.maxfilesperproc) — per-process fd ceiling
+#endif
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -299,6 +299,37 @@ int dup2_retry(int oldfd, int newfd) {
     return rc;
 }
 
+// A true upper bound on any live fd NUMBER, computed in the PARENT (getrlimit /
+// sysctl / fopen are not async-signal-safe, so they must never run post-fork).
+// Used as the exclusive ceiling for the child's [3, ceiling) close-on-exec sweep.
+// The HARD RLIMIT_NOFILE is the natural bound (soft <= hard always, so no fd can
+// be allocated at or above it); when the hard limit is infinite — the macOS
+// default, or a Linux `LimitNOFILE=infinity` unit — fall back to the kernel's
+// actual per-process descriptor cap (macOS `kern.maxfilesperproc`, Linux
+// `fs.nr_open`), above which the kernel refuses to allocate a descriptor, so the
+// bound stays finite AND complete without an unbounded sweep.
+long resolve_fd_ceiling() {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max != RLIM_INFINITY &&
+        rl.rlim_max <= static_cast<rlim_t>(1L << 31))
+        return static_cast<long>(rl.rlim_max);
+#if defined(__APPLE__)
+    int maxproc = 0;
+    size_t sz = sizeof(maxproc);
+    if (sysctlbyname("kern.maxfilesperproc", &maxproc, &sz, nullptr, 0) == 0 && maxproc > 0)
+        return maxproc;
+#elif defined(__linux__)
+    if (FILE* f = std::fopen("/proc/sys/fs/nr_open", "re")) {
+        long v = 0;
+        const int n = std::fscanf(f, "%ld", &v);
+        std::fclose(f);
+        if (n == 1 && v > 0)
+            return v;
+    }
+#endif
+    return 1L << 20; // last-resort finite bound (Linux default fs.nr_open)
+}
+
 // Async-signal-safe: writes `err` to the exec-error pipe (retried across
 // EINTR, no allocation) then terminates the child immediately via
 // _exit(127). Shared by a failed execvp() and by a load-bearing setup
@@ -385,47 +416,28 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         fcntl(err_write_fd.get(), F_SETFD, FD_CLOEXEC) == -1)
         return result; // fail closed, same reasoning as the pipe above
 
-    // Enumerate the ACTUAL open descriptors (>= 3) HERE in the parent, before
-    // fork(): opendir()/readdir() are not async-signal-safe, so they must not run
-    // post-fork. Handing the child the real live fd set — rather than sweeping to
-    // a guessed ceiling — is what makes the sanitisation COMPLETE. A soft-limit
-    // ceiling misses a descriptor whose NUMBER exceeds the current soft
-    // RLIMIT_NOFILE, which POSIX permits in two real ways: the limit is
-    // RLIM_INFINITY (no finite ceiling to sweep to), or a descriptor was opened
-    // while the limit was higher and the limit was later lowered (the fd stays
-    // valid). Enumeration also makes the sweep O(open fds) instead of O(soft
-    // limit) — no ~100ms-per-spawn fcntl storm on a large-limit host.
-    std::vector<int> inherited_fds;
-    long fallback_ceiling = 0; // >0 => the fd dir was unreadable; child sweeps [3, ceiling)
-    {
-#if defined(__linux__)
-        const char* fd_dir = "/proc/self/fd";
-#else
-        const char* fd_dir = "/dev/fd"; // macOS/BSD fdesc filesystem
-#endif
-        DIR* d = ::opendir(fd_dir);
-        if (d != nullptr) {
-            const int dir_fd = ::dirfd(d); // the enumeration's own fd — closed below, never inherited
-            for (dirent* e = ::readdir(d); e != nullptr; e = ::readdir(d)) {
-                char* endp = nullptr;
-                const long fd = std::strtol(e->d_name, &endp, 10);
-                if (endp != nullptr && *endp == '\0' && fd >= 3 && fd != dir_fd &&
-                    fd <= static_cast<long>(std::numeric_limits<int>::max()))
-                    inherited_fds.push_back(static_cast<int>(fd));
-            }
-            ::closedir(d);
-        } else {
-            // No /proc or /dev/fd (a stripped sandbox): fall back to a bounded
-            // fcntl sweep. Bound on the HARD limit, not the soft one — soft <= hard
-            // always, so no fd can ever have been allocated at or above the hard
-            // limit; this stays complete even after a soft-limit change. 4096 only
-            // if the hard limit is itself infinite (no finite bound available).
-            struct rlimit rl;
-            fallback_ceiling = 4096;
-            if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max != RLIM_INFINITY)
-                fallback_ceiling = static_cast<long>(rl.rlim_max);
-        }
-    }
+    // Ceiling for the child's inherited-fd sweep, computed HERE in the parent
+    // (getrlimit() is not async-signal-safe, so it must not run post-fork). The
+    // child sweeps the whole [3, child_fd_ceiling) range with fcntl AFTER fork(),
+    // which is both:
+    //   * COMPLETE — the bound is the HARD RLIMIT_NOFILE. soft <= hard always, so
+    //     no descriptor can ever be allocated at or above the hard limit; the
+    //     sweep therefore covers every possible live fd number (a soft-limit
+    //     ceiling would miss a fd opened while the limit was higher, or under an
+    //     RLIM_INFINITY soft limit).
+    //   * RACE-FREE — running post-fork, it re-derives the live set from the
+    //     child's own (frozen-at-fork) fd table, so it catches EVERY fd present
+    //     at fork(), including one a different, unrelated thread opened without
+    //     O_CLOEXEC in the window before fork(). A parent-side snapshot cannot
+    //     make that guarantee (global_fork_lock() serialises launchers, not
+    //     arbitrary socket()/open() callers). This is the round-4 fix: the prior
+    //     pre-fork enumeration had exactly that TOCTOU gap.
+    // Cost is O(ceiling) fcntl calls per spawn — accepted for a race-free,
+    // complete sanitiser on the agent's occasional (non-hot-path) shell-outs. The
+    // ceiling is the hard limit where finite (the shipped units pin
+    // LimitNOFILE=65536), else the kernel's per-process fd cap (macOS
+    // kern.maxfilesperproc ~10k; Linux fs.nr_open) — see resolve_fd_ceiling().
+    const long child_fd_ceiling = resolve_fd_ceiling();
 
     pid_t pid = fork();
     if (pid < 0)
@@ -505,22 +517,17 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // ONLY fcntl() runs here — an fd primitive on POSIX's enumerated
         // async-signal-safe list (man 7 signal-safety) and the one that toggles
         // FD_CLOEXEC without closing, matching this branch's list-based contract in
-        // the file header. The fd set was enumerated in the PARENT above (opendir /
-        // readdir are NOT on the list); the child only iterates that vector — no
-        // allocation, no lock — and fcntl()s each. The fallback ceiling sweep runs
-        // only when the fd directory was unreadable.
-        if (fallback_ceiling > 0) {
-            for (long fd = 3; fd < fallback_ceiling; ++fd) {
-                const int flags = fcntl(static_cast<int>(fd), F_GETFD);
-                if (flags != -1 && !(flags & FD_CLOEXEC))
-                    fcntl(static_cast<int>(fd), F_SETFD, flags | FD_CLOEXEC);
-            }
-        } else {
-            for (int fd : inherited_fds) {
-                const int flags = fcntl(fd, F_GETFD);
-                if (flags != -1 && !(flags & FD_CLOEXEC))
-                    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-            }
+        // the file header. This runs POST-fork over the whole [3, ceiling) range,
+        // so it re-derives the live fd set from the child's own frozen fd table:
+        // every descriptor present at fork() is swept, INCLUDING one a different
+        // thread opened without O_CLOEXEC in the pre-fork window (the round-4
+        // TOCTOU fix — a parent-side snapshot could not see such a fd). The ceiling
+        // is the hard RLIMIT_NOFILE (computed in the parent), a true upper bound on
+        // any fd number, so the sweep is complete.
+        for (long fd = 3; fd < child_fd_ceiling; ++fd) {
+            const int flags = fcntl(static_cast<int>(fd), F_GETFD);
+            if (flags != -1 && !(flags & FD_CLOEXEC))
+                fcntl(static_cast<int>(fd), F_SETFD, flags | FD_CLOEXEC);
         }
 
         // BR-003: execv(), not execvp() -- execvp() is not on Darwin's

@@ -56,7 +56,8 @@ namespace {
 
 // Replace invalid UTF-8 bytes with '?' (MSI/pkgutil data can contain
 // non-UTF-8 chars). Platform-agnostic, reused by both the Windows and macOS
-// branches below.
+// branches below. (Pipe/newline escaping of dynamic macOS fields happens in the
+// pure format_msi_row/format_product_code_row helpers in msi_packages_macos.hpp.)
 std::string sanitize_utf8(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -188,11 +189,7 @@ int do_list(yuzu::CommandContext& ctx) {
     for (const auto& id : ids) {
         auto info = parse_pkg_info(
             run_command(std::format("pkgutil --pkg-info {} 2>/dev/null", shell_quote(id))), id);
-        auto name = derive_display_name(info.identifier);
-        ctx.write_output(sanitize_utf8(std::format(
-            "msi|{}|{}|{}|{}", info.identifier, name.empty() ? "-" : name,
-            info.version.empty() ? "-" : info.version,
-            info.install_location.empty() ? "-" : info.install_location)));
+        ctx.write_output(sanitize_utf8(yuzu::msi_packages::macos::format_msi_row(info)));
         ++count;
     }
     if (truncated) {
@@ -237,9 +234,7 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     auto ids = parse_pkg_ids(run_command("pkgutil --pkgs 2>/dev/null"));
     int count = 0;
     for (const auto& id : ids) {
-        auto name = derive_display_name(id);
-        ctx.write_output(
-            sanitize_utf8(std::format("product_code|{}|{}", id, name.empty() ? "-" : name)));
+        ctx.write_output(sanitize_utf8(yuzu::msi_packages::macos::format_product_code_row(id)));
         ++count;
     }
     if (count == 0) {

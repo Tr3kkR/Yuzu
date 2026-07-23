@@ -523,8 +523,8 @@ TEST_CASE("run_bounded_subprocess sweeps an inherited fd above the old 4096 cap"
 // CODEX-1 (adversarial review): a soft-limit ceiling is not a valid upper bound
 // on the live fd set — POSIX keeps an already-open fd valid when RLIMIT_NOFILE is
 // later LOWERED below it. Placing a fd at 5000, then lowering the soft limit to
-// 1024, must still leave the exec'd child unable to see it (the parent-side
-// enumeration of the real open set catches it; a `rlim_cur` ceiling would miss it).
+// 1024, must still leave the exec'd child unable to see it (the child sweeps to
+// the HARD limit, which soft can never exceed; a `rlim_cur` ceiling would miss it).
 TEST_CASE("run_bounded_subprocess sweeps an inherited fd retained after the soft limit is lowered",
           "[subprocess][fd]") {
     struct rlimit saved{};
@@ -555,6 +555,42 @@ TEST_CASE("run_bounded_subprocess sweeps an inherited fd retained after the soft
     ::setrlimit(RLIMIT_NOFILE, &saved); // restore
     CHECK(r.tool_ran);
     CHECK(r.output == "CLEAN");
+}
+
+// Round-4 (adversarial review): a fd an UNRELATED thread opens without O_CLOEXEC
+// concurrently with a spawn must never leak into the exec'd child. The sweep runs
+// post-fork over the whole range, so it catches every fd present at fork()
+// regardless of when/which thread opened it — unlike a pre-fork snapshot, which
+// could miss one opened in the enumerate->fork window. This drives that window
+// under load: a racer thread continuously places/removes an inheritable fd at a
+// fixed number while the main thread spawns; the child must always report CLEAN.
+TEST_CASE("run_bounded_subprocess never leaks a fd opened by a racing thread (TOCTOU)",
+          "[subprocess][fd]") {
+    constexpr int kRaceFd = 25; // a fixed number the racer toggles; well above the runner's pipes
+    std::atomic<bool> stop{false};
+    std::thread racer([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const int fd = ::open("/dev/null", O_RDONLY);
+            if (fd < 0)
+                continue;
+            if (::dup2(fd, kRaceFd) == kRaceFd) // dup2 clears CLOEXEC -> deliberately inheritable
+                ::close(kRaceFd);
+            ::close(fd);
+        }
+    });
+
+    const std::string probe =
+        "if [ -e /dev/fd/" + std::to_string(kRaceFd) + " ]; then printf LEAK; else printf CLEAN; fi";
+    bool any_leak = false;
+    for (int i = 0; i < 60 && !any_leak; ++i) {
+        SubprocessResult r =
+            run_bounded_subprocess({"/bin/sh", "-c", probe}, SubprocessOptions{.deadline = 5000ms});
+        if (r.tool_ran && r.output == "LEAK")
+            any_leak = true;
+    }
+    stop.store(true, std::memory_order_relaxed);
+    racer.join();
+    CHECK_FALSE(any_leak);
 }
 
 #endif // !_WIN32

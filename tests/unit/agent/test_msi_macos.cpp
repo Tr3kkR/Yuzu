@@ -16,6 +16,7 @@
 
 #include <msi_packages_macos.hpp>
 
+#include <algorithm>
 #include <string>
 
 using namespace yuzu::msi_packages::macos;
@@ -140,4 +141,40 @@ TEST_CASE("derive_display_name falls back to the full identifier when there is n
         CHECK(derive_display_name("com.vendor.") == "com.vendor.");
     }
     SECTION("empty identifier") { CHECK(derive_display_name("") == ""); }
+}
+
+// Round-4 review: every dynamic macOS package field must be pipe/newline-escaped
+// before entering the positional `msi|...` / `product_code|...` protocol, so a
+// pkgutil receipt id, version or install path containing '|' or a newline can't
+// shift columns or inject a row downstream (plg-H1). safe_output_field escapes a
+// field '|' to "\\|" and a newline to a space, so a positional parser splitting
+// on UNESCAPED '|' sees only the structural separators.
+namespace {
+int count_unescaped_pipes(const std::string& s) {
+    int n = 0;
+    for (std::size_t i = 0; i < s.size(); ++i)
+        if (s[i] == '|' && (i == 0 || s[i - 1] != '\\'))
+            ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("format_msi_row escapes pipe/newline in every dynamic field", "[msi][macos]") {
+    PkgInfo info;
+    info.identifier = "com.eviL|corp.pkg\nInjected"; // '|' AND newline in the id
+    info.version = "1.0|2.0";
+    info.install_location = "/opt/we|ird\npath";
+
+    const std::string row = format_msi_row(info);
+    CHECK(count_unescaped_pipes(row) == 4);      // only the 4 structural separators split columns
+    CHECK(row.find('\n') == std::string::npos);  // newlines neutralised to spaces (no row injection)
+    CHECK(row.starts_with("msi|"));
+    CHECK(row.find("eviL\\|corp") != std::string::npos); // the field '|' was escaped, not dropped
+}
+
+TEST_CASE("format_product_code_row escapes pipe/newline in both fields", "[msi][macos]") {
+    const std::string row = format_product_code_row("com.x|y.z\nrow2");
+    CHECK(count_unescaped_pipes(row) == 2); // only the two structural separators
+    CHECK(row.find('\n') == std::string::npos);
+    CHECK(row.starts_with("product_code|"));
 }

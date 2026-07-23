@@ -386,7 +386,9 @@ static const ToolDef kTools[] = {
      "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
      "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
      "GuaranteedState:Read.",
-     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})"},
+     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})",
+     /*output_schema_json=*/nullptr, // content is a bare array of per-OS scope rows (tracked in #2363)
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"DEX per-OS signal coverage"})j"},
 
     {"get_dex_signal_detail",
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
@@ -399,7 +401,13 @@ static const ToolDef kTools[] = {
      R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Scope subjects/devices/by_day to one OS (all = every OS; by_os stays cross-OS)"},)j"
      R"j("limit":{"type":"integer","default":50,"minimum":0,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
      R"j(},"required":["obs_type"]})j",
-     R"j({"type":"object","properties":{"obs_type":{"type":"string"},"os":{"type":"string","enum":["all","windows","linux","macos"]},"subjects":{"type":"array","items":{"type":"object","additionalProperties":true}},"by_os":{"type":"array","items":{"type":"object","additionalProperties":true}},"devices":{"type":"array","items":{"type":"object","additionalProperties":true}},"by_day":{"type":"array","items":{"type":"object","additionalProperties":true}},"audit_persisted":{"type":"boolean"}},"required":["obs_type","os","subjects","by_os","devices","by_day"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("obs_type":{"type":"string"},"os":{"type":"string","enum":["all","windows","linux","macos"]},)j"
+     R"j("subjects":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","count","distinct_devices","last_seen"]}},)j"
+     R"j("by_os":{"type":"array","items":{"type":"object","properties":{"platform":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"}},"required":["platform","count","distinct_devices"]}},)j"
+     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"last_seen":{"type":"string"}},"required":["agent_id","count","last_seen"]}},)j"
+     R"j("by_day":{"type":"array","items":{"type":"object","properties":{"day":{"type":"string"},"count":{"type":"integer"}},"required":["day","count"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["obs_type","os","subjects","by_os","devices","by_day"]})j",
      R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Drill into one DEX signal"})j"},
 
     // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──

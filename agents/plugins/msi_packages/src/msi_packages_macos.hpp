@@ -12,9 +12,12 @@
 // "com.apple.pkg.Core"), never GUIDs -- callers must carry them through
 // honestly rather than coercing them into the Windows {GUID} shape.
 
+#include <format>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-H1 pipe/newline escaping)
 
 namespace yuzu::msi_packages::macos {
 
@@ -109,6 +112,30 @@ inline std::string derive_display_name(std::string_view identifier) {
     if (dot == std::string_view::npos || dot + 1 == identifier.size())
         return std::string(identifier);
     return std::string(identifier.substr(dot + 1));
+}
+
+// Format one `msi|identifier|name|version|install_location` inventory row with
+// every DYNAMIC field pipe/newline-escaped (plg-H1): a pkgutil receipt id,
+// version or install path containing '|' or a newline would otherwise shift
+// columns or inject a row in the positional downstream parser. Pure, so the
+// plugin's `list` action delegates here and the escaping is unit-tested without a
+// live pkgutil / CommandContext. Empty fields render the "-" sentinel.
+inline std::string format_msi_row(const PkgInfo& info) {
+    const std::string name = derive_display_name(info.identifier);
+    return std::format("msi|{}|{}|{}|{}", yuzu::util::safe_output_field(info.identifier),
+                       name.empty() ? std::string("-") : yuzu::util::safe_output_field(name),
+                       info.version.empty() ? std::string("-")
+                                            : yuzu::util::safe_output_field(info.version),
+                       info.install_location.empty()
+                           ? std::string("-")
+                           : yuzu::util::safe_output_field(info.install_location));
+}
+
+// Format one `product_code|identifier|name` row, both dynamic fields escaped.
+inline std::string format_product_code_row(std::string_view identifier) {
+    const std::string name = derive_display_name(identifier);
+    return std::format("product_code|{}|{}", yuzu::util::safe_output_field(identifier),
+                       name.empty() ? std::string("-") : yuzu::util::safe_output_field(name));
 }
 
 } // namespace yuzu::msi_packages::macos
