@@ -1410,7 +1410,7 @@ TEST_CASE("a paged batch's last entry, when sent, gets a sent-label (send-wrap l
 }
 
 TEST_CASE("concurrent pagers + a drainer do not race (TSan checkpoint)",
-          "[spark][runtime][journal][tsan]") {
+          "[spark][runtime][journal][tsan][tsan-heavy]") {
     PageRig rig;
     for (int i = 0; i < 20; ++i)
         rig.persist("r" + std::to_string(i));
@@ -1538,7 +1538,7 @@ TEST_CASE("a hostile rule_name is rejected from the journal but never crashes th
 }
 
 TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoint, QE-1)",
-          "[spark][runtime][journal][tsan]") {
+          "[spark][runtime][journal][tsan][tsan-heavy]") {
     PageRig rig;
     // A small retention cap keeps the pruner trimming the journal so page-passes stay O(small):
     // TSan finds a race from the INTERLEAVING, not from volume, so a short bounded run suffices.
