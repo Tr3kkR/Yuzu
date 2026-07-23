@@ -223,7 +223,7 @@ test(
   'agent unit tests',
   agent_test_exe,
   suite: 'agent',
-  timeout: 240,
+  timeout: 600, # Windows self-hosted (Defender-throttled SQLite, 4 shared agents) runs this suite ~5x slower than macOS/Linux; 240s was too tight once the guardian journal tests grew (#2345). Matches the server suite budget.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 
