@@ -1575,6 +1575,10 @@ McpServer::HandlerFn McpServer::build_handler(
                              .str())
                     .raw("serverInfo",
                          JObj().add("name", "yuzu-server").add("version", "0.1.3").str())
+                    // A5 item 6: static, operator-authored orientation for a fresh
+                    // client, single-sourced with yuzu://about + yuzu://operating-model
+                    // (mcp_orientation.hpp). Never fleet-derived data.
+                    .add("instructions", initialize_instructions())
                     .str();
             res.set_content(success_response(id, result), "application/json");
             return;
