@@ -90,6 +90,39 @@ public:
     /// require_permission and just needs to know who's calling.
     std::optional<auth::Session> resolve_session(const httplib::Request& req);
 
+    /// Re-validate the credential on a HELD-OPEN stream (MCP `GET /mcp/v1/`),
+    /// against the principal that stream is bound to. Called once per heartbeat
+    /// tick from the SSE pump, so a revoked credential cuts a LIVE stream — not
+    /// merely future attaches (ADR-1005 Decision 15(c)).
+    ///
+    /// Tri-state on purpose (Decision 15(i) / chaos CH-4): an unreachable auth
+    /// backend is NOT a revocation, and must not cut every stream on the fleet at
+    /// the same instant — it yields kIndeterminate, which the pump rides out for a
+    /// bounded grace window. Anything definitive (no credential, unknown/expired
+    /// cookie, revoked/expired token, credential now bound to a DIFFERENT
+    /// principal) is kRevoked and kills the stream on the spot.
+    ///
+    /// Credential precedence mirrors `resolve_session` (cookie → Bearer →
+    /// X-Yuzu-Token) but deliberately skips its lazy elevation-reap side effect —
+    /// re-validation is a read, not a request.
+    ///
+    /// NOTE (accepted, documented for security review): a cookie-authenticated
+    /// stream slides the session's INACTIVITY window on every tick, so a live
+    /// stream keeps its cookie session alive. The absolute session lifetime still
+    /// terminates it. MCP clients authenticate with API tokens in practice; if the
+    /// inactivity semantics matter for a future browser-side MCP client, the fix is
+    /// a non-touching `peek_session` on AuthManager.
+    auth::CredentialCheck revalidate_stream(const httplib::Request& req,
+                                            const std::string& expected_principal);
+
+    /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
+    /// validates: the `principal_kind` allowlist, and — for an engine token — that the
+    /// backing engine principal is still Active. `revalidate_stream` must apply them
+    /// too, or a deleted/revoked engine principal keeps its live stream while every
+    /// fresh request it makes is refused. Returns kIndeterminate (never kRevoked) when
+    /// the engine store cannot answer, so a store blip defers rather than mass-kills.
+    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token) const;
+
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.
     bool require_admin(const httplib::Request& req, httplib::Response& res);
@@ -153,12 +186,21 @@ public:
     /// `make_audit_event` writes an empty `principal` and the SOC 2
     /// CC6.6 query "every privileged session-creation row names the
     /// principal" returns false negatives (Gate 4 consistency B3).
+    ///
+    /// `principal_class_override`: `make_audit_event` re-stamps the class from the
+    /// resolved session's `principal_kind`, so an engine principal audits as "engine"
+    /// rather than the "agent" its bearer-token presentation implies. A caller that
+    /// already knows the class (because it captured it while the session was live) must
+    /// pass it, or its rows will disagree with the request-time rows for the same actor.
+    /// Empty keeps the credential-presentation default, which is right for the
+    /// pre-session login/MFA/OIDC sites.
     bool audit_log_for_principal(const httplib::Request& req, const std::string& action,
                                  const std::string& result, const std::string& principal,
                                  const std::string& principal_role,
                                  const std::string& target_type = {},
                                  const std::string& target_id = {},
-                                 const std::string& detail = {});
+                                 const std::string& detail = {},
+                                 const std::string& principal_class_override = {});
 
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,

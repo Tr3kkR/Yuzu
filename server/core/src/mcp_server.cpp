@@ -15,6 +15,7 @@
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
+#include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)
 #include "rest_audit.hpp"               // detail::try_persist_audit (behavioural-audit kernel, #1647)
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
@@ -1309,6 +1310,33 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // invoke the returned function directly without spinning up an httplib::Server
 // (see #438 — the acceptor thread crashes under TSan).
 
+namespace {
+
+// Present-but-unsupported MCP-Protocol-Version → 400. Shared by POST, GET and DELETE:
+// docs/user-manual/mcp.md states this rule for the /mcp/v1/ ENDPOINT, not for POST alone,
+// and a strict client that sends the header on a GET deserves the same answer it would get
+// on a POST rather than a stream. Returns true iff it filled in the denial.
+template <typename AuditFn>
+bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::Response& res,
+                                         const AuditFn& session_audit) {
+    const auto pv = req.get_header_value("MCP-Protocol-Version");
+    if (pv.empty() || transport::protocol_version_supported(pv)) {
+        return false; // absent → the caller assumes the default revision
+    }
+    const auto cid = yuzu::server::detail::make_correlation_id();
+    session_audit("mcp.session.reject", "failure", std::string{},
+                  "reason=protocol_version cid=" + cid);
+    res.status = 400;
+    res.set_content(
+        error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version", cid,
+                               "send MCP-Protocol-Version: 2025-06-18 (or omit the "
+                               "header to accept the 2025-03-26 default)"),
+        "application/json");
+    return true;
+}
+
+} // namespace
+
 McpServer::HandlerFn McpServer::build_handler(
     AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
     InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
@@ -1435,19 +1463,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     "application/json");
                 return;
             }
-            // MCP-Protocol-Version: absent → assume default; present-but-unsupported → 400.
-            const auto pv = req.get_header_value("MCP-Protocol-Version");
-            if (!pv.empty() && !transport::protocol_version_supported(pv)) {
-                const auto cid = yuzu::server::detail::make_correlation_id();
-                session_audit("mcp.session.reject", "failure", "",
-                              "reason=protocol_version cid=" + cid);
-                res.status = 400;
-                res.set_content(
-                    error_response_null_a4(kMcpBadProtocolVersion, "Unsupported MCP-Protocol-Version",
-                                           cid,
-                                           "send MCP-Protocol-Version: 2025-06-18 (or omit the "
-                                           "header to accept the 2025-03-26 default)"),
-                    "application/json");
+            if (reject_unsupported_protocol_version(req, res, session_audit)) {
                 return;
             }
         }
@@ -7122,10 +7138,19 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                                                   const bool* mcp_disabled,
                                                   const bool* streaming_disabled,
                                                   McpSessionRegistry* sessions,
-                                                  std::vector<std::string> allowed_origins) {
+                                                  std::vector<std::string> allowed_origins,
+                                                  yuzu::server::detail::StreamBudget* stream_budget,
+                                                  StreamRevalidateFn revalidate_fn,
+                                                  yuzu::MetricsRegistry* metrics,
+                                                  std::size_t per_principal_cap,
+                                                  StreamPrincipalAuditFn principal_audit_fn) {
     const std::vector<std::string> origins = std::move(allowed_origins);
     return [=](const httplib::Request& req, httplib::Response& res) {
-        res.set_header("Content-Type", "application/json");
+        // NOTE: no up-front Content-Type here. httplib's set_header EMPLACES into a
+        // multimap without erasing, while set_chunked_content_provider only
+        // set_header's its own type — so an application/json set here would ride
+        // along on the SSE response as a SECOND Content-Type header. Every denial
+        // path below sets the JSON type through set_content (which erases first).
         auto session_audit = [&](const char* action, const char* result,
                                  const std::string& target_id, const std::string& detail) {
             (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, result, "McpSession",
@@ -7150,6 +7175,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
         if (!transport::origin_allowed(req.get_header_value("Origin"), origins)) {
             const auto cid = yuzu::server::detail::make_correlation_id();
             session_audit("mcp.session.reject", "failure", "", "reason=origin cid=" + cid);
+            if (metrics != nullptr) {
+                metrics->counter("yuzu_mcp_stream_rejects_total", {{"reason", "origin"}})
+                    .increment();
+            }
             res.status = 403;
             res.set_content(
                 error_response_null_a4(kMcpOriginRejected, "Origin not allowed", cid,
@@ -7158,11 +7187,29 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                 "application/json");
             return;
         }
+        // Same transport pre-check as POST: the protocol-version contract is a property of
+        // the ENDPOINT, not of one method.
+        if (reject_unsupported_protocol_version(req, res, session_audit)) {
+            return;
+        }
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
-        // PR 1 placeholder — the real GET SSE channel is 2f PR 2.
-        res.status = 405;
+        // The SSE channel itself (session gate, Accept negotiation, replay, caps,
+        // provider) lives in mcp_stream.cpp — this file stays wiring.
+        // The actor is captured HERE, while the credential is still valid — the close
+        // audit runs at teardown, when it may not resolve at all. All three fields must
+        // come from the same live session, or the close row will disagree with the attach
+        // row about who acted: principal_class in particular is re-stamped from
+        // principal_kind at request time, so an engine principal reads "engine" there and
+        // would read "agent" from bare credential presentation here.
+        mcp::StreamAuditPrincipal actor{
+            .id = session->username,
+            .role = auth::role_to_string(auth::effective_role(*session)),
+            .cls = session->principal_kind == "engine" ? std::string("engine") : std::string{}};
+        handle_get_tail(req, res, session->username, *sessions, stream_budget, revalidate_fn,
+                        metrics, audit_fn, per_principal_cap, std::move(actor),
+                        principal_audit_fn);
     };
 }
 
@@ -7205,6 +7252,11 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                 "application/json");
             return;
         }
+        // Same transport pre-check as POST/GET — the protocol-version contract belongs to
+        // the endpoint, not to one method.
+        if (reject_unsupported_protocol_version(req, res, session_audit)) {
+            return;
+        }
         auto session = auth_fn(req, res);
         if (!session)
             return; // auth_fn already set 401
@@ -7223,12 +7275,18 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
                 "application/json");
             return;
         }
+        // The session id is an attacker-controlled HEADER until it validates, so the
+        // prefix that reaches an audit row is sanitised — raw bytes could inject the
+        // `;`/`=` field separators audit tooling parses, or CR/LF. The GET sibling in
+        // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
+        // the same verbs and was passing it through raw.
+        const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
         if (sessions->terminate(sid, session->username)) {
-            session_audit("mcp.session.close", "success", sid.substr(0, 8), "");
+            session_audit("mcp.session.close", "success", audit_sid, "");
             res.status = 200;
         } else {
             const auto cid = yuzu::server::detail::make_correlation_id();
-            session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
+            session_audit("mcp.session.reject", "failure", audit_sid,
                           "reason=unknown_session cid=" + cid);
             res.status = 404;
             res.set_content(
@@ -7267,12 +7325,18 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 SoftwareLicensingStore* software_licensing_store,
                                 EnginePrincipalStore* engine_principal_store,
                                 AccessReviewStore* access_review_store, AuthDB* auth_db,
-                                DirectorySync* directory_sync) {
+                                DirectorySync* directory_sync,
+                                yuzu::server::detail::StreamBudget* stream_budget,
+                                StreamRevalidateFn revalidate_fn,
+                                std::size_t mcp_max_streams_per_principal,
+                                StreamPrincipalAuditFn principal_audit_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
     svr.Get("/mcp/v1/", build_get_handler(auth_fn, audit_fn, &mcp_disabled, mcp_streaming_disabled,
-                                          sessions, allowed_origins));
+                                          sessions, allowed_origins, stream_budget, revalidate_fn,
+                                          metrics, mcp_max_streams_per_principal,
+                                          principal_audit_fn));
     svr.Delete("/mcp/v1/", build_delete_handler(auth_fn, audit_fn, &mcp_disabled,
                                                 mcp_streaming_disabled, sessions, allowed_origins));
 
@@ -7300,6 +7364,25 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                  "({} tools, {} resources, {} prompts{}{})",
                  kToolCount, kResourceCount, kPromptCount, read_only_mode ? ", read-only mode" : "",
                  streaming_off ? ", streaming disabled" : "");
+    // A streaming-enabled endpoint with either seam unwired is a misconfiguration,
+    // not a mode: without the budget, held-open GET streams are admitted without
+    // limit onto the shared worker pool; without re-validation, a revoked
+    // credential keeps its live stream until the session TTL. Test seams omit
+    // them deliberately; a production registration must not.
+    if (!streaming_off && !principal_audit_fn) {
+        spdlog::warn("MCP: streaming enabled with NO explicit-principal audit sink — "
+                     "mcp.stream.close rows will re-derive the actor from a credential that "
+                     "no longer resolves on a revocation close, and will name nobody. Test "
+                     "seams omit it deliberately; a production server must not.");
+    }
+    if (!streaming_off && stream_budget == nullptr) {
+        spdlog::warn("MCP: streaming enabled with NO stream budget — concurrent GET SSE "
+                     "streams are uncapped on the shared HTTP worker pool");
+    }
+    if (!streaming_off && !revalidate_fn) {
+        spdlog::warn("MCP: streaming enabled with NO credential re-validation — a live GET SSE "
+                     "stream will survive revocation of the credential that opened it");
+    }
 }
 
 } // namespace yuzu::server::mcp

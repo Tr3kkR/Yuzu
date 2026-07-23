@@ -304,6 +304,25 @@ struct Config {
     /// allowed because the endpoint requires a credential). Wired via the
     /// repeatable --mcp-allowed-origin / YUZU_MCP_ALLOWED_ORIGINS.
     std::vector<std::string> mcp_allowed_origins;
+    /// Concurrently held-open MCP SSE streams, globally and per principal
+    /// (Decision 15(d)/(h)). Each stream pins one HTTP worker for its whole life,
+    /// so this is a worker-pool budget, not a taste setting: the global cap is
+    /// clamped at boot to `pool_max - plain-REST reserve`. Per-principal is
+    /// deliberately BELOW the per-principal session cap (8) — a session is a cheap
+    /// cursor, a held-open worker is not.
+    /// Concurrent held-open SSE responses this server is sized for, across EVERY streaming
+    /// surface (MCP GET, /api/v1/events, the dashboard executions drawer, the legacy /events
+    /// stream). The worker pool is derived FROM this — not the other way round (ADR-0034):
+    /// a stream costs a blocked thread, which is cheap, so the operator declares the workload
+    /// and the pool is sized to honour it. 0 = the default (128).
+    std::size_t max_sse_streams{0};
+    /// Per-principal MCP stream allowance — a per-surface anti-monopoly policy, NOT a
+    /// capacity limit (the pool is protected by the global budget alone).
+    std::size_t mcp_max_streams_per_principal{4};
+    /// Pin the shared HTTP worker pool by hand. 0 = derive it from `max_sse_streams`, which
+    /// is what you want. Setting it overrides the derivation, and the stream target is then
+    /// clamped to whatever the pool you chose can actually carry.
+    std::size_t http_worker_threads{0};
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)

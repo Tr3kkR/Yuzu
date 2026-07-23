@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stream_budget.hpp"
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
@@ -308,7 +310,11 @@ public:
         // enrichment) — `rbac_store`/`engine_principal_store`/`token_store` above
         // double as the other three read-model deps, so no new params for those.
         AccessReviewStore* access_review_store = nullptr, AuthDB* auth_db = nullptr,
-        DirectorySync* directory_sync = nullptr);
+        DirectorySync* directory_sync = nullptr,
+        // ADR-0034: THE shared admission budget for held-open responses. GET /api/v1/events
+        // pins an httplib worker for the life of the subscription, so it leases from the same
+        // counter as every other streaming surface. nullptr = no admission control (tests).
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -364,7 +370,9 @@ public:
         // Periodic Access Reviews (SOC 2 CC6.2) — see the production overload's
         // doc comment above; identical trailing-optional-dep contract.
         AccessReviewStore* access_review_store = nullptr, AuthDB* auth_db = nullptr,
-        DirectorySync* directory_sync = nullptr);
+        DirectorySync* directory_sync = nullptr,
+        // ADR-0034: the shared held-open-response budget (see the overload above).
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the
