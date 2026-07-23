@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <stdexcept>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1170,6 +1171,120 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"close_access_review", {"AccessReview", "Attest"}},
 };
 
+// ── C8 fail-closed registration machinery (#2383) ────────────────────────
+// Three-way dispatch classification. Knownness (kTools membership) decides
+// FIRST: a kToolSecurity row for an unserved name must NOT make it
+// dispatchable, and a SERVED tool with no kToolSecurity row is a
+// security-registration defect that denies fail-closed instead of silently
+// skipping the generic tier+approval gate.
+enum class ToolSecurityClass {
+    kUnknown,               // not a served tool → "Unknown tool" (kMethodNotFound)
+    kKnownRegistered,       // served + registered → C7 / tier / approval as normal
+    kKnownMissingSecurity,  // served but unregistered → deny fail-closed
+};
+
+// The served kTools[] name set, shared by the dispatch classifier and the
+// McpServer ctor validator so it is built during construction, not lazily on
+// the first request. ToolDef::name points at string literals (static storage
+// duration), so the views never dangle.
+const std::unordered_set<std::string_view>& known_tool_names() {
+    static const std::unordered_set<std::string_view> names = [] {
+        std::unordered_set<std::string_view> s;
+        s.reserve(kToolCount);
+        for (const auto& t : kTools)
+            s.insert(t.name);
+        return s;
+    }();
+    return names;
+}
+
+// Pure classifier — the REAL dispatch path calls this, and the testonly
+// wrapper (classify_tool_for_test) runs the same function over synthetic
+// tables, so the three-way split cannot silently regress while tests stay
+// green.
+ToolSecurityClass classify_tool_security(
+    const std::string& tool_name, const std::unordered_set<std::string_view>& known_tools,
+    const std::unordered_map<std::string, ToolSecurity>& security) {
+    if (!known_tools.contains(std::string_view{tool_name}))
+        return ToolSecurityClass::kUnknown;
+    if (!security.contains(tool_name))
+        return ToolSecurityClass::kKnownMissingSecurity;
+    return ToolSecurityClass::kKnownRegistered;
+}
+
+// Borrowed (name, operation) row for the registration validator. Views are
+// valid only for the duration of the call; nothing is retained.
+struct ToolNameOp {
+    std::string_view name;
+    std::string_view operation;
+};
+
+// Pure registration validator (#2383) — throws std::runtime_error naming every
+// offender (sorted, so the message is deterministic regardless of hash-map
+// iteration order). Called by the McpServer ctor with the real tables and by
+// validate_tool_registration_for_test with synthetic ones.
+void validate_tool_security_registration(const std::vector<std::string_view>& tool_names,
+                                         const std::vector<ToolNameOp>& security_rows,
+                                         const std::vector<std::string_view>& write_tools) {
+    // Closed RBAC operation vocabulary (rbac_store.cpp's seeded catalogue). An
+    // operation typo (e.g. "read") is NOT harmlessly conservative: supervised
+    // tier_allows() permits every operation while requires_approval() matches
+    // exact strings, so a typo'd op skips its intended approval rule — fail
+    // OPEN. Reject anything outside the catalogue at boot instead.
+    static constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete",
+                                                    "Approve", "Push",  "Attest"};
+
+    const std::unordered_set<std::string_view> names(tool_names.begin(), tool_names.end());
+    std::unordered_map<std::string_view, std::string_view> rows;
+    rows.reserve(security_rows.size());
+    for (const auto& r : security_rows)
+        rows.emplace(r.name, r.operation);
+    const std::unordered_set<std::string_view> writes(write_tools.begin(), write_tools.end());
+
+    std::vector<std::string> offences;
+    // Exact set equality BOTH directions: a subset-only check would accept an
+    // extra security row, and an extra row for an unserved name is the drift
+    // state under which the dispatch pre-gate's knownness ordering matters.
+    for (const auto& n : names)
+        if (!rows.contains(n))
+            offences.push_back("served tool '" + std::string(n) + "' has no kToolSecurity row");
+    for (const auto& [n, op] : rows) {
+        if (!names.contains(n))
+            offences.push_back("kToolSecurity row '" + std::string(n) + "' names no served tool");
+        if (std::find(std::begin(kRbacOps), std::end(kRbacOps), op) == std::end(kRbacOps))
+            offences.push_back("tool '" + std::string(n) + "' has operation '" + std::string(op) +
+                               "' outside the RBAC operation catalogue");
+    }
+    // kWriteTools must be EXACTLY the non-Read subset: the C7 --mcp-read-only
+    // guard keys on kWriteTools, so a non-Read tool missing from it silently
+    // executes in read-only mode (a second, independent fail-open surface).
+    for (const auto& [n, op] : rows) {
+        if (!names.contains(n))
+            continue;  // already reported above
+        const bool non_read = (op != "Read");
+        if (non_read && !writes.contains(n))
+            offences.push_back("non-Read tool '" + std::string(n) +
+                               "' is missing from kWriteTools");
+        if (!non_read && writes.contains(n))
+            offences.push_back("Read tool '" + std::string(n) + "' must not be in kWriteTools");
+    }
+    for (const auto& w : writes)
+        if (!rows.contains(w))
+            offences.push_back("kWriteTools entry '" + std::string(w) +
+                               "' has no kToolSecurity row");
+
+    if (offences.empty())
+        return;
+    std::sort(offences.begin(), offences.end());
+    std::string msg = "MCP tool security registration invalid (C8 fail-closed, #2383): ";
+    for (size_t i = 0; i < offences.size(); ++i) {
+        if (i)
+            msg += "; ";
+        msg += offences[i];
+    }
+    throw std::runtime_error(msg);
+}
+
 // ── Tool annotation classification (ADR-1005 track 2g PR 2, invariant A5 item 1) ──
 //
 // SINGLE SOURCE for the standard MCP annotation hints. Every tool's served
@@ -1466,6 +1581,24 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 }
 
 } // anonymous namespace
+
+// ── C8 fail-closed boot validator (#2383) ────────────────────────────────
+// Refuse to construct — and therefore refuse to boot: the throw propagates
+// from start_web_server() to main()'s fatal-exception handler → EXIT_FAILURE
+// — when kTools / kToolSecurity / kWriteTools disagree. Every direct
+// test-harness construction runs the same check, so CI trips a
+// misregistration deterministically. --mcp-disable skips construction, which
+// is fine: no MCP surface, nothing to enforce.
+McpServer::McpServer() {
+    const auto& known = known_tool_names();
+    std::vector<std::string_view> names(known.begin(), known.end());
+    std::vector<ToolNameOp> rows;
+    rows.reserve(kToolSecurity.size());
+    for (const auto& [name, sec] : kToolSecurity)
+        rows.push_back({name, sec.operation});
+    std::vector<std::string_view> writes(kWriteTools.begin(), kWriteTools.end());
+    validate_tool_security_registration(names, rows, writes);
+}
 
 // ── Handler construction ─────────────────────────────────────────────────
 //
@@ -2261,10 +2394,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 return a.dump();
             };
 
+            // ── C8 pre-gate: three-way knownness classification (#2383) ─
+            // Knownness is decided BEFORE C7 and the generic C8 gate: an
+            // unknown tool name must fall through to the "Unknown tool"
+            // kMethodNotFound branch untouched (no read-only denial, no tier
+            // denial, no approval mint — even if a stray kToolSecurity /
+            // kWriteTools row exists for it), and a SERVED tool with no
+            // kToolSecurity row is a security-registration defect → deny
+            // fail-closed with a misconfig-flavored error, distinct from the
+            // tier/authz denials so audit can tell the two apart. The ctor
+            // validator makes this state unbootable; this branch is defense
+            // in depth should the validator ever be bypassed.
+            const auto sec_class =
+                classify_tool_security(tool_name, known_tool_names(), kToolSecurity);
+            if (sec_class == ToolSecurityClass::kKnownMissingSecurity) {
+                mcp_audit("failure", "tool security registration missing");
+                res.set_content(
+                    a4_error(kInternalError,
+                             "tool security registration missing — denied fail-closed",
+                             "this server build serves the tool without a security "
+                             "registration; report this misconfiguration to the server "
+                             "administrator"),
+                    "application/json");
+                return;
+            }
+
             // ── C7: read_only_mode enforcement ──────────────────────────
             // When the server is in read-only mode, reject any tool that
-            // performs a Write/Execute/Delete operation.
-            if (*p_read_only && kWriteTools.contains(tool_name)) {
+            // performs a Write/Execute/Delete operation. Known tools only —
+            // an unknown name skips straight to kMethodNotFound below.
+            if (sec_class == ToolSecurityClass::kKnownRegistered && *p_read_only &&
+                kWriteTools.contains(tool_name)) {
                 mcp_audit("denied", "read-only mode");
                 res.set_content(a4_error(kTierDenied, "MCP is in read-only mode",
                                          "the server is running with --mcp-read-only; use the "
@@ -2278,9 +2438,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // tier_allows() / requires_approval() generically.  This fires
             // for EVERY tool so Phase 2 write tools get policy enforcement
             // the moment they are registered in kToolSecurity.
-            auto sec_it = kToolSecurity.find(tool_name);
-            if (sec_it != kToolSecurity.end()) {
-                const auto& [sec_type, sec_op] = sec_it->second;
+            if (sec_class == ToolSecurityClass::kKnownRegistered) {
+                // kKnownRegistered guarantees the row exists (same map the
+                // classifier consulted).
+                const auto& [sec_type, sec_op] = kToolSecurity.find(tool_name)->second;
 
                 if (!tier_allows(tier, sec_type, sec_op)) {
                     mcp_audit("denied", "tier=" + std::string(tier));
@@ -7614,6 +7775,45 @@ std::vector<std::string_view> write_tool_names_for_test() {
     for (const auto& n : kWriteTools)
         names.push_back(n);
     return names;
+}
+
+std::vector<std::string> tool_names_for_test() {
+    std::vector<std::string> names;
+    names.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        names.emplace_back(t.name);
+    return names;
+}
+
+ToolClassForTest classify_tool_for_test(const std::string& tool_name,
+                                        const std::vector<std::string>& known_tools,
+                                        const std::vector<std::string>& registered_tools) {
+    const std::unordered_set<std::string_view> known(known_tools.begin(), known_tools.end());
+    std::unordered_map<std::string, ToolSecurity> sec;
+    sec.reserve(registered_tools.size());
+    for (const auto& r : registered_tools)
+        sec.emplace(r, ToolSecurity{"", "Read"});  // literals: static storage, no dangle
+    switch (classify_tool_security(tool_name, known, sec)) {
+    case ToolSecurityClass::kUnknown:
+        return ToolClassForTest::kUnknown;
+    case ToolSecurityClass::kKnownRegistered:
+        return ToolClassForTest::kKnownRegistered;
+    case ToolSecurityClass::kKnownMissingSecurity:
+        return ToolClassForTest::kKnownMissingSecurity;
+    }
+    return ToolClassForTest::kUnknown;  // unreachable; silences -Wreturn-type
+}
+
+void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
+                                         const std::vector<ToolSecurityRowOwned>& security_rows,
+                                         const std::vector<std::string>& write_tools) {
+    std::vector<std::string_view> names(tool_names.begin(), tool_names.end());
+    std::vector<ToolNameOp> rows;
+    rows.reserve(security_rows.size());
+    for (const auto& r : security_rows)
+        rows.push_back({r.name, r.operation});
+    std::vector<std::string_view> writes(write_tools.begin(), write_tools.end());
+    validate_tool_security_registration(names, rows, writes);
 }
 
 } // namespace yuzu::server::mcp

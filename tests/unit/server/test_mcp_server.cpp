@@ -39,6 +39,8 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>        // REQUIRE_THROWS_WITH (#2383)
+#include <catch2/matchers/catch_matchers_string.hpp> // ContainsSubstring (#2383)
 
 #include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
 
@@ -1233,6 +1235,76 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
                 token_id_required = true;
         CHECK(token_id_required);
     }
+}
+
+// #2383: C8 fail-closed. The boot validator and the three-way dispatch
+// classifier are exercised through the testonly seam over SYNTHETIC tables —
+// the seam wrappers forward to the REAL functions (no file-static mutation) —
+// plus the real tables through both paths. Supplemental falsification evidence
+// (temporarily deleting a real kToolSecurity row) lives in the PR notes.
+TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    // Real tables: constructing McpServer IS the boot validator — must not throw.
+    REQUIRE_NOTHROW(McpServer{});
+
+    // Real tables fed through the seam explicitly.
+    {
+        auto names = tool_names_for_test();
+        std::vector<ToolSecurityRowOwned> rows;
+        for (const auto& r : tool_security_rows_for_test())
+            rows.push_back({std::string(r.name), std::string(r.operation)});
+        std::vector<std::string> writes;
+        for (const auto& w : write_tool_names_for_test())
+            writes.emplace_back(w);
+        REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes));
+    }
+
+    // (a) served tool with no security row — the original C8 fail-open state.
+    REQUIRE_THROWS_WITH(
+        validate_tool_registration_for_test({"alpha", "beta"}, {{"alpha", "Read"}}, {}),
+        ContainsSubstring("'beta' has no kToolSecurity row"));
+
+    // (b) extra security row naming no served tool — a subset-only check would
+    // accept this; exact equality both directions must reject it.
+    REQUIRE_THROWS_WITH(
+        validate_tool_registration_for_test({"alpha"}, {{"alpha", "Read"}, {"ghost", "Read"}},
+                                            {}),
+        ContainsSubstring("'ghost' names no served tool"));
+
+    // (c) kWriteTools vs non-Read subset, both directions, plus a write entry
+    // with no security row at all.
+    REQUIRE_THROWS_WITH(validate_tool_registration_for_test({"w"}, {{"w", "Write"}}, {}),
+                        ContainsSubstring("non-Read tool 'w' is missing from kWriteTools"));
+    REQUIRE_THROWS_WITH(validate_tool_registration_for_test({"r"}, {{"r", "Read"}}, {"r"}),
+                        ContainsSubstring("Read tool 'r' must not be in kWriteTools"));
+    REQUIRE_THROWS_WITH(
+        validate_tool_registration_for_test({"a"}, {{"a", "Read"}}, {"phantom"}),
+        ContainsSubstring("kWriteTools entry 'phantom' has no kToolSecurity row"));
+
+    // (d) operation outside the closed RBAC catalogue. NOT harmlessly
+    // conservative: a typo'd "read" passes supervised tier_allows() (permits
+    // every op) yet misses every exact-string requires_approval() rule — the
+    // tool would skip its intended approval, failing OPEN.
+    REQUIRE_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "read"}}, {"t"}),
+        ContainsSubstring("operation 'read' outside the RBAC operation catalogue"));
+    // Attest is a first-class catalogue member (AccessReview) — valid non-Read.
+    REQUIRE_NOTHROW(validate_tool_registration_for_test({"t"}, {{"t", "Attest"}}, {"t"}));
+}
+
+TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
+    // known + registered → normal C7/tier/approval path.
+    CHECK(classify_tool_for_test("x", {"x"}, {"x"}) == ToolClassForTest::kKnownRegistered);
+    // known + missing security row → the fail-closed denial class; the dispatch
+    // branch returns before the approval flow and before any per-handler
+    // perm_fn, so a misregistered tool can neither mint a ticket nor execute.
+    CHECK(classify_tool_for_test("x", {"x"}, {}) == ToolClassForTest::kKnownMissingSecurity);
+    // unknown → "Unknown tool" (kMethodNotFound), untouched by C7/C8.
+    CHECK(classify_tool_for_test("x", {}, {}) == ToolClassForTest::kUnknown);
+    // unknown with a STRAY security row: the row must not make it dispatchable —
+    // knownness (kTools membership) decides first.
+    CHECK(classify_tool_for_test("x", {}, {"x"}) == ToolClassForTest::kUnknown);
 }
 
 // #2384: the confirm token_id pin, exercised end-to-end at the MCP surface —
