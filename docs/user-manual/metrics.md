@@ -666,7 +666,7 @@ on them.
 
 **Two meta-signals are the exception.** `yuzu_fleet_guardian_journal_reporting` and
 `..._tag_rejected` are server-owned counts published on **every completed sweep,
-including at `0`**, unlike the 22. Two consequences, and the second is easy to miss:
+including at `0`**, unlike the 29. Two consequences, and the second is easy to miss:
 
 - `_reporting == 0` while `yuzu_fleet_agents_healthy > 0` narrows the pipeline-dark
   question - but only once Guardian is actually deployed, since the sparse writer means
@@ -698,6 +698,13 @@ flips - absence in that window is guaranteed rather than evidentiary. After it, 
 reboot or OTA can produce a large step in `_evicted_no_send_evidence` about a retention
 window later that is population churn, not a new incident.
 
+> **Selector caveat.** Three counters in this family break the `yuzu_fleet_guardian_journal_*`
+> naming pattern - `yuzu_fleet_guardian_send_exceptions`, `yuzu_fleet_guardian_drain_exceptions`,
+> and `yuzu_fleet_guardian_sweep_exceptions` (their wire tags likewise drop the `_journal_`
+> infix, sitting beside `drain_exceptions`). A PromQL selector like
+> `{__name__=~"^yuzu_fleet_guardian_journal_"}` silently omits all three. Match
+> `^yuzu_fleet_guardian_` if you mean the whole family.
+
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed under sustained write failure. A **loss** channel - these records never reached the journal. Monitor-only |
@@ -723,6 +730,10 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_evicted_sent_unacked` | gauge | Fleet sum of **batches** aged out of the journal **with** a sent-label but no ack (each batch holds up to 256 records). **Monitor, do not page**: their records were sent and are very likely stored server-side; only the ack did not come back. Read against its no-evidence sibling |
 | `yuzu_fleet_guardian_journal_evicted_no_send_evidence` | gauge | Fleet sum of **batches** aged out with **no** sent-label - no evidence their records were ever transmitted (each batch holds up to 256 records, so this understates the record count). This is the **integrity-gap** counter: `> 0` suggests lifecycle audit records were lost between endpoint and server. A CC7.3-relevant evidence signal. Treat a rise as a **ticket to investigate**, not an incident-register entry: classification is **best-effort** (a crash between the send and the sent-label write counts a sent batch as no-evidence), so a mass reboot or OTA manufactures a large benign step about a retention window later. Do not escalate until agent-side corroboration or magnitude analysis rules out that artifact class. Monitor-only |
 | `yuzu_fleet_guardian_journal_maint_exceptions` | gauge | Fleet sum of exceptions swallowed by the journal maintenance tick (page/flush). Swallowed so maintenance cannot kill the agent - which is exactly why they must be visible here: a climbing value means maintenance is failing silently and the counters beside it are **understating** reality |
+| `yuzu_fleet_guardian_journal_backpressure_drops` | gauge | Fleet sum of lifecycle-audit entries **rejected** at outbox enqueue for capacity. A **loss** channel: arm/disarm still succeeds, but the audit record of it is dropped. A non-zero value means the audit trail is missing lifecycle edges under sustained delivery backpressure |
+| `yuzu_fleet_guardian_send_exceptions` | gauge | Fleet sum of per-entry drain **sends** that threw. Finer-grained than `_drain_exceptions`: one entry couldn't be serialized/sent, so that log's drain stops and jams delivery behind it. Spans the lifecycle log and the general outbox. **Wire key `yuzu.guardian_send_exceptions` (no `_journal_` infix)** |
+| `yuzu_fleet_guardian_drain_exceptions` | gauge | Fleet sum of firewalled throws in the outbox **delivery** machinery on the drain worker. Distinct from the journal counters: events are buffered but not shipping - a delivery fault, not a retention or audit-trail fault. **Wire key `yuzu.guardian_drain_exceptions` (no `_journal_` infix)** |
+| `yuzu_fleet_guardian_sweep_exceptions` | gauge | Fleet sum of firewalled throws in the convergence **sweep** lanes. Drift detection is degraded (the endpoint may miss policy violations) while the audit trail itself is unaffected. **Wire key `yuzu.guardian_sweep_exceptions` (no `_journal_` infix)** |
 | `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 29 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 29; it does not resolve it |
 | `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 

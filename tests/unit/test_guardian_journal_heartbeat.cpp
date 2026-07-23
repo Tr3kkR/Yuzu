@@ -78,6 +78,7 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .page_read_failures = 14,
         .clock_jump_skips = 15,
         .write_capacity_rejected = 16,
+        .gauge_underflow = 27,
         .journal_bytes = 17,
         .journal_batch_count = 18,
         .pages = 19,
@@ -88,9 +89,11 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .maint_exceptions = 24,
         .drain_exceptions = 25,
         .sweep_exceptions = 26,
+        .send_exceptions = 28,
+        .lifecycle_backpressure_drops = 29,
     };
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 26);
+    CHECK(tags.size() == 29);
 }
 
 TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",

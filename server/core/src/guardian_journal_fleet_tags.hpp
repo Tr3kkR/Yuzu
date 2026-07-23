@@ -25,7 +25,8 @@
 /// shape `yuzu_fleet_net_*` / `yuzu_fleet_perf_*` use (design item 9,
 /// "unlabeled/low-cardinality"). These are integrity and loss signals, not
 /// distributions: the fleet question is "did ANY endpoint lose a lifecycle record",
-/// which a sum answers and a percentile obscures. 29 families, 29 series, no
+/// which a sum answers and a percentile obscures. 29 counter families, 29 series (plus
+/// the 2 always-published meta gauges described below), no
 /// agent-controlled label anywhere - so no cardinality exposure at all (contrast the
 /// `os`-labelled families, which need an allowlist).
 ///
@@ -287,33 +288,33 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
 /// future refactor to a pointer, which the sizeof form would mis-size to 1.
 inline constexpr std::size_t kNGuardianJournalMetrics = std::size(kGuardianJournalMetrics);
 
-// ── Meta-signals: about the ROLLUP, not part of the 27-row table ──────────────
+// ── Meta-signals: about the ROLLUP, not part of the 29-row table ──────────────
 // Deliberately outside kGuardianJournalMetrics. That table is pinned 1:1 to
 // GuardianJournalStats by a static_assert on the struct's size, so anything added to
 // it that is not an agent counter breaks the pin. These two are computed server-side.
 //
-// Both are published on EVERY sweep including at 0 - the opposite of the 27, and
-// deliberately so. The 27 are agent-population rollups where absent means "nobody
+// Both are published on EVERY sweep including at 0 - the opposite of the 29, and
+// deliberately so. The 29 are agent-population rollups where absent means "nobody
 // reported"; these are server-owned counts that always have a true value, so a 0 is a
 // measurement ("nothing is reporting") rather than a fabrication. Same split
 // docs/observability-conventions.md draws between pre-seeded server-owned series and
 // absent-not-zero agent rollups, and the same posture as yuzu_fleet_perf_reporting.
 
 /// Agents whose latest heartbeat carried at least one parseable journal tag. The
-/// coverage denominator the 27 lack: without it, 5 reporting agents and 10,000 produce
+/// coverage denominator the 29 lack: without it, 5 reporting agents and 10,000 produce
 /// identical output and "absent = clean" is asserted at unknown coverage.
 inline constexpr const char* kGuardianJournalReportingGauge =
     "yuzu_fleet_guardian_journal_reporting";
 inline constexpr const char* kGuardianJournalReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_journal_* tag - the coverage denominator for the whole family. "
-    "Published every sweep INCLUDING 0, unlike the 27 counters. READ 0 CAREFULLY: "
+    "Published every sweep INCLUDING 0, unlike the 29 counters. READ 0 CAREFULLY: "
     "because the writer is SPARSE (a 0 counter emits no tag), this counts agents with "
     "at least one NON-ZERO counter, not agents whose journal pipeline is working. So 0 "
     "means EITHER the telemetry path is dark (pre-cutover, all aged out, reporting "
     "broke) OR nothing has been journalled anywhere since restart - a live journal on "
     "a fleet with no deployed Guardian rules reads 0 legitimately. It narrows the "
-    "overloaded absence of the 27 counters; it does not resolve it";
+    "overloaded absence of the 29 counters; it does not resolve it";
 
 /// Journal tags that were PRESENT on a heartbeat but failed the forged-value parse.
 inline constexpr const char* kGuardianJournalTagRejectedGauge =
@@ -334,7 +335,7 @@ inline constexpr const char* kGuardianJournalTagRejectedHelp =
 /// O(1) without being scanned. kMaxPlausibleGuardianJournalCount is 10 digits, so any
 /// longer token is implausible by construction. This matters because the parse runs
 /// under AgentHealthStore::mu_ - the same lock heartbeat ingest and every
-/// dashboard/REST fleet read take - 27 times per agent per ~15 s sweep. Without it, an
+/// dashboard/REST fleet read take - 29 times per agent per ~15 s sweep. Without it, an
 /// agent parking a multi-megabyte all-digit value in each tag gets it O(n)-scanned
 /// inside that critical section forever.
 ///
