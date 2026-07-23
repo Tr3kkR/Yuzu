@@ -78,6 +78,9 @@ constexpr std::string_view kEnginePrincipals[] = {
     "confirm_engine_rotation",        "transfer_engine_principal_owner",
     "audit_engine_no_admin",          "assign_engine_role",
     "unassign_engine_role",           "list_engine_roles"};
+constexpr std::string_view kAccessReviews[] = {"export_access_review", "open_access_review",
+                                               "record_attestation", "get_access_review",
+                                               "list_access_reviews", "close_access_review"};
 constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
                                                 "classify_operational_question",
                                                 "get_incident_playbook", "summarize_working_set"};
@@ -85,7 +88,7 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
 
-constexpr std::array<ToolFamily, 19> kFamilies{{
+constexpr std::array<ToolFamily, 20> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -109,6 +112,8 @@ constexpr std::array<ToolFamily, 19> kFamilies{{
     {"Certificates", "list issued agent certificates and revoke one", kCerts},
     {"Engine principals", "provision and manage the durable identities behind use-case engines",
      kEnginePrincipals},
+    {"Access reviews", "open, attest, close, and export SOC 2 access-certification reviews",
+     kAccessReviews},
     {"Agentic helpers", "high-level workflow helpers: fast posture, classification, playbooks",
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
