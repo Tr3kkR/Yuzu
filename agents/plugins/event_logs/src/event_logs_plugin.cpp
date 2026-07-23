@@ -14,11 +14,18 @@
  *   event|timestamp|level|event_id|source|message
  */
 
+#include "event_logs_macos.hpp"
+
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.hpp>
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <format>
 #include <string>
@@ -40,27 +47,36 @@ namespace {
 // ── subprocess helpers ─────────────────────────────────────────────────────
 
 std::vector<std::string> run_command_lines(const char* cmd) {
-    std::vector<std::string> lines;
-    std::array<char, 512> buf{};
+    std::string output;
 #ifdef _WIN32
+    std::array<char, 512> buf{};
     FILE* pipe = _popen(cmd, "r");
+    if (pipe) {
+        while (fgets(buf.data(), static_cast<int>(buf.size()), pipe))
+            output += buf.data();
+        _pclose(pipe);
+    }
 #else
-    FILE* pipe = popen(cmd, "r");
+    // Bounded, fork-lock-covered runner (review blocker) instead of a raw,
+    // deadline-less popen that bypassed both the fork lock and any timeout.
+    // `/bin/sh -c` preserves the shell semantics the Linux `journalctl` callers
+    // rely on; the runner drains and caps stdout.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/bin/sh", "-c", cmd},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    output = std::move(res.output);
 #endif
-    if (!pipe)
-        return lines;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line(buf.data());
+    std::vector<std::string> lines;
+    for (std::size_t scan = 0; scan < output.size();) {
+        const std::size_t nl = output.find('\n', scan);
+        const std::size_t end = (nl == std::string::npos) ? output.size() : nl;
+        std::string line = output.substr(scan, end - scan);
+        scan = (nl == std::string::npos) ? output.size() : nl + 1;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
             line.pop_back();
         if (!line.empty())
             lines.push_back(std::move(line));
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
     return lines;
 }
 
@@ -79,6 +95,13 @@ std::string sanitize_input(std::string_view input) {
     }
     return out;
 }
+
+// ── macOS `log show` deadline ────────────────────────────────────────────
+
+// Hard wall-clock bound on macOS `log show`: it has no built-in timeout and
+// GNU `timeout` isn't available on macOS, so an unbounded shell-out could
+// otherwise block the collection thread indefinitely (#2273).
+constexpr auto kLogShowDeadline = std::chrono::milliseconds(10000);
 
 // ── errors action ──────────────────────────────────────────────────────────
 
@@ -158,34 +181,38 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format("log show --predicate 'messageType == error' --last {}h "
-                           "--style compact 2>/dev/null | head -100",
-                           hours);
-    auto lines = run_command_lines(cmd.c_str());
-    if (lines.empty()) {
-        ctx.write_output("error|none|-|No error events found");
-        return 0;
+    constexpr std::size_t kMaxLines = 100;
+    std::vector<std::string> argv{"/usr/bin/log", "show",
+                                   "--predicate",  "messageType == error",
+                                   "--last",       std::format("{}h", hours),
+                                   "--style",      "compact"};
+    auto result = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = kLogShowDeadline,
+                                              .max_lines = kMaxLines,
+                                              .merge_stderr = false,
+                                              .stop_after_max_lines = true});
+
+    // Surface degraded `log show` runs to operators: the sentinel row + rc are
+    // honest but only visible by parsing returned rows, so a hung/failed/
+    // truncated shell-out would otherwise be silent in the agent log.
+    if (result.timed_out || !result.tool_ran || result.exit_code != 0 || result.output_truncated) {
+        spdlog::warn("event_logs errors: macOS 'log show' {} (timed_out={}, tool_ran={}, "
+                     "exit_code={}, output_truncated={})",
+                     result.timed_out         ? "timed out"
+                     : !result.tool_ran       ? "unavailable"
+                     : result.exit_code != 0  ? "failed"
+                                              : "output truncated",
+                     result.timed_out, result.tool_ran, result.exit_code, result.output_truncated);
     }
-    for (const auto& line : lines) {
-        // Compact format: "timestamp  process[pid]  message"
-        auto first_space = line.find("  ");
-        if (first_space == std::string::npos) {
-            ctx.write_output(std::format("error|{}|-|{}", line, line));
-            continue;
-        }
-        auto timestamp = line.substr(0, first_space);
-        auto rest = line.substr(first_space + 2);
-        auto second_space = rest.find("  ");
-        std::string process = "-";
-        std::string message = rest;
-        if (second_space != std::string::npos) {
-            process = rest.substr(0, second_space);
-            message = rest.substr(second_space + 2);
-        }
-        if (message.size() > 200)
-            message = message.substr(0, 200);
-        ctx.write_output(std::format("error|{}|{}|{}", timestamp, process, message));
-    }
+
+    // decide_log_show_output is the single source of truth for the
+    // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
+    // calls it and emits whatever it returns.
+    auto decision = yuzu::event_logs_macos::decide_log_show_output(result, "error",
+                                                                     "No error events found");
+    for (const auto& row : decision.rows)
+        ctx.write_output(row);
+    return decision.rc;
 
 #else
     ctx.write_output("error|platform not supported|-|-");
@@ -275,33 +302,41 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format("log show --predicate 'eventMessage contains \"{}\"' --last 24h "
-                           "--style compact 2>/dev/null | head -{}",
-                           filter, count);
-    auto lines = run_command_lines(cmd.c_str());
-    if (lines.empty()) {
-        ctx.write_output("event|none|-|No matching events found");
-        return 0;
+    std::vector<std::string> argv{"/usr/bin/log",
+                                   "show",
+                                   "--predicate",
+                                   std::format("eventMessage contains \"{}\"", filter),
+                                   "--last",
+                                   "24h",
+                                   "--style",
+                                   "compact"};
+    auto result = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = kLogShowDeadline,
+                                              .max_lines = static_cast<std::size_t>(count),
+                                              .merge_stderr = false,
+                                              .stop_after_max_lines = true});
+
+    // Surface degraded `log show` runs to operators: the sentinel row + rc are
+    // honest but only visible by parsing returned rows, so a hung/failed/
+    // truncated shell-out would otherwise be silent in the agent log.
+    if (result.timed_out || !result.tool_ran || result.exit_code != 0 || result.output_truncated) {
+        spdlog::warn("event_logs query: macOS 'log show' {} (timed_out={}, tool_ran={}, "
+                     "exit_code={}, output_truncated={})",
+                     result.timed_out         ? "timed out"
+                     : !result.tool_ran       ? "unavailable"
+                     : result.exit_code != 0  ? "failed"
+                                              : "output truncated",
+                     result.timed_out, result.tool_ran, result.exit_code, result.output_truncated);
     }
-    for (const auto& line : lines) {
-        auto first_space = line.find("  ");
-        if (first_space == std::string::npos) {
-            ctx.write_output(std::format("event|{}|-|{}", line, line));
-            continue;
-        }
-        auto timestamp = line.substr(0, first_space);
-        auto rest = line.substr(first_space + 2);
-        auto second_space = rest.find("  ");
-        std::string process = "-";
-        std::string message = rest;
-        if (second_space != std::string::npos) {
-            process = rest.substr(0, second_space);
-            message = rest.substr(second_space + 2);
-        }
-        if (message.size() > 200)
-            message = message.substr(0, 200);
-        ctx.write_output(std::format("event|{}|{}|{}", timestamp, process, message));
-    }
+
+    // decide_log_show_output is the single source of truth for the
+    // SubprocessResult -> (rows, rc) decision (BR-08) -- this shell only
+    // calls it and emits whatever it returns.
+    auto decision = yuzu::event_logs_macos::decide_log_show_output(result, "event",
+                                                                     "No matching events found");
+    for (const auto& row : decision.rows)
+        ctx.write_output(row);
+    return decision.rc;
 
 #else
     ctx.write_output("error|platform not supported");

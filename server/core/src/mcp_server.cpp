@@ -378,26 +378,41 @@ static const ToolDef kTools[] = {
     // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
     {"list_dex_signals",
      "List the DEX signal catalogue rollup: every observation type seen in the window with its "
-     "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate. Mirrors "
-     "GET /api/v1/dex/signals. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"}}})j"},
+     "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate; a "
+     "well-formed window with no observations returns an empty array. Mirrors GET "
+     "/api/v1/dex/signals. Requires GuaranteedState:Read.",
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"},)j"
+     R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Narrow to one OS's own signals (all = every OS)"}}})j",
+     /*output_schema_json=*/nullptr, // content is a bare array of signal rows (matches the REST list twin)
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"List DEX signal catalogue"})j"},
 
     {"get_dex_signal_scope",
      "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
      "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
      "GuaranteedState:Read.",
-     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})"},
+     R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})",
+     /*output_schema_json=*/nullptr, // content is a bare array of per-OS scope rows (tracked in #2363)
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"DEX per-OS signal coverage"})j"},
 
     {"get_dex_signal_detail",
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
      "per-day trend. The devices list names affected agent IDs (behavioral data) — every call is "
-     "audit-logged (dex.signal.view). Mirrors GET /api/v1/dex/signals/{obs_type}. Requires "
-     "GuaranteedState:Read.",
+     "audit-logged (dex.signal.view). A well-formed obs_type with no observations returns empty "
+     "arrays. Mirrors GET /api/v1/dex/signals/{obs_type}. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("obs_type":{"type":"string","description":"Catalogue key, e.g. process.crashed, os.boot (pattern [A-Za-z0-9._-]{1,64})"},)j"
+     R"j("obs_type":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","maxLength":64,"description":"Catalogue key, e.g. process.crashed, os.boot"},)j"
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"},)j"
-     R"j("limit":{"type":"integer","default":50,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
-     R"j(},"required":["obs_type"]})j"},
+     R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Scope subjects/devices/by_day to one OS (all = every OS; by_os stays cross-OS)"},)j"
+     R"j("limit":{"type":"integer","default":50,"minimum":0,"maximum":500,"description":"Caps subjects[] and devices[]"})j"
+     R"j(},"required":["obs_type"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("obs_type":{"type":"string"},"os":{"type":"string","enum":["all","windows","linux","macos"]},)j"
+     R"j("subjects":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["subject","count","distinct_devices","last_seen"]}},)j"
+     R"j("by_os":{"type":"array","items":{"type":"object","properties":{"platform":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"}},"required":["platform","count","distinct_devices"]}},)j"
+     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"last_seen":{"type":"string"}},"required":["agent_id","count","last_seen"]}},)j"
+     R"j("by_day":{"type":"array","items":{"type":"object","properties":{"day":{"type":"string"},"count":{"type":"integer"}},"required":["day","count"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"}},"required":["obs_type","os","subjects","by_os","devices","by_day"]})j",
+     R"j({"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"title":"Drill into one DEX signal"})j"},
 
     // ── F2a: DEX fleet performance read tools — parity with /api/v1/dex/perf/* ──
     {"get_dex_perf_fleet",
@@ -3643,8 +3658,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const std::string since =
                     dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
+                // A1 parity with GET /api/v1/dex/signals + the dashboard catalogue
+                // OS filter: `os` narrows the rollup to one OS (all = every OS).
+                const std::string os_scope = dex_normalize_os_filter(param_str(args, "os", ""));
                 JArr arr;
-                for (const auto& r : guaranteed_state_store->dex_signal_summary(since)) {
+                for (const auto& r : guaranteed_state_store->dex_signal_summary(since, os_scope)) {
                     arr.add(JObj()
                                 .add("obs_type", r.obs_type)
                                 .add("count", r.count)
@@ -3729,6 +3747,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string since =
                     dex_iso_since(dex_window_to_days(param_str(args, "window", "7d")));
                 const int limit = std::clamp(param_int32(args, "limit", 50), 0, 500);
+                // A1 parity with GET /api/v1/dex/signals/{obs_type} + the dashboard
+                // drilldown: `os` scopes subjects/devices/by_day to one OS (all =
+                // every OS). by_os stays cross-OS — it IS the split.
+                const std::string os_scope = dex_normalize_os_filter(param_str(args, "os", ""));
                 // Behavioral-PII access audit — the devices[] list below names the
                 // agent_ids exhibiting this signal. Same verb/target as the REST
                 // and dashboard per-signal views (cross-surface SIEM parity).
@@ -3746,7 +3768,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 JArr subjects;
                 for (const auto& s :
-                     guaranteed_state_store->dex_signal_subjects(obs_type, since, limit)) {
+                     guaranteed_state_store->dex_signal_subjects(obs_type, since, limit, os_scope)) {
                     subjects.add(JObj()
                                      .add("subject", s.subject)
                                      .add("count", s.count)
@@ -3763,18 +3785,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 JArr devices;
                 for (const auto& d :
-                     guaranteed_state_store->dex_signal_devices(obs_type, since, limit)) {
+                     guaranteed_state_store->dex_signal_devices(obs_type, since, limit, os_scope)) {
                     devices.add(JObj()
                                     .add("agent_id", d.agent_id)
                                     .add("count", d.crashes)
                                     .add("last_seen", d.last_seen));
                 }
                 JArr by_day;
-                for (const auto& d : guaranteed_state_store->dex_signal_by_day(obs_type, since)) {
+                for (const auto& d :
+                     guaranteed_state_store->dex_signal_by_day(obs_type, since, os_scope)) {
                     by_day.add(JObj().add("day", d.day).add("count", d.crashes));
                 }
                 JObj payload_obj;
                 payload_obj.add("obs_type", obs_type)
+                    .add("os", os_scope.empty() ? "all" : os_scope)
                     .raw("subjects", subjects.str())
                     .raw("by_os", by_os.str())
                     .raw("devices", devices.str())

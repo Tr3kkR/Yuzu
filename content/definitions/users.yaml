@@ -130,7 +130,10 @@ metadata:
     Enumerates local user accounts on the endpoint. Reports the username,
     enabled/disabled status, last logon timestamp, and account description.
     On Linux reads /etc/passwd (skipping system accounts with UID < 1000),
-    on macOS uses dscl, on Windows uses NetUserEnum.
+    on macOS uses dscl, on Windows uses NetUserEnum. On macOS, also reports
+    console_state — a tri-state ("true"/"false"/"unknown") signal for
+    whether the account is the current GUI/console-login user; Linux and
+    Windows leave this column empty.
   tags: [users, accounts, security, compliance, inventory]
 
 spec:
@@ -155,6 +158,8 @@ spec:
       - name: last_logon
         type: string
       - name: description
+        type: string
+      - name: console_state
         type: string
 
   readablePayload: "Enumerate local user accounts"

@@ -14,6 +14,8 @@
 #include <windows.h>
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #else
+#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
+
 #include <cstdio>
 #endif
 
@@ -675,7 +677,16 @@ std::string TriggerEngine::query_service_status(const std::string& service_name)
 
     // On macOS, use launchctl to check if a service is loaded and running
     std::string cmd = "launchctl list " + service_name + " 2>/dev/null";
-    FILE* pipe = popen(cmd.c_str(), "r");
+    FILE* pipe;
+    {
+        // BR-001: popen() forks internally, so it is itself a launcher --
+        // hold the process-wide fork lock across the call so it can't land
+        // mid-window of another launcher's unprotected [pipe()..fork()]
+        // (see fork_lock.hpp's contract). Released as soon as popen()
+        // returns; never held across the read loop or pclose() below.
+        std::lock_guard<std::mutex> fork_pipe_lock(global_fork_lock());
+        pipe = popen(cmd.c_str(), "r");
+    }
     if (!pipe) {
         return {};
     }
