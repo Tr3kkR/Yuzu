@@ -696,18 +696,19 @@ int main(int argc, char* argv[]) {
     // deployments that pre-seed --break-glass-user are warned there too.
     // Account lockout posture (SOC 2 CC6.3 evidence). Surfaced once at boot
     // so an operator/auditor can confirm the deployment's brute-force
-    // protection from journald without scraping per-event logs. The posture
-    // is gated on the auth.db store actually being wired (--data-dir set):
-    // lockout state lives in auth.db, so in a config-file-only deployment
-    // (auth_db_ == nullptr, the legacy fallback) every lockout op no-ops.
-    // Claiming "active" there would overstate the deployed control
-    // (governance/adversarial C4) — fail honest instead.
+    // protection from journald without scraping per-event logs. The posture is
+    // gated on the Postgres auth store being wired (--postgres-dsn set):
+    // lockout state lives in Postgres (users.failed_login_count / locked_until,
+    // ADR-0006), not the legacy auth.db. Without --postgres-dsn there is no
+    // auth store at all (ADR-0006/0007 fail-closed, no SQLite fallback) and the
+    // server will refuse to start below — claiming "active" here would overstate
+    // a deployment that will not boot (governance/adversarial C4), so warn honest.
     if (cfg.auth_lockout_threshold > 0) {
-        if (cfg.data_dir.empty()) {
+        if (cfg.postgres_dsn.empty()) {
             spdlog::warn("Account lockout CONFIGURED (threshold={}) but INACTIVE: failed-login "
-                         "lockout requires the auth.db store, which is created only when "
-                         "--data-dir is set. This config-file-only deployment has NO account "
-                         "lockout. Set --data-dir to activate it.",
+                         "lockout requires the Postgres auth store, which needs --postgres-dsn "
+                         "(or YUZU_POSTGRES_DSN). This deployment has no auth store wired and "
+                         "will fail closed at boot.",
                          cfg.auth_lockout_threshold);
         } else {
             spdlog::info("Account lockout active: {} failed local-password attempts → locked "

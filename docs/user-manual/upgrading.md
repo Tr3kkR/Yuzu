@@ -116,9 +116,16 @@ persistent auth database** — i.e. one started with `--data-dir`.
 > the server falls back to in-memory auth and lockout (and session persistence)
 > is silently **off**. The server logs a loud startup `WARN` in that state.
 > Set `--data-dir` to make the control active.
+>
+> **Superseded by the AuthDB→Postgres migration (see below).** Lockout state
+> now lives in **Postgres** (`users.failed_login_count` / `locked_until`), not
+> `auth.db`. It is active whenever `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
+> set — which the server now **requires to boot at all** (no SQLite fallback) —
+> and `--data-dir` no longer gates it. Read the `--data-dir` requirement above
+> as historical, for pre-migration builds only.
 
 No further config change is required to opt in — a deployment that already runs
-with `--data-dir` gains the behavior the instant you start the new build.
+with `--postgres-dsn` gains the behavior the instant you start the new build.
 
 What changes on upgrade:
 
@@ -394,12 +401,15 @@ closed (non-zero exit, refuses to serve)** otherwise:
 
 **Breaking the glass (IdP outage).** The break-glass account is dormant until
 armed out-of-band on the server host: `yuzu-server --break-glass-arm
---break-glass-user <name> --config … --data-dir …` arms it for
+--break-glass-user <name> --config … --data-dir … --postgres-dsn …` arms it for
 `--break-glass-window-secs` (default 24 h, auto-expiring). It still requires the
-account's MFA at login. Full runbook: `docs/ops-runbooks/auth-db-recovery.md`
-§ Break-glass arm (the `--break-glass-arm` CLI procedure is unaffected by
-the AuthDB→Postgres migration; the runbook's SQL-surgery sections elsewhere
-are SQLite-era and superseded — see its banner).
+account's MFA at login. Since the AuthDB→Postgres migration this one-shot opens
+the **Postgres** auth store, so `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
+**required** — point it at the same database the server uses; without it the
+command fails closed with "requires the Postgres auth store" and does nothing.
+`--data-dir` is still needed for the audit record. Full runbook:
+`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (its SQL-surgery
+sections elsewhere are SQLite-era and superseded — see its banner).
 
 **Migration.** AuthDB migration **v4** adds a nullable `break_glass_armed_until`
 column to `users` — automatic, additive, data-safe. **Rollback** below 0.x after

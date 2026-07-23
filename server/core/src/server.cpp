@@ -4266,6 +4266,18 @@ public:
 
         stop_requested_.store(true, std::memory_order_release);
 
+        // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
+        // inside AuthDB, not a ServerImpl member thread, so it is not in the
+        // joins below). This is signal-only — the join happens at
+        // auth_db_.reset() near the pool teardown — but requesting it here lets
+        // the reaper wind down concurrently with the rest of shutdown (it polls
+        // the flag each 1s), so that later join is near-instant rather than
+        // waiting out an in-flight cleanup. Its query is bounded by the pool's
+        // statement_timeout/lock_timeout regardless.
+        if (auth_db_) {
+            auth_db_->request_stop();
+        }
+
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
@@ -4533,6 +4545,21 @@ public:
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
+        // Auth substrate (ADR-0006/0010) — destruct-before-pool, and in
+        // dependency order. AuthDB owns a background reaper thread
+        // (cleanup_provisional_mfa) that leases pg_pool_ via
+        // try_acquire_for(); it is joined only in ~AuthDB::Impl, so auth_db_
+        // MUST be reset before pg_pool_ or the reaper's next acquire touches a
+        // destroyed pool (UAF on the security-critical auth store — the pure
+        // ~ServerImpl order is coincidentally safe via declaration order, but
+        // stop() proactively resets pg_pool_ below and would defeat it).
+        // auth_db_ borrows auth_secret_codec_, which borrows
+        // auth_key_provider_, so tear down inner-to-outer: stores → codec →
+        // key provider → pool.
+        scim_store_.reset();
+        auth_db_.reset();
+        auth_secret_codec_.reset();
+        auth_key_provider_.reset();
         pg_pool_.reset();
     }
 

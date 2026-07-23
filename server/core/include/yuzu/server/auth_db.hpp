@@ -155,6 +155,16 @@ public:
 
     ~AuthDB();
 
+    /// Signal the background provisional-MFA reaper to stop, WITHOUT joining.
+    /// Idempotent and thread-safe; the join still happens in the destructor.
+    /// `ServerImpl::stop()` calls this early — alongside the other pool-leasing
+    /// background threads it stops up front — so the reaper has the whole
+    /// teardown window to wind down (it checks the stop flag each 1s), making
+    /// the later `auth_db_.reset()` join near-instant instead of potentially
+    /// waiting out an in-flight cleanup UPDATE (which is itself bounded by the
+    /// pool's statement_timeout/lock_timeout, but need not be waited on inline).
+    void request_stop() noexcept;
+
     // Non-copyable, non-movable
     AuthDB(const AuthDB&) = delete;
     AuthDB& operator=(const AuthDB&) = delete;

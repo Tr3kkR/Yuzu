@@ -474,6 +474,20 @@ AuthDB::AuthDB(pg::PgPool& pool, pg::SecretCodec& secret_codec, int cleanup_inte
 
 AuthDB::~AuthDB() = default;
 
+void AuthDB::request_stop() noexcept {
+    // Signal-only: request the reaper to exit but do NOT join here (the join
+    // stays in ~Impl). Idempotent — safe to call before destruction and safe
+    // to call more than once. The reaper checks this each 1s of its sleep, so
+    // an early call lets it wind down concurrently with the rest of shutdown.
+    if (!impl_)
+        return;
+#ifdef __cpp_lib_jthread
+    impl_->cleanup_thread.request_stop();
+#else
+    impl_->stop_cleanup.store(true);
+#endif
+}
+
 bool AuthDB::is_ready() const noexcept { return impl_ && impl_->open; }
 bool AuthDB::is_open() const noexcept { return is_ready(); }
 
