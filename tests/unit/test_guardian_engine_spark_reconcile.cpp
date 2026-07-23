@@ -836,6 +836,31 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
                                  return SendResult::Sent;
                              });
 
+    // RAII safety net (mirrors OrphanExitGuard in agents/core/src/hard_exit.hpp):
+    // the send callback above parks the drain worker on `release`. If a REQUIRE
+    // below fires while the worker is en route to (or already parked in) that
+    // callback, Catch2 unwinds this scope; without releasing the worker first,
+    // ~GuardianEngine's stop()-join blocks on a `release` that never flips and
+    // the still-live worker races the destruction of these stack-local sync
+    // primitives - the #1648 non-Catch2 process exit (42) that defeats
+    // flake-retry classification and hard-blocks the whole agent suite. Declared
+    // AFTER `engine` so reverse-declaration-order destruction runs this FIRST:
+    // the worker is released (then joined by ~GuardianEngine) while send_mu/
+    // send_cv/release are still alive, so any assertion failure exits as an
+    // ordinary, classifiable Catch2 failure instead of a crash.
+    struct ReleaseParkedWorker {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release_flag;
+        ~ReleaseParkedWorker() {
+            {
+                std::lock_guard<std::mutex> lk{mu};
+                release_flag = true;
+            }
+            cv.notify_all();
+        }
+    } release_parked_worker{send_mu, send_cv, release};
+
     // One injected write failure leaves the armed rule's record PENDING rather than durable,
     // so what reaches disk later is attributable to a stop()-path persist and nothing else.
     engine.lifecycle_journal_for_test()->inject_write_failures_for_test(1);
@@ -846,8 +871,16 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
 
     {   // Park the worker inside a send, so the join below cannot complete.
+        // Generous deadline: on a saturated Windows CI runner the drain worker can
+        // be starved well past its ~5 s periodic backstop before it reaches the
+        // send callback (box-contention flake, not a logic bug - see the WeeTam
+        // agent-suite timeouts). The deadline is NOT shrunk by pinning the
+        // backstop cadence: a short backstop would let the worker persist the
+        // pending record on its own timer BEFORE the stop()-path persist, which
+        // would defeat this test's whole attribution. If the worker still misses
+        // this window, ReleaseParkedWorker above makes the failure exit cleanly.
         std::unique_lock<std::mutex> lk{send_mu};
-        REQUIRE(send_cv.wait_for(lk, std::chrono::seconds(10), [&] { return in_send; }));
+        REQUIRE(send_cv.wait_for(lk, std::chrono::seconds(30), [&] { return in_send; }));
     }
 
     std::atomic<bool> stop_returned{false};
