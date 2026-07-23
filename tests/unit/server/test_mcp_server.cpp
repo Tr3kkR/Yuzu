@@ -1608,6 +1608,32 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
+TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":54,"params":{"name":"list_dex_signals","arguments":{"window":"all","os":"macos"}}})");
+    REQUIRE(res);
+    auto rows = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(rows.is_array());
+    bool has_storage = false, has_crashed = false;
+    for (const auto& r : rows) {
+        const auto t = r["obs_type"].get<std::string>();
+        if (t == "storage.low") has_storage = true;
+        if (t == "process.crashed") has_crashed = true;
+    }
+    CHECK(has_storage);            // macOS-sourced signal present
+    CHECK_FALSE(has_crashed);      // Windows-sourced signal scoped out
+}
+
 TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
           "[mcp][integration][dex]") {
     GuaranteedStateStore store(":memory:");
@@ -1668,6 +1694,39 @@ TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal
             saw_view = true;
     CHECK(saw_view);
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_detail|success");
+}
+
+TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 parity)",
+          "[mcp][integration][dex]") {
+    GuaranteedStateStore store(":memory:");
+    mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    mcp_seed_obs(store, "w2", "WS-2", "process.crashed", "outlook.exe", "windows",
+                 "2026-06-10T11:00:00Z");
+    mcp_seed_obs(store, "m1", "MAC-1", "process.crashed", "Safari", "macos",
+                 "2026-06-10T12:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    auto win = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all","os":"windows"}}})");
+    REQUIRE(win);
+    auto wpayload = nlohmann::json::parse(
+        nlohmann::json::parse(win->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(wpayload["os"] == "windows");
+    REQUIRE(wpayload["devices"].is_array());
+    CHECK(wpayload["devices"].size() == 2); // WS-1 + WS-2, never MAC-1
+    CHECK(wpayload["by_os"].size() == 2);   // by_os stays cross-OS even under a filter
+
+    auto mac = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":53,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all","os":"macos"}}})");
+    REQUIRE(mac);
+    auto mpayload = nlohmann::json::parse(
+        nlohmann::json::parse(mac->body)["result"]["content"][0]["text"].get<std::string>());
+    CHECK(mpayload["os"] == "macos");
+    REQUIRE(mpayload["devices"].size() == 1);
+    CHECK(mpayload["devices"][0]["agent_id"] == "MAC-1");
 }
 
 // #1647: get_dex_signal_detail previously DISCARDED the AuditFn bool. It now captures

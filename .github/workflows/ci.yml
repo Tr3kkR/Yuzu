@@ -947,27 +947,20 @@ jobs:
           # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
           # ADR-0006) runs autoreconf during its build and the hosted macOS
           # image doesn't ship autotools.
-          brew install ninja ccache pipx autoconf automake libtool
-          # Pin CMake < 4.4 on the macOS leg: the runner's Homebrew CMake 4.4.0
-          # regressed meson's httplib dependency resolution — find_package(httplib)
-          # from vcpkg fails under 4.4.0, so `meson setup` aborts at the
-          # httplib/cpp-httplib probe (meson.build). 4.3.4 is the last-known-good
-          # version the passing macOS runs used. Prepended via $GITHUB_PATH so it
-          # takes precedence over any Homebrew cmake in the Configure step.
-          curl -fsSL https://github.com/Kitware/CMake/releases/download/v4.3.4/cmake-4.3.4-macos-universal.tar.gz -o /tmp/cmake.tar.gz
-          tar -xzf /tmp/cmake.tar.gz -C /tmp
-          echo "/tmp/cmake-4.3.4-macos-universal/CMake.app/Contents/bin" >> "$GITHUB_PATH"
           #
           # cmake deliberately excluded from this brew line, pinned via pipx
-          # below instead. 2026-07-16: brew's floating `cmake` drifted to
-          # 4.4.0 underneath us with no code change on our side, and that
-          # release crashes resolving httplib's CMake package: FindThreads'
-          # try_compile() trips CMake's own internal "This should not have
-          # happened" guard in Internal/CheckSourceCompiles.cmake, which
-          # poisons every subsequent cmake-method dependency lookup in the
-          # same configure. Broke macOS CI fleet-wide across unrelated PRs
-          # simultaneously (e.g. #2224). Pin like meson below so a future
-          # brew bump can't repeat this.
+          # below instead (a single pin mechanism — the two 8-way-merged PRs
+          # that each hit the 4.4.0 regression pinned it differently; the pipx
+          # path is kept because it mirrors the repo's pip3 --user pattern and
+          # carries the brew-unlink belt-and-suspenders below). 2026-07-16:
+          # brew's floating `cmake` drifted to 4.4.0 underneath us with no code
+          # change on our side, and that release crashes resolving httplib's
+          # CMake package: FindThreads' try_compile() trips CMake's own internal
+          # "This should not have happened" guard in
+          # Internal/CheckSourceCompiles.cmake, which poisons every subsequent
+          # cmake-method dependency lookup in the same configure. Broke macOS CI
+          # fleet-wide across unrelated PRs simultaneously (e.g. #2224). Pin like
+          # meson below so a future brew bump can't repeat this.
           brew install ninja ccache pipx autoconf automake libtool
           # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
           # (that's what the log line "cmake 4.4.0 is already installed and

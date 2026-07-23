@@ -32,6 +32,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <cstdint>
+#include <cstdlib>
+#include <mach-o/dyld.h>
+#include <sys/syslimits.h>
 #endif
 
 namespace {
@@ -285,14 +290,36 @@ private:
             }
         }
 #elif defined(__APPLE__)
-        // On macOS, use _NSGetExecutablePath or /proc alternative
-        // Just report the standard install path
+        // _NSGetExecutablePath uses a two-call idiom: the first call passes
+        // a zero-length buffer, which always fails and writes the required
+        // buffer size (including the terminating NUL) into `size`; allocate
+        // exactly that much and call again to actually fill it in. Then
+        // resolve symlinks/./.. via realpath so the reported path matches
+        // the real on-disk binary, not just wherever it was launched from.
         {
-            fs::path p = "/usr/local/bin/yuzu-agent";
-            std::error_code ec;
-            if (fs::exists(p, ec)) {
-                emit_file_info(ctx, p);
+            uint32_t size = 0;
+            _NSGetExecutablePath(nullptr, &size);
+
+            std::string raw_path(size, '\0');
+            if (size > 0 && _NSGetExecutablePath(raw_path.data(), &size) == 0) {
+                // raw_path includes the NUL terminator written by the call;
+                // drop it so it doesn't end up embedded in the std::string.
+                if (!raw_path.empty() && raw_path.back() == '\0') {
+                    raw_path.pop_back();
+                }
+
+                char resolved[PATH_MAX];
+                if (realpath(raw_path.c_str(), resolved) != nullptr) {
+                    emit_file_info(ctx, fs::path{resolved});
+                } else if (!raw_path.empty()) {
+                    // realpath failed (e.g. dangling component) — fall back
+                    // to the unresolved-but-real path rather than fabricate
+                    // one.
+                    emit_file_info(ctx, fs::path{raw_path});
+                }
             }
+            // If _NSGetExecutablePath itself fails, honestly report nothing
+            // rather than guess at an install location.
         }
 #endif
 

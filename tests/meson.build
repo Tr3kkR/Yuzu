@@ -191,8 +191,19 @@ agent_test_exe = executable(
     'unit/test_installed_apps_inventory.cpp',
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
+    'unit/test_wifi_corewlan.cpp',
     'unit/test_interaction_parsers.cpp',
     'unit/test_hardware_disks_macos.cpp',
+    'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
+                                          # macos_console_user.hpp already reachable via the agents/shared
+                                          # include_directories entry below.
+    'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
+    'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
+    'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
+    'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
+    'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
+    'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -201,10 +212,18 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
+    include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
-    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated)
+    include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated); also macos_console_user.hpp (test_certificates_macos.cpp)
     include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
+    include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
+    include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)
+    include_directories('../agents/plugins/bitlocker/src'),     # bitlocker_macos_apfs.hpp (P8 test)
+    include_directories('../agents/plugins/filesystem/src'),    # filesystem_macos_sig.hpp (#2273/1.14)
+    include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
+    include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
+    include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -243,6 +262,35 @@ test(
   timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
+
+# ── cert_store macOS honest-unsupported unit test (A-1.20 / P8; BR-001/BR-003
+#    branch-review fix) ────────────────────────────────────────────────────
+# cert_store.cpp's __APPLE__ branch unconditionally returns an honest
+# "unsupported" CertStoreResult (the macOS agent runs as a root LaunchDaemon
+# with no user login keychain — see the file header comment on
+# read_cert_from_store() there). This dedicated executable recompiles that
+# SAME cert_store.cpp source standalone — no Security/CoreFoundation
+# frameworks, not linked against the rest of yuzu_agent_core — purely to
+# check the contract in isolation. macOS only: on Linux/Windows
+# cert_store.cpp's OTHER branches are the real (non-stub) implementations,
+# which this target is not meant to probe.
+if host_machine.system() == 'darwin'
+  cert_store_fallback_test_exe = executable(
+    'yuzu_cert_store_fallback_tests',
+    files(
+      'unit/agent/test_cert_store_fallback.cpp',
+      '../agents/core/src/cert_store.cpp',
+    ),
+    include_directories: [
+      include_directories('../agents/core/include'),  # yuzu/agent/cert_store.hpp
+    ],
+    # spdlog_dep only for the header include path (cert_store.cpp's
+    # unconditional #include <spdlog/spdlog.h>); the macOS stub never
+    # actually calls into it.
+    dependencies: [yuzu_sdk_dep, spdlog_dep, catch2_dep],
+  )
+  test('cert_store macOS honest-unsupported', cert_store_fallback_test_exe, suite: 'agent', timeout: 30)
+endif
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
@@ -288,6 +336,7 @@ tar_test_exe = executable(
     'unit/test_app_perf_rollup_query.cpp',
     'unit/test_tar_proc_etw.cpp',
     'unit/test_tar_proc_es.cpp',
+    'unit/test_tar_netqual_nstat.cpp',
     'unit/test_tar_module_stream.cpp',
     'unit/test_tar_module_etw.cpp',
     'unit/test_tar_mapdrive.cpp',
@@ -306,6 +355,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_proc_es.cpp',
     '../agents/plugins/tar/src/tar_module_etw.cpp',
     '../agents/plugins/tar/src/tar_netqual_boot.cpp',
+    '../agents/plugins/tar/src/tar_netqual_nstat.cpp',
     '../agents/plugins/tar/src/tar_netconn_win.cpp',
     '../agents/plugins/tar/src/tar_mapdrive_collector.cpp',
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',

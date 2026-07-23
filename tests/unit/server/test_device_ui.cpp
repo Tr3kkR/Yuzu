@@ -185,7 +185,8 @@ TEST_CASE("device live ARP / DNS / sockets / services / users / netconfig render
         CHECK(h.find("dynamic") != std::string::npos);
         CHECK(h.find("&lt;script&gt;") != std::string::npos); // iface HTML-escaped
         CHECK(h.find("<script>") == std::string::npos);
-        CHECK(render_device_live_arp({}).find("not available on this OS") != std::string::npos);
+        CHECK(render_device_live_arp({}).find("not available on this platform") !=
+              std::string::npos);
     }
     SECTION("dns: searchable, escaped, empty note") {
         std::vector<LiveDnsEntry> rows{{"github.com", "A"}, {"<x>", "AAAA"}};

@@ -21,6 +21,7 @@
  */
 
 #include "tar_collectors.hpp"
+#include "tar_netqual_nstat.hpp"
 #include "tar_proc_etw.hpp"
 #include "tar_proc_es.hpp"
 #include "tar_proc_stream.hpp"
@@ -486,6 +487,24 @@ public:
         if (stream_active_) {
             spdlog::info("TAR: {} process stream active (process poll superseded)",
                          proc_stream_->method_name());
+        }
+
+        // roadmap 2.2: construct + start the nstat client alongside the ES
+        // process stream above (same lifetime/teardown ordering discipline —
+        // both are torn down together in shutdown() under collect_mu_).
+        // Unconditional/no #ifdef: start() is a documented no-op off-macOS,
+        // so this line is inert everywhere except macOS. Registered so the
+        // netqual free functions in tar_network_collector.cpp (a different
+        // TU, platform-dispatched) can reach it without a second,
+        // independently-owned client (tar_collectors.hpp,
+        // netqual_nstat_register_client).
+        nstat_client_ = std::make_unique<yuzu::tar::NstatClient>();
+        if (nstat_client_->start()) {
+            spdlog::info("TAR: nstat client active (netqual + tcp lifecycle)");
+        }
+        yuzu::tar::netqual_nstat_register_client(nstat_client_.get());
+
+        if (stream_active_) {
 
             // Boot-window backfill: replay the AutoLogger .etl (configured at
             // install time WITH a FlushTimer so it's continuously written to
@@ -738,6 +757,14 @@ public:
         ctx.unregister_trigger("tar.perf");
         ctx.unregister_trigger("tar.software");
         ctx.unregister_trigger("tar.rollup");
+        // Unregister the nstat client BEFORE tearing it down: collect_tcp_quality()
+        // / netqual_effective_capture_method() (tar_network_collector.cpp) both run
+        // OUTSIDE collect_mu_ (do_collect_fast's pre-collection stage), so a call
+        // in flight right now could otherwise race nstat_client_->stop() below.
+        // This narrows, but does not by itself eliminate, that window — the same
+        // level of care the ES process stream already accepts (see the collect_mu_
+        // comment right below).
+        yuzu::tar::netqual_nstat_register_client(nullptr);
         // Take collect_mu_ around the collector teardown: a collect_fast tick may
         // still be draining proc_stream_ (reads impl_ via drain()/running()), and
         // stop() resets impl_. The host quiesces the trigger engine before
@@ -756,6 +783,13 @@ public:
                 // Windows: closes the module-load ETW session + joins its
                 // consumer thread (idempotent; safe if never started).
                 module_stream_->stop();
+            }
+            if (nstat_client_) {
+                // Closes the kctl socket (unblocks the reader's recv) and joins
+                // the reader + query threads. Same teardown-ordering discipline
+                // as proc_stream_/module_stream_ above — the tcp leg only drains
+                // nstat_client_ under collect_mu_ (collect_fast_impl).
+                nstat_client_->stop();
             }
         }
         db_.reset();
@@ -859,6 +893,38 @@ private:
     // storm) when the ETW session is genuinely unavailable; reset when the source
     // is disabled, so a later re-enable retries. Guarded by collect_mu_.
     bool module_start_failed_{false};
+
+    // ── roadmap 2.2: nstat (macOS netqual + tcp lifecycle; tar_netqual_nstat.hpp)
+    // ONE client feeds both the netqual leg (collect_tcp_quality(), reached via
+    // netqual_nstat_register_client() below — see tar_collectors.hpp) and the
+    // tcp lifecycle leg (drained directly here, see the "tcp" block in
+    // collect_fast_impl). Constructed + started UNCONDITIONALLY on every
+    // platform: off-macOS every NstatClient method is a documented no-op and
+    // start() returns false, so this never needs an #ifdef — same "inert
+    // elsewhere" contract the ES/ETW streams get via platform-specific
+    // construction, just without needing platform selection since there is
+    // only ever one concrete NstatClient type. Single-owner (this plugin);
+    // NOT an EsClientBroker — nstat has exactly one consumer surface (memo
+    // ~/.claude/plans/nstat-spike-2.1-memo.md §4.3).
+    std::unique_ptr<yuzu::tar::NstatClient> nstat_client_;
+    // High-water mark of NstatClient::dropped() already logged (same pattern
+    // as last_logged_dropped_/last_module_dropped_). Guarded by collect_mu_.
+    std::uint64_t last_nstat_dropped_{0};
+    // HIGH-3: events mapped from the nstat lifecycle ring but not yet
+    // persisted because a prior insert failed (DB locked/full) — mirrors
+    // pending_stream_evs_/pending_module_evs_ above so a transient DB failure
+    // never permanently loses tcp lifecycle events. Guarded by collect_mu_;
+    // bounded by kPendingStreamCap. HIGH-4 clears this when the tcp source is
+    // disabled (the buffered-but-undelivered batch belongs to the paused
+    // window and must never be persisted on re-enable); HIGH-5 also feeds it
+    // from the stream-death/stall drain-before-fallback path.
+    std::vector<yuzu::tar::NetworkEvent> pending_nstat_evs_;
+    // Whether nstat was the tcp lifecycle PRIMARY source on the previous
+    // collect_fast tick — lets the "tcp" leg detect a nstat→poll fallback
+    // transition and reseed the poll's diff baseline instead of misreporting
+    // every already-open tcp connection as newly "connected" (see the tcp
+    // block's self-heal comment). Guarded by collect_mu_.
+    bool nstat_tcp_primary_prev_{false};
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -1036,10 +1102,162 @@ private:
             // #538: tcp's diff baseline lives under "network" (see diff_state_key).
             const std::string net_key{yuzu::tar::diff_state_key("tcp")};
             auto current = yuzu::tar::enumerate_connections();
+
+            // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
+            // when the plugin's NstatClient is live and system-wide — its
+            // SRC_ADDED/SRC_REMOVED stream drains straight into network_live
+            // below, gap-free, mirroring the ES process-stream discipline
+            // above. enumerate_connections() (the proc_pidfdinfo poll, called
+            // unconditionally above regardless of platform) stays the
+            // FALLBACK + SEED: a not-running/stalled client self-heals onto
+            // the ordinary poll diff below with no silent loss. UDP has no
+            // nstat provider, so it is ALWAYS diffed via the poll, never
+            // routed through nstat.
+            bool nstat_primary = nstat_client_ && nstat_client_->running() &&
+                                 nstat_client_->system_wide() && !nstat_client_->stalled();
+
+            // HIGH-3: maps a batch of drained lifecycle events into
+            // NetworkEvent rows, prepends anything held over from a prior
+            // failed insert (mirrors pending_stream_evs_/pending_module_evs_
+            // above), and inserts. On success the pending queue is cleared;
+            // on FAILURE the whole (already-typed) batch is retained,
+            // bounded, for a retry next tick — the previous behavior only
+            // logged "dropped this tick" and lost the batch for good.
+            auto persist_nstat_flow_events =
+                [&](std::vector<yuzu::tar::NstatFlowEvent> flow_events) {
+                    std::vector<yuzu::tar::NetworkEvent> typed;
+                    typed.reserve(flow_events.size());
+                    for (const auto& e : flow_events) {
+                        yuzu::tar::NetworkEvent ev;
+                        ev.ts = e.ts_unix;
+                        ev.snapshot_id = snap_id;
+                        ev.action = e.is_open ? "connected" : "disconnected";
+                        ev.proto = e.proto;
+                        ev.local_addr = e.local_addr;
+                        ev.local_port = e.local_port;
+                        ev.remote_addr = e.remote_addr;
+                        // nstat is a lifecycle event stream, not the
+                        // DNS-resolving poll (resolve_hostnames) —
+                        // remote_host stays empty, the same simplification
+                        // the ES process stream makes for cmdline.
+                        ev.remote_port = e.remote_port;
+                        // nstat's ADDED/REMOVED messages carry no TCP state
+                        // enum (only SRC_DESC's counters do, and only once
+                        // resolved) — ESTABLISHED/CLOSED is the honest
+                        // best-effort label for "flow just appeared" / "flow
+                        // just vanished" from the kernel's source table.
+                        ev.state = e.is_open ? "ESTABLISHED" : "CLOSED";
+                        ev.pid = e.pid;
+                        ev.process_name = e.process_name;
+                        typed.push_back(std::move(ev));
+                    }
+                    if (!pending_nstat_evs_.empty()) {
+                        typed.insert(typed.begin(),
+                                     std::make_move_iterator(pending_nstat_evs_.begin()),
+                                     std::make_move_iterator(pending_nstat_evs_.end()));
+                        pending_nstat_evs_.clear();
+                    }
+                    if (typed.empty())
+                        return;
+                    if (!db_->insert_network_events(typed)) {
+                        spdlog::error("TAR: nstat tcp lifecycle insert failed — re-queuing "
+                                      "{} events for the next tick",
+                                      typed.size());
+                        pending_nstat_evs_ = std::move(typed);
+                        if (pending_nstat_evs_.size() > kPendingStreamCap) {
+                            const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
+                                                     pending_nstat_evs_.begin() +
+                                                         static_cast<std::ptrdiff_t>(excess));
+                        }
+                    } else {
+                        total_events += static_cast<int>(typed.size());
+                    }
+                };
+
+            if (nstat_primary) {
+                persist_nstat_flow_events(nstat_client_->drain());
+                if (auto d = nstat_client_->dropped(); d > last_nstat_dropped_) {
+                    spdlog::warn("TAR: nstat lifecycle ring overflow — {} dropped (+{} since "
+                                 "last drain)",
+                                 d, d - last_nstat_dropped_);
+                    last_nstat_dropped_ = d;
+                }
+            } else if (nstat_tcp_primary_prev_ && nstat_client_) {
+                // HIGH-5: a stream-death/stall transition — nstat owned the
+                // tcp lifecycle LAST tick but is not primary THIS tick
+                // (running() self-detected the reader thread's death,
+                // system_wide() dropped, or stalled() tripped). drain() only
+                // needs the ring, not running(), so it can still hold events
+                // the reader buffered before it died; draining BEFORE
+                // seeding the poll's diff baseline below mirrors the process
+                // stream precedent of draining the ring before checking
+                // running() (see the "process" leg above) rather than
+                // abandoning a still-populated ring. A layout_mismatch()
+                // means our transcribed wire layout disagreed with this
+                // kernel, so the buffered bytes are untrustworthy and must
+                // be discarded, never persisted; the self-heal
+                // baseline-priming below (nstat_tcp_primary_prev_) applies
+                // either way.
+                if (!nstat_client_->layout_mismatch()) {
+                    persist_nstat_flow_events(nstat_client_->drain());
+                } else {
+                    // Discard, never persist: a layout mismatch is permanent
+                    // for this client's remaining session (running() stays
+                    // false — no future tick can ever become nstat_primary
+                    // again to retry a queued batch), so also drop any
+                    // already-typed pending_nstat_evs_ from an earlier failed
+                    // insert rather than let it sit stuck-forever bounded.
+                    nstat_client_->drain(); // discard — untrustworthy bytes
+                    pending_nstat_evs_.clear();
+                    spdlog::warn("TAR: nstat layout mismatch on stream death — discarding "
+                                 "the buffered tcp lifecycle ring");
+                }
+            } else if (!pending_nstat_evs_.empty() && nstat_client_) {
+                // R2-2: a poll-only steady-state tick (nstat never became
+                // primary again after a fallback) must still retry a stranded
+                // insert-retry backlog — a batch requeued on the one transition
+                // tick would otherwise sit in memory until disable/shutdown,
+                // since neither branch above runs once nstat_tcp_primary_prev_
+                // has flipped false. Mirrors pending_stream_evs_ being retried
+                // on every process tick.
+                persist_nstat_flow_events({});
+            }
+
             auto prev_json = db_->get_state(net_key);
             auto previous = json_to_connections(prev_json);
 
-            auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
+            const std::vector<yuzu::tar::NetConnection>* diff_current = &current;
+            const std::vector<yuzu::tar::NetConnection>* diff_previous = &previous;
+            std::vector<yuzu::tar::NetConnection> udp_current;
+            std::vector<yuzu::tar::NetConnection> udp_previous;
+            auto is_tcp = [](const yuzu::tar::NetConnection& c) {
+                return c.proto == "tcp" || c.proto == "tcp6";
+            };
+            if (nstat_primary) {
+                // TCP already handled above via the nstat drain — diff the
+                // poll for UDP only so the same open/close is never recorded
+                // twice.
+                udp_current = current;
+                udp_previous = previous;
+                std::erase_if(udp_current, is_tcp);
+                std::erase_if(udp_previous, is_tcp);
+                diff_current = &udp_current;
+                diff_previous = &udp_previous;
+            } else if (nstat_tcp_primary_prev_) {
+                // Falling back from nstat to the poll THIS tick: `previous`
+                // only carries udp (nstat owned tcp lifecycle last tick), so
+                // diffing it against the full current snapshot would
+                // misreport every already-open tcp connection as a fresh
+                // "connected" — a self-heal artifact, not a real event.
+                // Prime the baseline with the full current snapshot instead
+                // (zero diff this tick), mirroring the process stream's
+                // self-heal seeding above.
+                diff_previous = &current;
+            }
+            nstat_tcp_primary_prev_ = nstat_primary;
+
+            auto typed = yuzu::tar::compute_network_events(*diff_previous, *diff_current, ts, snap_id);
             if (!typed.empty()) {
                 if (!db_->insert_network_events(typed)) {
                     spdlog::error("TAR: failed to insert network events, skipping state save");
@@ -1049,7 +1267,28 @@ private:
                 total_events += static_cast<int>(typed.size());
             }
 
-            db_->set_state(net_key, connections_to_json(current).dump());
+            // While nstat is primary, persist the udp-only view so the next
+            // tick's poll diff stays apples-to-apples (never mistakes
+            // nstat-owned tcp state for a poll-observed disconnect);
+            // otherwise persist the full snapshot as before (the poll owns
+            // both protocols).
+            db_->set_state(net_key,
+                           connections_to_json(nstat_primary ? *diff_current : current).dump());
+        } else if (nstat_client_) {
+            // HIGH-4: forensic-pause contract for tcp lifecycle — the nstat
+            // client keeps its reader thread running and filling its ring
+            // even while the `tcp` source is disabled (the whole block above
+            // is skipped, so nothing here would otherwise touch it), unlike
+            // the poll which simply stops enumerating. Drain-and-DISCARD
+            // each disabled tick so the paused window is never inserted on
+            // re-enable — mirrors the process/module stream drain-and-discard
+            // contract above (tar_plugin.cpp process/module leg comments).
+            // Drop any pre-disable insert-retry backlog too. The client
+            // itself stays running (it also feeds netqual, which has its own
+            // independent enable gate below) — only the lifecycle ring is
+            // discarded here.
+            nstat_client_->drain();
+            pending_nstat_evs_.clear();
         }
 
         // netqual: per-connection TCP quality (BRD Workstream E). OPT-IN,
@@ -1723,10 +1962,36 @@ private:
         ctx.write_output(std::format("config|module_stream_dropped|{}",
                                      module_stream_ ? module_stream_->dropped() : 0));
 
+        // nstat (macOS tcp lifecycle) stream health — emitted UNCONDITIONALLY,
+        // same key-always-present NFR-visibility contract as the process/module
+        // streams above (there is no agent /metrics endpoint; tar.status is the
+        // operator/agentic surface, so ring-overflow / kernel-desync / flow-table
+        // growth must never be silent). All 0/false/"none" off-macOS or when no
+        // client. nstat_flow_table_size + nstat_flow_reaped are the observable
+        // signals of the bounded kernel-flow table (a lost SRC_REMOVED shows up
+        // as reaped, never as unbounded growth).
+        ctx.write_output(std::format("config|nstat_capture_method|{}",
+                                     nstat_client_ ? nstat_client_->method_name() : "none"));
+        ctx.write_output(std::format("config|nstat_stream_dropped|{}",
+                                     nstat_client_ ? nstat_client_->dropped() : 0));
+        ctx.write_output(std::format("config|nstat_stream_kernel_dropped|{}",
+                                     nstat_client_ ? nstat_client_->kernel_dropped() : 0));
+        ctx.write_output(std::format("config|nstat_flow_table_size|{}",
+                                     nstat_client_ ? nstat_client_->flow_table_size() : 0));
+        ctx.write_output(std::format("config|nstat_flow_reaped|{}",
+                                     nstat_client_ ? nstat_client_->flow_reaped() : 0));
+        ctx.write_output(std::format("config|nstat_stalled|{}",
+                                     (nstat_client_ && nstat_client_->stalled()) ? "true" : "false"));
+        ctx.write_output(
+            std::format("config|nstat_layout_mismatch|{}",
+                        (nstat_client_ && nstat_client_->layout_mismatch()) ? "true" : "false"));
+
         // netqual capture method (ADR-0020) — the method actually in effect:
         // "inetdiag" (Linux), "estats" (Windows once the elevation gate latches
         // active), "estats_pending" (Windows, gate not yet tested — or netqual
-        // off), "none" (Windows after the ACCESS_DENIED latch, macOS). Emitted
+        // off), "nstat" (macOS when the kctl client is live and system-wide),
+        // "none" (Windows after the ACCESS_DENIED latch; macOS unprivileged,
+        // layout-mismatch, or client down). Emitted
         // UNCONDITIONALLY (key-always-present contract, same as the process/
         // module keys above) so an operator can tell "netqual is on but the
         // agent can't collect" apart from "netqual is off".
@@ -2483,6 +2748,15 @@ private:
                 std::unique_lock<std::mutex> sw_lock;
                 if (src_name == "software")
                     sw_lock = std::unique_lock<std::mutex>(software_collect_mu_);
+                // C1 fix: capture the prior tcp enabled state BEFORE applying, so the
+                // R2-3 nstat-ring drain below fires only on an actual enable<->disable
+                // EDGE. An idempotent tcp_enabled=true re-assert (common from
+                // desired-state reconciliation) returns transition_ok==true but is NOT
+                // a pause boundary and must never discard live buffered lifecycle
+                // events (nstat stays primary and the poll is filtered to UDP, so the
+                // loss would be unobservable).
+                const bool tcp_prev_enabled =
+                    (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -2503,6 +2777,20 @@ private:
                         prev_perf_ = yuzu::tar::PerfCounters{};
                     else if (src_name == "procperf")
                         prev_proc_ = yuzu::tar::ProcSnapshot{};
+                }
+                // R2-3 (edge-gated per C1): drain-and-discard the nstat ring and
+                // insert-retry backlog on a real tcp enable<->disable EDGE, under
+                // collect_mu_ so it is atomic w.r.t. a collection tick. The disable
+                // edge clears everything buffered up to the pause; the enable edge
+                // clears whatever accumulated DURING a pause too short to have fired
+                // the per-tick disabled discard in collect_fast. The client keeps
+                // running (it also feeds netqual) — only the lifecycle ring is
+                // discarded. Gated on an actual state change so an idempotent
+                // re-assert never discards live events (C1).
+                if (transition_ok && src_name == "tcp" && nstat_client_ &&
+                    (v == "true") != tcp_prev_enabled) {
+                    nstat_client_->drain();
+                    pending_nstat_evs_.clear();
                 }
             }
             if (!transition_ok) {
