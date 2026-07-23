@@ -809,6 +809,15 @@ TEST_CASE("McpStreamState: an oversized frame is replaced, not corrupted",
 // worker task no routing try/catch ever sees — an escaped throw is std::terminate.
 // The throw sites are internal string/deque allocations (no callback seam to throw
 // through), so these tests trip the two failure phases via the explicit test seam.
+//
+// DISCLOSED COVERAGE GAPS (all the same "unreachable without a fault-injection harness
+// this repo does not have" class, none load-bearing): (1) a real allocator-level
+// bad_alloc — modelled deterministically by the PublishFault seam instead; (2) the
+// boundary's nested catch when the metric/log call ITSELF throws (no throwing-metrics
+// mock); (3) the recovery std::lock_guard's std::mutex::lock() throwing std::system_error
+// (a broken mutex — practically unreachable on glibc; the code contains it by falling
+// back to a bare atomic bump). The noexcept static_assert + the seam-driven tests below
+// are the regression guard for the reachable paths.
 
 TEST_CASE("McpStreamState: publish is a noexcept boundary — structural, not decorative",
           "[mcp][stream]") {
@@ -879,10 +888,18 @@ TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and 
     // were lost, and the ring still holds the frame so a Last-Event-ID resume recovers
     // it. NOTE this is the empty-queue lone-drop case: dropped_total==1 with an EMPTY
     // queue is the interaction #2366 introduced (pre-#2366 a drop always rode alongside
-    // a real push_back). The bump is done under the sink mutex, so the pump's predicate
-    // (which now includes dropped_total) is a proper condvar handoff and this emits on
-    // the publish's notify. This asserts the outcome; the timing is covered by the
-    // handoff, not by the tick.
+    // a real push_back).
+    //
+    // SCOPE OF THIS ASSERTION (honest): this pump_once runs on THIS thread AFTER the
+    // faulting publish, so the wait predicate is already true on entry — the call never
+    // parks and is never woken by notify_one. It therefore verifies the OUTCOME (an
+    // empty-queue drop is reported as events-dropped, and the ring still replays the
+    // frame), NOT the notify-driven wakeup timing. The deterministic condvar handoff
+    // (bump under the sink mutex; predicate includes dropped_total) is verified by
+    // cpp-safety inspection, not here. A genuine two-thread handshake test that parks the
+    // pump in wait_for first, then faults+publishes, and asserts prompt emission without a
+    // wall-clock bound is the correct exercise — filed as a track-2f PR-3 follow-up, where
+    // a real producer makes the sub-tick latency reachable.
     mcp::McpStreamPump pump{attached.sink, state, attached.generation,
                             [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
                             fast_cfg()};
