@@ -25,7 +25,8 @@
 /// shape `yuzu_fleet_net_*` / `yuzu_fleet_perf_*` use (design item 9,
 /// "unlabeled/low-cardinality"). These are integrity and loss signals, not
 /// distributions: the fleet question is "did ANY endpoint lose a lifecycle record",
-/// which a sum answers and a percentile obscures. 26 families, 26 series, no
+/// which a sum answers and a percentile obscures. 29 counter families, 29 series (plus
+/// the 2 always-published meta gauges described below), no
 /// agent-controlled label anywhere - so no cardinality exposure at all (contrast the
 /// `os`-labelled families, which need an allowlist).
 ///
@@ -37,7 +38,7 @@
 /// readings against.
 ///
 /// The writer is SPARSE: a counter that is 0 ships no tag.
-/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 26 at the top of
+/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 29 at the top of
 /// every sweep and re-publishes only those at least one retained agent reported this
 /// cycle. So an absent family means: no retained agent's latest heartbeat carried a
 /// value for it that PASSED the forged-value parse. Note both edges, each pinned by a
@@ -54,13 +55,6 @@
 /// `yuzu_server_reaper_sweep_duration_seconds` for sweep liveness. An earlier revision
 /// of this header claimed `absent()` covered a stall; it does not, and the comment at
 /// the publish site in agent_registry.cpp ("never goes stale") is exactly why.
-///
-/// ── NOT HERE YET ─────────────────────────────────────────────────────────────────
-/// `gauge_underflow` (GuardianLifecycleJournal::gauge_underflow()) is deliberately
-/// absent: it is not in GuardianJournalStats or the heartbeat emit yet, and wiring it
-/// there is cutover-gated on `prefer_spark` (commit 1ffa4299). When it lands, adding
-/// it here is ONE table row - the clear, accumulate, publish and describe loops are
-/// all driven off this table.
 
 #include <charconv>
 #include <cstddef>
@@ -104,7 +98,7 @@ struct GuardianJournalMetric {
 /// agents/core/src/guardian_journal_heartbeat.hpp for reviewability; nothing depends
 /// on it.
 ///
-/// TYPE-HONESTY. All 22 are exported as `gauge` because that is what they are
+/// TYPE-HONESTY. All 29 are exported as `gauge` because that is what they are
 /// server-side - a per-sweep recomputed fleet sum, cleared and rebuilt, never
 /// monotonic: it drops when an agent ages out or restarts, and a family nobody reports
 /// goes absent.
@@ -212,6 +206,15 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "(UP-1). NOT itself loss: the refused batch stays staged and the maintenance tick "
      "retries it after a later prune frees capacity, so records are lost only if staging "
      "then overflows (see stage_dropped). Counts BATCHES, each up to 256 records"},
+    {"yuzu.guardian_journal_gauge_underflow", "yuzu_fleet_guardian_journal_gauge_underflow",
+     "Fleet sum of times an agent's write-ceiling check read the journal size gauge as "
+     "NEGATIVE (UP-2 / #2303). Correct operation never underflows, so ANY non-zero here is "
+     "a real size-accounting bug on that endpoint: persist then fails CLOSED (defers to RAM "
+     "staging) until a prune rebase restores the gauge. It matters because the batch_count "
+     "gauge CLAMPS a negative to 0 - the endpoint reads as a healthy EMPTY journal while it "
+     "is actually refusing writes, so this is the only signal that de-camouflages that state. "
+     "Investigate the endpoint; a sustained climb with stage_dropped means the underflow is "
+     "now costing records"},
     {"yuzu.guardian_journal_bytes", "yuzu_fleet_guardian_journal_bytes",
      "Fleet sum of live on-disk journal size in bytes. A LIVE gauge, not cumulative. "
      "Capacity signal: per-endpoint it is bounded by the journal's own cap, so a fleet "
@@ -255,6 +258,18 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "Fleet sum of firewalled throws in the outbox DELIVERY machinery. Distinct from the "
      "journal counters beside it: events are buffered but not shipping, which is a "
      "delivery fault, not a retention or audit-trail fault"},
+    {"yuzu.guardian_send_exceptions", "yuzu_fleet_guardian_send_exceptions",
+     "Fleet sum of per-entry drain SENDS that threw (UP-4). Finer-grained than "
+     "drain_exceptions above: a single entry could not be serialized/sent, so the head is "
+     "retained and that log's drain STOPS - a permanently-failing entry jams delivery for "
+     "everything behind it, distinct from a stream-down retry. Spans the lifecycle log AND "
+     "the general outbox"},
+    {"yuzu.guardian_journal_backpressure_drops", "yuzu_fleet_guardian_journal_backpressure_drops",
+     "Fleet sum of lifecycle-audit entries REJECTED at outbox enqueue because it was at "
+     "capacity (UP-4). A LOSS channel: the arm/disarm itself still succeeds - the audit "
+     "trail never blocks a real detection-capability change - but the record of it is "
+     "dropped, so a non-zero value means the audit trail is missing lifecycle edges under "
+     "sustained delivery backpressure"},
     {"yuzu.guardian_sweep_exceptions", "yuzu_fleet_guardian_sweep_exceptions",
      "Fleet sum of firewalled throws in the convergence SWEEP lanes. Drift DETECTION is "
      "degraded - the endpoint may miss policy violations - while the audit trail itself "
@@ -273,33 +288,33 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
 /// future refactor to a pointer, which the sizeof form would mis-size to 1.
 inline constexpr std::size_t kNGuardianJournalMetrics = std::size(kGuardianJournalMetrics);
 
-// ── Meta-signals: about the ROLLUP, not part of the 22-row table ──────────────
+// ── Meta-signals: about the ROLLUP, not part of the 29-row table ──────────────
 // Deliberately outside kGuardianJournalMetrics. That table is pinned 1:1 to
 // GuardianJournalStats by a static_assert on the struct's size, so anything added to
 // it that is not an agent counter breaks the pin. These two are computed server-side.
 //
-// Both are published on EVERY sweep including at 0 - the opposite of the 22, and
-// deliberately so. The 22 are agent-population rollups where absent means "nobody
+// Both are published on EVERY sweep including at 0 - the opposite of the 29, and
+// deliberately so. The 29 are agent-population rollups where absent means "nobody
 // reported"; these are server-owned counts that always have a true value, so a 0 is a
 // measurement ("nothing is reporting") rather than a fabrication. Same split
 // docs/observability-conventions.md draws between pre-seeded server-owned series and
 // absent-not-zero agent rollups, and the same posture as yuzu_fleet_perf_reporting.
 
 /// Agents whose latest heartbeat carried at least one parseable journal tag. The
-/// coverage denominator the 22 lack: without it, 5 reporting agents and 10,000 produce
+/// coverage denominator the 29 lack: without it, 5 reporting agents and 10,000 produce
 /// identical output and "absent = clean" is asserted at unknown coverage.
 inline constexpr const char* kGuardianJournalReportingGauge =
     "yuzu_fleet_guardian_journal_reporting";
 inline constexpr const char* kGuardianJournalReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_journal_* tag - the coverage denominator for the whole family. "
-    "Published every sweep INCLUDING 0, unlike the 22 counters. READ 0 CAREFULLY: "
+    "Published every sweep INCLUDING 0, unlike the 29 counters. READ 0 CAREFULLY: "
     "because the writer is SPARSE (a 0 counter emits no tag), this counts agents with "
     "at least one NON-ZERO counter, not agents whose journal pipeline is working. So 0 "
     "means EITHER the telemetry path is dark (pre-cutover, all aged out, reporting "
     "broke) OR nothing has been journalled anywhere since restart - a live journal on "
     "a fleet with no deployed Guardian rules reads 0 legitimately. It narrows the "
-    "overloaded absence of the 22 counters; it does not resolve it";
+    "overloaded absence of the 29 counters; it does not resolve it";
 
 /// Journal tags that were PRESENT on a heartbeat but failed the forged-value parse.
 inline constexpr const char* kGuardianJournalTagRejectedGauge =
@@ -320,7 +335,7 @@ inline constexpr const char* kGuardianJournalTagRejectedHelp =
 /// O(1) without being scanned. kMaxPlausibleGuardianJournalCount is 10 digits, so any
 /// longer token is implausible by construction. This matters because the parse runs
 /// under AgentHealthStore::mu_ - the same lock heartbeat ingest and every
-/// dashboard/REST fleet read take - 22 times per agent per ~15 s sweep. Without it, an
+/// dashboard/REST fleet read take - 29 times per agent per ~15 s sweep. Without it, an
 /// agent parking a multi-megabyte all-digit value in each tag gets it O(n)-scanned
 /// inside that critical section forever.
 ///

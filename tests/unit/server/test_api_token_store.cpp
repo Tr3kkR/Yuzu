@@ -1154,7 +1154,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation cuts over immediately — revokes the
     const std::string predecessor_id = predecessor->token_id;
     const std::string successor_id = successor->token_id;
 
-    auto confirmed = store.confirm_rotation(principal, "admin");
+    auto confirmed = store.confirm_rotation(principal, successor_id, "admin");
     REQUIRE(confirmed.has_value());
 
     auto predecessor_after = store.get_token(predecessor_id).value();
@@ -1197,7 +1197,15 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initi
     auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
     REQUIRE(rotated.has_value());
 
-    auto stolen_confirm = store.confirm_rotation(principal, "mallory");
+    // The CORRECT successor id is supplied so this isolates the operator check
+    // (a wrong id would trip the #2384 token_id pin first).
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    auto stolen_confirm = store.confirm_rotation(principal, successor_id, "mallory");
     REQUIRE_FALSE(stolen_confirm.has_value());
     CHECK(stolen_confirm.error().find("different operator") != std::string::npos);
 
@@ -1208,7 +1216,7 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initi
         CHECK(t.confirmed_at == 0);
 
     // The SAME operator who initiated it can still confirm afterward.
-    auto real_confirm = store.confirm_rotation(principal, "admin");
+    auto real_confirm = store.confirm_rotation(principal, successor_id, "admin");
     CHECK(real_confirm.has_value());
 }
 
@@ -1226,9 +1234,128 @@ TEST_CASE("ApiTokenStore: confirm_rotation with no in-flight rotation is rejecte
     REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
                 .has_value());
 
-    // Only one active credential — nothing to confirm.
-    auto confirmed = store.confirm_rotation(principal, "admin");
+    // Only one active credential — nothing to confirm. (Any non-empty
+    // token_id: the no-pair rejection fires before the #2384 id match.)
+    auto confirmed = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef", "admin");
     REQUIRE_FALSE(confirmed.has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation rejects a token_id that is not the pending "
+          "successor — no mutation (#2384 pin)",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-mismatch";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+
+    std::string predecessor_id, successor_id, rotation_group;
+    for (const auto& t : store.list_active_for_principal(principal)) {
+        if (t.supersedes_token_id.empty()) {
+            predecessor_id = t.token_id;
+        } else {
+            successor_id = t.token_id;
+            rotation_group = t.rotation_group;
+        }
+    }
+    REQUIRE_FALSE(successor_id.empty());
+
+    // The PREDECESSOR's id (the likely operator mistake) and a bogus id both
+    // mismatch the pending successor.
+    for (const std::string& wrong : {predecessor_id, std::string{"feedfacefeedfacefeedface"}}) {
+        auto mismatch = store.confirm_rotation(principal, wrong, "admin");
+        REQUIRE_FALSE(mismatch.has_value());
+        CHECK(mismatch.error().find("does not match the pending rotation") != std::string::npos);
+    }
+
+    // No mutation: both credentials active, linkage intact, confirmed_at unset.
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    for (const auto& t : active) {
+        CHECK(t.confirmed_at == 0);
+        CHECK(t.rotation_group == rotation_group);
+        if (t.token_id == successor_id)
+            CHECK(t.supersedes_token_id == predecessor_id);
+    }
+
+    // Empty token_id is rejected by the input guard, same no-mutation posture.
+    auto empty_id = store.confirm_rotation(principal, "", "admin");
+    REQUIRE_FALSE(empty_id.has_value());
+    CHECK(empty_id.error().find("token_id required") != std::string::npos);
+
+    // The correct id still confirms — the rejections above consumed nothing.
+    CHECK(store.confirm_rotation(principal, successor_id, "admin").has_value());
+}
+
+TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's successor id cannot "
+          "confirm a LATER rotation (#2384 regression)",
+          "[pg][token][rotation][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-blind-retry";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Rotation 1: rotate + confirm with R1's successor id (the happy flow).
+    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
+                .has_value());
+    std::string r1_successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            r1_successor_id = t.token_id;
+    REQUIRE_FALSE(r1_successor_id.empty());
+    REQUIRE(store.confirm_rotation(principal, r1_successor_id, "admin").has_value());
+
+    // Rotation 2 begins: R1's successor is now R2's predecessor.
+    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
+                .has_value());
+    std::string r2_successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            r2_successor_id = t.token_id;
+    REQUIRE_FALSE(r2_successor_id.empty());
+    REQUIRE(r2_successor_id != r1_successor_id);
+
+    // THE #2384 SCENARIO: a blind retry of the R1 confirm (same args, same
+    // operator) lands after R2 started. Pre-pin this confirmed R2 early and
+    // revoked R2's predecessor — R1's still-live successor. Now it mismatches.
+    auto stale_retry = store.confirm_rotation(principal, r1_successor_id, "admin");
+    REQUIRE_FALSE(stale_retry.has_value());
+    CHECK(stale_retry.error().find("does not match the pending rotation") != std::string::npos);
+
+    // R2 is untouched: its predecessor (R1's successor) is still active and
+    // the pair is still pending. NOTE: R2's predecessor legitimately RETAINS
+    // its historical confirmed_at from R1 (kept as a marker by design) — only
+    // R2's successor must be unconfirmed.
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    bool r1_successor_still_active = false;
+    for (const auto& t : active) {
+        if (t.token_id == r1_successor_id) {
+            r1_successor_still_active = true;
+            CHECK(t.revoked == false);
+        }
+        if (t.token_id == r2_successor_id)
+            CHECK(t.confirmed_at == 0);
+    }
+    CHECK(r1_successor_still_active);
+
+    // R2's own successor id confirms R2 normally.
+    CHECK(store.confirm_rotation(principal, r2_successor_id, "admin").has_value());
 }
 
 // ── Manual revoke resolves the rotation pair (design §7, PR #2284 review Major 3) ──

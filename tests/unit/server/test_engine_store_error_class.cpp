@@ -40,6 +40,10 @@ TEST_CASE("classify_engine_store_error: transient / conflict / client classes",
     CHECK(classify_engine_store_error("grace window elapsed") == E::Conflict);
     CHECK(classify_engine_store_error("rotation in progress by a different operator") ==
           E::Conflict);
+    // #2384 confirm token_id pin: a stale/wrong successor id means the
+    // rotation state has moved on — 409, don't blindly retry with the same id.
+    CHECK(classify_engine_store_error("token_id does not match the pending rotation successor; "
+                                      "pass the token_id returned by rotate") == E::Conflict);
 
     // Client-validation (permanent bad input/state — REST 400 / MCP kInvalidParams).
     CHECK(classify_engine_store_error("classification must be internal or external") ==
@@ -55,4 +59,7 @@ TEST_CASE("classify_engine_store_error: transient / conflict / client classes",
           E::ClientValidation);
     CHECK(classify_engine_store_error("principal has a non-engine active credential") ==
           E::ClientValidation);
+
+    // #2384: the confirm token_id input guard is a permanent client error.
+    CHECK(classify_engine_store_error("token_id required") == E::ClientValidation);
 }

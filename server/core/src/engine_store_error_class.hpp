@@ -40,7 +40,11 @@ enum class EngineStoreErrorClass {
         return EngineStoreErrorClass::Conflict;
 
     // 3. Other rotation-state conflicts (no broad substring, order-independent).
-    if (has("grace window elapsed") || has("different operator"))
+    //    "does not match the pending rotation": the confirm token_id pin
+    //    (#2384) — a stale/wrong successor id, i.e. the rotation state has
+    //    moved on. 409, don't blindly retry with the same id.
+    if (has("grace window elapsed") || has("different operator") ||
+        has("does not match the pending rotation"))
         return EngineStoreErrorClass::Conflict;
 
     // 4. Advisory-lock contention — transient/retryable.
@@ -88,6 +92,7 @@ enum class EngineStoreErrorClass {
         // guard normally prevents it) but classified explicitly per step 6.
         "non-engine active credential",
         "principal_id required",
+        "token_id required",
         "requesting_user required",
         "overlap window below 24h floor",
         "overlap window exceeds the maximum",
