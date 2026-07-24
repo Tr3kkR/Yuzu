@@ -1317,6 +1317,9 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         validate_tool_registration_for_test(
             {"d"}, {{"d", "Infrastructure", "Read"}, {"d", "Security", "Execute"}}, {}),
         ContainsSubstring("duplicate kToolSecurity row for 'd'"));
+    CHECK_THROWS_WITH(validate_tool_registration_for_test(
+                          {"d"}, {{"d", "Tag", "Write"}}, {"d", "d"}),
+                      ContainsSubstring("duplicate kWriteTools entry 'd'"));
 
     // (g) multiple simultaneous offences: ALL are named, in sorted order (the
     // std::sort is what makes the thrown message deterministic across

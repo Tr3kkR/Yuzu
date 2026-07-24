@@ -1035,7 +1035,10 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 // members (delete_tag, quarantine_device, and — via the generic C8 gate —
 // execute_instruction/revoke_certificate/execute_bundle on the supervised
 // tier) route through the ticket-then-recall approval flow.
-static const std::unordered_set<std::string> kWriteTools = {
+// RAW authoritative sequence (#2423 review F1): the boot validator consumes
+// THIS array, before the lookup set below is derived, so a duplicate entry is
+// an offence — not a silent first-wins collapse at static init.
+static const char* const kWriteToolsRaw[] = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle",
@@ -1052,6 +1055,16 @@ static const std::unordered_set<std::string> kWriteTools = {
     "open_access_review", "record_attestation", "close_access_review",
 };
 
+// Lookup set DERIVED from the raw sequence; collapse here is safe because the
+// ctor validator rejects duplicates in kWriteToolsRaw before the server serves.
+static const std::unordered_set<std::string> kWriteTools = [] {
+    std::unordered_set<std::string> s;
+    s.reserve(std::size(kWriteToolsRaw));
+    for (const auto* n : kWriteToolsRaw)
+        s.insert(n);
+    return s;
+}();
+
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
 // Every tool declares its securable type and operation so that tier_allows()
 // and requires_approval() can be evaluated generically before dispatch.
@@ -1060,7 +1073,17 @@ struct ToolSecurity {
     const char* operation;
 };
 
-static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
+struct ToolSecurityEntry {
+    const char* name;
+    ToolSecurity sec;
+};
+
+// RAW authoritative registration sequence (#2423 review F1): the boot
+// validator consumes THIS array, before the lookup map below is derived, so a
+// duplicate entry — e.g. a merge-conflict resolution pasting a weak
+// (securable, operation) row above the intended one — is an offence, not a
+// silent first-wins collapse at static init.
+static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
     {"get_agent_details", {"Infrastructure", "Read"}},
@@ -1172,6 +1195,17 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"close_access_review", {"AccessReview", "Attest"}},
 };
 
+// Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
+// because the ctor validator rejects duplicates in kToolSecurityRows before
+// the server serves.
+static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = [] {
+    std::unordered_map<std::string, ToolSecurity> m;
+    m.reserve(std::size(kToolSecurityRows));
+    for (const auto& r : kToolSecurityRows)
+        m.emplace(r.name, r.sec);
+    return m;
+}();
+
 // ── C8 fail-closed registration machinery (#2383) ────────────────────────
 // Three-way dispatch classification. Knownness (kTools membership) decides
 // FIRST: a kToolSecurity row for an unserved name must NOT make it
@@ -1266,7 +1300,11 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
     for (const auto& r : security_rows)
         if (!rows.emplace(r.name, r).second)
             offences.push_back("duplicate kToolSecurity row for '" + std::string(r.name) + "'");
-    const std::unordered_set<std::string_view> writes(write_tools.begin(), write_tools.end());
+    std::unordered_set<std::string_view> writes;
+    writes.reserve(write_tools.size());
+    for (const auto& w : write_tools)
+        if (!writes.insert(w).second)
+            offences.push_back("duplicate kWriteTools entry '" + std::string(w) + "'");
 
     // Exact set equality BOTH directions: a subset-only check would accept an
     // extra security row, and an extra row for an unserved name is the drift
@@ -1626,17 +1664,18 @@ McpServer::McpServer() {
     // Force the dispatch classifier's name set to build here, at construction,
     // rather than lazily on the first request.
     (void)known_tool_names();
-    // Feed the validator the RAW kTools sequence (not the deduplicated set) so
-    // a copy-pasted duplicate ToolDef is an offence, not silently collapsed.
+    // Feed the validator the RAW sequences for ALL THREE tables (#2423 review
+    // F1) — never the derived map/set, whose static-init first-wins collapse
+    // would hide a duplicate before validation could see it.
     std::vector<std::string_view> names;
     names.reserve(static_cast<size_t>(kToolCount));
     for (const auto& t : kTools)
         names.push_back(t.name);
     std::vector<ToolSecurityTuple> rows;
-    rows.reserve(kToolSecurity.size());
-    for (const auto& [name, sec] : kToolSecurity)
-        rows.push_back({name, sec.securable_type, sec.operation});
-    std::vector<std::string_view> writes(kWriteTools.begin(), kWriteTools.end());
+    rows.reserve(std::size(kToolSecurityRows));
+    for (const auto& r : kToolSecurityRows)
+        rows.push_back({r.name, r.sec.securable_type, r.sec.operation});
+    std::vector<std::string_view> writes(std::begin(kWriteToolsRaw), std::end(kWriteToolsRaw));
     validate_tool_security_registration(names, rows, writes);
 }
 
@@ -2385,8 +2424,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // matches the REST a4 envelope, which emits retry_after_ms:5000 on the
             // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
-                                  std::string_view remediation = {}, long retry_after_ms = -1) {
-                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                  std::string_view remediation = {}, long retry_after_ms = -1,
+                                  std::string_view cid_override = {}) {
+                // cid_override lets a caller mint the correlation id FIRST and
+                // stamp it into its log/audit records before building the
+                // envelope (#2423 review F4); default preserves mint-here.
+                const std::string cid = cid_override.empty()
+                                            ? yuzu::server::detail::make_correlation_id()
+                                            : std::string(cid_override);
                 std::string data = R"({"correlation_id":")" + cid + R"(","retry_after_ms":)" +
                                    (retry_after_ms >= 0 ? std::to_string(retry_after_ms)
                                                         : std::string("null")) +
@@ -2447,25 +2492,43 @@ McpServer::HandlerFn McpServer::build_handler(
             // in depth should the validator ever be bypassed.
             const auto sec_class =
                 classify_tool_security(tool_name, known_tool_names(), kToolSecurity);
+            if (sec_class == ToolSecurityClass::kUnknown) {
+                // Structural early exit (#2423 review F2): an unknown name's
+                // termination must not depend on handler↔kTools parity — the
+                // boot validator sees tables, not the handler chain, so a
+                // future orphaned handler branch would otherwise execute with
+                // no tier/approval gate. Same audit + response as the terminal
+                // "Unknown tool" backstop at the bottom of the chain.
+                mcp_audit("failure", "unknown tool");
+                res.set_content(
+                    error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
+                    "application/json");
+                return;
+            }
             if (sec_class == ToolSecurityClass::kKnownMissingSecurity) {
                 // Server-side fault, not an authz denial — and PERMANENT, not
                 // retryable, despite kInternalError's transient-store use in
                 // mcp_error_for_store_msg (retry_after_ms stays null). Loud on
                 // every channel — journal + metric + audit (governance UP-5):
                 // this branch firing at all means the boot validator was
-                // bypassed, which is itself the incident to surface.
+                // bypassed, which is itself the incident to surface. The A4
+                // correlation_id is minted FIRST so the journal line, the
+                // audit row, and the client envelope all carry the same token
+                // (#2423 review F4, agentic-first §122 backfill).
+                const std::string cid = yuzu::server::detail::make_correlation_id();
                 spdlog::error("MCP dispatch: tool '{}' has no security registration — "
-                              "denied fail-closed (#2383)",
-                              tool_name);
+                              "denied fail-closed (#2383) correlation_id={}",
+                              tool_name, cid);
                 if (metrics != nullptr)
                     metrics->counter("yuzu_mcp_tool_security_misconfig_total").increment();
-                mcp_audit("failure", "tool security registration missing");
+                mcp_audit("failure", "tool security registration missing correlation_id=" + cid);
                 res.set_content(
                     a4_error(kInternalError,
                              "tool security registration missing — denied fail-closed",
                              "this server build serves the tool without a security "
                              "registration; report this misconfiguration to the server "
-                             "administrator"),
+                             "administrator",
+                             -1, cid),
                     "application/json");
                 return;
             }

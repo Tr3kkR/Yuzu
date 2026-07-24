@@ -506,6 +506,13 @@ public:
                           "construction failed before commit (#2366); the frame was never "
                           "published and no event id was consumed",
                           "counter");
+        metrics_.describe("yuzu_mcp_tool_security_misconfig_total",
+                          "MCP tools/call denials for a served tool with no security "
+                          "registration (C8 fail-closed, #2383) — the boot validator makes "
+                          "this state unbootable, so any non-zero value means it was "
+                          "bypassed; alert on > 0 "
+                          "(docs/ops-runbooks/mcp-tool-registration-recovery.md)",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
@@ -513,6 +520,7 @@ public:
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
+        metrics_.counter("yuzu_mcp_tool_security_misconfig_total");
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
