@@ -19,8 +19,8 @@
 // This is a SUPPORTED SUBSET of JSON Schema, not a conforming validator: the
 // keyword catalogue is CLOSED to exactly what the served tool schemas use
 // (type / properties / required / enum / minimum / maximum / maxLength /
-// pattern / items / additionalProperties / anyOf-of-required-alternatives,
-// with description and default ignored). Any other keyword — and any
+// pattern / items / minItems / maxItems / additionalProperties /
+// anyOf-of-required-alternatives, with description and default ignored). Any other keyword — and any
 // malformed operand for a supported keyword — is a COMPILE error, surfaced
 // through the C8 boot validator so a schema the gate cannot fully enforce is
 // unbootable rather than partially enforced. Do not claim general JSON

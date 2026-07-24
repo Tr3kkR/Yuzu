@@ -21,6 +21,8 @@ struct SchemaNode {
     std::vector<std::pair<std::string, std::unique_ptr<const SchemaNode>>> properties;
     std::vector<std::string> required;
     std::unique_ptr<const SchemaNode> items;
+    std::optional<std::size_t> min_items;          // arrays
+    std::optional<std::size_t> max_items;          // arrays
     std::unique_ptr<const SchemaNode> additional;  // additionalProperties value-schema
     bool additional_forbidden = false;             // additionalProperties:false
     std::vector<std::vector<std::string>> any_of;  // required-only alternatives
@@ -47,7 +49,7 @@ constexpr int kMaxSchemaDepth = 8;
 constexpr std::string_view kSupportedKeywords[] = {
     "type",     "properties", "required", "description",          "default",
     "enum",     "minimum",    "maximum",  "maxLength",            "pattern",
-    "items",    "anyOf",      "additionalProperties"};
+    "items",    "minItems",   "maxItems", "anyOf",                "additionalProperties"};
 
 std::optional<SchemaType> parse_type(std::string_view t) {
     if (t == "string")
@@ -213,7 +215,7 @@ std::unique_ptr<const SchemaNode> compile_node(const nlohmann::json& s, const st
         }
     }
 
-    // ── items (array only) ──────────────────────────────────────────────
+    // ── items / minItems / maxItems (array only) ────────────────────────
     if (s.contains("items")) {
         require_type("items", SchemaType::kArray, "array");
         if (!s["items"].is_object())
@@ -221,6 +223,19 @@ std::unique_ptr<const SchemaNode> compile_node(const nlohmann::json& s, const st
         else
             node->items = compile_node(s["items"], path + "/items", depth + 1, errors);
     }
+    for (const char* kw : {"minItems", "maxItems"}) {
+        if (!s.contains(kw))
+            continue;
+        require_type(kw, SchemaType::kArray, "array");
+        if (!s[kw].is_number_integer() || s[kw].get<std::int64_t>() < 0) {
+            err(std::string("'") + kw + "' at '" + path + "' must be a non-negative integer");
+            continue;
+        }
+        (kw == std::string_view{"minItems"} ? node->min_items : node->max_items) =
+            static_cast<std::size_t>(s[kw].get<std::int64_t>());
+    }
+    if (node->min_items && node->max_items && *node->min_items > *node->max_items)
+        err("'minItems' exceeds 'maxItems' at '" + path + "'");
 
     // ── additionalProperties (object only; schema-form or false) ────────
     if (s.contains("additionalProperties")) {
@@ -397,10 +412,18 @@ std::optional<SchemaViolation> validate_node(const SchemaNode& n, const nlohmann
         }
     }
 
-    if (v.is_array() && n.items) {
-        for (std::size_t i = 0; i < v.size(); ++i)
-            if (auto violation = validate_node(*n.items, v[i], path + "/" + std::to_string(i)))
-                return violation;
+    if (v.is_array()) {
+        if (n.min_items && v.size() < *n.min_items)
+            return SchemaViolation{path, "array has fewer than minItems " +
+                                             std::to_string(*n.min_items) + " items"};
+        if (n.max_items && v.size() > *n.max_items)
+            return SchemaViolation{path, "array has more than maxItems " +
+                                             std::to_string(*n.max_items) + " items"};
+        if (n.items)
+            for (std::size_t i = 0; i < v.size(); ++i)
+                if (auto violation =
+                        validate_node(*n.items, v[i], path + "/" + std::to_string(i)))
+                    return violation;
     }
 
     return std::nullopt;

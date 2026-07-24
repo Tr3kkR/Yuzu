@@ -6060,6 +6060,16 @@ TEST_CASE("MCP 2405: registration validator rejects malformed and unsupported in
     CHECK_THROWS_WITH(
         validate_tool_registration_for_test(
             {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","minItems":3,"maxItems":1,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'minItems' exceeds 'maxItems'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","maxItems":-1,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'maxItems' at '/properties/x' must be a non-negative integer"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
             {{"t", R"({"type":"object","properties":{},"additionalProperties":true})"}}),
         ContainsSubstring("'true' is unsupported"));
     CHECK_THROWS_WITH(
@@ -6167,6 +6177,22 @@ TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
         REQUIRE(neither);
         CHECK(neither->reason.find("execution_id") != std::string::npos);
         CHECK(neither->reason.find("instruction_id") != std::string::npos);
+    }
+    // minItems/maxItems on arrays (2f's execute_bundle/execute_instruction
+    // schemas carry them — the dev merge that added them forced this
+    // catalogue extension; the boot validator caught it fail-closed, by design).
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"steps":{"type":"array","minItems":1,"maxItems":2,"items":{"type":"string"}}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"steps":["a"]})")));
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"steps":["a","b"]})")));
+        auto empty = s->validate(nlohmann::json::parse(R"({"steps":[]})"));
+        REQUIRE(empty);
+        CHECK(empty->reason.find("fewer than minItems 1") != std::string::npos);
+        auto over = s->validate(nlohmann::json::parse(R"({"steps":["a","b","c"]})"));
+        REQUIRE(over);
+        CHECK(over->reason.find("more than maxItems 2") != std::string::npos);
     }
     // additionalProperties:false rejects undeclared keys at the WILDCARD path.
     {
