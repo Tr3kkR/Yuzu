@@ -103,6 +103,7 @@ session's `GET` stream when `execute_instruction` is called with a `_meta.progre
 | `yuzu_mcp_bridge_mailbox_drops_total` | counter | Oldest-progress frames dropped from a record's bounded 16-slot arming mailbox (a fast producer outrunning the projector); terminals are never dropped. |
 | `yuzu_mcp_bridge_projector_cycles_total` | counter | Projector wake cycles - an event-driven liveness signal. `yuzu_mcp_bridge_records_active > 0` with a flat rate here means the projector thread is wedged. |
 | `yuzu_mcp_stream_terminal_publish_failures_total` | counter | Terminal-frame publish failures seen by the bridge's `publish_final → fallback → poison` ladder. Non-zero means a client-visible result could not be delivered on the stream (recoverable by `execution_id`). Alert-worthy. |
+| `yuzu_mcp_stream_final_unpinned_total` | counter | Committed terminal frames that found no free pin slot and were published **unpinned** (a real terminal is committed rather than lost to preserve a pin). Not expected: the bridge caps streamed records per session at the pin count, so any non-zero value means that admission accounting was violated and the affected final is evictable from the replay ring - still recoverable by `execution_id`. Alert on `> 0`. |
 
 All reason-label sets are closed (every value is a static literal seeded to 0 at boot),
 so `absent()`/`rate()` alerting is meaningful on a healthy server.

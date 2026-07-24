@@ -544,6 +544,14 @@ public:
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
                           "records_active > 0 with a flat rate here means the projector is wedged",
                           "counter");
+        metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
+                          "Committed terminal frames that found no free pin slot and were published "
+                          "UNPINNED (a real terminal is committed rather than lost to preserve a "
+                          "pin). Not expected: the bridge caps streamed records per session at the "
+                          "pin count, so any non-zero value means that admission accounting was "
+                          "violated and the affected final is evictable from the replay ring "
+                          "(still recoverable by execution_id). Alert on > 0",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
@@ -553,6 +561,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
+        metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
         // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
         // meaningful on a healthy/idle server (observability-conventions; the
         // reason literals mirror the bridge's reject/degrade taxonomies).
