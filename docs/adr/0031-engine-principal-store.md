@@ -179,6 +179,24 @@ request without needing to consult the other two.
   MCP tool wrapping them. That authoring surface (dashboard + REST + MCP for the identity itself,
   as opposed to PR 4.2's role-*assignment* surface) is PR 4.3 scope; this ADR does not change
   that boundary.
+- **Liveness re-checks are cached; authorization decisions are not** (#2367). `get_for_auth`
+  remains the authoritative chokepoint and always reads through to Postgres. A sibling,
+  `get_for_auth_revalidate`, serves the per-tick "is this already-authenticated stream's backing
+  principal still alive?" question from a 60 s positive cache, and has exactly one caller:
+  `AuthRoutes::engine_credential_state`, reached only from `revalidate_stream`. The split is the
+  security argument. That path already tolerates staleness of the same order by design — on
+  `StoreUnreachable` the stream rides out a ~60 s grace window (Decision 15(i), CH-4) — so caching
+  there changes no posture, whereas caching session synthesis or an on-behalf-of target check
+  would widen revocation latency on a path that tolerates none. Without the cache, every engine
+  stream cost one uncached lease-bounded read per ~3 s tick, which under a pool brownout was
+  self-amplifying (unreachable → indeterminate → keep retrying) and starved the data plane, not
+  just the streaming feature. Only `Active` is cached: `MissingOrRevoked` is terminal and rare
+  (and negative-caching it would need `create()` invalidation to avoid masking a fresh principal),
+  and caching `StoreUnreachable` would extend the outage the cache exists to damp. `revoke()` and
+  `transfer_owner()` invalidate synchronously **after** their write, guarded by a generation
+  counter copied from `ApiTokenStore` — so the writing replica cuts the stream on the next tick,
+  and the cross-replica window is bounded by the TTL, the same residual property the token cache
+  already carries.
 - A boot-time collision scan (`server.cpp`, hardened alongside this store in the PR 4.2 fix round
   to require `rbac_store_->is_open()` before trusting a clean result) refuses to start the server
   if a pre-existing `engine:`-named local user or RBAC group predates the reservation — see
