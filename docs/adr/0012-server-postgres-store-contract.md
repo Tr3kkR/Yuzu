@@ -81,6 +81,39 @@ lease. Per-store classes stay single-schema owners and **never expose their leas
 is committed now; the seam is **built when its first consumer (vuln-graph scoring) lands**, not
 speculatively. Until then no store may grow a cross-schema method.
 
+### 5. Read caching on an authoritative store (added 2026-07-24, #2367)
+
+An authoritative store MAY cache reads, subject to all five of the following. The rules were
+first worked out for `EnginePrincipalStore`'s stream-liveness cache (ADR-0031) after an external
+review round found three ways to get it wrong; they are recorded here so the next store does not
+re-derive them differently.
+
+1. **Positive results only.** Never cache a "not found" (it needs a create-path invalidation hook
+   to avoid masking a freshly created row) and never cache a store-unreachable result (caching
+   "I could not ask" extends the outage). A failure MAY be *rate-limited* — repeating a recently
+   obtained deny-class answer without taking a lease, for a window far shorter than the positive
+   TTL — which is a different thing from caching it, and is what stops the per-tick retry storm
+   the cache exists to prevent from simply returning once entries age out.
+2. **Invalidate synchronously on the store's own writes, AFTER the write lands**, under a
+   generation guard whose re-check shares one critical section with the insert. Invalidating
+   before the write leaves an unguarded window in which a concurrent reader re-reads the old row
+   and installs an entry that outlives the write by a full TTL.
+3. **Report provenance to the caller.** A cached answer must be distinguishable from a fresh one.
+   A caller that grants time-bounded trust on the strength of a check — the canonical case is a
+   held-open stream with a grace window — will otherwise let cache residency and its own budget
+   ADD rather than nest, silently multiplying how long a dead credential is honoured.
+4. **Never serve a fresh authorization decision.** Split the accessor: the authoritative one stays
+   read-through and keeps the chokepoint contract; the cached one is separate, narrowly typed
+   (liveness only — do not hand back a row a caller might read as current), and has as few callers
+   as the design can enforce.
+5. **Bound residency, and bound every map you added.** A hard ceiling with a sweep on each map's
+   own insert path, declining to insert rather than evicting something live. Note that a
+   failure-backoff map fills precisely when the positive map does not, so a sweep hung only off
+   the positive path never runs when it is needed.
+
+A cache whose TTL is coupled to another component's timing constant (a grace window, a heartbeat
+interval) must pin that relationship with a `static_assert`, not a comment.
+
 ## Considered and rejected
 
 - **A single rule — all fail-soft, or all fail-hard.** Rejected. Fail-soft is wrong for

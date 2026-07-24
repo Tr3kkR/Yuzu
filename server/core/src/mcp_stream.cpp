@@ -5,6 +5,7 @@
 #include "mcp_transport.hpp"
 #include "rest_a4_envelope.hpp"
 #include "auth_routes.hpp" // detail::sanitize_detail_value — audit-string sanitiser
+#include "engine_principal_store.hpp" // kAuthCacheTtl — the staleness bound this pump clamps to (#2367)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_audit.hpp"
 
@@ -919,14 +920,10 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
                 }
                 grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
             }
-            // Checked on the arming tick too, not just later ones: a backdated
-            // deadline can already be in the past, and the pre-#2367 "arm now,
-            // test next tick" shape would then grant an extra tick of life to a
-            // stream whose budget was already spent.
-            if (now() > *grace_deadline_) {
-                stream_->close(McpStreamClose::kAuthUnavailable);
-                return finish(write, McpStreamClose::kAuthUnavailable);
-            }
+            // Expiry is tested below, after the switch — on the arming tick too,
+            // not just later ones: a backdated deadline can already be in the
+            // past, and the pre-#2367 "arm now, test next tick" shape would
+            // grant an extra tick of life to a stream whose budget was spent.
             break;
         case StreamRevalidate::kValid:
             // An AUTHORITATIVE confirmation: the store was asked and answered.
@@ -936,14 +933,47 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
             grace_deadline_.reset();
             break;
         case StreamRevalidate::kValidStale:
-            // Valid, but nothing was asked of the store — the credential is
-            // good as of `last_authoritative_ok_`, which is NOT now. Keep the
-            // stream running and leave the budget where it is: do not advance
-            // last_authoritative_ok_, and do not clear a deadline already armed
-            // (an outage that began before the cache expired must keep its
-            // clock). Consumers that do not model staleness may treat this as
-            // kValid; this one must not.
+            // Valid, but nothing was asked of the store on this tick. Do NOT
+            // clear an armed deadline (an outage that began before the cache
+            // expired keeps its clock) and do NOT treat this as a fresh
+            // confirmation.
+            //
+            // But DO advance the floor. The answer came from a cache with a
+            // known maximum age, so it is positive evidence that the store
+            // confirmed this principal within that window — and without using
+            // it, `last_authoritative_ok_` is only refreshed on the tick that
+            // happens to miss the cache. A principal with several concurrent
+            // streams refreshes the shared entry from whichever stream ticks
+            // first, so every OTHER stream could ride cached answers for far
+            // longer than the TTL, and then get a deadline already in the past
+            // the moment the store blipped: zero grace, all of them at once.
+            // Clamping to `now - max_staleness` bounds that to one cache
+            // window per stream, and can only ever move the floor FORWARD
+            // (never past `now`), so it cannot extend a life.
+            if (cfg_.revalidate_max_staleness.count() > 0) {
+                last_authoritative_ok_ =
+                    std::max(last_authoritative_ok_, now() - cfg_.revalidate_max_staleness);
+            }
             break;
+        default:
+            // Fail CLOSED on an enumerator this pump does not know, matching
+            // auth_routes.cpp's `return R::kRevoked` fall-out. `werror` is off,
+            // so an unhandled value is a warning, not a build failure — and
+            // falling out of the switch would leave the stream RUNNING on an
+            // auth answer nobody interpreted. This PR is itself proof that
+            // enumerators get added.
+            stream_->close(McpStreamClose::kAuthUnavailable);
+            return finish(write, McpStreamClose::kAuthUnavailable);
+        }
+
+        // Checked AFTER the switch so it also covers kValidStale: a deadline
+        // armed by an earlier indeterminate tick must still fire while cached
+        // answers are arriving. Reachable when the TOKEN half is the
+        // unavailable one and the engine half is serving cache hits — without
+        // this, such a stream outlives its own deadline by up to a TTL.
+        if (grace_deadline_.has_value() && now() > *grace_deadline_) {
+            stream_->close(McpStreamClose::kAuthUnavailable);
+            return finish(write, McpStreamClose::kAuthUnavailable);
         }
     }
 
@@ -1215,6 +1245,21 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     // deterministic unit tests). At the 60 s default this spreads deaths over [60 s, 90 s].
     McpStreamPump::Config pump_cfg{};
     pump_cfg.revalidate_grace_jitter_max = pump_cfg.revalidate_grace / 2;
+    // #2367: this surface's revalidate callback may answer from the
+    // engine-principal liveness cache, so tell the pump how stale that can be.
+    // Without it, a stream whose sibling keeps refreshing the shared cache
+    // entry never advances its own authoritative floor and gets zero grace on
+    // the first blip.
+    pump_cfg.revalidate_max_staleness =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            EnginePrincipalStore::kAuthCacheTtl);
+    // The coupling is load-bearing, so pin it at compile time rather than in a
+    // comment: an aged cache entry must still leave a usable slice of the grace
+    // window. Lowering the grace window or raising the TTL without re-checking
+    // this would silently make an outage cut engine streams instantly.
+    static_assert(EnginePrincipalStore::kAuthCacheTtl * 4 <= kMcpRevalidateGraceDefault,
+                  "engine liveness cache TTL must stay well under the revalidate grace "
+                  "window (#2367) - otherwise a fully-aged entry leaves no grace at all");
     auto pump = std::make_shared<McpStreamPump>(sink, stream, generation, std::move(revalidate_fn),
                                                 std::move(session_alive), pump_cfg,
                                                 McpStreamPump::ClockFn{}, metrics);

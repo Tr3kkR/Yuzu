@@ -20,8 +20,11 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 using yuzu::server::EngineLookup;
 using yuzu::server::EngineLookupStatus;
@@ -630,12 +633,11 @@ TEST_CASE("revalidate cache entries expire and are re-read (clock seam)",
     YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
+    auto fake_now = std::chrono::steady_clock::now(); // outlives `store` by construction
     EnginePrincipalStore store{pool};
     REQUIRE(store.is_open());
     REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-ttl")
                .has_value());
-
-    auto fake_now = std::chrono::steady_clock::now();
     store.set_clock_for_test([&] { return fake_now; });
 
     REQUIRE_FALSE(store.get_for_auth_revalidate("engine:cache-ttl").from_cache);
@@ -666,10 +668,9 @@ TEST_CASE("an unreachable store is rate-limited, not re-asked on every tick",
     // Invalid pool never connects, so no live DB is needed.
     PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
     REQUIRE_FALSE(pool.valid());
+    auto fake_now = std::chrono::steady_clock::now(); // outlives `store` by construction
     EnginePrincipalStore store{pool};
     REQUIRE_FALSE(store.is_open());
-
-    auto fake_now = std::chrono::steady_clock::now();
     store.set_clock_for_test([&] { return fake_now; });
 
     // First call actually asks and fails.
@@ -694,40 +695,159 @@ TEST_CASE("an unreachable store is rate-limited, not re-asked on every tick",
     CHECK(store.revalidate_cache_misses() == 2);
 }
 
-TEST_CASE("the revalidate cache is bounded and sheds expired entries",
+TEST_CASE("the revalidate cache is physically bounded, not just filtered",
           "[pg][engine_principal][store][cache]") {
-    // BLOCKER-3 regression. Engine principals are created through a live
-    // REST/MCP surface with no store-level ceiling, and an entry is otherwise
-    // only dropped when that same principal is looked up again — so churn
-    // through distinct principals would grow the map for the process lifetime.
+    // BLOCKER-3 regression. The earlier version of this test asserted only on
+    // revalidate_cache_size(), which reports UNEXPIRED entries -- so deleting
+    // the ceiling and the sweep entirely would still have passed it. These
+    // assertions go through the physical-residency seam, so they fail if the
+    // bound is removed.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    auto fake_now = std::chrono::steady_clock::now(); // declared BEFORE the store
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_clock_for_test([&] { return fake_now; });
+    store.set_max_entries_for_test(3);
+
+    for (int i = 0; i < 3; ++i) {
+        const auto id = "engine:cap-" + std::to_string(i);
+        REQUIRE(store.create("B", "alice", "j", "internal", "admin", id).has_value());
+        REQUIRE(store.get_for_auth_revalidate(id).status == EngineLookupStatus::Active);
+    }
+    CHECK(store.revalidate_cache_resident_for_test() == 3);
+
+    // Full, and every entry still live: the sweep frees nothing, so a fourth
+    // principal must be DECLINED rather than evicting a live entry. It still
+    // gets a correct answer -- read-through is slower, never wrong.
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:cap-overflow")
+               .has_value());
+    const auto overflow = store.get_for_auth_revalidate("engine:cap-overflow");
+    CHECK(overflow.status == EngineLookupStatus::Active);
+    CHECK_FALSE(overflow.from_cache);
+    CHECK(store.revalidate_cache_resident_for_test() == 3); // ceiling held
+    // ...and it was not cached, so the next call reads through again.
+    CHECK_FALSE(store.get_for_auth_revalidate("engine:cap-overflow").from_cache);
+
+    // Once the incumbents expire, the sweep reclaims their slots on the next
+    // insert -- residency must come DOWN, which a filtered count cannot show.
+    fake_now += std::chrono::seconds(30);
+    REQUIRE(store.get_for_auth_revalidate("engine:cap-overflow").status ==
+            EngineLookupStatus::Active);
+    CHECK(store.revalidate_cache_resident_for_test() == 1);
+}
+
+TEST_CASE("the failure-backoff map is bounded on its own insert path",
+          "[engine_principal][store][cache]") {
+    // The backoff map is filled ONLY during an outage, which is exactly when
+    // the positive-insert path (the other sweep site) never runs. Bounding one
+    // map and not the other bounds neither.
+    auto fake_now = std::chrono::steady_clock::now();
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    store.set_clock_for_test([&] { return fake_now; });
+    store.set_max_entries_for_test(3);
+
+    for (int i = 0; i < 8; ++i) {
+        const auto id = "engine:backoff-" + std::to_string(i);
+        CHECK(store.get_for_auth_revalidate(id).status == EngineLookupStatus::StoreUnreachable);
+    }
+    CHECK(store.revalidate_backoff_resident_for_test() <= 3);
+
+    // After the windows elapse the sweep reclaims them on the next insert.
+    fake_now += std::chrono::seconds(30);
+    CHECK(store.get_for_auth_revalidate("engine:backoff-late").status ==
+          EngineLookupStatus::StoreUnreachable);
+    CHECK(store.revalidate_backoff_resident_for_test() == 1);
+}
+
+TEST_CASE("a revoke clears the failure backoff, so a revoked principal is not held alive",
+          "[pg][engine_principal][store][cache]") {
+    // Without this the backoff would answer StoreUnreachable -> kIndeterminate
+    // for its whole window, keeping a JUST-REVOKED principal's stream alive in
+    // grace -- contradicting "the writing replica cuts the stream next tick".
     YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     EnginePrincipalStore store{pool};
     REQUIRE(store.is_open());
-
-    auto fake_now = std::chrono::steady_clock::now();
-    store.set_clock_for_test([&] { return fake_now; });
-
-    for (int i = 0; i < 8; ++i) {
-        const auto id = "engine:bounded-" + std::to_string(i);
-        REQUIRE(store.create("B", "alice", "j", "internal", "admin", id).has_value());
-        REQUIRE(store.get_for_auth_revalidate(id).status == EngineLookupStatus::Active);
-    }
-    CHECK(store.revalidate_cache_size() == 8);
-
-    // Every stream for those principals ends; nothing looks them up again.
-    // They must not stay resident forever.
-    fake_now += std::chrono::seconds(30);
-    CHECK(store.revalidate_cache_size() == 0);
-
-    // A later insert sweeps the dead entries rather than accumulating beside
-    // them (observable through a fresh warm-up leaving exactly one live entry).
-    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:bounded-late")
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:backoff-revoke")
                .has_value());
-    REQUIRE(store.get_for_auth_revalidate("engine:bounded-late").status ==
+    REQUIRE(store.get_for_auth_revalidate("engine:backoff-revoke").status ==
             EngineLookupStatus::Active);
-    CHECK(store.revalidate_cache_size() == 1);
+
+    store.invalidate_revalidate_cache("engine:backoff-revoke");
+    CHECK(store.revalidate_backoff_resident_for_test() == 0);
+
+    auto revoked = store.revoke("engine:backoff-revoke");
+    REQUIRE(revoked.has_value());
+    CHECK(store.revalidate_cache_resident_for_test() == 0);
+    CHECK(store.revalidate_backoff_resident_for_test() == 0);
+    CHECK(store.get_for_auth_revalidate("engine:backoff-revoke").status ==
+          EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("concurrent revalidate + revoke never leaves a stale Active (TSan)",
+          "[pg][engine_principal][store][cache]") {
+    // The deterministic hook test above proves the generation-guard ARITHMETIC
+    // but runs on one thread, so it gives TSan nothing to inspect and never
+    // contends revalidate_cache_mu_. This drives real threads through the
+    // reader path, the writer path, and the metrics path at once -- the shape
+    // ApiTokenStore's own TOCTOU regression uses.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Race", "alice", "j", "internal", "admin", "engine:race")
+               .has_value());
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> stale_after_revoke{false};
+    std::atomic<bool> revoked_done{false};
+
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto r = store.get_for_auth_revalidate("engine:race");
+                // THE invariant: once the revoke has returned, no later call
+                // may still report the principal live. A call that overlaps the
+                // revoke may legitimately return Active once (documented
+                // bounded window), hence the ordering guard.
+                if (revoked_done.load(std::memory_order_acquire) &&
+                    r.status == EngineLookupStatus::Active) {
+                    stale_after_revoke.store(true, std::memory_order_release);
+                }
+            }
+        });
+    }
+    // Metrics-path reader: exercises the same mutex from a third role.
+    std::thread poller([&] {
+        while (!stop.load(std::memory_order_acquire))
+            (void)store.revalidate_cache_size();
+    });
+
+    auto revoked = store.revoke("engine:race");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+    revoked_done.store(true, std::memory_order_release);
+
+    // Let the readers observe the post-revoke world before tearing down.
+    for (int i = 0; i < 200; ++i)
+        (void)store.revalidate_cache_size();
+
+    stop.store(true, std::memory_order_release);
+    for (auto& t : readers)
+        t.join();
+    poller.join();
+
+    CHECK_FALSE(stale_after_revoke.load());
+    CHECK(store.get_for_auth_revalidate("engine:race").status ==
+          EngineLookupStatus::MissingOrRevoked);
 }
 
 TEST_CASE("invalidate_revalidate_cache clears one principal or all of them",

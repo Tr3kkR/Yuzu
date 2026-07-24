@@ -191,6 +191,47 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
+
+Two operator-visible changes to held-open MCP/SSE streams authenticated by an
+**engine** principal. Nothing changes for human or API-token streams.
+
+**Liveness re-checks are cached for 15 seconds.** Every held-open stream
+re-validates its credential on each ~3 s heartbeat tick. For engine principals
+that check previously read PostgreSQL every tick, which under a connection-pool
+brownout was self-amplifying and could starve ordinary request traffic — not
+just streaming. It is now served from a short cache, and a store that cannot be
+reached is rate-limited rather than re-asked on every tick.
+
+Fresh authorization is unaffected: creating a session and on-behalf-of target
+checks still read through on every call, so revoking an engine principal stops
+new sessions immediately. On the server handling the revoke, live streams are
+still cut on the next tick — the cache is invalidated as part of that write.
+Across replicas, a revoke reaches another replica's stream within the 15 s TTL
+plus a tick. If your compliance posture quotes a revocation-latency figure for
+engine principals, that is the number.
+
+**A stream may now end sooner during a PostgreSQL outage.** The 60 s
+indeterminate grace window is now measured from the stream's last
+*authoritative* credential confirmation rather than from the moment the outage
+was noticed. Previously a stream could ride cached answers and then collect a
+full fresh 60 s window on top of them; total survival past a real confirmation
+is now bounded by the window itself. In practice a stream can close with
+`auth_unavailable` up to ~15 s earlier than before. Clients reconnect and
+resume via `Last-Event-ID` as they already do, and durable results remain
+fetchable by `execution_id`.
+
+**New observability.** Four metrics
+(`yuzu_server_engine_revalidate_cache_hits_total`, `..._misses_total`,
+`..._cache_size`, `..._backoff_suppressed_total` — see
+[metrics.md](metrics.md)). The last is the brownout signal: it moves only while
+the store is unreachable. The server also emits a startup warning when
+effective SSE stream capacity exceeds 16x `--postgres-pool-size`; if you see
+it, watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use` before
+raising either.
+
+No configuration changes are required and no flags were added.
+
 ### vNEXT — MCP supervised-tier calls now enforce the published input schema pre-approval (#2405)
 
 Approval-gated MCP `tools/call` arguments are now validated against the tool's
@@ -1100,6 +1141,8 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
+
+Held-open SSE streams also lease this pool: each re-validates its credential every ~3 s tick. Those reads are cached (60 s for API tokens, 15 s for the engine-principal liveness check), so steady-state cost is proportional to *distinct credentials* rather than to stream count — but the refreshes still land here alongside ordinary traffic, and a stream capacity far above the pool size is the shape that turns a brief pool blip into a correlated stall. The server warns at startup when effective SSE stream capacity exceeds 16x `--postgres-pool-size`. Treat that as a prompt to watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`, not as an instruction to enlarge the pool reflexively — adding connections against an already-struggling database makes matters worse, and lowering the stream capacity is often the better lever.
 
 **`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
 

@@ -199,7 +199,13 @@ request without needing to consult the other two.
   Total survival past a real confirmation is therefore bounded by `revalidate_grace` however much
   of it was spent on cached answers. The TTL is deliberately well below that window (15 s against
   60 s): at parity a fully-aged entry would leave zero remaining grace and an outage would cut
-  engine streams instantly — worse than the uncached behaviour. **The same additive window still
+  engine streams instantly — worse than the uncached behaviour. That coupling is pinned by a
+  `static_assert` in `mcp_stream.cpp` rather than left to a comment, so lowering the grace window
+  or raising the TTL fails the build. The cache is keyed by PRINCIPAL while the grace budget is
+  per-STREAM, so a principal with several concurrent streams would otherwise refresh the shared
+  entry from whichever stream ticks first and leave the others accumulating unbounded staleness;
+  the pump clamps its authoritative floor forward to `now - kAuthCacheTtl` on a cached answer,
+  which bounds that to one cache window per stream and can only ever move the floor forward. **The same additive window still
   exists on the API-token half of `revalidate_stream`**, whose 60 s cache reports a hit as plain
   valid; that is pre-existing and tracked as #2447, not introduced here. The mechanism this ADR
   adds (`kValidStale` + a backdated grace budget) is what that fix will wire in.
@@ -209,9 +215,13 @@ request without needing to consult the other two.
   could not reach the store instead arms a short jittered backoff (5 s) during which that
   principal is answered `StoreUnreachable` without taking a lease: a rate limiter, not a negative
   cache, and the thing that stops the amplifier returning the moment positive entries age out
-  during a sustained brownout. Entries carry subtractive TTL jitter so a cohort warmed together
-  does not expire together, the map has a hard entry ceiling with an expired-entry sweep before
-  insert (declining to cache rather than evicting something live when still full), and
+  during a sustained brownout. Its jitter is ADDITIVE (5-10 s), the opposite sign to the TTL's:
+  extending a backoff is always safe, whereas a positive TTL must never overshoot the bound the
+  grace arithmetic depends on. Entries carry subtractive TTL jitter so a cohort warmed together
+  does not expire together; BOTH maps carry the same hard entry ceiling with an expired-entry
+  sweep on their own insert path (declining to record rather than evicting something live when
+  still full) — bounding only the positive map would bound neither, since the backoff map is
+  filled precisely when the positive one is not; and
   `revoke()`/`transfer_owner()` invalidate synchronously **after** their write under a generation
   guard modelled on `ApiTokenStore`'s. The writing replica cuts the stream on the next tick; the
   cross-replica window is bounded by the TTL, the same residual property the token cache carries.

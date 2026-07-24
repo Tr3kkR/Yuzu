@@ -194,6 +194,13 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
   annotations:
     summary: "FleetTopologyStore is evicting agents at the 100000-entry hard cap — fleet outgrew the cap or a cap-flood attack is in progress"
 
+- alert: EngineRevalidateBackoffSustained
+  expr: increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
+  for: 5m
+  annotations:
+    summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
+    description: "This counter only moves while the store cannot be reached. Correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for pool exhaustion, and with yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} for streams that have already ended."
+
 - alert: VizFleetPushedMapNearCap
   expr: yuzu_viz_pushed_map_size > 80000
   for: 10m

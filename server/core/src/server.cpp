@@ -936,6 +936,23 @@ public:
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
+        // #2367 engine-principal liveness cache — same shape as the token
+        // siblings above, described so the families ship typed and with HELP
+        // rather than as bare untyped samples.
+        metrics_.describe("yuzu_server_engine_revalidate_cache_hits_total",
+                          "Engine-principal stream liveness re-checks served from cache",
+                          "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_cache_misses_total",
+                          "Engine-principal stream liveness re-checks that read through to "
+                          "PostgreSQL",
+                          "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_cache_size",
+                          "Engine principals with a live (unexpired) liveness cache entry",
+                          "gauge");
+        metrics_.describe("yuzu_server_engine_revalidate_backoff_suppressed_total",
+                          "Engine-principal liveness re-checks answered StoreUnreachable from the "
+                          "failure backoff without taking a connection lease",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an

@@ -506,6 +506,20 @@ public:
         // spread (half the grace). A stream picks its own offset once, so the spread is
         // stable for the life of that stream.
         std::chrono::milliseconds revalidate_grace_jitter_max{0};
+
+        // #2367. Maximum age of a `kValidStale` answer — i.e. how stale the
+        // revalidate callback's cache is allowed to be. The pump uses it to
+        // clamp `last_authoritative_ok_` forward on a cached answer, so a
+        // stream that keeps getting cache hits (because a SIBLING stream on the
+        // same principal is the one refreshing the shared entry) still has a
+        // bounded, non-zero grace budget when the store finally blips.
+        //
+        // 0 = "answers are always authoritative": the pump then never advances
+        // the floor on kValidStale. That is the correct default for any surface
+        // whose revalidate callback has no cache, and it is the conservative
+        // direction (less life, never more). Wired from
+        // EnginePrincipalStore::kAuthCacheTtl for the MCP GET surface.
+        std::chrono::milliseconds revalidate_max_staleness{0};
     };
 
     using ClockFn = std::function<std::chrono::steady_clock::time_point()>;

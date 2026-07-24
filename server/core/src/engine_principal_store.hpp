@@ -173,6 +173,16 @@ public:
     /// Injectable for tests only — see `set_clock_for_test`.
     using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
 
+    /// How long a positive liveness answer may be reused (#2367). PUBLIC
+    /// because it is not an implementation detail: it is the staleness bound
+    /// a consumer needs in order to keep its own freshness arithmetic honest,
+    /// and it is COUPLED to `McpStreamPump`'s revalidate grace window — the
+    /// TTL must stay well under it, or an aged entry leaves no usable grace
+    /// and an outage cuts engine streams instantly. `auth_routes.cpp` carries
+    /// a static_assert pinning that relationship so a future edit to either
+    /// constant fails the build instead of silently degrading availability.
+    static constexpr auto kAuthCacheTtl = std::chrono::seconds(15);
+
     explicit EnginePrincipalStore(pg::PgPool& pool);
 
     EnginePrincipalStore(const EnginePrincipalStore&) = delete;
@@ -242,6 +252,20 @@ public:
     /// before any concurrent use. Passing an empty function restores the
     /// default `steady_clock::now`.
     void set_clock_for_test(ClockFn fn);
+
+    /// Test seams for the RESIDENCY bound. `revalidate_cache_size()` reports
+    /// what the cache is currently SERVING (unexpired only), which is the
+    /// right operator-facing number but cannot observe the ceiling — an
+    /// expired-but-unswept entry still occupies a slot. These report physical
+    /// occupancy, so a test can prove the sweep and the decline-to-insert
+    /// actually run rather than inferring it from a filtered count.
+    [[nodiscard]] std::size_t revalidate_cache_resident_for_test() const;
+    [[nodiscard]] std::size_t revalidate_backoff_resident_for_test() const;
+
+    /// Test seam: shrink the entry ceiling so the full-after-sweep path is
+    /// reachable without materialising `kAuthCacheMaxEntries` principals.
+    /// 0 restores the default.
+    void set_max_entries_for_test(std::size_t n);
 
     // Test-only seam (#2367), mirroring ApiTokenStore's
     // `test_hook_after_validate_select_`. Null in production (zero overhead).
@@ -361,18 +385,23 @@ private:
     /// worse than the uncached behaviour this replaced. At 15 s the worst case
     /// still leaves 45 s of grace, while collapsing a 3 s tick 5x (and, with
     /// misses coalesced, further still).
-    static constexpr auto kAuthCacheTtl = std::chrono::seconds(15);
 
-    /// Up to a quarter of the TTL is subtracted per entry at insert, so entries
+    /// Up to `kAuthCacheTtlJitter` is subtracted per entry at insert, so entries
     /// warmed together (every stream revalidating after one outage recovers, or
     /// after a boot) do not all expire on the same tick and re-stampede the
     /// pool. Subtracted, never added — jitter must not push an entry past the
     /// TTL bound the grace arithmetic above depends on.
-    static constexpr auto kAuthCacheTtlJitter = kAuthCacheTtl / 4;
+    /// NOTE the integer-duration arithmetic: seconds(15)/4 truncates to
+    /// seconds(3), not 3.75 s. Spelled in milliseconds so the value is what it
+    /// says it is.
+    static constexpr auto kAuthCacheTtlJitter = std::chrono::milliseconds{3750};
 
     /// After a read-through that could not reach the store, further reads for
-    /// that principal are suppressed for this long (plus jitter) and answered
-    /// `StoreUnreachable` without touching the pool.
+    /// that principal are suppressed and answered `StoreUnreachable` without
+    /// touching the pool. Jitter is ADDITIVE here (unlike the TTL's, which is
+    /// subtractive), so the real window is `kAuthFailureBackoff` to twice it —
+    /// 5 s to 10 s. Extending a backoff is safe; shortening a positive TTL is
+    /// the direction that must never overshoot, hence the opposite signs.
     ///
     /// This is a RATE LIMITER, not a negative cache. The distinction matters:
     /// it repeats an answer we obtained moments ago from the authoritative
@@ -392,11 +421,17 @@ private:
     /// then, if still full, simply declines to cache: degrading to read-through
     /// is slower, never wrong.
     static constexpr std::size_t kAuthCacheMaxEntries = 1024;
+    /// Effective ceiling; `kAuthCacheMaxEntries` unless a test shrinks it.
+    /// Applies to BOTH maps — the backoff map is filled precisely when the
+    /// positive map is not, so bounding only one of them bounds neither.
+    std::size_t max_entries_{kAuthCacheMaxEntries};
 
     mutable std::mutex revalidate_cache_mu_;
     mutable std::unordered_map<std::string, CachedAuth> revalidate_cache_;
-    /// principal_id -> "do not touch the pool for this key before". Swept on
-    /// the same schedule as the positive map.
+    /// principal_id -> "do not touch the pool for this key before". Swept and
+    /// ceiling-checked on ITS OWN insert path: an outage is the only thing
+    /// that fills this map, and the positive-insert path (the other sweep
+    /// site) by definition does not run during one.
     mutable std::unordered_map<std::string, std::chrono::steady_clock::time_point>
         revalidate_backoff_;
 
