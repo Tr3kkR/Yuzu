@@ -11,7 +11,7 @@
 #       runs-on: ubuntu-24.04
 #       container: ghcr.io/tr3kkr/yuzu-ci-gateway:latest
 
-FROM erlang:28@sha256:59e809003f7690b4bf1a5ed4ab9135a2073ce00a3ae45545835f528f9630ad2b
+FROM erlang:28@sha256:813572bf7637558acc3fbfb3a0f596fa39df0fe9bc3663d11e3b1ce3644ab3e1
 
 ARG REBAR3_VERSION=3.24.0
 
