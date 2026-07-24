@@ -233,7 +233,12 @@ agent_test_exe = executable(
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
   # thread_pool.hpp directly in the test TU, so it needs fmt symbols linked here.
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep],
+  # sqlite3_dep: test_kv_store.cpp opens a SECOND raw connection to the same file to
+  # provoke a genuine SQLite failure (dropping the table so prepare fails), which is the
+  # only way to exercise KvStore's fallible-read branches end to end rather than through
+  # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
+  # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],

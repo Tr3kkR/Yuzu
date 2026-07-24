@@ -708,6 +708,8 @@ bounds, UP-6 to the jitter) and are listed anyway so the set stays in one place.
 - UP-3 / UP-4 / UP-17 — a bit flip inside the key timestamp is now decisive for retention
   ordering; nothing cross-checks key-ts against the value's own `ts_ms`; two agent processes
   sharing one `kv_store.db` would each replay the other's batches.
-- Test-coverage gaps: the real SQLite error branches of `list_keys_sized`/`get_entry` at the
-  KvStore layer, the page-side quarantine rename `Conflict` branch, and the persist
-  cap x circuit-breaker interaction.
+- Test-coverage gaps: the page-side quarantine rename `Conflict` branch, and the persist
+  cap x circuit-breaker interaction. (The KvStore fallible-read branches are now covered for
+  a CLOSED handle and for a real `prepare` failure, both mutation-verified. The remaining
+  hole is a mid-SCAN failure - `rc != SQLITE_DONE` after rows have been returned - which
+  needs a VFS shim; it is shared with the pre-existing `list_entries` and predates #2299.)

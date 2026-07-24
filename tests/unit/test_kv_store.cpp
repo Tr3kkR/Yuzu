@@ -6,6 +6,11 @@
 
 #include <yuzu/agent/kv_store.hpp>
 
+// A SECOND, raw connection to the same file - the only way to make a REAL SQLite call
+// fail inside KvStore (drop the table out from under it) rather than testing a
+// stand-in. See the fallible-read tests at the bottom of this file.
+#include <sqlite3.h>
+
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -791,4 +796,71 @@ TEST_CASE("KvStore::rename_key reports Conflict even with extended result codes 
     // Both rows survive untouched, exactly as in the primary-code path.
     CHECK(t.store.get("p1", "lc:a").value_or("") == "A");
     CHECK(t.store.get("p1", "lc:b").value_or("") == "B");
+}
+
+// ── The fallible-read contract: "cannot tell" must never read as "not there" ─────
+//
+// These two methods exist BECAUSE they distinguish a failed read from an absent row -
+// `get()`/`list()` collapse both and the journal's eviction classifier would then report a
+// transient DB error as audit loss. So the failure branch IS the feature, and every other
+// "read failed" test in this area injects at the journal layer, never reaching the real call.
+
+TEST_CASE("KvStore fallible reads report a CLOSED handle rather than an empty result",
+          "[kv_store][entries]") {
+    // Reached through a documented state transition, not a test-only seam: the move
+    // constructor nulls the moved-from handle, and the `!db_` guard exists precisely so
+    // that object stays safe to call. An empty vector / nullopt here would be a caller
+    // reading "the namespace is empty" out of "the store is gone".
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:a", "v"));
+    KvStore moved = std::move(t.store);
+    REQUIRE(moved.get("p1", "lc:a").has_value()); // the handle really did transfer
+
+    auto scan = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE_FALSE(scan.has_value());
+    CHECK(scan.error().message.find("closed") != std::string::npos);
+
+    auto point = t.store.get_entry("p1", "lc:a");
+    REQUIRE_FALSE(point.has_value());
+    CHECK(point.error().message.find("closed") != std::string::npos);
+}
+
+TEST_CASE("KvStore fallible reads surface a REAL SQLite failure as an error, not as absence",
+          "[kv_store][entries]") {
+    // The branch that matters in production. Dropping the table through a second connection
+    // makes prepare_v2 fail for real - no injected stand-in - so a live row does not come
+    // back as a clean "absent" once the schema is gone.
+    //
+    // Scope, stated precisely because it is easy to overclaim: this reaches the PREPARE
+    // failure path of both methods, verified by mutation (making either method treat a
+    // failed prepare as absence turns this red). It does NOT reach the mid-SCAN failure
+    // path - `rc != SQLITE_DONE` after rows have already been returned - which needs a VFS
+    // shim or a schema change landing mid-statement. That branch is shared with the
+    // pre-existing `list_entries` and is recorded as a deferred gap rather than faked here:
+    // a test that appears to cover it but does not is worse than a named hole.
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:a", "v"));
+    REQUIRE(t.store.get_entry("p1", "lc:a").value().has_value()); // present before the drop
+
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
+    if (err)
+        sqlite3_free(err);
+    sqlite3_close(raw);
+    REQUIRE(rc == SQLITE_OK);
+
+    auto scan = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE_FALSE(scan.has_value()); // NOT an empty vector
+    CHECK_FALSE(scan.error().message.empty());
+
+    auto point = t.store.get_entry("p1", "lc:a");
+    REQUIRE_FALSE(point.has_value()); // NOT nullopt - the row's absence is unknown, not proven
+    CHECK_FALSE(point.error().message.empty());
+
+    // The contrast that motivates the pair: the fail-OPEN siblings cannot tell you any of
+    // this. Both report the same thing for a dropped table as for an empty namespace.
+    CHECK(t.store.list("p1", "lc:").empty());
+    CHECK_FALSE(t.store.get("p1", "lc:a").has_value());
 }
