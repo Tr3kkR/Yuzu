@@ -518,6 +518,45 @@ TEST_CASE("revoke invalidates the revalidate cache — no stale Active survives 
           EngineLookupStatus::MissingOrRevoked);
 }
 
+TEST_CASE("a revoked principal is never served Active again, however the clock flaps (#2367 CH-2)",
+          "[pg][engine_principal][store][cache]") {
+    // Gate-5 chaos CH-2, the core security invariant: once a principal is
+    // revoked, no amount of time passing or re-querying can make the liveness
+    // cache report it Active again. This composes revoke + repeated reads +
+    // clock advances across TTL boundaries into one explicit immortality-bound
+    // test (the pieces are covered separately above; this is the composition
+    // the chaos pass asked to have pinned, not inferred).
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Flap", "alice", "j", "internal", "admin", "engine:flap").has_value());
+
+    auto fake_now = std::chrono::steady_clock::now(); // outlives `store`
+    store.set_clock_for_test([&] { return fake_now; });
+
+    // Warm it live, then revoke.
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:flap").status ==
+            EngineLookupStatus::Active);
+    auto revoked = store.revoke("engine:flap");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+
+    // Now hammer it across many TTL windows. It must be MissingOrRevoked on
+    // EVERY call -- a revoked principal has no path back to Active, and nothing
+    // (not a cache hit, not TTL expiry, not a re-query) resurrects it.
+    for (int i = 0; i < 10; ++i) {
+        const auto r = EngineLivenessTestAccess::revalidate(store, "engine:flap");
+        CHECK(r.status == EngineLookupStatus::MissingOrRevoked);
+        CHECK_FALSE(r.from_cache); // MissingOrRevoked is never cached, so always a fresh read
+        fake_now += std::chrono::seconds(20); // step past a full TTL each iteration
+    }
+    CHECK(store.revalidate_cache_size() == 0);
+
+    store.set_clock_for_test({}); // restore before fake_now dies
+}
+
 TEST_CASE("transfer_owner invalidates the revalidate cache",
           "[pg][engine_principal][store][cache]") {
     YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
