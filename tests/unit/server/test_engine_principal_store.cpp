@@ -450,20 +450,25 @@ TEST_CASE("get_for_auth_revalidate caches Active while get_for_auth stays uncach
     REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-warm")
                .has_value());
 
-    // First revalidate reads through (miss) and installs the entry.
-    CHECK(store.get_for_auth_revalidate("engine:cache-warm").status ==
-          EngineLookupStatus::Active);
+    // First revalidate reads through (miss) and installs the entry. A
+    // read-through is authoritative, so from_cache is false.
+    {
+        const auto first = store.get_for_auth_revalidate("engine:cache-warm");
+        CHECK(first.status == EngineLookupStatus::Active);
+        CHECK_FALSE(first.from_cache);
+    }
     CHECK(store.revalidate_cache_misses() == 1);
     CHECK(store.revalidate_cache_hits() == 0);
     CHECK(store.revalidate_cache_size() == 1);
 
     // Subsequent ticks are served from cache — this is the whole point: N
     // streams x per-tick revalidation stops being N Postgres reads per tick.
+    // Each hit must announce itself as cached, or the pump would reset its
+    // grace budget on an answer nobody re-confirmed.
     for (int i = 0; i < 5; ++i) {
-        EngineLookup l = store.get_for_auth_revalidate("engine:cache-warm");
+        const auto l = store.get_for_auth_revalidate("engine:cache-warm");
         CHECK(l.status == EngineLookupStatus::Active);
-        REQUIRE(l.row.has_value()); // a cached hit still honours "row iff Active"
-        CHECK(l.row->principal_id == "engine:cache-warm");
+        CHECK(l.from_cache);
     }
     CHECK(store.revalidate_cache_hits() == 5);
     CHECK(store.revalidate_cache_misses() == 1); // unchanged — no further reads
@@ -519,20 +524,27 @@ TEST_CASE("transfer_owner invalidates the revalidate cache",
     REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-xfer")
                .has_value());
 
-    EngineLookup warm = store.get_for_auth_revalidate("engine:cache-xfer");
-    REQUIRE(warm.status == EngineLookupStatus::Active);
-    REQUIRE(warm.row.has_value());
-    CHECK(warm.row->owner_username == "alice");
+    REQUIRE(store.get_for_auth_revalidate("engine:cache-xfer").status ==
+            EngineLookupStatus::Active);
+    REQUIRE(store.revalidate_cache_size() == 1);
 
     auto moved = store.transfer_owner("engine:cache-xfer", "bob");
     REQUIRE(moved.has_value());
     REQUIRE(*moved);
     CHECK(store.revalidate_cache_size() == 0);
 
-    EngineLookup after = store.get_for_auth_revalidate("engine:cache-xfer");
-    REQUIRE(after.status == EngineLookupStatus::Active);
-    REQUIRE(after.row.has_value());
-    CHECK(after.row->owner_username == "bob"); // no stale row served
+    // The next lookup is a genuine read-through, not a cache hit.
+    const auto after = store.get_for_auth_revalidate("engine:cache-xfer");
+    CHECK(after.status == EngineLookupStatus::Active);
+    CHECK_FALSE(after.from_cache);
+
+    // The revalidate result deliberately carries no row, so the owner change is
+    // observed through the authoritative read. (Withholding the row is what
+    // makes a stale owner_username unreadable by construction.)
+    auto row = store.get("engine:cache-xfer");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->owner_username == "bob");
 }
 
 TEST_CASE("get_for_auth_revalidate caches ONLY Active — never MissingOrRevoked, never "
@@ -611,6 +623,111 @@ TEST_CASE("a revoke racing a revalidate's cache-write cannot poison the cache (#
     CHECK(store.revalidate_cache_size() == 0); // generation bump defeated the write
     CHECK(store.get_for_auth_revalidate("engine:cache-race").status ==
           EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("revalidate cache entries expire and are re-read (clock seam)",
+          "[pg][engine_principal][store][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-ttl")
+               .has_value());
+
+    auto fake_now = std::chrono::steady_clock::now();
+    store.set_clock_for_test([&] { return fake_now; });
+
+    REQUIRE_FALSE(store.get_for_auth_revalidate("engine:cache-ttl").from_cache);
+    CHECK(store.get_for_auth_revalidate("engine:cache-ttl").from_cache); // warm
+
+    // Just inside the jittered TTL floor (TTL minus its maximum jitter): still
+    // a hit for certain.
+    fake_now += std::chrono::seconds(10);
+    CHECK(store.get_for_auth_revalidate("engine:cache-ttl").from_cache);
+    CHECK(store.revalidate_cache_size() == 1);
+
+    // Past the full TTL: expired for certain, whatever jitter was drawn. The
+    // answer is still Active, but it is authoritative again — which is what
+    // lets the pump reset its grace budget.
+    fake_now += std::chrono::seconds(20);
+    CHECK(store.revalidate_cache_size() == 0); // expired entries are not "cached"
+    const auto after = store.get_for_auth_revalidate("engine:cache-ttl");
+    CHECK(after.status == EngineLookupStatus::Active);
+    CHECK_FALSE(after.from_cache);
+}
+
+TEST_CASE("an unreachable store is rate-limited, not re-asked on every tick",
+          "[engine_principal][store][cache]") {
+    // BLOCKER-2 regression. Without the backoff the positive cache fixes only
+    // the warm steady state: once entries age out during a sustained brownout,
+    // every stream reads through on every ~3 s tick — the O(streams x tick)
+    // amplifier #2367 exists to remove, merely postponed by one TTL.
+    // Invalid pool never connects, so no live DB is needed.
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    auto fake_now = std::chrono::steady_clock::now();
+    store.set_clock_for_test([&] { return fake_now; });
+
+    // First call actually asks and fails.
+    CHECK(store.get_for_auth_revalidate("engine:brownout").status ==
+          EngineLookupStatus::StoreUnreachable);
+    CHECK(store.revalidate_cache_misses() == 1);
+    CHECK(store.revalidate_backoff_suppressed() == 0);
+
+    // The next several ticks repeat that answer without asking again.
+    for (int i = 0; i < 10; ++i) {
+        CHECK(store.get_for_auth_revalidate("engine:brownout").status ==
+              EngineLookupStatus::StoreUnreachable);
+    }
+    CHECK(store.revalidate_cache_misses() == 1); // no further reads attempted
+    CHECK(store.revalidate_backoff_suppressed() == 10);
+
+    // Backoff is short by design — recovery must be noticed promptly, so past
+    // the window (plus its maximum jitter) the store is probed again.
+    fake_now += std::chrono::seconds(11);
+    CHECK(store.get_for_auth_revalidate("engine:brownout").status ==
+          EngineLookupStatus::StoreUnreachable);
+    CHECK(store.revalidate_cache_misses() == 2);
+}
+
+TEST_CASE("the revalidate cache is bounded and sheds expired entries",
+          "[pg][engine_principal][store][cache]") {
+    // BLOCKER-3 regression. Engine principals are created through a live
+    // REST/MCP surface with no store-level ceiling, and an entry is otherwise
+    // only dropped when that same principal is looked up again — so churn
+    // through distinct principals would grow the map for the process lifetime.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto fake_now = std::chrono::steady_clock::now();
+    store.set_clock_for_test([&] { return fake_now; });
+
+    for (int i = 0; i < 8; ++i) {
+        const auto id = "engine:bounded-" + std::to_string(i);
+        REQUIRE(store.create("B", "alice", "j", "internal", "admin", id).has_value());
+        REQUIRE(store.get_for_auth_revalidate(id).status == EngineLookupStatus::Active);
+    }
+    CHECK(store.revalidate_cache_size() == 8);
+
+    // Every stream for those principals ends; nothing looks them up again.
+    // They must not stay resident forever.
+    fake_now += std::chrono::seconds(30);
+    CHECK(store.revalidate_cache_size() == 0);
+
+    // A later insert sweeps the dead entries rather than accumulating beside
+    // them (observable through a fresh warm-up leaving exactly one live entry).
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:bounded-late")
+               .has_value());
+    REQUIRE(store.get_for_auth_revalidate("engine:bounded-late").status ==
+            EngineLookupStatus::Active);
+    CHECK(store.revalidate_cache_size() == 1);
 }
 
 TEST_CASE("invalidate_revalidate_cache clears one principal or all of them",

@@ -393,13 +393,17 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
     // from revalidate_stream — the per-tick liveness re-check of an ALREADY
     // authenticated stream — never from session synthesis or an on-behalf-of
     // target check, both of which call get_for_auth and read through to
-    // Postgres every time. See the store hpp for why the split is the security
-    // argument: this path already grants a grace window of the same order as
-    // the cache TTL, so caching here changes no posture; caching a fresh
-    // authorization decision would.
-    switch (engine_principal_store_->get_for_auth_revalidate(token.principal_id).status) {
+    // Postgres every time (which is why this method is private).
+    const auto engine = engine_principal_store_->get_for_auth_revalidate(token.principal_id);
+    switch (engine.status) {
     case EngineLookupStatus::Active:
-        return R::kValid;
+        // Propagate WHERE the answer came from, not just what it was. A cached
+        // Active reported as plain kValid would reset the pump's grace clock,
+        // making cache residency and the grace window additive — the stream
+        // rides the cache, then gets a full FRESH grace window once it expires.
+        // kValidStale keeps the pump measuring from the last AUTHORITATIVE
+        // confirmation, so total survival stays bounded by the grace window.
+        return engine.from_cache ? R::kValidStale : R::kValid;
     case EngineLookupStatus::MissingOrRevoked:
         // Terminal: the credential's backing principal is dead. Cut the stream now —
         // this is the revocation path the per-tick re-validation exists for.
@@ -471,11 +475,15 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                 // applies them too. Without them a DELETED OR REVOKED ENGINE PRINCIPAL kept
                 // its live MCP stream indefinitely — every fresh request 401'd, while the
                 // stream slid its own idle TTL forward on each tick and never expired.
-                if (const auto engine = engine_credential_state(*checked.token);
-                    engine != R::kValid) {
-                    return engine;
-                }
-                return R::kValid;
+                // Returned verbatim, including kValidStale (#2367): the engine
+                // gate is the only staleness this function models today, and
+                // flattening it to kValid here would undo the whole point of
+                // the distinction. NOTE the token half above is NOT modelled —
+                // `validate_token_checked` is served from its own 60 s cache
+                // and reports a hit as plain kValid, so a token-authenticated
+                // stream still carries the additive window this closes for
+                // engine principals. Pre-existing; tracked as #2447.
+                return engine_credential_state(*checked.token);
             }
             break; // a valid token for SOMEONE ELSE is not authority for this stream
         case ApiTokenStore::TokenCheck::kUnavailable:

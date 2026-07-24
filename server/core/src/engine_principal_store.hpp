@@ -64,30 +64,41 @@
 /// `validate_token` and the fleet data plane with it.
 ///
 /// So `get_for_auth_revalidate()` adds a short-TTL positive cache — and ONLY
-/// that method. `get_for_auth()` stays uncached and authoritative. The split
-/// is the security argument, not an implementation detail:
+/// that method. `get_for_auth()` stays uncached and authoritative. Which
+/// question is being asked decides whether a cached answer is admissible:
 ///
-///   - The revalidation path already tolerates a bounded staleness window by
-///     design: on `kIndeterminate` the stream rides out a ~60 s grace period
-///     (Decision 15(i), CH-4). A cache TTL of the same order therefore adds
-///     nothing qualitatively new to stream-liveness posture.
-///   - A FRESH authorization decision tolerates none. Session synthesis
-///     (`synthesize_token_session`) and the MCP/REST on-behalf-of target
-///     checks keep reading through to Postgres every time, so revoking a
-///     principal still stops new sessions and new delegations instantly.
+///   - A LIVENESS RE-CHECK asks "may this already-authenticated stream keep
+///     running?". The stream was authenticated authoritatively at attach, and
+///     the pump grants it a bounded grace window when the store cannot be
+///     reached at all — so a recent answer is proportionate here.
+///   - A FRESH AUTHORIZATION DECISION tolerates no staleness. Session
+///     synthesis (`synthesize_token_session`) and the MCP/REST on-behalf-of
+///     target checks keep reading through to Postgres every time, so revoking
+///     a principal still stops new sessions and new delegations instantly.
 ///
-/// Only `Active` is cached. `MissingOrRevoked` is not (it is terminal and
-/// rare — the alerting path — and negative-caching it would need `create()`
-/// invalidation to avoid masking a fresh principal). `StoreUnreachable` is
-/// emphatically not: caching "I could not ask" would extend the very outage
-/// this cache exists to damp.
+/// A cached answer is NOT reported as a re-confirmation. `EngineRevalidate`
+/// carries `from_cache`, the caller turns that into
+/// `auth::CredentialCheck::kValidStale`, and the pump measures its grace
+/// budget from the last AUTHORITATIVE confirmation. Without that, cache
+/// residency and the grace window would ADD: a stream would ride the cache and
+/// then collect a full fresh grace window once it expired. With it, total
+/// survival past a real confirmation stays bounded by the grace window, and
+/// `kAuthCacheTtl` is sized well under that window so an aged entry still
+/// leaves useful grace (see the constant).
+///
+/// Only `Active` is cached. `MissingOrRevoked` is not (terminal and rare — the
+/// alerting path — and negative-caching it would need `create()` invalidation
+/// to avoid masking a fresh principal). `StoreUnreachable` is not cached
+/// either, but it IS rate-limited: a short jittered backoff repeats that
+/// answer without taking a lease, because otherwise the positive cache fixes
+/// only the warm steady state and the per-tick amplifier returns intact the
+/// moment entries age out during a sustained brownout.
 ///
 /// Revocation latency on the cached path: the writing replica invalidates
 /// synchronously in `revoke()`/`transfer_owner()`, so a single-server
 /// deployment (the shipped posture) cuts the stream on the next tick. Across
 /// replicas the window is bounded by `kAuthCacheTtl` — the same residual
-/// property `ApiTokenStore`'s token cache already carries, and strictly
-/// inside the grace window the pump would have granted anyway.
+/// property `ApiTokenStore`'s token cache already carries.
 
 #include <atomic>
 #include <chrono>
@@ -141,8 +152,27 @@ struct EngineLookup {
     std::optional<EnginePrincipalRow> row;
 };
 
+/// Result of `get_for_auth_revalidate` (#2367) — liveness only, no row.
+///
+/// `from_cache` is not a diagnostic: it is the difference between "the store
+/// confirmed this principal just now" and "the store confirmed it up to
+/// `kAuthCacheTtl` ago". The caller must propagate that distinction (as
+/// `auth::CredentialCheck::kValidStale`) so a held-open stream keeps measuring
+/// its grace budget from the last AUTHORITATIVE confirmation. Collapsing it
+/// into a plain "valid" makes cache residency and the grace window additive.
+/// It is only ever true alongside `Active` — a miss reads through, so
+/// `MissingOrRevoked` and `StoreUnreachable` are always authoritative.
+struct EngineRevalidate {
+    EngineLookupStatus status = EngineLookupStatus::StoreUnreachable;
+    bool from_cache = false;
+};
+
 class EnginePrincipalStore {
 public:
+    /// Clock used for revalidation-cache TTL, jitter, and failure backoff.
+    /// Injectable for tests only — see `set_clock_for_test`.
+    using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
+
     explicit EnginePrincipalStore(pg::PgPool& pool);
 
     EnginePrincipalStore(const EnginePrincipalStore&) = delete;
@@ -163,16 +193,22 @@ public:
     /// LIVENESS RE-CHECK ONLY — the per-tick "is this already-authenticated
     /// stream's backing principal still alive?" question, served from a
     /// `kAuthCacheTtl` positive cache (#2367; rationale in the file doc
-    /// comment). Same three-state contract as `get_for_auth`.
+    /// comment). Same three-state status contract as `get_for_auth`.
     ///
     /// NEVER use this to make a FRESH authorization decision — not for
     /// session synthesis, not for an on-behalf-of target check, not for a
     /// route's admission gate. Those must call `get_for_auth`. A cached
-    /// `Active` is evidence that the principal was live within the TTL, which
-    /// is sufficient to let an EXISTING stream keep running (its pump already
-    /// grants a grace window of the same order) and is NOT sufficient to
+    /// `Active` is evidence that the principal was live within the TTL; that
+    /// is enough to let an EXISTING stream keep running, and not enough to
     /// admit anything new.
-    [[nodiscard]] EngineLookup get_for_auth_revalidate(const std::string& principal_id) const;
+    ///
+    /// Returns NO row, deliberately. The only consumer branches on status, and
+    /// withholding the row means a cached answer can never be mistaken for
+    /// authoritative metadata (a cached `owner_username` is exactly the kind of
+    /// thing a future caller would read without noticing it may be a minute
+    /// old). It also keeps a cache hit allocation-free.
+    [[nodiscard]] EngineRevalidate
+    get_for_auth_revalidate(const std::string& principal_id) const;
 
     /// Drop `principal_id` from the revalidation cache (empty string = clear
     /// all). Called synchronously by this store's own lifecycle writers; also
@@ -189,9 +225,23 @@ public:
     [[nodiscard]] std::uint64_t revalidate_cache_misses() const noexcept {
         return revalidate_cache_misses_.load(std::memory_order_relaxed);
     }
+    /// Lookups answered `StoreUnreachable` from the failure backoff without
+    /// taking a pool lease. This is the brownout-damping counter: a climbing
+    /// value means the store is down AND the amplifier is being held off.
+    [[nodiscard]] std::uint64_t revalidate_backoff_suppressed() const noexcept {
+        return revalidate_backoff_suppressed_.load(std::memory_order_relaxed);
+    }
 
-    /// Number of distinct principals currently cached (test/observability).
+    /// Number of principals with a LIVE (unexpired) cache entry. Expired but
+    /// not-yet-swept entries are not counted — "resident" and "currently
+    /// cached" are different facts, and reporting the former as the latter
+    /// would overstate what the cache is actually serving.
     [[nodiscard]] std::size_t revalidate_cache_size() const;
+
+    /// Test seam: override the clock used for TTL, jitter, and backoff. Call
+    /// before any concurrent use. Passing an empty function restores the
+    /// default `steady_clock::now`.
+    void set_clock_for_test(ClockFn fn);
 
     // Test-only seam (#2367), mirroring ApiTokenStore's
     // `test_hook_after_validate_select_`. Null in production (zero overhead).
@@ -286,10 +336,12 @@ public:
     count_active_owned_by(const std::string& owner_username) const;
 
 private:
-    /// One cached Active lookup. Only ever built from an `Active` result.
+    /// One cached Active lookup. The liveness fact and when it stops counting —
+    /// no row: the consumer branches on status only, and not retaining the row
+    /// removes any chance of a stale `owner_username` being read as current.
+    /// `expires_at` carries its jitter baked in (see the insert path).
     struct CachedAuth {
-        EnginePrincipalRow row;
-        std::chrono::steady_clock::time_point cached_at;
+        std::chrono::steady_clock::time_point expires_at;
     };
 
     pg::PgPool& pool_;
@@ -297,11 +349,69 @@ private:
 
     /// Revalidation cache (#2367) — positive entries only, see the file doc
     /// comment for why this is not on `get_for_auth`.
-    static constexpr auto kAuthCacheTtl = std::chrono::seconds(60);
+    ///
+    /// The TTL is deliberately WELL BELOW the pump's revalidate grace window
+    /// (60 s), not equal to it. Total survival past the last authoritative
+    /// confirmation is `cache residency + remaining grace`, and the consumer
+    /// backdates its grace deadline to that last authoritative confirmation
+    /// (`CredentialCheck::kValidStale`), so the sum is bounded by the grace
+    /// window itself. Sizing the TTL at the full 60 s would make that bound
+    /// technically hold while leaving a fully-aged entry with ZERO remaining
+    /// grace — an outage would then cut engine streams instantly, strictly
+    /// worse than the uncached behaviour this replaced. At 15 s the worst case
+    /// still leaves 45 s of grace, while collapsing a 3 s tick 5x (and, with
+    /// misses coalesced, further still).
+    static constexpr auto kAuthCacheTtl = std::chrono::seconds(15);
+
+    /// Up to a quarter of the TTL is subtracted per entry at insert, so entries
+    /// warmed together (every stream revalidating after one outage recovers, or
+    /// after a boot) do not all expire on the same tick and re-stampede the
+    /// pool. Subtracted, never added — jitter must not push an entry past the
+    /// TTL bound the grace arithmetic above depends on.
+    static constexpr auto kAuthCacheTtlJitter = kAuthCacheTtl / 4;
+
+    /// After a read-through that could not reach the store, further reads for
+    /// that principal are suppressed for this long (plus jitter) and answered
+    /// `StoreUnreachable` without touching the pool.
+    ///
+    /// This is a RATE LIMITER, not a negative cache. The distinction matters:
+    /// it repeats an answer we obtained moments ago from the authoritative
+    /// store, for a window far shorter than the positive TTL, and it re-probes
+    /// promptly so recovery is detected fast. Without it the positive cache
+    /// fixes only the warm steady state: once entries expire during a sustained
+    /// brownout, every stream reads through on every ~3 s tick, each blocking
+    /// up to the 1500 ms lease timeout — which is precisely the amplifier
+    /// #2367 exists to remove, merely postponed by one TTL.
+    static constexpr auto kAuthFailureBackoff = std::chrono::seconds(5);
+
+    /// Hard ceiling on resident entries. Engine principals are created through
+    /// a live REST/MCP surface with no store-level count limit, and an entry is
+    /// otherwise only removed when that same principal is looked up again — so
+    /// a principal whose streams all ended would sit resident for the process
+    /// lifetime. On a full map the insert path first sweeps expired entries and
+    /// then, if still full, simply declines to cache: degrading to read-through
+    /// is slower, never wrong.
+    static constexpr std::size_t kAuthCacheMaxEntries = 1024;
+
     mutable std::mutex revalidate_cache_mu_;
     mutable std::unordered_map<std::string, CachedAuth> revalidate_cache_;
+    /// principal_id -> "do not touch the pool for this key before". Swept on
+    /// the same schedule as the positive map.
+    mutable std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        revalidate_backoff_;
+
+    /// Clock seam. Production leaves this as `steady_clock::now`; tests inject a
+    /// controllable clock so TTL expiry, jitter bounds, and backoff windows are
+    /// testable without sleeping through them. Set once before any concurrent
+    /// use (there is no lock around the function object itself).
+    ClockFn clock_{[] { return std::chrono::steady_clock::now(); }};
     mutable std::atomic<std::uint64_t> revalidate_cache_hits_{0};
     mutable std::atomic<std::uint64_t> revalidate_cache_misses_{0};
+    mutable std::atomic<std::uint64_t> revalidate_backoff_suppressed_{0};
+
+    /// Drop expired positive entries and elapsed backoffs. Caller holds
+    /// `revalidate_cache_mu_`.
+    void sweep_expired_locked(std::chrono::steady_clock::time_point now) const;
 
     /// TOCTOU guard against cache POISONING, copied from
     /// `ApiTokenStore::revoke_generation_` including its hard-won ordering

@@ -174,7 +174,22 @@ EngineLookup EnginePrincipalStore::get_for_auth(const std::string& principal_id)
     return {EngineLookupStatus::Active, std::move(row)};
 }
 
-EngineLookup
+namespace {
+
+/// Non-cryptographic per-entry jitter. Decorrelates expiry only — it guards
+/// nothing, so a cheap thread_local PRNG is the right tool. Mirrors the pump's
+/// grace jitter (`mcp_stream.cpp`), including seeding once per worker.
+std::chrono::milliseconds jitter_up_to(std::chrono::milliseconds span) {
+    if (span.count() <= 0)
+        return std::chrono::milliseconds{0};
+    static thread_local std::minstd_rand rng{
+        static_cast<std::uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
+    return std::chrono::milliseconds{static_cast<std::int64_t>(rng()) % (span.count() + 1)};
+}
+
+} // namespace
+
+EngineRevalidate
 EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) const {
     // #2367. LIVENESS RE-CHECK ONLY — see the hpp contract. This exists so N
     // engine streams re-validating every ~3 s cost O(cache refresh) instead of
@@ -187,48 +202,90 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
     // observable at the cache-write below. Cache-poisoning guard only; see the
     // revoke_generation_ field comment for the residual single-call window.
     const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
+    const auto now = clock_();
 
     {
         std::lock_guard lk(revalidate_cache_mu_);
         auto it = revalidate_cache_.find(principal_id);
         if (it != revalidate_cache_.end()) {
-            if (std::chrono::steady_clock::now() - it->second.cached_at < kAuthCacheTtl) {
+            if (now < it->second.expires_at) {
                 revalidate_cache_hits_.fetch_add(1, std::memory_order_relaxed);
-                return {EngineLookupStatus::Active, it->second.row};
+                // from_cache: the caller MUST NOT treat this as a fresh
+                // confirmation (hpp contract on EngineRevalidate).
+                return {EngineLookupStatus::Active, /*from_cache=*/true};
             }
             revalidate_cache_.erase(it); // expired — fall through and read through
+        }
+
+        // Failure backoff: the store was unreachable moments ago and we agreed
+        // not to ask again yet. Repeat that answer without taking a lease —
+        // this is what stops a sustained brownout from restoring the
+        // O(streams x tick) amplifier once positive entries age out.
+        if (auto bo = revalidate_backoff_.find(principal_id); bo != revalidate_backoff_.end()) {
+            if (now < bo->second) {
+                revalidate_backoff_suppressed_.fetch_add(1, std::memory_order_relaxed);
+                return {EngineLookupStatus::StoreUnreachable, /*from_cache=*/false};
+            }
+            revalidate_backoff_.erase(bo);
         }
     }
     revalidate_cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
-    EngineLookup fresh = get_for_auth(principal_id);
+    const EngineLookup fresh = get_for_auth(principal_id);
 
-    // Positive entries ONLY. MissingOrRevoked is terminal and rare (and
-    // negative-caching it would need create() invalidation to avoid masking a
-    // freshly minted principal); StoreUnreachable must never be cached — that
-    // would extend the outage this cache exists to damp.
     if (test_hook_after_revalidate_read_)
         test_hook_after_revalidate_read_();
 
-    if (fresh.status == EngineLookupStatus::Active && fresh.row.has_value()) {
+    if (fresh.status == EngineLookupStatus::StoreUnreachable) {
+        std::lock_guard lk(revalidate_cache_mu_);
+        revalidate_backoff_[principal_id] =
+            clock_() + kAuthFailureBackoff + jitter_up_to(kAuthFailureBackoff);
+        return {fresh.status, /*from_cache=*/false};
+    }
+
+    // Positive entries ONLY. MissingOrRevoked is terminal and rare, and
+    // negative-caching it would need a create() invalidation hook to avoid
+    // masking a freshly minted principal.
+    if (fresh.status == EngineLookupStatus::Active) {
         // The generation re-check MUST be taken UNDER the mutex, in the same
         // critical section as the insert (ApiTokenStore's hard-won rule — a
         // check-then-lock ordering lets a concurrent revoke's erase land
         // between the check and the insert, leaving a stale Active alive for
         // the full TTL).
         std::lock_guard lk(revalidate_cache_mu_);
+        revalidate_backoff_.erase(principal_id); // reachable again
         if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
-            revalidate_cache_[principal_id] =
-                CachedAuth{*fresh.row, std::chrono::steady_clock::now()};
+            const auto stamp = clock_();
+            if (revalidate_cache_.size() >= kAuthCacheMaxEntries)
+                sweep_expired_locked(stamp);
+            // Still full after the sweep: decline to cache rather than evict
+            // something live. Read-through is slower, never wrong.
+            if (revalidate_cache_.size() < kAuthCacheMaxEntries) {
+                revalidate_cache_[principal_id] = CachedAuth{
+                    stamp + kAuthCacheTtl - jitter_up_to(kAuthCacheTtlJitter)};
+            }
         }
     }
 
-    return fresh;
+    return {fresh.status, /*from_cache=*/false};
+}
+
+void EnginePrincipalStore::sweep_expired_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::erase_if(revalidate_cache_, [&](const auto& kv) { return now >= kv.second.expires_at; });
+    std::erase_if(revalidate_backoff_, [&](const auto& kv) { return now >= kv.second; });
 }
 
 std::size_t EnginePrincipalStore::revalidate_cache_size() const {
+    const auto now = clock_();
     std::lock_guard lk(revalidate_cache_mu_);
-    return revalidate_cache_.size();
+    return static_cast<std::size_t>(
+        std::count_if(revalidate_cache_.begin(), revalidate_cache_.end(),
+                      [&](const auto& kv) { return now < kv.second.expires_at; }));
+}
+
+void EnginePrincipalStore::set_clock_for_test(ClockFn fn) {
+    clock_ = fn ? std::move(fn) : ClockFn{[] { return std::chrono::steady_clock::now(); }};
 }
 
 void EnginePrincipalStore::invalidate_revalidate_cache(const std::string& principal_id) {
