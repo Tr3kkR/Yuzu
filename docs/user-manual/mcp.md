@@ -208,9 +208,23 @@ change: a notification POST now answers `202` instead of `204`).
   Streams are held open, so a proxy in front of Yuzu must not buffer them. The server
   sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare
   need their own response-buffering opt-out.
-  In this release the channel carries heartbeats and replayed frames;
-  `notifications/progress` for long-running tools arrives in the next 2f rung (see
-  `docs/mcp-server.md`).
+  **Live progress (`notifications/progress`).** Call `execute_instruction` on a
+  Streamable-HTTP session with a `_meta.progressToken` (a string ≤512 bytes, or an
+  integer) in the `tools/call` params, and as the fleet responds the server pushes
+  `notifications/progress` frames onto *this session's `GET` stream*: `params.progress`
+  = agents responded, `params.total` = agents targeted, `params.progressToken` echoed
+  verbatim, and `params._meta["yuzu.execution_id"]` carrying the durable handle. The
+  token is opaque and echoed unchanged; anything that is not a string ≤512 bytes or an
+  integer is treated as "no progress requested". You will typically see an immediate
+  `0/N` frame (emitted as soon as the target count is known) followed by frames as
+  agents report in; these frames are part of the same per-session ring, so
+  **`Last-Event-ID` resume replays missed progress frames** exactly like any other.
+  Progress is **best-effort**: even after supplying a token you MUST still be prepared
+  to poll (`query_responses` / `get_execution_status`) - a reservation can silently
+  degrade to the plain path under load (e.g. the 256-record cap), and zero progress
+  frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
+  **not** emit progress (poll `get_bundle_result`). Progress delivery is on the `GET`
+  stream only in this release; SSE-on-`POST` arrives in a later 2f rung.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
@@ -975,6 +989,21 @@ second).
 **Fix**: Honour `retry_after_ms`. Close a stream you no longer need (drop the GET
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
+
+### -32014: Streamed result no longer buffered
+
+**Symptom**: On a `GET`-stream resume you receive a JSON-RPC error frame with code
+`-32014` echoing a request id, its A4 `error.data` carrying the `execution_id` and a
+"fetch by execution_id" remediation.
+
+**Cause**: The server force-expired a parked streamed result under memory pressure
+before it could be delivered on the stream (the buffered-result population hit its cap).
+The real result was never lost - only its *streamed* copy was dropped.
+
+**Fix**: Fetch the result durably with the supplied `execution_id`
+(`get_execution_status` / `query_responses`). This code cannot occur for
+`execute_instruction` progress in the current release (the parked-result path activates
+with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
 
 ### -32004: MCP tier does not allow this operation
 
