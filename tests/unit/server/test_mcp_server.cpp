@@ -10,6 +10,7 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
@@ -1258,7 +1259,8 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         std::vector<std::string> writes;
         for (const auto& w : write_tool_names_for_test())
             writes.emplace_back(w);
-        REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes));
+        REQUIRE_NOTHROW(
+            validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test()));
     }
 
     // (a) served tool with no security row — the original C8 fail-open state.
@@ -1266,7 +1268,7 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
     // offence ends in the same "has no kToolSecurity row" suffix.
     CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"},
                                                           {{"alpha", "Infrastructure", "Read"}},
-                                                          {}),
+                                                          {}, {}),
                       ContainsSubstring("served tool 'beta' has no kToolSecurity row"));
 
     // (b) extra security row naming no served tool — a subset-only check would
@@ -1274,19 +1276,19 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
     CHECK_THROWS_WITH(
         validate_tool_registration_for_test(
             {"alpha"}, {{"alpha", "Infrastructure", "Read"}, {"ghost", "Infrastructure", "Read"}},
-            {}),
+            {}, {}),
         ContainsSubstring("kToolSecurity row 'ghost' names no served tool"));
 
     // (c) kWriteTools vs non-Read subset, both directions, plus a write entry
     // with no security row at all.
     CHECK_THROWS_WITH(
-        validate_tool_registration_for_test({"w"}, {{"w", "Tag", "Write"}}, {}),
+        validate_tool_registration_for_test({"w"}, {{"w", "Tag", "Write"}}, {}, {}),
         ContainsSubstring("non-Read tool 'w' is missing from kWriteTools"));
     CHECK_THROWS_WITH(
-        validate_tool_registration_for_test({"r"}, {{"r", "Tag", "Read"}}, {"r"}),
+        validate_tool_registration_for_test({"r"}, {{"r", "Tag", "Read"}}, {"r"}, {}),
         ContainsSubstring("Read tool 'r' must not be in kWriteTools"));
     CHECK_THROWS_WITH(
-        validate_tool_registration_for_test({"a"}, {{"a", "Tag", "Read"}}, {"phantom"}),
+        validate_tool_registration_for_test({"a"}, {{"a", "Tag", "Read"}}, {"phantom"}, {}),
         ContainsSubstring("kWriteTools entry 'phantom' has no kToolSecurity row"));
 
     // (d) operation outside the closed RBAC catalogue. NOT harmlessly
@@ -1294,38 +1296,38 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
     // every op) yet misses every exact-string requires_approval() rule — the
     // tool would skip its intended approval, failing OPEN.
     CHECK_THROWS_WITH(
-        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "read"}}, {"t"}),
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "read"}}, {"t"}, {}),
         ContainsSubstring("operation 'read' outside the RBAC operation catalogue"));
     // Attest is a first-class catalogue member (AccessReview) — valid non-Read.
     CHECK_NOTHROW(
-        validate_tool_registration_for_test({"t"}, {{"t", "AccessReview", "Attest"}}, {"t"}));
+        validate_tool_registration_for_test({"t"}, {{"t", "AccessReview", "Attest"}}, {"t"}, {}));
 
     // (e) securable TYPE outside the catalogue — same fail-open class as (d):
     // supervised tier_allows() permits every type and requires_approval()
     // exact-matches type strings, so {"Securty","Execute"} would silently skip
     // the quarantine-class approval rule (governance UP-6).
     CHECK_THROWS_WITH(
-        validate_tool_registration_for_test({"q"}, {{"q", "Securty", "Execute"}}, {"q"}),
+        validate_tool_registration_for_test({"q"}, {{"q", "Securty", "Execute"}}, {"q"}, {}),
         ContainsSubstring("securable type 'Securty' outside the RBAC securable catalogue"));
 
     // (f) duplicates are offences, not silent collapses: a dropped duplicate
     // could discard the stricter of two conflicting registrations.
     CHECK_THROWS_WITH(validate_tool_registration_for_test(
-                          {"d", "d"}, {{"d", "Infrastructure", "Read"}}, {}),
+                          {"d", "d"}, {{"d", "Infrastructure", "Read"}}, {}, {}),
                       ContainsSubstring("duplicate served tool name 'd'"));
     CHECK_THROWS_WITH(
         validate_tool_registration_for_test(
-            {"d"}, {{"d", "Infrastructure", "Read"}, {"d", "Security", "Execute"}}, {}),
+            {"d"}, {{"d", "Infrastructure", "Read"}, {"d", "Security", "Execute"}}, {}, {}),
         ContainsSubstring("duplicate kToolSecurity row for 'd'"));
     CHECK_THROWS_WITH(validate_tool_registration_for_test(
-                          {"d"}, {{"d", "Tag", "Write"}}, {"d", "d"}),
+                          {"d"}, {{"d", "Tag", "Write"}}, {"d", "d"}, {}),
                       ContainsSubstring("duplicate kWriteTools entry 'd'"));
 
     // (g) multiple simultaneous offences: ALL are named, in sorted order (the
     // std::sort is what makes the thrown message deterministic across
     // hash-map iteration order — this is the regression net for it).
     try {
-        validate_tool_registration_for_test({"alpha", "beta"}, {}, {"gamma"});
+        validate_tool_registration_for_test({"alpha", "beta"}, {}, {"gamma"}, {});
         FAIL("expected validator throw");
     } catch (const std::runtime_error& e) {
         const std::string msg = e.what();
@@ -5615,6 +5617,603 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
     CHECK(capped["error"]["code"] == yuzu::server::mcp::kTierDenied);
     CHECK(appr.pending_count() == 25); // not 26
     sqlite3_close(raw);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2405 — C8 pre-approval input-schema validation.
+//
+// A schema-invalid tools/call must neither MINT an approval ticket (an
+// admin's approval wasted on args the handler will reject) nor CONSUME one
+// on recall (a one-time capability burned for nothing). The gate validates
+// the ORIGINAL args against the tool's compiled input schema above the
+// mint/recall fork; boot compiles every served schema via the same subset
+// compiler (validate_tool_security_registration's 4th sequence).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+// Shared fixture bits for the gated-tool schema tests: a TagStore with one
+// tag plus a real sqlite-backed ApprovalManager (the mint/consume evidence).
+struct SchemaGateHarness {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags{tagdb.path};
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    std::optional<yuzu::server::ApprovalManager> appr;
+    McpTestServer ts;
+
+    explicit SchemaGateHarness(const std::string& tier) {
+        tags.set_tag("agent-1", "role", "web", "server");
+        REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+        appr.emplace(raw);
+        appr->create_tables();
+        ts.tag_store_for_test = &tags;
+        ts.approval_manager_for_test = &*appr;
+        ts.start(tier);
+    }
+    ~SchemaGateHarness() { sqlite3_close(raw); }
+
+    nlohmann::json call(const std::string& body) {
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    }
+};
+} // namespace
+
+TEST_CASE("MCP 2405: schema-invalid args cannot mint an approval ticket",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+
+    // delete_tag missing required `key` → -32602 with A4 data, and crucially
+    // NO pending ticket (pre-#2405 this minted, an admin approved, and only
+    // the post-consume handler said kInvalidParams).
+    auto body = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("missing required property 'key'") != std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find(
+              "no approval ticket was created or consumed") != std::string::npos);
+    CHECK(h.appr->pending_count() == 0);
+    REQUIRE(!h.ts.audit_log.empty());
+    CHECK(h.ts.audit_log.back() == "mcp.delete_tag|denied");
+}
+
+TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected and NOT consumed",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+
+    // Seed the pre-#2405 state directly: a ticket already minted for
+    // schema-invalid args (missing `key`) and approved by an admin.
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})");
+    REQUIRE(seeded);
+    REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
+
+    // The recall matches the ticket exactly (definition_id + canon), but the
+    // args are schema-invalid → -32602 BEFORE consume_ticket: the one-time
+    // capability survives. Pre-#2405 this was the exact burn scenario.
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":")" +
+        *seeded + R"("}}})";
+    auto body = h.call(recall);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    auto after = h.appr->get(*seeded);
+    REQUIRE(after);
+    CHECK(after->status == "approved"); // not consumed, not rejected
+    CHECK(after->consumed_at == 0);     // the CAS never ran
+}
+
+TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("supervised");
+
+    auto body = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"quarantine_device","arguments":{"agent_id":42}}})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("'/agent_id'") != std::string::npos);
+    CHECK(h.appr->pending_count() == 0);
+}
+
+TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-declaring tools",
+          "[mcp][integration][approval][schema]") {
+    // approval_id is control-plane: only delete_tag/quarantine_device declare
+    // it in their schemas; on every other gated tool it is injected
+    // undeclared. A non-string one must be rejected uniformly — stripping it
+    // before validation would drop it into param_str's "" and the fresh-MINT
+    // path (Sol review B1).
+    SchemaGateHarness h("operator");
+    auto declaring = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":42}}})");
+    REQUIRE(declaring.contains("error"));
+    CHECK(declaring["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(declaring["error"]["message"].get<std::string>().find("'/approval_id'") !=
+          std::string::npos);
+    CHECK(h.appr->pending_count() == 0);
+
+    yuzu::test::TempDbFile adb2{std::string_view{"mcp-appr-"}};
+    sqlite3* raw2 = nullptr;
+    REQUIRE(sqlite3_open(adb2.path.string().c_str(), &raw2) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr2(raw2);
+        appr2.create_tables();
+        McpTestServer ts2;
+        ts2.approval_manager_for_test = &appr2;
+        auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                           const std::string&,
+                           const std::unordered_map<std::string, std::string>&,
+                           const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-x", 1};
+        };
+        ts2.start_with_dispatch(dispatch, "supervised");
+        auto undeclared = nlohmann::json::parse(
+            ts2.call(
+                   R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","approval_id":42}}})")
+                ->body);
+        REQUIRE(undeclared.contains("error"));
+        CHECK(undeclared["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(undeclared["error"]["message"].get<std::string>().find("'/approval_id'") !=
+              std::string::npos);
+        CHECK(appr2.pending_count() == 0);
+    }
+    sqlite3_close(raw2);
+}
+
+TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declare it",
+          "[mcp][integration][approval][schema]") {
+    // execute_instruction's schema does NOT declare approval_id; the full
+    // mint → approve → recall flow must still execute (undeclared properties
+    // are tolerated — no additionalProperties in the served schemas).
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        bool dispatched = false;
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            dispatched = true;
+            return {"cmd-ok", 1};
+        };
+        ts.start_with_dispatch(dispatch, "supervised");
+
+        auto mint = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})")
+                ->body);
+        auto approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+        std::string recall =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","approval_id":")" +
+            approval_id + R"("}}})";
+        auto body = nlohmann::json::parse(ts.call(recall)->body);
+        REQUIRE(body.contains("result"));
+        CHECK(dispatched);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        // steps[1] missing required `action` → violation at /steps/1.
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":"a"},{"plugin":"p"}]}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("'/steps/1'") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 0);
+
+        // params is a value-schema map: a non-string value violates at the
+        // WILDCARDED path — the caller-derived key never appears.
+        auto body2 = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":308,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":"a","params":{"XKEYX":3}}]}}})")
+                ->body);
+        REQUIRE(body2.contains("error"));
+        CHECK(body2["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body2["error"]["message"].get<std::string>().find("'/steps/0/params/*'") !=
+              std::string::npos);
+        CHECK(body2.dump().find("XKEYX") == std::string::npos); // key not echoed
+        CHECK(appr.pending_count() == 0);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit detail",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        // A secret-looking, newline-carrying map key inside a value-schema
+        // map. The violation path must be the wildcard, and neither the
+        // response body nor any audit detail row may carry the key.
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":309,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":"a","params":{"SECRET\nTOKEN-XYZZY":7}}]}}})");
+        REQUIRE(res);
+        CHECK(res->body.find("XYZZY") == std::string::npos);
+        for (const auto& d : ts.audit_details)
+            CHECK(d.find("XYZZY") == std::string::npos);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: non-object arguments are rejected at the root",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+    for (const char* args : {"42", "[]", "null", R"("s")"}) {
+        auto body = h.call(
+            std::string(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":310,"params":{"name":"delete_tag","arguments":)") +
+            args + "}}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("expected an object") !=
+              std::string::npos);
+    }
+    CHECK(h.appr->pending_count() == 0);
+}
+
+TEST_CASE("MCP 2405: schema failure wins before ticket lookup and pending handback",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+
+    // Bogus approval_id + invalid args → -32602, NOT the ticket-mismatch
+    // kPermissionDenied (validation sits above the recall lookup).
+    auto bogus = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":311,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":"deadbeefdeadbeefdeadbeefdeadbeef"}}})");
+    REQUIRE(bogus.contains("error"));
+    CHECK(bogus["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // Mint a VALID pending ticket, then recall with schema-invalid args and
+    // that id → -32602, not the pending handback; the ticket stays pending.
+    auto mint = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":312,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    auto approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":313,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":")" +
+        approval_id + R"("}}})";
+    auto body = h.call(recall);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(h.appr->pending_count() == 1); // still pending, untouched
+}
+
+TEST_CASE("MCP 2405: C7 read-only and tier denials still precede schema validation",
+          "[mcp][integration][approval][schema]") {
+    // Authz ordering is unchanged: an unauthorized caller learns nothing
+    // about argument validity.
+    SECTION("C7 read-only wins") {
+        SchemaGateHarness h("supervised");
+        h.ts.read_only_mode_ = true;
+        auto body = h.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":314,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        CHECK(body["error"]["message"].get<std::string>().find("read-only") !=
+              std::string::npos);
+    }
+    SECTION("tier denial wins") {
+        SchemaGateHarness h("readonly");
+        auto body = h.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":315,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    }
+}
+
+TEST_CASE("MCP 2405: degraded no-approval-manager deny still precedes schema validation",
+          "[mcp][integration][approval][schema]") {
+    // Placement A sits INSIDE the approval block, after the degraded
+    // no-manager deny — a degraded deployment answers exactly as before
+    // (companion to "no approval manager, degraded deny" above).
+    McpTestServer ts;
+    ts.start("supervised"); // approval_manager_for_test == nullptr
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":316,"params":{"name":"quarantine_device","arguments":{"agent_id":42}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("approval manager") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP 2405: schema denial carries one correlation id and a bounded counter",
+          "[mcp][integration][approval][schema]") {
+    yuzu::MetricsRegistry reg;
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.tag_store_for_test = &tags;
+        ts.approval_manager_for_test = &appr;
+        ts.metrics_for_test = &reg;
+        ts.start("operator");
+
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":317,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})")
+                ->body);
+        const auto cid = body["error"]["data"]["correlation_id"].get<std::string>();
+        REQUIRE(!cid.empty());
+        // The SAME cid is stamped into the audit detail (#2423 one-cid pattern).
+        REQUIRE(!ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("correlation_id=" + cid) != std::string::npos);
+        // Bounded per-tool counter incremented exactly once.
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", "delete_tag"}})
+                  .value() == 1.0);
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", "quarantine_device"}})
+                  .value() == 0.0);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: registration validator rejects malformed and unsupported input schemas",
+          "[mcp][2g][schema]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    // Baseline: a well-formed schema row passes.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"t"}, {{"t", "Tag", "Read"}}, {},
+        {{"t", R"({"type":"object","properties":{"x":{"type":"string"}}})"}}));
+
+    // Not JSON at all.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "Read"}}, {},
+                                            {{"t", "not json"}}),
+        ContainsSubstring("tool 't' input schema: input schema is not valid JSON"));
+
+    // Root not an object schema.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "Read"}}, {},
+                                            {{"t", R"({"type":"string"})"}}),
+        ContainsSubstring("input schema root is not an object schema"));
+
+    // Closed keyword catalogue: oneOf is a boot offence, not a silent skip.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"oneOf":[]})"}}),
+        ContainsSubstring("unsupported keyword 'oneOf'"));
+
+    // Uncompilable RE2 pattern.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","pattern":"("}}})"}}),
+        ContainsSubstring("'pattern' at '/properties/x' does not compile as RE2"));
+
+    // required naming an undeclared property (the Yuzu authoring lint).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"required":["ghost"]})"}}),
+        ContainsSubstring("requires 'ghost' which is not declared in 'properties'"));
+
+    // Malformed operands: each rejected deterministically, never an nlohmann
+    // throw-first.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"integer","minimum":5,"maximum":1}}})"}}),
+        ContainsSubstring("'minimum' exceeds 'maximum'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","maxLength":-1}}})"}}),
+        ContainsSubstring("'maxLength' at '/properties/x' must be a non-negative integer"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","items":{"type":"string"}}}})"}}),
+        ContainsSubstring("keyword 'items' at '/properties/x' requires type 'array'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"additionalProperties":true})"}}),
+        ContainsSubstring("'true' is unsupported"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"a":{"type":"string"}},"anyOf":[{"required":["a"],"extra":1}]})"}}),
+        ContainsSubstring("must be an object containing only a non-empty 'required' array"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":["object","string"],"properties":{}})"}}),
+        ContainsSubstring("must be a single string (unions are unsupported)"));
+
+    // Multiple simultaneous schema offences: ALL named, sorted alongside the
+    // table offences (the same accumulate-all + sort determinism as #2383).
+    try {
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"oneOf":[],"allOf":[]})"}});
+        FAIL("expected validator throw");
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        const auto p_all = msg.find("unsupported keyword 'allOf'");
+        const auto p_one = msg.find("unsupported keyword 'oneOf'");
+        REQUIRE(p_all != std::string::npos);
+        REQUIRE(p_one != std::string::npos);
+        CHECK(p_all < p_one); // sorted
+    }
+}
+
+TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
+          "[mcp][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+
+    // Strict integer: 1 accepted, 1.0 rejected, out-of-int64 rejected.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":100}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"n":1})")));
+        auto strict = s->validate(nlohmann::json::parse(R"({"n":1.0})"));
+        REQUIRE(strict);
+        CHECK(strict->reason.find("integral floats") != std::string::npos);
+        auto range = s->validate(nlohmann::json::parse(R"({"n":18446744073709551615})"));
+        REQUIRE(range);
+        CHECK(range->reason.find("signed 64-bit") != std::string::npos);
+        // Boundaries: min/max inclusive, one past each rejected.
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"n":100})")));
+        auto over = s->validate(nlohmann::json::parse(R"({"n":101})"));
+        REQUIRE(over);
+        CHECK(over->reason.find("above the maximum 100") != std::string::npos);
+        auto under = s->validate(nlohmann::json::parse(R"({"n":0})"));
+        REQUIRE(under);
+        CHECK(under->reason.find("below the minimum 1") != std::string::npos);
+    }
+    // enum, maxLength (bytes), pattern (unanchored SEARCH semantics).
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"w":{"type":"string","enum":["24h","7d"]},"t":{"type":"string","maxLength":4},"p":{"type":"string","pattern":"b+"},"anch":{"type":"string","pattern":"^b+$"}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"w":"24h"})")));
+        auto bad_enum = s->validate(nlohmann::json::parse(R"({"w":"48h"})"));
+        REQUIRE(bad_enum);
+        CHECK(bad_enum->reason.find("must be one of") != std::string::npos);
+        // maxLength counts BYTES: "éé" is 2 codepoints / 4 bytes → at cap;
+        // "ééa" (5 bytes) is over.
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"t":"éé"})")));
+        CHECK(s->validate(nlohmann::json::parse(R"({"t":"ééa"})")));
+        // JSON Schema pattern is a SEARCH: "b+" matches inside "abc".
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"p":"abc"})")));
+        // A self-anchored pattern still means what it says.
+        CHECK(s->validate(nlohmann::json::parse(R"({"anch":"abc"})")));
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"anch":"bbb"})")));
+    }
+    // anyOf (at-least-one-of) + alternatives named in the failure reason.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"execution_id":{"type":"string"},"instruction_id":{"type":"string"}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"execution_id":"e"})")));
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"instruction_id":"i"})")));
+        auto neither = s->validate(nlohmann::json::parse(R"({})"));
+        REQUIRE(neither);
+        CHECK(neither->reason.find("execution_id") != std::string::npos);
+        CHECK(neither->reason.find("instruction_id") != std::string::npos);
+    }
+    // additionalProperties:false rejects undeclared keys at the WILDCARD path.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":false})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"a":"x"})")));
+        auto extra = s->validate(nlohmann::json::parse(R"({"a":"x","EVIL":1})"));
+        REQUIRE(extra);
+        CHECK(extra->path == "/*");
+        CHECK(extra->reason.find("EVIL") == std::string::npos);
+    }
+    // boolean + number types; empty schema accepts arbitrary objects.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"b":{"type":"boolean"},"f":{"type":"number"}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"b":true,"f":1.5})")));
+        CHECK(s->validate(nlohmann::json::parse(R"({"b":"yes"})")));
+        auto e = compile_input_schema(R"({"type":"object","properties":{}})");
+        REQUIRE(e);
+        CHECK_FALSE(e->validate(nlohmann::json::parse(R"({"anything":{"nested":[1]}})")));
+    }
+}
+
+TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully covered",
+          "[mcp][2g][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+    using yuzu::server::mcp::requires_approval;
+
+    // Hand-written minimal valid instance per approval-gated tool. The tether
+    // below derives the gated set from the REAL security rows +
+    // requires_approval(), so adding a gated tool without extending this map
+    // fails here rather than silently shipping unvalidated coverage.
+    const std::map<std::string, nlohmann::json> gated_instances = {
+        {"delete_tag", nlohmann::json::parse(R"({"agent_id":"a","key":"k"})")},
+        {"execute_instruction", nlohmann::json::parse(R"({"plugin":"p","action":"a"})")},
+        {"execute_bundle",
+         nlohmann::json::parse(R"({"agent_id":"a","steps":[{"plugin":"p","action":"a"}]})")},
+        {"quarantine_device", nlohmann::json::parse(R"({"agent_id":"a"})")},
+        {"revoke_certificate", nlohmann::json::parse(R"({"serial_hex":"AB12"})")},
+        {"create_engine_principal",
+         nlohmann::json::parse(
+             R"({"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"internal"})")},
+        {"revoke_engine_principal", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        {"transfer_engine_principal_owner",
+         nlohmann::json::parse(R"({"principal_id":"engine:v","new_owner":"o2"})")},
+        {"mint_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        {"rotate_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        {"confirm_engine_rotation",
+         nlohmann::json::parse(R"({"principal_id":"engine:v","token_id":"t1"})")},
+        {"assign_engine_role",
+         nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
+        {"unassign_engine_role",
+         nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
+    };
+
+    // Tether: the gated set derived from security rows + requires_approval()
+    // must equal the hand-written instance keys (stale-coverage guard).
+    std::set<std::string> gated;
+    for (const auto& row : tool_security_rows_for_test())
+        for (const char* tier : {"operator", "supervised"})
+            if (requires_approval(tier, std::string(row.securable), std::string(row.operation)))
+                gated.insert(std::string(row.name));
+    std::set<std::string> covered;
+    for (const auto& [name, inst] : gated_instances)
+        covered.insert(name);
+    CHECK(gated == covered);
+
+    // Every served schema compiles; every gated tool's minimal instance is
+    // accepted, both bare and with the injected approval_id.
+    for (const auto& row : input_schemas_for_test()) {
+        auto compiled = compile_input_schema(row.schema_json);
+        REQUIRE(compiled);
+        if (auto it = gated_instances.find(row.name); it != gated_instances.end()) {
+            INFO("gated tool: " << row.name);
+            CHECK_FALSE(compiled->validate(it->second));
+            auto with_ticket = it->second;
+            with_ticket["approval_id"] = "deadbeefdeadbeefdeadbeefdeadbeef";
+            CHECK_FALSE(compiled->validate(with_ticket));
+        }
+    }
 }
 
 TEST_CASE("MCP approve_request approves a pending request as a second principal",
