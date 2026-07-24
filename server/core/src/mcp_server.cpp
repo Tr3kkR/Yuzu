@@ -2429,6 +2429,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // cid_override lets a caller mint the correlation id FIRST and
                 // stamp it into its log/audit records before building the
                 // envelope (#2423 review F4); default preserves mint-here.
+                // Raw-embedded into the JSON below (like the minted cid), so it
+                // MUST be a server-generated make_correlation_id() token —
+                // never caller-derived text.
                 const std::string cid = cid_override.empty()
                                             ? yuzu::server::detail::make_correlation_id()
                                             : std::string(cid_override);
