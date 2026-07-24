@@ -191,6 +191,54 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — MCP supervised-tier calls now enforce the published input schema pre-approval (#2405)
+
+Approval-gated MCP `tools/call` arguments are now validated against the tool's
+published `inputSchema` BEFORE an approval ticket is minted or consumed. Most
+callers only fail earlier (junk args that would have failed after admin
+approval now answer `-32602` immediately, with no ticket created or burned).
+
+**Previously-succeeding shapes that now break — supervised-tier
+`execute_instruction` / `execute_bundle`, plus any approval-gated tool taking
+an `integer` parameter:**
+
+- `execute_instruction` / `execute_bundle` with a `params` object containing a
+  non-string value (number/bool/array/object) — previously silently
+  stringified by the handler after approval. Stringify client-side.
+- `execute_bundle` with `steps: []` or more than 32 steps (the schema's
+  `minItems`/`maxItems`, matching the handler's own 1–32 bound).
+- `execute_instruction` with more than 10 000 `agent_ids`, or any single
+  `agent_ids` element longer than 128 bytes.
+- `execute_instruction` with `plugin`/`action` longer than 128 bytes, or
+  `scope` / a `params` value longer than 8192 bytes. (`execute_bundle`'s
+  per-step `plugin`/`action`/`params` carry no length bound and so are
+  unaffected by *these* bounds — the non-string rule above still applies to
+  them.)
+- Any approval-gated tool given an **integral float** where the schema declares
+  `integer` — e.g. `mint_engine_credential {"ttl_days": 90.0}` or
+  `rotate_engine_credential {"overlap_days": 7.0}`. These previously
+  "succeeded" in the worst way: the server ignored the value and silently
+  applied the parameter's default. Send a JSON integer (`90`, not `90.0`) —
+  note that Python's `json.dumps` emits `90.0` for a float-typed value.
+
+The bound-based rejections above were already the published schema contract
+(added in track 2f) but were client-advisory until this change; they are now
+enforced on the approval-gated path. **Operator and readonly callers of these
+two tools are unchanged** — schema validation runs where `requires_approval` is
+true, which for `Execution:Execute` is the supervised tier only, so those
+bounds stay advisory on the other tiers (full every-path enforcement is tracked
+in #2437). Note the gate keys on the *operation*, not the tier: `delete_tag` is
+approval-gated on **operator** as well, so its arguments are validated there
+too — it simply carries no length or count bound today, so nothing breaks. Any approval ticket already minted-and-approved for one of the shapes
+above becomes unrecallable fail-closed (it is never consumed) and expires on
+the normal 7-day approval TTL; re-submit the corrected call for a fresh ticket.
+
+Also note: a recall whose arguments fail schema validation now answers `-32602`
+before the ticket is even looked up — clients that pattern-matched `-32003` for
+every recall failure should treat `-32602` as "fix the arguments, ticket
+untouched". Full detail: `docs/mcp-server.md` "Pre-approval input-schema
+validation".
+
 ### vNEXT — MCP tool annotations are now truthful; write tools carry `destructiveHint:true` for the first time
 
 Track 2g PR 2. Every MCP tool now advertises the four standard annotation hints

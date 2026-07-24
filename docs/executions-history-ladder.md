@@ -240,14 +240,24 @@ agentic route wraps every event in
 subscribed to one channel can still discriminate events without out-of-
 band context.
 
-**Two consumers, one bus, one set of publisher invariants** — the
+**Three consumers, one bus, one set of publisher invariants** - the
 publisher list above (`update_agent_status` / `refresh_counts` /
 `mark_cancelled` → `agent-transition` / `execution-progress` /
-`execution-completed`) is the single taxonomy both routes emit. A new
-event type must be added on the bus side first; both routes pick it up
-transparently. **Do not add a route-specific event type to either
-sibling** — that would split the taxonomy and break the A3 invariant
-that a single deterministic step name appears on every channel.
+`execution-completed`) is the single taxonomy every consumer reads. The
+three live consumers are (1) the dashboard SSE route
+(`execution.live_subscribe`), (2) the agentic route
+(`api.v1.events.subscribe`, `GET /api/v1/events`), and (3) the **MCP
+progress bridge** (track 2f PR 3a, `McpStreamBridge`), a *consumer-side
+projection only*: it maps the same bus events onto an MCP session's `GET`
+stream as `notifications/progress` + a final JSON-RPC response, adds **no
+bus event type** and renames no step. The bridge subscribes via
+`ExecutionEventBus::subscribe_and_replay` (atomic install-then-replay,
+closing the `replay_since`+`subscribe` race the two older siblings still
+carry - tracked for migration in #2410). A new event type must be added
+on the bus side first; every consumer picks it up transparently. **Do not
+add a consumer-specific event type** - that would split the taxonomy and
+break the A3 invariant that a single deterministic step name appears on
+every channel.
 
 The agentic route's audit verb is `api.v1.events.subscribe` (separate
 from `execution.live_subscribe` so SIEM filters can distinguish browser

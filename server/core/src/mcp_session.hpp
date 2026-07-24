@@ -98,6 +98,16 @@ public:
 
     std::size_t active_count() const;
 
+    // True iff `id` is present, bound to `principal`, AND not idle-expired at the
+    // time of the call. PURE READ - track 2f bridge-sweep support: it does NOT
+    // slide last_seen (a parked bridge record must never extend session life),
+    // runs no gc, and erases nothing (an expired entry is left for the next
+    // touching call to reap). The liveness predicate is the exact negation of
+    // gc_locked's expiry test (`now() - last_seen > idle_ttl`) so the two can
+    // never disagree. Same no-oracle posture as validate_and_touch: a foreign
+    // principal reads as absent.
+    bool exists(const std::string& id, const std::string& principal) const;
+
 private:
     struct Entry {
         std::string principal;
