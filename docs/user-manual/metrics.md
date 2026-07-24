@@ -717,7 +717,7 @@ window later that is population churn, not a new incident.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed under sustained write failure. A **loss** channel - these records never reached the journal. Monitor-only |
+| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed. A **loss** channel - these records never reached the journal. THREE causes, and they need different responses: sustained write failure (see `_write_failures`); capacity refusal (see `_write_capacity_rejected`); and, since #2299, simply out-running the heartbeat's per-tick persist bounds - up to 4 batches / 1024 records per tick, which in the byte-split regime is the lower figure by far. On that third path `_write_failures` and `_write_capacity_rejected` are both **zero** and nothing is broken; compare `_batches_written`'s rate against the per-tick ceiling before concluding the alert is faulty. Monitor-only |
 | `yuzu_fleet_guardian_journal_stage_failures` | gauge | Fleet sum of disarm records that could not be built post-teardown. A **loss** channel: the lifecycle end of a rule is unrecorded |
 | `yuzu_fleet_guardian_journal_field_rejected` | gauge | Fleet sum of records kept out by a field failing validation (embedded NUL, oversized, non-UTF-8). A **loss** channel and a malformed-input signal |
 | `yuzu_fleet_guardian_journal_clock_rejected` | gauge | Fleet sum of records kept out by a skewed clock (timestamp ≤ 0). A **loss** channel, and the fleet's clock-health canary - a journal timestamp that cannot be trusted is not admissible evidence |

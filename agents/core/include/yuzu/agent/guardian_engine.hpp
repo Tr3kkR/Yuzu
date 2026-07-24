@@ -372,7 +372,16 @@ private:
     /// on the first write failure. prefer_spark_-gated (inert when spark is not the
     /// active backend). Fired via a terminate-safe guard on every apply_rules /
     /// start_local exit.
-    void persist_lifecycle_journal_locked();
+    ///
+    /// `max_batches` / `max_records` bound ONE call; pass `kJournalPersistUnbounded`
+    /// for either to disable it. NEITHER is defaulted, so every caller states its
+    /// intent and a future cadence caller cannot silently inherit unbounded behaviour.
+    /// Only the heartbeat's retry-persist passes real bounds - it is the sole cadence
+    /// caller, and the one that must not sit under mtx_ for an unbounded number of
+    /// slow-but-successful KvStore writes. Every one-shot caller (boot re-arm,
+    /// apply_rules, and both shutdown flushes) passes unbounded because each has to
+    /// drain what it was given.
+    void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,

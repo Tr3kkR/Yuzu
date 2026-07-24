@@ -46,6 +46,15 @@ std::vector<std::shared_ptr<const JournalRecord>> one(const std::string& rid,
     return {ptr(rid, kind)};
 }
 
+// Unbounded persist, spelled once. persist() deliberately has NO defaulted bounds - every
+// production caller must state its intent, so that a future cadence caller cannot silently
+// inherit unbounded behaviour - and this is the shape the one-shot callers use. Tests that
+// are ABOUT the bounds call persist() directly with explicit values.
+std::size_t persist_all(GuardianLifecycleJournal& j,
+                        std::span<const std::shared_ptr<const JournalRecord>> pending) {
+    return j.persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded);
+}
+
 // Read every batch back and flatten. Batch keys are lc:<nonce>:<seq12> with a fixed
 // per-process nonce + zero-padded seq, so list_entries' key order == persist order.
 std::vector<JournalRecord> read_all(KvStore& kv) {
@@ -78,7 +87,7 @@ TEST_CASE("journal persist: round-trips records durably", "[guardian][journal][p
     GuardianLifecycleJournal j(t.kv.get());
     std::vector<std::shared_ptr<const JournalRecord>> pending{ptr("r1", "armed"),
                                                               ptr("r2", "disarmed")};
-    CHECK(j.persist(pending) == 2);
+    CHECK(persist_all(j, pending) == 2);
     CHECK(j.batches_written() == 1);
     CHECK(j.write_failures() == 0);
 
@@ -98,7 +107,7 @@ TEST_CASE("journal persist: chunks a large push into multiple batches", "[guardi
     for (int i = 0; i < 300; ++i)
         pending.push_back(ptr("r" + std::to_string(i), "armed"));
 
-    CHECK(j.persist(pending) == 300);
+    CHECK(persist_all(j, pending) == 300);
     CHECK(j.batches_written() >= 2); // 300 > kMaxJournalEntriesPerBatch (256)
 
     auto got = read_all(*t.kv);
@@ -107,11 +116,113 @@ TEST_CASE("journal persist: chunks a large push into multiple batches", "[guardi
     CHECK(got.back().rule_id == "r299");
 }
 
+TEST_CASE("journal persist: a per-call batch cap defers the remainder to the next call",
+          "[guardian][journal][persist]") {
+    // C0 flip-checklist item 11. The circuit breaker bounds write FAILURE; nothing bounded
+    // slow SUCCESS, so one heartbeat tick could sit under mtx_ for as many autocommit inserts
+    // as the staging buffer held, each able to approach the 5 s busy timeout.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    std::vector<std::shared_ptr<const JournalRecord>> pending;
+    for (int i = 0; i < 600; ++i) // 3 batches' worth at 256 entries per batch
+        pending.push_back(ptr("r" + std::to_string(i), "armed"));
+
+    std::vector<PersistedBatch> first_batches;
+    const std::size_t first = j.persist(pending, &first_batches, /*max_batches=*/1, kJournalPersistUnbounded);
+    CHECK(first == kMaxJournalEntriesPerBatch); // exactly one batch, then stop
+    CHECK(j.batches_written() == 1);
+    // The provenance record for the batch it DID write must survive the cap - returning
+    // before it would keep durability but silently drop the sent-label evidence.
+    REQUIRE(first_batches.size() == 1);
+    CHECK(first_batches[0].event_ids.size() == kMaxJournalEntriesPerBatch);
+
+    // The caller erases exactly the returned prefix; the rest is simply still staged.
+    std::vector<std::shared_ptr<const JournalRecord>> rest(pending.begin() +
+                                                               static_cast<std::ptrdiff_t>(first),
+                                                           pending.end());
+    const std::size_t second = j.persist(rest, nullptr, /*max_batches=*/1, kJournalPersistUnbounded);
+    CHECK(second == kMaxJournalEntriesPerBatch);
+
+    std::vector<std::shared_ptr<const JournalRecord>> last(rest.begin() +
+                                                               static_cast<std::ptrdiff_t>(second),
+                                                           rest.end());
+    CHECK(j.persist(last, nullptr, /*max_batches=*/1, kJournalPersistUnbounded) == last.size()); // 88 < one batch
+
+    // Every record landed exactly once, in order: a capped return must never re-persist a
+    // committed batch under a fresh key.
+    auto got = read_all(*t.kv);
+    REQUIRE(got.size() == 600);
+    CHECK(got.front().rule_id == "r0");
+    CHECK(got.back().rule_id == "r599");
+    CHECK(j.batches_written() == 3);
+    CHECK(j.key_collisions() == 0);
+}
+
+TEST_CASE("journal persist: a RECORD cap floors the drain rate when batches are byte-split",
+          "[guardian][journal][persist]") {
+    // The batch cap alone is a latency bound that becomes an accidental THROUGHPUT bound.
+    // Four batches is ~1024 records when records are small, but as few as ~48 when large
+    // fields make the byte cap split them - a 21x swing (governance Gate 3 performance).
+    // Since the heartbeat tick is the only steady-state drain, the low end would shed
+    // records through journal_stage_dropped: a NEW loss channel created by a latency fix.
+    // The record cap floors the rate independently of record size.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    const std::string big(kMaxJournalFieldBytes - 1, 'x');
+    std::vector<std::shared_ptr<const JournalRecord>> pending;
+    for (int i = 0; i < 200; ++i) {
+        auto r = std::make_shared<JournalRecord>();
+        r->rule_id = "r" + std::to_string(i);
+        r->generation = 1;
+        r->event_id = "e" + std::to_string(i);
+        r->enqueued_ns = 1'700'000'000'000'000'000;
+        r->kind = "armed";
+        r->guard_type = "file";
+        r->rule_name = big;
+        pending.push_back(std::move(r));
+    }
+    // A generous batch cap with a TIGHT record cap: the record cap is what must bind, and it
+    // must bind even though no batch limit was reached.
+    const std::size_t written = j.persist(pending, nullptr, /*max_batches=*/100,
+                                          /*max_records=*/10);
+    CHECK(written >= 10);  // stops at the first batch boundary at or past the record cap...
+    CHECK(written < 100);  // ...rather than draining the whole push
+    CHECK(j.batches_written() < 100); // and it stopped for the RECORD reason, not the batch one
+}
+
+TEST_CASE("journal persist: the batch cap counts BATCHES, not records (byte-split push)",
+          "[guardian][journal][persist]") {
+    // Sizing the cap by record count alone would be wrong: a batch is bounded by
+    // kMaxJournalEntriesPerBatch AND kMaxJournalBatchBytes, so large records split into many
+    // more batches than the entry cap implies. The cap has to bound the number of KvStore
+    // round trips, which is the latency that matters, whichever limit did the splitting.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    const std::string big(kMaxJournalFieldBytes - 1, 'x'); // one record ~ a fifth of a batch
+    std::vector<std::shared_ptr<const JournalRecord>> pending;
+    for (int i = 0; i < 200; ++i) {
+        auto r = std::make_shared<JournalRecord>();
+        r->rule_id = "r" + std::to_string(i);
+        r->generation = 1;
+        r->event_id = "e" + std::to_string(i);
+        r->enqueued_ns = 1'700'000'000'000'000'000;
+        r->kind = "armed";
+        r->guard_type = "file";
+        r->rule_name = big;
+        pending.push_back(std::move(r));
+    }
+
+    const std::size_t written = j.persist(pending, nullptr, /*max_batches=*/2, kJournalPersistUnbounded);
+    CHECK(j.batches_written() == 2);          // the cap held...
+    CHECK(written < kMaxJournalEntriesPerBatch); // ...on the BYTE limit, well short of 256 entries
+    CHECK(written > 0);
+}
+
 TEST_CASE("journal persist: empty pending writes nothing", "[guardian][journal][persist]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     std::vector<std::shared_ptr<const JournalRecord>> empty;
-    CHECK(j.persist(empty) == 0);
+    CHECK(persist_all(j, empty) == 0);
     CHECK(j.batches_written() == 0);
     CHECK(read_all(*t.kv).empty());
 }
@@ -119,7 +230,7 @@ TEST_CASE("journal persist: empty pending writes nothing", "[guardian][journal][
 TEST_CASE("journal persist: null KvStore is a no-op", "[guardian][journal][persist]") {
     GuardianLifecycleJournal j(nullptr);
     std::vector<std::shared_ptr<const JournalRecord>> pending{ptr("r1", "armed")};
-    CHECK(j.persist(pending) == 0);
+    CHECK(persist_all(j, pending) == 0);
     CHECK(j.batches_written() == 0);
 }
 
@@ -130,12 +241,12 @@ TEST_CASE("journal persist: a write failure circuit-breaks; a retry of the same 
     std::vector<std::shared_ptr<const JournalRecord>> pending{ptr("r1", "armed"), ptr("r2", "armed")};
 
     j.inject_write_failures_for_test(1); // force the (single) batch write to fail
-    CHECK(j.persist(pending) == 0);      // circuit-broke - nothing durably written
+    CHECK(persist_all(j, pending) == 0);      // circuit-broke - nothing durably written
     CHECK(j.write_failures() == 1);
     CHECK(read_all(*t.kv).empty());
 
     // Retry the SAME pending (as the maintenance tick would) - no injected fault now.
-    CHECK(j.persist(pending) == 2);
+    CHECK(persist_all(j, pending) == 2);
     auto got = read_all(*t.kv);
     REQUIRE(got.size() == 2);
     CHECK(got[0].rule_id == "r1");
@@ -153,14 +264,14 @@ TEST_CASE("journal persist: a mid-persist failure returns the committed-prefix c
     // Batch 1 writes; batch 2's write fails. written must be batch 1's 256 records so the
     // caller erases exactly that prefix and the rest stay pending (review B4b).
     j.inject_write_failures_for_test(/*n=*/1, /*skip_first=*/1);
-    CHECK(j.persist(pending) == 256);
+    CHECK(persist_all(j, pending) == 256);
     auto after1 = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(after1.has_value());
     CHECK(after1->size() == 1); // only batch 1 durable
 
     // Retry the remaining records (as the engine does after erasing the 256 prefix).
     std::vector<std::shared_ptr<const JournalRecord>> rest(pending.begin() + 256, pending.end());
-    CHECK(j.persist(rest) == 44);
+    CHECK(persist_all(j, rest) == 44);
     CHECK(read_all(*t.kv).size() == 300); // every record durable exactly once
 }
 
@@ -178,8 +289,8 @@ std::size_t count_keys(KvStore& kv, std::string_view prefix) {
 TEST_CASE("journal prune: age cap evicts batches older than retention", "[guardian][journal][prune]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
     REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 2);
 
     // A now_ms far in the future makes every real-now batch older than 7 days. A pass that
@@ -202,7 +313,7 @@ TEST_CASE("journal prune: count cap evicts the oldest batches by (ts_ms,key)", "
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/2, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100);
     for (int i = 0; i < 4; ++i)
-        REQUIRE(j.persist(one("r" + std::to_string(i), "armed")) == 1);
+        REQUIRE(persist_all(j, one("r" + std::to_string(i), "armed")) == 1);
     REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 4);
 
     auto stats = j.prune(0); // now_ms=0 → nothing is "too old" under the 100000-day cap
@@ -218,7 +329,7 @@ TEST_CASE("journal prune: byte cap evicts to satisfy the budget", "[guardian][jo
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(100000, kNoCap, /*max_bytes=*/1, 100); // 1 byte < any batch
     for (int i = 0; i < 3; ++i)
-        REQUIRE(j.persist(one("r" + std::to_string(i), "armed")) == 1);
+        REQUIRE(persist_all(j, one("r" + std::to_string(i), "armed")) == 1);
     REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 3);
 
     auto stats = j.prune(0);
@@ -235,7 +346,7 @@ TEST_CASE("journal prune: a MALFORMED-KEY batch is quarantined; good batches sur
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     REQUIRE(t.kv->set(kJournalNamespace, "lc:corrupt:000000000000", "not valid json"));
-    REQUIRE(j.persist(one("good", "armed")) == 1);
+    REQUIRE(persist_all(j, one("good", "armed")) == 1);
 
     auto stats = j.prune(0);
     CHECK(stats.quarantined == 1);
@@ -261,7 +372,7 @@ TEST_CASE("journal prune: a corrupt VALUE under a good key survives prune (lazy-
     GuardianLifecycleJournal j(t.kv.get());
     const std::int64_t now = 1'700'000'000'000;
     REQUIRE(t.kv->set(kJournalNamespace, journal_batch_key(now, "wellkeyed", 0), "not valid json"));
-    REQUIRE(j.persist(one("good", "armed")) == 1);
+    REQUIRE(persist_all(j, one("good", "armed")) == 1);
 
     auto stats = j.prune(now);
     CHECK(stats.quarantined == 0); // prune did not read the value, so it saw nothing wrong
@@ -280,7 +391,7 @@ TEST_CASE("journal prune: a corrupt VALUE under a good key survives prune (lazy-
 TEST_CASE("journal prune: an orphan sent-label is GC'd", "[guardian][journal][prune]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1); // a surviving batch (its label, if any, is kept)
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1); // a surviving batch (its label, if any, is kept)
     REQUIRE(t.kv->set(kJournalNamespace, "sent:ghost:000000000000", "")); // orphan: no such batch
 
     auto stats = j.prune(0);
@@ -325,14 +436,14 @@ TEST_CASE("mark_batch_sent writes a sent-label; eviction classifies by its prese
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100); // count cap 0 → prune evicts all
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
     auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     j.mark_batch_sent((*rows)[0].key);
     CHECK(j.sent_labels_written() == 1);
 
-    REQUIRE(j.persist(one("r2", "armed")) == 1); // a second, UNMARKED batch
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1); // a second, UNMARKED batch
 
     j.prune(0); // both evicted
     CHECK(j.evicted_sent_unacked() == 1);          // r1 had a sent-label
@@ -348,12 +459,12 @@ TEST_CASE("eviction classification falls back to a per-key read when the label s
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100); // count cap 0 -> evict everything
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
     auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
     j.mark_batch_sent((*rows)[0].key);          // this batch WAS delivered
-    REQUIRE(j.persist(one("r2", "armed")) == 1); // this one was not
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1); // this one was not
 
     j.inject_prune_sent_scan_failures_for_test(1);
     j.prune(0);
@@ -372,7 +483,7 @@ TEST_CASE("eviction classification: an UNREADABLE sent-label counts NEITHER outc
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100);
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
     auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
@@ -395,7 +506,7 @@ TEST_CASE("journal prune: an injected read failure is fail-safe (counted, read_o
           "[guardian][journal][prune]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
 
     j.inject_read_failures_for_test(1); // the next scan reports a read error
     auto s = j.prune(0);
@@ -415,8 +526,8 @@ TEST_CASE("journal prune: an injected delete failure leaves batches intact and i
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100); // count cap 0 → prune evicts all
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
 
     j.inject_delete_failures_for_test(1);
     auto s = j.prune(0);
@@ -434,12 +545,12 @@ TEST_CASE("journal persist: a hard write ceiling refuses runaway growth, resumes
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     j.set_write_ceiling_for_test(/*max_batches=*/2, /*max_bytes=*/kNoCap);
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1); // journal now at the hard ceiling of 2
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1); // journal now at the hard ceiling of 2
     CHECK(j.journal_batch_count() == 2);
 
     // A third batch is REFUSED (never written past the ceiling) + counted; the shared DB is bounded.
-    CHECK(j.persist(one("r3", "armed")) == 0);
+    CHECK(persist_all(j, one("r3", "armed")) == 0);
     CHECK(j.write_capacity_rejected() == 1);
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2); // r3 never written
 
@@ -448,7 +559,7 @@ TEST_CASE("journal persist: a hard write ceiling refuses runaway growth, resumes
     j.prune(32503680000000LL); // ~year 3000: all batches older than retention
     j.prune(32503680001000LL);
     CHECK(j.journal_batch_count() == 0);
-    CHECK(j.persist(one("r3", "armed")) == 1);
+    CHECK(persist_all(j, one("r3", "armed")) == 1);
     CHECK(j.write_capacity_rejected() == 1); // no new rejection
 }
 
@@ -478,8 +589,8 @@ TEST_CASE("journal size gauges track live batches + bytes across persist and pru
     CHECK(j.journal_batch_count() == 0);
     CHECK(j.journal_bytes() == 0);
 
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
     CHECK(j.journal_batch_count() == 2);
     CHECK(j.journal_bytes() > 0);
     const auto bytes2 = j.journal_bytes();
@@ -500,8 +611,8 @@ TEST_CASE("journal reopen: a fresh instance seeds its size gauges from the on-di
     std::uint64_t bytes_before = 0;
     {
         GuardianLifecycleJournal a(t.kv.get());
-        REQUIRE(a.persist(one("r1", "armed")) == 1);
-        REQUIRE(a.persist(one("r2", "armed")) == 1);
+        REQUIRE(persist_all(a, one("r1", "armed")) == 1);
+        REQUIRE(persist_all(a, one("r2", "armed")) == 1);
         REQUIRE(a.journal_batch_count() == 2);
         bytes_before = a.journal_bytes();
     }
@@ -521,15 +632,15 @@ TEST_CASE("journal reopen: the write ceiling is enforced against pre-existing ba
     TestKv t;
     {
         GuardianLifecycleJournal a(t.kv.get());
-        REQUIRE(a.persist(one("r1", "armed")) == 1);
-        REQUIRE(a.persist(one("r2", "armed")) == 1);
+        REQUIRE(persist_all(a, one("r1", "armed")) == 1);
+        REQUIRE(persist_all(a, one("r2", "armed")) == 1);
     }
 
     // The reopened instance is at its ceiling from its FIRST write - no free window in which a
     // crash-loop could grow the SHARED kv_store.db past the hard cap.
     GuardianLifecycleJournal b(t.kv.get());
     b.set_write_ceiling_for_test(/*max_batches=*/2, /*max_bytes=*/kNoCap);
-    CHECK(b.persist(one("r3", "armed")) == 0);
+    CHECK(persist_all(b, one("r3", "armed")) == 0);
     CHECK(b.write_capacity_rejected() == 1);
     CHECK(b.write_failures() == 0);                 // refused by the ceiling, not a failed write
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2); // r3 never reached the shared DB
@@ -548,7 +659,7 @@ TEST_CASE("journal reopen: multibyte values are sized in BYTES, not characters",
         r.rule_name = "café-日本語-Ünïcödé"; // multibyte
         std::vector<std::shared_ptr<const JournalRecord>> pending{
             std::make_shared<const JournalRecord>(r)};
-        REQUIRE(a.persist(pending) == 1);
+        REQUIRE(persist_all(a, pending) == 1);
         bytes_before = a.journal_bytes();
     }
 
@@ -570,7 +681,7 @@ TEST_CASE("journal reopen: an un-sizable journal fails CLOSED (assume at ceiling
     CHECK(j.journal_batch_count() == kMaxJournalBatches * 2); // the default hard ceiling
     CHECK(j.journal_bytes() == kMaxJournalBytes * 2);
 
-    CHECK(j.persist(one("r1", "armed")) == 0);
+    CHECK(persist_all(j, one("r1", "armed")) == 0);
     CHECK(j.write_capacity_rejected() == 1);
     CHECK(j.write_failures() == 0); // refused BEFORE the write, not attempted and failed
 }
@@ -581,8 +692,8 @@ TEST_CASE("journal prune: rebase-as-delta preserves a concurrent persist's incre
           "[guardian][journal][prune]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
     REQUIRE(j.journal_batch_count() == 2);
 
     // Fire a simulated concurrent persist() in the exact window between prune's scan and its
@@ -594,7 +705,7 @@ TEST_CASE("journal prune: rebase-as-delta preserves a concurrent persist's incre
         if (fired)
             return;
         fired = true;
-        REQUIRE(j.persist(one("r3", "armed")) == 1); // lands on disk + fetch_adds the gauge
+        REQUIRE(persist_all(j, one("r3", "armed")) == 1); // lands on disk + fetch_adds the gauge
     });
 
     auto s = j.prune(0); // retention wide open: nothing evicted, so gauge == true on-disk size
@@ -614,15 +725,15 @@ TEST_CASE("journal prune: rebases a fail-closed boot seed back to on-disk realit
           "[guardian][journal][prune][reopen]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
     j.set_write_ceiling_for_test(/*max_batches=*/1000, /*max_bytes=*/kNoCap);
 
     // Stage the fail-closed boot seed: the ctor size-probe failed once, pinning the gauge at
     // the hard ceiling. A pure fetch_sub scheme (no rebase) could never walk this back down -
     // one unlucky boot would brick journal writes forever. Rebase-as-delta must recover it.
     j.set_size_gauges_for_test(/*count=*/1000, /*bytes=*/1000);
-    CHECK(j.persist(one("bricked", "armed")) == 0); // ceiling reads full -> rejected
+    CHECK(persist_all(j, one("bricked", "armed")) == 0); // ceiling reads full -> rejected
     CHECK(j.write_capacity_rejected() == 1);
 
     auto s = j.prune(0); // a successful scan rebases the gauge to the true 2 on disk
@@ -634,7 +745,7 @@ TEST_CASE("journal prune: rebases a fail-closed boot seed back to on-disk realit
     REQUIRE(sz.has_value());
     CHECK(j.journal_bytes() == sz->bytes);
 
-    CHECK(j.persist(one("r3", "armed")) == 1); // writes work again - no longer bricked
+    CHECK(persist_all(j, one("r3", "armed")) == 1); // writes work again - no longer bricked
     CHECK(j.journal_batch_count() == 3);
 }
 
@@ -643,8 +754,8 @@ TEST_CASE("journal prune: a persist in the PRE-scan window over-counts safely, h
           "[guardian][journal][prune]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
 
     // Fire a concurrent persist in the window AFTER pre_count is snapshotted but BEFORE
     // list_entries - so the new row is BOTH seen by the scan (in rows->size()) AND carries its
@@ -655,7 +766,7 @@ TEST_CASE("journal prune: a persist in the PRE-scan window over-counts safely, h
         if (fired)
             return;
         fired = true;
-        REQUIRE(j.persist(one("r3", "armed")) == 1);
+        REQUIRE(persist_all(j, one("r3", "armed")) == 1);
     });
 
     auto s1 = j.prune(0);
@@ -678,7 +789,7 @@ TEST_CASE("journal persist: a negative gauge fails CLOSED and recovers after a p
           "[guardian][journal][persist]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
 
     // Force a negative gauge. This cannot happen in correct operation (every lc: row is
     // counted), so the seam stages the state a future over-subtraction bug would produce.
@@ -686,7 +797,7 @@ TEST_CASE("journal persist: a negative gauge fails CLOSED and recovers after a p
 
     // FAIL-CLOSED: the write is REFUSED (not admitted on a clamp-to-0 read, which would be
     // fail-OPEN and grow the shared kv_store.db on an untrusted size), and the tripwire counts.
-    CHECK(j.persist(one("neg", "armed")) == 0);
+    CHECK(persist_all(j, one("neg", "armed")) == 0);
     CHECK(j.gauge_underflow() >= 1);
     CHECK(j.write_failures() == 0);                 // refused BEFORE the write, not attempted and failed
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1); // the refused row never reached the shared DB
@@ -696,7 +807,7 @@ TEST_CASE("journal persist: a negative gauge fails CLOSED and recovers after a p
     auto s = j.prune(0);
     CHECK(s.read_ok);
     CHECK(j.journal_batch_count() == 1); // rebased to the one row (r1) actually on disk
-    CHECK(j.persist(one("r2", "armed")) == 1); // no longer refused
+    CHECK(persist_all(j, one("r2", "armed")) == 1); // no longer refused
     CHECK(j.journal_batch_count() == 2);
 }
 
@@ -705,17 +816,17 @@ TEST_CASE("journal persist: a negative gauge stays bricked while prune scans kee
           "[guardian][journal][persist]") {
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
     j.set_size_gauges_for_test(/*count=*/-3, /*bytes=*/-3); // simulate an over-subtraction bug
 
     // Recovery is ONLY via a successful prune rebase (UP-1). While the scan chronically fails,
     // the negative gauge is never walked back and writes stay refused - bricked, but BOUNDED
     // (records defer to RAM staging, drops counted) rather than the old unbounded fail-open.
     j.inject_read_failures_for_test(2);
-    CHECK(j.persist(one("x1", "armed")) == 0); // still refused
+    CHECK(persist_all(j, one("x1", "armed")) == 0); // still refused
     auto f1 = j.prune(0);
     CHECK_FALSE(f1.read_ok); // scan failed -> no rebase
-    CHECK(j.persist(one("x2", "armed")) == 0); // still bricked
+    CHECK(persist_all(j, one("x2", "armed")) == 0); // still bricked
     auto f2 = j.prune(0);
     CHECK_FALSE(f2.read_ok);
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1); // nothing written while bricked (only r1)
@@ -724,7 +835,7 @@ TEST_CASE("journal persist: a negative gauge stays bricked while prune scans kee
     auto ok = j.prune(0);
     CHECK(ok.read_ok);
     CHECK(j.journal_batch_count() == 1);
-    CHECK(j.persist(one("r2", "armed")) == 1); // recovered
+    CHECK(persist_all(j, one("r2", "armed")) == 1); // recovered
 }
 
 TEST_CASE("journal prune: a future-dated batch is shed before real evidence",
@@ -750,8 +861,8 @@ TEST_CASE("journal prune: a future-dated batch is shed before real evidence",
                                   R"({"rule_id":"r","event_id":"future-1","kind":"armed",)"
                                   R"("guard_type":"file","rule_name":"n","generation":1,)"
                                   R"("enqueued_ns":1700000000000000000})")));
-    REQUIRE(j.persist(one("real1", "armed")) == 1);
-    REQUIRE(j.persist(one("real2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("real1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("real2", "armed")) == 1);
     REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == 3);
 
     // Count ceiling of 2 forces exactly one eviction; it must be the future-dated one.
@@ -778,8 +889,8 @@ TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock ju
     const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
-    REQUIRE(j.persist(one("r1", "armed")) == 1);
-    REQUIRE(j.persist(one("r2", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
 
     // Retention of 0 days: everything is expired, with no clock anomaly whatsoever.
     j.set_retention_limits_for_test(/*days=*/0, /*max_batches=*/1000,
@@ -818,7 +929,7 @@ TEST_CASE("journal prune: an IMPLAUSIBLY LARGE value cannot evict the rest of th
     // Three ordinary batches, then one oversized row stamped NEWEST, so oldest-first eviction
     // reaches the real evidence BEFORE it would ever reach the bad row.
     for (int i = 0; i < 3; ++i)
-        REQUIRE(j.persist(one("real" + std::to_string(i), "armed")) == 1);
+        REQUIRE(persist_all(j, one("real" + std::to_string(i), "armed")) == 1);
     // Sized from the stable BATCH cap, deliberately not from the threshold under test: a
     // fixture derived from kMaxPlausibleJournalValueBytes would move with it and could not
     // detect the threshold being widened.
@@ -864,7 +975,7 @@ TEST_CASE("journal prune: a MAXIMAL legitimate batch is never size-quarantined",
         r->rule_name = big;
         pending.push_back(std::move(r));
     }
-    REQUIRE(j.persist(pending) == 200);
+    REQUIRE(persist_all(j, pending) == 200);
     const auto batches = j.batches_written();
     REQUIRE(batches >= 2); // the byte cap really did split them
 

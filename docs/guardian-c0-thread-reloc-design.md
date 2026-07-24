@@ -636,11 +636,30 @@ Whichever PR flips `prefer_spark` MUST also:
     coverage, so the item-9 episode cannot clear on a pass that had one. The key
     change is migration-free ONLY while the journal is dormant, which is why it landed
     pre-flip.
-11. **Bound the heartbeat's retry-persist** (Gate 3 performance). It is circuit-broken on
+11. ~~**Bound the heartbeat's retry-persist** (Gate 3 performance). It is circuit-broken on
     FAILURE but unbounded on slow SUCCESS: 4096 staged records is 16 autocommit inserts under
     `mtx_`, ~9.9 ms healthy but able to approach the 5 s busy timeout each under KvStore
     contention. A per-tick batch cap or wall deadline is what makes "cheap retry-persist on the
-    heartbeat" structurally true rather than true-in-practice.
+    heartbeat" structurally true rather than true-in-practice.~~
+    - **DONE**: `persist()` takes TWO per-call bounds - a BATCH cap
+    (`kJournalPersistMaxBatchesPerTick`, 4) and a RECORD cap
+    (`kJournalPersistMaxRecordsPerTick`, 1024) - and stops at whichever it reaches first. Both
+    are passed only by the heartbeat tick, the one cadence caller. Two bounds rather than one
+    because a batch cap alone is a latency budget masquerading as a throughput budget: four
+    batches is ~1024 records when records are small, but as few as ~48 when large fields make
+    the byte cap split them, and since the heartbeat is the only steady-state drain the low end
+    would shed records through `journal_stage_dropped` - a NEW loss channel created by a
+    latency fix (governance Gate 3 performance). The record cap floors the drain rate
+    independently of record size. The cap check sits at the
+    very end of the Inserted case, after the sequence, gauges, written count and provenance
+    have all advanced, so a capped return is indistinguishable from the existing
+    circuit-broken one and the remainder simply stays staged for the next tick. Boot,
+    apply_rules and both shutdown flushes pass `kJournalPersistUnbounded`; NEITHER bound is
+    defaulted, so a future cadence caller cannot inherit unbounded behaviour by omission
+    (governance Gate 3 architect). Caps rather than a wall
+    deadline: the repo has an earned rule against wall-clock bounds in tests (#2372), and the
+    cap must count KvStore round trips, which the byte limit can multiply well past the
+    16 batches a records-per-tick sizing would predict.
 12. **Jitter the maintenance phase per agent** (Gate 3 performance). NOTE: this item used to
     size the fleet from a SUSTAINED redelivery floor of 0.1 batch/s/agent - ~256k events/s and
     ~615 Mbit/s at 10k agents. That floor no longer exists: replay consults the durable

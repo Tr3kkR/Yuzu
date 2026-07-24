@@ -45,6 +45,39 @@ inline constexpr std::size_t kMaxJournalBatchBytes = 256 * 1024; // 256 KiB
 /// Bounded staging reserve (RAM). Overflow → drop-oldest + journal_stage_dropped.
 inline constexpr std::size_t kMaxPendingJournalRecords = 4096;
 
+/// What ONE heartbeat retry-persist may write (C0 flip-checklist item 11). The heartbeat
+/// thread holds the engine mutex across the call, so the cost is a LATENCY budget - but a
+/// latency budget expressed only in batches silently becomes a THROUGHPUT floor, and those
+/// two are not the same number.
+///
+/// Why both caps. Each batch is a separate autocommit insert that can approach the KvStore's
+/// 5 s busy timeout under contention, so the BATCH cap is what bounds a tick's worst case
+/// (~4 x 5 s, inside the 30 s heartbeat) instead of leaving it unbounded. But a batch is
+/// capped at kMaxJournalEntriesPerBatch entries AND kMaxJournalBatchBytes, so how many
+/// RECORDS four batches carry depends entirely on record size: ~1024 when records are small
+/// and batches fill on the entry cap, but as few as ~48 when large fields make the byte cap
+/// split them - a 21x swing in sustained drain rate, from ~34 rec/s down to ~1.6 rec/s
+/// (governance Gate 3 performance). The heartbeat tick is the only steady-state drain, so at
+/// the low end a sustained event rate the pre-cap code absorbed would instead overflow the
+/// bounded staging buffer and shed records through the counted journal_stage_dropped path.
+/// That would be a NEW loss channel introduced by a latency fix, which is not a trade worth
+/// making silently.
+///
+/// The RECORD cap therefore floors the throughput independently of record size: whichever
+/// limit is reached first ends the call, so the tick is bounded in round trips AND the drain
+/// rate cannot collapse with record size. 1024 records matches the small-record regime the
+/// batch cap already allowed, and stays two orders above any plausible sustained arm/disarm
+/// rate. A burst above it drains over the next few ticks.
+inline constexpr std::size_t kJournalPersistMaxBatchesPerTick = 4;
+inline constexpr std::size_t kJournalPersistMaxRecordsPerTick = 1024;
+
+/// Explicit "no cap" for persist()'s bounds - the one-shot callers (boot re-arm, apply_rules,
+/// and both shutdown flushes) each have to drain what they were given. Named rather than a
+/// defaulted 0 so that omitting the argument is not the unbounded case: a future cadence
+/// caller that forgot it would otherwise get an unbounded write run under the engine mutex,
+/// which is exactly the defect the cap exists to prevent (governance Gate 3 architect).
+inline constexpr std::size_t kJournalPersistUnbounded = 0;
+
 /// Per-field byte cap. An oversized field keeps the whole record out (counted).
 inline constexpr std::size_t kMaxJournalFieldBytes = 4096;
 

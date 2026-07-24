@@ -162,8 +162,27 @@ public:
     /// stops at the first write failure (remaining records stay pending for the
     /// maintenance-tick retry) so one failing write cannot stall a 500-rule
     /// apply_rules for 500 × the 5 s KvStore busy timeout under mtx_.
+    ///
+    /// `max_batches` / `max_records` bound ONE call; `kJournalPersistUnbounded`
+    /// (0) disables either. The circuit breaker above covers write FAILURE; these
+    /// cover slow SUCCESS, which the heartbeat's retry-persist had no bound on at
+    /// all: a full staging buffer is many autocommit inserts under mtx_, each able
+    /// to approach the 5 s KvStore busy timeout under contention, and the heartbeat
+    /// thread waits for every one of them. Whichever limit is reached first ends
+    /// the call, which is deliberate - batches bound the LATENCY (round trips) and
+    /// records bound the THROUGHPUT floor, and with only the former the drain rate
+    /// collapses ~21x when large fields make the byte cap split batches. A capped
+    /// call returns like a circuit-broken one - the remainder stays staged and the
+    /// next tick continues - so the caller needs no new handling.
+    ///
+    /// NEITHER argument is defaulted, on purpose: every caller must state its
+    /// intent, so that a future cadence caller cannot silently inherit unbounded
+    /// behaviour. Only the heartbeat passes real bounds; the boot, apply_rules and
+    /// both shutdown flushes pass `kJournalPersistUnbounded` because each has to
+    /// drain everything it was given.
     [[nodiscard]] std::size_t persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
-                                      std::vector<PersistedBatch>* out_batches = nullptr);
+                                      std::vector<PersistedBatch>* out_batches,
+                                      std::size_t max_batches, std::size_t max_records);
 
     /// Enforce retention + quarantine (design §6, rev-4.1 #9). Evicts the oldest
     /// batches by (ts_ms, key) once they exceed the age (kJournalRetentionDays),

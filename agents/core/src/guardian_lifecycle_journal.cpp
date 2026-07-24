@@ -133,9 +133,11 @@ void GuardianLifecycleJournal::seed_size_gauges_() {
 
 std::size_t
 GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
-                                  std::vector<PersistedBatch>* out_batches) {
+                                  std::vector<PersistedBatch>* out_batches,
+                                  std::size_t max_batches, std::size_t max_records) {
     if (!kv_ || pending.empty())
         return 0;
+    std::size_t batches_this_call = 0;
 
     // `written` is the count of leading pending SLOTS durably committed. The caller passes it
     // to erase_persisted_prefix, so it must map 1:1 to the front of `pending`; snapshot never
@@ -248,6 +250,24 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
                         pb.event_ids.push_back(e.event_id);
                     out_batches->push_back(std::move(pb));
                 }
+                // PER-CALL BATCH CAP (C0 flip-checklist item 11). Checked HERE, at the very end
+                // of the Inserted case, and nowhere earlier: everything above - batch_seq_, the
+                // gauges, `i`, `written`, the provenance record - describes a batch that is
+                // already durable. Returning before `written` advances would leave a committed
+                // batch staged and re-persist it under a new key on the next call (a duplicate
+                // durable record); returning before the provenance record would keep durability
+                // but silently drop the sent-label evidence for the batch just written.
+                //
+                // The remainder simply stays staged. That is not a new state: it is exactly what
+                // the Exists and Error circuit-breakers below already produce, and the caller
+                // handles it the same way - it erases the returned prefix and the next tick
+                // re-snapshots the rest.
+                // Whichever bound is reached first. `written` is the record count, so the
+                // record cap is read straight off it.
+                if (max_batches != kJournalPersistUnbounded && ++batches_this_call >= max_batches)
+                    return written;
+                if (max_records != kJournalPersistUnbounded && written >= max_records)
+                    return written;
                 break;
             case KvInsert::Exists:
                 // ~2^-64 boot-nonce+seq collision: DON'T overwrite. Count it, advance the seq
