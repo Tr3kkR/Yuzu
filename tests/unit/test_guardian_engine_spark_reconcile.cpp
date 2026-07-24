@@ -618,7 +618,8 @@ TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal u
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};
     // Seed the journal namespace with a batch that must be left untouched.
-    REQUIRE(kv.set(yuzu::agent::kJournalNamespace, "lc:seed:000000000000",
+    const auto seed_key = yuzu::agent::journal_batch_key(1'700'000'000'000LL, "seed", 0);
+    REQUIRE(kv.set(yuzu::agent::kJournalNamespace, seed_key,
                    R"({"v":4,"ts_ms":1700000000000,"entries":[{"rule_id":"r","generation":1,)"
                    R"("event_id":"e","enqueued_ns":1700000000000000000,"kind":"armed",)"
                    R"("guard_type":"file","rule_name":"n"}]})"));
@@ -635,7 +636,10 @@ TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal u
     engine.page_journal();
     engine.journal_maintenance_tick();
     CHECK(engine.lifecycle_journal_for_test()->pages() == 0);            // no paging pass ran
-    CHECK(kv.exists(yuzu::agent::kJournalNamespace, "lc:seed:000000000000")); // seed untouched
+    CHECK(kv.exists(yuzu::agent::kJournalNamespace, seed_key)); // seed untouched
+    // A WELL-FORMED key on purpose: seeded with the retired pre-ts format this would
+    // prove only "a row that prune would quarantine anyway is untouched", which is true
+    // of a dormant journal for the wrong reason (governance Gate 3 architect/QE).
 
     engine.stop();
     spark_engine.stop();

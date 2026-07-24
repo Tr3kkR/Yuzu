@@ -614,12 +614,28 @@ Whichever PR flips `prefer_spark` MUST also:
    forced-blocking sanity step, or a 0 reading is ambiguous (no-block vs gauge-broken). Four
    mechanisms for the loss itself were built and reverted in this PR; the lesson recorded there
    is that the channel needs measuring before it is engineered.
-10. **Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
+10. ~~**Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
     ~668 ms per pass at the byte ceiling, 97% of it in `parse_journal_batch`, with `rows` (raw)
     and `cands` (parsed) both live for a measured +162 MiB RSS on the endpoint every 30 s.
     Building candidates as `(key, ts_ms)` and parsing only the ones actually considered takes
-    the pass to ~110 ms and +66 MiB. The 128 cap currently bounds 0.5% of the work.
+    the pass to ~110 ms and +66 MiB. The 128 cap currently bounds 0.5% of the work.~~
+    - **DONE** via #2299 perf-P-1, and further than the item asked: the batch key carries the
+    timestamp (`lc:<ts13>:<nonce>:<seq12>`), so `ORDER BY key` IS `(ts_ms, key)` and both
+    passes select, order and expire candidates from KEYS ALONE. Prune parses no values at
+    all; page reads a value only for a candidate it actually CONSIDERS - it needs the parsed
+    batch to size the request, so that is the ones it places, the ones it finds blocked, and
+    the remaining slice scanned for the smallest blocked requirement when the window is full -
+    memoized, bounded by the 128 cap. Three consequences are documented at the code: a corrupt
+    VALUE is now discovered and quarantined by the replay pass rather than by prune (a
+    malformed KEY is still prune's, on sight); a corrupt-value batch the rotation never
+    reaches before it ages out is therefore counted `evicted_without_send_evidence` rather
+    than `quarantined`, so on a mass-corruption endpoint that audit-loss counter no longer
+    separates "never delivered" from "never deliverable" and should be read alongside
+    `quarantined`; and a candidate whose value READ FAILS is not counted as block-free
+    coverage, so the item-9 episode cannot clear on a pass that had one. The key
+    change is migration-free ONLY while the journal is dormant, which is why it landed
+    pre-flip.
 11. **Bound the heartbeat's retry-persist** (Gate 3 performance). It is circuit-broken on
     FAILURE but unbounded on slow SUCCESS: 4096 staged records is 16 autocommit inserts under
     `mtx_`, ~9.9 ms healthy but able to approach the 5 s busy timeout each under KvStore
@@ -650,3 +666,48 @@ Whichever PR flips `prefer_spark` MUST also:
    worker visible; it was a partial mitigation, not a closure.)
 
 Tracked on #2298, which is the cutover gate list.
+
+### 15. Deferred findings from the #2299 O(work) governance run — resolve or risk-accept before the flip
+
+The L2 run closed one BLOCKING regression and a
+long list of SHOULDs, but deliberately deferred the items below. They are recorded HERE, not
+only in a governance transcript, because a deferred finding with no forward pointer is a
+finding that gets re-discovered at flip time instead of resolved (Gate 6
+enterprise-readiness). Each needs an outcome - fixed, or explicitly risk-accepted and
+attributed - before `prefer_spark` flips. File them against #2298.
+
+Recorded here, in the FIRST PR of the three-PR #2299 stack, rather than the last: most of
+these are findings against this PR's own code, and if the rest of the stack stalled they would
+otherwise be undocumented on `dev`. A few belong to the later PRs (UP-9/UP-10 to the persist
+bounds, UP-6 to the jitter) and are listed anyway so the set stays in one place.
+
+- **UP-11 — the page SUCCESS stamp advances on passes that did NO work.** A no-token return, a
+  `stopping_` return, or a pass whose every value read failed all refresh
+  `last_page_success_steady_ms_`, so `yuzu.guardian_journal_page_stale_seconds` can read
+  healthy while replay is genuinely stalled. PRE-EXISTING from L1b, not introduced by L2 - but
+  L2 is the rung that makes replay real, and this is the gauge an on-call engineer will trust
+  first once it is. Both compliance and SRE called this the one deferred item that should be a
+  flip PREREQUISITE rather than ordinary backlog. **Highest priority of this list.**
+- UP-5 — a pre-planted `quarantine:` twin makes the page-side rename Conflict every pass;
+  bounded by the per-pass candidate cap, but can stall the drain behind ~128 KvStore round
+  trips. Tampered-DB only. The same shape applies to the size-quarantine branch, where the row
+  additionally keeps counting toward the byte ceiling and can permanently block writes.
+- UP-6 — the boot forced page is deferred by up to one page interval, so a crash-looping
+  process may never perform its boot replay. Records stay durable; the next healthy boot
+  replays them.
+- UP-9 / UP-10 — the persist bounds are a deliberate trade: a slower post-outage drain, and a
+  tick that can still hold `mtx_` for roughly four busy timeouts (bounded, where it was
+  previously unbounded).
+- UP-12 — the `sent:` label namespace has no ceiling of its own and its GC is skipped on every
+  early return, so stale labels can accumulate invisibly to the byte gauge.
+- UP-15 — `stopping_` is a one-way latch with no reset. Harmless today (one `run()` per
+  process) but a trap for any future in-process restart: maintenance would stay off while
+  persist kept writing to the ceiling.
+- UP-16 — the min-blocked inner scan memoizes up to a full slice of parsed batches purely to
+  compute a size, in the memory-pressure regime.
+- UP-3 / UP-4 / UP-17 — a bit flip inside the key timestamp is now decisive for retention
+  ordering; nothing cross-checks key-ts against the value's own `ts_ms`; two agent processes
+  sharing one `kv_store.db` would each replay the other's batches.
+- Test-coverage gaps: the real SQLite error branches of `list_keys_sized`/`get_entry` at the
+  KvStore layer, the page-side quarantine rename `Conflict` branch, and the persist
+  cap x circuit-breaker interaction.

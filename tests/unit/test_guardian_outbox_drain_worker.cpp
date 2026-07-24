@@ -1737,7 +1737,7 @@ TEST_CASE("a batch repeating an event_id is sized by its distinct records",
     // persist() never writes such a row, which is exactly why this needs writing by hand.
     // RED without the de-duplication: the batch is reported blocked and pages nothing.
     JournalRig rig;
-    const auto key = std::string{kBatchKeyPrefix} + "dup:000000000001";
+    const auto key = journal_batch_key(1'700'000'000'000LL, "dup", 1);
     const std::string row =
         R"({"v":4,"ts_ms":1700000000000,"entries":[)"
         R"({"rule_id":"r","event_id":"dup","kind":"armed","guard_type":"file","rule_name":"n",)"
