@@ -1795,6 +1795,20 @@ header, so these names stay rejected on client ingress permanently.
 
 ## Engine principals & delegation (ADR-1005 — design)
 
+**Stream liveness is cached; authorization is not** (#2367). The per-tick
+re-check that keeps a held-open MCP/SSE stream alive reads the engine principal
+through `EnginePrincipalStore::get_for_auth_revalidate` — a 15 s, Active-only
+liveness cache with exactly one caller, the private
+`AuthRoutes::engine_credential_state`. Every *fresh* authorization decision —
+session synthesis, and the REST/MCP on-behalf-of target checks — still calls the
+authoritative `get_for_auth` and reads through to Postgres on every call, so a
+revoked principal cannot obtain a new session or a new delegation at any point.
+A cached answer is reported as `auth::CredentialCheck::kValidStale` rather than
+`kValid`, which is what stops a stream from riding the cache and then collecting
+a full fresh outage-grace window on top of it. See ADR-0031 Consequences for the
+invalidation and bounding rules, and `docs/mcp-server.md` "Revocation." for the
+resulting latency bounds.
+
 - **Design doc:** `docs/auth-engine-principals-design.md` (execution-plan item
   2b, feeds Phases 4–5). **Shipped (PR 4.1–4.3):** the identity store + RBAC
   resolution (PR 4.1–4.2) and the operator-facing REST + MCP + admin-console

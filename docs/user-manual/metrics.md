@@ -88,6 +88,19 @@ The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bou
 | `yuzu_server_live_requests_total{kind, outcome}` | counter | Live-read requests by `kind` (`uptime` / `processes` / `unknown`) and terminal HTTP `outcome` (`200` / `400` / `403` / `429` / `500` / `502` / `503` / `504`). A rising `outcome="429"` rate means the concurrency cap is shedding load. |
 | `yuzu_server_live_inflight` | gauge | Current in-flight synchronous live-read polls. Approaching the cap (default 4) indicates saturation; sustained at the cap alongside 429s means the live surface is a bottleneck. |
 
+## Engine-principal revalidation-cache metrics
+
+Every held-open SSE stream re-validates its credential on each ~3 s pump tick. For a stream authenticated by an **engine** principal that check consults `EnginePrincipalStore`, and these metrics show whether it is being served from the short-TTL liveness cache (#2367) or reaching Postgres. The cache exists to keep that per-tick load off the connection pool, where it was previously self-amplifying under a pool brownout.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_engine_revalidate_cache_hits_total` | counter | Liveness re-checks answered from cache — no Postgres read. In steady state hits should dominate misses by roughly `TTL / tick`. |
+| `yuzu_server_engine_revalidate_cache_misses_total` | counter | Re-checks that read through to Postgres (cold, expired, or invalidated by a revoke). A rate approaching one per stream per tick means the cache is not doing its job — look for a revoke loop or a clock problem. |
+| `yuzu_server_engine_revalidate_cache_size` | gauge | Principals with a live (unexpired) entry. Bounded by construction; sustained residence at the ceiling means engine-principal churn worth investigating. |
+| `yuzu_server_engine_revalidate_backoff_suppressed_total` | counter | Re-checks answered `StoreUnreachable` from the failure backoff **without** taking a pool lease. **This is the brownout signal**: it only moves while the store is unreachable, and while it moves the per-tick retry amplifier is being held off. Any movement means the store is unreachable — see the `EngineRevalidateStoreUnreachable` alert and `docs/ops-runbooks/engine-principal-store-recovery.md`. Read it alongside `yuzu_pg_acquire_wait_seconds` and `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}` — streams are riding their grace windows and some will end. |
+
+This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a
@@ -180,6 +193,14 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
   expr: increase(yuzu_viz_pushed_cap_evictions_total[10m]) > 0
   annotations:
     summary: "FleetTopologyStore is evicting agents at the 100000-entry hard cap — fleet outgrew the cap or a cap-flood attack is in progress"
+
+- alert: EngineRevalidateStoreUnreachable
+  expr: increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
+  labels:
+    severity: warning
+  annotations:
+    summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
+    description: "This counter only moves while the store cannot be reached. First rule out real impact: a flat yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} means the backoff is absorbing the blip and no streams have ended. Then correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for pool exhaustion. Runbook: docs/ops-runbooks/engine-principal-store-recovery.md."
 
 - alert: VizFleetPushedMapNearCap
   expr: yuzu_viz_pushed_map_size > 80000

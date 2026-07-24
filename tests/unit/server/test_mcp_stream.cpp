@@ -521,6 +521,163 @@ TEST_CASE("McpStreamPump/CH-4: a recovered backend resets the grace window",
     CHECK(pump.pump_once(wire.writer()));
 }
 
+TEST_CASE("McpStreamPump/#2367: cached validity does NOT reset the grace budget",
+          "[mcp][stream][ch4]") {
+    // The window that made cache residency and the grace window ADD. A cached
+    // credential answer keeps the stream alive but re-confirms nothing, so the
+    // grace budget must keep running from the last AUTHORITATIVE confirmation.
+    // Treated as plain kValid, the stream would ride the cache and then collect
+    // a full FRESH grace window on top of it.
+    //
+    // NOTE this case runs at fast_cfg's default revalidate_max_staleness of 0
+    // (the conservative "answers are always authoritative" default). It proves
+    // the floor-does-not-reset property in isolation; the sibling case below
+    // ("a sibling-refreshed cache still leaves usable grace") exercises the
+    // PRODUCTION shape with a non-zero staleness bound wired from kAuthCacheTtl.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::milliseconds(1000);
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, fast_cfg(grace),
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    // 900 ms of cached-valid answers. The stream stays up — a cache hit is not
+    // a failure — but the budget is being spent, not refreshed.
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // The cache expires and the store turns out to be unreachable. Only 100 ms
+    // of the 1000 ms budget remains, so a further 200 ms must kill it. Under
+    // the old "arm the deadline at first kIndeterminate" behaviour this stream
+    // would have lived another full second.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(200);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("McpStreamPump/#2367: an authoritative re-confirmation does reset the budget",
+          "[mcp][stream][ch4]") {
+    // The other half: kValidStale must not be so strict that a genuinely
+    // re-confirmed stream inherits a spent budget.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&verdict] { return verdict; },
+                            [] { return true; },
+                            fast_cfg(std::chrono::milliseconds(1000)),
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    clock_now += std::chrono::milliseconds(900); // budget nearly spent on cached answers
+    CHECK(pump.pump_once(wire.writer()));
+
+    verdict = mcp::StreamRevalidate::kValid; // the store was actually asked
+    CHECK(pump.pump_once(wire.writer()));
+
+    // Budget restarts from here, so 900 ms of indeterminate is survivable again.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+}
+
+TEST_CASE("McpStreamPump/#2367: a sibling-refreshed cache still leaves usable grace",
+          "[mcp][stream][ch4]") {
+    // sec-M2 regression. The liveness cache is keyed by PRINCIPAL, but the
+    // grace budget is per-STREAM. With several streams on one principal, only
+    // whichever stream's tick lands on expiry gets an authoritative kValid --
+    // the others ride cache hits indefinitely. If a cached answer never
+    // advanced the authoritative floor, those streams would accumulate
+    // unbounded staleness and then be cut with ZERO grace the instant the
+    // store blipped, all at once. A cache hit is positive evidence the store
+    // confirmed within its TTL, so the floor clamps forward to now - TTL.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::milliseconds(1000);
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    auto cfg = fast_cfg(grace);
+    cfg.revalidate_max_staleness = std::chrono::milliseconds(250);
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, cfg,
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    // Ten seconds of nothing but cached answers - far beyond the grace window.
+    // Without the clamp the floor would still sit at construction time and the
+    // stream would die instantly below.
+    for (int i = 0; i < 10; ++i) {
+        clock_now += std::chrono::seconds(1);
+        REQUIRE(pump.pump_once(wire.writer()));
+    }
+
+    // Store blips. The budget spent is at most one staleness window, so most
+    // of the grace remains: 500 ms must NOT kill it.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(500);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // ...but the budget is still finite: it is not immortal.
+    clock_now += std::chrono::milliseconds(600);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("McpStreamPump/#2367: a cached answer clears a grace deadline armed during an outage",
+          "[mcp][stream][ch4]") {
+    // A cached answer is POSITIVE evidence -- the entry only exists because an
+    // authoritative read succeeded within the staleness window -- so it must
+    // clear a deadline armed earlier, exactly as an authoritative kValid does.
+    //
+    // Getting this wrong kills healthy streams: with two streams on one
+    // principal, the one that ticks first after recovery re-reads and warms the
+    // shared cache entry, and the other then rides hits. If those hits left the
+    // outage-era deadline counting down, that second stream would close
+    // `auth_unavailable` against a reachable store and an Active principal.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kIndeterminate;
+
+    auto cfg = fast_cfg(std::chrono::milliseconds(1000));
+    cfg.revalidate_max_staleness = std::chrono::milliseconds(250);
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, cfg,
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    CHECK(pump.pump_once(wire.writer())); // outage arms the deadline
+    clock_now += std::chrono::milliseconds(900);
+
+    // Store recovers; a sibling stream refreshed the entry, so this one sees a
+    // cache hit. Well past the armed deadline -- it must survive.
+    verdict = mcp::StreamRevalidate::kValidStale;
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+    clock_now += std::chrono::seconds(5);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // The budget is still finite: cached answers only advance the floor to
+    // now - max_staleness, so a fresh outage kills it within the window.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(1300);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
 TEST_CASE("McpStreamPump: a terminated session ends the stream with its own reason",
           "[mcp][stream]") {
     auto state = std::make_shared<mcp::McpStreamState>();

@@ -63,6 +63,12 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    construction-only. Never hold a lease across network/disk/external work. Never call another
    store while holding a lease (one lease per logical operation).
 
+   *Caching an authoritative read?* Do not invent the rules — **ADR-0012 §4** ("Read caching on
+   an authoritative store") encodes the five that this seam demands: positive-only, invalidate
+   synchronously on your own writes under a generation guard, report provenance, never serve a
+   fresh authorization decision from cache, and bound every map on its own insert path.
+   `EnginePrincipalStore`'s liveness cache (#2367) is the worked example.
+
 6. **Wire into `server.cpp`** via the construction helper, after the `PgPool` probe and inside
    the `if (pg_pool_ && !startup_failed_)` guard. A Postgres store that cannot open is a **fatal
    startup error** — the helper flips `startup_failed_` on `!is_open()`. Member-declare the
