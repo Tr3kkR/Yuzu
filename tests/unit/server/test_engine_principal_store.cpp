@@ -778,6 +778,51 @@ TEST_CASE("the revalidate cache is physically bounded, not just filtered",
     CHECK(store.revalidate_cache_resident_for_test() == 1);
 }
 
+TEST_CASE("a revoke racing a failed read does not install a shadowing backoff (#2367 C1)",
+          "[engine_principal][store][cache]") {
+    // Adversarial-review finding C1 (PR #2462): the Active-insert arm
+    // re-checks the revoke generation under the mutex before caching; the
+    // StoreUnreachable BACKOFF-insert arm must do the
+    // same. Otherwise a read that failed during a brownout installs a backoff
+    // entry AFTER a concurrent revoke has erased the maps -- and that backoff
+    // then answers StoreUnreachable (no read-through) for its whole window once
+    // the store recovers, so a just-revoked principal's stream rides grace
+    // instead of being cut on the next tick (contradicting ADR-0031).
+    //
+    // Invalid pool -> get_for_auth returns StoreUnreachable deterministically
+    // without a lease. The after-read hook stands in for the concurrent revoke
+    // by bumping the generation through invalidate_revalidate_cache (revoke's
+    // own gen-bump path; revoke() itself early-returns on a closed store, so it
+    // cannot be used directly here).
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+
+    bool fired = false;
+    store.test_hook_after_revalidate_read_ = [&] {
+        if (fired)
+            return;
+        fired = true;
+        store.invalidate_revalidate_cache("engine:c1"); // the racing revoke's gen bump
+    };
+
+    // The read fails; the generation moved between the pre-read snapshot and
+    // the insert, so NO backoff is installed -- the next tick reads through.
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:c1").status ==
+          EngineLookupStatus::StoreUnreachable);
+    store.test_hook_after_revalidate_read_ = nullptr;
+    REQUIRE(fired);
+    CHECK(store.revalidate_backoff_resident_for_test() == 0);
+
+    // Guard against a vacuous pass: with NO intervening bump, a StoreUnreachable
+    // read DOES install a backoff. (Reverting the C1 fix makes the check above
+    // fail while this one still passes.)
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:c1-baseline").status ==
+          EngineLookupStatus::StoreUnreachable);
+    CHECK(store.revalidate_backoff_resident_for_test() == 1);
+}
+
 TEST_CASE("the failure-backoff map is bounded on its own insert path",
           "[engine_principal][store][cache]") {
     // The backoff map is filled ONLY during an outage, which is exactly when

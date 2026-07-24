@@ -243,17 +243,29 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
     if (fresh.status == EngineLookupStatus::StoreUnreachable) {
         const auto stamp = clock_();
         std::lock_guard lk(revalidate_cache_mu_);
-        // The backoff map needs the SAME ceiling discipline as the positive
-        // map, and needs it on THIS path: an outage is the only thing that
-        // fills this map, and the positive-insert arm (the other sweep site)
-        // by definition does not run during one. Without this, a principal
-        // whose stream ends mid-outage leaves an entry resident for the
-        // process lifetime.
-        if (revalidate_backoff_.size() >= max_entries_)
-            sweep_expired_locked(stamp);
-        if (revalidate_backoff_.size() < max_entries_) {
-            revalidate_backoff_.insert_or_assign(
-                principal_id, stamp + kAuthFailureBackoff + jitter_up_to(kAuthFailureBackoff));
+        // C1 (adversarial review, PR #2462): the SAME generation guard the
+        // Active arm below applies. If a revoke bumped the generation while
+        // this read was in flight, do NOT install a backoff -- it would answer
+        // StoreUnreachable (no read-through) for the whole backoff window once
+        // the store recovers, so a just-revoked principal's stream would ride
+        // its grace window instead of being cut on the next tick (contradicting
+        // ADR-0031's writing-replica "next tick" property). Leave it uncached;
+        // the next tick reads through to MissingOrRevoked. Fail-safe direction
+        // and bounded (the stream still dies at the grace deadline), but a real
+        // revocation delay on the auth path -- close it symmetrically.
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            // The backoff map needs the SAME ceiling discipline as the positive
+            // map, and needs it on THIS path: an outage is the only thing that
+            // fills this map, and the positive-insert arm (the other sweep
+            // site) by definition does not run during one. Without this, a
+            // principal whose stream ends mid-outage leaves an entry resident
+            // for the process lifetime.
+            if (revalidate_backoff_.size() >= max_entries_)
+                sweep_expired_locked(stamp);
+            if (revalidate_backoff_.size() < max_entries_) {
+                revalidate_backoff_.insert_or_assign(
+                    principal_id, stamp + kAuthFailureBackoff + jitter_up_to(kAuthFailureBackoff));
+            }
         }
         // Declining to record a backoff is safe in the same way as declining
         // to cache: the next tick simply reads through again.
