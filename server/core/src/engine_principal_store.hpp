@@ -55,13 +55,17 @@
 ///
 /// Every live MCP/SSE stream re-validates its credential on each ~3 s pump
 /// tick. The token row itself is served from `ApiTokenStore`'s 60 s cache, so
-/// for an ENGINE principal the extra `get_for_auth` hop was the only uncached
-/// read on that path: one Postgres round-trip per engine stream per tick,
+/// for an ENGINE principal the extra `get_for_auth` hop was, in steady state,
+/// the only uncached read on that path: one Postgres round-trip per engine
+/// stream per tick,
 /// each a bounded `try_acquire_for` on a pool of ~16 connections. That is
 /// absorbable in steady state and self-amplifying under a pool brownout —
 /// `StoreUnreachable` -> `kIndeterminate` -> every engine stream stays in its
 /// grace window and KEEPS retrying, N waiters starving ordinary
-/// `validate_token` and the fleet data plane with it.
+/// `validate_token` and the fleet data plane with it. (Past 60 s of a
+/// sustained outage the TOKEN half of the same tick resumes reading through
+/// too, since it has no equivalent backoff — so this removes one of the two
+/// amplifiers, not both. Tracked with #2447.)
 ///
 /// So `get_for_auth_revalidate()` adds a short-TTL positive cache — and ONLY
 /// that method. `get_for_auth()` stays uncached and authoritative. Which
@@ -117,6 +121,9 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+class AuthRoutes;
+struct EngineLivenessTestAccess;
 
 /// One persisted engine-principal identity row.
 struct EnginePrincipalRow {
@@ -178,7 +185,7 @@ public:
     /// a consumer needs in order to keep its own freshness arithmetic honest,
     /// and it is COUPLED to `McpStreamPump`'s revalidate grace window — the
     /// TTL must stay well under it, or an aged entry leaves no usable grace
-    /// and an outage cuts engine streams instantly. `auth_routes.cpp` carries
+    /// and an outage cuts engine streams instantly. `mcp_stream.cpp` carries
     /// a static_assert pinning that relationship so a future edit to either
     /// constant fails the build instead of silently degrading availability.
     static constexpr auto kAuthCacheTtl = std::chrono::seconds(15);
@@ -199,26 +206,6 @@ public:
     /// not-found — it is for admin/test reads only). Always reads through to
     /// Postgres: a fresh authorization decision is never served from cache.
     [[nodiscard]] EngineLookup get_for_auth(const std::string& principal_id) const;
-
-    /// LIVENESS RE-CHECK ONLY — the per-tick "is this already-authenticated
-    /// stream's backing principal still alive?" question, served from a
-    /// `kAuthCacheTtl` positive cache (#2367; rationale in the file doc
-    /// comment). Same three-state status contract as `get_for_auth`.
-    ///
-    /// NEVER use this to make a FRESH authorization decision — not for
-    /// session synthesis, not for an on-behalf-of target check, not for a
-    /// route's admission gate. Those must call `get_for_auth`. A cached
-    /// `Active` is evidence that the principal was live within the TTL; that
-    /// is enough to let an EXISTING stream keep running, and not enough to
-    /// admit anything new.
-    ///
-    /// Returns NO row, deliberately. The only consumer branches on status, and
-    /// withholding the row means a cached answer can never be mistaken for
-    /// authoritative metadata (a cached `owner_username` is exactly the kind of
-    /// thing a future caller would read without noticing it may be a minute
-    /// old). It also keeps a cache hit allocation-free.
-    [[nodiscard]] EngineRevalidate
-    get_for_auth_revalidate(const std::string& principal_id) const;
 
     /// Drop `principal_id` from the revalidation cache (empty string = clear
     /// all). Called synchronously by this store's own lifecycle writers; also
@@ -360,6 +347,36 @@ public:
     count_active_owned_by(const std::string& owner_username) const;
 
 private:
+    // PRIVATE ON PURPOSE (#2367). The cached/uncached split is the security
+    // argument of this whole feature, and a doc comment is not an enforcement
+    // mechanism -- three independent reviewers predicted the same failure: a
+    // future admission gate greps this header, sees two auth-shaped methods,
+    // and picks the one named "revalidate" because its code is a poll. Access
+    // is therefore restricted in the type system to the ONE legitimate caller.
+    // Anything needing the engine gate somewhere new must call `get_for_auth`.
+    friend class AuthRoutes;
+    friend struct EngineLivenessTestAccess;
+
+    /// LIVENESS RE-CHECK ONLY — the per-tick "is this already-authenticated
+    /// stream's backing principal still alive?" question, served from a
+    /// `kAuthCacheTtl` positive cache (#2367; rationale in the file doc
+    /// comment). Same three-state status contract as `get_for_auth`.
+    ///
+    /// NEVER use this to make a FRESH authorization decision — not for
+    /// session synthesis, not for an on-behalf-of target check, not for a
+    /// route's admission gate. Those must call `get_for_auth`. A cached
+    /// `Active` is evidence that the principal was live within the TTL; that
+    /// is enough to let an EXISTING stream keep running, and not enough to
+    /// admit anything new.
+    ///
+    /// Returns NO row, deliberately. The only consumer branches on status, and
+    /// withholding the row means a cached answer can never be mistaken for
+    /// authoritative metadata (a cached `owner_username` is exactly the kind of
+    /// thing a future caller would read without noticing it may be a minute
+    /// old). It also keeps a cache hit allocation-free.
+    [[nodiscard]] EngineRevalidate
+    get_for_auth_revalidate(const std::string& principal_id) const;
+
     /// One cached Active lookup. The liveness fact and when it stops counting —
     /// no row: the consumer branches on status only, and not retaining the row
     /// removes any chance of a stale `owner_username` being read as current.
@@ -466,6 +483,15 @@ private:
     /// next tick reads through) and inside the pump's grace window by
     /// construction.
     std::atomic<std::uint64_t> revoke_generation_{0};
+};
+
+/// Test-only door to the private liveness path (#2367). Production code
+/// reaches it exclusively through `AuthRoutes::engine_credential_state`; this
+/// exists so the store's cache behaviour stays directly testable without
+/// widening the production surface.
+struct EngineLivenessTestAccess {
+    [[nodiscard]] static EngineRevalidate revalidate(const EnginePrincipalStore& store,
+                                                     const std::string& principal_id);
 };
 
 } // namespace yuzu::server

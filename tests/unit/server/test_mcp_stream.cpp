@@ -629,13 +629,17 @@ TEST_CASE("McpStreamPump/#2367: a sibling-refreshed cache still leaves usable gr
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
 }
 
-TEST_CASE("McpStreamPump/#2367: an armed grace deadline still fires while cached answers arrive",
+TEST_CASE("McpStreamPump/#2367: a cached answer clears a grace deadline armed during an outage",
           "[mcp][stream][ch4]") {
-    // cps-S1 regression. Reachable when the TOKEN half is the unavailable one:
-    // grace arms from kIndeterminate, that half recovers, and the engine half
-    // then serves cache hits. The kValidStale arm deliberately does not CLEAR
-    // an armed deadline -- but if nothing tests it either, the stream outlives
-    // its own deadline by up to a full cache TTL.
+    // A cached answer is POSITIVE evidence -- the entry only exists because an
+    // authoritative read succeeded within the staleness window -- so it must
+    // clear a deadline armed earlier, exactly as an authoritative kValid does.
+    //
+    // Getting this wrong kills healthy streams: with two streams on one
+    // principal, the one that ticks first after recovery re-reads and warms the
+    // shared cache entry, and the other then rides hits. If those hits left the
+    // outage-era deadline counting down, that second stream would close
+    // `auth_unavailable` against a reachable store and an Active principal.
     auto state = std::make_shared<mcp::McpStreamState>();
     auto attached = state->attach_and_replay(0, nullptr, "alice");
     auto clock_now = std::chrono::steady_clock::now();
@@ -649,13 +653,21 @@ TEST_CASE("McpStreamPump/#2367: an armed grace deadline still fires while cached
                             [&clock_now] { return clock_now; }};
     FakeWire wire;
 
-    CHECK(pump.pump_once(wire.writer())); // arms the deadline
-    verdict = mcp::StreamRevalidate::kValidStale; // engine cache starts hitting
-    clock_now += std::chrono::milliseconds(400);
+    CHECK(pump.pump_once(wire.writer())); // outage arms the deadline
+    clock_now += std::chrono::milliseconds(900);
+
+    // Store recovers; a sibling stream refreshed the entry, so this one sees a
+    // cache hit. Well past the armed deadline -- it must survive.
+    verdict = mcp::StreamRevalidate::kValidStale;
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+    clock_now += std::chrono::seconds(5);
     CHECK(pump.pump_once(wire.writer()));
 
-    // Past the armed deadline. Cached answers must not hold it open.
-    clock_now += std::chrono::milliseconds(900);
+    // The budget is still finite: cached answers only advance the floor to
+    // now - max_staleness, so a fresh outage kills it within the window.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(1300);
     CHECK_FALSE(pump.pump_once(wire.writer()));
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
 }

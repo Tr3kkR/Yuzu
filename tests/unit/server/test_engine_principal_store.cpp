@@ -29,6 +29,7 @@
 using yuzu::server::EngineLookup;
 using yuzu::server::EngineLookupStatus;
 using yuzu::server::EnginePrincipalRow;
+using yuzu::server::EngineLivenessTestAccess;
 using yuzu::server::EnginePrincipalStore;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
@@ -456,7 +457,7 @@ TEST_CASE("get_for_auth_revalidate caches Active while get_for_auth stays uncach
     // First revalidate reads through (miss) and installs the entry. A
     // read-through is authoritative, so from_cache is false.
     {
-        const auto first = store.get_for_auth_revalidate("engine:cache-warm");
+        const auto first = EngineLivenessTestAccess::revalidate(store, "engine:cache-warm");
         CHECK(first.status == EngineLookupStatus::Active);
         CHECK_FALSE(first.from_cache);
     }
@@ -469,7 +470,7 @@ TEST_CASE("get_for_auth_revalidate caches Active while get_for_auth stays uncach
     // Each hit must announce itself as cached, or the pump would reset its
     // grace budget on an answer nobody re-confirmed.
     for (int i = 0; i < 5; ++i) {
-        const auto l = store.get_for_auth_revalidate("engine:cache-warm");
+        const auto l = EngineLivenessTestAccess::revalidate(store, "engine:cache-warm");
         CHECK(l.status == EngineLookupStatus::Active);
         CHECK(l.from_cache);
     }
@@ -499,7 +500,7 @@ TEST_CASE("revoke invalidates the revalidate cache — no stale Active survives 
     REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-revoke")
                .has_value());
 
-    REQUIRE(store.get_for_auth_revalidate("engine:cache-revoke").status ==
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:cache-revoke").status ==
             EngineLookupStatus::Active);
     REQUIRE(store.revalidate_cache_size() == 1);
 
@@ -509,11 +510,11 @@ TEST_CASE("revoke invalidates the revalidate cache — no stale Active survives 
     CHECK(store.revalidate_cache_size() == 0); // dropped by the write, not by TTL
 
     // Next tick observes the revocation immediately.
-    CHECK(store.get_for_auth_revalidate("engine:cache-revoke").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cache-revoke").status ==
           EngineLookupStatus::MissingOrRevoked);
     // ...and stays uncached, so it cannot be resurrected by a later hit.
     CHECK(store.revalidate_cache_size() == 0);
-    CHECK(store.get_for_auth_revalidate("engine:cache-revoke").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cache-revoke").status ==
           EngineLookupStatus::MissingOrRevoked);
 }
 
@@ -527,7 +528,7 @@ TEST_CASE("transfer_owner invalidates the revalidate cache",
     REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-xfer")
                .has_value());
 
-    REQUIRE(store.get_for_auth_revalidate("engine:cache-xfer").status ==
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:cache-xfer").status ==
             EngineLookupStatus::Active);
     REQUIRE(store.revalidate_cache_size() == 1);
 
@@ -537,7 +538,7 @@ TEST_CASE("transfer_owner invalidates the revalidate cache",
     CHECK(store.revalidate_cache_size() == 0);
 
     // The next lookup is a genuine read-through, not a cache hit.
-    const auto after = store.get_for_auth_revalidate("engine:cache-xfer");
+    const auto after = EngineLivenessTestAccess::revalidate(store, "engine:cache-xfer");
     CHECK(after.status == EngineLookupStatus::Active);
     CHECK_FALSE(after.from_cache);
 
@@ -561,7 +562,7 @@ TEST_CASE("get_for_auth_revalidate caches ONLY Active — never MissingOrRevoked
         REQUIRE(store.is_open());
 
         for (int i = 0; i < 3; ++i)
-            CHECK(store.get_for_auth_revalidate("engine:never-existed").status ==
+            CHECK(EngineLivenessTestAccess::revalidate(store, "engine:never-existed").status ==
                   EngineLookupStatus::MissingOrRevoked);
         CHECK(store.revalidate_cache_size() == 0);
         CHECK(store.revalidate_cache_hits() == 0);
@@ -571,7 +572,7 @@ TEST_CASE("get_for_auth_revalidate caches ONLY Active — never MissingOrRevoked
         // immediately, with no create() invalidation hook.
         REQUIRE(store.create("Late", "alice", "j", "internal", "admin", "engine:never-existed")
                    .has_value());
-        CHECK(store.get_for_auth_revalidate("engine:never-existed").status ==
+        CHECK(EngineLivenessTestAccess::revalidate(store, "engine:never-existed").status ==
               EngineLookupStatus::Active);
     }
 
@@ -584,7 +585,7 @@ TEST_CASE("get_for_auth_revalidate caches ONLY Active — never MissingOrRevoked
         REQUIRE_FALSE(store.is_open());
 
         for (int i = 0; i < 3; ++i)
-            CHECK(store.get_for_auth_revalidate("engine:whatever").status ==
+            CHECK(EngineLivenessTestAccess::revalidate(store, "engine:whatever").status ==
                   EngineLookupStatus::StoreUnreachable);
         CHECK(store.revalidate_cache_size() == 0);
         CHECK(store.revalidate_cache_hits() == 0);
@@ -619,12 +620,12 @@ TEST_CASE("a revoke racing a revalidate's cache-write cannot poison the cache (#
     // This call read an Active row before the revoke landed, so returning
     // Active once is permitted (documented bounded window). What is NOT
     // permitted is caching it.
-    (void)store.get_for_auth_revalidate("engine:cache-race");
+    (void)EngineLivenessTestAccess::revalidate(store, "engine:cache-race");
     store.test_hook_after_revalidate_read_ = nullptr;
     REQUIRE(fired);
 
     CHECK(store.revalidate_cache_size() == 0); // generation bump defeated the write
-    CHECK(store.get_for_auth_revalidate("engine:cache-race").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cache-race").status ==
           EngineLookupStatus::MissingOrRevoked);
 }
 
@@ -640,13 +641,13 @@ TEST_CASE("revalidate cache entries expire and are re-read (clock seam)",
                .has_value());
     store.set_clock_for_test([&] { return fake_now; });
 
-    REQUIRE_FALSE(store.get_for_auth_revalidate("engine:cache-ttl").from_cache);
-    CHECK(store.get_for_auth_revalidate("engine:cache-ttl").from_cache); // warm
+    REQUIRE_FALSE(EngineLivenessTestAccess::revalidate(store, "engine:cache-ttl").from_cache);
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cache-ttl").from_cache); // warm
 
     // Just inside the jittered TTL floor (TTL minus its maximum jitter): still
     // a hit for certain.
     fake_now += std::chrono::seconds(10);
-    CHECK(store.get_for_auth_revalidate("engine:cache-ttl").from_cache);
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:cache-ttl").from_cache);
     CHECK(store.revalidate_cache_size() == 1);
 
     // Past the full TTL: expired for certain, whatever jitter was drawn. The
@@ -654,7 +655,7 @@ TEST_CASE("revalidate cache entries expire and are re-read (clock seam)",
     // lets the pump reset its grace budget.
     fake_now += std::chrono::seconds(20);
     CHECK(store.revalidate_cache_size() == 0); // expired entries are not "cached"
-    const auto after = store.get_for_auth_revalidate("engine:cache-ttl");
+    const auto after = EngineLivenessTestAccess::revalidate(store, "engine:cache-ttl");
     CHECK(after.status == EngineLookupStatus::Active);
     CHECK_FALSE(after.from_cache);
 }
@@ -674,14 +675,14 @@ TEST_CASE("an unreachable store is rate-limited, not re-asked on every tick",
     store.set_clock_for_test([&] { return fake_now; });
 
     // First call actually asks and fails.
-    CHECK(store.get_for_auth_revalidate("engine:brownout").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:brownout").status ==
           EngineLookupStatus::StoreUnreachable);
     CHECK(store.revalidate_cache_misses() == 1);
     CHECK(store.revalidate_backoff_suppressed() == 0);
 
     // The next several ticks repeat that answer without asking again.
     for (int i = 0; i < 10; ++i) {
-        CHECK(store.get_for_auth_revalidate("engine:brownout").status ==
+        CHECK(EngineLivenessTestAccess::revalidate(store, "engine:brownout").status ==
               EngineLookupStatus::StoreUnreachable);
     }
     CHECK(store.revalidate_cache_misses() == 1); // no further reads attempted
@@ -690,7 +691,7 @@ TEST_CASE("an unreachable store is rate-limited, not re-asked on every tick",
     // Backoff is short by design — recovery must be noticed promptly, so past
     // the window (plus its maximum jitter) the store is probed again.
     fake_now += std::chrono::seconds(11);
-    CHECK(store.get_for_auth_revalidate("engine:brownout").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:brownout").status ==
           EngineLookupStatus::StoreUnreachable);
     CHECK(store.revalidate_cache_misses() == 2);
 }
@@ -714,7 +715,7 @@ TEST_CASE("the revalidate cache is physically bounded, not just filtered",
     for (int i = 0; i < 3; ++i) {
         const auto id = "engine:cap-" + std::to_string(i);
         REQUIRE(store.create("B", "alice", "j", "internal", "admin", id).has_value());
-        REQUIRE(store.get_for_auth_revalidate(id).status == EngineLookupStatus::Active);
+        REQUIRE(EngineLivenessTestAccess::revalidate(store, id).status == EngineLookupStatus::Active);
     }
     CHECK(store.revalidate_cache_resident_for_test() == 3);
 
@@ -723,17 +724,17 @@ TEST_CASE("the revalidate cache is physically bounded, not just filtered",
     // gets a correct answer -- read-through is slower, never wrong.
     REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:cap-overflow")
                .has_value());
-    const auto overflow = store.get_for_auth_revalidate("engine:cap-overflow");
+    const auto overflow = EngineLivenessTestAccess::revalidate(store, "engine:cap-overflow");
     CHECK(overflow.status == EngineLookupStatus::Active);
     CHECK_FALSE(overflow.from_cache);
     CHECK(store.revalidate_cache_resident_for_test() == 3); // ceiling held
     // ...and it was not cached, so the next call reads through again.
-    CHECK_FALSE(store.get_for_auth_revalidate("engine:cap-overflow").from_cache);
+    CHECK_FALSE(EngineLivenessTestAccess::revalidate(store, "engine:cap-overflow").from_cache);
 
     // Once the incumbents expire, the sweep reclaims their slots on the next
     // insert -- residency must come DOWN, which a filtered count cannot show.
     fake_now += std::chrono::seconds(30);
-    REQUIRE(store.get_for_auth_revalidate("engine:cap-overflow").status ==
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:cap-overflow").status ==
             EngineLookupStatus::Active);
     CHECK(store.revalidate_cache_resident_for_test() == 1);
 }
@@ -753,13 +754,13 @@ TEST_CASE("the failure-backoff map is bounded on its own insert path",
 
     for (int i = 0; i < 8; ++i) {
         const auto id = "engine:backoff-" + std::to_string(i);
-        CHECK(store.get_for_auth_revalidate(id).status == EngineLookupStatus::StoreUnreachable);
+        CHECK(EngineLivenessTestAccess::revalidate(store, id).status == EngineLookupStatus::StoreUnreachable);
     }
     CHECK(store.revalidate_backoff_resident_for_test() <= 3);
 
     // After the windows elapse the sweep reclaims them on the next insert.
     fake_now += std::chrono::seconds(30);
-    CHECK(store.get_for_auth_revalidate("engine:backoff-late").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:backoff-late").status ==
           EngineLookupStatus::StoreUnreachable);
     CHECK(store.revalidate_backoff_resident_for_test() == 1);
 }
@@ -776,7 +777,7 @@ TEST_CASE("a revoke clears the failure backoff, so a revoked principal is not he
     REQUIRE(store.is_open());
     REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:backoff-revoke")
                .has_value());
-    REQUIRE(store.get_for_auth_revalidate("engine:backoff-revoke").status ==
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:backoff-revoke").status ==
             EngineLookupStatus::Active);
 
     store.invalidate_revalidate_cache("engine:backoff-revoke");
@@ -786,7 +787,7 @@ TEST_CASE("a revoke clears the failure backoff, so a revoked principal is not he
     REQUIRE(revoked.has_value());
     CHECK(store.revalidate_cache_resident_for_test() == 0);
     CHECK(store.revalidate_backoff_resident_for_test() == 0);
-    CHECK(store.get_for_auth_revalidate("engine:backoff-revoke").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:backoff-revoke").status ==
           EngineLookupStatus::MissingOrRevoked);
 }
 
@@ -813,13 +814,16 @@ TEST_CASE("concurrent revalidate + revoke never leaves a stale Active (TSan)",
     for (int i = 0; i < 4; ++i) {
         readers.emplace_back([&] {
             while (!stop.load(std::memory_order_acquire)) {
-                const auto r = store.get_for_auth_revalidate("engine:race");
-                // THE invariant: once the revoke has returned, no later call
-                // may still report the principal live. A call that overlaps the
-                // revoke may legitimately return Active once (documented
-                // bounded window), hence the ordering guard.
-                if (revoked_done.load(std::memory_order_acquire) &&
-                    r.status == EngineLookupStatus::Active) {
+                // Snapshot BEFORE the call, not after. THE invariant is that a
+                // call which STARTS after the revoke has returned can never
+                // report the principal live. Sampling afterwards instead would
+                // misattribute a call that began before the revoke and
+                // legitimately returned a cached Active -- the documented
+                // bounded single-call window -- and flake under TSan
+                // scheduling.
+                const bool already_revoked = revoked_done.load(std::memory_order_acquire);
+                const auto r = EngineLivenessTestAccess::revalidate(store, "engine:race");
+                if (already_revoked && r.status == EngineLookupStatus::Active) {
                     stale_after_revoke.store(true, std::memory_order_release);
                 }
             }
@@ -846,7 +850,7 @@ TEST_CASE("concurrent revalidate + revoke never leaves a stale Active (TSan)",
     poller.join();
 
     CHECK_FALSE(stale_after_revoke.load());
-    CHECK(store.get_for_auth_revalidate("engine:race").status ==
+    CHECK(EngineLivenessTestAccess::revalidate(store, "engine:race").status ==
           EngineLookupStatus::MissingOrRevoked);
 }
 
@@ -859,8 +863,8 @@ TEST_CASE("invalidate_revalidate_cache clears one principal or all of them",
     REQUIRE(store.is_open());
     REQUIRE(store.create("A", "alice", "j", "internal", "admin", "engine:inv-a").has_value());
     REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:inv-b").has_value());
-    REQUIRE(store.get_for_auth_revalidate("engine:inv-a").status == EngineLookupStatus::Active);
-    REQUIRE(store.get_for_auth_revalidate("engine:inv-b").status == EngineLookupStatus::Active);
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:inv-a").status == EngineLookupStatus::Active);
+    REQUIRE(EngineLivenessTestAccess::revalidate(store, "engine:inv-b").status == EngineLookupStatus::Active);
     REQUIRE(store.revalidate_cache_size() == 2);
 
     store.invalidate_revalidate_cache("engine:inv-a");

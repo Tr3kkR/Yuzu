@@ -272,7 +272,17 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
         std::lock_guard lk(revalidate_cache_mu_);
         revalidate_backoff_.erase(principal_id); // reachable again
         if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
-            const auto stamp = clock_();
+            // Age the entry from BEFORE the read, not after it. The consumer
+            // treats a cache hit as "the store confirmed this within the TTL"
+            // and credits its own freshness budget accordingly, so the stamp
+            // must not be later than the instant the fact was actually
+            // observed. A slow-but-successful query (the pool allows up to the
+            // read timeout, and a server-side statement can run longer still)
+            // would otherwise stamp a fact observed at T as T+latency and let
+            // it be served a further TTL, pushing total survival past the
+            // grace window. Using the pre-read timestamp only ever expires the
+            // entry EARLIER, which is the safe direction.
+            const auto stamp = now;
             if (revalidate_cache_.size() >= max_entries_)
                 sweep_expired_locked(stamp);
             // Still full after the sweep: decline to cache rather than evict
@@ -286,6 +296,11 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
     }
 
     return {fresh.status, /*from_cache=*/false};
+}
+
+EngineRevalidate EngineLivenessTestAccess::revalidate(const EnginePrincipalStore& store,
+                                                      const std::string& principal_id) {
+    return store.get_for_auth_revalidate(principal_id);
 }
 
 void EnginePrincipalStore::sweep_expired_locked(
@@ -318,6 +333,12 @@ void EnginePrincipalStore::set_max_entries_for_test(std::size_t n) {
 }
 
 void EnginePrincipalStore::set_clock_for_test(ClockFn fn) {
+    // Under the cache mutex: every production read of `clock_` happens either
+    // under this mutex or on a path serialised by it, and the threaded tests
+    // establish genuine multi-threaded use of this store. Setting it is still
+    // contractually a before-concurrency operation, but taking the lock costs
+    // nothing and removes the one unsynchronised write.
+    std::lock_guard lk(revalidate_cache_mu_);
     clock_ = fn ? std::move(fn) : ClockFn{[] { return std::chrono::steady_clock::now(); }};
 }
 

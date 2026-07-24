@@ -62,6 +62,14 @@ enum class CredentialCheck : int {
     /// Not a denial and not a degradation — the credential IS valid. A consumer
     /// that does not model staleness may safely treat this as `kValid`; it will
     /// simply inherit the additive window described above.
+    ///
+    /// PRODUCER INVARIANT: every site that returns this must be bounded by a
+    /// staleness limit the consumer knows about. `McpStreamPump` clamps its
+    /// authoritative floor forward by `Config::revalidate_max_staleness`, which
+    /// is wired from the ONE current producer's cache TTL
+    /// (`EnginePrincipalStore::kAuthCacheTtl`). A second producer with a longer
+    /// window, added without raising that config, would silently over-grant
+    /// grace — the clamp would credit a confirmation that never happened.
     kValidStale,
 };
 

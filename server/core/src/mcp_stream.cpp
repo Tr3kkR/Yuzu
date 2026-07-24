@@ -954,6 +954,24 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
                 last_authoritative_ok_ =
                     std::max(last_authoritative_ok_, now() - cfg_.revalidate_max_staleness);
             }
+            // ...and CLEAR any armed deadline, because this IS positive
+            // evidence: a cached answer only exists because an authoritative
+            // read succeeded within the staleness window. Leaving the deadline
+            // armed would kill a healthy stream -- two streams on one
+            // principal, outage ends, the one that ticks first re-reads and
+            // warms the shared entry, and the other then rides cache hits with
+            // a deadline armed during the outage still counting down. It would
+            // close `auth_unavailable` against a reachable store and an Active
+            // principal, contradicting CH-4's recovered-backend invariant.
+            //
+            // The bound survives because the floor advanced only to
+            // `now - max_staleness`: a re-armed deadline is computed from that,
+            // and cached answers cannot outlive a dead store by more than one
+            // cache window (entries expire and are not renewed without a
+            // successful read), so an outage still ends the stream within
+            // `revalidate_grace` of its last real confirmation.
+            grace_start_.reset();
+            grace_deadline_.reset();
             break;
         default:
             // Fail CLOSED on an enumerator this pump does not know, matching

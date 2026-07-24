@@ -81,7 +81,7 @@ lease. Per-store classes stay single-schema owners and **never expose their leas
 is committed now; the seam is **built when its first consumer (vuln-graph scoring) lands**, not
 speculatively. Until then no store may grow a cross-schema method.
 
-### 5. Read caching on an authoritative store (added 2026-07-24, #2367)
+### 4. Read caching on an authoritative store (added 2026-07-24, #2367)
 
 An authoritative store MAY cache reads, subject to all five of the following. The rules were
 first worked out for `EnginePrincipalStore`'s stream-liveness cache (ADR-0031) after an external
@@ -91,7 +91,7 @@ re-derive them differently.
 1. **Positive results only.** Never cache a "not found" (it needs a create-path invalidation hook
    to avoid masking a freshly created row) and never cache a store-unreachable result (caching
    "I could not ask" extends the outage). A failure MAY be *rate-limited* — repeating a recently
-   obtained deny-class answer without taking a lease, for a window far shorter than the positive
+   obtained deny-class answer without taking a lease, for a window shorter than the positive
    TTL — which is a different thing from caching it, and is what stops the per-tick retry storm
    the cache exists to prevent from simply returning once entries age out.
 2. **Invalidate synchronously on the store's own writes, AFTER the write lands**, under a

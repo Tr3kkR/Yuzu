@@ -237,7 +237,7 @@ private:
     ///
     /// PRIVATE ON PURPOSE (#2367). This is the ONLY site that reads the engine
     /// principal through `EnginePrincipalStore::get_for_auth_revalidate`, i.e. the
-    /// 60 s cached path. That is sound here and only here, because the stream
+    /// 15 s cached path. That is sound here and only here, because the stream
     /// revalidation this serves already tolerates staleness of the same order by
     /// design (on StoreUnreachable the pump rides out a ~60 s grace window,
     /// Decision 15(i)/CH-4). A FRESH authorization decision tolerates none, so
