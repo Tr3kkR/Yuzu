@@ -6744,23 +6744,21 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
           "[mcp][integration][execute][bridge][2f]") {
     namespace smcp = yuzu::server::mcp;
 
-    // Real tracker (SQLite) + bus + session registry + bridge, mock everything else.
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-bridge-tracker-");
-    std::filesystem::remove(db_path);
+    // Real tracker + bus + session registry + bridge, mock everything else.
+    // :memory: (not a temp FILE) on purpose: this TEST_CASE re-runs its fixture
+    // per SECTION, and file-SQLite create_tables is serialized by Defender on the
+    // Windows CI runner (flake #473 class) - the dominant per-section cost that
+    // pushed the server suite over its 600s meson cap (#2092/#2093). The tracker
+    // uses this single connection, so an in-memory DB is fully equivalent here.
     sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
     struct Guard {
         sqlite3* h;
-        std::filesystem::path p;
         ~Guard() {
             if (h)
                 sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
         }
-    } guard{db, db_path};
+    } guard{db};
 
     yuzu::server::ExecutionTracker tracker(db);
     tracker.create_tables();

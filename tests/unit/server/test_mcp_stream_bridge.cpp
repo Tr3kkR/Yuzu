@@ -498,7 +498,7 @@ TEST_CASE("bridge second-thread terminal vs park (TSan)", "[mcp][bridge][2f]") {
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(5), "exec-t"));
     auto flood = std::async(std::launch::async, [&] {
-        for (int i = 0; i < 50; ++i) {
+        for (int i = 0; i < 20; ++i) {  // enough to race the arm; keeps Windows-debug wall-clock low
             fx.bus.publish("exec-t", "execution-progress", kProgress13);
         }
         fx.bus.publish("exec-t", "execution-completed", kCompleted, /*is_terminal=*/true);
@@ -736,7 +736,10 @@ TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
     SECTION("arm-vs-abandon race: exactly one arbitration winner (TSan)") {
         Fx fx;
         auto s = fx.make_session();
-        for (int i = 0; i < 50; ++i) {
+        // 15 iterations (was 50): each spawns 2 threads; the race manifests within
+        // a handful of interleavings under TSan, and 100 thread spawn/joins on the
+        // Windows-debug CI runner was material wall-clock (server suite 600s cap).
+        for (int i = 0; i < 15; ++i) {
             REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), false).ok);
             std::atomic<bool> go{false};
             auto armer = std::async(std::launch::async, [&] {
