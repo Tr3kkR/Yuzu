@@ -396,4 +396,12 @@ private:
 // were relocated to mcp_server_testonly.hpp (issue #2385) — production callers
 // have no reason to see them.
 
+// The served tool names whose calls can reach the #2405 pre-approval
+// input-schema gate — every tool whose (securable, operation) makes
+// requires_approval() true for some tier. Sorted, deterministic. This is the
+// closed label set server.cpp pre-seeds for yuzu_mcp_tool_args_invalid_total
+// (docs/observability-conventions.md: bounded-label counters are pre-seeded
+// to 0 so absent() alerts stay meaningful).
+std::vector<std::string> approval_gated_tool_names();
+
 } // namespace yuzu::server::mcp

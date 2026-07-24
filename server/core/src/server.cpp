@@ -513,6 +513,12 @@ public:
                           "bypassed; alert on > 0 "
                           "(docs/ops-runbooks/mcp-tool-registration-recovery.md)",
                           "counter");
+        metrics_.describe("yuzu_mcp_tool_args_invalid_total",
+                          "MCP tools/call denials where the arguments failed the tool's "
+                          "input schema before approval-ticket mint/consume (#2405); a "
+                          "spike on one tool means a supervised worker is submitting "
+                          "malformed arguments or probing",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
@@ -521,6 +527,12 @@ public:
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
         metrics_.counter("yuzu_mcp_tool_security_misconfig_total");
+        // Pre-seed the #2405 schema-denial counter for every approval-gated
+        // tool — the closed label set that can reach the gate — so absent()
+        // alerts stay meaningful (observability-conventions.md).
+        for (const auto& tool : mcp::approval_gated_tool_names()) {
+            metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
+        }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});

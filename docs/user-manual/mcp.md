@@ -1034,10 +1034,17 @@ recall once it is approved.
 
 **Cause**: A required parameter is missing or invalid. For example, calling
 `get_agent_details` without `agent_id`, or calling `query_responses` with
-neither `execution_id` nor `instruction_id`.
+neither `execution_id` nor `instruction_id`. For an approval-gated tool this
+can also fire on a **recall** carrying `approval_id`: if the arguments fail
+schema validation the call is denied `-32602` immediately, before the ticket
+is even looked up (nothing consumed) — distinct from `-32003`'s "arguments
+don't match the ticket", which applies only to schema-*valid* mismatched
+arguments (#2405).
 
-**Fix**: Include all required parameters in the `arguments` object. See the
-[Available Tools](#available-tools) section for parameter requirements.
+**Fix**: Include all required parameters in the `arguments` object, typed as
+the tool's `inputSchema` declares (integers must be JSON integers — `1.0` is
+rejected). See the [Available Tools](#available-tools) section for parameter
+requirements.
 
 ### MCP client cannot connect
 

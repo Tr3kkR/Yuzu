@@ -6060,6 +6060,28 @@ TEST_CASE("MCP 2405: registration validator rejects malformed and unsupported in
             {{"t", R"({"type":["object","string"],"properties":{}})"}}),
         ContainsSubstring("must be a single string (unions are unsupported)"));
 
+    // Non-empty schema sequence must be honest (Gate 2 sec-LOW-1): duplicate
+    // rows and name-disparity with the served set are offences — a testonly
+    // caller cannot "pass" by supplying a shorter or disjoint schema list.
+    // ({} still deliberately skips schema checks for #2383-only tests.)
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{}})"},
+             {"t", R"({"type":"object","properties":{}})"}}),
+        ContainsSubstring("duplicate input schema row for 't'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t", "u"}, {{"t", "Tag", "Read"}, {"u", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{}})"}}),
+        ContainsSubstring("served tool 'u' has no input schema row"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{}})"},
+             {"ghost", R"({"type":"object","properties":{}})"}}),
+        ContainsSubstring("input schema row 'ghost' names no served tool"));
+
     // Multiple simultaneous schema offences: ALL named, sorted alongside the
     // table offences (the same accumulate-all + sort determinism as #2383).
     try {
@@ -6200,6 +6222,13 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
     for (const auto& [name, inst] : gated_instances)
         covered.insert(name);
     CHECK(gated == covered);
+
+    // The production accessor server.cpp pre-seeds the
+    // yuzu_mcp_tool_args_invalid_total labels from must agree with the same
+    // derivation — a drift here would seed stale metric labels.
+    const auto seeded = yuzu::server::mcp::approval_gated_tool_names();
+    CHECK(std::set<std::string>(seeded.begin(), seeded.end()) == gated);
+    CHECK(std::is_sorted(seeded.begin(), seeded.end()));
 
     // Every served schema compiles; every gated tool's minimal instance is
     // accepted, both bare and with the injected approval_id.

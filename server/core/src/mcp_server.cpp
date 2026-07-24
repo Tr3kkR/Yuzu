@@ -1329,11 +1329,32 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
                                          const std::vector<ToolSchemaSource>& input_schemas) {
     std::vector<std::string> offences;
 
-    for (const auto& s : input_schemas) {
-        auto compiled = compile_input_schema(s.input_schema_json);
-        if (!compiled)
-            for (const auto& e : compiled.error())
-                offences.push_back("tool '" + std::string(s.name) + "' input schema: " + e);
+    // An EMPTY schema sequence skips the schema checks entirely — the
+    // #2383-only synthetic validator tests pass {} deliberately. A NON-empty
+    // sequence must be honest: duplicates rejected and name-parity with the
+    // served set both directions, so a testonly caller cannot "pass" by
+    // supplying a shorter or disjoint schema list (Gate 2 sec-LOW-1).
+    if (!input_schemas.empty()) {
+        std::unordered_set<std::string_view> schema_names;
+        schema_names.reserve(input_schemas.size());
+        for (const auto& s : input_schemas) {
+            if (!schema_names.insert(s.name).second)
+                offences.push_back("duplicate input schema row for '" + std::string(s.name) +
+                                   "'");
+        }
+        for (const auto& n : tool_names)
+            if (!schema_names.contains(n))
+                offences.push_back("served tool '" + std::string(n) + "' has no input schema row");
+        for (const auto& s : input_schemas)
+            if (std::find(tool_names.begin(), tool_names.end(), s.name) == tool_names.end())
+                offences.push_back("input schema row '" + std::string(s.name) +
+                                   "' names no served tool");
+        for (const auto& s : input_schemas) {
+            auto compiled = compile_input_schema(s.input_schema_json);
+            if (!compiled)
+                for (const auto& e : compiled.error())
+                    offences.push_back("tool '" + std::string(s.name) + "' input schema: " + e);
+        }
     }
 
     std::unordered_set<std::string_view> names;
@@ -1733,6 +1754,18 @@ McpServer::McpServer() {
     // Build the derived compiled-schema cache now — after the validator has
     // accepted the raw sequences — rather than lazily on the first request.
     (void)compiled_input_schemas();
+}
+
+std::vector<std::string> approval_gated_tool_names() {
+    std::vector<std::string> out;
+    for (const auto& r : kToolSecurityRows)
+        for (const char* tier : {"operator", "supervised"})
+            if (requires_approval(tier, r.sec.securable_type, r.sec.operation)) {
+                out.emplace_back(r.name);
+                break;
+            }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // ── Handler construction ─────────────────────────────────────────────────
