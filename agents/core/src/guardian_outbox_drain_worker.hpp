@@ -77,15 +77,18 @@ namespace yuzu::agent {
 
 class GuardianLifecycleJournal;
 
-/// Journal REPLAY-PAGE cadence. Load-bearing (#2298 governance f-1/A1): a paging pass is
-/// a full `list_entries` + parse + `validate_record` sweep of the journal, and
-/// JournalPagingBucket charges a token only when a batch pages NET-NEW work. So when the
-/// send window already holds every candidate - the normal state while the link is down and
-/// the backlog is retained - the bucket never throttles and every wake rescans the whole
-/// journal. Since the drain worker wakes on EVERY outbox enqueue, "page on every wake" is
-/// unbounded scan cost driven by the event rate. 30 s restores exactly the pre-C0 rate (one
+/// Journal REPLAY-PAGE cadence. Load-bearing (#2298 governance f-1/A1): a paging pass scans
+/// the whole batch-key namespace, and JournalPagingBucket charges a token only when a batch
+/// pages NET-NEW work. So when the send window already holds every candidate - the normal
+/// state while the link is down and the backlog is retained - the bucket never throttles and
+/// every wake rescans. Since the drain worker wakes on EVERY outbox enqueue, "page on every
+/// wake" is scan cost driven by the event rate. 30 s restores exactly the pre-C0 rate (one
 /// page per heartbeat tick); the reconnect kick still forces an immediate page, so replay
 /// promptness is unaffected.
+///
+/// The per-pass cost is much lower since #2299 - the scan reads keys and value lengths, and
+/// values are read only for the candidates actually considered - but the cadence still bounds
+/// the SCAN, which no amount of lazy parsing removes.
 inline constexpr std::chrono::milliseconds kGuardianJournalPageInterval{30'000};
 
 /// Retention-prune cadence. TIME-based for the same reason, and additionally because the

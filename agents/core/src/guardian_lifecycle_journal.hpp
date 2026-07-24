@@ -142,7 +142,9 @@ struct PersistedBatch {
 struct JournalPruneStats {
     bool read_ok{false};           ///< the initial journal scan succeeded (gates the boot barrier, M5)
     std::size_t evicted{0};        ///< batches removed by retention (age/count/bytes)
-    std::size_t quarantined{0};    ///< unparseable batches moved aside this pass
+    std::size_t quarantined{0};    ///< MALFORMED-KEY / implausibly-sized batches moved
+                                   ///< aside this pass. A corrupt VALUE is quarantined by
+                                   ///< the REPLAY pass instead (#2299), not counted here.
     std::size_t sent_labels_gc{0}; ///< orphaned/evicted sent-labels removed this pass
 };
 
@@ -166,7 +168,8 @@ public:
     /// Enforce retention + quarantine (design §6, rev-4.1 #9). Evicts the oldest
     /// batches by (ts_ms, key) once they exceed the age (kJournalRetentionDays),
     /// count (kMaxJournalBatches), or byte (kMaxJournalBytes) caps; moves any
-    /// unparseable batch aside to a bounded quarantine (atomic rename); GCs
+    /// malformed-KEY or implausibly-sized batch aside to a bounded quarantine (atomic
+/// rename) - a corrupt VALUE is the replay pass's to quarantine since #2299; GCs
     /// sent-labels whose batch no longer survives. `now_ms` is the wall clock in ms
     /// (a parameter so age eviction is testable). Fail-safe: a read error counts
     /// prune_failures and returns, never throws, never fatal. Runs off mtx_ (KvStore
@@ -226,9 +229,15 @@ public:
     [[nodiscard]] std::uint64_t batches_pruned() const noexcept {
         return batches_pruned_.load(std::memory_order_relaxed);
     }
-    /// page_into_window passes whose journal scan failed. The read is the same O(journal)
-    /// KvStore scan prune() counts under prune_failures(); without its own counter a page-side
-    /// read failure is invisible and replay silently does nothing (#2345 Gate 6 SRE).
+    /// Page-side KvStore READ FAILURES. Two kinds, deliberately on one counter: a failed
+    /// candidate SCAN (one per pass, the pass then pages nothing) and, since #2299, a failed
+    /// per-candidate VALUE read (up to the per-pass candidate cap, each leaving that one
+    /// candidate's disposition unknown). Both mean "replay could not read what it needed",
+    /// which is the operator question; without a counter at all a page-side read failure is
+    /// invisible and replay silently does nothing (#2345 Gate 6 SRE).
+    ///
+    /// NOTE the unit is therefore FAILED READS, not failed passes - a single pass can add
+    /// more than one. Do not read a rate off this as a pass-failure rate.
     [[nodiscard]] std::uint64_t page_read_failures() const noexcept {
         return page_read_failures_.load(std::memory_order_relaxed);
     }
@@ -255,6 +264,12 @@ public:
     [[nodiscard]] std::uint64_t evicted_sent_unacked() const noexcept {
         return evicted_sent_unacked_.load(std::memory_order_relaxed);
     }
+    /// Batches retention removed with NO sent-label - the audit-loss signal. Since #2299 it
+    /// also absorbs a batch whose VALUE was corrupt and which the replay rotation never
+    /// reached before it aged out (corrupt-value quarantine moved to the replay pass, so
+    /// prune no longer intercepts such a row). Both are lost evidence, so the alarm is not
+    /// wrong - but on a mass-corruption endpoint it no longer distinguishes "never
+    /// delivered" from "never deliverable". Read it with `quarantined` when diagnosing.
     [[nodiscard]] std::uint64_t evicted_without_send_evidence() const noexcept {
         return evicted_without_send_evidence_.load(std::memory_order_relaxed);
     }
@@ -355,7 +370,7 @@ public:
         post_classify_hook_ = std::move(hook);
     }
 
-    /// TEST-ONLY: force the next `n` journal SCANS (the list_entries at the head of a prune
+    /// TEST-ONLY: force the next `n` journal SCANS (the keys-only scan at the head of a prune
     /// pass) to fail, exercising the read-error fail-safe: prune_failures increments, read_ok
     /// stays false, and the boot-prune barrier does NOT latch (design §10 "injected list
     /// failure distinguished from empty & retried"). No production caller.
@@ -363,7 +378,7 @@ public:
         inject_fail_reads_.store(n, std::memory_order_relaxed);
     }
 
-    /// TEST-ONLY: force the next `n` REPLAY scans (the list_entries at the head of
+    /// TEST-ONLY: force the next `n` REPLAY scans (the keys-only scan at the head of
     /// page_into_window) to fail. Deliberately a separate counter from the prune-side
     /// injection: the point of page_read_failures() is that the two scans fail independently,
     /// so a test that conflated them could not observe the difference. No production caller.
@@ -376,6 +391,40 @@ public:
     }
     void inject_page_read_failures_for_test(int n) noexcept {
         inject_fail_page_reads_.store(n, std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: force the next `n` prune-side SENT-LABEL scans to fail, exercising the
+    /// eviction classifier's per-key fallback. Separate from the page-side sent-scan
+    /// injection: the two passes read the same namespace for different reasons and must fail
+    /// independently for either fallback to be testable. No production caller.
+    void inject_prune_sent_scan_failures_for_test(int n) noexcept {
+        inject_fail_prune_sent_scans_.store(n, std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: force the next `n` prune-side per-key sent-label POINT reads to fail. Pair
+    /// it with the scan injection above to stage the correlated failure that matters - one
+    /// broken database, not one broken key - and prove an evicted batch of UNKNOWN
+    /// disposition is counted as neither sent nor unsent. No production caller.
+    void inject_prune_sent_read_failures_for_test(int n) noexcept {
+        inject_fail_prune_sent_reads_.store(n, std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: force the next `n` per-candidate VALUE reads (the point read a replay pass
+    /// issues only for a candidate it actually considers) to fail. Distinct from the two scan
+    /// injections above: those fail before any value is read, so without this the point-read
+    /// error path - which must NOT be recorded as block-free coverage - is unreachable from a
+    /// test. No production caller.
+    void inject_value_read_failures_for_test(int n) noexcept {
+        inject_fail_value_reads_.store(n, std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY: how many candidate VALUES the replay pass has read from the KvStore. The
+    /// O(work) proof: a pass over a journal whose candidates are all sent-labelled, expired or
+    /// outside the per-pass cap must read ZERO values, where the pre-#2299 pass read (and
+    /// parsed) every row in the namespace. Deliberately NOT a heartbeat/fleet counter - it
+    /// pins an implementation property, not an operator signal.
+    [[nodiscard]] std::uint64_t candidate_value_fetches_for_test() const noexcept {
+        return candidate_value_fetches_.load(std::memory_order_relaxed);
     }
 
     /// TEST-ONLY: overwrite the size gauges directly, to stage a state the production
@@ -397,7 +446,7 @@ public:
         post_scan_hook_ = std::move(hook);
     }
 
-    /// TEST-ONLY: run `hook` inside prune_locked_ BEFORE `list_entries` (between the pre_count
+    /// TEST-ONLY: run `hook` inside prune_locked_ BEFORE the scan (between the pre_count
     /// snapshot and the scan). This is the window where a concurrent persist's row IS seen by
     /// the scan AND carries its own fetch_add - the transient DOUBLE-count. Proves it self-heals
     /// to the true on-disk size (over-count only, ceiling tightens). Complements the post-scan
@@ -437,7 +486,9 @@ private:
     std::atomic<std::uint64_t> batches_written_{0};
     std::atomic<std::uint64_t> write_failures_{0};
     std::atomic<std::uint64_t> key_collisions_{0};
-    std::atomic<std::uint64_t> quarantined_{0};         ///< unparseable batches moved aside
+    std::atomic<std::uint64_t> quarantined_{0};         ///< batches moved aside: malformed key
+                                                        ///< or implausible size (prune), corrupt
+                                                        ///< value (replay pass, since #2299)
     std::atomic<std::uint64_t> quarantine_failures_{0}; ///< could not even quarantine a corrupt batch
     std::atomic<std::uint64_t> batches_pruned_{0};      ///< batches evicted by retention
     std::atomic<std::uint64_t> prune_failures_{0};      ///< a prune pass could not read the journal
@@ -458,7 +509,7 @@ private:
     std::atomic<std::uint64_t> gauge_underflow_{0};              ///< ceiling check saw a negative gauge (UP-2)
     std::atomic<bool> size_seeded_{false};              ///< seed_size_gauges_ call-once guard (UP-7)
     std::function<void()> post_scan_hook_;              ///< test-only prune interleaving seam (null in prod)
-    std::function<void()> pre_scan_hook_;               ///< test-only pre-list_entries interleaving seam (UP-3)
+    std::function<void()> pre_scan_hook_;               ///< test-only pre-scan interleaving seam (UP-3)
     std::function<void()> post_classify_hook_;          ///< test-only per-candidate seam (mid-loop stop, null in prod)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
@@ -486,6 +537,12 @@ private:
     std::atomic<std::uint64_t> page_read_failures_{0};
     std::atomic<std::uint64_t> sent_scan_failures_{0};
     std::atomic<int> inject_fail_sent_scans_{0}; ///< test-only: fail the next N label scans
+    std::atomic<int> inject_fail_value_reads_{0}; ///< test-only: fail the next N candidate value reads
+    std::atomic<int> inject_fail_prune_sent_scans_{0}; ///< test-only: fail the next N prune label scans
+    std::atomic<int> inject_fail_prune_sent_reads_{0}; ///< test-only: fail the next N prune label reads
+    std::atomic<std::uint64_t> candidate_value_fetches_{0}; ///< test-only O(work) proof counter
+    /// One-shot latch for the retired-key-format warn (prune only, under paging_mutex_).
+    bool old_format_key_warned_{false};
     /// Fair-rotation cursor (review B2): the last-CONSIDERED (ts_ms, key). Each pass resumes at
     /// the first candidate strictly greater and wraps, so the never-sent tail is reached instead
     /// of the oldest sent-and-popped batches monopolising the bucket. Process-local (NOT

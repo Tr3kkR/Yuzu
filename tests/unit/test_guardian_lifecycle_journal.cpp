@@ -14,7 +14,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -224,8 +226,12 @@ TEST_CASE("journal prune: byte cap evicts to satisfy the budget", "[guardian][jo
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 0);
 }
 
-TEST_CASE("journal prune: an unparseable batch is quarantined; good batches survive",
+TEST_CASE("journal prune: a MALFORMED-KEY batch is quarantined; good batches survive",
           "[guardian][journal][prune]") {
+    // A key that fails the strict shape check has no trustworthy timestamp, so retention can
+    // neither age nor order it - it is quarantined on sight. (This key is also in the
+    // pre-#2299 format, which is corruption for the same reason: the journal was dormant when
+    // the format changed, so no row on any disk can legitimately carry it.)
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     REQUIRE(t.kv->set(kJournalNamespace, "lc:corrupt:000000000000", "not valid json"));
@@ -242,6 +248,33 @@ TEST_CASE("journal prune: an unparseable batch is quarantined; good batches surv
     REQUIRE(b.has_value());
     CHECK(b->entries.at(0).rule_id == "good");
     CHECK(count_keys(*t.kv, kQuarantineKeyPrefix) == 1); // the corrupt one moved aside
+}
+
+TEST_CASE("journal prune: a corrupt VALUE under a good key survives prune (lazy-parse pin)",
+          "[guardian][journal][prune]") {
+    // The O(work) contract (#2299 perf-P-1): prune reads KEYS and value BYTE LENGTHS only, so
+    // it can no longer see that a value is garbage - the replay pass quarantines it when it
+    // reads the candidate it is about to place. Prune must therefore leave the row alone and
+    // treat it as an ordinary retention candidate. This is the assertion that goes red if
+    // someone "restores" a value parse to the prune scan.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    const std::int64_t now = 1'700'000'000'000;
+    REQUIRE(t.kv->set(kJournalNamespace, journal_batch_key(now, "wellkeyed", 0), "not valid json"));
+    REQUIRE(j.persist(one("good", "armed")) == 1);
+
+    auto stats = j.prune(now);
+    CHECK(stats.quarantined == 0); // prune did not read the value, so it saw nothing wrong
+    CHECK(j.quarantined() == 0);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+    CHECK(count_keys(*t.kv, kQuarantineKeyPrefix) == 0);
+
+    // It is still BOUNDED - the corrupt row is subject to every ceiling like any other row.
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/1, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    const auto trimmed = j.prune(now);
+    CHECK(trimmed.evicted == 1);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1);
 }
 
 TEST_CASE("journal prune: an orphan sent-label is GC'd", "[guardian][journal][prune]") {
@@ -304,6 +337,56 @@ TEST_CASE("mark_batch_sent writes a sent-label; eviction classifies by its prese
     j.prune(0); // both evicted
     CHECK(j.evicted_sent_unacked() == 1);          // r1 had a sent-label
     CHECK(j.evicted_without_send_evidence() == 1);  // r2 had none
+}
+
+TEST_CASE("eviction classification falls back to a per-key read when the label scan fails",
+          "[guardian][journal][prune]") {
+    // The classifier reads the sent-label namespace ONCE per pass instead of once per evicted
+    // key. If that scan fails it must still classify - from a bounded per-key read - or a
+    // transient scan error would silently report a whole evict set as unsent.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100); // count cap 0 -> evict everything
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    j.mark_batch_sent((*rows)[0].key);          // this batch WAS delivered
+    REQUIRE(j.persist(one("r2", "armed")) == 1); // this one was not
+
+    j.inject_prune_sent_scan_failures_for_test(1);
+    j.prune(0);
+    CHECK(j.evicted_sent_unacked() == 1);         // the fallback found r1's label
+    CHECK(j.evicted_without_send_evidence() == 1); // and correctly found none for r2
+}
+
+TEST_CASE("eviction classification: an UNREADABLE sent-label counts NEITHER outcome",
+          "[guardian][journal][prune]") {
+    // The fallback has to be the FALLIBLE per-key read. exists() answers false for both
+    // "absent" and "the read failed", and the per-key read fails for exactly the reason the
+    // scan just did - one broken database, not one broken key - so an exists()-based fallback
+    // would report every evicted batch as "no send evidence", which is the reading an operator
+    // is meant to treat as audit loss. Unknown is not evidence of absence.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    REQUIRE(j.persist(one("r1", "armed")) == 1);
+    auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    j.mark_batch_sent((*rows)[0].key);
+
+    j.inject_prune_sent_scan_failures_for_test(1);
+    j.inject_prune_sent_read_failures_for_test(5); // the correlated failure
+    const auto stats = j.prune(0);
+
+    CHECK(stats.evicted == 1); // the eviction itself still happened and is counted
+    CHECK(j.batches_pruned() == 1);
+    CHECK(j.evicted_sent_unacked() == 0);
+    CHECK(j.evicted_without_send_evidence() == 0); // NOT reported as lost evidence
+    CHECK(j.prune_failures() >= 1);                // counted instead - once, not per key
 }
 
 // ── Fault-injection + capacity hardening (governance Gate 7) ──────────────────
@@ -657,10 +740,13 @@ TEST_CASE("journal prune: a future-dated batch is shed before real evidence",
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
 
-    // Hand-write a batch stamped a year ahead, alongside two ordinary ones.
-    const std::string future_key = std::string{kBatchKeyPrefix} + "future:000000000001";
+    // Hand-write a batch stamped a year ahead, alongside two ordinary ones. The future stamp
+    // has to be in the KEY: that is what retention reads, and a key carrying an ordinary
+    // timestamp would make this an ordinary batch no matter what the value said.
+    const std::int64_t future_ts = now + 365LL * 86400000;
+    const std::string future_key = journal_batch_key(future_ts, "future", 1);
     REQUIRE(t.kv->set(kJournalNamespace, future_key,
-                      std::format(R"({{"v":4,"ts_ms":{},"entries":[{}]}})", now + 365LL * 86400000,
+                      std::format(R"({{"v":4,"ts_ms":{},"entries":[{}]}})", future_ts,
                                   R"({"rule_id":"r","event_id":"future-1","kind":"armed",)"
                                   R"("guard_type":"file","rule_name":"n","generation":1,)"
                                   R"("enqueued_ns":1700000000000000000})")));
@@ -707,4 +793,94 @@ TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock ju
 
     const auto accepted = j.prune(now + 6000); // ...and the next pass proceeds
     CHECK(accepted.evicted == 2);
+}
+
+TEST_CASE("journal prune: an IMPLAUSIBLY LARGE value cannot evict the rest of the journal",
+          "[guardian][journal][prune]") {
+    // Gate 4 unhappy-path UP-1. Before #2299 prune parsed every value, so a corrupt row was
+    // quarantined OUT of the candidate set and never counted toward the byte ceiling. With a
+    // keys-only prune it counts for its full stored size - and byte eviction is deliberately
+    // UNCAPPED (it has to bring an over-ceiling journal back under in one pass), so a single
+    // tampered or bit-rotted oversized row would evict every older batch in one go, deleting
+    // undelivered evidence and counting it as ordinary retention.
+    //
+    // A row larger than persist() can produce is corruption by size, detectable from the scan
+    // alone. RED without the size check: the good batches are gone.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    // persist() stamps the real wall clock, so the fat row's key must be minted from the SAME
+    // clock to sit newest - a hardcoded epoch would make it oldest and the test would pass for
+    // the wrong reason (oldest-first would evict the fat row first, sparing the rest anyway).
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+
+    // Three ordinary batches, then one oversized row stamped NEWEST, so oldest-first eviction
+    // reaches the real evidence BEFORE it would ever reach the bad row.
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(j.persist(one("real" + std::to_string(i), "armed")) == 1);
+    // Sized from the stable BATCH cap, deliberately not from the threshold under test: a
+    // fixture derived from kMaxPlausibleJournalValueBytes would move with it and could not
+    // detect the threshold being widened.
+    const std::string fat_key = journal_batch_key(now + 60'000, "fat", 0);
+    REQUIRE(t.kv->set(kJournalNamespace, fat_key,
+                      std::string(2 * kMaxJournalBatchBytes + 1, 'x')));
+
+    // A byte ceiling far below the oversized row, so it alone would blow it.
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/kNoCap,
+                                    /*max_bytes=*/64 * 1024, /*max_quarantine=*/100);
+    const auto stats = j.prune(now);
+
+    CHECK(stats.quarantined == 1);                       // the oversized row moved aside...
+    CHECK_FALSE(t.kv->exists(kJournalNamespace, fat_key));
+    CHECK(stats.evicted == 0);                           // ...and took no real evidence with it
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 3);      // all three genuine batches survive
+    // And the gauge was adjusted by what actually left, not by a parsed size it never read.
+    CHECK(j.quarantined() == 1);
+}
+
+TEST_CASE("journal prune: a MAXIMAL legitimate batch is never size-quarantined",
+          "[guardian][journal][prune]") {
+    // The other half of the size-quarantine pin (Gate 8 security). The first test proves an
+    // oversized row IS quarantined; this one proves the threshold cannot reach a batch
+    // persist() can actually write - because a quarantined row is eventually deleted by the
+    // over-cap shed, so a threshold that crept below the write path's bound would silently
+    // destroy real audit evidence with only a counter to show for it.
+    //
+    // Built at the write path's worst case: every record carrying maximum-length fields, so
+    // the byte cap (not the entry cap) is what splits the batches.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    const std::string big(kMaxJournalFieldBytes - 1, 'x');
+    std::vector<std::shared_ptr<const JournalRecord>> pending;
+    for (int i = 0; i < 200; ++i) {
+        auto r = std::make_shared<JournalRecord>();
+        r->rule_id = big;
+        r->generation = 1;
+        r->event_id = "e" + std::to_string(i);
+        r->enqueued_ns = 1'700'000'000'000'000'000;
+        r->kind = "armed";
+        r->guard_type = "file";
+        r->rule_name = big;
+        pending.push_back(std::move(r));
+    }
+    REQUIRE(j.persist(pending) == 200);
+    const auto batches = j.batches_written();
+    REQUIRE(batches >= 2); // the byte cap really did split them
+
+    // Every row persist() wrote must be within the plausible-size bound...
+    auto rows = t.kv->list_keys_sized(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == batches);
+    for (const auto& r : *rows)
+        CHECK(r.bytes <= kMaxPlausibleJournalValueBytes);
+
+    // ...and a prune must leave every one of them alone.
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const auto stats = j.prune(now);
+    CHECK(stats.quarantined == 0);
+    CHECK(j.quarantined() == 0);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == batches);
 }

@@ -190,7 +190,9 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "write_capacity_rejected"},
     {"yuzu.guardian_journal_page_read_failures",
      "yuzu_fleet_guardian_journal_page_read_failures",
-     "Fleet sum of REPLAY passes whose journal scan failed. Kept separate from "
+     "Fleet sum of REPLAY-side journal READ FAILURES - the candidate scan (at most once "
+     "per pass) plus, since #2299, each per-candidate value read a pass attempts, so ONE "
+     "pass can contribute several and this is not a pass-failure rate. Kept separate from "
      "prune_failures because the two fail independently and the pairing is what carries "
      "the meaning: retention succeeding while replay is stalled means records are being "
      "deleted on schedule and shipped never"},
@@ -254,7 +256,11 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "escalate until agent-side corroboration or magnitude analysis rules out that "
      "crash-timing artifact class. MONITOR-ONLY - see the alerting note; neither "
      "increase() nor bare > 0 is sound over a fleet sum. NOTE the unit is BATCHES, each "
-     "holding up to 256 records, so this UNDERSTATES the record count"},
+     "holding up to 256 records, so this UNDERSTATES the record count. Since #2299 also "
+     "cross-check quarantined: corrupt-VALUE quarantine moved to the replay pass, so a "
+     "corrupt batch the rotation never reaches before it ages out lands here rather than "
+     "as quarantined - both are lost evidence, but this no longer separates 'never "
+     "delivered' from 'never deliverable'"},
     {"yuzu.guardian_drain_exceptions", "yuzu_fleet_guardian_drain_exceptions",
      "Fleet sum of firewalled throws in the outbox DELIVERY machinery. Distinct from the "
      "journal counters beside it: events are buffered but not shipping, which is a "

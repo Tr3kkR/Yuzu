@@ -1059,7 +1059,12 @@ groups:
   #           incident-register entry: classification is BEST-EFFORT, so a crash
   #           between the send and the sent-label write counts a sent batch as
   #           no-evidence, and a mass reboot or OTA manufactures a large benign step
-  #           roughly one retention window (7d) later. Do NOT escalate until agent-side
+  #           roughly one retention window (7d) later. Since #2299 a THIRD benign class
+  #           exists: quarantine of a corrupt-VALUE batch moved to the replay pass, so a
+  #           corrupt batch the rotation never reaches before it ages out is counted here
+  #           rather than as quarantined - cross-check
+  #           yuzu_fleet_guardian_journal_quarantined before treating a spike as pure
+  #           delivery loss. Do NOT escalate until agent-side
   #           corroboration or magnitude analysis rules out that crash-timing artifact
   #           class. No `for:` clause on purpose - the 90s staleness window means an
   #           agent that reports a loss then dies is visible for less than one `for:`
