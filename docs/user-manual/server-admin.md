@@ -205,9 +205,12 @@ approval now answer `-32602` immediately, with no ticket created or burned).
   stringified by the handler after approval. Stringify client-side.
 - `execute_bundle` with `steps: []` or more than 32 steps (the schema's
   `minItems`/`maxItems`, matching the handler's own 1–32 bound).
-- `execute_instruction` with more than 10 000 `agent_ids`.
+- `execute_instruction` with more than 10 000 `agent_ids`, or any single
+  `agent_ids` element longer than 128 bytes.
 - `execute_instruction` with `plugin`/`action` longer than 128 bytes, or
-  `scope` / a `params` value longer than 8192 bytes.
+  `scope` / a `params` value longer than 8192 bytes. (`execute_bundle`'s
+  per-step `plugin`/`action`/`params` carry no length bound and are
+  unaffected.)
 
 The bound-based rejections above were already the published schema contract
 (added in track 2f) but were client-advisory until this change; they are now
