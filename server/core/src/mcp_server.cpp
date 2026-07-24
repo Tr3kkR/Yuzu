@@ -3,6 +3,7 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
+#include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
@@ -1233,6 +1234,30 @@ const std::unordered_set<std::string_view>& known_tool_names() {
     return names;
 }
 
+// Compiled input schemas, keyed by served tool name (#2405). DERIVED from
+// kTools[] — the ctor forces this to build only AFTER
+// validate_tool_security_registration() has accepted the raw sequences, so a
+// schema the subset compiler rejects is an unbootable offence there, never a
+// throw from this cache (the throw below is belt-and-braces for a validator
+// bypass, mirroring the dispatch pre-gate's defense-in-depth posture).
+// Immutable after construction; concurrent validate() calls are const reads.
+const std::unordered_map<std::string_view, CompiledInputSchema>& compiled_input_schemas() {
+    static const std::unordered_map<std::string_view, CompiledInputSchema> schemas = [] {
+        std::unordered_map<std::string_view, CompiledInputSchema> m;
+        m.reserve(kToolCount);
+        for (const auto& t : kTools) {
+            auto compiled = compile_input_schema(t.input_schema_json);
+            if (!compiled)
+                throw std::runtime_error(
+                    std::string("MCP input schema failed to compile for tool '") + t.name +
+                    "' (#2405; the boot validator should have rejected this build)");
+            m.emplace(t.name, std::move(*compiled));
+        }
+        return m;
+    }();
+    return schemas;
+}
+
 // Pure classifier — the REAL dispatch path calls this, and the testonly
 // wrapper (classify_tool_for_test) runs the same function over synthetic
 // tables, so the three-way split cannot silently regress while tests stay
@@ -1278,6 +1303,13 @@ constexpr std::string_view kRbacSecurables[] = {
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
     "AccessReview",   "SoftwareLicensing"};
 
+// Borrowed (name, input_schema_json) row for the registration validator's
+// 4th sequence (#2405). Views are valid only for the duration of the call.
+struct ToolSchemaSource {
+    std::string_view name;
+    std::string_view input_schema_json;
+};
+
 // Pure registration validator (#2383) — throws std::runtime_error naming every
 // offender (sorted, so the message is deterministic regardless of hash-map
 // iteration order). Called by the McpServer ctor with the real tables and by
@@ -1285,10 +1317,24 @@ constexpr std::string_view kRbacSecurables[] = {
 // (possibly-duplicated) sequences, NOT pre-deduplicated sets — a duplicate
 // entry is itself an offence (a dropped duplicate could silently discard the
 // stricter of two conflicting registrations).
+//
+// #2405 adds the 4th sequence: every served input schema must compile under
+// the mcp_input_schema subset compiler, so the C8 gate's pre-approval
+// validation can never meet a schema it only partially enforces. In
+// production the sequence is built from the same kTools[] array as
+// tool_names, so name-parity between the two needs no separate check here.
 void validate_tool_security_registration(const std::vector<std::string_view>& tool_names,
                                          const std::vector<ToolSecurityTuple>& security_rows,
-                                         const std::vector<std::string_view>& write_tools) {
+                                         const std::vector<std::string_view>& write_tools,
+                                         const std::vector<ToolSchemaSource>& input_schemas) {
     std::vector<std::string> offences;
+
+    for (const auto& s : input_schemas) {
+        auto compiled = compile_input_schema(s.input_schema_json);
+        if (!compiled)
+            for (const auto& e : compiled.error())
+                offences.push_back("tool '" + std::string(s.name) + "' input schema: " + e);
+    }
 
     std::unordered_set<std::string_view> names;
     names.reserve(tool_names.size());
@@ -1676,7 +1722,17 @@ McpServer::McpServer() {
     for (const auto& r : kToolSecurityRows)
         rows.push_back({r.name, r.sec.securable_type, r.sec.operation});
     std::vector<std::string_view> writes(std::begin(kWriteToolsRaw), std::end(kWriteToolsRaw));
-    validate_tool_security_registration(names, rows, writes);
+    // 4th raw sequence (#2405): the served input schemas, from the SAME
+    // kTools[] array as `names`, so a schema the C8 gate cannot fully
+    // enforce refuses to boot alongside the other registration offences.
+    std::vector<ToolSchemaSource> schemas;
+    schemas.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        schemas.push_back({t.name, t.input_schema_json});
+    validate_tool_security_registration(names, rows, writes, schemas);
+    // Build the derived compiled-schema cache now — after the validator has
+    // accepted the raw sequences — rather than lazily on the first request.
+    (void)compiled_input_schemas();
 }
 
 // ── Handler construction ─────────────────────────────────────────────────
@@ -2606,6 +2662,56 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string audit_agent = param_str(args, "agent_id");
                     const std::string mint_detail_prefix =
                         audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
+
+                    // ── #2405: input-schema validation BEFORE any ticket work ──
+                    // A schema-invalid call must neither MINT a ticket (an
+                    // admin's approval would be wasted on args the handler
+                    // rejects) nor CONSUME one on recall (a one-time capability
+                    // burned for nothing). This single check sits above the
+                    // mint/recall fork, so the two paths cannot diverge.
+                    // Validate the ORIGINAL args, approval_id included:
+                    // stripping it first (as canonical_args does for ticket
+                    // binding) would let a malformed non-string approval_id
+                    // fall through param_str's "" into the fresh-mint path
+                    // unseen. approval_id is control-plane, not tool input —
+                    // reject a non-string one explicitly (uniform across all
+                    // gated tools; only delete_tag/quarantine_device declare
+                    // it, the rest tolerate it as an undeclared property).
+                    // Handler-side validation stays as defense in depth.
+                    {
+                        std::optional<SchemaViolation> violation;
+                        if (args.contains("approval_id") && !args["approval_id"].is_string())
+                            violation = SchemaViolation{"/approval_id", "expected a string"};
+                        else
+                            violation = compiled_input_schemas().at(tool_name).validate(args);
+                        if (violation) {
+                            // One cid across audit row + client envelope
+                            // (#2423 review F4). No spdlog line: a client
+                            // fault, not a server fault. `path` carries no
+                            // caller-derived text (SchemaViolation contract:
+                            // caller-derived keys are wildcarded to '*').
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            if (metrics != nullptr)
+                                metrics
+                                    ->counter("yuzu_mcp_tool_args_invalid_total",
+                                              {{"tool", tool_name}})
+                                    .increment();
+                            mcp_audit("denied",
+                                      "arguments do not match the tool input schema at '" +
+                                          violation->path + "' correlation_id=" + cid);
+                            res.set_content(
+                                a4_error(kInvalidParams,
+                                         "arguments do not match the tool input schema at '" +
+                                             violation->path + "': " + violation->reason,
+                                         "correct the arguments to match this tool's "
+                                         "tools/list inputSchema and re-call; no approval "
+                                         "ticket was created or consumed",
+                                         -1, cid),
+                                "application/json");
+                            return;
+                        }
+                    }
 
                     if (supplied_id.empty()) {
                         // First call → mint a ticket, but DEDUP first (governance
@@ -7926,14 +8032,27 @@ ToolClassForTest classify_tool_for_test(const std::string& tool_name,
 
 void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
                                          const std::vector<ToolSecurityRowOwned>& security_rows,
-                                         const std::vector<std::string>& write_tools) {
+                                         const std::vector<std::string>& write_tools,
+                                         const std::vector<ToolSchemaRowOwned>& input_schemas) {
     std::vector<std::string_view> names(tool_names.begin(), tool_names.end());
     std::vector<ToolSecurityTuple> rows;
     rows.reserve(security_rows.size());
     for (const auto& r : security_rows)
         rows.push_back({r.name, r.securable, r.operation});
     std::vector<std::string_view> writes(write_tools.begin(), write_tools.end());
-    validate_tool_security_registration(names, rows, writes);
+    std::vector<ToolSchemaSource> schemas;
+    schemas.reserve(input_schemas.size());
+    for (const auto& s : input_schemas)
+        schemas.push_back({s.name, s.schema_json});
+    validate_tool_security_registration(names, rows, writes, schemas);
+}
+
+std::vector<ToolSchemaRowOwned> input_schemas_for_test() {
+    std::vector<ToolSchemaRowOwned> out;
+    out.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        out.push_back({t.name, t.input_schema_json});
+    return out;
 }
 
 std::vector<std::string> rbac_ops_for_test() {
