@@ -1920,7 +1920,15 @@ walkthrough.
   that re-serves the same successor secret on a same-caller retry, and a
   60-second background sweep that auto-revokes the predecessor once its
   overlap window elapses and warns (an operational, non-security signal) on
-  an unused successor nearing expiry.
+  an unused successor nearing expiry. **Confirm replay classification (#2404):**
+  a `confirm` replayed after its own rotation already resolved returns a
+  *terminal* conflict (REST `409` / MCP `kInvalidParams`), never a retryable
+  `503`, so an agentic client honouring the tool's `idempotentHint` stops
+  instead of retrying a permanently-failing call; the decision is made by a
+  positive-read state classifier (`rotation_confirm_state.hpp`) that keeps
+  `success` a one-time effect. The confirm is never a silent success no-op:
+  the initiator grace binding is evicted post-confirm, so a success answer
+  would attest without verifying initiation.
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
   MCP `audit_engine_no_admin` — independently resolves every engine
   principal's actual roles + effective permissions against the live RBAC

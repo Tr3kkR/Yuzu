@@ -256,6 +256,13 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
 // identify as pure client-input validation (no DB round trip needed to
 // produce them, or an unambiguous non-empty-read data-shape fact) get an
 // explicit 400 mapping below.
+//
+// #2404 refinement: this ambiguity is SPECIFIC to the EMPTY-read cases. A
+// confirm that reads a NON-empty active set (one credential, or >2, or a
+// two-credential pair) is a positive read — see rotation_confirm_state.hpp —
+// so those states now carry terminal conflict/client strings (409/400), and
+// only the genuinely-empty-or-unrecognized-pair case keeps the retryable "no
+// in-flight rotation to confirm".
 static int engine_store_error_status(const std::string& err) {
     // Thin dispatch over the shared classifier (engine_store_error_class.hpp)
     // so REST and the MCP twin (mcp_error_for_store_msg) never diverge.
@@ -690,7 +697,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "The required token_id pins the confirm to the exact pending rotation — pass the successor token_id the rotate response returned; a stale or mismatched id is rejected with no state change.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id"], "properties": {"token_id": {"type": "string", "maxLength": 64, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id missing, empty, or not a string"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "token_id does not match the pending rotation successor, rotation confirmation unavailable, or initiated by a different operator"}, "503": {"description": "Store unavailable, or no in-flight rotation to confirm (ambiguous with a transient store read failure — retry, or rotate first if genuinely absent)"}}}
+      "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "The required token_id pins the confirm to the exact pending rotation — pass the successor token_id the rotate response returned; a stale or mismatched id is rejected with no state change.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id"], "properties": {"token_id": {"type": "string", "maxLength": 64, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
     },
     "/engine-principals/{id}/transfer-owner": {
       "post": {"summary": "Admin-forced ownership reassignment of an engine principal", "tags": ["Security"], "description": "Never depends on the outgoing owner's cooperation (design §3.1).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["new_owner"], "properties": {"new_owner": {"type": "string", "description": "Must reference an existing user"}}}}}}, "responses": {"200": {"description": "Transferred; {transferred:true}"}, "400": {"description": "Bad JSON, or new_owner missing/does not reference an existing user"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active"}, "503": {"description": "Store unavailable"}}}
@@ -2981,12 +2988,24 @@ void RestApiV1::register_routes(
     // — never inferred from the rotate call succeeding.
     sink.Post(
         R"(/api/v1/engine-principals/([^/]+)/credentials/confirm)",
-        [perm_fn, auth_fn, audit_fn, step_up_fn, eps, token_store](
+        [perm_fn, auth_fn, audit_fn, step_up_fn, eps, token_store, metrics_registry](
             const httplib::Request& req, httplib::Response& res) {
+            // #2404 confirm-outcome counter (surface=rest). Stamped at the
+            // store-open guard and on every store result below; NOT on the
+            // perm / input-validation early-outs above, per the family's scope
+            // contract (server.cpp describe).
+            const auto confirm_metric = [metrics_registry](const char* result) {
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_engine_principal_confirm_total",
+                                  {{"surface", "rest"}, {"result", result}})
+                        .increment();
+            };
             if (!perm_fn(req, res, "Security", "Write"))
                 return;
             if (!eps || !eps->is_open() || !token_store ||
                 !token_store->is_open()) {
+                confirm_metric("transient"); // store unavailable at the open guard
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
@@ -3027,12 +3046,17 @@ void RestApiV1::register_routes(
             auto confirmed =
                 token_store->confirm_rotation(principal_id, confirm_token_id, session->username);
             if (!confirmed) {
+                // Increment BEFORE the audit emission so an audit-store failure
+                // cannot suppress the operational counter (#2404).
+                confirm_metric(yuzu::server::detail::confirm_result_label(
+                    yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                 res.status = engine_store_error_status(confirmed.error());
                 res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
                 (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
                                "EnginePrincipal", principal_id, confirmed.error());
                 return;
             }
+            confirm_metric("success");
             // Success detail records WHICH credential was confirmed — the
             // store validated confirm_token_id equals the pending successor's
             // token_id, so this is server-verified and not the raw secret.

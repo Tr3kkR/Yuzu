@@ -128,6 +128,15 @@ rotate response returned: it pins the confirm to that exact rotation, so a
 blind retry of an old confirm can never resolve a **later** rotation early
 (a stale or mismatched id gets a `409` and changes nothing).
 
+If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
+double-submit, or a client racing the auto-revoke sweep — you get a *terminal*
+`409` (`rotation already confirmed` / `no rotation in flight ... already the
+sole active credential`), not a retryable `503`. Treat it as done: the rotation
+is resolved and there is nothing left to confirm. Rotate again only if you
+genuinely need a fresh credential. (The one case that stays `503`-retryable is
+a genuine store hiccup — an empty read, lock contention, or a persist failure —
+where retrying is the right move.)
+
 ### 5. Transfer ownership
 
 Ownership transfer is **admin-forced** — it does not require the outgoing

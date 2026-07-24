@@ -755,7 +755,12 @@ static const ToolDef kTools[] = {
      "that closes the loop, gated behind its own Security:Write check rather than being inferred "
      "from a successful rotate call. Requires the successor token_id the rotate call returned — "
      "the confirm is pinned to that exact rotation and a stale or mismatched id is rejected with "
-     "no state change, so a blind retry can never confirm a later rotation. Mirrors POST "
+     "no state change, so a blind retry can never confirm a later rotation. Replaying a confirm "
+     "after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
+     "re-rotate if a fresh rotation is needed. Note: an exact supervised replay carrying the same "
+     "consumed approval_id is denied earlier at the approval gate ('approval already used') before "
+     "this logic runs. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -1601,9 +1606,13 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // token_id arg pins the confirm to the exact pending successor, so a
     // same-args replay can only ever target the pair it was issued for: while
     // pending it confirms it (once); after cutover or once a later rotation is
-    // in flight the stale id mismatches and NOTHING is written → idempotent
-    // per the MCP hint's no-additional-effect semantics (the replay errors,
-    // but errors safely). Pre-#2384 this was false (unpinned blind retry could
+    // in flight NOTHING is written → idempotent per the MCP hint's
+    // no-additional-effect semantics (the replay errors, but errors safely).
+    // #2404 preserves the hint: the post-resolution replay still writes
+    // nothing, it just changes the ERROR from retryable to a terminal
+    // already-confirmed/already-resolved conflict (a same-pin match yields
+    // "already confirmed"; a moved-on rotation yields "the rotation was
+    // resolved"). Pre-#2384 the hint was false (unpinned blind retry could
     // confirm a LATER rotation early).
     {"confirm_engine_rotation", {ToolEffect::Destructive, true, "Confirm engine credential rotation"}},
     // assign/unassign_engine_role: INSERT OR IGNORE (additive) vs DELETE grant
@@ -7144,6 +7153,17 @@ McpServer::HandlerFn McpServer::build_handler(
             // POST /api/v1/engine-principals/{id}/credentials/confirm. Own
             // Security:Write gate (not inferred from rotate having succeeded).
             if (tool_name == "confirm_engine_rotation") {
+                // #2404 confirm-outcome counter (surface=mcp). Twin of the REST
+                // route's; stamped at the store-open guard and on every store
+                // result below, NOT on the tier / perm / input-validation
+                // early-outs (family scope contract, server.cpp describe).
+                const auto confirm_metric = [metrics](const char* result) {
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_engine_principal_confirm_total",
+                                      {{"surface", "mcp"}, {"result", result}})
+                            .increment();
+                };
                 if (!tier_allows(tier, "Security", "Write")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
@@ -7155,6 +7175,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (deny_if_engine_session())
                     return;
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    confirm_metric("transient"); // store unavailable at the open guard
                     mcp_audit("failure", "engine credential store unavailable");
                     res.set_content(a4_error(kInternalError, "engine credential store unavailable",
                                              "retry the request", /*retry_after_ms=*/5000),
@@ -7181,6 +7202,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto confirmed = engine_credential_store_->confirm_rotation(
                     principal_id, confirm_token_id, session->username);
                 if (!confirmed) {
+                    // Increment BEFORE the audit emission so an audit-store
+                    // failure cannot suppress the operational counter (#2404).
+                    confirm_metric(yuzu::server::detail::confirm_result_label(
+                        yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.confirm", "failure",
                                 "EnginePrincipal", principal_id, confirmed.error());
@@ -7192,6 +7217,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                confirm_metric("success");
                 // Success detail records WHICH credential was confirmed — the
                 // store validated confirm_token_id equals the pending
                 // successor's token_id, so this is server-verified (not a

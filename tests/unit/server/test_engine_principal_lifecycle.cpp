@@ -917,6 +917,55 @@ TEST_CASE("Engine-principal REST: POST .../credentials/confirm dispatched throug
     CHECK(found_audit);
 }
 
+TEST_CASE("Engine-principal REST: confirm replayed after success is a terminal 409 (A4) with a "
+          "conflict metric, not a retryable 503 (#2404)",
+          "[pg][rest][engine_principal][confirm]") {
+    RestEngineHarness h;
+    auto [principal_id, raw1] = h.create_and_mint("confirm-replay");
+    (void)raw1;
+    h.session_user = "alice";
+
+    auto rot = h.rotate(principal_id);
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200);
+    const auto successor_token_id =
+        nlohmann::json::parse(rot->body)["data"]["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    const auto confirm_metric = [&](const char* result) {
+        return h.metrics
+            .counter("yuzu_engine_principal_confirm_total",
+                     {{"surface", "rest"}, {"result", result}})
+            .value();
+    };
+
+    // First confirm succeeds (the real cutover).
+    auto first = h.confirm(principal_id, successor_token_id);
+    REQUIRE(first);
+    REQUIRE(first->status == 200);
+    CHECK(confirm_metric("success") == 1.0);
+
+    // The replay (network-dropped 200 / double-submit): SAME args. Terminal
+    // 409, NOT 503 — an agentic client honouring idempotentHint must stop, not
+    // loop. The A4 envelope carries a correlation_id and the terminal message.
+    auto replay = h.confirm(principal_id, successor_token_id);
+    REQUIRE(replay);
+    CHECK(replay->status == 409);
+    CHECK(replay->body.find("rotation already confirmed") != std::string::npos);
+    CHECK(replay->body.find("correlation_id") != std::string::npos); // A4 envelope
+    CHECK(confirm_metric("conflict") == 1.0);
+    CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
+
+    // The replay is audited as a failure row — the forensic evidence.
+    bool found_fail_audit = false;
+    for (const auto& a : h.audit_log) {
+        if (a.action == "engine_principal.credential.confirm" && a.result == "failure" &&
+            a.detail.find("rotation already confirmed") != std::string::npos)
+            found_fail_audit = true;
+    }
+    CHECK(found_fail_audit);
+}
+
 TEST_CASE("Engine-principal REST: confirm with a mismatched or missing token_id is "
           "rejected without touching the rotation (#2384 pin)",
           "[pg][rest][engine_principal][confirm]") {

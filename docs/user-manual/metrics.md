@@ -360,6 +360,63 @@ if you want notification that an engine principal is regularly hitting its
 cap (may indicate the cap is tuned too low for its workload, or a runaway
 caller).
 
+## Engine-credential confirm metric (#2404)
+
+```
+# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded (#2404)
+# TYPE yuzu_engine_principal_confirm_total counter
+yuzu_engine_principal_confirm_total{surface="rest",result="success"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="conflict"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="client_error"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="transient"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="success"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="conflict"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="client_error"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="transient"} 0
+```
+
+All 8 series (the closed `surface` × `result` cross-product) are pre-seeded to
+`0` at startup so `absent()` alerts stay meaningful. The family makes a
+credential-**confirm** retry storm alertable, which `yuzu_http_requests_total`
+cannot show (it has no per-route label). `result` mirrors the shared
+store-error taxonomy (`engine_store_error_class.hpp`): `conflict` is a terminal
+409/kInvalidParams (a replay after the rotation already resolved, a moved-on
+pin, or unresolved rotation metadata — the client must not blindly retry),
+`client_error` is a 400 (more-than-two or non-engine active credentials),
+`transient` is a retryable 503 (store unavailable, lock contention, a persist
+failure, or the ambiguous empty/malformed-pair "no in-flight rotation"), and
+`success` is a completed confirm.
+
+**Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
+**or** trips the store-open guard (which increments `result="transient"`);
+pre-store denials — permission, MFA step-up, input validation, and the MCP
+supervised approval-gate's consumed-ticket replay (`approval already used`) —
+are deliberately **excluded**, so the label set stays a fact about store
+outcomes rather than a catch-all endpoint tally. The increment is stamped
+**before** the audit emission, so an audit-store failure cannot suppress it.
+Wired on **both** surfaces (the `surface` label prevents double-count) because
+either a REST or an agentic MCP client can drive the #2404 replay shape.
+
+**Operational, not `event="security"`.** A replay conflict is an expected
+agent-retry pattern, not an attack signal; the counter carries no `principal_id`
+label (bounded cardinality only) — pair it with the
+`engine_principal.credential.confirm` audit rows for per-principal forensics
+(metric-is-the-signal / audit-row-is-the-evidence). A useful alert is
+`increase(yuzu_engine_principal_confirm_total{result="conflict"}[15m]) > <n>`
+to catch a client stuck replaying a resolved confirm, and
+`increase(...{result="transient"}[15m])` for a genuine store-health storm.
+
+**Semantics for alert authors:** this counts confirm **attempts** that reach
+the store, not logical rotations — a client retrying a `transient` blip 20 times
+before it succeeds adds 20 to `transient` for one rotation. Pick the threshold
+`<n>` relative to your fleet's typical retry count, not your rotation cadence.
+Also cross-reference `yuzu_engine_principal_rotation_sweep_failures_total`: a
+`result="conflict"` cluster correlating with a non-zero, sustained sweep-failure
+count is the prolonged-sweep-outage signature (a predecessor's overlap window
+never closes, so a confirm surfaces the `unresolved rotation metadata` state) —
+**inspect the credential before revoking**, since in that state the sole active
+credential is the good survivor.
+
 ## Access review metrics
 
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
