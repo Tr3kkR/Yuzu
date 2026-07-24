@@ -6233,8 +6233,8 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
     CHECK(gated == covered);
 
     // The production accessor server.cpp pre-seeds the
-    // yuzu_mcp_tool_args_invalid_total labels from must agree with the same
-    // derivation — a drift here would seed stale metric labels.
+    // yuzu_mcp_tool_args_invalid_total labels from must agree with this same
+    // derivation — drift here would seed stale metric labels.
     const auto seeded = yuzu::server::mcp::approval_gated_tool_names();
     CHECK(std::set<std::string>(seeded.begin(), seeded.end()) == gated);
     CHECK(std::is_sorted(seeded.begin(), seeded.end()));

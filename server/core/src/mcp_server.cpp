@@ -1320,9 +1320,10 @@ struct ToolSchemaSource {
 //
 // #2405 adds the 4th sequence: every served input schema must compile under
 // the mcp_input_schema subset compiler, so the C8 gate's pre-approval
-// validation can never meet a schema it only partially enforces. In
-// production the sequence is built from the same kTools[] array as
-// tool_names, so name-parity between the two needs no separate check here.
+// validation can never meet a schema it only partially enforces. A non-empty
+// sequence is also held to duplicate-rejection and name-parity with the
+// served set (below), so a testonly caller cannot pass a shorter or disjoint
+// schema list; {} deliberately skips the schema checks (#2383-only tests).
 void validate_tool_security_registration(const std::vector<std::string_view>& tool_names,
                                          const std::vector<ToolSecurityTuple>& security_rows,
                                          const std::vector<std::string_view>& write_tools,
