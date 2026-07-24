@@ -660,7 +660,15 @@ Whichever PR flips `prefer_spark` MUST also:
     deadline: the repo has an earned rule against wall-clock bounds in tests (#2372), and the
     cap must count KvStore round trips, which the byte limit can multiply well past the
     16 batches a records-per-tick sizing would predict.
-12. **Jitter the maintenance phase per agent** (Gate 3 performance). NOTE: this item used to
+12. ~~**Jitter the maintenance phase per agent** (Gate 3 performance).~~ **DONE** - phase
+    offsets on `last_page`/`last_prune`, plus a jittered release deadline on the BOOT and
+    RECONNECT forced pages, enabled explicitly by the production wiring in `agent.cpp` (never
+    inferred from other config: several tests drive a live worker with no timing override,
+    and the production-boot-order regression depends on the worker running immediately). The
+    deadline bounds the worker's condition-variable wait, so a deferred force is a real
+    scheduled wake - polling it at the 5 s backstop would have re-synchronised every agent
+    onto the backstop tick and spread nothing. A deferral never drops a kick, and the
+    backlog-recovery refill re-arm is deliberately exempt. Original note retained: NOTE: this item used to
     size the fleet from a SUSTAINED redelivery floor of 0.1 batch/s/agent - ~256k events/s and
     ~615 Mbit/s at 10k agents. That floor no longer exists: replay consults the durable
     sent-label and does not re-offer delivered batches on an ordinary pass (#2345 round 8), so

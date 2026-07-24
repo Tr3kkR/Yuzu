@@ -71,6 +71,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <thread>
 
 namespace yuzu::agent {
@@ -110,6 +111,17 @@ inline constexpr std::size_t kGuardianDrainBudget = 512;
 /// an enqueue already moved the generation (#2345 Gate 4 UP-1).
 inline constexpr std::chrono::milliseconds kGuardianMinRefillInterval{1'000};
 
+/// How far a RECONNECT-forced page may be deferred when jitter is on (item 12). Small on
+/// purpose: the kick exists for promptness, and replay volume is bucket-paced anyway, so a
+/// few seconds of fleet spread costs nothing an operator would notice while turning a
+/// simultaneous fleet-wide journal scan into a smear.
+inline constexpr std::chrono::milliseconds kGuardianForcedPageJitterMax{5'000};
+
+/// A uniform offset in [0, upper). Free function so the distribution itself is unit-testable
+/// without a running worker. `upper <= 0` yields 0 (a zero interval means "no cadence").
+[[nodiscard]] YUZU_EXPORT std::chrono::milliseconds
+guardian_jitter_offset(std::mt19937& rng, std::chrono::milliseconds upper);
+
 /// Wall-clock companion to kGuardianDrainBudget. 512 entries bounds the COUNT but not the
 /// TIME: at a pathological seconds-per-send it is still minutes, and the worker may be
 /// holding up GuardianEngine::stop()'s join for all of it.
@@ -136,6 +148,18 @@ struct GuardianMaintenanceConfig {
     /// slow-but-succeeding send makes an N-entry pass arbitrarily long while
     /// GuardianEngine::stop() waits on our join (#2298 Sol review).
     std::chrono::milliseconds drain_max_wall{kGuardianDrainMaxWall};
+    /// Spread this agent's maintenance phase over its interval (C0 flip-checklist item 12).
+    /// Every agent boots its worker at its own start, so nothing correlates the CADENCE
+    /// across a fleet - but the FORCED passes do correlate: a gateway bounce or a restored
+    /// snapshot hands every agent a boot/reconnect page in the same second, each a full
+    /// journal scan and a token burst. Jitter is aimed at that burst.
+    ///
+    /// Default OFF and enabled explicitly by production wiring. Inferring it from whatever
+    /// else a caller configured would be worse than useless in tests: several drive a live
+    /// worker without overriding any timing, including the production-boot-order regression
+    /// that depends on the worker running IMMEDIATELY - a hollow pass is the failure mode
+    /// there, not a red one.
+    bool jitter{false};
 };
 
 /// Which maintenance passes to run this cycle. The CALLER owns cadence - the worker loop
@@ -215,6 +239,23 @@ public:
     /// exceptions - the worker thread's loop() does (so a test can still observe a
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
+
+    /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
+    /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by
+    /// that mutex, and a doc comment is not a synchronization primitive - a later caller
+    /// would otherwise race the loop's own draws and trip TSan rather than fail visibly.
+    void seed_jitter_rng_for_test(std::uint32_t seed) {
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        jitter_rng_.seed(seed);
+    }
+
+    /// TEST-ONLY: the steady-clock ms before which a pending forced page will not be
+    /// consumed (0 = none). Reading it is how a test observes a DEFERRED force without
+    /// asserting a wall-clock upper bound.
+    [[nodiscard]] std::int64_t force_page_not_before_ms_for_test() {
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        return force_page_not_before_ms_;
+    }
 
     /// Deterministic test seam (also the worker thread's own loop body): run the
     /// maintenance passes named by `ops` synchronously on the caller's thread. Holds no
@@ -306,6 +347,13 @@ private:
     /// Seeded TRUE so the first cycle replays the journal at boot without waiting out
     /// kDefaultPageInterval.
     std::atomic<bool> force_page_{true};
+    /// Earliest steady-clock ms at which a pending forced page may be consumed (item 12).
+    /// 0 = no deferral. Written under sig_->mu (by notify() and the loop) so the loop can
+    /// derive its wait deadline from it without a second synchronisation point.
+    std::int64_t force_page_not_before_ms_{0};
+    /// Per-agent jitter source. Touched only under sig_->mu, or on the worker thread before
+    /// start() publishes it.
+    std::mt19937 jitter_rng_;
 };
 
 

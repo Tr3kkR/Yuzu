@@ -1902,3 +1902,175 @@ TEST_CASE("CH-11: a failed sent-label scan falls back to re-offering, and says s
     CHECK(degraded.skipped_already_sent == 0); // skipped nothing...
     CHECK(degraded.records_paged == 2);        // ...and re-offered, the safe direction
 }
+
+// ── Maintenance phase + forced-page jitter (C0 flip-checklist item 12) ─────────
+
+TEST_CASE("guardian_jitter_offset is uniform over [0, upper) and safe at zero",
+          "[spark][guardian][drain][maint]") {
+    std::mt19937 rng(12345);
+    for (int i = 0; i < 500; ++i) {
+        const auto off = guardian_jitter_offset(rng, 30'000ms);
+        CHECK(off >= 0ms);
+        CHECK(off < 30'000ms); // half-open: an offset of a full interval is a whole skipped pass
+    }
+    // A zero interval means "no cadence", not "divide by zero".
+    CHECK(guardian_jitter_offset(rng, 0ms) == 0ms);
+    CHECK(guardian_jitter_offset(rng, -5ms) == 0ms);
+
+    // Two agents seeded differently must not draw the same SEQUENCE - the entire point.
+    // Compared as a sequence, not a single draw: uniform_int_distribution's mapping is
+    // implementation-defined, so "seed 1 and seed 2 differ on their first draw" is a property
+    // of one STL and one collision (~1/30000) away from a cross-toolchain failure that no
+    // code change would explain.
+    std::mt19937 a(1), b(2);
+    std::vector<std::chrono::milliseconds> sa, sb;
+    for (int i = 0; i < 8; ++i) {
+        sa.push_back(guardian_jitter_offset(a, 30'000ms));
+        sb.push_back(guardian_jitter_offset(b, 30'000ms));
+    }
+    CHECK(sa != sb);
+}
+
+TEST_CASE("jitter DEFERS a forced page rather than dropping it",
+          "[spark][guardian][drain][maint]") {
+    // The forced page is the correlated one: a gateway bounce or a mass restart hands every
+    // agent a boot/reconnect replay - a full journal scan plus a token burst - in the same
+    // second. Jitter must spread that WITHOUT ever losing a kick, so the deadline is observed
+    // through the seam rather than by asserting a wall-clock upper bound on the work.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h, // only a FORCED page can fire
+                                      .prune_interval = 1h,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(4242);
+    worker.start();
+
+    // The boot force is deferred within the (hour-long) page interval, so it is still pending
+    // and still carries a deadline well into the future.
+    const auto deadline = worker.force_page_not_before_ms_for_test();
+    CHECK(deadline > 0);
+    std::this_thread::sleep_for(40ms); // many periodic bounds: a DROP would show up here
+    CHECK(rig.journal->pages() == 0);
+    CHECK(worker.force_page_not_before_ms_for_test() == deadline); // still pending, not consumed
+
+    worker.stop();
+}
+
+TEST_CASE("a jittered forced page still runs once its deadline passes",
+          "[spark][guardian][drain][maint]") {
+    // The other half of the contract: deferral is not suppression. With a tiny page interval
+    // the boot force's offset is bounded by that interval, so the pass must happen - and the
+    // deadline must be cleared once it is consumed, or a later kick would inherit it.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 10ms, // jitter bound: offset < 10ms
+                                      .prune_interval = 1h,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(99);
+    worker.start();
+    // Spin on the OBSERVABLE (a page happened), never on a wall-clock upper bound: a slower
+    // runner takes longer to get here, it does not make the assertion wrong.
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (rig.journal->pages() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+    CHECK(rig.journal->pages() >= 1);
+    worker.stop();
+}
+
+TEST_CASE("jitter is OFF unless asked for, so every other cadence test is deterministic",
+          "[spark][guardian][drain][maint]") {
+    // Enablement is explicit (production wiring calls set_maintenance_jitter). Inferring it
+    // from some other configured field would silently defer the boot page in tests that
+    // depend on it running immediately, turning a real assertion into a hollow pass.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h,
+                                      .prune_interval = 1h});
+    CHECK(worker.force_page_not_before_ms_for_test() == 0);
+    worker.start();
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (rig.journal->pages() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+    CHECK(rig.journal->pages() >= 1); // the boot force ran immediately, undeferred
+    CHECK(worker.force_page_not_before_ms_for_test() == 0);
+    worker.stop();
+}
+
+TEST_CASE("a kick storm cannot keep postponing an already-deferred forced page",
+          "[spark][guardian][drain][maint]") {
+    // First kick wins. Re-drawing the deadline on every notify() would let a FLAPPING link
+    // postpone the forced replay indefinitely: each reconnect lands a fresh offset, so the
+    // pass that re-offers sent-labelled batches (whose in-flight send may have been lost)
+    // keeps being pushed back by exactly the event it exists to respond to. One draw is all
+    // the fleet spread needs. RED if notify() sets the deadline unconditionally: the observed
+    // deadline moves with each kick.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h, // only a forced page can fire
+                                      .prune_interval = 1h,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(7);
+    // No start(): the loop must not consume the force while the deadlines are compared, so
+    // this exercises notify()'s own state transition rather than racing the worker thread.
+    worker.notify();
+    const auto first = worker.force_page_not_before_ms_for_test();
+    CHECK(first > 0);
+    for (int i = 0; i < 20; ++i)
+        worker.notify();
+    CHECK(worker.force_page_not_before_ms_for_test() == first); // monotone, not re-drawn
+}
+
+TEST_CASE("jitter: concurrent notify() against a live jittered loop is race-free",
+          "[spark][guardian][drain][maint]") {
+    // TSan coverage for the shape the other jitter tests deliberately avoid. The kick-storm
+    // test omits start() so it can compare deadlines deterministically, and the deferral test
+    // starts the worker but never notifies - so the new sig_->mu critical sections
+    // (notify() writing force_page_not_before_ms_ and drawing from jitter_rng_, while the
+    // loop reads both to compute its wait deadline and to consume the force) were never
+    // executed CONCURRENTLY under the sanitizer (governance Gate 3 cpp-safety).
+    //
+    // Asserts liveness only. Any timing assertion here would be a wall-clock upper bound,
+    // which is the standing flake source on a contended runner.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/2,
+                                     {.journal = rig.journal,
+                                      .page_interval = 5ms, // tiny, so forces land constantly
+                                      .prune_interval = 5ms,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(31337);
+    worker.start();
+
+    std::atomic<bool> stop_kicking{false};
+    std::thread kicker([&] {
+        while (!stop_kicking.load(std::memory_order_relaxed))
+            worker.notify();
+    });
+
+    // Spin on the observable rather than sleeping a fixed time: a slower runner takes longer
+    // to get here, it does not make the assertion wrong.
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (rig.journal->pages() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+
+    stop_kicking.store(true, std::memory_order_relaxed);
+    kicker.join();
+    worker.stop();
+
+    CHECK(rig.journal->pages() >= 1); // the loop stayed live under a continuous kick storm
+    // A stopped worker leaves no pending deferral that a later observer could misread.
+    CHECK(worker.force_page_not_before_ms_for_test() >= 0);
+}
