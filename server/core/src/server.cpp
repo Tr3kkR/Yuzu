@@ -936,6 +936,23 @@ public:
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
+        // #2367 engine-principal liveness cache — same shape as the token
+        // siblings above, described so the families ship typed and with HELP
+        // rather than as bare untyped samples.
+        metrics_.describe("yuzu_server_engine_revalidate_cache_hits_total",
+                          "Engine-principal stream liveness re-checks served from cache",
+                          "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_cache_misses_total",
+                          "Engine-principal stream liveness re-checks that read through to "
+                          "PostgreSQL",
+                          "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_cache_size",
+                          "Engine principals with a live (unexpired) liveness cache entry",
+                          "gauge");
+        metrics_.describe("yuzu_server_engine_revalidate_backoff_suppressed_total",
+                          "Engine-principal liveness re-checks answered StoreUnreachable from the "
+                          "failure backoff without taking a connection lease",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
@@ -3719,6 +3736,25 @@ public:
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
                 }
+                // #2367: the same observability for the engine-principal
+                // revalidation cache. Without these the cache is invisible —
+                // its whole job is to keep per-tick stream re-validation off
+                // the pool, and there would be no way to see whether it is
+                // doing it. `backoff_suppressed` is the brownout signal: it
+                // only moves while the store is unreachable AND the per-tick
+                // retry amplifier is being held off.
+                if (engine_principal_store_) {
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_hits_total")
+                        .set(static_cast<double>(engine_principal_store_->revalidate_cache_hits()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_misses_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revalidate_cache_misses()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_size")
+                        .set(static_cast<double>(engine_principal_store_->revalidate_cache_size()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revalidate_backoff_suppressed()));
+                }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are
                 // observable -- the route-level yuzu_viz_oversize_response_total
@@ -5730,6 +5766,40 @@ private:
                          "handover). Raise --http-worker-threads or lower the target.",
                          target_streams, pool_max, effective_streams,
                          detail::kPlainRestReserveDefault, detail::kMaxProvidersPerStream);
+        }
+        // #2367: held-open streams and the Postgres pool are coupled capacities,
+        // and nothing else says so at boot. Every live stream re-validates its
+        // credential each pump tick against this pool. Those reads are cached,
+        // so steady state is O(streams / TTL) rather than O(streams x tick) —
+        // but the refreshes still land here alongside ordinary request traffic,
+        // and a stream capacity far above the pool size is the shape that turns
+        // a pool blip into a correlated stall.
+        //
+        // Deliberately warned on the EFFECTIVE capacity, not the configured
+        // target: a hand-pinned --http-worker-threads can clamp the target well
+        // below what was asked for, and warning about capacity the server will
+        // never admit is just noise.
+        //
+        // Advisory only — not a clamp and not a startup failure. The safe ratio
+        // depends on link latency and traffic mix, so this points at the metrics
+        // that answer it rather than inventing a rule. The threshold sits above
+        // the shipped default ratio (128 streams / 16 connections = 8:1, so a
+        // default server is quiet) and below the cliff #2367 names (512 on a
+        // pool of 16 = 32:1).
+        if (pg_pool_) {
+            constexpr std::size_t kStreamsPerPgConnAdvisory = 16;
+            if (effective_streams > pg_pool_->size() * kStreamsPerPgConnAdvisory) {
+                spdlog::warn(
+                    "[PG] effective SSE stream capacity {} is more than {}x --postgres-pool-size "
+                    "{}. Held-open streams re-validate their credential against this pool, so at "
+                    "this ratio a pool brownout can stall streams and ordinary requests together. "
+                    "Watch yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use; if they climb, "
+                    "lower the stream capacity or raise --postgres-pool-size (and check the "
+                    "database can carry the extra connections — enlarging the pool against an "
+                    "already-struggling server makes things worse, not better). Engine-principal "
+                    "streams are the heaviest case; other SSE surfaces re-validate more cheaply.",
+                    effective_streams, kStreamsPerPgConnAdvisory, pg_pool_->size());
+            }
         }
         stream_budget_ =
             std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{effective_streams});

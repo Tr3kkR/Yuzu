@@ -156,6 +156,53 @@ step, not a routine failure mode.
    one-shot migration flag — so a clean pass confirms the collision is
    fully resolved.
 
+## Alert: `EngineRevalidateStoreUnreachable` (#2367)
+
+**What fired.** `yuzu_server_engine_revalidate_backoff_suppressed_total` moved.
+That counter increments ONLY when a liveness re-check for an engine principal
+was answered `StoreUnreachable` from the failure backoff — i.e. the store was
+already found unreachable moments earlier, and the server is deliberately not
+re-asking on every stream tick. It cannot move while the store is healthy, so
+this is a true-positive signal about store reachability, not a cache-tuning
+metric.
+
+**What is happening to streams meanwhile.** Held-open MCP/SSE streams
+authenticated by an engine principal are being told "indeterminate", which is
+NOT a revocation: each rides a bounded grace window measured from its last
+authoritative credential confirmation, then closes with
+`reason=auth_unavailable`. Human/API-token streams are unaffected by this
+particular signal.
+
+**Triage, in order.**
+
+1. Is the substrate reachable at all? `curl -s localhost:8080/readyz` — the
+   conjunction includes `engine_principal_store`. If `/readyz` is failing, this
+   is a store-availability incident: go to "Detection signal" above and to
+   `docs/postgres-store-playbook.md`.
+2. Is it the pool rather than the database? Check
+   `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`. Saturation with a
+   healthy database means lease starvation, not an outage — see the
+   pool-sizing guidance in `docs/user-manual/server-admin.md` and note the
+   boot warning about SSE stream capacity versus `--postgres-pool-size`.
+3. How much damage? `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}`
+   counts streams that already exhausted their grace window. A flat count
+   means the backoff is absorbing the incident without killing sessions.
+4. Is the cache doing its job either side of the incident?
+   `yuzu_server_engine_revalidate_cache_hits_total` versus `..._misses_total`.
+   In steady state hits should dominate; misses climbing while hits are flat
+   suggests entries are being invalidated repeatedly (a revoke loop) rather
+   than an availability problem.
+
+**Recovery.** No operator action restores the streams directly — clients
+reconnect and resume via `Last-Event-ID`, and durable results remain fetchable
+by `execution_id`. Fix the underlying store or pool problem; the backoff
+re-probes within seconds of recovery, so streams re-establish on their own.
+
+**Do NOT** reflexively raise `--postgres-pool-size` in response to this alert.
+Adding connections to an already-struggling database makes matters worse;
+confirm the database is healthy first, and consider lowering SSE stream
+capacity instead.
+
 ## Cross-references
 
 - Store contract, three-state `get_for_auth`, and construction posture:

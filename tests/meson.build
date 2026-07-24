@@ -444,6 +444,10 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
+      # #2367: test-only definition of EngineLivenessTestAccess::revalidate,
+      # kept OFF the production link line so the private cached path has no
+      # public trampoline in server_core.
+      'unit/server/engine_liveness_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
