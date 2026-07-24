@@ -270,6 +270,14 @@ std::string lower_copy(std::string v) {
 }
 
 // All 26 Phase 1 read-only tools.
+//
+// SCHEMA AUTHORING (#2405): every input_schema_json below must compile under
+// the CLOSED keyword catalogue in mcp_input_schema.cpp — an unsupported
+// keyword, a malformed operand, or (on an approval-gated tool) a root
+// `additionalProperties:false` without a declared `approval_id` is a BOOT
+// FAILURE, not a warning. Adding a keyword means extending that catalogue
+// (semantics + operand grammar + tests + docs) in the same change. See
+// docs/mcp-server.md "Adding a tool".
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})"},
@@ -578,9 +586,13 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
-     // contract (A5 materiality backfill) - client-advisory, per the same
-     // advisory-vs-enforced convention as the annotation hints. Real server-side
-     // enforcement of these input caps is tracked in #2437.
+     // contract (A5 materiality backfill). Enforcement is SPLIT since #2405:
+     // on the APPROVAL-GATED path (supervised tier, where requires_approval is
+     // true) the C8 gate validates arguments against this schema before an
+     // approval ticket is minted or consumed, so these caps ARE enforced there;
+     // on the operator/readonly path they remain client-advisory, per the same
+     // advisory-vs-enforced convention as the annotation hints. Full
+     // server-side enforcement on every path is tracked in #2437.
      R"j({"type":"object","properties":{)j"
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"

@@ -414,11 +414,11 @@ std::optional<SchemaViolation> validate_node(const SchemaNode& n, const nlohmann
 
     if (v.is_array()) {
         if (n.min_items && v.size() < *n.min_items)
-            return SchemaViolation{path, "array has fewer than minItems " +
-                                             std::to_string(*n.min_items) + " items"};
+            return SchemaViolation{path, "array is below the minItems " +
+                                             std::to_string(*n.min_items) + " (items)"};
         if (n.max_items && v.size() > *n.max_items)
-            return SchemaViolation{path, "array has more than maxItems " +
-                                             std::to_string(*n.max_items) + " items"};
+            return SchemaViolation{path, "array exceeds maxItems " +
+                                             std::to_string(*n.max_items) + " (items)"};
         if (n.items)
             for (std::size_t i = 0; i < v.size(); ++i)
                 if (auto violation =
@@ -441,6 +441,10 @@ std::optional<SchemaViolation> CompiledInputSchema::validate(const nlohmann::jso
     if (!root_)  // defensive: compile_input_schema never hands out a null root
         return SchemaViolation{"", "schema unavailable"};
     return validate_node(*root_, args, "");
+}
+
+std::size_t supported_keyword_count() {
+    return std::size(kSupportedKeywords);
 }
 
 std::expected<CompiledInputSchema, std::vector<std::string>>

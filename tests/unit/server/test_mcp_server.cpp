@@ -6070,6 +6070,34 @@ TEST_CASE("MCP 2405: registration validator rejects malformed and unsupported in
     CHECK_THROWS_WITH(
         validate_tool_registration_for_test(
             {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","minItems":-1,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'minItems' at '/properties/x' must be a non-negative integer"));
+    // Non-integer operands hit the type-check disjunct, not the <0 arm.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","minItems":"3","items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'minItems' at '/properties/x' must be a non-negative integer"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","maxItems":1.5,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'maxItems' at '/properties/x' must be a non-negative integer"));
+    // Array-only gating: the same require_type() guard the sibling `items`
+    // keyword carries (cpp-safety + QE: fail-closed but previously untested).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","minItems":1}}})"}}),
+        ContainsSubstring("keyword 'minItems' at '/properties/x' requires type 'array'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","maxItems":1}}})"}}),
+        ContainsSubstring("keyword 'maxItems' at '/properties/x' requires type 'array'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
             {{"t", R"({"type":"object","properties":{},"additionalProperties":true})"}}),
         ContainsSubstring("'true' is unsupported"));
     CHECK_THROWS_WITH(
@@ -6189,11 +6217,21 @@ TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
         CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"steps":["a","b"]})")));
         auto empty = s->validate(nlohmann::json::parse(R"({"steps":[]})"));
         REQUIRE(empty);
-        CHECK(empty->reason.find("fewer than minItems 1") != std::string::npos);
+        CHECK(empty->reason.find("below the minItems 1 (items)") != std::string::npos);
         auto over = s->validate(nlohmann::json::parse(R"({"steps":["a","b","c"]})"));
         REQUIRE(over);
-        CHECK(over->reason.find("more than maxItems 2") != std::string::npos);
+        CHECK(over->reason.find("exceeds maxItems 2 (items)") != std::string::npos);
+        // maxItems:0 means "must be empty" — a degenerate but legal bound.
+        auto z = compile_input_schema(
+            R"({"type":"object","properties":{"none":{"type":"array","maxItems":0,"items":{"type":"string"}}}})");
+        REQUIRE(z);
+        CHECK_FALSE(z->validate(nlohmann::json::parse(R"({"none":[]})")));
+        CHECK(z->validate(nlohmann::json::parse(R"({"none":["a"]})")));
     }
+    // Catalogue drift tether: growing kSupportedKeywords must be a deliberate
+    // act that also revisits the header contract comment and the
+    // docs/mcp-server.md bullet (both enumerate the same closed list).
+    CHECK(yuzu::server::mcp::supported_keyword_count() == 15);
     // additionalProperties:false rejects undeclared keys at the WILDCARD path.
     {
         auto s = compile_input_schema(
@@ -6346,6 +6384,51 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         REQUIRE(typed.contains("error"));
         CHECK(typed["error"]["code"] == yuzu::server::mcp::kInvalidParams);
         CHECK(appr.pending_count() == 1); // nothing new minted
+
+        // The array bounds 2f published (minItems/maxItems) are enforced at
+        // the gate on the REAL served schemas — steps:[] is the case the
+        // catalogue extension newly closes (UP-3's example burn), and
+        // over-cap agent_ids is its sibling.
+        auto empty_steps = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":325,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[]}}})")
+                ->body);
+        REQUIRE(empty_steps.contains("error"));
+        CHECK(empty_steps["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(empty_steps["error"]["message"].get<std::string>().find("'/steps'") !=
+              std::string::npos);
+        CHECK(empty_steps["error"]["message"].get<std::string>().find("minItems") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // no ticket minted for the empty bundle
+
+        std::string many_steps =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":326,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[)";
+        for (int i = 0; i < 33; ++i) {
+            if (i)
+                many_steps += ',';
+            many_steps += R"({"plugin":"p","action":"a)" + std::to_string(i) + R"("})";
+        }
+        many_steps += "]}}}";
+        auto over_steps = nlohmann::json::parse(ts.call(many_steps)->body);
+        REQUIRE(over_steps.contains("error"));
+        CHECK(over_steps["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_steps["error"]["message"].get<std::string>().find("maxItems") !=
+              std::string::npos);
+
+        std::string many_agents =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":327,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":[)";
+        for (int i = 0; i < 10001; ++i) {
+            if (i)
+                many_agents += ',';
+            many_agents += R"("a)" + std::to_string(i) + R"(")";
+        }
+        many_agents += "]}}}";
+        auto over_agents = nlohmann::json::parse(ts.call(many_agents)->body);
+        REQUIRE(over_agents.contains("error"));
+        CHECK(over_agents["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_agents["error"]["message"].get<std::string>().find("'/agent_ids'") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // still only the one valid mint
     }
     sqlite3_close(raw);
 }
@@ -6403,10 +6486,10 @@ TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
     // upstream). 8 threads × mixed accept/reject on a pattern-bearing schema.
     using yuzu::server::mcp::compile_input_schema;
     auto s = compile_input_schema(
-        R"({"type":"object","properties":{"x":{"type":"string","pattern":"^[a-z]{1,8}$"},"n":{"type":"integer","minimum":1,"maximum":100}}})");
+        R"({"type":"object","properties":{"x":{"type":"string","pattern":"^[a-z]{1,8}$"},"n":{"type":"integer","minimum":1,"maximum":100},"a":{"type":"array","minItems":1,"maxItems":2,"items":{"type":"string"}}}})");
     REQUIRE(s);
-    const auto good = nlohmann::json::parse(R"({"x":"abc","n":5})");
-    const auto bad = nlohmann::json::parse(R"({"x":"NOPE!","n":101})");
+    const auto good = nlohmann::json::parse(R"({"x":"abc","n":5,"a":["p"]})");
+    const auto bad = nlohmann::json::parse(R"({"x":"NOPE!","n":101,"a":[]})");
     std::vector<std::thread> workers;
     std::atomic<int> accepts{0}, rejects{0};
     for (int t = 0; t < 8; ++t)

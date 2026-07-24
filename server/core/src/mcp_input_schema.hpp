@@ -20,7 +20,12 @@
 // keyword catalogue is CLOSED to exactly what the served tool schemas use
 // (type / properties / required / enum / minimum / maximum / maxLength /
 // pattern / items / minItems / maxItems / additionalProperties /
-// anyOf-of-required-alternatives, with description and default ignored). Any other keyword — and any
+// anyOf-of-required-alternatives, with description and default ignored).
+// The catalogue is enumerated in THREE places that must move together:
+// kSupportedKeywords in mcp_input_schema.cpp, this comment, and the
+// "Pre-approval input-schema validation" bullet in docs/mcp-server.md.
+// A size tether in test_mcp_server.cpp fails when the array grows without
+// this list being revisited. Any other keyword — and any
 // malformed operand for a supported keyword — is a COMPILE error, surfaced
 // through the C8 boot validator so a schema the gate cannot fully enforce is
 // unbootable rather than partially enforced. Do not claim general JSON
@@ -87,5 +92,11 @@ class CompiledInputSchema {
 // '/properties/foo'"); the boot validator prefixes the owning tool name.
 std::expected<CompiledInputSchema, std::vector<std::string>>
 compile_input_schema(std::string_view schema_json);
+
+// Size of the closed keyword catalogue, for the drift tether described above:
+// growing kSupportedKeywords without revisiting the header comment and
+// docs/mcp-server.md fails a test rather than silently shipping a schema
+// keyword the operator docs never mention.
+std::size_t supported_keyword_count();
 
 }  // namespace yuzu::server::mcp

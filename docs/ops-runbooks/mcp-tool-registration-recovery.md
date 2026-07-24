@@ -20,7 +20,8 @@ securable type outside the RBAC catalogue). Since #2405 the same validator
 also compiles every served input schema, so the list can additionally carry
 `tool '<name>' input schema: ...` offences — schema not valid JSON, root not
 an object schema, an unsupported keyword or type, a malformed keyword operand
-(e.g. `minimum` exceeding `maximum`, a negative `maxLength`), a `pattern`
+(e.g. `minimum` exceeding `maximum`, `minItems` exceeding `maxItems`, a
+negative `maxLength`/`maxItems`), a keyword on the wrong type, a `pattern`
 that does not compile as RE2, nesting beyond the supported depth, a
 `required` name not declared in `properties`, or an approval-gated tool
 setting `additionalProperties:false` without declaring `approval_id` (its
