@@ -589,6 +589,13 @@ public:
         // dispatches once the Subscribe stream is open. Construction is
         // safe even when KV failed to open (it degrades to in-memory only).
         guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
+        // Spread this endpoint's journal maintenance and its forced (boot / reconnect) replay
+        // pages over their intervals - the ONLY place jitter is turned on, so every test keeps
+        // a deterministic cadence. Must precede wire_spark_engine(), which builds the worker.
+        // What it protects against is a CORRELATED fleet event - a gateway bounce, a mass
+        // restart, a restored snapshot - handing thousands of agents the same full journal
+        // scan and token burst in the same second (C0 flip-checklist item 12).
+        guardian_->set_maintenance_jitter(true);
         // start_local() (the pre-network cached-rule re-arm) is DEFERRED until after
         // the SparkEngine is constructed, started, and wired below (ADR-0021 rung
         // 7.7a): wire_spark_engine() must run before start_local() (the header
