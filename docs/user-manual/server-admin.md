@@ -191,6 +191,25 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — MCP supervised-tier calls now reject typed `params` values pre-approval (#2405)
+
+Approval-gated MCP `tools/call` arguments are now validated against the tool's
+published `inputSchema` BEFORE an approval ticket is minted or consumed. Most
+callers only fail earlier (junk args that would have failed after admin
+approval now answer `-32602` immediately, with no ticket created or burned).
+**One previously-succeeding shape breaks:** `execute_instruction` /
+`execute_bundle` on the **supervised** tier with a `params` object containing a
+non-string value (number/bool/array/object) — previously silently stringified
+by the handler after approval — is now rejected `-32602` before the approval
+workflow starts. Any supervised-tier integration sending typed `params` values
+must stringify them client-side before upgrading. **Operator tier is
+unchanged** (schema validation runs only on the approval-gated path; the
+handler coercion remains there). Also note: a recall whose arguments fail
+schema validation now answers `-32602` before the ticket is even looked up —
+clients that pattern-matched `-32003` for every recall failure should treat
+`-32602` as "fix the arguments, ticket untouched". Full detail:
+`docs/mcp-server.md` "Pre-approval input-schema validation".
+
 ### vNEXT — MCP tool annotations are now truthful; write tools carry `destructiveHint:true` for the first time
 
 Track 2g PR 2. Every MCP tool now advertises the four standard annotation hints

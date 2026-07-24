@@ -544,9 +544,12 @@ Required parameters are validated server-side; missing required fields return a
 
 For **approval-gated tools**, arguments are additionally validated against the
 tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
-work (#2405): a call with missing/mistyped arguments answers `-32602`
-immediately — it never creates an approval request, and a re-call carrying an
-`approval_id` with invalid arguments never consumes the ticket. The error
+work (#2405): a call with missing/mistyped arguments (per the published
+`inputSchema`) answers `-32602` immediately — it never creates an approval
+request, and a re-call carrying an `approval_id` with schema-invalid arguments
+never consumes the ticket. (Semantic checks the schema cannot express — an
+unknown plugin name, a nonexistent agent — still happen in the handler and are
+not pre-empted by this gate.) The error
 message names the offending field as a JSON-pointer-style path (e.g.
 `/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
 confirming no ticket was created or consumed. Two strictness notes: `integer`
@@ -703,12 +706,15 @@ proposes.
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier, or `delete_tag` on `operator`).
 2. The server validates the arguments against the tool's `inputSchema`
-   **first** (#2405): invalid arguments answer `-32602` with no approval
-   request created — an admin's approval can no longer be wasted on a call
-   the handler would reject, and a recall with invalid arguments cannot burn
-   its one-time ticket. Then the MCP server creates an **approval request**
-   with status `pending` (`definition_id = "mcp.<tool>"`, the tool arguments
-   captured as the canonical scope expression).
+   **first** (#2405): schema-invalid arguments answer `-32602` with no
+   approval request created — an admin's approval can no longer be wasted on
+   a call that fails schema validation, and a recall with schema-invalid
+   arguments cannot burn its one-time ticket. Arguments that pass the schema
+   but fail a handler's semantic check (e.g. an unknown plugin/action name)
+   are unaffected by this gate and can still consume a ticket. Then the MCP
+   server creates an **approval request** with status `pending`
+   (`definition_id = "mcp.<tool>"`, the tool arguments captured as the
+   canonical scope expression).
 3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
    carrying `error.data.approval_id` and `error.data.status_url`
    (`/api/v1/approvals/{id}`).

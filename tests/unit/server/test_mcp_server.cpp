@@ -6344,6 +6344,27 @@ TEST_CASE("MCP 2405: gated additionalProperties:false without approval_id is a b
           R"({"type":"object","properties":{"agent_id":{"type":"string"}},"additionalProperties":false})"}}));
 }
 
+TEST_CASE("MCP 2405: schema failure precedes the per-submitter cap deny",
+          "[mcp][integration][approval][schema]") {
+    // Chaos CH-6: validation sits above the mint fork, so an AT-CAP submitter
+    // with schema-invalid args gets -32602 (fix the args), not the cap's
+    // kTierDenied — and the pending set is untouched either way.
+    SchemaGateHarness h("operator");
+    for (int i = 0; i < 25; ++i) {
+        auto b = h.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":330,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-)" +
+            std::to_string(i) + R"(","key":"role"}}})");
+        REQUIRE(b.contains("error"));
+        REQUIRE(b["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    }
+    REQUIRE(h.appr->pending_count() == 25); // at cap
+    auto body = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":331,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-x"}}})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // not kTierDenied
+    CHECK(h.appr->pending_count() == 25);
+}
+
 TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
           "[mcp][schema]") {
     // Pins the thread-safety claim in mcp_input_schema.hpp under the nightly

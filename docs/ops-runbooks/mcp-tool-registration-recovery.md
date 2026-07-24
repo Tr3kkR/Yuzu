@@ -53,4 +53,10 @@ retry window — this stops once the unit settles in `failed`.
   affected tool returns `-32603` "tool security registration missing — denied
   fail-closed" and increments `yuzu_mcp_tool_security_misconfig_total`. That
   counter being non-zero is itself an incident signal — alert on it.
+- The sibling `yuzu_mcp_tool_args_invalid_total{tool}` counter (#2405) counts
+  schema-invalid approval-gated calls. Unlike the misconfig counter it is NOT
+  an incident on its own (a worker with a typo trips it), but a sustained
+  spike on one tool is a malformed integration or probing — suggested rule:
+  `increase(yuzu_mcp_tool_args_invalid_total[15m]) > 20` per tool, tuned to
+  your fleet's supervised-call volume.
 - `docs/mcp-server.md` — Security Model, boot-time registration validator.
