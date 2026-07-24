@@ -5,6 +5,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "rotation_confirm_state.hpp"
 #include "secure_random.hpp"
 
 #include <yuzu/secure_zero.hpp>
@@ -997,9 +998,48 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
             }
         }
 
-        if (active.size() != 2) {
+        // #2404: discriminate the states a confirm can find so a replay after
+        // the rotation already resolved gets a TERMINAL answer (the caller's
+        // classifier maps these strings to a 409/kInvalidParams conflict),
+        // instead of the old blanket "no in-flight rotation" that classified
+        // 503-retryable and made an idempotent-hint-honouring agent retry a
+        // permanently-failing call forever. The state machine is factored into
+        // a pure classifier (rotation_confirm_state.hpp) so a future
+        // pre-consume recheck seam (#2443) can reuse the same taxonomy; the
+        // recheck HERE, under the advisory lock, stays authoritative.
+        switch (detail::classify_confirm_state(active, token_id)) {
+        case detail::RotationConfirmState::kNoneActive:
+            // Ambiguous with a swallowed read failure (empty-on-error read
+            // contract) -> stays retryable, never a terminal client error.
             error_msg = "no in-flight rotation to confirm";
             return false;
+        case detail::RotationConfirmState::kOverfull:
+            error_msg = "more than two active credentials for this principal - "
+                        "resolve manually before confirming";
+            return false;
+        case detail::RotationConfirmState::kUnresolvedSole:
+            // A best-effort pair-resolve failed (or the partner expired before
+            // cleanup), leaving one row still stamped mid-rotation. Rotating
+            // from here would strand a malformed pair, so the remediation is
+            // revoke/inspect, NEVER rotate (#2404 F1).
+            error_msg = "one active credential with unresolved rotation metadata - "
+                        "do not rotate; revoke or inspect the credential state";
+            return false;
+        case detail::RotationConfirmState::kSoleConfirmed:
+            error_msg = "rotation already confirmed - the supplied token_id is the "
+                        "sole active credential; nothing to confirm";
+            return false;
+        case detail::RotationConfirmState::kSoleResolved:
+            error_msg = "no rotation in flight - the supplied token_id is already the "
+                        "sole active credential; nothing to confirm";
+            return false;
+        case detail::RotationConfirmState::kSoleOtherToken:
+            error_msg = "no rotation in flight for the supplied token_id - the rotation "
+                        "was resolved (confirmed, revoked, or cut over); rotate again if "
+                        "a new rotation is needed";
+            return false;
+        case detail::RotationConfirmState::kPair:
+            break; // exactly two active -> fall through to pair processing below
         }
 
         const ApiToken* predecessor = nullptr;

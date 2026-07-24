@@ -1231,6 +1231,30 @@ public:
                           "Cumulative engine-credential rotation-sweep ticks that failed with an "
                           "exception (predecessor auto-revocation skipped for that tick)",
                           "counter");
+        // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
+        // 503-transient retry storm on confirm is alertable instead of
+        // invisible (yuzu_http_requests_total has no per-route label). SCOPE
+        // CONTRACT (deliberately narrow, so the label set stays a fact): counts
+        // only confirm calls that reached the credential store OR found it
+        // unavailable at the store-open guard — NOT pre-store denials
+        // (permission / input-validation / MCP approval-gate), which are other
+        // families' concern. `result` mirrors the engine_store_error_class
+        // taxonomy plus `success`. Operational, NOT event="security" (a replay
+        // conflict is an expected agent retry shape, not an attack signal); no
+        // principal_id label (bounded cardinality only) — pair with the
+        // `engine_principal.credential.confirm` audit rows for per-principal
+        // forensics. One describe site only (#2446 last-write-wins on dup).
+        metrics_.describe("yuzu_engine_principal_confirm_total",
+                          "Engine-credential rotation confirm outcomes by surface (rest|mcp) and "
+                          "result (success|conflict|client_error|transient); store-reaching calls "
+                          "only, pre-store denials excluded (#2404)",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+                metrics_.counter("yuzu_engine_principal_confirm_total",
+                                 {{"surface", surface}, {"result", result}});
+            }
+        }
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");

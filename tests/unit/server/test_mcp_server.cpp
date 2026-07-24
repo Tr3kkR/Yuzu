@@ -1456,6 +1456,74 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
     CHECK(audit_bound);
 }
 
+TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams + a conflict "
+          "metric, not kInternalError (#2404)",
+          "[mcp][pg][engine_principal][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-replay";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.start();
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-replay"}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    const auto confirm_call = [&](int id) {
+        return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", id},
+                                      {"params",
+                                       {{"name", "confirm_engine_rotation"},
+                                        {"arguments",
+                                         {{"principal_id", principal},
+                                          {"token_id", successor_token_id}}}}}}
+                           .dump());
+    };
+    const auto confirm_metric = [&](const char* result) {
+        return reg
+            .counter("yuzu_engine_principal_confirm_total",
+                     {{"surface", "mcp"}, {"result", result}})
+            .value();
+    };
+
+    // First confirm succeeds (the real cutover).
+    auto ok = confirm_call(93);
+    REQUIRE(ok->status == 200);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    CHECK(confirm_metric("success") == 1.0);
+
+    // The replay: SAME args. Before #2404 the store's "no in-flight rotation"
+    // classified kInternalError (-32603, "retryable") and an idempotent-hint-
+    // honouring client would loop forever. Now it is a TERMINAL kInvalidParams
+    // (-32602) already-confirmed conflict.
+    auto replay = confirm_call(94);
+    REQUIRE(replay->status == 200); // JSON-RPC error still rides a 200
+    CHECK(replay->body.find("-32602") != std::string::npos);          // kInvalidParams
+    CHECK(replay->body.find("-32603") == std::string::npos);          // NOT kInternalError
+    CHECK(replay->body.find("rotation already confirmed") != std::string::npos);
+    CHECK(confirm_metric("conflict") == 1.0);
+    CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
+}
+
 // ── 2. ping ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
