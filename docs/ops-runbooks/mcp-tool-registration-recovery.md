@@ -21,9 +21,13 @@ also compiles every served input schema, so the list can additionally carry
 `tool '<name>' input schema: ...` offences — schema not valid JSON, root not
 an object schema, an unsupported keyword or type, a malformed keyword operand
 (e.g. `minimum` exceeding `maximum`, a negative `maxLength`), a `pattern`
-that does not compile as RE2, nesting beyond the supported depth, or a
-`required` name not declared in `properties`. The recovery procedure is
-identical — the defect is compiled into the binary. If the shipped systemd unit
+that does not compile as RE2, nesting beyond the supported depth, a
+`required` name not declared in `properties`, or an approval-gated tool
+setting `additionalProperties:false` without declaring `approval_id` (its
+tickets would be unrecallable). The recovery procedure is identical — the
+defect is compiled into the binary. If MCP itself is not needed while a
+rolled-back binary is prepared, `--mcp-disable` skips the validator (and the
+whole MCP surface) entirely and is the documented emergency bridge. If the shipped systemd unit
 (`deploy/systemd/yuzu-server.service`) is in use, the unit retries up to
 `StartLimitBurst=3` times within `StartLimitIntervalSec=60` and then enters
 the `failed` state. Note: the gRPC agent listener opens briefly each attempt

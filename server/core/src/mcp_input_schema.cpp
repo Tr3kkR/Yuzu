@@ -108,7 +108,8 @@ std::unique_ptr<const SchemaNode> compile_node(const nlohmann::json& s, const st
         node->type = *ty;
         type_known = true;
     } else {
-        err("unsupported type '" + s["type"].get<std::string>() + "' at '" + path + "'");
+        err("unsupported type '" + s["type"].get_ref<const std::string&>() + "' at '" + path +
+            "'");
     }
     auto type_is = [&](SchemaType t) { return type_known && node->type == t; };
     auto require_type = [&](const char* keyword, SchemaType t, const char* type_name) {

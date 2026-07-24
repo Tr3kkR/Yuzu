@@ -1355,6 +1355,35 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
                 for (const auto& e : compiled.error())
                     offences.push_back("tool '" + std::string(s.name) + "' input schema: " + e);
         }
+        // Unrecallable-ticket trap (#2405 governance UP-4): an approval-gated
+        // tool whose schema sets root additionalProperties:false without
+        // declaring approval_id would reject its OWN recall argument — every
+        // ticket it mints would be unredeemable, silently, forever. The
+        // checklist documents the rule; this makes it unbootable instead.
+        for (const auto& s : input_schemas) {
+            const auto row = std::find_if(security_rows.begin(), security_rows.end(),
+                                          [&](const auto& r) { return r.name == s.name; });
+            if (row == security_rows.end())
+                continue;  // parity offence already reported above
+            const bool gated = requires_approval("operator", row->securable, row->operation) ||
+                               requires_approval("supervised", row->securable, row->operation);
+            if (!gated)
+                continue;
+            const auto parsed =
+                nlohmann::json::parse(s.input_schema_json, nullptr, /*allow_exceptions=*/false);
+            if (!parsed.is_object())
+                continue;  // compile offence already reported above
+            const bool forbids_extra = parsed.contains("additionalProperties") &&
+                                       parsed["additionalProperties"].is_boolean() &&
+                                       !parsed["additionalProperties"].get<bool>();
+            const bool declares_ticket = parsed.contains("properties") &&
+                                         parsed["properties"].is_object() &&
+                                         parsed["properties"].contains("approval_id");
+            if (forbids_extra && !declares_ticket)
+                offences.push_back("approval-gated tool '" + std::string(s.name) +
+                                   "' sets additionalProperties:false without declaring "
+                                   "approval_id — its approval tickets would be unrecallable");
+        }
     }
 
     std::unordered_set<std::string_view> names;

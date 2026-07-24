@@ -47,6 +47,7 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -5650,7 +5651,10 @@ struct SchemaGateHarness {
         ts.approval_manager_for_test = &*appr;
         ts.start(tier);
     }
-    ~SchemaGateHarness() { sqlite3_close(raw); }
+    ~SchemaGateHarness() {
+        appr.reset();  // destroy the manager BEFORE closing its borrowed handle
+        sqlite3_close(raw);
+    }
 
     nlohmann::json call(const std::string& body) {
         auto res = ts.call(body);
@@ -5790,6 +5794,7 @@ TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declar
             ts.call(
                   R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})")
                 ->body);
+        REQUIRE(mint.contains("error")); // a clean Catch2 failure beats a json type_error
         auto approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
         REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
 
@@ -5900,6 +5905,7 @@ TEST_CASE("MCP 2405: schema failure wins before ticket lookup and pending handba
     // that id → -32602, not the pending handback; the ticket stays pending.
     auto mint = h.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":312,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    REQUIRE(mint.contains("error")); // a clean Catch2 failure beats a json type_error
     auto approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
     std::string recall =
         R"({"jsonrpc":"2.0","method":"tools/call","id":313,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":")" +
@@ -5973,9 +5979,12 @@ TEST_CASE("MCP 2405: schema denial carries one correlation id and a bounded coun
                 ->body);
         const auto cid = body["error"]["data"]["correlation_id"].get<std::string>();
         REQUIRE(!cid.empty());
-        // The SAME cid is stamped into the audit detail (#2423 one-cid pattern).
+        // The SAME cid is stamped into the audit detail (#2423 one-cid pattern),
+        // inside the exact SIEM-documented prefix (docs/mcp-server.md quotes it).
         REQUIRE(!ts.audit_details.empty());
         CHECK(ts.audit_details.back().find("correlation_id=" + cid) != std::string::npos);
+        CHECK(ts.audit_details.back().find("arguments do not match the tool input schema at '") !=
+              std::string::npos);
         // Bounded per-tool counter incremented exactly once.
         CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", "delete_tag"}})
                   .value() == 1.0);
@@ -6243,6 +6252,125 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
             CHECK_FALSE(compiled->validate(with_ticket));
         }
     }
+}
+
+TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
+          "[mcp][integration][approval][schema]") {
+    // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
+    // this proves the real served tables carry those keywords through the
+    // live dispatch path — an out-of-range value on a real gated tool is
+    // denied pre-mint (Gate 3 QE-1).
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        auto deny = [&](const char* body, const char* path_frag) {
+            auto b = nlohmann::json::parse(ts.call(body)->body);
+            REQUIRE(b.contains("error"));
+            CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(b["error"]["message"].get<std::string>().find(path_frag) !=
+                  std::string::npos);
+        };
+        // enum: create_engine_principal.classification ∈ {internal, external}.
+        deny(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":320,"params":{"name":"create_engine_principal","arguments":{"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"bogus"}}})",
+            "'/classification'");
+        // maximum: mint_engine_credential.ttl_days <= 90.
+        deny(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":321,"params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:v","ttl_days":91}}})",
+            "'/ttl_days'");
+        // maxLength: confirm_engine_rotation.token_id <= 64 bytes.
+        deny((std::string(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":322,"params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:v","token_id":")") +
+              std::string(65, 'a') + R"("}}})")
+                 .c_str(),
+             "'/token_id'");
+        CHECK(appr.pending_count() == 0);
+
+        // A REALISTIC (non-minimal) execute_instruction payload — scope +
+        // agent_ids + string params — passes validation and mints (-32006).
+        // Deliberate tier-dependent strictness (Gate 4 happy-S1, accepted):
+        // params values must be STRINGS on the approval-gated path even
+        // though the handler would coerce a number via dump(); an
+        // operator-tier caller (validation unreachable) keeps the
+        // pre-existing coercion. Strict typing on the destructive tier is
+        // the documented product decision, not an accident.
+        auto mint = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":323,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","scope":"tag:web","agent_ids":["agent-001","agent-002"],"params":{"verbose":"true","depth":"2"}}}})")
+                ->body);
+        REQUIRE(mint.contains("error"));
+        CHECK(mint["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+        CHECK(appr.pending_count() == 1);
+        // The same payload with a TYPED params value is denied pre-mint.
+        auto typed = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":324,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{"depth":2}}}})")
+                ->body);
+        REQUIRE(typed.contains("error"));
+        CHECK(typed["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.pending_count() == 1); // nothing new minted
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: gated additionalProperties:false without approval_id is a boot offence",
+          "[mcp][2g][schema]") {
+    using Catch::Matchers::ContainsSubstring;
+    // UP-4: such a tool would reject its OWN recall argument — every ticket
+    // unredeemable. Tag:Delete is approval-gated (operator + supervised).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Delete"}}, {"t"},
+            {{"t",
+              R"({"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false})"}}),
+        ContainsSubstring("approval-gated tool 't' sets additionalProperties:false without "
+                          "declaring approval_id"));
+    // Declaring approval_id makes the same shape legal.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"t"}, {{"t", "Tag", "Delete"}}, {"t"},
+        {{"t",
+          R"({"type":"object","properties":{"agent_id":{"type":"string"},"approval_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false})"}}));
+    // A NON-gated tool may forbid extras freely.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"t"}, {{"t", "Tag", "Read"}}, {},
+        {{"t",
+          R"({"type":"object","properties":{"agent_id":{"type":"string"}},"additionalProperties":false})"}}));
+}
+
+TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
+          "[mcp][schema]") {
+    // Pins the thread-safety claim in mcp_input_schema.hpp under the nightly
+    // TSan tier: httplib workers share one CompiledInputSchema per tool, and
+    // RE2's lazy DFA build is the only interior mutation (mutex-guarded
+    // upstream). 8 threads × mixed accept/reject on a pattern-bearing schema.
+    using yuzu::server::mcp::compile_input_schema;
+    auto s = compile_input_schema(
+        R"({"type":"object","properties":{"x":{"type":"string","pattern":"^[a-z]{1,8}$"},"n":{"type":"integer","minimum":1,"maximum":100}}})");
+    REQUIRE(s);
+    const auto good = nlohmann::json::parse(R"({"x":"abc","n":5})");
+    const auto bad = nlohmann::json::parse(R"({"x":"NOPE!","n":101})");
+    std::vector<std::thread> workers;
+    std::atomic<int> accepts{0}, rejects{0};
+    for (int t = 0; t < 8; ++t)
+        workers.emplace_back([&] {
+            for (int i = 0; i < 200; ++i) {
+                if (!s->validate(good))
+                    ++accepts;
+                if (s->validate(bad))
+                    ++rejects;
+            }
+        });
+    for (auto& w : workers)
+        w.join();
+    CHECK(accepts == 8 * 200);
+    CHECK(rejects == 8 * 200);
 }
 
 TEST_CASE("MCP approve_request approves a pending request as a second principal",
