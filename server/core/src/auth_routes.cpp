@@ -389,7 +389,15 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
     if (!engine_principal_store_) {
         return R::kRevoked;
     }
-    switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+    // The ONE cached-lookup site (#2367). This function is only ever reached
+    // from revalidate_stream — the per-tick liveness re-check of an ALREADY
+    // authenticated stream — never from session synthesis or an on-behalf-of
+    // target check, both of which call get_for_auth and read through to
+    // Postgres every time. See the store hpp for why the split is the security
+    // argument: this path already grants a grace window of the same order as
+    // the cache TTL, so caching here changes no posture; caching a fresh
+    // authorization decision would.
+    switch (engine_principal_store_->get_for_auth_revalidate(token.principal_id).status) {
     case EngineLookupStatus::Active:
         return R::kValid;
     case EngineLookupStatus::MissingOrRevoked:

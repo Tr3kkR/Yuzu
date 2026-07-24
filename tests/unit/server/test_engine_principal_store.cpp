@@ -438,6 +438,201 @@ TEST_CASE("EnginePrincipalStore::get_for_auth — Active vs MissingOrRevoked vs 
     }
 }
 
+// ── get_for_auth_revalidate: the #2367 liveness cache ──────────────────────
+
+TEST_CASE("get_for_auth_revalidate caches Active while get_for_auth stays uncached",
+          "[pg][engine_principal][store][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-warm")
+               .has_value());
+
+    // First revalidate reads through (miss) and installs the entry.
+    CHECK(store.get_for_auth_revalidate("engine:cache-warm").status ==
+          EngineLookupStatus::Active);
+    CHECK(store.revalidate_cache_misses() == 1);
+    CHECK(store.revalidate_cache_hits() == 0);
+    CHECK(store.revalidate_cache_size() == 1);
+
+    // Subsequent ticks are served from cache — this is the whole point: N
+    // streams x per-tick revalidation stops being N Postgres reads per tick.
+    for (int i = 0; i < 5; ++i) {
+        EngineLookup l = store.get_for_auth_revalidate("engine:cache-warm");
+        CHECK(l.status == EngineLookupStatus::Active);
+        REQUIRE(l.row.has_value()); // a cached hit still honours "row iff Active"
+        CHECK(l.row->principal_id == "engine:cache-warm");
+    }
+    CHECK(store.revalidate_cache_hits() == 5);
+    CHECK(store.revalidate_cache_misses() == 1); // unchanged — no further reads
+
+    // get_for_auth is the authoritative chokepoint and must NOT consult or
+    // populate the cache: fresh authorization decisions always read through.
+    const auto hits_before = store.revalidate_cache_hits();
+    const auto misses_before = store.revalidate_cache_misses();
+    for (int i = 0; i < 3; ++i)
+        CHECK(store.get_for_auth("engine:cache-warm").status == EngineLookupStatus::Active);
+    CHECK(store.revalidate_cache_hits() == hits_before);
+    CHECK(store.revalidate_cache_misses() == misses_before);
+}
+
+TEST_CASE("revoke invalidates the revalidate cache — no stale Active survives the write",
+          "[pg][engine_principal][store][cache]") {
+    // THE security test for #2367. A cached Active must not outlive its
+    // principal: on the writing replica the stream is cut on the very next
+    // tick, not after kAuthCacheTtl.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-revoke")
+               .has_value());
+
+    REQUIRE(store.get_for_auth_revalidate("engine:cache-revoke").status ==
+            EngineLookupStatus::Active);
+    REQUIRE(store.revalidate_cache_size() == 1);
+
+    auto revoked = store.revoke("engine:cache-revoke");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+    CHECK(store.revalidate_cache_size() == 0); // dropped by the write, not by TTL
+
+    // Next tick observes the revocation immediately.
+    CHECK(store.get_for_auth_revalidate("engine:cache-revoke").status ==
+          EngineLookupStatus::MissingOrRevoked);
+    // ...and stays uncached, so it cannot be resurrected by a later hit.
+    CHECK(store.revalidate_cache_size() == 0);
+    CHECK(store.get_for_auth_revalidate("engine:cache-revoke").status ==
+          EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("transfer_owner invalidates the revalidate cache",
+          "[pg][engine_principal][store][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-xfer")
+               .has_value());
+
+    EngineLookup warm = store.get_for_auth_revalidate("engine:cache-xfer");
+    REQUIRE(warm.status == EngineLookupStatus::Active);
+    REQUIRE(warm.row.has_value());
+    CHECK(warm.row->owner_username == "alice");
+
+    auto moved = store.transfer_owner("engine:cache-xfer", "bob");
+    REQUIRE(moved.has_value());
+    REQUIRE(*moved);
+    CHECK(store.revalidate_cache_size() == 0);
+
+    EngineLookup after = store.get_for_auth_revalidate("engine:cache-xfer");
+    REQUIRE(after.status == EngineLookupStatus::Active);
+    REQUIRE(after.row.has_value());
+    CHECK(after.row->owner_username == "bob"); // no stale row served
+}
+
+TEST_CASE("get_for_auth_revalidate caches ONLY Active — never MissingOrRevoked, never "
+          "StoreUnreachable",
+          "[pg][engine_principal][store][cache]") {
+    SECTION("MissingOrRevoked is re-read every call (no negative caching)") {
+        YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        EnginePrincipalStore store{pool};
+        REQUIRE(store.is_open());
+
+        for (int i = 0; i < 3; ++i)
+            CHECK(store.get_for_auth_revalidate("engine:never-existed").status ==
+                  EngineLookupStatus::MissingOrRevoked);
+        CHECK(store.revalidate_cache_size() == 0);
+        CHECK(store.revalidate_cache_hits() == 0);
+        CHECK(store.revalidate_cache_misses() == 3);
+
+        // Not negative-caching is what lets a freshly created principal be seen
+        // immediately, with no create() invalidation hook.
+        REQUIRE(store.create("Late", "alice", "j", "internal", "admin", "engine:never-existed")
+                   .has_value());
+        CHECK(store.get_for_auth_revalidate("engine:never-existed").status ==
+              EngineLookupStatus::Active);
+    }
+
+    SECTION("StoreUnreachable is never cached — caching it would extend the outage") {
+        // Invalid pool: never connects, so no live DB needed (mirrors the
+        // get_for_auth StoreUnreachable section above).
+        PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+        REQUIRE_FALSE(pool.valid());
+        EnginePrincipalStore store{pool};
+        REQUIRE_FALSE(store.is_open());
+
+        for (int i = 0; i < 3; ++i)
+            CHECK(store.get_for_auth_revalidate("engine:whatever").status ==
+                  EngineLookupStatus::StoreUnreachable);
+        CHECK(store.revalidate_cache_size() == 0);
+        CHECK(store.revalidate_cache_hits() == 0);
+    }
+}
+
+TEST_CASE("a revoke racing a revalidate's cache-write cannot poison the cache (#2367 TOCTOU)",
+          "[pg][engine_principal][store][cache]") {
+    // Deterministic interleave at the exact poisoning point, mirroring
+    // ApiTokenStore's #2179 regression test. The hook fires after the
+    // read-through (which saw an Active row) and before the generation
+    // re-check, i.e. precisely where a naive implementation would install an
+    // entry that outlives the revoke by a full TTL.
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("Vuln Sync", "alice", "j", "internal", "admin", "engine:cache-race")
+               .has_value());
+
+    bool fired = false;
+    store.test_hook_after_revalidate_read_ = [&] {
+        if (fired)
+            return; // the revoke's own path must not recurse
+        fired = true;
+        auto revoked = store.revoke("engine:cache-race");
+        REQUIRE(revoked.has_value());
+        REQUIRE(*revoked);
+    };
+
+    // This call read an Active row before the revoke landed, so returning
+    // Active once is permitted (documented bounded window). What is NOT
+    // permitted is caching it.
+    (void)store.get_for_auth_revalidate("engine:cache-race");
+    store.test_hook_after_revalidate_read_ = nullptr;
+    REQUIRE(fired);
+
+    CHECK(store.revalidate_cache_size() == 0); // generation bump defeated the write
+    CHECK(store.get_for_auth_revalidate("engine:cache-race").status ==
+          EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("invalidate_revalidate_cache clears one principal or all of them",
+          "[pg][engine_principal][store][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create("A", "alice", "j", "internal", "admin", "engine:inv-a").has_value());
+    REQUIRE(store.create("B", "alice", "j", "internal", "admin", "engine:inv-b").has_value());
+    REQUIRE(store.get_for_auth_revalidate("engine:inv-a").status == EngineLookupStatus::Active);
+    REQUIRE(store.get_for_auth_revalidate("engine:inv-b").status == EngineLookupStatus::Active);
+    REQUIRE(store.revalidate_cache_size() == 2);
+
+    store.invalidate_revalidate_cache("engine:inv-a");
+    CHECK(store.revalidate_cache_size() == 1);
+
+    store.invalidate_revalidate_cache(); // empty id = clear all
+    CHECK(store.revalidate_cache_size() == 0);
+}
+
 // ── list_all ────────────────────────────────────────────────────────────────
 
 TEST_CASE("EnginePrincipalStore::list_all returns created principals, ordered, with the "

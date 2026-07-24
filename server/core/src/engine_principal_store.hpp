@@ -50,11 +50,55 @@
 ///
 /// Operator-facing REST/MCP/console CRUD wrapping this store's API is PR
 /// 4.3 scope — this header adds no routes.
+///
+/// ## The revalidation cache (#2367) — deliberately NOT on the auth chokepoint
+///
+/// Every live MCP/SSE stream re-validates its credential on each ~3 s pump
+/// tick. The token row itself is served from `ApiTokenStore`'s 60 s cache, so
+/// for an ENGINE principal the extra `get_for_auth` hop was the only uncached
+/// read on that path: one Postgres round-trip per engine stream per tick,
+/// each a bounded `try_acquire_for` on a pool of ~16 connections. That is
+/// absorbable in steady state and self-amplifying under a pool brownout —
+/// `StoreUnreachable` -> `kIndeterminate` -> every engine stream stays in its
+/// grace window and KEEPS retrying, N waiters starving ordinary
+/// `validate_token` and the fleet data plane with it.
+///
+/// So `get_for_auth_revalidate()` adds a short-TTL positive cache — and ONLY
+/// that method. `get_for_auth()` stays uncached and authoritative. The split
+/// is the security argument, not an implementation detail:
+///
+///   - The revalidation path already tolerates a bounded staleness window by
+///     design: on `kIndeterminate` the stream rides out a ~60 s grace period
+///     (Decision 15(i), CH-4). A cache TTL of the same order therefore adds
+///     nothing qualitatively new to stream-liveness posture.
+///   - A FRESH authorization decision tolerates none. Session synthesis
+///     (`synthesize_token_session`) and the MCP/REST on-behalf-of target
+///     checks keep reading through to Postgres every time, so revoking a
+///     principal still stops new sessions and new delegations instantly.
+///
+/// Only `Active` is cached. `MissingOrRevoked` is not (it is terminal and
+/// rare — the alerting path — and negative-caching it would need `create()`
+/// invalidation to avoid masking a fresh principal). `StoreUnreachable` is
+/// emphatically not: caching "I could not ask" would extend the very outage
+/// this cache exists to damp.
+///
+/// Revocation latency on the cached path: the writing replica invalidates
+/// synchronously in `revoke()`/`transfer_owner()`, so a single-server
+/// deployment (the shipped posture) cuts the stream on the next tick. Across
+/// replicas the window is bounded by `kAuthCacheTtl` — the same residual
+/// property `ApiTokenStore`'s token cache already carries, and strictly
+/// inside the grace window the pump would have granted anyway.
 
+#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -112,8 +156,49 @@ public:
     /// three-state contract. Every session-synthesis / delegation-redemption
     /// caller MUST route through this, never a plain `get()` (which returns
     /// any lifecycle_state and does not distinguish store-unreachable from
-    /// not-found — it is for admin/test reads only).
+    /// not-found — it is for admin/test reads only). Always reads through to
+    /// Postgres: a fresh authorization decision is never served from cache.
     [[nodiscard]] EngineLookup get_for_auth(const std::string& principal_id) const;
+
+    /// LIVENESS RE-CHECK ONLY — the per-tick "is this already-authenticated
+    /// stream's backing principal still alive?" question, served from a
+    /// `kAuthCacheTtl` positive cache (#2367; rationale in the file doc
+    /// comment). Same three-state contract as `get_for_auth`.
+    ///
+    /// NEVER use this to make a FRESH authorization decision — not for
+    /// session synthesis, not for an on-behalf-of target check, not for a
+    /// route's admission gate. Those must call `get_for_auth`. A cached
+    /// `Active` is evidence that the principal was live within the TTL, which
+    /// is sufficient to let an EXISTING stream keep running (its pump already
+    /// grants a grace window of the same order) and is NOT sufficient to
+    /// admit anything new.
+    [[nodiscard]] EngineLookup get_for_auth_revalidate(const std::string& principal_id) const;
+
+    /// Drop `principal_id` from the revalidation cache (empty string = clear
+    /// all). Called synchronously by this store's own lifecycle writers; also
+    /// public so a future replication/notify hook can invalidate on a peer's
+    /// write without reaching into internals.
+    void invalidate_revalidate_cache(const std::string& principal_id = {});
+
+    /// Revalidation-cache counters (observability parity with
+    /// `ApiTokenStore::cache_hits`/`cache_misses`). A miss is any lookup that
+    /// had to read Postgres — absent, expired, or non-Active.
+    [[nodiscard]] std::uint64_t revalidate_cache_hits() const noexcept {
+        return revalidate_cache_hits_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t revalidate_cache_misses() const noexcept {
+        return revalidate_cache_misses_.load(std::memory_order_relaxed);
+    }
+
+    /// Number of distinct principals currently cached (test/observability).
+    [[nodiscard]] std::size_t revalidate_cache_size() const;
+
+    // Test-only seam (#2367), mirroring ApiTokenStore's
+    // `test_hook_after_validate_select_`. Null in production (zero overhead).
+    // Fires in get_for_auth_revalidate AFTER the read-through and BEFORE the
+    // generation re-check + cache-write, letting a test deterministically
+    // interleave a revoke at the exact poisoning point.
+    std::function<void()> test_hook_after_revalidate_read_;
 
     /// Mint a new engine principal. Validates BEFORE inserting:
     ///  - `classification` must be exactly "internal" or "external" (empty or
@@ -201,8 +286,41 @@ public:
     count_active_owned_by(const std::string& owner_username) const;
 
 private:
+    /// One cached Active lookup. Only ever built from an `Active` result.
+    struct CachedAuth {
+        EnginePrincipalRow row;
+        std::chrono::steady_clock::time_point cached_at;
+    };
+
     pg::PgPool& pool_;
     bool open_{false};
+
+    /// Revalidation cache (#2367) — positive entries only, see the file doc
+    /// comment for why this is not on `get_for_auth`.
+    static constexpr auto kAuthCacheTtl = std::chrono::seconds(60);
+    mutable std::mutex revalidate_cache_mu_;
+    mutable std::unordered_map<std::string, CachedAuth> revalidate_cache_;
+    mutable std::atomic<std::uint64_t> revalidate_cache_hits_{0};
+    mutable std::atomic<std::uint64_t> revalidate_cache_misses_{0};
+
+    /// TOCTOU guard against cache POISONING, copied from
+    /// `ApiTokenStore::revoke_generation_` including its hard-won ordering
+    /// rule: a writer bumps this BEFORE it takes `revalidate_cache_mu_`, and
+    /// a reader re-checks it UNDER that mutex, in the same critical section as
+    /// the insert. A check-then-lock ordering leaves a real window — the
+    /// writer's erase runs between the reader's check and its insert (erasing
+    /// nothing, because nothing is inserted yet), after which the reader
+    /// installs a stale `Active` that survives the full TTL. Holding the lock
+    /// across re-check AND insert serializes the pair against the erase:
+    /// either the reader observes the bump and skips, or the erase lands
+    /// strictly after the insert and removes it.
+    ///
+    /// This guards the CACHE only. It does not serialize an in-flight
+    /// revalidate against a concurrent revoke: a principal revoked during a
+    /// revalidate's own execution may be reported Active once. Bounded (the
+    /// next tick reads through) and inside the pump's grace window by
+    /// construction.
+    std::atomic<std::uint64_t> revoke_generation_{0};
 };
 
 } // namespace yuzu::server
