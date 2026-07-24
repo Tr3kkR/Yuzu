@@ -1083,6 +1083,12 @@ groups:
   #           The pending reserve overflowed under sustained write failure - records
   #           never reached the journal; the audit trail has a hole. Correlate with
   #           _write_failures and _pending on the same agents.
+  #           THREE causes need different responses: sustained write failure, capacity
+  #           refusal, and - since #2299 - simply out-running the heartbeat's per-tick
+  #           persist bounds (4 batches / 1024 records). On that third path
+  #           write_failures and write_capacity_rejected are both ZERO and nothing is
+  #           broken; check batches_written's rate against the per-tick ceiling before
+  #           treating the alert as faulty.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-stage-dropped"
   #     - alert: YuzuGuardianJournalWriteFailures
   #       expr: |

@@ -174,7 +174,7 @@ struct PageRig {
                 JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
                               .enqueued_ns = 1'700'000'000'000'000'000, .kind = kind,
                               .guard_type = "file", .rule_name = "n"})};
-        REQUIRE(journal->persist(pending) == 1);
+        REQUIRE(journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 1);
     }
 };
 } // namespace
@@ -1344,7 +1344,7 @@ TEST_CASE("#2364 episode: survives small-batch placement while the big batch is 
             JournalRecord{.rule_id = "big", .generation = 1, .event_id = "e-big-" + std::to_string(i),
                           .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                           .guard_type = "file", .rule_name = "n"}));
-    REQUIRE(rig.journal->persist(big) == 4);
+    REQUIRE(rig.journal->persist(big, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 4);
     rig.persist("small");
 
     CHECK(rig.journal->headroom_blocked_since_for_test() == -1); // no episode yet
@@ -1606,7 +1606,7 @@ TEST_CASE("#2364 episode: restart after clear - a fresh episode stamps and clear
             JournalRecord{.rule_id = "big", .generation = 1, .event_id = "e-big-" + std::to_string(i),
                           .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                           .guard_type = "file", .rule_name = "n"}));
-    REQUIRE(rig.journal->persist(big) == 4);
+    REQUIRE(rig.journal->persist(big, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 4);
     const std::int64_t t0 = 1'700'000'000'000;
     REQUIRE(rig.journal->page_into_window(*rig.rt, t0).headroom_blocked);
     REQUIRE(rig.journal->headroom_blocked_since_for_test() >= 0);
@@ -1629,7 +1629,7 @@ TEST_CASE("#2364 episode: restart after clear - a fresh episode stamps and clear
             JournalRecord{.rule_id = "big2", .generation = 1, .event_id = "e-b2-" + std::to_string(i),
                           .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                           .guard_type = "file", .rule_name = "n"}));
-    REQUIRE(rig.journal->persist(big2) == 2);
+    REQUIRE(rig.journal->persist(big2, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 2);
     const auto s3 = rig.journal->page_into_window(*rig.rt, t0 + 120'000);
     CHECK(s3.headroom_blocked);
     const auto since2 = rig.journal->headroom_blocked_since_for_test();
@@ -1958,7 +1958,7 @@ TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
     REQUIRE(pending.size() == 1);
 
     std::vector<PersistedBatch> batches;
-    CHECK(rig.journal->persist(pending, &batches) == 1);
+    CHECK(rig.journal->persist(pending, &batches, kJournalPersistUnbounded, kJournalPersistUnbounded) == 1);
     REQUIRE(batches.size() == 1);
     for (const auto& b : batches)
         rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
@@ -2045,7 +2045,7 @@ TEST_CASE("concurrent persist + page + prune + drain do not race (TSan checkpoin
                     .rule_id = "w" + std::to_string(n), .generation = 1,
                     .event_id = "we-" + std::to_string(n), .enqueued_ns = 1'700'000'000'000'000'000,
                     .kind = "armed", .guard_type = "file", .rule_name = "n"})};
-            (void)rig.journal->persist(pending);
+            (void)rig.journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded);
         }
     });
     // Drainer.

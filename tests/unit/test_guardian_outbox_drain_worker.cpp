@@ -164,7 +164,7 @@ struct JournalRig {
                 .event_id = "e-" + tag + "-" + std::to_string(i),
                 .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                 .guard_type = "file", .rule_name = "n"}));
-        REQUIRE(journal->persist(pending) == n);
+        REQUIRE(journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == n);
     }
     /// Persist one record as its own durable batch (one persist call = one batch key),
     /// WITHOUT going through the runtime - so the only way it can reach the send window
@@ -175,7 +175,7 @@ struct JournalRig {
                 JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
                               .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                               .guard_type = "file", .rule_name = "n"})};
-        REQUIRE(journal->persist(pending) == 1);
+        REQUIRE(journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 1);
     }
 };
 
@@ -725,7 +725,7 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
             if (pending.empty())
                 continue;
             std::vector<PersistedBatch> batches;
-            const std::size_t written = rig.journal->persist(pending, &batches);
+            const std::size_t written = rig.journal->persist(pending, &batches, kJournalPersistUnbounded, kJournalPersistUnbounded);
             if (written > 0) {
                 rig.rt->erase_persisted_prefix(written, snap.drops_at_snapshot);
                 for (const auto& b : batches)
@@ -931,7 +931,7 @@ TEST_CASE("a link-down/reconnect cycle with REAL Retain semantics loses nothing"
                 auto& pending = snap.records;
         if (!pending.empty()) {
             std::vector<PersistedBatch> batches;
-            const std::size_t written = rig.journal->persist(pending, &batches);
+            const std::size_t written = rig.journal->persist(pending, &batches, kJournalPersistUnbounded, kJournalPersistUnbounded);
             if (written > 0)
                 rig.rt->erase_persisted_prefix(written, snap.drops_at_snapshot);
         }
