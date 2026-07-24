@@ -556,6 +556,20 @@ Tools accept parameters via the `arguments` object in the `tools/call` request.
 Required parameters are validated server-side; missing required fields return a
 `-32602 Invalid params` error.
 
+For **approval-gated tools**, arguments are additionally validated against the
+tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
+work (#2405): a call with missing, mistyped, or out-of-bounds arguments (per
+the published `inputSchema`) answers `-32602` immediately — it never creates an approval
+request, and a re-call carrying an `approval_id` with schema-invalid arguments
+never consumes the ticket. (Semantic checks the schema cannot express — an
+unknown plugin name, a nonexistent agent — still happen in the handler and are
+not pre-empted by this gate.) The error
+message names the offending field as a JSON-pointer-style path (e.g.
+`/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
+confirming no ticket was created or consumed. Two strictness notes: `integer`
+parameters must be JSON integers (an integral float like `1.0` is rejected),
+and `maxLength` limits are byte counts.
+
 **Examples of key parameters:**
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
@@ -705,7 +719,14 @@ proposes.
 
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier, or `delete_tag` on `operator`).
-2. The MCP server creates an **approval request** with status `pending`
+2. The server validates the arguments against the tool's `inputSchema`
+   **first** (#2405): schema-invalid arguments answer `-32602` with no
+   approval request created — an admin's approval can no longer be wasted on
+   a call that fails schema validation, and a recall with schema-invalid
+   arguments cannot burn its one-time ticket. Arguments that pass the schema
+   but fail a handler's semantic check (e.g. an unknown plugin/action name)
+   are unaffected by this gate and can still consume a ticket. Then the MCP
+   server creates an **approval request** with status `pending`
    (`definition_id = "mcp.<tool>"`, the tool arguments captured as the
    canonical scope expression).
 3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
@@ -1048,10 +1069,17 @@ recall once it is approved.
 
 **Cause**: A required parameter is missing or invalid. For example, calling
 `get_agent_details` without `agent_id`, or calling `query_responses` with
-neither `execution_id` nor `instruction_id`.
+neither `execution_id` nor `instruction_id`. For an approval-gated tool this
+can also fire on a **recall** carrying `approval_id`: if the arguments fail
+schema validation the call is denied `-32602` immediately, before the ticket
+is even looked up (nothing consumed) — distinct from `-32003`'s "arguments
+don't match the ticket", which applies only to schema-*valid* mismatched
+arguments (#2405).
 
-**Fix**: Include all required parameters in the `arguments` object. See the
-[Available Tools](#available-tools) section for parameter requirements.
+**Fix**: Include all required parameters in the `arguments` object, typed as
+the tool's `inputSchema` declares (integers must be JSON integers — `1.0` is
+rejected). See the [Available Tools](#available-tools) section for parameter
+requirements.
 
 ### MCP client cannot connect
 

@@ -16,7 +16,19 @@ there is nothing to repair on the host.
 
 The offender list names each affected tool and which table disagrees (missing
 or duplicate `kToolSecurity` row, `kWriteTools` mismatch, or an operation /
-securable type outside the RBAC catalogue). If the shipped systemd unit
+securable type outside the RBAC catalogue). Since #2405 the same validator
+also compiles every served input schema, so the list can additionally carry
+`tool '<name>' input schema: ...` offences — schema not valid JSON, root not
+an object schema, an unsupported keyword or type, a malformed keyword operand
+(e.g. `minimum` exceeding `maximum`, `minItems` exceeding `maxItems`, a
+negative `maxLength`/`maxItems`), a keyword on the wrong type, a `pattern`
+that does not compile as RE2, nesting beyond the supported depth, a
+`required` name not declared in `properties`, or an approval-gated tool
+setting `additionalProperties:false` without declaring `approval_id` (its
+tickets would be unrecallable). The recovery procedure is identical — the
+defect is compiled into the binary. If MCP itself is not needed while a
+rolled-back binary is prepared, `--mcp-disable` skips the validator (and the
+whole MCP surface) entirely and is the documented emergency bridge. If the shipped systemd unit
 (`deploy/systemd/yuzu-server.service`) is in use, the unit retries up to
 `StartLimitBurst=3` times within `StartLimitIntervalSec=60` and then enters
 the `failed` state. Note: the gRPC agent listener opens briefly each attempt
@@ -42,4 +54,10 @@ retry window — this stops once the unit settles in `failed`.
   affected tool returns `-32603` "tool security registration missing — denied
   fail-closed" and increments `yuzu_mcp_tool_security_misconfig_total`. That
   counter being non-zero is itself an incident signal — alert on it.
+- The sibling `yuzu_mcp_tool_args_invalid_total{tool}` counter (#2405) counts
+  schema-invalid approval-gated calls. Unlike the misconfig counter it is NOT
+  an incident on its own (a worker with a typo trips it), but a sustained
+  spike on one tool is a malformed integration or probing — suggested rule:
+  `increase(yuzu_mcp_tool_args_invalid_total[15m]) > 20` per tool, tuned to
+  your fleet's supervised-call volume.
 - `docs/mcp-server.md` — Security Model, boot-time registration validator.

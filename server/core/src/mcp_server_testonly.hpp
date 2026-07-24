@@ -68,11 +68,26 @@ struct ToolSecurityRowOwned {
     std::string operation;
 };
 
+// Owning-string (name, input_schema_json) row for the validator's 4th raw
+// sequence (#2405) — synthetic input-schema sources.
+struct ToolSchemaRowOwned {
+    std::string name;
+    std::string schema_json;
+};
+
 // Runs the REAL ctor registration validator over synthetic tables — throws
 // std::runtime_error naming every offender, exactly as McpServer() does.
+// `input_schemas` feeds the #2405 subset-compiler offence classes; pass {}
+// to exercise only the #2383 table-parity checks.
 void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
                                          const std::vector<ToolSecurityRowOwned>& security_rows,
-                                         const std::vector<std::string>& write_tools);
+                                         const std::vector<std::string>& write_tools,
+                                         const std::vector<ToolSchemaRowOwned>& input_schemas);
+
+// The served (name, input_schema_json) pairs from kTools[] (#2405), so the
+// whole-table sweep test can compile every served schema and assert the
+// required-⊆-properties lint without duplicating the table.
+std::vector<ToolSchemaRowOwned> input_schemas_for_test();
 
 // The validator's closed-catalogue mirrors of rbac_store.cpp's seeded `ops[]`
 // and `types[]` (#2383 UP-6/C-3) — the [rbac_store] binding test compares
