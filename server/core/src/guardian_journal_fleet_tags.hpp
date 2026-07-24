@@ -6,12 +6,13 @@
 /// tag keys, the `yuzu_fleet_guardian_journal_*` gauge names they roll up into, their
 /// HELP text, and the forged-value-safe parse of the agent-supplied values.
 ///
-/// The writer is agents/core/src/guardian_journal_heartbeat.hpp
-/// (`emit_guardian_journal_heartbeat_tags`). The two sides are bound by
-/// tests/unit/server/test_guardian_journal_fleet_tags.cpp, which emits through the
-/// agent's REAL emitter and asserts every key it produces is one this table
-/// recognises. That test is the drift guard: a rename on either side without the
-/// other is a red test, not a silently-dead gauge.
+/// The writer is agents/core/src/guardian_journal_heartbeat.hpp - the sparse counter
+/// emitter (`emit_guardian_journal_heartbeat_tags`) for the 29-row table, and the age
+/// emitter (`emit_guardian_journal_age_tags`) for the MAX table further down. Both
+/// sides are bound by tests/unit/server/test_guardian_journal_fleet_tags.cpp, which
+/// emits through the agent's REAL emitters and asserts every key produced is one a
+/// table here recognises. That test is the drift guard: a rename on either side
+/// without the other is a red test, not a silently-dead gauge.
 ///
 /// The keys are duplicated here rather than `#include`d from the agent header ON
 /// PURPOSE. Server production code including an agent private header would add an
@@ -38,9 +39,9 @@
 /// readings against.
 ///
 /// The writer is SPARSE: a counter that is 0 ships no tag.
-/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 29 at the top of
-/// every sweep and re-publishes only those at least one retained agent reported this
-/// cycle. So an absent family means: no retained agent's latest heartbeat carried a
+/// `AgentHealthStore::recompute_metrics` `clear_gauge_family()`s all 29 (and the age
+/// family's 3, same rule) at the top of every sweep and re-publishes only those at
+/// least one retained agent reported this cycle. So an absent family means: no retained agent's latest heartbeat carried a
 /// value for it that PASSED the forged-value parse. Note both edges, each pinned by a
 /// test in tests/unit/server/test_agent_health_store.cpp: a non-conforming agent's
 /// explicit "0" parses and PUBLISHES the family at 0, and a rejected non-zero value
@@ -288,6 +289,85 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
 /// future refactor to a pointer, which the sizeof form would mis-size to 1.
 inline constexpr std::size_t kNGuardianJournalMetrics = std::size(kGuardianJournalMetrics);
 
+// ── AGE gauges: a SEPARATE, MAX-rollup family (flip item 6 + #2364 step-1) ────────
+// Deliberately NOT rows in kGuardianJournalMetrics, for two independent reasons:
+//  1. That table is pinned 1:1 to GuardianJournalStats (29 uint64 counters) by the
+//     sizeof static_assert in its pin test; the ages live in their own agent struct
+//     (GuardianJournalAgeStats) with its own pin.
+//  2. The rollup op differs and the op lives IN THE CONSUMER, not the row (the row
+//     struct has no op field - SUM is implicit in agent_registry.cpp's `+=` for the 29
+//     above). These roll up as **MAX across agents**: a fleet SUM of ages is
+//     meaningless, and the fleet question is "how stale is the WORST endpoint" /
+//     "how old is the LONGEST-blocked episode anywhere" - a single stalled agent IS
+//     the signal. The `_max` suffix on every gauge name keeps that visible to an
+//     operator reading a graph.
+//
+// EMISSION differs from the 29 too (writer: emit_guardian_journal_age_tags): the two
+// staleness ages ship on every heartbeat INCLUDING 0 while the drain worker is live -
+// a zero age is a real "fresh" reading, and the whole point of item 6 is that a dead
+// worker must not be indistinguishable from an idle one - and are ABSENT entirely
+// while dormant (prefer_spark off). The blocked age stays sparse (0 = "no episode",
+// absent-means-healthy). So server-side: absent family = nothing live reported;
+// a published 0 = at least one live worker, all of them fresh.
+//
+// COVERAGE DENOMINATOR, considered and DECLINED (governance Gate 3 architect): ages
+// deliberately do not count toward yuzu_fleet_guardian_journal_reporting (that meta's
+// documented meaning is the counter family), and no separate ages-reporting meta ships
+// with the monitor-only phase - partial coverage (5 live workers reporting fresh reads
+// identically to 10,000) is a KNOWN gap. Post-flip, compare the family's presence
+// against yuzu_fleet_agents_healthy for a coarse denominator; a real per-family
+// coverage meta rides the per-agent operator surface work (#2083-class), not this
+// table. Revisit at the flip (#2390) rather than relitigating here.
+//
+// ATTRIBUTION (same #2083-class caveat as the counter family, WORSE under MAX): a
+// single agent shipping a plausible-but-wrong value below the 1e9 ceiling OWNS the
+// fleet MAX outright - a sum dilutes a forgery, a max is captured by it - and no
+// per-agent axis exists yet to identify which endpoint is reporting the extreme.
+// Treat any surprising MAX as "find the endpoint first" (today: query agents'
+// heartbeat tags directly), and do not raise the plausibility ceiling to accommodate
+// an outlier.
+//
+// Name rule (asserted by the pin test): gauge == "yuzu_fleet_" + tag minus its
+// "yuzu." prefix + "_max".
+inline constexpr GuardianJournalMetric kGuardianJournalAgeMetrics[] = {
+    {"yuzu.guardian_journal_page_stale_seconds",
+     "yuzu_fleet_guardian_journal_page_stale_seconds_max",
+     "Fleet MAX (worst endpoint) of seconds since the drain worker's last non-throwing "
+     "replay PAGE pass, seeded from worker start. A LIVENESS gauge for the maintenance "
+     "loop: a dead worker thread or a permanently-throwing pass grows without bound, "
+     "which is what makes silent worker death visible at all (a dead worker's sparse "
+     "counters just stay absent, indistinguishable from idle). Deferred or read-failed "
+     "passes still stamp - those failure modes have their own counters. Expect it to "
+     "hover around the 30 s page cadence on a healthy fleet; sustained multiples of "
+     "that on some endpoint is the signal. Absent while the journal path is dormant "
+     "(prefer_spark off) or no agent reports"},
+    {"yuzu.guardian_journal_prune_stale_seconds",
+     "yuzu_fleet_guardian_journal_prune_stale_seconds_max",
+     "Fleet MAX (worst endpoint) of seconds since the drain worker's last non-throwing "
+     "retention PRUNE pass - the prune sibling of page_stale_seconds, separate because "
+     "the cadences differ (120 s prune vs 30 s page) and stall independently. A "
+     "growing value means retention is not running on some endpoint: the journal grows "
+     "toward its cap, where writes start being refused (write_capacity_rejected). "
+     "Expect ~120 s on a healthy fleet. Absent while dormant or unreported"},
+    {"yuzu.guardian_journal_headroom_blocked_seconds",
+     "yuzu_fleet_guardian_journal_headroom_blocked_seconds_max",
+     "Fleet MAX of the age in seconds of the oldest current headroom-blocked "
+     "replay-congestion EPISODE (#2364): somewhere a journal batch could not be placed "
+     "in the send window for lack of room, continuously since the value's start. "
+     "Episode-scoped and sampled at pass granularity: it clears only after a proven "
+     "block-free sweep of all of that journal's candidates, resets on agent restart, "
+     "and a forced (reconnect/boot) pass can start an episode from already-delivered "
+     "batches - so read it as replay-window congestion, not proof of unsent loss. Its "
+     "loss-relevant threshold is the 7-day retention window (604800 s): an episode age "
+     "approaching that means never-sent records on that endpoint are nearing deletion "
+     "(see evicted_no_send_evidence). CAVEAT: a clear can COINCIDE with the blocked "
+     "batch's own terminal eviction (the evicted batch stops being a candidate, so "
+     "coverage completes) - corroborate any clear against evicted_no_send_evidence "
+     "before reading it as recovery. Sparse: absent means no endpoint is blocked"},
+};
+
+inline constexpr std::size_t kNGuardianJournalAgeMetrics = std::size(kGuardianJournalAgeMetrics);
+
 // ── Meta-signals: about the ROLLUP, not part of the 29-row table ──────────────
 // Deliberately outside kGuardianJournalMetrics. That table is pinned 1:1 to
 // GuardianJournalStats by a static_assert on the struct's size, so anything added to
@@ -307,7 +387,9 @@ inline constexpr const char* kGuardianJournalReportingGauge =
     "yuzu_fleet_guardian_journal_reporting";
 inline constexpr const char* kGuardianJournalReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
-    "yuzu.guardian_journal_* tag - the coverage denominator for the whole family. "
+    "yuzu.guardian_journal_* COUNTER tag (the 29-row family; the three *_seconds age "
+    "tags deliberately do not count here) - the coverage denominator for the counter "
+    "family. "
     "Published every sweep INCLUDING 0, unlike the 29 counters. READ 0 CAREFULLY: "
     "because the writer is SPARSE (a 0 counter emits no tag), this counts agents with "
     "at least one NON-ZERO counter, not agents whose journal pipeline is working. So 0 "

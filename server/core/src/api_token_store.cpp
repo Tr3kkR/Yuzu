@@ -960,12 +960,14 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
 }
 
 std::expected<void, std::string>
-ApiTokenStore::confirm_rotation(const std::string& principal_id,
+ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::string& token_id,
                                 const std::string& requesting_user) {
     if (!open_)
         return std::unexpected("database not open");
     if (principal_id.empty())
         return std::unexpected("principal_id required");
+    if (token_id.empty())
+        return std::unexpected("token_id required");
     if (requesting_user.empty())
         return std::unexpected("requesting_user required");
 
@@ -1012,6 +1014,17 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id,
             successor->rotation_group != predecessor->rotation_group ||
             successor->supersedes_token_id != predecessor->token_id) {
             error_msg = "no in-flight rotation to confirm";
+            return false;
+        }
+
+        // #2384: the caller must pin the exact rotation being confirmed by
+        // supplying the successor's token_id (the value rotate returned).
+        // A stale id from an earlier rotation — the blind-retry hazard —
+        // mismatches here and rejects before any write. Checked before the
+        // initiator binding: structural mismatch is the harder failure.
+        if (token_id != successor->token_id) {
+            error_msg = "token_id does not match the pending rotation successor; "
+                        "pass the token_id returned by rotate";
             return false;
         }
 

@@ -91,6 +91,20 @@ bounded-resource machine credential) as a CC6.6 control for any privileged/
 machine-identity access review. See `docs/user-manual/engine-principals.md`
 "Per-principal quota cap" for the operator-facing reference.
 
+**Addendum — engine-credential rotation confirm pinning (CC6.1/CC6.3, #2384).**
+The overlap-pair rotation's maker-checker confirm step is pinned to the exact
+credential being confirmed: the confirm call (REST and MCP) requires the
+successor `token_id` the rotate response returned, a stale or mismatched id is
+rejected with no state change, and the success audit row records
+`token_id=<confirmed id>` — binding the attestation evidence to one specific
+credential. This closes a rotation-confirm replay hazard (a blind retry of an
+old confirm landing after a second rotation started could previously revoke
+that later rotation's still-live credential). Credit as a CC6.3
+credential-rotation control with per-credential attestation evidence; the
+operator-facing flow is `docs/user-manual/engine-principals.md` §4 and the
+audit contract is the `engine_principal.credential.confirm` row in
+`docs/user-manual/audit-log.md`.
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security

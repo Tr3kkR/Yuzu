@@ -2012,6 +2012,13 @@ public:
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
                                 emit_guardian_journal_heartbeat_tags(tags, guardian_->journal_stats());
+                                // Journal AGE gauges (flip item 6 + #2364): the staleness pair
+                                // ships every heartbeat INCLUDING zero while the drain worker is
+                                // live (zero is a real "fresh" reading), the blocked age ships
+                                // sparsely. Dormancy is journal_age_stats() returning nullopt
+                                // (prefer_spark off / worker not started), not a zero - so an
+                                // inert journal still adds no tags here.
+                                emit_guardian_journal_age_tags(tags, guardian_->journal_age_stats());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted and each suppressed repeat is counted, so the
                                 // suppression is observable (not silent). Sparse: non-zero only.
