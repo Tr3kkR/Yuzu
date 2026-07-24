@@ -553,6 +553,16 @@ private:
     bool finish(const WriteFn& write, McpStreamClose reason);
     std::chrono::steady_clock::time_point now() const;
 
+    /// Drop the current indeterminate-grace spell. Called from BOTH the kValid
+    /// and kValidStale arms of the revalidate switch — a cache hit is as much a
+    /// confirmation as a read-through (#2367). Shared so the two arms cannot
+    /// silently diverge: round-1's BLOCKING bug was exactly one of them
+    /// clearing the deadline while the other left it armed.
+    void clear_grace_deadline_() {
+        grace_start_.reset();
+        grace_deadline_.reset();
+    }
+
     std::shared_ptr<McpStreamSink> sink_;
     std::shared_ptr<McpStreamState> stream_;
     std::uint64_t generation_;

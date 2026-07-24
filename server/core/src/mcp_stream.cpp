@@ -920,58 +920,50 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
                 }
                 grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
             }
-            // Expiry is tested below, after the switch — on the arming tick too,
-            // not just later ones: a backdated deadline can already be in the
-            // past, and the pre-#2367 "arm now, test next tick" shape would
-            // grant an extra tick of life to a stream whose budget was spent.
+            // Expiry is tested below, after the switch (kValidStale can clear a
+            // deadline, so the test must run once the verdict is known, not
+            // inline here).
             break;
         case StreamRevalidate::kValid:
             // An AUTHORITATIVE confirmation: the store was asked and answered.
-            // Only this resets the budget.
             last_authoritative_ok_ = now();
-            grace_start_.reset();
-            grace_deadline_.reset();
+            clear_grace_deadline_();
             break;
         case StreamRevalidate::kValidStale:
-            // Valid, but nothing was asked of the store on this tick. Do NOT
-            // clear an armed deadline (an outage that began before the cache
-            // expired keeps its clock) and do NOT treat this as a fresh
-            // confirmation.
+            // Valid, but nothing was asked of the store on this tick — the
+            // answer came from a cache with a known maximum age.
             //
-            // But DO advance the floor. The answer came from a cache with a
-            // known maximum age, so it is positive evidence that the store
-            // confirmed this principal within that window — and without using
-            // it, `last_authoritative_ok_` is only refreshed on the tick that
-            // happens to miss the cache. A principal with several concurrent
-            // streams refreshes the shared entry from whichever stream ticks
-            // first, so every OTHER stream could ride cached answers for far
-            // longer than the TTL, and then get a deadline already in the past
-            // the moment the store blipped: zero grace, all of them at once.
-            // Clamping to `now - max_staleness` bounds that to one cache
-            // window per stream, and can only ever move the floor FORWARD
-            // (never past `now`), so it cannot extend a life.
+            // Advance the floor. The cache entry is positive evidence that the
+            // store confirmed this principal within `max_staleness`, and
+            // without using it `last_authoritative_ok_` would only refresh on
+            // the tick that happens to MISS. A principal with several
+            // concurrent streams refreshes the shared entry from whichever
+            // stream ticks first, so every OTHER stream would ride cached
+            // answers far longer than the TTL and then face a deadline already
+            // in the past the instant the store blipped: zero grace, all at
+            // once. Clamping to `now - max_staleness` bounds that to one cache
+            // window per stream and can only ever move the floor FORWARD (never
+            // past `now`), so it cannot extend a life.
             if (cfg_.revalidate_max_staleness.count() > 0) {
                 last_authoritative_ok_ =
                     std::max(last_authoritative_ok_, now() - cfg_.revalidate_max_staleness);
             }
-            // ...and CLEAR any armed deadline, because this IS positive
-            // evidence: a cached answer only exists because an authoritative
-            // read succeeded within the staleness window. Leaving the deadline
-            // armed would kill a healthy stream -- two streams on one
-            // principal, outage ends, the one that ticks first re-reads and
-            // warms the shared entry, and the other then rides cache hits with
-            // a deadline armed during the outage still counting down. It would
-            // close `auth_unavailable` against a reachable store and an Active
-            // principal, contradicting CH-4's recovered-backend invariant.
-            //
-            // The bound survives because the floor advanced only to
-            // `now - max_staleness`: a re-armed deadline is computed from that,
-            // and cached answers cannot outlive a dead store by more than one
-            // cache window (entries expire and are not renewed without a
-            // successful read), so an outage still ends the stream within
-            // `revalidate_grace` of its last real confirmation.
-            grace_start_.reset();
-            grace_deadline_.reset();
+            // Then CLEAR the deadline, exactly as kValid does — a cache hit is
+            // as much a confirmation as a read-through (the entry cannot exist
+            // unless an authoritative read succeeded within the window, and a
+            // revoke erases it synchronously). Leaving a deadline armed here
+            // was the round-1 defect: two streams on one principal, the outage
+            // ends, the first stream re-reads and warms the shared entry, and
+            // the second then rides hits with an outage-era deadline still
+            // counting down — closing `auth_unavailable` against a reachable
+            // store and an Active principal, contradicting CH-4's
+            // recovered-backend invariant. The bound survives because the floor
+            // advanced only to `now - max_staleness`, and a cached answer
+            // cannot outlive a dead store by more than one window (entries
+            // expire and are not renewed without a successful read), so a real
+            // outage still ends the stream within `revalidate_grace` of its
+            // last authoritative confirmation.
+            clear_grace_deadline_();
             break;
         default:
             // Fail CLOSED on an enumerator this pump does not know, matching
@@ -984,11 +976,12 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
             return finish(write, McpStreamClose::kAuthUnavailable);
         }
 
-        // Checked AFTER the switch so it also covers kValidStale: a deadline
-        // armed by an earlier indeterminate tick must still fire while cached
-        // answers are arriving. Reachable when the TOKEN half is the
-        // unavailable one and the engine half is serving cache hits — without
-        // this, such a stream outlives its own deadline by up to a TTL.
+        // Fire a backdated kIndeterminate deadline on its OWN arming tick. Only
+        // the kIndeterminate arm leaves a deadline armed past this point (kValid
+        // and kValidStale both cleared it above); its deadline is backdated to
+        // `last_authoritative_ok_`, so it can already be in the past when first
+        // armed, and the pre-#2367 "arm now, test next tick" shape would grant
+        // an extra tick of life to a stream whose budget was already spent.
         if (grace_deadline_.has_value() && now() > *grace_deadline_) {
             stream_->close(McpStreamClose::kAuthUnavailable);
             return finish(write, McpStreamClose::kAuthUnavailable);
