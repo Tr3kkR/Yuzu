@@ -123,6 +123,7 @@ audit contract is the `engine_principal.credential.confirm` row in
 - Dependency and image scanning gates in CI.
 - Signed release artifacts and provenance attestation.
 - Formal secure coding standard + threat modeling for high-risk subsystems.
+- MCP tool dispatch validates its internal authorization-registration tables at startup and refuses to boot on drift, rather than silently serving an under-governed tool (fail-closed on internal misconfiguration; #2383).
 
 ### Evidence
 

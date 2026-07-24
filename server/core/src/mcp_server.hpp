@@ -65,6 +65,13 @@ namespace yuzu::server::mcp {
 /// Mirrors the RestApiV1 pattern: receives store pointers + auth/perm/audit callbacks.
 class McpServer {
 public:
+    /// C8 fail-closed boot validator (#2383): throws std::runtime_error naming
+    /// the offenders when the served kTools[] names, the kToolSecurity
+    /// registrations, and the kWriteTools read-only guard set disagree — a
+    /// misregistered build refuses to construct (and therefore to boot) instead
+    /// of silently skipping the generic tier+approval gate for the missing tool.
+    McpServer();
+
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn =
