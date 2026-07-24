@@ -700,6 +700,77 @@ TEST_CASE("KvStore prefix scans escape LIKE wildcards in the prefix", "[kv_store
     REQUIRE(pct.has_value());
     CHECK(pct->size() == 1);
     CHECK(pct->front().value == "pct");
+
+    // list_keys_sized is the fourth call site of the same helper - it must not drift.
+    auto sized = t.store.list_keys_sized("p1", "a_b:");
+    REQUIRE(sized.has_value());
+    CHECK(sized->size() == 1);
+    CHECK(sized->front().key == "a_b:1");
+}
+
+// ── list_keys_sized / get_entry: the O(work) scan pair (#2299 perf-P-1) ──────────
+
+TEST_CASE("KvStore::list_keys_sized returns keys + value byte lengths in key order",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:b", "678"));     // out of order on purpose
+    REQUIRE(t.store.set("p1", "lc:a", "12345"));
+    REQUIRE(t.store.set("p1", "other:c", "9999")); // different prefix, excluded
+
+    auto rows = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    // ORDER BY key is the contract a fixed-width key prefix turns into ordering by
+    // that field - a caller that drops its own sort depends on it.
+    CHECK((*rows)[0].key == "lc:a");
+    CHECK((*rows)[1].key == "lc:b");
+    CHECK((*rows)[0].bytes == 5);
+    CHECK((*rows)[1].bytes == 3);
+
+    // Byte accounting agrees row-for-row with the value-materializing sibling.
+    auto entries = t.store.list_entries("p1", "lc:");
+    REQUIRE(entries.has_value());
+    REQUIRE(entries->size() == rows->size());
+    for (std::size_t i = 0; i < rows->size(); ++i) {
+        CHECK((*rows)[i].key == (*entries)[i].key);
+        CHECK((*rows)[i].bytes == (*entries)[i].value.size());
+    }
+}
+
+TEST_CASE("KvStore::list_keys_sized sizes multibyte values in BYTES, and empty is not an error",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    auto empty = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE(empty.has_value()); // empty namespace: a clean empty vector, never an error
+    CHECK(empty->empty());
+
+    const std::string v = "café-日本語"; // > one byte per code point
+    REQUIRE(t.store.set("p1", "lc:u", v));
+    auto rows = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().bytes == v.size()); // octet_length, not the glyph count
+}
+
+TEST_CASE("KvStore::get_entry distinguishes absent from failed, and reads bytes exactly",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    const std::string with_nul = std::string("head\0tail", 9);
+    REQUIRE(t.store.set("p1", "lc:n", with_nul));
+
+    auto present = t.store.get_entry("p1", "lc:n");
+    REQUIRE(present.has_value());
+    REQUIRE(present->has_value());
+    // get() truncates at the NUL; the fallible point read must not - a corrupt value
+    // has to reach the parser intact to be quarantined rather than silently repaired.
+    CHECK(**present == with_nul);
+    CHECK(t.store.get("p1", "lc:n").value_or("").size() == 4);
+
+    // ABSENT is a value (nullopt), not an error: only that distinction lets a caller
+    // treat "cannot tell" differently from "not there".
+    auto missing = t.store.get_entry("p1", "lc:does-not-exist");
+    REQUIRE(missing.has_value());
+    CHECK(!missing->has_value());
 }
 
 // ── rename_key extended-result-code masking (#2303 K1) ──────────────────────────
