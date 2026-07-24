@@ -183,7 +183,7 @@ source:
 | Hop | M1 TLS | Why |
 |---|---|---|
 | gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. |
-| agent → gateway (:50051) | **one-way TLS (PR5c; live-wired in PR5b)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod`; distributing the CA to agents + the deployed-compose wiring land in PR5b (the shipped composes are still plaintext until then). Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. |
+| agent → gateway (:50051) | **one-way TLS (PR5c; live in the reference composes, #1314)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod` and shipped live in `docker-compose.reference-gateway.yml`: the gateway mounts the grpcbox TLS `sys.config` + the shared CA volume, and the agent auto-discovers the install CA at `/etc/yuzu/certs/default-ca.pem` (#1314). **Caveat (#1291):** the transport is driven by the mounted grpcbox `sys.config`, NOT the `YUZU_GW_TLS_*` env vars, which are still inert — an operator who only sets those env vars has NOT enabled gateway TLS. Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. |
 | server → gateway mgmt (:50063) | **strict mutual TLS (#1314)** | The privileged command-fan-out plane. The reference-gateway topology now ships it as **strict mTLS**: the gateway mgmt listener requires a CA-issued client cert (the patched grpcbox's `verify_peer`+`fail_if_no_peer_cert` defaults), and the C++ server's command-forwarding client presents its server leaf and verifies the gateway against the install CA (`build_gateway_command_credentials`, fail-closed if the certs are missing). A container with no CA-issued cert — including a compromised agent — is rejected at the TLS layer, instead of the previous plaintext+unauthenticated plane. **Residual (#1314 M-1):** `verify_peer` authenticates to the **CA, not to the server's identity**, so *any* holder of *any* CA-issued cert passes — not only an enrolled agent's per-agent leaf, but also another agent's stolen leaf+key, or the `default-server`/`default-gateway` leaves. A compromised enrolled agent that extracts its own cert+key from its data dir can therefore still reach the mgmt plane. Pinning the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) is the cryptographic-identity-binding follow-up (QUIC-era, like the agent edge). A plaintext stack (`--no-tls`) keeps it insecure and must stay on a trusted network. |
 
 > **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
@@ -198,18 +198,22 @@ source:
 > exposed deployment. **Direct agent→server connections are already full mTLS
 > (PR2/PR3) over any network — the gap is specific to the gateway edge.**
 >
-> **One-way TLS now closes this (PR5c)** — the vendored+patched grpcbox
-> (`_checkouts/grpcbox`) makes `fail_if_no_peer_cert`/`verify` configurable, so the
-> agent listener can run server-authenticated TLS (`verify_none` +
-> `fail_if_no_peer_cert=false`): encrypted + gateway-authenticated, no client cert
-> required (bootstrap-safe). It is enabled in `sys.config.prod`. **But the deployed
-> composes are still plaintext until PR5b wires it in + distributes the CA to
-> agents.** So **until your deployment is on PR5b (or you enable one-way TLS + ship
-> the CA yourself), a gateway exposed to an untrusted network MUST still do one
-> of:** (a) terminate TLS in front of the gateway (reverse proxy on :50051,
-> forwarding plaintext only over loopback/a trusted segment); or (b) keep the agent
-> port on a trusted network (VPN / private subnet / service mesh). The QUIC
-> transport (#376) is the longer-term native path.
+> **One-way TLS now closes this (PR5c), and the reference composes ship it live
+> (#1314).** The vendored+patched grpcbox (`_checkouts/grpcbox`) makes
+> `fail_if_no_peer_cert`/`verify` configurable, so the agent listener runs
+> server-authenticated TLS (`verify_none` + `fail_if_no_peer_cert=false`):
+> encrypted + gateway-authenticated, no client cert required (bootstrap-safe). It
+> is enabled in `sys.config.prod` and wired live in
+> `docker-compose.reference-gateway.yml` (mounted grpcbox `sys.config` + shared CA
+> volume + agent CA auto-discovery). **But a deployment that still runs plaintext —
+> the UAT/demo/sanitizer rigs (which pass `--no-tls` deliberately), a hand-rolled
+> compose, or one that relied on the still-inert `YUZU_GW_TLS_*` env vars (#1291)
+> instead of a mounted `sys.config` — has an unprotected `:50051`.** For any such
+> gateway exposed to an untrusted network, MUST still do one of: (a) terminate TLS
+> in front of the gateway (reverse proxy on :50051, forwarding plaintext only over
+> loopback/a trusted segment); or (b) keep the agent port on a trusted network
+> (VPN / private subnet / service mesh). The QUIC transport (#376) is the
+> longer-term native path.
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
 (upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +
@@ -277,15 +281,20 @@ non-verifying listener for now — issuing it completes per-agent-mTLS day-one
 *cryptographic* through-gateway identity binding remains the QUIC-era follow-up
 (agent identity across the gateway is still the app-layer `gateway_observed_peer`).
 
-### Distribution flip — staged as PR5b
+### Distribution flip — shipped as #1314
 
 Making a fresh **containerised** install encrypted-by-default (dropping
-`--no-tls`/`--no-https` across the compose/Dockerfile surface + a shared cert
-volume) is staged separately because it carries container-integration steps that
-must be validated against a booted stack, and **no CI workflow currently boots
-the `deploy/docker/*.yml` composes** (the pre-release smoke writes its own inline
-plaintext compose; the UAT rigs are manual). The known requirements PR5b must
-satisfy:
+`--no-tls`/`--no-https` from the image CMDs + a shared cert volume + agent CA
+auto-discovery) **shipped as #1314** (the original "PR5b" branch, #1271, was
+closed and this work re-landed there). A container off the published image is now
+encrypted + mutually authenticated out of the box: `Dockerfile.server`/`.chisel`
+and `Dockerfile.agent.chisel` no longer bake `--no-tls`/`--no-https`; the server
+serves HTTPS on 8443 (8080 → redirect) + (m)TLS gRPC; and the agent, given TLS
+with no `--ca-cert`, discovers the install CA at `/etc/yuzu/certs/default-ca.pem`
+before grpc falls back to system roots. `docker-compose.reference-gateway.yml` is
+the worked end-to-end example. The container-integration requirements the flip
+had to satisfy — all validated against a booted stack, since **no CI workflow
+boots the `deploy/docker/*.yml` composes** — were:
 
 - **Cert-dir ownership** — the runtime image runs as `yuzu`, but `/etc/yuzu` is
   root-owned; the cert dir must be writable by `yuzu` (chown, or a pre-created
@@ -304,9 +313,14 @@ satisfy:
   *after* the server's first-boot generation; the gateway's plaintext listeners
   + lazy upstream channel make this benign, but it must be confirmed.
 
-Until PR5b, the server is encrypted-and-mutually-authenticated by default when
-run **without** `--no-tls`/`--no-https` (PR2 generates the certs); the shipped
-compose rigs still pass those flags explicitly.
+The server is encrypted-and-mutually-authenticated by default when run
+**without** `--no-tls`/`--no-https` (PR2 generates the certs), and as of #1314 the
+shipped **images** no longer pass those flags — only the deliberately-plaintext
+dev/test rigs (`docker-compose.demo.yml`, `full-uat.yml`, `sanitizer-uat.yml`)
+still do. Residual gaps are tracked separately: the `YUZU_GW_TLS_*` env toggle is
+inert, so gateway TLS is set via a mounted `sys.config` (#1291); the compose
+wizard still emits `--no-tls` + the inert env model (#1313); and an agent left
+with TLS unconfigured falls back to plaintext with no cert pinning (#660).
 
 ## Subordinate-CA — root Yuzu's CA in an enterprise PKI (PR6, M2)
 
@@ -500,9 +514,9 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR3 | Per-agent mTLS issuance at enrollment | shipped |
 | PR4 | CA REST surface + this doc | shipped |
 | PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | shipped |
-| PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes stay plaintext until PR5b wires it.) | shipped |
-| PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test land in PR5b. | shipped |
-| PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (HTTPS healthcheck, volume timing; needs a booted stack — no CI boots the deploy composes). **Partial — shipped:** `--cert-san` + Dockerfile.server cert-dir ownership (boot-test-validated). | in progress |
+| PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes are now TLS by default — #1314.) | shipped |
+| PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test shipped in #1314 (wired live in `docker-compose.reference-gateway.yml`). | shipped |
+| PR5b → #1314 | Distribution flip — drop `--no-tls`/`--no-https` from the image CMDs + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (HTTPS healthcheck, volume timing, `--cert-san`). The original PR5b branch (#1271) was **closed**; the deliverable **shipped as #1314** (secure-by-default images + agent CA auto-discovery; `docker-compose.reference-gateway.yml` is the worked example). Residuals tracked as #1291 (inert `YUZU_GW_TLS_*` env — use a mounted `sys.config`), #1313 (compose wizard), #660 (agent plaintext default). | shipped (#1314) |
 | PR6 (M2) | Subordinate-CA — export the CA CSR (`GET /ca/root-csr`) + import an enterprise-signed intermediate (`POST /ca/import-chain`, validates carries-our-key + is-CA + chains-to-parent) → `CaMode::Subordinate`; issued leaves chain to the corporate root, issuing key unchanged. Engine `cert_matches_key`/`cert_is_ca`/`verify_chain_to_bundle`; `ca_root.chain_pem` (migration v4); dashboard import panel. See "Subordinate-CA" above. | in review |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
@@ -558,7 +572,7 @@ on revocation (the periodic sweep, PR3 H-1); periodic CRL re-publish before
 re-provision guard (PR3 H-2); `idx_ca_issued_issued_at` for the inventory sort.
 **Addressed by the #1243/#1244 round:** the agent↔gateway edge encryption
 (one-way TLS capability, PR5c — vendored+patched grpcbox, agent listener enabled
-in `sys.config.prod`) with live wiring + CA-to-agent distribution in PR5b;
+in `sys.config.prod`) with live wiring + CA-to-agent distribution shipped in #1314;
 `--cert-san` for cross-host default leaves; the PR5 over-claim corrected (gateway
 CSR survives transit but is not signed until PR5d). (The plaintext-`:50051`
 agent-listener bind-default was reviewed and kept at `0.0.0.0` — agents must
