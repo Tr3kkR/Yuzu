@@ -6,7 +6,8 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
-#include "mcp_transport.hpp" // Streamable HTTP transport pre-checks (2f)
+#include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
+#include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -559,21 +560,32 @@ static const ToolDef kTools[] = {
     // Phase 2 write tool
     {"execute_instruction",
      "Execute a plugin action on one or more agents. ASYNC: returns immediately with command_id "
-     "+ execution_id + agents_reached; the agents run the action and report back separately. To "
-     "get results, poll query_responses with the returned execution_id — an EMPTY result means "
-     "the run is still in flight, so wait ~2-5s and retry a few times (or call "
-     "get_execution_status to confirm a terminal state), or subscribe to live JSON events via GET "
-     "/api/v1/events?execution_id=<id>. Find valid plugin/action names AND their parameters via "
-     "discover_plugins (parameter_schema is inline for actions with a published definition) or "
-     "discover_instructions — do not guess action names. "
+     "+ execution_id + agents_reached; the agents run the action and report back separately. "
+     "LIVE PROGRESS: on a Streamable HTTP session, include _meta.progressToken (string|int) in "
+     "the tools/call params and notifications/progress frames (agents responded / targeted, with "
+     "the execution_id in _meta under \"yuzu.execution_id\") arrive on this session's GET SSE "
+     "stream as the fleet responds. Progress is always BEST-EFFORT: even after supplying a "
+     "token you MUST still be prepared to poll (a reservation can silently degrade under load "
+     "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "FALLBACK when not streaming: poll query_responses with the "
+     "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
+     "and retry a few times (or call get_execution_status to confirm a terminal state), or "
+     "subscribe to live JSON events via GET /api/v1/events?execution_id=<id>. Find valid "
+     "plugin/action names AND their parameters via discover_plugins (parameter_schema is inline "
+     "for actions with a published definition) or discover_instructions - do not guess action "
+     "names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
+     // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
+     // contract (A5 materiality backfill) - client-advisory, per the same
+     // advisory-vs-enforced convention as the annotation hints. Real server-side
+     // enforcement of these input caps is tracked in #2437.
      R"j({"type":"object","properties":{)j"
-     R"j("plugin":{"type":"string","description":"Plugin name (e.g. os_info, hardware)"},)j"
-     R"j("action":{"type":"string","description":"Action name (e.g. version, list)"},)j"
-     R"j("params":{"type":"object","additionalProperties":{"type":"string"},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
+     R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":8192},"description":"Key-value parameters"},)j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
+     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -583,12 +595,14 @@ static const ToolDef kTools[] = {
      "Fan one instruction out into several plugin actions on ONE device, async. The server "
      "dispatches each step as an ordinary command under a shared correlation id and returns "
      "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
-     "bundle_id for the collated result. Use this instead of N execute_instruction calls when "
-     "refreshing a device (cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 "
-     "steps, distinct (plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
+     "bundle_id for the collated result - bundles do NOT emit notifications/progress "
+     "(no _meta.progressToken support in the 2f scope; polling is the contract here). Use "
+     "this instead of N execute_instruction calls when refreshing a device "
+     "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
+     "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
-     R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
+     R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
      R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
@@ -5016,6 +5030,59 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (scope.empty() && agent_ids.empty())
                     scope = "__all__";
 
+                // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
+                // A request carrying _meta.progressToken opts into live progress
+                // on the session's GET stream. Reservation happens BEFORE
+                // create_execution (admission rejections must be truthful about
+                // "no execution row"); in 3a every reservation failure DEGRADES
+                // SILENTLY to today's plain path - the plain response is
+                // self-sufficient (it carries execution_id), so a 429 is
+                // reserved for 3b's streamed intent only. The response bytes
+                // are identical with or without a bridge record.
+                mcp::McpStreamBridge* const bridge = stream_bridge_;
+                const auto bridge_sid = req.get_header_value("Mcp-Session-Id");
+                auto bridge_token = extract_progress_token(rpc.params);
+                bool bridge_active = false;
+                const auto bridge_degrade = [&](const char* reason) {
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // observability must never fail the dispatch
+                        }
+                    }
+                };
+                if (streaming_on && bridge != nullptr && execution_tracker != nullptr &&
+                    !bridge_sid.empty() && bridge_token.has_value()) {
+                    // The session id was validated (principal-bound) at handler
+                    // entry; reserve re-checks it against the registry anyway
+                    // (no TOCTOU widening - a dead session just degrades).
+                    // GUARD: reserve allocates (make_shared + map insert); a
+                    // bad_alloc here must degrade to the plain path, not turn a
+                    // dispatchable command into a 500 (byte-identical contract).
+                    try {
+                        auto rr = bridge->reserve(bridge_sid, session->username, id,
+                                                  std::move(bridge_token),
+                                                  /*streamed_intent=*/false);
+                        if (rr.ok) {
+                            bridge_active = true;
+                        } else {
+                            // L1: a coarse single degrade reason - reserve()
+                            // already counted the FINE reject reason into
+                            // yuzu_mcp_bridge_reject_total{reason=...}, so
+                            // forwarding it here too would double-taxonomy the
+                            // degrade counter with an open (undocumented) label
+                            // set. "why did progress degrade" = reserve_rejected;
+                            // "which reserve reject" lives in reject_total.
+                            bridge_degrade("reserve_rejected");
+                        }
+                    } catch (...) {
+                        bridge_degrade("reserve_threw");
+                    }
+                }
+
                 // #1088 — create the execution row BEFORE dispatch so the
                 // execution_id is known when cmd_dispatch generates
                 // command_id, the dispatch wiring can record the
@@ -5063,6 +5130,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
+                // S2/S3 (2f PR 3a): no execution row ⇒ no durable fetch handle ⇒
+                // no bridge record (degrade); otherwise subscribe the reserved
+                // record to the bus (atomic install-then-replay routes any
+                // pre-subscribe event - the operator-cancel class - through the
+                // normal listener). A subscribe failure has zero side effects
+                // (3a.3 contract), so abandon + degrade keeps the plain path
+                // byte-identical.
+                if (bridge_active && execution_id.empty()) {
+                    bridge->abandon(bridge_sid, id);
+                    bridge_active = false;
+                    bridge_degrade("no_execution_row");
+                }
+                if (bridge_active) {
+                    bool subscribed = false;
+                    try {
+                        subscribed = bridge->subscribe(bridge_sid, id, execution_id);
+                    } catch (...) {
+                        subscribed = false;
+                    }
+                    if (!subscribed) {
+                        bridge->abandon(bridge_sid, id);
+                        bridge_active = false;
+                        bridge_degrade("subscribe_failed");
+                    }
+                }
+
                 // governance R1 unhappy-UP-1 BLOCKING: dispatch_fn can
                 // throw (mgmt_group_store->get_members SQLite, scope
                 // parser bug, registry_.send_to_* gRPC stream write,
@@ -5079,6 +5172,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         dispatch_fn(plugin, action, agent_ids, scope, params, execution_id);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
+                    // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
+                    // out in-flight listeners), then mark_cancelled - the cancel
+                    // terminal then has no bridge listener to reach. Error bytes
+                    // below are unchanged.
+                    if (bridge_active) {
+                        bridge->abandon(bridge_sid, id);
+                        bridge_active = false;
+                    }
                     if (execution_tracker && !execution_id.empty()) {
                         execution_tracker->mark_cancelled(execution_id, session->username);
                     }
@@ -5090,6 +5191,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 if (agents_reached == 0) {
+                    // 2f PR 3a: zero agents = the pre-dispatch failure class -
+                    // abandon the bridge record before mark_cancelled (same
+                    // ordering rationale as the dispatch-throw path above).
+                    if (bridge_active) {
+                        bridge->abandon(bridge_sid, id);
+                        bridge_active = false;
+                    }
                     // Mirror the REST sibling — cancel the pre-created
                     // execution row so it doesn't sit at status=running
                     // forever. mark_cancelled records the attempt for
@@ -5134,6 +5242,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Mirrors workflow_routes.cpp:1461-1463.
                 if (execution_tracker && !execution_id.empty()) {
                     execution_tracker->set_agents_targeted(execution_id, agents_reached);
+                    // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
+                    // arrived BEFORE set_agents_targeted saw agents_targeted==0
+                    // and could not transition the row to terminal
+                    // (refresh_counts requires targeted > 0), and
+                    // set_agents_targeted itself publishes nothing - an
+                    // all-respond-early execution stayed `running` forever with
+                    // no bus terminal. Re-evaluating here publishes fresh counts
+                    // and, when everyone already responded, the terminal. The
+                    // zero-agents path returned above, so this never fires with
+                    // targeted==0. (The identical REST/scheduled sibling holes -
+                    // workflow_routes.cpp, rest_api_v1.cpp, schedule_runner.cpp -
+                    // are tracked in issue #2408.)
+                    execution_tracker->refresh_counts(execution_id);
                 }
 
                 // #1088 — include execution_id in the result so the
@@ -5154,6 +5275,39 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add(JObj().add("type", "text").add("text", result_obj.str()))
                                  .str())
                         .str();
+                // S5 (2f PR 3a): arm GET-only - the atomic flip-and-drain hands
+                // the latched mailbox to the projector, which publishes progress
+                // LIVE onto this session's GET stream. `result` is passed as the
+                // result_base (B5): a parked record's real final re-emits today's
+                // result object with status/agents_* added as top-level keys.
+                // The plain JSON below answers this POST either way - GET-only
+                // mode NEVER emits a second final response (no pin, no final
+                // frame; the H2/G9-class byte test pins this).
+                if (bridge_active) {
+                    // GUARD (Sol code-review finding, 2026-07-23): passing the
+                    // lvalue `result` to arm()'s by-value result_base copies it,
+                    // and arm() builds a fallback string, both BEFORE the phase
+                    // flip - either can bad_alloc. An escaped throw here would
+                    // turn a successful dispatch into an httplib 500 (breaking the
+                    // byte-identical plain-path contract) AND strand the record in
+                    // kArming (sweep excludes kArming → a permanently leaked
+                    // global slot). Contain it: best-effort abandon the still-
+                    // kArming record and fall through to the unchanged success
+                    // response below.
+                    try {
+                        bridge->arm(bridge_sid, id, McpStreamBridge::ArmMode::kGetOnly, result);
+                    } catch (...) {
+                        try {
+                            bridge->abandon(bridge_sid, id);
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Under sustained OOM even abandon may fail; the record
+                            // then leaks one bounded slot (global cap 256) but the
+                            // plain response below still goes out - the contract
+                            // that matters.
+                        }
+                        bridge_degrade("arm_threw");
+                    }
+                }
                 // governance R1 happy-LOW-1: include command_id and
                 // execution_id in audit detail so SOC 2 investigators
                 // can join the audit row to the execution tracker row

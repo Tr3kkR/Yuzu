@@ -116,6 +116,27 @@ public:
     /// comparable. Listener is invoked synchronously from `publish`.
     std::size_t subscribe(const std::string& execution_id, Listener listener);
 
+    /// Atomically install `listener` AND replay buffered events with `id > since_id` to
+    /// it, under a single hold of the channel mutex. Returns the subscription token, as
+    /// `subscribe` does.
+    ///
+    /// This closes the replay→subscribe race the `/api/v1/events` sibling documents and
+    /// lives with (a frame published between its separate `replay_since` and `subscribe`
+    /// calls reaches neither): here a publisher needs the same channel mutex, so nothing
+    /// can land in the gap. Each event reaches the listener EXACTLY once - buffered events
+    /// came from publishes that completed before this lock was held (the listener missed
+    /// their live fan-out) and are delivered by the replay; events published after this
+    /// returns get the live fan-out and are past the replay cursor.
+    ///
+    /// The listener is installed BEFORE the replay on purpose: `listeners.emplace` is the
+    /// only allocating step, so doing it first means an insertion failure throws with ZERO
+    /// projection side effects (nothing was replayed). The listener MUST be non-throwing
+    /// (the bus's standing "short, queue-and-notify" contract): a throw from a replay call
+    /// would propagate out with the listener already installed. The 2f progress bridge's
+    /// listener is a hard noexcept boundary, satisfying this.
+    std::size_t subscribe_and_replay(const std::string& execution_id, std::uint64_t since_id,
+                                     Listener listener);
+
     /// Unsubscribe a token previously returned by `subscribe`. Idempotent;
     /// silently no-ops if the channel or sub_id no longer exists.
     void unsubscribe(const std::string& execution_id, std::size_t sub_id);
