@@ -1717,6 +1717,40 @@ public:
                 } else {
                     spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
                                  pg_pool_->size());
+
+                    // #2367: held-open streams and the Postgres pool are coupled
+                    // capacities, and nothing else says so at boot. Every live
+                    // stream re-validates its credential each pump tick; those
+                    // reads are cached (60 s, see EnginePrincipalStore's
+                    // revalidation cache and ApiTokenStore's token cache), so
+                    // steady-state load is O(streams / TTL), not O(streams x
+                    // tick). But the refreshes still land on this pool alongside
+                    // ordinary request traffic, and a stream target far above the
+                    // pool size is the shape that turns a pool blip into a
+                    // correlated stall: every stream's refresh queues on a
+                    // bounded acquire at once.
+                    //
+                    // Advisory only — deliberately not a clamp and not a startup
+                    // failure. The safe ratio depends on link latency and traffic
+                    // mix, so this points the operator at the two metrics that
+                    // actually answer it rather than inventing a hard rule.
+                    // Threshold sits ABOVE the shipped default ratio (128 streams
+                    // / 16 connections = 8:1) so a default server is quiet, and
+                    // below the cliff the issue names (512 streams on a pool of
+                    // 16 = 32:1), which warns.
+                    constexpr std::size_t kStreamsPerPgConnAdvisory = 16;
+                    const std::size_t stream_target =
+                        cfg_.max_sse_streams > 0 ? cfg_.max_sse_streams
+                                                 : detail::kTargetHeldOpenStreamsDefault;
+                    if (stream_target > pg_pool_->size() * kStreamsPerPgConnAdvisory) {
+                        spdlog::warn(
+                            "[PG] --max-sse-streams {} is more than {}x --postgres-pool-size {}. "
+                            "Held-open streams refresh their credential against this pool; at "
+                            "this ratio a pool brownout stalls streams and ordinary requests "
+                            "together. Watch yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use, "
+                            "and raise --postgres-pool-size if they climb.",
+                            stream_target, kStreamsPerPgConnAdvisory, pg_pool_->size());
+                    }
                 }
             }
         }
