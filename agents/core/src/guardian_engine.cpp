@@ -510,6 +510,36 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
     return s;
 }
 
+std::optional<GuardianJournalAgeStats> GuardianEngine::journal_age_stats() const {
+    std::lock_guard lock(mtx_);
+    // Dormancy is an ABSENCE, not a zero (unlike every counter above, a zero age is a real
+    // "fresh" reading). The worker is CONSTRUCTED even at prefer_spark_=false - only start()
+    // is gated - so the flag check is load-bearing, not belt-and-braces; the stamp check
+    // additionally covers the wired-but-not-yet-started window (stamps seed at start()).
+    if (!prefer_spark_ || !spark_drain_worker_)
+        return std::nullopt;
+    const auto page_ms = spark_drain_worker_->last_page_success_steady_ms();
+    const auto prune_ms = spark_drain_worker_->last_prune_success_steady_ms();
+    if (page_ms == 0 || prune_ms == 0)
+        return std::nullopt;
+    // One `now` for every age, so the three readings are mutually consistent within a sample.
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    const auto age_seconds = [now_ms](std::uint64_t since_ms) -> std::uint64_t {
+        if (now_ms <= 0)
+            return 0; // implausible steady reading: saturate rather than wrap
+        const auto now_u = static_cast<std::uint64_t>(now_ms);
+        return now_u > since_ms ? (now_u - since_ms) / 1000 : 0;
+    };
+    GuardianJournalAgeStats s;
+    s.page_stale_seconds = age_seconds(page_ms);
+    s.prune_stale_seconds = age_seconds(prune_ms);
+    if (lifecycle_journal_)
+        s.headroom_blocked_seconds = lifecycle_journal_->headroom_blocked_age_ms(now_ms) / 1000;
+    return s;
+}
+
 std::uint64_t GuardianEngine::unhealthy_suppressed() const {
     std::lock_guard lock(mtx_);
     return spark_runtime_ ? spark_runtime_->unhealthy_suppressed() : 0;

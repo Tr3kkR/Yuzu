@@ -23,6 +23,16 @@ std::int64_t journal_now_ms() {
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
+
+/// steady_clock in ms for the item-6 success stamps. Clamped >= 1: 0 is the "start() never
+/// ran" sentinel, and steady_clock's epoch is unspecified (commonly boot), so an honest
+/// reading CAN be 0 early in a machine's life - the clamp costs 1 ms of accuracy once ever.
+std::uint64_t success_stamp_now_ms() {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    return ms > 0 ? static_cast<std::uint64_t>(ms) : 1;
+}
 } // namespace
 
 YUZU_EXPORT void set_guardian_joined_thread(bool on) noexcept { tl_guardian_joined_thread = on; }
@@ -42,6 +52,15 @@ void GuardianOutboxDrainWorker::start() {
         if (started_ || sig_->stopping.load(std::memory_order_acquire))
             return;
         started_ = true;
+    }
+    // Seed the item-6 staleness stamps NOW, not on the first pass: a thread that starts and
+    // then dies (or never completes a pass) reads as an ever-growing age from its very first
+    // heartbeat, which is what makes worker death visible at all (flip item 14 - sparse
+    // counters at zero are indistinguishable from healthy idle).
+    {
+        const auto now = success_stamp_now_ms();
+        last_page_success_steady_ms_.store(now, std::memory_order_relaxed);
+        last_prune_success_steady_ms_.store(now, std::memory_order_relaxed);
     }
     // Captures the shared Signal (NOT `this`), so a copy that outlives this
     // worker (installed on the runtime, cleared in stop() but a copy already
@@ -268,12 +287,18 @@ void GuardianOutboxDrainWorker::loop() {
         };
 
         if (prune_due && !stop_requested()) {
-            firewalled([this] { maintenance_once({.prune = true}); });
+            const bool ok = firewalled([this] { maintenance_once({.prune = true}); });
             // Stamped AFTER the attempt, so the cadence is a minimum GAP rather than
             // start-to-start. Start-to-start means a pass that runs longer than its own
             // interval is due again the instant it finishes, which under KvStore contention
             // degenerates back into continuous scanning (#2298 Sol review).
             last_prune = std::chrono::steady_clock::now();
+            // The SUCCESS stamp, by contrast, moves only when the pass did not throw - a
+            // permanently-throwing prune must read as a growing age (item 6), while the
+            // cadence stamp above deliberately advances regardless (min-GAP pacing).
+            if (ok)
+                last_prune_success_steady_ms_.store(success_stamp_now_ms(),
+                                                    std::memory_order_relaxed);
         }
 
         GuardianMaintenanceResult page_result;
@@ -281,6 +306,9 @@ void GuardianOutboxDrainWorker::loop() {
             const bool ok = firewalled(
                 [&] { page_result = maintenance_once({.replay_sent = forced_page, .page = true}); });
             last_page = std::chrono::steady_clock::now();
+            if (ok) // success stamp: non-throwing passes only (see the prune site)
+                last_page_success_steady_ms_.store(success_stamp_now_ms(),
+                                                   std::memory_order_relaxed);
             // A FORCED page that never ran must not be lost: re-arm so the next cycle
             // retries it rather than waiting out a full cadence interval.
             // ...and one that ran but did NO work because the paging rate-limiter had no

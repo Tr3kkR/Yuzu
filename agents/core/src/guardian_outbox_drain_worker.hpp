@@ -237,6 +237,28 @@ public:
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
     }
 
+    /// steady_clock ms of the last PAGE maintenance pass that ran without throwing, seeded
+    /// non-zero at start() (flip item 6 / item 14). 0 means start() has not run - the reader
+    /// treats that as "no worker", not as an age. The cadence locals in loop() advance even
+    /// when a pass throws (deliberate min-GAP pacing); these advance ONLY on a non-throwing
+    /// pass, so a dead thread or a permanently-throwing pass reads as an ever-growing age on
+    /// the heartbeat. A deferred-no-token or read-failed pass still counts: it returned, so
+    /// the LOOP is alive - this is a liveness gauge, not a throughput gauge. KNOWN BLIND
+    /// SPOT (governance UP-4): read failures have their own counter
+    /// (page_read_failures), but a PERMANENTLY token-starved worker does not - deferred
+    /// passes stamp "fresh" here while zero replay happens, and deferred_no_token is
+    /// per-pass state with no cumulative counter or heartbeat tag. A starvation counter is
+    /// tracked as a follow-up; until it lands, do not cite this gauge as evidence replay is
+    /// making progress. Lock-free.
+    [[nodiscard]] std::uint64_t last_page_success_steady_ms() const noexcept {
+        return last_page_success_steady_ms_.load(std::memory_order_relaxed);
+    }
+    /// PRUNE sibling of last_page_success_steady_ms() - separate because the two passes run
+    /// on different cadences (30 s page / 120 s prune) and stall independently.
+    [[nodiscard]] std::uint64_t last_prune_success_steady_ms() const noexcept {
+        return last_prune_success_steady_ms_.load(std::memory_order_relaxed);
+    }
+
 private:
     void loop();
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
@@ -271,6 +293,12 @@ private:
     std::thread thread_;
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
+    /// Success stamps for the staleness gauges (item 6). Seeded at start() (clamped >= 1 so
+    /// 0 stays the unambiguous "never started" sentinel even right after boot, where
+    /// steady_clock's epoch-relative reading can itself be ~0), stored at the loop's
+    /// maintenance call sites only when the firewalled pass did not throw.
+    std::atomic<std::uint64_t> last_page_success_steady_ms_{0};
+    std::atomic<std::uint64_t> last_prune_success_steady_ms_{0};
     /// Set by notify(), cleared by the loop: force ONE page irrespective of cadence.
     /// Seeded TRUE so the first cycle replays the journal at boot without waiting out
     /// kDefaultPageInterval.

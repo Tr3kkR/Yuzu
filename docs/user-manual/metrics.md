@@ -641,10 +641,12 @@ question is *"did any endpoint lose a lifecycle record"* - a flat sum answers th
 a percentile obscures it. One consequence worth having: no agent-controlled label
 means no cardinality exposure at all.
 
-**What absence means, mechanically.** The agent emits a journal tag **only when the
-counter is non-zero**, and every family is cleared and re-published each sweep. So an
-absent family means: *no retained agent's latest heartbeat carried a value for it that
-passed the forged-value parse.* Both edges matter and both are pinned by tests - a
+**What absence means, mechanically.** For the **counter families**, the agent emits a
+journal tag **only when the counter is non-zero**, and every family is cleared and
+re-published each sweep. So an absent family means: *no retained agent's latest
+heartbeat carried a value for it that passed the forged-value parse.* (The three
+`_seconds_max` age gauges at the end of the table have their own emission posture -
+see their rows; the cleared-and-republished-per-sweep rule applies to them too.) Both edges matter and both are pinned by tests - a
 non-conforming agent's explicit `"0"` parses and **publishes** the family at `0`, while
 a rejected non-zero value (over the plausibility ceiling, say) leaves it **absent** and
 increments `_tag_rejected`. What the rollup avoids is publishing a fabricated `0` for a
@@ -655,14 +657,19 @@ This page deliberately stops there. It tells you what each gauge counts and when
 emitted, not what a reading proves about fleet health - the interpretation belongs with
 whoever enables alerting at the `prefer_spark` cutover, against a live journal.
 
-**These are `gauge`-typed fleet sums, and they are monitor-only.** No churn-robust
-*new-increment* alert exists over an unlabelled fleet sum of per-agent cumulative
-counters: the sum cannot tell a new increment from a returning agent. The full analysis
-- why `increase()`/`rate()`, `delta()` and bare `> 0` each fail, what the rising-edge
-template does and does not buy, and the enable-time prerequisites - is stated once, in
-the `yuzu-guardian-journal` preamble in `docs/prometheus/yuzu-alerts.yml`, alongside the
-disabled templates themselves. Graph these, review them after an incident, do not page
-on them.
+**The counter rows are `gauge`-typed fleet sums, and they are monitor-only.** No
+churn-robust *new-increment* alert exists over an unlabelled fleet sum of per-agent
+cumulative counters: the sum cannot tell a new increment from a returning agent. The
+full analysis - why `increase()`/`rate()`, `delta()` and bare `> 0` each fail, what the
+rising-edge template does and does not buy, and the enable-time prerequisites - is
+stated once, in the `yuzu-guardian-journal` preamble in `docs/prometheus/yuzu-alerts.yml`,
+alongside the disabled templates themselves. Graph these, review them after an incident,
+do not page on them. **The three `_seconds_max` age rows are structurally different**:
+a fleet MAX of live ages with a meaningful absolute threshold, where a plain `> X for: Y`
+IS sound (see the commented staleness examples in the same alerts file) - do not apply
+the counter family's monitor-only reasoning to them wholesale, and equally do not apply
+an "any journal series > 0" panel to the family, since ~30 s is a *healthy* staleness
+reading.
 
 **Two meta-signals are the exception.** `yuzu_fleet_guardian_journal_reporting` and
 `..._tag_rejected` are server-owned counts published on **every completed sweep,
@@ -703,7 +710,10 @@ window later that is population churn, not a new incident.
 > and `yuzu_fleet_guardian_sweep_exceptions` (their wire tags likewise drop the `_journal_`
 > infix, sitting beside `drain_exceptions`). A PromQL selector like
 > `{__name__=~"^yuzu_fleet_guardian_journal_"}` silently omits all three. Match
-> `^yuzu_fleet_guardian_` if you mean the whole family.
+> `^yuzu_fleet_guardian_` if you mean the whole family - and note that EITHER selector
+> now also sweeps in the three `_seconds_max` age gauges, which are MAX-rolled live ages
+> (not sums of counters): exclude `_seconds_max$` from any panel or rule that assumes
+> "non-zero means something was lost".
 
 | Metric | Type | Description |
 |---|---|---|
@@ -734,7 +744,10 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_send_exceptions` | gauge | Fleet sum of per-entry drain **sends** that threw. Finer-grained than `_drain_exceptions`: one entry couldn't be serialized/sent, so that log's drain stops and jams delivery behind it. Spans the lifecycle log and the general outbox. **Wire key `yuzu.guardian_send_exceptions` (no `_journal_` infix)** |
 | `yuzu_fleet_guardian_drain_exceptions` | gauge | Fleet sum of firewalled throws in the outbox **delivery** machinery on the drain worker. Distinct from the journal counters: events are buffered but not shipping - a delivery fault, not a retention or audit-trail fault. **Wire key `yuzu.guardian_drain_exceptions` (no `_journal_` infix)** |
 | `yuzu_fleet_guardian_sweep_exceptions` | gauge | Fleet sum of firewalled throws in the convergence **sweep** lanes. Drift detection is degraded (the endpoint may miss policy violations) while the audit trail itself is unaffected. **Wire key `yuzu.guardian_sweep_exceptions` (no `_journal_` infix)** |
-| `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 29 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 29; it does not resolve it |
+| `yuzu_fleet_guardian_journal_page_stale_seconds_max` | gauge | Fleet **MAX** (worst endpoint, `_max` suffix - not a sum like the rest of the family; two 30 s-stale agents are not one 60 s-stale agent) of seconds since the drain worker's last non-throwing replay **page** pass, seeded from worker start. A **liveness** gauge for the maintenance loop: a dead worker thread or a permanently-throwing pass grows without bound - which is what makes silent worker death visible at all, since a dead worker's sparse counters just stay absent. Unlike the counters, the wire tag is emitted every heartbeat **including `0`** while the worker is live, and is **absent entirely** while dormant (`prefer_spark` off). Expect it to hover around the 30 s page cadence on a healthy fleet |
+| `yuzu_fleet_guardian_journal_prune_stale_seconds_max` | gauge | Fleet **MAX** of seconds since the drain worker's last non-throwing retention **prune** pass - the prune sibling of `_page_stale_seconds_max`, separate because the cadences differ (120 s vs 30 s) and stall independently. A growing value means retention is not running on some endpoint: the journal grows toward its cap, where writes start being refused (`_write_capacity_rejected`). Expect ~120 s on a healthy fleet. Same emit-including-`0` / absent-while-dormant posture as its page sibling |
+| `yuzu_fleet_guardian_journal_headroom_blocked_seconds_max` | gauge | Fleet **MAX** of the age of the oldest current **headroom-blocked replay-congestion episode** (#2364): somewhere a journal batch could not be placed in the send window for lack of room, continuously since the value's start. Episode-scoped and sampled at pass granularity: clears only after a proven block-free sweep of all of that journal's *candidates* (the batches a replay pass currently considers - unexpired, unquarantined journal batches), resets on agent restart, and a forced (boot/reconnect) pass can start an episode from already-delivered batches - read it as **replay-window congestion**, not proof of unsent loss. Its loss-relevant threshold is the 7-day retention window (604 800 s): an episode approaching that means never-sent records on that endpoint are nearing deletion - read with `_evicted_no_send_evidence`. **Caveat**: a clear can *coincide* with the blocked batch's own terminal eviction (an evicted batch stops being a candidate, so coverage completes) - corroborate a clear against `_evicted_no_send_evidence` before reading it as recovery. **Sparse**: absent means no endpoint is blocked |
+| `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 29 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 29; it does not resolve it. **Counts the 29 counter tags only - an agent reporting only the three `_seconds` age tags does not count here** |
 | `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 
 ## NVD CVE sync metrics
@@ -864,7 +877,10 @@ sum by (plugin) (rate(yuzu_agent_commands_executed_total{status="failure"}[5m]))
 
 The agent has no Prometheus endpoint, so the Guardian lifecycle journal reports through
 heartbeat `status_tags`. Emission is SPARSE - a quiescent or inert journal ships no tags at
-all, so absence means "nothing to report", not "not collected".
+all, so absence means "nothing to report", not "not collected". One exception: the two
+`_stale_seconds` age tags below are emitted every heartbeat **including `0`** while the drain
+worker is live (a zero age is a real "fresh" reading), and are absent only while the journal
+path is dormant.
 
 | Tag | Meaning | What to do |
 |---|---|---|
@@ -880,30 +896,33 @@ all, so absence means "nothing to report", not "not collected".
 | `yuzu.guardian_journal_backpressure_drops` | Lifecycle-audit entries **rejected** at outbox enqueue because it was at capacity. A **loss** channel: the arm/disarm still succeeds (the audit trail never blocks a real detection-capability change) but the record of that change is dropped. | A nonzero value means the audit trail is missing lifecycle edges under sustained delivery backpressure - investigate why delivery is not draining. |
 | `yuzu.guardian_sweep_exceptions` | Firewalled throws in the convergence SWEEP lanes. | Drift DETECTION is degraded (the endpoint may miss policy violations); the audit trail itself is unaffected. |
 | `yuzu.guardian_journal_bytes` / `yuzu.guardian_journal_batch_count` | Current on-disk size and batch count of the journal. Gauges, not counters. | Not independently actionable - use them to interpret the rows above (a climbing size alongside `prune_failures` means retention is not keeping up). |
+| `yuzu.guardian_journal_page_stale_seconds` / `yuzu.guardian_journal_prune_stale_seconds` | Seconds since the drain worker's last **non-throwing** page / prune maintenance pass, seeded from worker start. **Liveness** gauges (flip item 6): a dead, hung, or permanently-throwing worker reads as an ever-growing age. Emitted every heartbeat **including `0`** while the worker is live; absent while dormant. Two tags because the cadences differ (30 s page / 120 s prune) and stall independently. A deferred or read-failed pass still stamps - the loop is alive; those failure modes have their own counters. | Healthy readings hover around each pass's cadence. A steadily growing age with climbing `maint_exceptions` means every pass is throwing now; with a **flat** `maint_exceptions` the worker is hung **or its loop died earlier** (loop death increments that counter exactly once and logs a `critical` line - check the agent log to tell the two apart). Either way the journal is unmaintained - see the restart caveat below. |
+| `yuzu.guardian_journal_headroom_blocked_seconds` | Age of the current headroom-blocked **replay-congestion episode** (#2364): a journal batch could not be placed in the send window for lack of room, continuously since the value's start. Sampled at pass granularity; clears only after a proven block-free sweep of all candidates (the batches a replay pass currently considers); resets on agent restart; a forced (boot/reconnect) pass can start an episode from already-delivered batches. **Sparse**: absent = no current episode. | Sustained growth means the send window is not draining while a backlog waits - check connectivity and the delivery counters. The loss-relevant threshold is the 7-day retention window (604 800 s): an episode approaching it means never-sent records are nearing deletion (`_evicted_no_send_evidence`). A clear can coincide with the blocked batch's own eviction - corroborate against `_evicted_no_send_evidence` before reading a clear as recovery. |
 
-**Known gap: none of these counters distinguish a healthy idle worker from one that died.**
-The tags are emitted sparsely - a zero is omitted - so a Guardian drain worker that stops before
-doing any work reads on the heartbeat exactly like one with nothing to do. An exception that
-kills the worker's loop is counted (under `yuzu.guardian_journal_maint_exceptions`, with a
-`critical` log line naming it) no matter which cycle it happens on. What is NOT counted is a
-worker that never starts, or one that HANGS rather than throwing - blocked indefinitely on a
-store call, say. Nothing throws, so the firewall has nothing to catch and every counter simply
-stays where it was. Until the "seconds since the last successful pass" gauge tracked for the `prefer_spark`
-cutover (#2298) ships, corroborate a suspected-dead worker with the agent's logs rather than
-with metrics alone. There is no restart primitive short of restarting the agent daemon, and a
-restart is not free: records already written to the journal survive it, but `GuardianEngine`'s
-shutdown holds its lock while it joins the drain worker, so a stop arriving while that worker is
-hung rather than dead can itself be cut short by a supervisor's stop timeout. Prefer a graceful
-stop, and confirm the process exited on its own rather than being killed.
+**A gap the age gauges close (formerly "Known gap"):** the counter tags alone cannot
+distinguish a healthy idle worker from a dead one - they are sparse, so a worker that stops
+before doing any work reads exactly like one with nothing to do, and a worker that HANGS (blocked
+indefinitely on a store call) throws nothing for the firewall to catch. The `_stale_seconds`
+gauges above are the fix (flip items 6/14): they are seeded at worker **start** and re-stamped
+only by a completed non-throwing pass, so dead, hung, and permanently-throwing workers all read
+as an ever-growing age - and because they are emitted including `0`, "fresh" is a real reading,
+not an absence. What they still cannot show is a worker that **never started at all**: no worker
+means the tags are absent, which post-cutover is itself the anomaly to look for on a rule-bearing
+agent. There is no restart primitive short of restarting the agent daemon, and a restart is not
+free: records already written to the journal survive it, but `GuardianEngine`'s shutdown holds
+its lock while it joins the drain worker, so a stop arriving while that worker is hung rather
+than dead can itself be cut short by a supervisor's stop timeout. Prefer a graceful stop, and
+confirm the process exited on its own rather than being killed.
 
 Note the tag KEY is not always the internal field name - the audit-gap row above is emitted
 as `..._evicted_no_send_evidence` though the field is `evicted_without_send_evidence`. Grep
 heartbeat payloads for the key in this table, not for the field name; the emitter in
 `agents/core/src/guardian_journal_heartbeat.hpp` is authoritative.
 
-This table covers the actionable subset. The emitter ships roughly twenty
-`yuzu.guardian_journal_*` tags in total (sparsely - only non-zero ones), so a tag absent from
-this table is not necessarily absent from the payload.
+This table covers the actionable subset. The emitters ship about thirty
+`yuzu.guardian_journal_*` tags in total (the counters sparsely - only non-zero ones - plus the
+age tags per their own posture above), so a tag absent from this table is not necessarily
+absent from the payload.
 
 Counters are cumulative for the agent process and reset on restart.
 
