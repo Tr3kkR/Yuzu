@@ -88,6 +88,26 @@ The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bou
 | `yuzu_server_live_requests_total{kind, outcome}` | counter | Live-read requests by `kind` (`uptime` / `processes` / `unknown`) and terminal HTTP `outcome` (`200` / `400` / `403` / `429` / `500` / `502` / `503` / `504`). A rising `outcome="429"` rate means the concurrency cap is shedding load. |
 | `yuzu_server_live_inflight` | gauge | Current in-flight synchronous live-read polls. Approaching the cap (default 4) indicates saturation; sustained at the cap alongside 429s means the live surface is a bottleneck. |
 
+## MCP progress-bridge metrics
+
+The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a
+session's `GET` stream when `execute_instruction` is called with a `_meta.progressToken`
+(see `docs/user-manual/mcp.md`). It is in-memory and bounded (256 correlation records).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_mcp_bridge_records_active` | gauge | Correlation records currently live (global cap 256). Approaching the cap means new progress requests will degrade to the plain path. |
+| `yuzu_mcp_bridge_reject_total{reason}` | counter | Reservation rejections, by closed-set `reason` (`disabled` / `unknown_session` / `shutdown` / `duplicate_request_id` / `global_cap` / `pin_slots`). A rising `global_cap` rate means the bridge is at capacity. |
+| `yuzu_mcp_bridge_degrade_total{reason}` | counter | `execute_instruction` progress requests that silently fell back to the plain (poll) path, by `reason` (`reserve_rejected` - a reservation was rejected, with the finer reason in `reject_total`; `reserve_threw` / `no_execution_row` / `subscribe_failed` / `arm_threw` - an allocation/tracker failure). The plain response is self-sufficient (carries `execution_id`); a non-zero rate is a reliability signal, not an error. |
+| `yuzu_mcp_bridge_listener_failures_total` | counter | Bus-listener copy failures contained at the noexcept boundary (the event was not latched). The durable `execution_id` fetch is the backstop. Should be ~0. |
+| `yuzu_mcp_bridge_mailbox_drops_total` | counter | Oldest-progress frames dropped from a record's bounded 16-slot arming mailbox (a fast producer outrunning the projector); terminals are never dropped. |
+| `yuzu_mcp_bridge_projector_cycles_total` | counter | Projector wake cycles - an event-driven liveness signal. `yuzu_mcp_bridge_records_active > 0` with a flat rate here means the projector thread is wedged. |
+| `yuzu_mcp_stream_terminal_publish_failures_total` | counter | Terminal-frame publish failures seen by the bridge's `publish_final → fallback → poison` ladder. Non-zero means a client-visible result could not be delivered on the stream (recoverable by `execution_id`). Alert-worthy. |
+| `yuzu_mcp_stream_final_unpinned_total` | counter | Committed terminal frames that found no free pin slot and were published **unpinned** (a real terminal is committed rather than lost to preserve a pin). Not expected: the bridge caps streamed records per session at the pin count, so any non-zero value means that admission accounting was violated and the affected final is evictable from the replay ring - still recoverable by `execution_id`. Alert on `> 0`. |
+
+All reason-label sets are closed (every value is a static literal seeded to 0 at boot),
+so `absent()`/`rate()` alerting is meaningful on a healthy server.
+
 ## Pre-flight runner metrics
 
 | Metric | Type | Meaning |

@@ -208,9 +208,23 @@ change: a notification POST now answers `202` instead of `204`).
   Streams are held open, so a proxy in front of Yuzu must not buffer them. The server
   sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare
   need their own response-buffering opt-out.
-  In this release the channel carries heartbeats and replayed frames;
-  `notifications/progress` for long-running tools arrives in the next 2f rung (see
-  `docs/mcp-server.md`).
+  **Live progress (`notifications/progress`).** Call `execute_instruction` on a
+  Streamable-HTTP session with a `_meta.progressToken` (a string ≤512 bytes, or an
+  integer) in the `tools/call` params, and as the fleet responds the server pushes
+  `notifications/progress` frames onto *this session's `GET` stream*: `params.progress`
+  = agents responded, `params.total` = agents targeted, `params.progressToken` echoed
+  verbatim, and `params._meta["yuzu.execution_id"]` carrying the durable handle. The
+  token is opaque and echoed unchanged; anything that is not a string ≤512 bytes or an
+  integer is treated as "no progress requested". You will typically see an immediate
+  `0/N` frame (emitted as soon as the target count is known) followed by frames as
+  agents report in; these frames are part of the same per-session ring, so
+  **`Last-Event-ID` resume replays missed progress frames** exactly like any other.
+  Progress is **best-effort**: even after supplying a token you MUST still be prepared
+  to poll (`query_responses` / `get_execution_status`) - a reservation can silently
+  degrade to the plain path under load (e.g. the 256-record cap), and zero progress
+  frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
+  **not** emit progress (poll `get_bundle_result`). Progress delivery is on the `GET`
+  stream only in this release; SSE-on-`POST` arrives in a later 2f rung.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
@@ -542,6 +556,20 @@ Tools accept parameters via the `arguments` object in the `tools/call` request.
 Required parameters are validated server-side; missing required fields return a
 `-32602 Invalid params` error.
 
+For **approval-gated tools**, arguments are additionally validated against the
+tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
+work (#2405): a call with missing, mistyped, or out-of-bounds arguments (per
+the published `inputSchema`) answers `-32602` immediately — it never creates an approval
+request, and a re-call carrying an `approval_id` with schema-invalid arguments
+never consumes the ticket. (Semantic checks the schema cannot express — an
+unknown plugin name, a nonexistent agent — still happen in the handler and are
+not pre-empted by this gate.) The error
+message names the offending field as a JSON-pointer-style path (e.g.
+`/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
+confirming no ticket was created or consumed. Two strictness notes: `integer`
+parameters must be JSON integers (an integral float like `1.0` is rejected),
+and `maxLength` limits are byte counts.
+
 **Examples of key parameters:**
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
@@ -691,7 +719,14 @@ proposes.
 
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier, or `delete_tag` on `operator`).
-2. The MCP server creates an **approval request** with status `pending`
+2. The server validates the arguments against the tool's `inputSchema`
+   **first** (#2405): schema-invalid arguments answer `-32602` with no
+   approval request created — an admin's approval can no longer be wasted on
+   a call that fails schema validation, and a recall with schema-invalid
+   arguments cannot burn its one-time ticket. Arguments that pass the schema
+   but fail a handler's semantic check (e.g. an unknown plugin/action name)
+   are unaffected by this gate and can still consume a ticket. Then the MCP
+   server creates an **approval request** with status `pending`
    (`definition_id = "mcp.<tool>"`, the tool arguments captured as the
    canonical scope expression).
 3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
@@ -955,6 +990,21 @@ second).
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
 
+### -32014: Streamed result no longer buffered
+
+**Symptom**: On a `GET`-stream resume you receive a JSON-RPC error frame with code
+`-32014` echoing a request id, its A4 `error.data` carrying the `execution_id` and a
+"fetch by execution_id" remediation.
+
+**Cause**: The server force-expired a parked streamed result under memory pressure
+before it could be delivered on the stream (the buffered-result population hit its cap).
+The real result was never lost - only its *streamed* copy was dropped.
+
+**Fix**: Fetch the result durably with the supplied `execution_id`
+(`get_execution_status` / `query_responses`). This code cannot occur for
+`execute_instruction` progress in the current release (the parked-result path activates
+with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
+
 ### -32004: MCP tier does not allow this operation
 
 **Symptom**: A tool call returns error code `-32004`.
@@ -1019,10 +1069,17 @@ recall once it is approved.
 
 **Cause**: A required parameter is missing or invalid. For example, calling
 `get_agent_details` without `agent_id`, or calling `query_responses` with
-neither `execution_id` nor `instruction_id`.
+neither `execution_id` nor `instruction_id`. For an approval-gated tool this
+can also fire on a **recall** carrying `approval_id`: if the arguments fail
+schema validation the call is denied `-32602` immediately, before the ticket
+is even looked up (nothing consumed) — distinct from `-32003`'s "arguments
+don't match the ticket", which applies only to schema-*valid* mismatched
+arguments (#2405).
 
-**Fix**: Include all required parameters in the `arguments` object. See the
-[Available Tools](#available-tools) section for parameter requirements.
+**Fix**: Include all required parameters in the `arguments` object, typed as
+the tool's `inputSchema` declares (integers must be JSON integers — `1.0` is
+rejected). See the [Available Tools](#available-tools) section for parameter
+requirements.
 
 ### MCP client cannot connect
 

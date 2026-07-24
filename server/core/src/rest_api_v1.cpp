@@ -9402,15 +9402,15 @@ void RestApiV1::register_routes(
     //     `yuzu_server_sse_api_queue_overflow_total` (counter),
     //     `yuzu_server_sse_api_replay_gap_total` (counter).
     //
-    // **Known race window (governance unhappy-R10 + tracked as a
-    // follow-up issue against `ExecutionEventBus`):** `replay_since`
+    // **Known race window (governance unhappy-R10):** `replay_since`
     // and `subscribe` run under separate locks. A publish that fires
     // between the two is neither replayed (it post-dates the buffer
     // snapshot) nor delivered live (the listener is not yet
-    // installed). The fix is bus-side — an atomic
-    // `subscribe_with_replay` API that holds the channel mutex across
-    // both — and benefits the dashboard sibling identically, so it is
-    // filed as a single follow-up rather than fixed inline.
+    // installed). The bus-side fix now EXISTS - track 2f PR 3a landed
+    // `ExecutionEventBus::subscribe_and_replay` (atomic install-then-
+    // replay under one channel-mutex hold; the 2f MCP progress bridge
+    // uses it). Only the migration of THIS surface + the dashboard
+    // sibling remains; tracked in issue #2410.
     //
     // Parity with the dashboard sibling at `workflow_routes.cpp` —
     // both consume the same per-execution channel from
