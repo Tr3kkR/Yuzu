@@ -558,8 +558,8 @@ Required parameters are validated server-side; missing required fields return a
 
 For **approval-gated tools**, arguments are additionally validated against the
 tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
-work (#2405): a call with missing/mistyped arguments (per the published
-`inputSchema`) answers `-32602` immediately — it never creates an approval
+work (#2405): a call with missing, mistyped, or out-of-bounds arguments (per
+the published `inputSchema`) answers `-32602` immediately — it never creates an approval
 request, and a re-call carrying an `approval_id` with schema-invalid arguments
 never consumes the ticket. (Semantic checks the schema cannot express — an
 unknown plugin name, a nonexistent agent — still happen in the handler and are
