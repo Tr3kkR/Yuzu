@@ -865,13 +865,29 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     }
 
     const std::size_t limit = std::min<std::size_t>(cands.size(), kJournalPageMaxBatchesPerPass);
+    // Episode-state locals (#2364 telemetry). `note_clean` records a candidate observed
+    // block-free this pass into the cross-pass coverage set - only while an episode is
+    // active, so the steady no-episode state allocates nothing. A stop-truncated pass
+    // proves nothing and must not reach the footer's clear check.
+    bool stop_truncated = false;
+    const bool episode_active =
+        headroom_blocked_since_steady_ms_.load(std::memory_order_relaxed) >= 0;
+    const auto note_clean = [&](const std::string& key) {
+        if (episode_active)
+            clean_keys_since_block_.insert(key);
+    };
     for (std::size_t n = 0; n < limit; ++n) {
-        if (stopping_.load(std::memory_order_acquire))
+        if (stopping_.load(std::memory_order_acquire)) {
+            stop_truncated = true;
             break; // shutdown began: stop mutating the window (stop-race gate, rev-4.1 #7)
+        }
+        if (post_classify_hook_)
+            post_classify_hook_(); // test-only: land a stop between candidates
         Cand& c = cands[(start + n) % cands.size()];
         if (!sent_labels.empty() &&
             sent_labels.count(journal_sent_key_from_batch_key(c.key)) != 0) {
             ++stats.skipped_already_sent;
+            note_clean(c.key); // delivered => waits on no headroom
             page_cursor_ = std::pair{c.ts_ms, c.key}; // advance: never pin the rotation
             continue;
         }
@@ -892,6 +908,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         const std::size_t need = net_new_of(c.batch);
         if (need == 0) {
             // Already fully windowed: no work, and emphatically NOT a blockage.
+            note_clean(c.key);
             page_cursor_ = id;
             continue;
         }
@@ -958,6 +975,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             stats.headroom_blocked = true;
             if (stats.min_blocked_headroom == 0 || outcome.required < stats.min_blocked_headroom)
                 stats.min_blocked_headroom = outcome.required;
+        } else {
+            note_clean(c.key); // placed, or every entry already a member - not blocked
         }
         if (outcome.added > 0) {
             // Charge BEFORE the break, deliberately. This pass is allowed to place one batch
@@ -974,6 +993,57 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 break; // paged one net-new over an empty bucket; the rest wait for a refill
         }
         // added == 0 and not blocked: every entry was already a member; keep rotating.
+    }
+
+    // Headroom-blocked EPISODE state (#2364 step-1 telemetry): the age of the current
+    // replay-congestion episode, surfaced as yuzu.guardian_journal_headroom_blocked_seconds.
+    // Pass-level, never per-try_page_batch-call: in the #2364 starvation regime a single pass
+    // BOTH places small batches AND leaves the large one blocked, so any per-call
+    // set-on-block/clear-on-place state pins the age at ~0 in exactly the regime this gauge
+    // exists to expose (Sol + Kimi opine, 2026-07-23).
+    //
+    // Transition rules (both external reviewers independently, + the Fable review that
+    // replaced a coverage COUNT with the distinct-key set):
+    //  - A blocked observation is PROOF, however the loop exited: set-if-unset.
+    //  - A clean pass is only a SLICE (kJournalPageMaxBatchesPerPass=128 vs up to 1000
+    //    batches; the token-debt break above also ends a pass early), so clearing on a clean
+    //    pass would zero the gauge whenever the starved batch sits outside the scanned slice
+    //    - a sawtooth in the big-journal regime. Clear ONLY once EVERY candidate that
+    //    currently exists has itself been observed block-free since the last blocked
+    //    observation (the clean_keys_since_block_ membership check below; a single full
+    //    clean sweep clears immediately, partial slices accumulate across passes). A COUNT
+    //    compared against the current set size is NOT equivalent: prune eviction between
+    //    passes removes already-counted candidates, the count survives, the bar drops, and
+    //    the episode clears before the rotation re-reaches the still-blocked batch -
+    //    re-opening the sawtooth under exactly the shrink-churn the starvation regime
+    //    produces. Distinct-key coverage is churn-proof in both directions: an evicted
+    //    candidate stops being required, a new one becomes required.
+    //  - A stop-truncated pass with no blocked observation proves neither state: touch
+    //    nothing. (Every earlier return above - no KV, stopping, no token, boot-prune fail,
+    //    scan fail - already touches nothing by construction.)
+    //  - An empty candidate set has nothing to block: clear.
+    // Single writer (paging_mutex_ serialises passes); the atomic exists for the lock-free
+    // heartbeat read - the heartbeat must never queue behind an in-flight O(journal) pass.
+    if (stats.headroom_blocked) {
+        clean_keys_since_block_.clear();
+        if (headroom_blocked_since_steady_ms_.load(std::memory_order_relaxed) < 0) {
+            const auto now_steady = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count();
+            headroom_blocked_since_steady_ms_.store(now_steady, std::memory_order_relaxed);
+        }
+    } else if (!stop_truncated && episode_active) {
+        bool covered = true; // empty set: trivially covered -> clear
+        for (const Cand& c : cands) {
+            if (clean_keys_since_block_.count(c.key) == 0) {
+                covered = false;
+                break;
+            }
+        }
+        if (covered) {
+            headroom_blocked_since_steady_ms_.store(-1, std::memory_order_relaxed);
+            clean_keys_since_block_.clear(); // release the epoch's memory
+        }
     }
 
     pages_.fetch_add(1, std::memory_order_relaxed);

@@ -65,6 +65,7 @@ class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
 struct GuardianJournalStats;
+struct GuardianJournalAgeStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 struct OutboxEntry;
@@ -179,6 +180,15 @@ public:
     /// emits these SPARSELY (only non-zero) via emit_guardian_journal_heartbeat_tags. All
     /// zero when prefer_spark is off / the journal is quiescent.
     [[nodiscard]] GuardianJournalStats journal_stats() const;
+
+    /// The journal AGE gauges (flip item 6 + #2364 step-1), emitted via
+    /// emit_guardian_journal_age_tags. Returns nullopt while the ages are meaningless:
+    /// prefer_spark off (spark dormant - the counters-are-zero trick does NOT extend to
+    /// ages, where 0 is a real reading, so dormancy must be an ABSENCE), no drain worker,
+    /// or a worker that has not completed start() (stamps still 0). This gate is inside the
+    /// engine because prefer_spark_ is deliberately not exposed; the heartbeat just forwards
+    /// whatever this returns.
+    [[nodiscard]] std::optional<GuardianJournalAgeStats> journal_age_stats() const;
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as

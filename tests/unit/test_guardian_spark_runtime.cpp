@@ -1317,6 +1317,354 @@ TEST_CASE("page_into_window bounds net-new work per pass (rate limit)", "[spark]
     CHECK(drain_lifecycle(*rig.rt).size() == s.batches_paged);
 }
 
+// ── #2364 headroom-blocked EPISODE state ──────────────────────────────────────
+// The regime test: the episode clock must SURVIVE a pass that places small batches
+// while the big one stays blocked - that is the exact starvation channel #2364
+// documents, and the design this replaced (clear-on-placement) zeroed the clock on
+// every such pass, measuring nothing (Sol + Kimi opine, 2026-07-23).
+
+TEST_CASE("#2364 episode: survives small-batch placement while the big batch is blocked",
+          "[spark][runtime][journal]") {
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1; // clamped up to the one-max-batch floor (256)
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    // Fill the window to headroom 3.
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i + 3 < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap - 3);
+
+    // ONE 4-record batch (blocked: needs 4 > 3) + one 1-record batch (fits).
+    std::vector<std::shared_ptr<const JournalRecord>> big;
+    for (int i = 0; i < 4; ++i)
+        big.push_back(std::make_shared<const JournalRecord>(
+            JournalRecord{.rule_id = "big", .generation = 1, .event_id = "e-big-" + std::to_string(i),
+                          .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                          .guard_type = "file", .rule_name = "n"}));
+    REQUIRE(rig.journal->persist(big) == 4);
+    rig.persist("small");
+
+    CHECK(rig.journal->headroom_blocked_since_for_test() == -1); // no episode yet
+
+    const std::int64_t t0 = 1'700'000'000'000;
+    const auto s1 = rig.journal->page_into_window(*rig.rt, t0);
+    CHECK(s1.headroom_blocked);
+    CHECK(s1.records_paged == 1); // the small batch placed IN THE SAME PASS
+    const auto since1 = rig.journal->headroom_blocked_since_for_test();
+    CHECK(since1 >= 0); // episode started
+
+    // Second blocked pass: set-if-unset must HOLD the original stamp, not re-stamp -
+    // re-stamping is the sawtooth that pins the age at ~0 under sustained starvation.
+    const auto s2 = rig.journal->page_into_window(*rig.rt, t0 + 60'000);
+    CHECK(s2.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since1);
+
+    // The age accessor takes the caller's steady now: exact age, and saturating (a now
+    // at-or-before the stamp reads 0, never an unsigned wrap).
+    CHECK(rig.journal->headroom_blocked_age_ms(since1 + 5'000) == 5'000);
+    CHECK(rig.journal->headroom_blocked_age_ms(since1) == 0);
+    CHECK(rig.journal->headroom_blocked_age_ms(since1 - 1) == 0);
+
+    // Recovery: drain the window, then a pass that classifies EVERY candidate with no
+    // block observed (a full clean sweep) clears the episode.
+    drain_lifecycle(*rig.rt);
+    const auto s3 = rig.journal->page_into_window(*rig.rt, t0 + 120'000);
+    CHECK_FALSE(s3.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == -1);
+    CHECK(rig.journal->headroom_blocked_age_ms(t0) == 0); // no episode -> age 0
+}
+
+TEST_CASE("#2364 episode: a clean SLICE of a >128-candidate journal must not clear it",
+          "[spark][runtime][journal]") {
+    // A pass scans at most kJournalPageMaxBatchesPerPass (128) candidates, so with more
+    // candidates than that a clean pass proves nothing about the unscanned tail -
+    // clearing on it would sawtooth the gauge in the big-journal regime (both external
+    // reviewers, independently). Clearing waits for accumulated block-free coverage of
+    // the full candidate set.
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1; // floor 256
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    // 130 journal batches whose records are ALREADY in the window (need==0 candidates:
+    // cleanly classified, never a blockage, and - crucially - no token spend), plus one
+    // OLDEST 1-record batch that cannot fit (headroom 0) and starts the episode.
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    const std::int64_t base_ts = 1'700'000'000'000;
+    write_batch("lc:aaa:000000000000", base_ts - 1'000, "e-blk"); // oldest -> scanned first
+    std::vector<OutboxEntry> windowed;
+    for (int i = 0; i < 130; ++i) {
+        const auto id = std::to_string(i);
+        write_batch("lc:bbb:" + std::string(12 - id.size(), '0') + id, base_ts + i, "e-r" + id);
+        windowed.push_back(lc_entry("r" + id, "e-r" + id));
+    }
+    // Fill the window COMPLETELY: the 130 candidate ids + filler to capacity.
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    for (std::size_t i = 130; i < cap; ++i)
+        windowed.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(windowed)).added == cap);
+
+    // Pass 1: headroom 0, the oldest candidate needs a slot -> blocked, episode starts.
+    const auto s1 = rig.journal->page_into_window(*rig.rt, base_ts + 50'000);
+    CHECK(s1.headroom_blocked);
+    const auto since = rig.journal->headroom_blocked_since_for_test();
+    REQUIRE(since >= 0);
+
+    // The blocked batch gets a durable sent-label (as if delivered), so ordinary passes
+    // now SKIP it - every remaining candidate classifies cleanly (already windowed).
+    REQUIRE(rig.kv->set(kJournalNamespace, journal_sent_key_from_batch_key("lc:aaa:000000000000"),
+                        ""));
+
+    // Pass 2: 131 candidates, slice cap 128 -> a CLEAN pass that covered only a slice.
+    // The old clear-on-clean-pass rule would clear here; the episode must survive.
+    const auto s2 = rig.journal->page_into_window(*rig.rt, base_ts + 110'000);
+    CHECK_FALSE(s2.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since);
+
+    // Pass 3: accumulated block-free coverage (128 + 128) now spans all 131 candidates
+    // -> the episode clears.
+    const auto s3 = rig.journal->page_into_window(*rig.rt, base_ts + 170'000);
+    CHECK_FALSE(s3.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == -1);
+}
+
+TEST_CASE("#2364 episode: shrink-churn cannot clear it early (distinct coverage, not a count)",
+          "[spark][runtime][journal]") {
+    // THE Fable-review regression (2026-07-23). A coverage COUNT compared against the
+    // current candidate-set size clears early when prune eviction removes
+    // already-counted candidates between passes: the count survives, the bar drops, and
+    // the episode clears before the rotation ever re-reaches the still-blocked batch -
+    // re-opening the sawtooth in exactly the #2364 shrink-churn regime. Distinct-key
+    // coverage must keep the episode alive until every SURVIVING candidate has itself
+    // been observed block-free.
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1; // floor 256
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    const std::int64_t base_ts = 1'700'000'000'000;
+    // Oldest: the blocked batch (1 net-new record, and the window will be full).
+    write_batch("lc:aaa:000000000000", base_ts - 1'000, "e-blk");
+    // 260 newer batches, all sent-labelled: they classify cleanly (skip-sent) without
+    // needing window room, and 260 > 2x the 128-per-pass slice so full coverage takes
+    // more than two passes.
+    std::vector<std::string> clean_keys;
+    for (int i = 0; i < 260; ++i) {
+        const auto id = std::to_string(i);
+        const std::string key = "lc:bbb:" + std::string(12 - id.size(), '0') + id;
+        write_batch(key, base_ts + i, "e-r" + id);
+        REQUIRE(rig.kv->set(kJournalNamespace, journal_sent_key_from_batch_key(key), ""));
+        clean_keys.push_back(key);
+    }
+    // Window completely full -> the blk batch can never place.
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap);
+
+    // Pass 1: the oldest candidate blocks at headroom 0 -> episode starts.
+    const auto s1 = rig.journal->page_into_window(*rig.rt, base_ts + 50'000);
+    REQUIRE(s1.headroom_blocked);
+    const auto since = rig.journal->headroom_blocked_since_for_test();
+    REQUIRE(since >= 0);
+
+    // Pass 2: a clean 128-candidate slice (cursor sits after blk), coverage 128 of 261.
+    const auto s2 = rig.journal->page_into_window(*rig.rt, base_ts + 110'000);
+    CHECK_FALSE(s2.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since);
+
+    // Prune-eviction stand-in: delete the 128 candidates pass 2 just classified. A
+    // count-based rule now holds 128 counted classifications against a 133-candidate
+    // set - pass 3's clean slice would push it to 256 >= 133 and clear spuriously.
+    for (int i = 0; i < 128; ++i)
+        REQUIRE(rig.kv->del(kJournalNamespace, clean_keys[static_cast<std::size_t>(i)]));
+
+    // Pass 3: another clean slice (128 of the 132 remaining cleans; blk still not
+    // reached). The still-blocked batch has NOT been observed block-free, so the
+    // episode MUST survive - this is the assertion the count rule fails.
+    const auto s3 = rig.journal->page_into_window(*rig.rt, base_ts + 170'000);
+    CHECK_FALSE(s3.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since);
+
+    // Pass 4: the rotation finishes the cleans and wraps back to blk - still blocked,
+    // and set-if-unset holds the ORIGINAL stamp (the episode was continuous).
+    const auto s4 = rig.journal->page_into_window(*rig.rt, base_ts + 230'000);
+    CHECK(s4.headroom_blocked);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since);
+}
+
+TEST_CASE("#2364 episode: a stop-truncated pass with FULL coverage still does not clear",
+          "[spark][runtime][journal]") {
+    // Drives the in-loop stopping_ break (the only writer of stop_truncated) via the
+    // test-only per-candidate hook - no external sequence can land a stop between
+    // candidates deterministically. DISCRIMINATING setup (governance Gate 3 QE): the
+    // truncated pass completes the coverage of EVERY candidate before the stop lands,
+    // so if the stop_truncated guard were deleted the footer's covered-check would
+    // evaluate TRUE and clear - this test flips on exactly that mutation, unlike a
+    // partial-coverage truncation where the missing keys also block the clear.
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1; // floor 256
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    auto write_batch = [&](const std::string& key, std::int64_t ts_ms, const std::string& eid) {
+        REQUIRE(rig.kv->set(
+            kJournalNamespace, key,
+            R"({"v":4,"ts_ms":)" + std::to_string(ts_ms) +
+                R"(,"entries":[{"rule_id":"r","generation":1,"event_id":")" + eid +
+                R"(","enqueued_ns":1700000000000000000,"kind":"armed","guard_type":"file","rule_name":"n"}]})"));
+    };
+    // Same 131-candidate scaffold as the clean-slice test: blk oldest, 130 batches
+    // whose records are pre-windowed (need==0 -> clean, token-free classifications).
+    const std::int64_t base_ts = 1'700'000'000'000;
+    write_batch("lc:aaa:000000000000", base_ts - 1'000, "e-blk");
+    std::vector<OutboxEntry> windowed;
+    for (int i = 0; i < 130; ++i) {
+        const auto id = std::to_string(i);
+        write_batch("lc:bbb:" + std::string(12 - id.size(), '0') + id, base_ts + i, "e-r" + id);
+        windowed.push_back(lc_entry("r" + id, "e-r" + id));
+    }
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    for (std::size_t i = 130; i < cap; ++i)
+        windowed.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(windowed)).added == cap);
+
+    // Pass 1: blocked at blk -> episode starts. Then label blk as delivered so every
+    // candidate classifies cleanly from here on.
+    REQUIRE(rig.journal->page_into_window(*rig.rt, base_ts + 50'000).headroom_blocked);
+    const auto since = rig.journal->headroom_blocked_since_for_test();
+    REQUIRE(since >= 0);
+    REQUIRE(rig.kv->set(kJournalNamespace, journal_sent_key_from_batch_key("lc:aaa:000000000000"),
+                        ""));
+
+    // Pass 2: ordinary clean 128-slice (covers bbb0..bbb127). Survives - partial.
+    (void)rig.journal->page_into_window(*rig.rt, base_ts + 110'000);
+    REQUIRE(rig.journal->headroom_blocked_since_for_test() == since);
+
+    // Pass 3: the rotation continues at bbb128, bbb129, then blk - after those THREE
+    // classifications coverage of all 131 candidates is complete. Stop on the 4th
+    // examined candidate: the pass is truncated AFTER coverage completed, so ONLY the
+    // stop_truncated guard stands between this pass and a (wrong) clear.
+    int classify_calls = 0;
+    rig.journal->set_post_classify_hook_for_test([&] {
+        if (++classify_calls == 4)
+            rig.journal->request_stop();
+    });
+    const auto s3 = rig.journal->page_into_window(*rig.rt, base_ts + 170'000);
+    CHECK_FALSE(s3.headroom_blocked);
+    CHECK(classify_calls == 4); // truncated mid-loop, after the coverage-completing 3rd
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since); // NOT cleared
+}
+
+TEST_CASE("#2364 episode: restart after clear - a fresh episode stamps and clears cleanly",
+          "[spark][runtime][journal]") {
+    // Guards the epoch-reset path (governance Gate 3 QE): after block -> clear, a
+    // SECOND blocking episode must get its own fresh stamp and must itself be
+    // clearable - i.e. the clear really reset the coverage set, and no stale coverage
+    // from epoch 1 lets epoch 2 clear early (or blocks it from clearing at all).
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1;
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i + 3 < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap - 3);
+
+    // Episode 1: a 4-record batch blocks against headroom 3.
+    std::vector<std::shared_ptr<const JournalRecord>> big;
+    for (int i = 0; i < 4; ++i)
+        big.push_back(std::make_shared<const JournalRecord>(
+            JournalRecord{.rule_id = "big", .generation = 1, .event_id = "e-big-" + std::to_string(i),
+                          .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                          .guard_type = "file", .rule_name = "n"}));
+    REQUIRE(rig.journal->persist(big) == 4);
+    const std::int64_t t0 = 1'700'000'000'000;
+    REQUIRE(rig.journal->page_into_window(*rig.rt, t0).headroom_blocked);
+    REQUIRE(rig.journal->headroom_blocked_since_for_test() >= 0);
+
+    // Clear episode 1: drain frees the window; the next pass places big (full clean
+    // coverage of the single candidate).
+    drain_lifecycle(*rig.rt);
+    (void)rig.journal->page_into_window(*rig.rt, t0 + 60'000);
+    REQUIRE(rig.journal->headroom_blocked_since_for_test() == -1);
+
+    // Episode 2: a fresh 2-record batch against a re-filled window (headroom 1).
+    const std::size_t headroom_now = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> refill;
+    for (std::size_t i = 0; i + 1 < headroom_now; ++i)
+        refill.push_back(lc_entry("fill2", "g" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(refill)).added == headroom_now - 1);
+    std::vector<std::shared_ptr<const JournalRecord>> big2;
+    for (int i = 0; i < 2; ++i)
+        big2.push_back(std::make_shared<const JournalRecord>(
+            JournalRecord{.rule_id = "big2", .generation = 1, .event_id = "e-b2-" + std::to_string(i),
+                          .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
+                          .guard_type = "file", .rule_name = "n"}));
+    REQUIRE(rig.journal->persist(big2) == 2);
+    const auto s3 = rig.journal->page_into_window(*rig.rt, t0 + 120'000);
+    CHECK(s3.headroom_blocked);
+    const auto since2 = rig.journal->headroom_blocked_since_for_test();
+    CHECK(since2 >= 0); // fresh episode stamped after a genuine -1
+
+    // And episode 2 clears on recovery exactly like episode 1 did.
+    drain_lifecycle(*rig.rt);
+    (void)rig.journal->page_into_window(*rig.rt, t0 + 180'000);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == -1);
+}
+
+TEST_CASE("#2364 episode: early returns leave the state untouched",
+          "[spark][runtime][journal]") {
+    // Every return before the end-of-pass update - stop, no token, scan failure - must
+    // neither start nor clear an episode: an examination that never ran refutes nothing.
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 1;
+    PageRig rig;
+    rig.rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i < cap; ++i)
+        fill.push_back(lc_entry("fill", "f" + std::to_string(i)));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap);
+    rig.persist("blk"); // 1 net-new record, headroom 0 -> blocks when a pass runs
+
+    const std::int64_t t0 = 1'700'000'000'000;
+    // A failed journal scan returns before the update: no episode may start.
+    rig.journal->inject_page_read_failures_for_test(1);
+    (void)rig.journal->page_into_window(*rig.rt, t0);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == -1);
+
+    // A real pass starts it.
+    (void)rig.journal->page_into_window(*rig.rt, t0 + 30'000);
+    const auto since = rig.journal->headroom_blocked_since_for_test();
+    REQUIRE(since >= 0);
+
+    // After request_stop() the pass returns at the entry gate: state untouched.
+    rig.journal->request_stop();
+    (void)rig.journal->page_into_window(*rig.rt, t0 + 60'000);
+    CHECK(rig.journal->headroom_blocked_since_for_test() == since);
+}
+
 TEST_CASE("page_into_window prunes an expired batch before replaying (boot barrier)",
           "[spark][runtime][journal]") {
     PageRig rig;

@@ -832,6 +832,11 @@ public:
         // MONITOR-ONLY until a per-agent axis lands (#2083-class; see the note).
         for (const auto& m : detail::kGuardianJournalMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
+        // The journal AGE family (item 6 + #2364) - its own table because it rolls up
+        // as MAX, not SUM (a fleet sum of ages is meaningless; see the table comment in
+        // guardian_journal_fleet_tags.hpp for the emission differences too).
+        for (const auto& m : detail::kGuardianJournalAgeMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
         // The two meta-signals are NOT in that table (it is pinned 1:1 to the agent's
         // GuardianJournalStats) and are published every sweep including at 0.
         metrics_.describe(detail::kGuardianJournalReportingGauge,
