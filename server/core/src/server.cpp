@@ -1717,40 +1717,6 @@ public:
                 } else {
                     spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
                                  pg_pool_->size());
-
-                    // #2367: held-open streams and the Postgres pool are coupled
-                    // capacities, and nothing else says so at boot. Every live
-                    // stream re-validates its credential each pump tick; those
-                    // reads are cached (60 s, see EnginePrincipalStore's
-                    // revalidation cache and ApiTokenStore's token cache), so
-                    // steady-state load is O(streams / TTL), not O(streams x
-                    // tick). But the refreshes still land on this pool alongside
-                    // ordinary request traffic, and a stream target far above the
-                    // pool size is the shape that turns a pool blip into a
-                    // correlated stall: every stream's refresh queues on a
-                    // bounded acquire at once.
-                    //
-                    // Advisory only — deliberately not a clamp and not a startup
-                    // failure. The safe ratio depends on link latency and traffic
-                    // mix, so this points the operator at the two metrics that
-                    // actually answer it rather than inventing a hard rule.
-                    // Threshold sits ABOVE the shipped default ratio (128 streams
-                    // / 16 connections = 8:1) so a default server is quiet, and
-                    // below the cliff the issue names (512 streams on a pool of
-                    // 16 = 32:1), which warns.
-                    constexpr std::size_t kStreamsPerPgConnAdvisory = 16;
-                    const std::size_t stream_target =
-                        cfg_.max_sse_streams > 0 ? cfg_.max_sse_streams
-                                                 : detail::kTargetHeldOpenStreamsDefault;
-                    if (stream_target > pg_pool_->size() * kStreamsPerPgConnAdvisory) {
-                        spdlog::warn(
-                            "[PG] --max-sse-streams {} is more than {}x --postgres-pool-size {}. "
-                            "Held-open streams refresh their credential against this pool; at "
-                            "this ratio a pool brownout stalls streams and ordinary requests "
-                            "together. Watch yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use, "
-                            "and raise --postgres-pool-size if they climb.",
-                            stream_target, kStreamsPerPgConnAdvisory, pg_pool_->size());
-                    }
                 }
             }
         }
@@ -3728,6 +3694,25 @@ public:
                         .set(static_cast<double>(api_token_store_->cache_misses()));
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
+                }
+                // #2367: the same observability for the engine-principal
+                // revalidation cache. Without these the cache is invisible —
+                // its whole job is to keep per-tick stream re-validation off
+                // the pool, and there would be no way to see whether it is
+                // doing it. `backoff_suppressed` is the brownout signal: it
+                // only moves while the store is unreachable AND the per-tick
+                // retry amplifier is being held off.
+                if (engine_principal_store_) {
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_hits_total")
+                        .set(static_cast<double>(engine_principal_store_->revalidate_cache_hits()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_misses_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revalidate_cache_misses()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_size")
+                        .set(static_cast<double>(engine_principal_store_->revalidate_cache_size()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revalidate_backoff_suppressed()));
                 }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are
@@ -5740,6 +5725,40 @@ private:
                          "handover). Raise --http-worker-threads or lower the target.",
                          target_streams, pool_max, effective_streams,
                          detail::kPlainRestReserveDefault, detail::kMaxProvidersPerStream);
+        }
+        // #2367: held-open streams and the Postgres pool are coupled capacities,
+        // and nothing else says so at boot. Every live stream re-validates its
+        // credential each pump tick against this pool. Those reads are cached,
+        // so steady state is O(streams / TTL) rather than O(streams x tick) —
+        // but the refreshes still land here alongside ordinary request traffic,
+        // and a stream capacity far above the pool size is the shape that turns
+        // a pool blip into a correlated stall.
+        //
+        // Deliberately warned on the EFFECTIVE capacity, not the configured
+        // target: a hand-pinned --http-worker-threads can clamp the target well
+        // below what was asked for, and warning about capacity the server will
+        // never admit is just noise.
+        //
+        // Advisory only — not a clamp and not a startup failure. The safe ratio
+        // depends on link latency and traffic mix, so this points at the metrics
+        // that answer it rather than inventing a rule. The threshold sits above
+        // the shipped default ratio (128 streams / 16 connections = 8:1, so a
+        // default server is quiet) and below the cliff #2367 names (512 on a
+        // pool of 16 = 32:1).
+        if (pg_pool_) {
+            constexpr std::size_t kStreamsPerPgConnAdvisory = 16;
+            if (effective_streams > pg_pool_->size() * kStreamsPerPgConnAdvisory) {
+                spdlog::warn(
+                    "[PG] effective SSE stream capacity {} is more than {}x --postgres-pool-size "
+                    "{}. Held-open streams re-validate their credential against this pool, so at "
+                    "this ratio a pool brownout can stall streams and ordinary requests together. "
+                    "Watch yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use; if they climb, "
+                    "lower the stream capacity or raise --postgres-pool-size (and check the "
+                    "database can carry the extra connections — enlarging the pool against an "
+                    "already-struggling server makes things worse, not better). Engine-principal "
+                    "streams are the heaviest case; other SSE surfaces re-validate more cheaply.",
+                    effective_streams, kStreamsPerPgConnAdvisory, pg_pool_->size());
+            }
         }
         stream_budget_ =
             std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{effective_streams});
