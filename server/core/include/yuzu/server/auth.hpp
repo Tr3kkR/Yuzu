@@ -46,6 +46,23 @@ enum class CredentialCheck : int {
     kValid,
     kRevoked,       ///< definitive: signed out, expired, revoked, rebound, or absent
     kIndeterminate, ///< the auth store could not answer — NOT evidence of revocation
+    /// Valid, but the answer came from a cache — nothing was asked of the
+    /// authoritative store on this tick (#2367).
+    ///
+    /// This exists because "still valid" and "re-confirmed valid" are different
+    /// facts to a held-open stream, and conflating them silently extends how
+    /// long a stream can outlive its credential. A consumer that treats this as
+    /// plain `kValid` and resets its grace clock makes cache residency and the
+    /// grace window ADD: the stream rides the cache, and only once the cache
+    /// expires does a full FRESH grace window start. The consumer must instead
+    /// keep measuring its grace budget from the last AUTHORITATIVE `kValid`, so
+    /// total survival past a real confirmation stays bounded by the grace
+    /// window however much of it was spent on cached answers.
+    ///
+    /// Not a denial and not a degradation — the credential IS valid. A consumer
+    /// that does not model staleness may safely treat this as `kValid`; it will
+    /// simply inherit the additive window described above.
+    kValidStale,
 };
 
 struct UserEntry {

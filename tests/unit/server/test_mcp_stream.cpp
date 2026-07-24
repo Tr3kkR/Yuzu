@@ -521,6 +521,70 @@ TEST_CASE("McpStreamPump/CH-4: a recovered backend resets the grace window",
     CHECK(pump.pump_once(wire.writer()));
 }
 
+TEST_CASE("McpStreamPump/#2367: cached validity does NOT reset the grace budget",
+          "[mcp][stream][ch4]") {
+    // The window that made cache residency and the grace window ADD. A cached
+    // credential answer keeps the stream alive but re-confirms nothing, so the
+    // grace budget must keep running from the last AUTHORITATIVE confirmation.
+    // Treated as plain kValid, the stream would ride the cache and then collect
+    // a full FRESH grace window on top of it.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::milliseconds(1000);
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, fast_cfg(grace),
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    // 900 ms of cached-valid answers. The stream stays up — a cache hit is not
+    // a failure — but the budget is being spent, not refreshed.
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // The cache expires and the store turns out to be unreachable. Only 100 ms
+    // of the 1000 ms budget remains, so a further 200 ms must kill it. Under
+    // the old "arm the deadline at first kIndeterminate" behaviour this stream
+    // would have lived another full second.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(200);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("McpStreamPump/#2367: an authoritative re-confirmation does reset the budget",
+          "[mcp][stream][ch4]") {
+    // The other half: kValidStale must not be so strict that a genuinely
+    // re-confirmed stream inherits a spent budget.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&verdict] { return verdict; },
+                            [] { return true; },
+                            fast_cfg(std::chrono::milliseconds(1000)),
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    clock_now += std::chrono::milliseconds(900); // budget nearly spent on cached answers
+    CHECK(pump.pump_once(wire.writer()));
+
+    verdict = mcp::StreamRevalidate::kValid; // the store was actually asked
+    CHECK(pump.pump_once(wire.writer()));
+
+    // Budget restarts from here, so 900 ms of indeterminate is survivable again.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+}
+
 TEST_CASE("McpStreamPump: a terminated session ends the stream with its own reason",
           "[mcp][stream]") {
     auto state = std::make_shared<mcp::McpStreamState>();

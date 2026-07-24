@@ -769,7 +769,14 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      clock_(std::move(clock)), metrics_(metrics) {}
+      clock_(std::move(clock)), metrics_(metrics) {
+    // #2367: the grace budget is measured from the last authoritative
+    // confirmation, and attach already performed one — GET admission
+    // authenticates the request fully before this pump is constructed. Seeding
+    // to "now" rather than the epoch is what stops the very first
+    // indeterminate tick from computing an instantly-expired deadline.
+    last_authoritative_ok_ = now();
+}
 
 std::chrono::steady_clock::time_point McpStreamPump::now() const {
     return clock_ ? clock_() : std::chrono::steady_clock::now();
@@ -880,7 +887,16 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
             // jitter chosen ONCE here, so streams that all entered grace together do
             // not all die together (Config::revalidate_grace_jitter_max).
             if (!grace_deadline_.has_value()) {
-                grace_start_ = now();
+                // #2367: the budget is measured from the last AUTHORITATIVE
+                // confirmation, not from this tick. A credential re-check that
+                // was served from a cache (kValidStale below) keeps the stream
+                // alive without re-confirming anything, so starting the clock
+                // here would let cache residency and the grace window ADD —
+                // the stream rides the cache, then collects a full fresh grace
+                // window on top. Backdating keeps total survival past a real
+                // confirmation bounded by revalidate_grace, however much of it
+                // was spent on cached answers.
+                grace_start_ = last_authoritative_ok_;
                 std::chrono::milliseconds jitter{0};
                 if (cfg_.revalidate_grace_jitter_max.count() > 0) {
                     // A per-stream offset in [0, jitter_max]. thread_local RNG seeded once
@@ -902,14 +918,31 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
                         static_cast<std::int64_t>(rng()) % (span + 1)};
                 }
                 grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
-            } else if (now() > *grace_deadline_) {
+            }
+            // Checked on the arming tick too, not just later ones: a backdated
+            // deadline can already be in the past, and the pre-#2367 "arm now,
+            // test next tick" shape would then grant an extra tick of life to a
+            // stream whose budget was already spent.
+            if (now() > *grace_deadline_) {
                 stream_->close(McpStreamClose::kAuthUnavailable);
                 return finish(write, McpStreamClose::kAuthUnavailable);
             }
             break;
         case StreamRevalidate::kValid:
+            // An AUTHORITATIVE confirmation: the store was asked and answered.
+            // Only this resets the budget.
+            last_authoritative_ok_ = now();
             grace_start_.reset();
             grace_deadline_.reset();
+            break;
+        case StreamRevalidate::kValidStale:
+            // Valid, but nothing was asked of the store — the credential is
+            // good as of `last_authoritative_ok_`, which is NOT now. Keep the
+            // stream running and leave the budget where it is: do not advance
+            // last_authoritative_ok_, and do not clear a deadline already armed
+            // (an outage that began before the cache expired must keep its
+            // clock). Consumers that do not model staleness may treat this as
+            // kValid; this one must not.
             break;
         }
     }

@@ -547,11 +547,24 @@ private:
     Config cfg_;
     ClockFn clock_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
+    // #2367. When this stream's credential was last confirmed AUTHORITATIVELY —
+    // the store was asked and answered — as opposed to served from a cache
+    // (StreamRevalidate::kValidStale). The indeterminate grace deadline is
+    // measured from HERE, not from the tick the outage was noticed, so a stream
+    // cannot extend its life by riding cached answers and then collecting a
+    // full fresh grace window once they expire. Seeded at construction: attach
+    // performs a fresh authoritative authentication before this pump exists.
+    std::chrono::steady_clock::time_point last_authoritative_ok_;
+    // Where the current indeterminate spell's budget is measured from: the last
+    // authoritative confirmation (see above), NOT the moment the store first
+    // failed to answer.
     std::optional<std::chrono::steady_clock::time_point> grace_start_;
     // The effective grace deadline for THIS stream's current indeterminate spell,
     // = grace_start_ + revalidate_grace + a per-stream jitter chosen once when
     // grace_start_ is set (see Config::revalidate_grace_jitter_max). Reset alongside
-    // grace_start_ when the credential re-validates.
+    // grace_start_ when the credential re-validates AUTHORITATIVELY. Because
+    // grace_start_ is backdated it can already be in the past when armed, so the
+    // expiry test runs on the arming tick too.
     std::optional<std::chrono::steady_clock::time_point> grace_deadline_;
 };
 
