@@ -65,7 +65,10 @@
 /// `validate_token` and the fleet data plane with it. (Past 60 s of a
 /// sustained outage the TOKEN half of the same tick resumes reading through
 /// too, since it has no equivalent backoff — so this removes one of the two
-/// amplifiers, not both. Tracked with #2447.)
+/// amplifiers, not both. Tracked with #2447; the residual sharp edges of this
+/// one are #2454 (global revoke generation), #2455 (no single-flight), #2456
+/// (lease timeout vs permanent error), #2457 (unbounded read on the writer
+/// thread) and #2458 (silent ceiling / config binding).)
 ///
 /// So `get_for_auth_revalidate()` adds a short-TTL positive cache — and ONLY
 /// that method. `get_for_auth()` stays uncached and authoritative. Which
