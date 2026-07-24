@@ -542,6 +542,17 @@ Tools accept parameters via the `arguments` object in the `tools/call` request.
 Required parameters are validated server-side; missing required fields return a
 `-32602 Invalid params` error.
 
+For **approval-gated tools**, arguments are additionally validated against the
+tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
+work (#2405): a call with missing/mistyped arguments answers `-32602`
+immediately — it never creates an approval request, and a re-call carrying an
+`approval_id` with invalid arguments never consumes the ticket. The error
+message names the offending field as a JSON-pointer-style path (e.g.
+`/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
+confirming no ticket was created or consumed. Two strictness notes: `integer`
+parameters must be JSON integers (an integral float like `1.0` is rejected),
+and `maxLength` limits are byte counts.
+
 **Examples of key parameters:**
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
@@ -691,9 +702,13 @@ proposes.
 
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier, or `delete_tag` on `operator`).
-2. The MCP server creates an **approval request** with status `pending`
-   (`definition_id = "mcp.<tool>"`, the tool arguments captured as the
-   canonical scope expression).
+2. The server validates the arguments against the tool's `inputSchema`
+   **first** (#2405): invalid arguments answer `-32602` with no approval
+   request created — an admin's approval can no longer be wasted on a call
+   the handler would reject, and a recall with invalid arguments cannot burn
+   its one-time ticket. Then the MCP server creates an **approval request**
+   with status `pending` (`definition_id = "mcp.<tool>"`, the tool arguments
+   captured as the canonical scope expression).
 3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
    carrying `error.data.approval_id` and `error.data.status_url`
    (`/api/v1/approvals/{id}`).
