@@ -294,6 +294,10 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
         fake_now += std::chrono::seconds(30); // well past the ~12-15 s TTL
         CHECK(ar.revalidate_stream(req, expected) == R::kValid);      // expired -> read through
         CHECK(ar.revalidate_stream(req, expected) == R::kValidStale); // re-warmed under fake clock
+        // fake_now is a SECTION-scoped local captured by-ref in the store's
+        // clock_; restore the default before it dies so the borrowed reference
+        // can never dangle (the store outlives this scope).
+        engine_store->set_clock_for_test({});
     }
 }
 

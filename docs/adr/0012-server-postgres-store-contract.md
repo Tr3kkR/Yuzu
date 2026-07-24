@@ -101,7 +101,10 @@ re-derive them differently.
 3. **Report provenance to the caller.** A cached answer must be distinguishable from a fresh one.
    A caller that grants time-bounded trust on the strength of a check — the canonical case is a
    held-open stream with a grace window — will otherwise let cache residency and its own budget
-   ADD rather than nest, silently multiplying how long a dead credential is honoured.
+   ADD rather than nest, silently multiplying how long a dead credential is honoured. `ApiTokenStore`,
+   the sibling this clause was derived alongside, does NOT yet satisfy this rule (it reports a cache
+   hit as plain valid) — that gap is #2447, and it is exactly the additive-window failure this rule
+   exists to prevent.
 4. **Never serve a fresh authorization decision.** Split the accessor: the authoritative one stays
    read-through and keeps the chokepoint contract; the cached one is separate, narrowly typed
    (liveness only — do not hand back a row a caller might read as current), and has as few callers

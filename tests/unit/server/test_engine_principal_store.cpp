@@ -798,6 +798,14 @@ TEST_CASE("concurrent revalidate + revoke never leaves a stale Active (TSan)",
     // contends revalidate_cache_mu_. This drives real threads through the
     // reader path, the writer path, and the metrics path at once -- the shape
     // ApiTokenStore's own TOCTOU regression uses.
+    //
+    // The VALUE of this case is running it under TSan (a real data race on the
+    // shared mutex/atomics is reported). The stale_after_revoke CHECK_FALSE is
+    // a weak logical assertion by design: a single one-shot revoke's insert
+    // window is microseconds wide, so it would almost never fire even if the
+    // generation guard were removed -- do not read a green CHECK as proof of the
+    // guard (the hook test is that proof). Under a non-TSan build this is a
+    // liveness smoke test only.
     YUZU_REQUIRE_PG_DB_TPL(db, engine_principal_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 8}};
     REQUIRE(pool.valid());
@@ -835,9 +843,12 @@ TEST_CASE("concurrent revalidate + revoke never leaves a stale Active (TSan)",
             (void)store.revalidate_cache_size();
     });
 
+    // Capture the revoke outcome but do NOT assert on it yet: a throwing
+    // REQUIRE here, with the reader/poller threads still joinable, would call
+    // ~thread on a joinable thread (std::terminate) and the running threads
+    // would touch these destructing stack locals (UAF). Stop + join FIRST on
+    // every path, then assert.
     auto revoked = store.revoke("engine:race");
-    REQUIRE(revoked.has_value());
-    REQUIRE(*revoked);
     revoked_done.store(true, std::memory_order_release);
 
     // Let the readers observe the post-revoke world before tearing down.
@@ -849,9 +860,63 @@ TEST_CASE("concurrent revalidate + revoke never leaves a stale Active (TSan)",
         t.join();
     poller.join();
 
+    // Threads are joined; assertions are now safe to throw.
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
     CHECK_FALSE(stale_after_revoke.load());
     CHECK(EngineLivenessTestAccess::revalidate(store, "engine:race").status ==
           EngineLookupStatus::MissingOrRevoked);
+}
+
+TEST_CASE("concurrent StoreUnreachable exercises the backoff map under contention (TSan)",
+          "[engine_principal][store][cache]") {
+    // The positive-cache TSan test above uses a VALID pool, so it never drives
+    // the revalidate_backoff_ map -- that path only fills on StoreUnreachable.
+    // An invalid pool answers StoreUnreachable without a lease, so N threads
+    // hammering distinct keys insert/erase/sweep the backoff map (and bump
+    // revalidate_backoff_suppressed_) concurrently while a poller reads its
+    // size, bringing that mutex/counter discipline under the sanitizer. No live
+    // DB needed (the pool never connects).
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+    EnginePrincipalStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    store.set_max_entries_for_test(16); // force sweep/decline churn on the backoff map
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> wrong_status{false};
+
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&, i] {
+            int n = 0;
+            while (!stop.load(std::memory_order_acquire)) {
+                // Distinct keys per thread so inserts spread across the map;
+                // an unreachable store must ALWAYS deny (either read-through or
+                // backoff -- both StoreUnreachable), never admit.
+                const auto id = "engine:bo-" + std::to_string(i) + "-" + std::to_string(n++ % 64);
+                if (EngineLivenessTestAccess::revalidate(store, id).status !=
+                    EngineLookupStatus::StoreUnreachable) {
+                    wrong_status.store(true, std::memory_order_release);
+                }
+            }
+        });
+    }
+    std::thread poller([&] {
+        while (!stop.load(std::memory_order_acquire))
+            (void)store.revalidate_backoff_resident_for_test();
+    });
+
+    for (int i = 0; i < 500; ++i)
+        (void)store.revalidate_backoff_resident_for_test();
+
+    stop.store(true, std::memory_order_release);
+    for (auto& t : readers)
+        t.join();
+    poller.join();
+
+    CHECK_FALSE(wrong_status.load());               // fail-closed held throughout
+    CHECK(store.revalidate_backoff_resident_for_test() <= 16); // ceiling held under contention
 }
 
 TEST_CASE("invalidate_revalidate_cache clears one principal or all of them",

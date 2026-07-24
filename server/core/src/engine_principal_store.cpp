@@ -282,6 +282,16 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
             // it be served a further TTL, pushing total survival past the
             // grace window. Using the pre-read timestamp only ever expires the
             // entry EARLIER, which is the safe direction.
+            //
+            // Known tradeoff (#2460): a read that itself takes longer than the
+            // TTL (a slow-but-successful SELECT, not a hard timeout) is born
+            // already expired, so the cache gives NO relief under a slow-PG
+            // brownout — every stream reads through every tick. That is the
+            // deliberate cost of never over-granting: reliability degrades in
+            // the safe direction. The real fixes are per-principal single-flight
+            // (#2455, collapses the concurrent read-through) and a client-side
+            // read deadline (#2457); they must NOT be "fixed" by stamping
+            // post-read, which reintroduces the over-grant this line closed.
             const auto stamp = now;
             if (revalidate_cache_.size() >= max_entries_)
                 sweep_expired_locked(stamp);
@@ -298,10 +308,14 @@ EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) c
     return {fresh.status, /*from_cache=*/false};
 }
 
-EngineRevalidate EngineLivenessTestAccess::revalidate(const EnginePrincipalStore& store,
-                                                      const std::string& principal_id) {
-    return store.get_for_auth_revalidate(principal_id);
-}
+// EngineLivenessTestAccess::revalidate is DELIBERATELY not defined here. It
+// forwards to the private get_for_auth_revalidate, so defining it in this
+// production TU would link a public trampoline to the cached path into the
+// shipping server_core library. Its definition lives in a test-only TU
+// (tests/unit/server/engine_liveness_test_access.cpp), so a production caller
+// that tries to use it gets a LINK error -- the compile/link-time wall that
+// makes "authorization is never served from cache" a structural control, not a
+// convention (#2367, governance architect finding).
 
 void EnginePrincipalStore::sweep_expired_locked(
     std::chrono::steady_clock::time_point now) const {
@@ -333,11 +347,13 @@ void EnginePrincipalStore::set_max_entries_for_test(std::size_t n) {
 }
 
 void EnginePrincipalStore::set_clock_for_test(ClockFn fn) {
-    // Under the cache mutex: every production read of `clock_` happens either
-    // under this mutex or on a path serialised by it, and the threaded tests
-    // establish genuine multi-threaded use of this store. Setting it is still
-    // contractually a before-concurrency operation, but taking the lock costs
-    // nothing and removes the one unsynchronised write.
+    // Correctness rests on the before-concurrency contract: `clock_` is read
+    // UNLOCKED on the hot path (get_for_auth_revalidate), so this locked write
+    // does not make a concurrent set/read pair race-free -- it only removes the
+    // unsynchronised WRITE, and the contract (set the clock before any thread
+    // uses the store) is what actually holds. Honoured in practice: every
+    // clock-setting test is single-threaded, and the threaded tests never set
+    // the clock. The lock is cheap defence-in-depth, not the guarantee.
     std::lock_guard lk(revalidate_cache_mu_);
     clock_ = fn ? std::move(fn) : ClockFn{[] { return std::chrono::steady_clock::now(); }};
 }

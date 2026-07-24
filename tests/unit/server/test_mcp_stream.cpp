@@ -528,6 +528,12 @@ TEST_CASE("McpStreamPump/#2367: cached validity does NOT reset the grace budget"
     // grace budget must keep running from the last AUTHORITATIVE confirmation.
     // Treated as plain kValid, the stream would ride the cache and then collect
     // a full FRESH grace window on top of it.
+    //
+    // NOTE this case runs at fast_cfg's default revalidate_max_staleness of 0
+    // (the conservative "answers are always authoritative" default). It proves
+    // the floor-does-not-reset property in isolation; the sibling case below
+    // ("a sibling-refreshed cache still leaves usable grace") exercises the
+    // PRODUCTION shape with a non-zero staleness bound wired from kAuthCacheTtl.
     auto state = std::make_shared<mcp::McpStreamState>();
     auto attached = state->attach_and_replay(0, nullptr, "alice");
     auto clock_now = std::chrono::steady_clock::now();

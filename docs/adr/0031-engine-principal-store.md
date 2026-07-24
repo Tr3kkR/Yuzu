@@ -205,9 +205,10 @@ request without needing to consult the other two.
   per-STREAM, so a principal with several concurrent streams would otherwise refresh the shared
   entry from whichever stream ticks first and leave the others accumulating unbounded staleness;
   the pump clamps its authoritative floor forward to `now - kAuthCacheTtl` on a cached answer,
-  which bounds that to one cache window per stream and can only ever move the floor forward. **The same additive window still
-  exists on the API-token half of `revalidate_stream`**, whose 60 s cache reports a hit as plain
-  valid; that is pre-existing and tracked as #2447, not introduced here. The mechanism this ADR
+  which bounds that to one cache window per stream and can only ever move the floor forward.
+  **The same additive window still exists on the API-token half of `revalidate_stream`**, whose
+  60 s cache reports a hit as plain valid; that is pre-existing and tracked as #2447, not
+  introduced here. The mechanism this ADR
   adds (`kValidStale` + a backdated grace budget) is what that fix will wire in.
 - **The cache is bounded, and a failed lookup is rate-limited rather than retried per tick**
   (#2367). Only `Active` is cached — `MissingOrRevoked` is terminal and rare, and negative-caching

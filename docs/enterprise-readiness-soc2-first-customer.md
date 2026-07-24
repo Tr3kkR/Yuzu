@@ -122,6 +122,14 @@ distinct figures, and they should be quoted separately:
   token cache already carries, and is the figure to quote for a multi-replica
   deployment.
 
+These figures apply to streams authenticated by an **engine** principal.
+Streams authenticated by an ordinary API token have a *different, currently-open*
+profile: a token-cache hit is still treated as a fresh confirmation, so for
+those the cache residency and the outage grace window can still add — the
+non-additive guarantee below is engine-specific (pre-existing, tracked as
+#2447). Do not generalise the engine figures to all streams when answering a
+questionnaire.
+
 An auth store that is *unreachable* is deliberately not treated as a
 revocation (it would cut every stream on the fleet at once); such streams ride
 a bounded grace window and then close with a distinct `auth_unavailable`
