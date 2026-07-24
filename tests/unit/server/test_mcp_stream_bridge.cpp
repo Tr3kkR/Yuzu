@@ -236,6 +236,12 @@ std::size_t count_error_code(const std::vector<mcp::sse_bus::SseEvent>& frames,
 const std::string kProgress13 = R"({"agents_responded":1,"agents_targeted":3})";
 const std::string kCompleted = R"({"status":"completed","agents_success":3,"agents_failure":0})";
 
+/// An execution-progress payload with explicit counts (for monotonic-progress tests).
+std::string prog(std::uint64_t responded, std::uint64_t targeted) {
+    return R"({"agents_responded":)" + std::to_string(responded) + R"(,"agents_targeted":)" +
+           std::to_string(targeted) + "}";
+}
+
 }  // namespace
 
 TEST_CASE("bridge reserve - every reject reason is truthful and counted", "[mcp][bridge][2f]") {
@@ -300,6 +306,42 @@ TEST_CASE("bridge arming latch + abandon containment", "[mcp][bridge][2f]") {
     CHECK(fx.bridge->record_count() == 0);
     CHECK(s.stream->next_event_id() == 1);  // ring untouched
     CHECK(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);  // key freed
+}
+
+TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridge][2f]") {
+    // MCP MUST: notifications/progress `progress` increases with each frame.
+    // Feed duplicate and DECREASING bus snapshots; only the strictly-increasing
+    // subsequence may reach the wire.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-mono"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+    // Sequence: 1, 1(dup), 3, 2(decrease), 3(dup), 5, 4(decrease) / total 5.
+    for (auto r : {1u, 1u, 3u, 2u, 3u, 5u, 4u}) {
+        fx.bus.publish("exec-mono", "execution-progress", prog(r, 5));
+    }
+    // Expect exactly the increasing subsequence 1, 3, 5.
+    REQUIRE(poll_until([&] {
+        std::uint64_t last = 0;
+        for (const auto& f : ring_frames(*s.stream, "alice")) {
+            last = json::parse(f.data)["params"]["progress"].get<std::uint64_t>();
+        }
+        return last == 5;  // wait until the 5-frame lands
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    std::vector<std::uint64_t> got;
+    std::uint64_t prev = 0;
+    for (const auto& f : frames) {
+        auto p = json::parse(f.data)["params"]["progress"].get<std::uint64_t>();
+        CHECK(p > prev);  // strictly increasing, no duplicate, no decrease
+        prev = p;
+        got.push_back(p);
+    }
+    // Named local (not a braced-init inside CHECK) — commas in a macro arg break
+    // the MSVC preprocessor (the #2365 comma-in-macro class).
+    const std::vector<std::uint64_t> expected{1, 3, 5};
+    CHECK(got == expected);
 }
 
 TEST_CASE("bridge GET-only lifecycle - live progress, no final, no pin", "[mcp][bridge][2f]") {
@@ -379,14 +421,21 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-h"));
-    for (int i = 0; i < 4; ++i) {
-        fx.bus.publish("exec-h", "execution-progress", kProgress13);  // latched pre-arm
+    // DISTINCT strictly-increasing counts (1/12 .. 12/12) so H1's monotonic
+    // suppression keeps every frame - the point here is no frame STRANDS across
+    // the arm flip, so each drained event must be a distinct wire frame.
+    // The ==12 count is NOT flaky under H1's out-of-order suppression: the
+    // mailbox is a FIFO and events are latched in bus-publish order (pre-arm ids
+    // 1-4 before concurrent ids 5-12), so the single projector always drains
+    // ascending - a lower value can never arrive after a higher one.
+    for (std::uint64_t i = 1; i <= 4; ++i) {
+        fx.bus.publish("exec-h", "execution-progress", prog(i, 12));  // latched pre-arm
     }
     std::atomic<bool> go{false};
     auto publisher = std::async(std::launch::async, [&] {
         go.store(true, std::memory_order_release);
-        for (int i = 0; i < 8; ++i) {
-            fx.bus.publish("exec-h", "execution-progress", kProgress13);
+        for (std::uint64_t i = 5; i <= 12; ++i) {
+            fx.bus.publish("exec-h", "execution-progress", prog(i, 12));
         }
     });
     while (!go.load(std::memory_order_acquire)) {
@@ -397,7 +446,15 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
     // Eventual totality: every one of the 12 frames reaches the ring - whether it
     // landed pre-flip (drained by the handoff wake) or post-flip (listener wake).
     REQUIRE(poll_until([&] { return s.stream->next_event_id() == 13; }));
-    CHECK(count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 12);
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_method(frames, "notifications/progress") == 12);
+    // …and the wire sequence is strictly increasing (H1).
+    std::uint64_t prev = 0;
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data);
+        CHECK(j["params"]["progress"].get<std::uint64_t>() > prev);
+        prev = j["params"]["progress"].get<std::uint64_t>();
+    }
 }
 
 TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge][2f]") {
@@ -846,9 +903,11 @@ TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-o"));
         // Latch 20 progress frames during kArming so the 16-slot mailbox
         // genuinely overflows (4 drops) - arming AFTER would let the projector
-        // keep pace and never drop.
-        for (int i = 1; i <= 20; ++i) {
-            fx.bus.publish("exec-o", "execution-progress", kProgress13);
+        // keep pace and never drop. DISTINCT increasing counts so H1 keeps the
+        // 16 survivors (the drop happens at the LISTENER before the projector's
+        // monotonic suppression, so the 4-drop delta is what we're testing).
+        for (std::uint64_t i = 1; i <= 20; ++i) {
+            fx.bus.publish("exec-o", "execution-progress", prog(i, 20));
         }
         // Fault every observability call across the drain: the 4-drop delta must
         // NOT be lost - it parks (restored) and lands once the fault clears.
@@ -858,7 +917,7 @@ TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3
         REQUIRE(poll_until([&] { return s.stream->next_event_id() > 16; }));
         fx.bridge->inject_observability_fault_for_test(0);  // heal
         // Another wake flushes the restored/pending delta.
-        fx.bus.publish("exec-o", "execution-progress", kProgress13);
+        fx.bus.publish("exec-o", "execution-progress", prog(21, 21));
         REQUIRE(poll_until(
             [&] { return fx.reg.counter("yuzu_mcp_bridge_mailbox_drops_total").value() >= 4.0; }));
     }

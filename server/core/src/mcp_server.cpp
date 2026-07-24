@@ -576,12 +576,16 @@ static const ToolDef kTools[] = {
      "names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
+     // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
+     // contract (A5 materiality backfill) - client-advisory, per the same
+     // advisory-vs-enforced convention as the annotation hints. Real server-side
+     // enforcement of these input caps is tracked in #2437.
      R"j({"type":"object","properties":{)j"
-     R"j("plugin":{"type":"string","description":"Plugin name (e.g. os_info, hardware)"},)j"
-     R"j("action":{"type":"string","description":"Action name (e.g. version, list)"},)j"
-     R"j("params":{"type":"object","additionalProperties":{"type":"string"},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
+     R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":8192},"description":"Key-value parameters"},)j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
+     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -598,7 +602,7 @@ static const ToolDef kTools[] = {
      "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
-     R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
+     R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
      R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
@@ -5065,7 +5069,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         if (rr.ok) {
                             bridge_active = true;
                         } else {
-                            bridge_degrade(rr.reject_reason);
+                            // L1: a coarse single degrade reason - reserve()
+                            // already counted the FINE reject reason into
+                            // yuzu_mcp_bridge_reject_total{reason=...}, so
+                            // forwarding it here too would double-taxonomy the
+                            // degrade counter with an open (undocumented) label
+                            // set. "why did progress degrade" = reserve_rejected;
+                            // "which reserve reject" lives in reject_total.
+                            bridge_degrade("reserve_rejected");
                         }
                     } catch (...) {
                         bridge_degrade("reserve_threw");

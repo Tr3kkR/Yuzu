@@ -6908,9 +6908,13 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         REQUIRE(r2->status == 200);              // silent degrade - still a success
         CHECK(nlohmann::json::parse(r2->body).contains("result"));
         CHECK(bridge.record_count() == 1);
+        // L1: the degrade counter carries the COARSE reason; the fine
+        // "duplicate_request_id" lives in reject_total (counted inside reserve).
         CHECK(metrics
-                  .counter("yuzu_mcp_bridge_degrade_total",
-                           {{"reason", "duplicate_request_id"}})
+                  .counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_rejected"}})
+                  .value() == 1.0);
+        CHECK(metrics
+                  .counter("yuzu_mcp_bridge_reject_total", {{"reason", "duplicate_request_id"}})
                   .value() == 1.0);
     }
 

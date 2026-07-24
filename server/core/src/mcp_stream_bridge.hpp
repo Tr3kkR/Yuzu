@@ -352,6 +352,13 @@ private:
         /// any deferred charge decrement under bridge_mu_ completes (D4).
         bool projection_in_flight = false;
         bool pressure_requested = false;   ///< E1 - projector claims no new progress batch
+        /// H1 (MCP MUST: notifications/progress `progress` strictly increases):
+        /// the highest `progress` value already committed to the wire for this
+        /// record, and whether any has been sent. Touched ONLY by the single
+        /// projector thread inside project_record (never the listener/sweep), so
+        /// no synchronization is needed.
+        std::uint64_t last_progress_sent = 0;
+        bool progress_sent_any = false;
         bool terminal_projected = false;   ///< settled (published, GET-only-consumed, or poisoned)
         bool final_published = false;      ///< a REAL final committed to the ring
         /// A5/C3: the per-session streamed-admission charge. Released exactly

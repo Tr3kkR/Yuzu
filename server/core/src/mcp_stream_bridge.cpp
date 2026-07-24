@@ -22,8 +22,10 @@ constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
 constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
-// Shared with mcp_stream's poison path by NAME (one operator-facing series for
-// "a terminal could not be delivered", whichever layer detected it).
+// Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
+// (below); named in the yuzu_mcp_stream_* family because it describes stream-
+// terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
+// increments nothing; publish_guarded uses the generic publish-failure counter).
 constexpr const char* kMetricTerminalPublishFailures =
     "yuzu_mcp_stream_terminal_publish_failures_total";
 
@@ -217,8 +219,13 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     {
         // D4: check shutdown BEFORE the registry call (and re-check after) so
         // the isolated-registry-lock rule holds without racing the gate.
-        std::lock_guard<std::mutex> lk(bridge_mu_);
-        if (shutdown_started_) {
+        bool shutting_down = false;
+        {
+            std::lock_guard<std::mutex> lk(bridge_mu_);
+            shutting_down = shutdown_started_;
+        }
+        if (shutting_down) {
+            count_reject("shutdown");  // L2: count here too, like the post-registry branch
             return {false, "shutdown"};
         }
     }
@@ -629,7 +636,8 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     // Progress first - the final must be last on the wire.
     if (batch_n > 0 && rec->progress_token.has_value()) {
         for (std::size_t i = 0; i < batch_n; ++i) {
-            std::string frame;
+            std::uint64_t responded = 0;
+            std::uint64_t targeted = 0;
             try {
                 const auto counts = parse_progress(batch[i].data);
                 // UP-4: skip a frame with no meaningful denominator. An
@@ -641,14 +649,11 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
                 if (counts.targeted == 0) {
                     continue;
                 }
+                targeted = counts.targeted;
                 // Defensive clamp: responded must never exceed targeted on the
                 // wire (a transient count skew between the two COUNT(*) subqueries
                 // must not surface as progress>total).
-                const std::uint64_t responded = std::min(counts.responded, counts.targeted);
-                const std::string msg = std::to_string(responded) + "/" +
-                                        std::to_string(counts.targeted) + " agents responded";
-                frame = progress_notification(*rec->progress_token, responded, counts.targeted,
-                                              msg, rec->execution_id);
+                responded = std::min(counts.responded, counts.targeted);
             } catch (...) {
                 // C4: drop this batch's remainder, keep going to terminal
                 // settlement. A malformed/unbuildable progress delta is
@@ -656,10 +661,39 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
                 spdlog::warn("MCP bridge: progress frame build failed; dropping batch remainder");
                 break;
             }
-            if (get_only) {
-                rec->stream->publish("message", frame);  // live GET + ring (single stream)
-            } else {
-                rec->stream->publish_ring_only("message", frame);  // resume replay only
+            // H1 (governance adversarial review): both supported MCP revisions say
+            // notifications/progress `progress` MUST INCREASE with each frame.
+            // The bus publishes a fresh refresh_counts snapshot on EVERY agent
+            // response (and the S4.5 fix makes duplicate snapshots more likely),
+            // and snapshot-and-release publishing outside the tracker mutex can
+            // even momentarily decrease the count - so forwarding every snapshot
+            // verbatim would emit equal/decreasing progress. Suppress any
+            // candidate not strictly greater than the last value already
+            // committed to the wire for this record (the first frame is always
+            // allowed, so an initial 0/N is fine as the starting point). Same
+            // "a strict client can reject" rationale as the UP-4 total:0 skip.
+            if (rec->progress_sent_any && responded <= rec->last_progress_sent) {
+                continue;
+            }
+            std::string frame;
+            try {
+                const std::string msg = std::to_string(responded) + "/" +
+                                        std::to_string(targeted) + " agents responded";
+                frame = progress_notification(*rec->progress_token, responded, targeted,
+                                              msg, rec->execution_id);
+            } catch (...) {
+                spdlog::warn("MCP bridge: progress frame build failed; dropping batch remainder");
+                break;
+            }
+            const std::uint64_t id = get_only
+                                         ? rec->stream->publish("message", frame)  // live GET + ring
+                                         : rec->stream->publish_ring_only("message", frame);  // replay
+            // Advance the watermark ONLY after the frame actually committed
+            // (id != 0); a pre-commit publish failure leaves the value un-sent so
+            // a later equal-value snapshot can still carry it.
+            if (id != 0) {
+                rec->last_progress_sent = responded;
+                rec->progress_sent_any = true;
             }
         }
     }

@@ -560,7 +560,8 @@ public:
                             "global_cap", "pin_slots"}) {
             metrics_.counter("yuzu_mcp_bridge_reject_total", {{"reason", reason}});
         }
-        for (auto reason : {"reserve_threw", "no_execution_row", "subscribe_failed", "arm_threw"}) {
+        for (auto reason : {"reserve_rejected", "reserve_threw", "no_execution_row",
+                            "subscribe_failed", "arm_threw"}) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
