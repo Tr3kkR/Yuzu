@@ -18,6 +18,14 @@
 /// vector here is positive evidence of the real active-set size. Only
 /// `kNoneActive` is ambiguous with a masked read failure; every other state is
 /// a fact the caller can classify terminally (#2404).
+///
+/// LOAD-BEARING READ INVARIANT: this "positive read == ground truth" premise
+/// holds ONLY because the caller reads the active set on the PRIMARY, inside the
+/// same `pg_advisory_xact_lock`'d write transaction that will act on it — never
+/// from a lagged read-replica or a stale snapshot. If a future change routes the
+/// confirm read to a replica, a replica showing one active row while two exist
+/// (or a not-yet-replicated revoke) would make the terminal classification wrong
+/// on a genuinely live rotation. Keep the read primary + in-txn (UP-6, #2404).
 
 #include <string>
 #include <vector>

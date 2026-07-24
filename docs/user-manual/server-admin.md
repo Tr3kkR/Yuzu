@@ -259,6 +259,30 @@ a required `token_id` argument that pins the confirm to the exact pending
 rotation, so its `idempotentHint` is corrected back to `true` — and the new
 required argument IS a breaking change for that one unreleased tool/route.)*
 
+### vNEXT — `confirm_engine_rotation` replay-after-resolution is now a terminal error (#2404)
+
+Direct sequel to the `#2384` entry above. A `confirm` (REST
+`POST /api/v1/engine-principals/{id}/credentials/confirm` or MCP
+`confirm_engine_rotation`) replayed **after the rotation already resolved** — a
+network-dropped `200`, a double-submit, or a client racing the auto-revoke
+sweep — now returns a **terminal** `409` / MCP `kInvalidParams` (`rotation
+already confirmed` / `no rotation in flight ... already the sole active
+credential`), instead of the previous retryable `503`. A confirm that finds
+**more than two** active credentials likewise now returns a terminal `400`
+(was `503`). Only a genuinely-empty read and an unrecognized two-credential
+pair stay `503`.
+
+**Not a breaking change** by this file's convention — no previously-succeeding
+call is rejected; the first, real confirm still returns `200` identically. But
+**worth a glance for any integration that pattern-matches `503 => retry`**: such
+a client will now loop forever against a permanently-`503` call under the old
+behavior, which is exactly the livelock this fixes — after the upgrade it gets a
+terminal `409`/`400` and should stop and (if it genuinely needs a new
+credential) call `rotate`, not replay `confirm`. Agentic MCP clients honouring
+`idempotentHint:true` get the correct terminal answer automatically. Full
+detail: `docs/user-manual/rest-api.md` (confirm error table) and
+`docs/user-manual/engine-principals.md`.
+
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
 The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`

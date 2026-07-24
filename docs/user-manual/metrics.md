@@ -385,6 +385,17 @@ label (bounded cardinality only) — pair it with the
 to catch a client stuck replaying a resolved confirm, and
 `increase(...{result="transient"}[15m])` for a genuine store-health storm.
 
+**Semantics for alert authors:** this counts confirm **attempts** that reach
+the store, not logical rotations — a client retrying a `transient` blip 20 times
+before it succeeds adds 20 to `transient` for one rotation. Pick the threshold
+`<n>` relative to your fleet's typical retry count, not your rotation cadence.
+Also cross-reference `yuzu_engine_principal_rotation_sweep_failures_total`: a
+`result="conflict"` cluster correlating with a non-zero, sustained sweep-failure
+count is the prolonged-sweep-outage signature (a predecessor's overlap window
+never closes, so a confirm surfaces the `unresolved rotation metadata` state) —
+**inspect the credential before revoking**, since in that state the sole active
+credential is the good survivor.
+
 ## Access review metrics
 
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic

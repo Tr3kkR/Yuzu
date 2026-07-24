@@ -1341,11 +1341,15 @@ TEST_CASE("ApiTokenStore: confirm_rotation after the sweep cuts over is a termin
 
     // A confirm racing the sweep now finds the successor resolved. Terminal,
     // and worded "no rotation in flight" (not "already confirmed") because the
-    // cutover was the sweep, not an explicit confirm.
+    // cutover was the sweep, not an explicit confirm. Assert the contiguous
+    // fragment unique to kSoleResolved ("already the sole active credential"):
+    // it disambiguates from kSoleConfirmed ("is the sole...") and kSoleOtherToken
+    // (no "sole active credential") in a single check, so a partial message
+    // drift on one branch can't false-pass (qe review, #2404).
     auto swept_confirm = store.confirm_rotation(principal, successor_id, "admin");
     REQUIRE_FALSE(swept_confirm.has_value());
     CHECK(swept_confirm.error().find("no rotation in flight") != std::string::npos);
-    CHECK(swept_confirm.error().find("sole active credential") != std::string::npos);
+    CHECK(swept_confirm.error().find("already the sole active credential") != std::string::npos);
     CHECK(classify_engine_store_error(swept_confirm.error()) == E::Conflict);
 }
 

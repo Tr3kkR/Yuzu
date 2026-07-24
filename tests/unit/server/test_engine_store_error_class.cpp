@@ -85,8 +85,9 @@ TEST_CASE("classify_engine_store_error: #2404 confirm-replay terminal strings",
               "(confirmed, revoked, or cut over); rotate again if a new rotation is needed") ==
           E::Conflict);
     CHECK(classify_engine_store_error(
-              "one active credential with unresolved rotation metadata - do not rotate; "
-              "revoke or inspect the credential state") == E::Conflict);
+              "one active credential with unresolved rotation metadata - inspect the "
+              "credential state and do not rotate; revoke only if it is confirmed stale") ==
+          E::Conflict);
 
     // The >2-active confirm string is a permanent client condition (mirrors
     // rotate's), not a conflict.

@@ -7157,7 +7157,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // route's; stamped at the store-open guard and on every store
                 // result below, NOT on the tier / perm / input-validation
                 // early-outs (family scope contract, server.cpp describe).
-                const auto confirm_metric = [&](const char* result) {
+                const auto confirm_metric = [metrics](const char* result) {
                     if (metrics)
                         metrics
                             ->counter("yuzu_engine_principal_confirm_total",

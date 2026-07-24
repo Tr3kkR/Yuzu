@@ -2994,7 +2994,7 @@ void RestApiV1::register_routes(
             // store-open guard and on every store result below; NOT on the
             // perm / input-validation early-outs above, per the family's scope
             // contract (server.cpp describe).
-            const auto confirm_metric = [&](const char* result) {
+            const auto confirm_metric = [metrics_registry](const char* result) {
                 if (metrics_registry)
                     metrics_registry
                         ->counter("yuzu_engine_principal_confirm_total",
