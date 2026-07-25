@@ -502,6 +502,39 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
             return out;
         }
 
+        // 1a. Contiguity (#2435). A nonzero cursor that clears the window check above can STILL
+        //     front a NON-contiguous surviving suffix: eviction is oldest-unpinned-first and
+        //     skips pinned finals (Decision 15(f)), so the ring can hold [.., pinned final N, ..]
+        //     with the unpinned frames between the cursor and N already evicted. The replay loop
+        //     below serves every surviving id > cursor, so it would hand the client id N right
+        //     after its cursor with a SILENT hole where cursor+1..N-1 used to be — the exact
+        //     Last-Event-ID gap the resume mechanism must never produce. Require the surviving
+        //     ids strictly above the cursor to form an unbroken run cursor+1, cursor+2, ...,
+        //     next_id_-1 (the ring is ascending by id — frames push to back, eviction erases in
+        //     place). Any hole -> kGap: the client re-initializes and fetches the final by
+        //     execution_id (the Decision 15(f) durable handle), rather than resume over a gap.
+        //     Checked BEFORE any mutation, so a gapped attach leaves the session untouched.
+        if (last_event_id != 0) {
+            std::uint64_t expected = last_event_id + 1;
+            for (const auto& ev : ring_) {
+                if (ev.id <= last_event_id) {
+                    continue; // already delivered — not part of the replayed suffix
+                }
+                if (ev.id != expected) {
+                    out.status = AttachStatus::kGap; // hole between cursor and a surviving frame
+                    return out;
+                }
+                ++expected;
+            }
+            if (expected != next_id_) {
+                // The surviving run did not reach the newest assigned id — the tail of the
+                // replay window is missing. (Normally unreachable: the newest frame is never
+                // evicted; belt-and-braces so a future eviction change can't open a silent gap.)
+                out.status = AttachStatus::kGap;
+                return out;
+            }
+        }
+
         // 1b. Unpin acknowledged finals (unpin rule (b)): a cursor at or past a pinned
         //     final's id proves the client already consumed it, so it no longer needs the
         //     eviction exemption - release it and let its ring space be reclaimed. (A pinned

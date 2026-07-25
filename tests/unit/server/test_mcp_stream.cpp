@@ -284,6 +284,49 @@ TEST_CASE("McpStreamState: a bogus future cursor takes the same path as an evict
           mcp::McpStreamState::AttachStatus::kGap);
 }
 
+TEST_CASE("McpStreamState: a nonzero cursor fronting a NON-contiguous surviving suffix is a GAP, "
+          "not a silent skip over frames evicted behind a pinned final (#2435)",
+          "[mcp][stream][ch2][2f]") {
+    // A shared session ring interleaves frames from concurrent streamed POSTs: an early
+    // request's final is PINNED (eviction-exempt, Decision 15(f)) while a later request keeps
+    // publishing progress and wraps the ring, evicting the UNPINNED frames between the pinned
+    // final and the newest. The surviving suffix then has a hole the replay loop would skip.
+    mcp::McpStreamState state{/*ring_cap=*/4};
+    for (int i = 1; i <= 4; ++i)
+        state.publish("message", "p" + std::to_string(i)); // ids 1..4
+    const auto final_id = state.publish_final("message", "final-A"); // id 5, pinned
+    REQUIRE(final_id == 5);
+    for (int i = 6; i <= 10; ++i)
+        state.publish("message", "p" + std::to_string(i)); // ids 6..10
+
+    // Ring is now [5(pinned), 8, 9, 10]: 1..4 and 6,7 were evicted; 5 survives because pinned.
+    REQUIRE(state.pinned_count() == 1);
+    REQUIRE(state.is_pinned(5));
+
+    // A resume from cursor 4 would replay 5 and then JUMP to 8 — a silent Last-Event-ID gap
+    // where 6,7 used to be. #2435: that is a kGap (client re-initializes and fetches the final
+    // by execution_id), not a skip. Checked before any mutation, so a fresh state each time.
+    CHECK(state.attach_and_replay(4, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kGap);
+    // Cursor 5 (client already acked the pinned final) still fronts the 6,7 hole -> kGap.
+    CHECK(state.attach_and_replay(5, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kGap);
+    // Cursor 7 fronts a CONTIGUOUS surviving suffix (8,9,10) -> serviceable.
+    CHECK(state.attach_and_replay(7, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kAttached);
+
+    // Cursor 0 is UNAFFECTED by the contiguity gate: a fresh client explicitly takes whatever
+    // the ring still holds (no resume contract), so the hole is tolerated and it replays the
+    // whole surviving window [5, 8, 9, 10].
+    auto fresh = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(fresh.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(fresh.sink->sse->mu);
+    std::vector<std::uint64_t> ids;
+    for (const auto& ev : fresh.sink->sse->queue)
+        ids.push_back(ev.id);
+    CHECK(ids == std::vector<std::uint64_t>{5, 8, 9, 10});
+}
+
 TEST_CASE("McpStreamState: a live sink receives published frames", "[mcp][stream]") {
     mcp::McpStreamState state;
     auto attached = state.attach_and_replay(0, nullptr, "alice");
