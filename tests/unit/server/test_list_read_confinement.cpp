@@ -289,3 +289,51 @@ TEST_CASE("authorize_list_read: INV-7 holds over a 4-level tree with a mid-tree 
     std::sort(rhs.begin(), rhs.end());
     CHECK(lhs == rhs);
 }
+
+// ── Grant via an RBAC GROUP (principal_type='group' arm) ──────────────────────
+// The security-relevant "grant to a team, not an individual" path: a
+// management-group role assigned to an RBAC group, reached by a user through
+// RBAC-group membership (get_assignments_for_principal's group OR-arm). Was
+// entirely untested (quality-engineer SHOULD).
+TEST_CASE("authorize_list_read: grant via an RBAC group (principal_type='group')",
+          "[list_read][rbac][group-principal]") {
+    Rig r;
+    REQUIRE(r.rbac.create_group({"soc-team", "", "local", "", 0}).has_value());
+    REQUIRE(r.rbac.add_group_member("soc-team", "teamuser").has_value());
+    // Role granted to the RBAC GROUP on P, not to teamuser directly.
+    REQUIRE(r.mgmt.assign_role({r.gP, "group", "soc-team", "RespReader"}).has_value());
+
+    auto d = r.rbac.authorize_list_read("teamuser", "Response", "Read", &r.mgmt);
+    REQUIRE(d.decision == ListReadDecision::AdmitScoped); // reached via the group arm
+    CHECK(contains(d.visible_agents, "a_p"));
+    CHECK(contains(d.visible_agents, "a_c1")); // P's descendant
+    CHECK(contains(d.visible_agents, "a_c2"));
+    CHECK(!contains(d.visible_agents, "a_s")); // outside P's subtree
+    CHECK(r.rbac.check_scoped_permission("teamuser", "Response", "Read", "a_p", &r.mgmt));
+
+    // Negative: drop the RBAC-group membership → the scoped grant is gone.
+    REQUIRE(r.rbac.remove_group_member("soc-team", "teamuser").has_value());
+    auto d2 = r.rbac.authorize_list_read("teamuser", "Response", "Read", &r.mgmt);
+    CHECK(d2.decision == ListReadDecision::DenyAll);
+}
+
+// ── Same group carrying BOTH an allow-role and a deny-role ⇒ deny wins ────────
+// The group lands in both allow_groups and deny_groups; expand_visible_set
+// subtracts the deny subtree, so its members are excluded despite the allow
+// (quality-engineer SHOULD — INV-4 tests only used different groups).
+TEST_CASE("authorize_list_read: same group allow+deny roles ⇒ AdmitScoped empty (deny wins)",
+          "[list_read][rbac][inv7]") {
+    Rig r;
+    r.group_assign(r.gP, "split", "RespReader");
+    r.group_assign(r.gP, "split", "RespDenier");
+
+    auto d = r.rbac.authorize_list_read("split", "Response", "Read", &r.mgmt);
+    // Holds an allow (→ not DenyAll), but the co-located deny subtracts P's whole
+    // subtree → AdmitScoped with an empty visible set.
+    CHECK(d.decision == ListReadDecision::AdmitScoped);
+    CHECK(d.visible_agents.empty());
+    CHECK(r.rbac.holds_permission_via_any_group("split", "Response", "Read", &r.mgmt));
+    // Per-row gate agrees: deny wins for every member of the group.
+    CHECK(!r.rbac.check_scoped_permission("split", "Response", "Read", "a_p", &r.mgmt));
+    CHECK(!r.rbac.check_scoped_permission("split", "Response", "Read", "a_c1", &r.mgmt));
+}

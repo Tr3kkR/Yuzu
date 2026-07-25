@@ -575,6 +575,51 @@ TEST_CASE("ManagementGroupStore: get_descendant_ids terminates on self-loop row"
     CHECK(ancestors.empty());
 }
 
+// ADR-0017: get_member_agents_in_subtrees is the descendant-ward dual of the
+// ancestor walk; its recursive-CTE (UNION dedup + depth<10 cap) must terminate
+// on a corrupt/cyclic tree rather than loop, mirroring get_descendant_ids
+// (quality-engineer SHOULD — the symmetry invariant deserves a direct test).
+TEST_CASE("ManagementGroupStore: get_member_agents_in_subtrees terminates on injected cycle",
+          "[mgmt][hierarchy][cycle]") {
+    TempDb tmp;
+    std::string a_id;
+    std::string b_id;
+    {
+        ManagementGroupStore store(tmp.path);
+        ManagementGroup a;
+        a.name = "SubCyc-A";
+        a.membership_type = "static";
+        auto r1 = store.create_group(a);
+        REQUIRE(r1.has_value());
+        a_id = *r1;
+        ManagementGroup b;
+        b.name = "SubCyc-B";
+        b.membership_type = "static";
+        b.parent_id = a_id;
+        auto r2 = store.create_group(b);
+        REQUIRE(r2.has_value());
+        b_id = *r2;
+        REQUIRE(store.add_member(a_id, "agent-a").has_value());
+        REQUIRE(store.add_member(b_id, "agent-b").has_value());
+    } // close store before reaching in with raw sqlite3
+
+    { // inject A->B->A (ids are hex from generate_id() — no injection vector)
+        sqlite3* raw = nullptr;
+        const auto path_str = tmp.path.string();
+        REQUIRE(sqlite3_open(path_str.c_str(), &raw) == SQLITE_OK);
+        std::string sql = "UPDATE management_groups SET parent_id = '" + b_id +
+                          "' WHERE id = '" + a_id + "';";
+        REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    ManagementGroupStore store(tmp.path);
+    auto members = store.get_member_agents_in_subtrees({a_id});
+    REQUIRE(members.has_value()); // terminates (no hang), fully-read result
+    CHECK(std::find(members->begin(), members->end(), "agent-a") != members->end());
+    CHECK(std::find(members->begin(), members->end(), "agent-b") != members->end());
+}
+
 TEST_CASE("ManagementGroupStore: update_group accepts reparent-to-root",
           "[mgmt][hierarchy]") {
     TempDb tmp;
