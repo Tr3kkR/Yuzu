@@ -335,9 +335,50 @@ bool source_enabled(TarDatabase& db, std::string_view source) {
            "true";
 }
 
-void run_retention(TarDatabase& db, int64_t now_epoch) {
-    // M17: Wrap all retention deletes in a single transaction to amortize fsync cost
-    db.execute_sql("BEGIN TRANSACTION");
+namespace {
+
+// Run a single-value COUNT(*) through the TRUSTED connection. `execute_user_query`
+// is the authorizer-sandboxed path for untrusted operator SQL (tar.sql, #760) and
+// is deliberately NOT used here: this SQL is built from registry constants and
+// integer-formatted timestamps, never operator input.
+//
+// Returns nullopt on any query error, so the caller can fail closed rather than
+// read a zero and mistake a broken query for an empty table.
+std::optional<int64_t> count_where(TarDatabase& db, std::string_view table,
+                                   std::string_view predicate) {
+    auto res = db.execute_query(std::format("SELECT COUNT(*) FROM {} WHERE {}", table, predicate),
+                                /*max_rows=*/1);
+    if (!res.has_value() || res->rows.empty() || res->rows[0].empty())
+        return std::nullopt;
+    try {
+        return std::stoll(res->rows[0][0]);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+} // namespace
+
+void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guard) {
+    // #2361 read phase, deliberately OUTSIDE the transaction. Interleaving 40+
+    // count scans with the deletes would hold the write lock for the whole
+    // sweep, on an endpoint where the collectors are trying to insert. Counts
+    // taken a moment before the delete can be slightly stale, which is
+    // conservative-safe in both directions: the per-table cap bounds every
+    // delete regardless of what the counts said, and a row inserted between the
+    // count and the delete is newer than the cutoff, so it is not a candidate.
+    struct Plan {
+        std::string table;
+        int64_t cutoff;
+        std::string ts_col;
+    };
+    std::vector<Plan> plans;
+    int declined_tables = 0, time_based_tables = 0;
+
+    const int64_t prev_pass_now = guard.last_pass_now;
+    // Record the reading for the NEXT pass before any early exit: it is an honest
+    // observation of the clock whatever this pass goes on to do.
+    guard.last_pass_now = now_epoch;
 
     for (const auto& src : capture_sources()) {
         // #539: Skip retention for disabled sources. The configure docstring and
@@ -351,19 +392,113 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
         // both skip retention, so the forensic window an operator paused — or one
         // whose `_enabled` value was clobbered — is never pruned. This matches the
         // collect-time source_enabled() gate, which also fails closed on "errored".
+        //
+        // This gate stays STRICTLY AHEAD of any guard bookkeeping: a paused or
+        // errored source whose rows are all past their cutoff must neither
+        // delete nor decline. Declining would burn a per-table decline counter
+        // (and an operator-facing warn) on a source that was never going to be
+        // pruned in the first place.
         auto enabled_key = std::format("{}_enabled", src.name);
         if (canonical_source_enabled(
                 db.get_config(enabled_key, src.default_enabled ? "true" : "false")) != "true")
             continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);
-            auto sql = retention_sql(table_name, now_epoch);
-            if (!sql.empty()) {
-                db.execute_sql(sql);
+            // Row-count retention is left exactly as it was. It trims only the
+            // excess over a fixed ceiling, computed with no clock at all, so no
+            // clock reading can make it delete more than it always would.
+            if (g.retention_type != RetentionType::kTimeBased) {
+                auto sql = retention_sql(table_name, now_epoch);
+                if (!sql.empty())
+                    db.execute_sql(sql);
+                continue;
             }
+
+            ++time_based_tables;
+            const int64_t cutoff = now_epoch - g.retention_default;
+            const std::string ts_col{ts_column_for_suffix(g.suffix)};
+
+            // Detect by OUTCOME rather than by a clock delta: a delta check is
+            // inert on the first pass after a reboot, which is precisely the
+            // wrong-RTC-at-boot case. `datable` excludes rows stamped
+            // implausibly far ahead -- they can never be too old, so letting
+            // them answer the question would disarm the guard permanently.
+            auto expired = count_where(db, table_name, std::format("{} < {}", ts_col, cutoff));
+            auto datable = count_where(
+                db, table_name,
+                std::format("{} <= {}", ts_col, now_epoch + kTarRetentionFutureSlackSec));
+            if (!expired || !datable) {
+                // Fail closed: a count we could not read is not evidence that
+                // deleting is safe. Skip the table this pass and leave its latch
+                // alone (an unread count says nothing about the clock).
+                spdlog::warn("TAR retention: could not count {} - skipping it this pass",
+                             table_name);
+                continue;
+            }
+            bool& latched = guard.latched[table_name];
+            if (*expired == 0) {
+                // Nothing to delete, so nothing to guard against -- and the
+                // anomaly this table latched for is over. Same rule the accepting
+                // path applies below.
+                latched = false;
+                continue;
+            }
+
+            const bool would_wipe = *datable > 0 && *expired == *datable;
+            // Supplement, not a replacement: the outcome test only fires when a
+            // jump exceeds this table's WHOLE retention window. A half-window
+            // jump expires half the table -- bounded by the cap below, but
+            // otherwise unreported. Process-local, hence a supplement to the
+            // restart-safe outcome test above.
+            const bool big_step =
+                prev_pass_now != 0 && now_epoch - prev_pass_now > g.retention_default;
+
+            if ((would_wipe || big_step) && !latched) {
+                latched = true;
+                ++guard.declines[table_name];
+                ++declined_tables;
+                spdlog::debug("TAR retention: declining {} ({} of {} rows expired, clock moved "
+                              "{}s, window {}s)",
+                              table_name, *expired, *datable,
+                              prev_pass_now == 0 ? 0 : now_epoch - prev_pass_now,
+                              g.retention_default);
+                continue;
+            }
+            // Hold the latch only while the wipe condition itself persists, so a
+            // genuinely all-expired table drains at cap pace without re-tripping
+            // the guard, and an ordinary over-cap backlog (survivors present)
+            // never arms it -- arming there would mask the decline of a real
+            // anomaly arriving next.
+            latched = would_wipe;
+            plans.push_back(Plan{table_name, cutoff, ts_col});
         }
     }
 
+    // One aggregate line per pass rather than one per table. A real clock
+    // anomaly trips every time-based table at once, so per-table warns would bury
+    // the signal ~20 lines deep on an endpoint nobody is tailing. The per-table
+    // detail is at debug above, and the durable operator surface is the decline
+    // counter in `tar status` -- the agent has no /metrics endpoint, so a bare
+    // log line is not a fleet-readable signal on its own.
+    if (declined_tables > 0)
+        spdlog::warn("TAR retention: clock guard declined {} of {} time-based tables this pass; "
+                     "this endpoint's clock moved in a way that would have wiped the forensic "
+                     "window. Deletion resumes, paced, once the condition clears.",
+                     declined_tables, time_based_tables);
+
+    // M17: Wrap all retention deletes in a single transaction to amortize fsync
+    // cost. Only ACCEPTED deletes reach here, so a declining pass writes nothing.
+    db.execute_sql("BEGIN TRANSACTION");
+    for (const auto& p : plans) {
+        // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
+        // KEY` plus an `idx_{table}_{ts_col}` index (generate_warehouse_ddl), so
+        // the subquery is an index scan, not a sort.
+        db.execute_sql(std::format("DELETE FROM {} WHERE id IN ("
+                                   "SELECT id FROM {} WHERE {} < {} "
+                                   "ORDER BY {} ASC, id ASC LIMIT {})",
+                                   p.table, p.table, p.ts_col, p.cutoff, p.ts_col,
+                                   kMaxTarDeletesPerTablePerPass));
+    }
     db.execute_sql("COMMIT");
 }
 

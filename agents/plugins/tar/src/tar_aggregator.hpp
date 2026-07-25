@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -78,14 +79,75 @@ parse_pattern_config(std::string_view json_text, bool require_min_core_len = fal
  */
 int run_aggregation(TarDatabase& db, int64_t now_epoch);
 
+// ── Retention clock guard (#2361) ─────────────────────────────────────────────
+//
+// Time-based retention deletes rows older than `now - retention_default`, with
+// `now` read from the endpoint clock -- the clock in the fleet most likely to be
+// wrong. A dead CMOS battery, a long suspend, a cloned VM, or a boot before NTP
+// converges all produce a reading that marks every row in a warehouse table
+// expired at once, and the delete that follows takes the whole forensic window
+// with it. These constants and this state bound that.
+
+// Rows timestamped further ahead than this are excluded from the "would this
+// pass delete everything datable?" question. They cannot be too old, so counting
+// them as ordinary survivors would let ONE row written under a forward-skewed
+// clock veto the guard for the life of the endpoint -- the guard would die
+// exactly when it is needed. Mirrors the audit store's kAuditTtlFutureSlackSec
+// and the journal's kJournalFutureSlackMs.
+inline constexpr int64_t kTarRetentionFutureSlackSec = 24 * 3600;
+
+// Upper bound on rows one pass deletes from one table. At the 900-second rollup
+// cadence this is ~480k rows/day/table, far above the growth rate of any TAR
+// warehouse table on an endpoint, so the accepting path keeps up and the latch
+// never sits permanently set. Sized as a drain rate, not a batch guess.
+inline constexpr int64_t kMaxTarDeletesPerTablePerPass = 5000;
+
+/**
+ * Per-table clock-guard state for time-based retention. Owned by the plugin and
+ * passed into every `run_retention` call so the latch survives across passes.
+ *
+ * Deliberately IN-MEMORY, not persisted: a reboot re-declines, which is the
+ * right behaviour for the wrong-RTC-at-boot case this exists to catch.
+ *
+ * NOT thread-safe. `run_retention` reads and writes it without holding the
+ * database mutex, and a manual `tar rollup` instruction can arrive while the
+ * 900-second `tar.rollup` trigger is mid-pass, so the CALLER must serialise
+ * whole rollup passes against each other (TarPlugin holds `rollup_mu_` for
+ * exactly that).
+ */
+struct RetentionGuardState {
+    /// "This table already declined for the current anomaly." Keyed by real
+    /// table name. Cleared once the wipe condition stops holding.
+    std::map<std::string, bool> latched;
+    /// Cumulative declines per table, surfaced through the `tar status` action.
+    /// The agent has no /metrics endpoint, so this is the operator's only
+    /// fleet-readable signal that an endpoint's clock is wrong.
+    std::map<std::string, int64_t> declines;
+    /// The `now_epoch` the previous pass saw, or 0 before the first pass. Zero
+    /// is load-bearing: the elapsed delta is meaningless on the first pass of a
+    /// process and would report the whole Unix epoch as "the clock moved".
+    int64_t last_pass_now{0};
+};
+
 /**
  * Run retention cleanup for all warehouse tables.
  * Enforces row-count limits on live tables and time-based retention on
  * aggregated tables.
+ *
+ * Row-count retention is unguarded and unchanged: it only ever trims the excess
+ * over a fixed ceiling, so no clock reading can make it delete more than it was
+ * always going to. Time-based retention is clock-guarded (#2361): a pass that
+ * would delete every datable row of a table, or that follows a wall-clock jump
+ * larger than that table's whole retention window, declines once and is counted
+ * instead; accepted passes delete at most kMaxTarDeletesPerTablePerPass rows per
+ * table, oldest first.
+ *
  * @param db        The TAR database.
  * @param now_epoch Current epoch seconds.
+ * @param guard     Per-table guard state; see RetentionGuardState for the
+ *                  caller's serialisation obligation.
  */
-void run_retention(TarDatabase& db, int64_t now_epoch);
+void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guard);
 
 /**
  * Apply an enable/disable transition for a TAR capture source.

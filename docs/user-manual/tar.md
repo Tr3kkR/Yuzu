@@ -252,6 +252,7 @@ config|dns_enabled|false
 config|dns_paused_at|0
 config|dns_live_rows|0
 config|dns_oldest_ts|0
+retention_guard_declines_total|0
 config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
@@ -290,6 +291,23 @@ config|process_enabled|errored
 `errored` means the stored value is not the literal `true`/`false` the agent
 ever writes (corruption or tampering); the source is fail-closed until it is
 re-`configure`d. See the tri-state description below.
+
+`retention_guard_declines_total` is the count of retention passes this agent
+declined because its clock moved (see "The retention clock guard" below). It is
+always emitted, so `0` is a positive statement that the agent's clock is behaving.
+When it is non-zero, one extra line per affected warehouse table names the table
+and its own decline count:
+
+```
+retention_guard|process_hourly|3
+retention_guard|tcp_hourly|3
+retention_guard_declines_total|6
+```
+
+Only tables that have actually declined appear, so a healthy agent emits just the
+total. The counters are in-memory and reset when the agent restarts. Scrape this
+across the fleet to find endpoints whose clocks need attention -- the agent has no
+`/metrics` endpoint, so this action is the fleet-readable signal.
 
 The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
@@ -385,6 +403,45 @@ TAR is designed for minimal performance overhead:
 - **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day (plus the ~1-2 MB perf window)
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
 - **Automatic purge**: old events are removed hourly based on the retention setting
+
+### The retention clock guard
+
+Time-based retention deletes rows older than `now - <tier retention>`, where
+`now` is read from the **endpoint's own clock** -- the clock in a fleet most
+likely to be wrong. A dead CMOS battery, a long suspend, a cloned VM, or a boot
+before NTP converges all produce a reading that marks every row in a warehouse
+table expired at once, and an unguarded delete then takes the whole forensic
+window with it.
+
+A retention pass therefore refuses to act on that:
+
+- **It declines a pass that would delete every datable row of a table**, and
+  counts the decline. The same applies when more wall-clock time than that
+  table's whole retention window has elapsed since the previous pass. The
+  decline is latched per table, so a warehouse that is legitimately all-expired
+  still ages out -- it just costs one rollup tick (900 s) first.
+- **Every accepted pass deletes at most 5,000 rows per table**, oldest first
+  (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
+  A wipe the guard chose to allow ages out at a paced rate rather than in one
+  statement.
+- Rows timestamped implausibly far in the future -- more than a day ahead, i.e.
+  written while the clock was already skewed forward -- are excluded from the
+  "would this delete everything?" question. Without that, one such row would
+  disarm the guard permanently.
+
+**Row-count retention is deliberately unguarded.** The `*_live` tiers trim only
+the excess over a fixed row ceiling, computed with no clock at all, so no clock
+reading can make them delete more than they always would.
+
+**A paused or errored source is skipped before the guard is consulted**, so it
+neither deletes nor records a decline -- an operator who paused a source for
+forensics never sees a clock-anomaly signal from it.
+
+The operator surface is `retention_guard_declines_total` (and the per-table
+`retention_guard|<table>|<n>` lines) in the `status` action, described above.
+A non-zero value means that endpoint's clock moved in a way that would have
+wiped its forensic window; check the host's time synchronisation. Retention
+resumes automatically, paced, once the condition clears.
 
 > **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
 > upgrade to this release, every Windows agent continues **device** performance

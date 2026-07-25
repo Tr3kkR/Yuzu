@@ -990,7 +990,14 @@ const std::unordered_map<std::string, TableRef>& table_ref_map() {
     return map;
 }
 
-// Get the timestamp column name for a granularity suffix
+} // namespace
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+// Get the timestamp column name for a granularity suffix. Public since #2361:
+// the retention clock guard in `run_retention` needs the same column the DDL
+// indexes and `retention_sql`'s time branch filters on, and a second copy of
+// this mapping in the aggregator would be a silent divergence waiting to happen.
 std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "live")    return "ts";
     if (suffix == "hourly")  return "hour_ts";
@@ -998,10 +1005,6 @@ std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "monthly") return "month_ts";
     return "ts";
 }
-
-} // namespace
-
-// ── Public API ──────────────────────────────────────────────────────────────
 
 const std::vector<CaptureSourceDef>& capture_sources() {
     return build_sources();

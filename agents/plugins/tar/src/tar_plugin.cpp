@@ -846,6 +846,19 @@ private:
     // dedicated mutex serialises concurrent collect_software (manual vs trigger)
     // without that cross-collector coupling.
     std::mutex software_collect_mu_;
+    // Serialises whole rollup passes (#2361). do_rollup is reachable from two
+    // places at once: the 900s `tar.rollup` trigger and an operator-issued manual
+    // `tar rollup` instruction. run_retention's clock-guard state is plain
+    // in-memory maps that it reads and writes WITHOUT holding db_->mu_ (the
+    // database mutex only serialises individual statements), so two concurrent
+    // passes would race the latch and the decline counters -- exactly what TSan
+    // catches in CI. Serialising the pass is cleaner than making each map entry
+    // atomic, and rollup is a background maintenance tick where a rare wait costs
+    // nothing. Also makes the aggregate-then-retain ordering below atomic.
+    std::mutex rollup_mu_;
+    // Per-table retention clock-guard state. Guarded by rollup_mu_ while
+    // run_retention mutates it; do_status reads it under the same lock.
+    yuzu::tar::RetentionGuardState retention_guard_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
     // Per-app version cache, keyed by (pid, create_time): resolves each top-N
@@ -1909,6 +1922,27 @@ private:
             }
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
         }
+        // Retention clock-guard declines, per warehouse table (#2361). The agent
+        // has no /metrics endpoint, so this action is the ONLY fleet-readable
+        // signal that an endpoint's clock moved in a way that would have wiped
+        // its forensic window - a `spdlog::warn` on an unattended endpoint is not
+        // an operator surface. A server-side instruction reads these to find the
+        // hosts whose clocks need attention. Absent lines mean zero declines;
+        // only tables that have actually declined are emitted, so a healthy fleet
+        // pays nothing for this. State is in-memory, so it resets on agent
+        // restart - deliberately, since a reboot re-declines anyway.
+        {
+            std::lock_guard rollup_lock(rollup_mu_);
+            int64_t total_declines = 0;
+            for (const auto& [table, count] : retention_guard_.declines) {
+                if (count <= 0)
+                    continue;
+                total_declines += count;
+                ctx.write_output(std::format("retention_guard|{}|{}", table, count));
+            }
+            ctx.write_output(std::format("retention_guard_declines_total|{}", total_declines));
+        }
+
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
@@ -2899,10 +2933,17 @@ private:
 
     int do_rollup(yuzu::CommandContext& ctx) {
         // No collect_mu_ needed — rollup operates on aggregate tables, not live-state diffs.
-        // The SQLite-level mutex (db_->mu_) provides thread safety.
+        // The SQLite-level mutex (db_->mu_) provides thread safety for individual
+        // statements. It does NOT cover run_retention's in-memory clock-guard
+        // state, which spans many statements - rollup_mu_ does (#2361), and it
+        // keeps the trigger tick and a manual `tar rollup` from interleaving.
+        std::lock_guard rollup_lock(rollup_mu_);
         auto ts = now_epoch_seconds();
+        // Ordering is load-bearing and unchanged: aggregation runs BEFORE
+        // retention so each tier consumes the tier below it before retention can
+        // delete from it.
         int total = yuzu::tar::run_aggregation(*db_, ts);
-        yuzu::tar::run_retention(*db_, ts);
+        yuzu::tar::run_retention(*db_, ts, retention_guard_);
         ctx.write_output(std::format("tar|rollup|{}|rows_aggregated", total));
         return 0;
     }

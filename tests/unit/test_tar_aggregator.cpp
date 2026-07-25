@@ -18,9 +18,13 @@
 
 #include <chrono>
 #include <format>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 using namespace yuzu::tar;
 
@@ -67,6 +71,7 @@ void seed_tcp_hourly(TarDatabase& db, int64_t t_now) {
 
 TEST_CASE("TAR retention: disabled source preserves hourly rows past cutoff",
           "[tar][retention][issue539]") {
+    yuzu::tar::RetentionGuardState guard;
     // Reproduction of /governance chaos-injector CHAOS-2. Without the
     // per-source guard, two retention passes (t0+1h and t0+25h) drain
     // process_hourly entirely after the operator disables process_enabled
@@ -83,14 +88,15 @@ TEST_CASE("TAR retention: disabled source preserves hourly rows past cutoff",
 
     db.set_config("process_enabled", "false");
 
-    run_retention(db, t0 + 3600);
-    run_retention(db, t0 + kHourlyCutoffSec + 3600);
+    run_retention(db, t0 + 3600, guard);
+    run_retention(db, t0 + kHourlyCutoffSec + 3600, guard);
 
     CHECK(row_count(db, "process_hourly") == 48);
 }
 
 TEST_CASE("TAR retention: enabled sources still age out past cutoff",
           "[tar][retention][issue539]") {
+    yuzu::tar::RetentionGuardState guard;
     // Counter-test: an enabled source must continue to age out, otherwise
     // the #539 fix would silently disable retention everywhere. With the
     // 48-row centered seed, exactly the rows with hour_ts < (t_now -
@@ -106,7 +112,7 @@ TEST_CASE("TAR retention: enabled sources still age out past cutoff",
 
     REQUIRE(db.get_config("process_enabled", "true") == "true");
 
-    run_retention(db, t_now);
+    run_retention(db, t_now, guard);
 
     auto remaining = row_count(db, "process_hourly");
     CHECK(remaining > 0);
@@ -114,6 +120,7 @@ TEST_CASE("TAR retention: enabled sources still age out past cutoff",
 }
 
 TEST_CASE("TAR retention: re-enabling a source resumes retention", "[tar][retention][issue539]") {
+    yuzu::tar::RetentionGuardState guard;
     // Operator journey: freeze for analysis, take an export, re-enable to
     // resume normal aging. The guard is purely config-driven, so flipping
     // <source>_enabled back to "true" must immediately re-arm time-based
@@ -128,11 +135,11 @@ TEST_CASE("TAR retention: re-enabling a source resumes retention", "[tar][retent
     seed_process_hourly(db, t_now);
 
     db.set_config("process_enabled", "false");
-    run_retention(db, t_now);
+    run_retention(db, t_now, guard);
     REQUIRE(row_count(db, "process_hourly") == 48);
 
     db.set_config("process_enabled", "true");
-    run_retention(db, t_now);
+    run_retention(db, t_now, guard);
 
     auto after_resume = row_count(db, "process_hourly");
     CHECK(after_resume > 0);
@@ -520,6 +527,7 @@ TEST_CASE("TAR #538: disabling perf/procperf does not touch any baseline state",
 
 TEST_CASE("TAR retention: disabling one source does not pause others",
           "[tar][retention][issue539]") {
+    yuzu::tar::RetentionGuardState guard;
     // Independence invariant: the guard is per-source. Disabling
     // process_enabled must not freeze tcp / service / user retention —
     // otherwise a future refactor could turn the per-source guard into a
@@ -536,7 +544,7 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
 
     db.set_config("process_enabled", "false");
     // tcp_enabled left at default => "true"
-    run_retention(db, t_now);
+    run_retention(db, t_now, guard);
 
     CHECK(row_count(db, "process_hourly") == 48); // disabled, preserved
     auto tcp_remaining = row_count(db, "tcp_hourly");
@@ -792,6 +800,7 @@ TEST_CASE("TAR default-off: opt-in source's first disable is a no-op transition"
 
 TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never prunes (#560)",
           "[tar][retention][source-lifecycle]") {
+    yuzu::tar::RetentionGuardState guard;
     // The collect-time gate (source_enabled) fails closed on a non-canonical
     // _enabled value, mapping it to "errored". Retention MUST agree and preserve
     // that source's rows — otherwise a tampered or bit-flipped value would stop
@@ -811,7 +820,7 @@ TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never
     db.set_config("process_enabled", "maybe");
     REQUIRE(canonical_source_enabled(db.get_config("process_enabled", "true")) == "errored");
     // tcp_enabled left at default => "true" (actively, validly enabled).
-    run_retention(db, t_now);
+    run_retention(db, t_now, guard);
 
     CHECK(row_count(db, "process_hourly") == 48); // errored => preserved, not pruned
     auto tcp_remaining = row_count(db, "tcp_hourly");
@@ -828,4 +837,294 @@ TEST_CASE("TAR canonical_source_enabled is a strict tri-state (#560)", "[tar][so
     CHECK(canonical_source_enabled(" false ") == "errored");
     CHECK(canonical_source_enabled("yes") == "errored");
     CHECK(canonical_source_enabled("") == "errored");
+}
+
+// ── #2361: the retention clock guard ───────────────────────────────────────
+//
+// Time-based retention deletes rows older than `now - retention_default`, with
+// `now` read from the endpoint's own clock - the clock in the fleet most likely
+// to be wrong (dead CMOS battery, long suspend, cloned VM, boot before NTP
+// converges). The delete used to be unbounded, so one bad reading took the
+// whole forensic window with it. These tests drive `run_retention` at explicit
+// timestamps, so nothing here depends on the real clock.
+
+namespace {
+
+// Insert `count` process_hourly rows all stamped at exactly `ts`.
+void seed_process_hourly_at(TarDatabase& db, int64_t ts, int count) {
+    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
+    for (int i = 0; i < count; ++i) {
+        REQUIRE(db.execute_sql(std::format("INSERT INTO process_hourly "
+                                           "(hour_ts,name,user,start_count,stop_count) "
+                                           "VALUES ({}, 'svc.exe', 'SYSTEM', 1, 1)",
+                                           ts)));
+    }
+    REQUIRE(db.execute_sql("COMMIT"));
+}
+
+struct TarGuardFixture {
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-2361-"}};
+    std::optional<TarDatabase> db;
+    yuzu::tar::RetentionGuardState guard;
+
+    TarGuardFixture() {
+        auto opened = TarDatabase::open(tmp.path);
+        REQUIRE(opened.has_value());
+        db.emplace(std::move(*opened));
+        REQUIRE(db->create_warehouse_tables());
+    }
+};
+
+// A fixed "now" far from both the epoch and the real clock.
+constexpr int64_t kT0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC
+
+} // namespace
+
+TEST_CASE("TAR #2361: a pass that would delete every datable row declines once",
+          "[tar][retention][clock-guard]") {
+    TarGuardFixture f;
+    // Every row well past the 24h hourly cutoff: a forward clock jump looks
+    // exactly like this.
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 20); // nothing deleted
+    CHECK(f.guard.declines["process_hourly"] == 1);
+}
+
+TEST_CASE("TAR #2361: the decline is latched, so a genuine backlog still drains",
+          "[tar][retention][clock-guard]") {
+    // Declining every pass would turn the guard into a permanent retention leak
+    // on any endpoint whose warehouse is legitimately all-expired.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard);
+    REQUIRE(row_count(*f.db, "process_hourly") == 20);
+
+    run_retention(*f.db, kT0 + 1, f.guard); // latched: accepted this time
+    CHECK(row_count(*f.db, "process_hourly") == 0);
+    CHECK(f.guard.declines["process_hourly"] == 1); // not counted twice
+}
+
+TEST_CASE("TAR #2361: the latch clears once the backlog drains, re-arming the guard",
+          "[tar][retention][clock-guard]") {
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard);     // decline #1
+    run_retention(*f.db, kT0 + 1, f.guard); // drain
+    run_retention(*f.db, kT0 + 2, f.guard); // nothing expired -> latch clears
+    REQUIRE(row_count(*f.db, "process_hourly") == 0);
+
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // fresh anomaly
+    run_retention(*f.db, kT0 + 3, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 5);
+    CHECK(f.guard.declines["process_hourly"] == 2);
+}
+
+TEST_CASE("TAR #2361: one future-dated row cannot disarm the guard",
+          "[tar][retention][clock-guard]") {
+    // A row stamped implausibly far ahead - written while the clock was skewed
+    // forward, or carried in by a VM clone - can never itself be too old. If it
+    // counted as an ordinary survivor it would answer "no, this pass would not
+    // delete everything" for the life of the endpoint, disarming the guard
+    // exactly when it is needed.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    seed_process_hourly_at(*f.db, kT0 + yuzu::tar::kTarRetentionFutureSlackSec + 3600, 1);
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 21); // still declines
+    CHECK(f.guard.declines["process_hourly"] == 1);
+}
+
+TEST_CASE("TAR #2361: an in-window survivor means no wipe, so the pass deletes immediately",
+          "[tar][retention][clock-guard]") {
+    // The healthy steady state. The guard must be invisible here.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // inside the 24h window
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 1);
+    CHECK(f.guard.declines["process_hourly"] == 0);
+}
+
+TEST_CASE("TAR #2361: a sub-window forward jump is caught by the step check",
+          "[tar][retention][clock-guard]") {
+    // The outcome test alone only fires when a jump exceeds a table's WHOLE
+    // retention window. A jump of just over one window expires a large slice
+    // while leaving survivors, which the cap bounds but nothing would report.
+    TarGuardFixture f;
+    const int64_t later = kT0 + kHourlyCutoffSec + 1;
+
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // expired at both readings
+    seed_process_hourly_at(*f.db, later - 60, 1); // survivor at BOTH readings
+    run_retention(*f.db, kT0, f.guard);
+    REQUIRE(row_count(*f.db, "process_hourly") == 1);
+    REQUIRE(f.guard.declines["process_hourly"] == 0);
+
+    seed_process_hourly_at(*f.db, kT0 - 9 * kHourlyCutoffSec, 5);
+    run_retention(*f.db, later, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 6); // nothing deleted
+    CHECK(f.guard.declines["process_hourly"] == 1);
+}
+
+TEST_CASE("TAR #2361: an ordinary over-cap backlog does NOT arm the latch",
+          "[tar][retention][clock-guard]") {
+    // The latch tracks the WIPE condition, not the backlog. Arming it on any
+    // capped pass would leave a busy endpoint permanently latched, and a real
+    // clock anomaly arriving next would then delete with no decline and no
+    // counter. kSurplus is deliberately independent of the cap.
+    constexpr int64_t kSurplus = 7;
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
+                           static_cast<int>(yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus));
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: a backlog, not an anomaly
+
+    run_retention(*f.db, kT0, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == kSurplus + 1); // one cap's worth deleted
+    CHECK(f.guard.declines["process_hourly"] == 0);
+
+    run_retention(*f.db, kT0 + 1, f.guard); // finish the backlog
+    CHECK(row_count(*f.db, "process_hourly") == 1);
+    CHECK(f.guard.declines["process_hourly"] == 0);
+
+    // Now a real anomaly. An armed latch would let this delete silently.
+    REQUIRE(f.db->execute_sql("DELETE FROM process_hourly"));
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 3);
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 3);
+    CHECK(f.guard.declines["process_hourly"] == 1);
+}
+
+TEST_CASE("TAR #2361: a disabled source with all-expired rows neither declines nor deletes",
+          "[tar][retention][clock-guard][issue539]") {
+    // The #539/#560 source gate stays strictly ahead of any guard bookkeeping. A
+    // paused or errored source is not a candidate for deletion, so it must not
+    // burn a decline counter (or an operator-facing warn) either - that would
+    // report a clock anomaly on an endpoint whose clock is fine.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    SECTION("paused") { f.db->set_config("process_enabled", "false"); }
+    SECTION("errored") { f.db->set_config("process_enabled", "maybe"); }
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+    CHECK(f.guard.declines["process_hourly"] == 0);
+}
+
+TEST_CASE("TAR #2361: row-count retention still trims, unguarded, under a bad clock",
+          "[tar][retention][clock-guard]") {
+    // Row-count retention trims only the excess over a fixed ceiling and is
+    // computed with no clock at all, so no clock reading can make it delete more
+    // than it always would. It is therefore deliberately NOT guarded, NOT capped,
+    // and NOT declined. `netqual_boot` has a 400-row ceiling, small enough to
+    // exercise the trim directly: seeding 410 ancient rows must still leave
+    // exactly 400 and must not touch the decline counters.
+    constexpr int kBootCeiling = 400;
+    constexpr int kOver = 10;
+    TarGuardFixture f;
+    f.db->set_config("netqual_enabled", "true"); // opt-in source
+    REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
+    for (int i = 0; i < kBootCeiling + kOver; ++i) {
+        REQUIRE(f.db->execute_sql(std::format("INSERT INTO netqual_boot (ts,boot_ts,window_s) "
+                                              "VALUES ({}, {}, 60)",
+                                              kT0 - 10 * kHourlyCutoffSec,
+                                              kT0 - 10 * kHourlyCutoffSec - 60)));
+    }
+    REQUIRE(f.db->execute_sql("COMMIT"));
+
+    // Every row is "ancient" by the clock the pass is handed.
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "netqual_boot") == kBootCeiling);
+    CHECK(f.guard.declines["netqual_boot"] == 0);
+    CHECK(f.guard.latched["netqual_boot"] == false);
+}
+
+TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not declined",
+          "[tar][retention][clock-guard]") {
+    // Fail closed on an unreadable count: a count we could not read is not
+    // evidence that deleting is safe. The table is skipped for the pass, its
+    // latch is left alone (an unread count says nothing about the clock), no
+    // decline is recorded against it, and the rest of the sweep still runs.
+    //
+    // Dropping the table is the cheap way to force the count to error. Note this
+    // covers the skip, the no-spurious-decline, and the keep-going properties;
+    // the "delete anyway" variant is not separable here, because every cheap way
+    // to break the count also breaks the delete that would follow it.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    for (int h = 0; h < 20; ++h) {
+        REQUIRE(f.db->execute_sql(
+            std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
+                        "process_name,connect_count,disconnect_count) "
+                        "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
+                        kT0 - 10 * kHourlyCutoffSec)));
+    }
+    REQUIRE(f.db->execute_sql("DROP TABLE process_hourly"));
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(f.guard.declines["process_hourly"] == 0); // unreadable, not "anomalous"
+    CHECK(f.guard.latched["process_hourly"] == false);
+    // The sweep kept going: tcp_hourly is all-expired, so it declines normally.
+    CHECK(f.guard.declines["tcp_hourly"] == 1);
+    CHECK(row_count(*f.db, "tcp_hourly") == 20);
+}
+
+TEST_CASE("TAR #2361: concurrent rollup passes are race-free when the caller serialises",
+          "[tar][retention][clock-guard]") {
+    // do_rollup is reachable from two places at once: the 900s `tar.rollup`
+    // trigger and an operator-issued manual `tar rollup`. RetentionGuardState is
+    // plain in-memory maps that run_retention reads and writes WITHOUT holding
+    // db_->mu_ (that mutex only serialises individual statements), so two
+    // concurrent passes would race the latch and the decline counters.
+    //
+    // TarPlugin owns `rollup_mu_` for exactly this. TarPlugin itself is not
+    // reachable from a unit test (it is a translation-unit-local class), so this
+    // exercises the same shape the plugin uses and is the TSan target for the
+    // contract: remove the lock_guard below and TSan reports on guard.latched /
+    // guard.declines.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200);
+
+    std::mutex rollup_mu;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < 5; ++i) {
+                std::lock_guard lock(rollup_mu);
+                run_retention(*f.db, kT0 + t * 10 + i, f.guard);
+            }
+        });
+    }
+    for (auto& th : threads)
+        th.join();
+
+    // First pass declines, the rest drain it. The exact interleaving is not
+    // pinned -- what is pinned is that the state stays coherent: the table ends
+    // empty and exactly one decline was recorded.
+    CHECK(row_count(*f.db, "process_hourly") == 0);
+    CHECK(f.guard.declines["process_hourly"] == 1);
+}
+
+TEST_CASE("TAR #2361: retention_sql's SQL text is unchanged (the guard reroutes at the caller)",
+          "[tar][retention][clock-guard]") {
+    // test_tar_warehouse.cpp and test_tar_perf.cpp pin retention_sql's exact
+    // output. The guard therefore lives in run_retention, NOT in retention_sql -
+    // this restates that contract locally so a future refactor that "tidies" the
+    // guard into retention_sql fails here rather than in an unrelated file.
+    const auto time_based = retention_sql("process_hourly", kT0);
+    CHECK(time_based == std::format("DELETE FROM process_hourly WHERE hour_ts < {}",
+                                    kT0 - kHourlyCutoffSec));
+    CHECK(time_based.find("LIMIT") == std::string::npos);
 }
