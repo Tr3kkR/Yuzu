@@ -12,7 +12,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 | File | Role |
 |---|---|
 | `Provision-Windows-Runner.ps1` | Installs the pinned toolchain, sets machine env (incl. the gateway + shared-cache contracts), emits `toolchain-manifest.json`. |
-| `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest (every required tool present, every contract env set). Run at provision time **and** as a registration/preflight gate. |
+| `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
 | `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache and selects that runner's persistent telemetry DB. |
 
 ## Standing up a new box
@@ -23,7 +23,11 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    pwsh -File deploy\windows\Provision-Windows-Runner.ps1
    ```
    Re-runnable; pins live in the `param()` block (bump deliberately). Open a new
-   shell afterwards so machine PATH/env take effect.
+   shell afterwards so machine PATH/env take effect. On an existing shared box,
+   first disable/drain all four runners and wait for their active jobs to finish:
+   the per-agent PostgreSQL-binary step refuses to copy or restart services while
+   any `Runner.Worker.exe` is running, so provisioning cannot interrupt another
+   agent's `[pg]` suite.
 
 2. **Self-test** (must pass before registering):
    ```powershell
@@ -80,11 +84,17 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   image file's FCB / image-section lock (~1000–1466 ms/spawn under concurrency;
   root-caused 2026-07-22, **not** Defender and **not** disk). A byte-identical
   copy at its own path has its own FCB and spawns in ~10–20 ms — validated ~50–70×
-  under all-four-agent churn. The step is idempotent (an already-repointed
-  `ImagePath` is a no-op; `robocopy` refreshes the tree in place) and per-agent
-  catch-and-continue, and it rolls the `ImagePath` back and restarts if a fresh
-  copy fails to serve. `D:\ci\pgbin` and each copy's `postgres.exe` join the
-  Defender exclusions below.
+  under all-four-agent churn. The step is idempotent (`robocopy` refreshes the
+  tree in place; an already-repointed `ImagePath` is accepted only after
+  `pg_isready` plus authenticated `SELECT 1`) and per-agent catch-and-continue.
+  A failed repoint restores the exact original `ImagePath`, restarts from the
+  original bin directory, and verifies the same two health checks; a failed
+  rollback is reported distinctly instead of claiming recovery. Agent 0's live
+  data exclusion comes from the service's actual `-D` argument, not an assumed
+  install-root layout. `D:\ci\pgbin` and each copy's `postgres.exe` join the
+  Defender exclusions below. The manifest self-test verifies all four private
+  binary sets, registered service executables, `Running` states, and live
+  authenticated probes, so drift fails before a build starts.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg
@@ -123,6 +133,7 @@ verified by `Assert-Toolchain.ps1`:
 {
   "generated": "2026-06-20T13:00:00Z",
   "host": "WEETAM",
+  "runner_count": 4,
   "pins":  { "python": "3.14.6", "meson": "1.11.1", "erlang": "28.4.2",
              "rebar3": "3.24.0", "postgres": "18.4", "vcpkg_baseline": "4b77da7..." },
   "env":   { "VCPKG_ROOT": "C:\\vcpkg", "CCACHE_DIR": "D:\\ci\\ccache",
@@ -134,6 +145,14 @@ verified by `Assert-Toolchain.ps1`:
     "root": "D:\\ci\\test-runs",
     "databases": ["D:\\ci\\test-runs\\yuzu-weetam-windows-0\\test-runs.db", "..."]
   },
+  "postgres_clusters": [
+    { "agent": 0, "service": "postgresql-x64-18-yuzu-ci", "port": 5433,
+      "bin": "D:\\ci\\pgbin\\agent-0\\bin",
+      "pg_ctl": "D:\\ci\\pgbin\\agent-0\\bin\\pg_ctl.exe",
+      "postgres": "D:\\ci\\pgbin\\agent-0\\bin\\postgres.exe",
+      "psql": "D:\\ci\\pgbin\\agent-0\\bin\\psql.exe",
+      "pg_isready": "D:\\ci\\pgbin\\agent-0\\bin\\pg_isready.exe" }
+  ],
   "tools": [ { "name": "vcpkg", "path": "C:\\vcpkg\\vcpkg.exe", "version": "...", "required": true }, ... ]
 }
 ```

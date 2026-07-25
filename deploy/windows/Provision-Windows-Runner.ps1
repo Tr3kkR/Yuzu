@@ -389,11 +389,63 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
   # robocopy refreshes the tree in place. Per-agent, catch-and-continue like the
   # per-agent-clusters step: one agent's failure records + continues, and the
   # accumulated list still throws once after the loop naming every failure.
+  function Get-PgServiceImageParts([string]$image){
+    $trimmed = $image.TrimStart()
+    $exe = if($trimmed -match '^"([^"]+)"'){ $Matches[1] } else { ($trimmed -split '\s+',2)[0] }
+    if(-not $exe){ throw "could not parse service executable from ImagePath '$image'" }
+    $data = $null
+    if($trimmed -match '(?i)(?:^|\s)-D\s*"([^"]+)"'){
+      $data = $Matches[1]
+    } elseif($trimmed -match '(?i)(?:^|\s)-D\s*([^\s"]+)'){
+      $data = $Matches[1]
+    }
+    [pscustomobject]@{ Exe=$exe; DataDir=$data }
+  }
+  function Assert-PgServing([string]$bin,[int]$port,[string]$context){
+    $ready = Join-Path $bin 'pg_isready.exe'
+    $psql  = Join-Path $bin 'psql.exe'
+    if(-not (Test-Path $ready)){ throw "$context missing $ready" }
+    if(-not (Test-Path $psql)){ throw "$context missing $psql" }
+    $deadline=(Get-Date).AddSeconds(90)
+    do {
+      & $ready -q -h 127.0.0.1 -p $port 2>$null
+      if($LASTEXITCODE -eq 0){ break }
+      Start-Sleep 2
+    } while((Get-Date) -lt $deadline)
+    if($LASTEXITCODE -ne 0){ throw "$context cluster on :$port not ready in 90s" }
+    $oldPassword = $env:PGPASSWORD
+    $env:PGPASSWORD='postgres'
+    try {
+      $probe = (& $psql -U postgres -h 127.0.0.1 -p $port -tAc 'SELECT 1' 2>$null | Out-String).Trim()
+      if($LASTEXITCODE -ne 0 -or $probe -ne '1'){
+        throw "$context SELECT 1 failed on :$port"
+      }
+    } finally {
+      if($null -eq $oldPassword){ Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
+      else { $env:PGPASSWORD = $oldPassword }
+    }
+  }
+
+  # This step copies live executable trees and may restart every cluster. Wee
+  # Tam's four runners share the box, so require an explicit maintenance drain
+  # rather than interrupting another agent's in-flight [pg] suite.
+  $activeWorkers = @(Get-CimInstance Win32_Process -Filter "Name = 'Runner.Worker.exe'" -EA Stop)
+  if($activeWorkers.Count -gt 0){
+    $workerPids = ($activeWorkers.ProcessId | Sort-Object) -join ', '
+    throw "refusing PostgreSQL binary reconciliation while Runner.Worker.exe is active (PID(s): $workerPids) — disable/drain all Wee Tam runners, wait for jobs to finish, then re-run provisioning"
+  }
+
   $major = $PostgresVersion.Split('.')[0]
   $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
   if(-not $pgbin){ throw "psql not found — the main PostgreSQL step must succeed before per-agent binary copies" }
   $pgroot  = Split-Path $pgbin -Parent            # install ROOT (parent of bin): C:\pgsql or C:\Program Files\PostgreSQL\$major
-  $srcData = Join-Path $pgroot 'data'             # agent-0's live cluster data — NEVER copy it
+  $agent0Svc = "postgresql-x64-$major-yuzu-ci"
+  $agent0Reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$agent0Svc"
+  $agent0Image = (Get-ItemProperty $agent0Reg -Name ImagePath -EA Stop).ImagePath
+  $srcData = (Get-PgServiceImageParts $agent0Image).DataDir
+  if(-not $srcData){
+    throw "agent 0 service $agent0Svc ImagePath has no parseable -D data directory — refusing to copy the install tree without a proven live-data exclusion"
+  }
   $failedAgents = @()
   for($n=0; $n -lt $RunnerCount; $n++){
     $svc    = if($n -eq 0){ "postgresql-x64-$major-yuzu-ci" } else { "postgresql-x64-$major-yuzu-ci-$n" }
@@ -425,34 +477,39 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
       #    copy's postgres.exe (its own FCB) is what serves.
       $regPath  = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
       $curImage = (Get-ItemProperty $regPath -Name ImagePath -EA Stop).ImagePath
-      $curExe   = if($curImage -match '^\s*"([^"]+)"'){ $Matches[1] } else { ($curImage -split '\s+',2)[0] }
+      $curExe   = (Get-PgServiceImageParts $curImage).Exe
       if([string]::Equals($curExe, $newExe, 'OrdinalIgnoreCase')){
-        Write-Host "agent ${n}: ImagePath already points at the private copy ($dstbin) — no-op"
+        # Path equality is not health: a prior interrupted provision can leave
+        # the registry repointed while the service is dead. Prove the existing
+        # no-op state serves before accepting it.
+        Assert-PgServing $dstbin $port "agent $n existing private service"
+        Write-Host "agent ${n}: ImagePath already points at the private copy ($dstbin) — serving verified, no-op"
       } else {
-        $newImage = $curImage.Replace($curExe, $newExe)   # $curExe came from $curImage → guaranteed present
+        # Replace the parsed executable token exactly once. String.Replace()
+        # would also rewrite an argument containing the same path substring.
+        $exeOffset = $curImage.IndexOf($curExe, [StringComparison]::OrdinalIgnoreCase)
+        if($exeOffset -lt 0){ throw "parsed executable '$curExe' not found in ImagePath '$curImage'" }
+        $newImage = $curImage.Substring(0,$exeOffset) + $newExe +
+                    $curImage.Substring($exeOffset + $curExe.Length)
         Set-ItemProperty $regPath -Name ImagePath -Value $newImage -Type ExpandString
         try {
-          Restart-Service $svc -Force
-          $deadline=(Get-Date).AddSeconds(90)
-          do {
-            & "$dstbin\pg_isready.exe" -q -h 127.0.0.1 -p $port 2>$null
-            if($LASTEXITCODE -eq 0){ break }
-            Start-Sleep 2
-          } while((Get-Date) -lt $deadline)
-          if($LASTEXITCODE -ne 0){ throw "cluster on :$port not ready in 90s after repoint" }
-          $env:PGPASSWORD='postgres'   # superuser pw for agent-0 (EDB --superpassword) and agents 1..N-1 (initdb --pwfile)
-          try {
-            if((& "$dstbin\psql.exe" -U postgres -h 127.0.0.1 -p $port -tAc 'SELECT 1') -ne '1'){
-              throw "SELECT 1 failed on :$port after repoint"
-            }
-          } finally { Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
+          Restart-Service $svc -Force -EA Stop
+          Assert-PgServing $dstbin $port "agent $n repointed service"
           Write-Host "agent ${n}: postgres.exe now private ($dstbin), svc $svc on :$port verified"
         } catch {
-          # A bad copy must never leave the cluster wedged: restore the original
-          # ImagePath and restart before surfacing the failure.
-          Set-ItemProperty $regPath -Name ImagePath -Value $curImage -Type ExpandString
-          Restart-Service $svc -Force -EA SilentlyContinue
-          throw "repoint of $svc failed, rolled ImagePath back to '$curExe': $($_.Exception.Message)"
+          # A bad copy must never leave the cluster wedged. Restore the exact
+          # original ImagePath, restart from its bin dir, and prove SELECT 1;
+          # distinguish a clean rollback from a failed recovery in the error.
+          $forwardError = $_.Exception.Message
+          try {
+            Set-ItemProperty $regPath -Name ImagePath -Value $curImage -Type ExpandString -EA Stop
+            Restart-Service $svc -Force -EA Stop
+            Assert-PgServing (Split-Path $curExe -Parent) $port "agent $n rollback service"
+          } catch {
+            $rollbackError = $_.Exception.Message
+            throw "repoint of $svc failed ($forwardError); rollback to '$curExe' ALSO FAILED verification ($rollbackError)"
+          }
+          throw "repoint of $svc failed ($forwardError); rollback to '$curExe' restored and verified the original service"
         }
       }
     } catch {
@@ -616,9 +673,24 @@ Step "emit toolchain manifest -> $ManifestPath" {
     @{ name='vcpkg';      path="$VcpkgRoot\vcpkg.exe"; version=(Ver { & "$VcpkgRoot\vcpkg.exe" version }); required=$true }
     @{ name='postgres';   path=(Join-Path $pgbin 'psql.exe'); version=$PostgresVersion; required=$true }
   )
+  $postgresClusters = @(for($n=0; $n -lt $RunnerCount; $n++){
+    $clusterBin = Join-Path $CacheRoot "pgbin\agent-$n\bin"
+    $clusterSvc = if($n -eq 0){ "postgresql-x64-$major-yuzu-ci" } else { "postgresql-x64-$major-yuzu-ci-$n" }
+    [ordered]@{
+      agent=$n
+      service=$clusterSvc
+      port=($PostgresPort + $n)
+      bin=$clusterBin
+      pg_ctl=(Join-Path $clusterBin 'pg_ctl.exe')
+      postgres=(Join-Path $clusterBin 'postgres.exe')
+      psql=(Join-Path $clusterBin 'psql.exe')
+      pg_isready=(Join-Path $clusterBin 'pg_isready.exe')
+    }
+  })
   $manifest = [ordered]@{
     generated = (Get-Date).ToUniversalTime().ToString('o')
     host      = $env:COMPUTERNAME
+    runner_count = $RunnerCount
     pins      = [ordered]@{ python=$PythonVersion; meson=$MesonVersion; erlang=$ErlangVersion; rebar3=$Rebar3Version; postgres=$PostgresVersion; vcpkg_baseline=$VcpkgBaseline }
     env       = [ordered]@{
       VCPKG_ROOT=$VcpkgRoot; CCACHE_DIR="$CacheRoot\ccache"; RUNNER_TOOL_CACHE="$CacheRoot\tool_cache"
@@ -632,6 +704,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
         Join-Path (Join-Path "$CacheRoot\test-runs" "yuzu-weetam-windows-$n") 'test-runs.db'
       })
     }
+    postgres_clusters = $postgresClusters
     tools     = $tools
   }
   New-Item -ItemType Directory -Force (Split-Path $ManifestPath) | Out-Null
