@@ -294,6 +294,24 @@ std::optional<ScimResource> ScimStore::get_by_scim_id(const std::string& scim_id
     return read_resource(res.get(), 0);
 }
 
+std::optional<bool> ScimStore::resource_exists(const std::string& scim_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable — never "does not exist"
+    if (scim_id.empty())
+        return false; // nothing was asked for; a definitive negative
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    pg::PgResult res =
+        pg::exec_params(lease.get(), "SELECT 1 FROM scim_store.scim_resources WHERE scim_id = $1",
+                        std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+    return PQntuples(res.get()) > 0;
+}
+
 std::optional<ScimResource> ScimStore::get_by_username(const std::string& username) const {
     if (!open_ || username.empty())
         return std::nullopt;

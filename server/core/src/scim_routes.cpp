@@ -291,13 +291,26 @@ std::string groups_location_base(const httplib::Request& req) {
 /// set_group_members`/`add_group_member` only ever see values this function
 /// already confirmed resolve to a real User resource). Deduplicates and
 /// preserves the relative order of `values`.
-std::vector<std::string> resolve_member_values(ScimStore* scim_store,
-                                               const std::vector<std::string>& values) {
+///
+/// ★ SECURITY (2026-07-25 Hermes pass, MEDIUM): validate-and-skip is only safe
+/// against a DEFINITIVE negative. This used to call `get_by_scim_id`, whose
+/// `nullopt` also means "the read failed" — so a transient store blip made a
+/// real member look unresolvable, it was skipped, and the caller persisted the
+/// SMALLER set. That is the same durable membership loss as the fold-onto-
+/// empty-set bug, just partial instead of total. It now uses the tri-state
+/// `resource_exists` and returns `nullopt` if ANY id could not be resolved, so
+/// the caller refuses the whole write rather than committing a set built from
+/// an unreliable read.
+std::optional<std::vector<std::string>>
+resolve_member_values(ScimStore* scim_store, const std::vector<std::string>& values) {
     std::vector<std::string> resolved;
     resolved.reserve(values.size());
     for (const auto& v : values) {
-        if (!scim_store->get_by_scim_id(v).has_value())
-            continue; // validate-and-skip
+        auto exists = scim_store->resource_exists(v);
+        if (!exists.has_value())
+            return std::nullopt; // could not determine — fail closed, never skip
+        if (!*exists)
+            continue; // definitively unknown — validate-and-skip, as before
         if (std::find(resolved.begin(), resolved.end(), v) == resolved.end())
             resolved.push_back(v);
     }
@@ -1722,7 +1735,17 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
             return;
         }
 
-        auto members = resolve_member_values(scim_store, input.member_values);
+        auto members_resolved = resolve_member_values(scim_store, input.member_values);
+        if (!members_resolved.has_value()) {
+            // Could not resolve every member — persisting the partial set
+            // would silently drop real members from a brand-new group.
+            send_scim_error(res, 503, "membership unavailable");
+            audit(auth_mgr, audit_store, req, "scim.group.created", "failure", group->scim_id,
+                 "member resolution unavailable", "Group");
+            record_request(auth_mgr, "group_create", 503);
+            return;
+        }
+        const std::vector<std::string>& members = *members_resolved;
         if (!members.empty() && !scim_store->set_group_members(group->scim_id, members)) {
             spdlog::error("ScimRoutes: set_group_members failed for group scim_id={}",
                          group->scim_id);
@@ -1989,7 +2012,20 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                         return;
                     }
                     const std::vector<std::string>& old_members = *old_members_read;
-                    new_members = resolve_member_values(scim_store, input.member_values);
+                    auto new_members_resolved =
+                        resolve_member_values(scim_store, input.member_values);
+                    if (!new_members_resolved.has_value()) {
+                        spdlog::error("ScimRoutes: PUT Groups — could not resolve every requested "
+                                     "member for group scim_id={}; refusing the replace "
+                                     "(fail-closed, would persist a partial set)",
+                                     id);
+                        send_scim_error(res, 503, "membership unavailable");
+                        audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
+                             "member resolution unavailable", "Group");
+                        record_request(auth_mgr, "group_replace", 503);
+                        return;
+                    }
+                    new_members = *new_members_resolved;
 
                     // #2127 review MEDIUM fix: persist the rename AND the
                     // membership replace atomically, in ONE transaction (was
@@ -2156,10 +2192,25 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
                       // Step 2: resolve/validate-and-skip the WHOLE final set
                       // against live SCIM User resources in one pass (never
-                      // per-op) — an unresolvable id (never provisioned,
-                      // deleted, or garbage from the IdP) is silently dropped,
-                      // same validate-and-skip contract as before.
-                      final_members = resolve_member_values(scim_store, final_members_raw);
+                      // per-op) — an id that DEFINITIVELY does not resolve
+                      // (never provisioned, deleted, or garbage from the IdP)
+                      // is silently dropped, same validate-and-skip contract
+                      // as before; an id that could not be CHECKED fails the
+                      // whole patch closed rather than being skipped.
+                      auto final_members_resolved =
+                          resolve_member_values(scim_store, final_members_raw);
+                      if (!final_members_resolved.has_value()) {
+                          spdlog::error("ScimRoutes: PATCH Groups — could not resolve every "
+                                       "member for group scim_id={}; refusing the patch "
+                                       "(fail-closed, would persist a partial set)",
+                                       id);
+                          send_scim_error(res, 503, "membership unavailable");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
+                               "member resolution unavailable", "Group");
+                          record_request(auth_mgr, "group_patch", 503);
+                          return;
+                      }
+                      final_members = *final_members_resolved;
 
                       const std::string pre_update_display_name = current->display_name;
                       final_display = patch.display_name.value_or(current->display_name);

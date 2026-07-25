@@ -3378,4 +3378,140 @@ TEST_CASE("Groups integration: PUT persist failure leaves displayName, membershi
     CHECK(found_failure);
 }
 
+// ── 2026-07-25 review HIGH #3 + Hermes MEDIUM: ROUTE-level fail-closed ──────
+//
+// The store-layer tests prove the reads return nullopt on failure. These prove
+// the ROUTES act on it. Without them the route-level nullopt checks could be
+// reverted and every other test in this file would still pass (Hermes pass 1,
+// MEDIUM) — the fix would silently regress into the exact durable-membership-
+// loss bug it was written to close.
+//
+// Fault injection is a REVERSIBLE rename rather than a DROP, so each test can
+// assert both halves of the contract: the request fails closed with 503, AND
+// the real membership is still intact afterwards.
+
+namespace {
+
+void hide_membership_table(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(),
+        "ALTER TABLE scim_store.scim_group_members RENAME TO scim_group_members_hidden")};
+    REQUIRE(r.ok());
+}
+
+void restore_membership_table(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(),
+        "ALTER TABLE scim_store.scim_group_members_hidden RENAME TO scim_group_members")};
+    REQUIRE(r.ok());
+}
+
+// Provision a user + a group containing them; returns {user_scim_id, group_id}.
+std::pair<std::string, std::string>
+seed_group_with_member(Fixture& f, const std::string& username, const std::string& group_name) {
+    auto ur = f.post("/scim/v2/Users", {{"userName", username}});
+    REQUIRE(ur);
+    REQUIRE(ur->status == 201);
+    auto user_id = json::parse(ur->body)["id"].get<std::string>();
+
+    auto gr = f.post("/scim/v2/Groups",
+                     {{"displayName", group_name},
+                      {"members", json::array({json{{"value", user_id}}})}});
+    REQUIRE(gr);
+    REQUIRE(gr->status == 201);
+    auto group_id = json::parse(gr->body)["id"].get<std::string>();
+    return {user_id, group_id};
+}
+
+} // namespace
+
+TEST_CASE("ScimRoutes: PATCH Groups fails closed and preserves membership when the membership "
+          "read is unavailable",
+          "[pg][scim][routes][failclosed]") {
+    Fixture f;
+    auto [user_id, group_id] = seed_group_with_member(f, "patchfc", "PatchFailClosed");
+
+    hide_membership_table(f.auth_db.dsn());
+
+    // The fold would otherwise start from an empty set and COMMIT it,
+    // wiping the real membership.
+    auto res = f.patch("/scim/v2/Groups/" + group_id,
+                       {{"Operations",
+                         json::array({json{{"op", "add"},
+                                           {"path", "members"},
+                                           {"value", json::array({json{{"value", "ghost"}}})}}})}});
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    restore_membership_table(f.auth_db.dsn());
+
+    auto members = f.scim_store->list_group_member_user_scim_ids(group_id);
+    REQUIRE(members.has_value());
+    REQUIRE(members->size() == 1);
+    CHECK((*members)[0] == user_id); // untouched
+}
+
+TEST_CASE("ScimRoutes: PUT Groups fails closed when the membership snapshot is unavailable",
+          "[pg][scim][routes][failclosed]") {
+    Fixture f;
+    auto [user_id, group_id] = seed_group_with_member(f, "putfc", "PutFailClosed");
+
+    hide_membership_table(f.auth_db.dsn());
+
+    auto res = f.put("/scim/v2/Groups/" + group_id,
+                     {{"displayName", "PutFailClosedRenamed"}, {"members", json::array()}});
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    restore_membership_table(f.auth_db.dsn());
+
+    // Neither the rename nor the membership replace was applied.
+    auto grp = f.scim_store->get_group_by_id(group_id);
+    REQUIRE(grp.has_value());
+    CHECK(grp->display_name == "PutFailClosed");
+    auto members = f.scim_store->list_group_member_user_scim_ids(group_id);
+    REQUIRE(members.has_value());
+    CHECK(members->size() == 1);
+}
+
+TEST_CASE("ScimRoutes: DELETE Groups fails closed when the membership snapshot is unavailable",
+          "[pg][scim][routes][failclosed]") {
+    Fixture f;
+    auto [user_id, group_id] = seed_group_with_member(f, "delfc", "DeleteFailClosed");
+
+    hide_membership_table(f.auth_db.dsn());
+
+    // Deleting without the snapshot would leave former members holding a role
+    // this group conferred, with no group left to justify it.
+    auto res = f.del("/scim/v2/Groups/" + group_id);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    restore_membership_table(f.auth_db.dsn());
+    CHECK(f.scim_store->get_group_by_id(group_id).has_value()); // still there
+}
+
+TEST_CASE("ScimRoutes: GET Groups fails closed rather than rendering an empty members[]",
+          "[pg][scim][routes][failclosed]") {
+    Fixture f;
+    auto [user_id, group_id] = seed_group_with_member(f, "getfc", "GetFailClosed");
+
+    hide_membership_table(f.auth_db.dsn());
+
+    // A 200 with `members: []` would tell the IdP the group is empty, and a
+    // reconciling connector could then "restore" that emptiness.
+    auto single = f.get("/scim/v2/Groups/" + group_id);
+    REQUIRE(single);
+    CHECK(single->status == 503);
+    auto listed = f.get("/scim/v2/Groups");
+    REQUIRE(listed);
+    CHECK(listed->status == 503);
+
+    restore_membership_table(f.auth_db.dsn());
+}
+
 #endif // YUZU_SCIM_TSAN_BUILD

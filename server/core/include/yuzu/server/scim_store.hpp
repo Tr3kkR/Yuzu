@@ -124,6 +124,22 @@ public:
                                                 const std::string& external_id = {});
 
     std::optional<ScimResource> get_by_scim_id(const std::string& scim_id) const;
+
+    /// Tri-state existence check: `true` = a resource with this `scim_id`
+    /// exists, `false` = it definitively does not, `nullopt` = the store
+    /// could not answer (closed, lease timeout, failed statement).
+    ///
+    /// ★ SECURITY (2026-07-25 Hermes pass, MEDIUM): `get_by_scim_id` collapses
+    /// "no such resource" and "read failed" into the same `nullopt`, which is
+    /// harmless for a plain lookup but NOT for group-membership resolution:
+    /// `resolve_member_values` treats an unresolvable id as validate-and-skip,
+    /// so on a transient blip a genuinely-provisioned member is dropped and
+    /// the PUT/PATCH handler then persists the SMALLER set — a partial version
+    /// of the durable membership loss the tri-state membership reads fix. Use
+    /// this (not `get_by_scim_id().has_value()`) anywhere a negative answer
+    /// feeds a write. Deliberately additive: `get_by_scim_id`'s many read-only
+    /// call sites keep their existing contract.
+    std::optional<bool> resource_exists(const std::string& scim_id) const;
     std::optional<ScimResource> get_by_username(const std::string& username) const;
 
     /// Empty `external_id` always returns `nullopt` (an empty externalId is
