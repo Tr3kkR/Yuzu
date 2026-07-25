@@ -19,7 +19,9 @@
   it is built best-effort outside the migration runner, so a failure to create it
   degrades retention to full scans instead of taking the audit trail offline.
 
-- **Behaviour change:** audit retention is now a floor, not a ceiling. Reducing
-  `--audit-retention-days` no longer frees disk immediately -- the cut expires the
-  whole old window at once, which the guard declines once and then drains at
-  25,000 rows/hour.
+- **Behaviour change:** audit retention is now a floor, not a ceiling. Expired rows
+  age out at up to 25,000 per hourly pass instead of all at once, so a large backlog
+  clears over hours rather than in a single statement. (Reducing
+  `--audit-retention-days` never expired existing rows in the first place --
+  `ttl_expires_at` is stamped at INSERT and is never rewritten -- so a reduction
+  still does not reclaim disk retroactively.)

@@ -346,12 +346,15 @@ refuses to act on that:
 
 - **It declines a pass that would expire every datable row**, logs a warning,
   and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
-  applies when more than a whole retention window of wall-clock time has
-  elapsed since the previous pass; that elapsed-time reading is persisted, so
-  it still fires on the first pass after a restart --- including a server that
-  *booted* with an already-wrong clock. The decline is latched, so an audit
-  table that is *legitimately* all-expired still ages out --- it just costs one
-  cleanup interval first.
+  applies when the gap since the previous pass exceeds a threshold (the
+  retention window, floored at 7 days), or when the stored reading is *ahead* of
+  the current clock. That reading is persisted, so the check still fires on the
+  first pass after a restart --- including a server that *booted* with an
+  already-wrong clock. The floor matters: elapsed time cannot distinguish a
+  clock jump from an outage, so on a short retention setting an unfloored check
+  would report every maintenance window as a clock anomaly. The decline is
+  latched, so an audit table that is *legitimately* all-expired still ages out
+  --- it just costs one cleanup interval first.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
   default), oldest first. A wipe the guard chose to allow therefore ages out at
   a paced rate an operator can still catch, rather than in one statement.
@@ -383,6 +386,8 @@ first two:
 | `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. |
+| `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is

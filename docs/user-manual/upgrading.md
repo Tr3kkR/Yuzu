@@ -757,15 +757,16 @@ clock, so one forward clock step could wipe a store in a single statement. They
 are now guarded and capped. Two operator-visible consequences on upgrade:
 
 - **Audit retention is now a floor, not a ceiling.** A pass that would expire
-  every datable row declines once and then drains at 25,000 rows per hourly pass.
-  Reducing `--audit-retention-days` therefore no longer frees disk immediately:
-  the cut expires the whole old window at once, and a 365→30 day cut on a
-  5-million-row table drains over roughly a week. Watch
-  `yuzu_server_audit_retention_cap_reached_total` and
-  `yuzu_server_audit_rows_deleted_total` while it drains. Full behaviour:
+  every datable row declines once, and every accepted pass is capped at 25,000
+  rows, so a large backlog ages out over hours rather than in one statement.
+  Watch `yuzu_server_audit_retention_cap_reached_total` alongside
+  `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
+  Note that changing `--audit-retention-days` never re-dates existing rows
+  (`ttl_expires_at` is stamped at INSERT), so a reduction does not reclaim disk
+  retroactively. Full behaviour:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
-- **`audit_store` gains schema v3** (a two-row `audit_retention_meta` table for
-  the durable clock reading — instant) plus the best-effort index build described
+- **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
+  table holding the durable clock reading — one row, instant) plus the best-effort index build described
   under Schema Migrations above.
 - **Agents surface new `tar status` lines** (`retention_guard_declines_total`,
   `retention_guard_failures_total`, and per-table detail). Existing consumers

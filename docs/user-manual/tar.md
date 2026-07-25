@@ -427,11 +427,15 @@ A retention pass therefore refuses to act on that:
 
 - **It declines a pass that would delete every datable row of a table**, and
   counts the decline. The same applies when more wall-clock time than that
-  table's whole retention window has elapsed since the previous pass; that
-  reading is persisted in `tar_config`, so it still fires on the first pass
-  after an agent restart -- including an agent that *booted* with a wrong RTC.
-  The decline is latched per table, so a warehouse that is legitimately
-  all-expired still ages out -- it just costs one rollup tick (900 s) first.
+  table's retention window -- floored at 30 days -- has elapsed since the
+  previous pass, or when the stored reading is *ahead* of the current clock.
+  That reading is persisted in `tar_config`, so it still fires on the first pass
+  after an agent restart, including an agent that *booted* with a wrong RTC.
+  **The floor is why an endpoint that was simply switched off does not report a
+  clock anomaly**: elapsed time cannot tell a jump from a dark laptop, and the
+  shortest window here is 24 hours. The decline is latched per table, so a
+  warehouse that is legitimately all-expired still ages out -- it just costs one
+  rollup tick (900 s) first.
 - **Every accepted pass deletes at most 5,000 rows per table**, oldest first
   (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
   A wipe the guard chose to allow ages out at a paced rate rather than in one
@@ -465,7 +469,9 @@ and `retention_guard_failed|<table>|<n>` lines) in the `status` action, describe
 above. A non-zero declines total means that endpoint's clock moved in a way that
 would have wiped its forensic window; check the host's time synchronisation. A
 non-zero failures total means retention has stopped for that table for a reason
-that is not the clock. Retention resumes automatically, paced, once the
+that is not the clock -- either its row counts could not be read, or its delete
+failed (a failed transaction rolls back every table's delete, so all of them are
+reported). Retention resumes automatically, paced, once the
 condition clears.
 
 > **Upgrade note (device perf sampling; per-app sampling is opt-in).** On

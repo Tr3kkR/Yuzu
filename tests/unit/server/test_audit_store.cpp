@@ -555,17 +555,25 @@ TEST_CASE("AuditStore #2360: a sub-window forward jump is caught by the step che
     // survivors behind, which the per-pass cap would bound but nothing would
     // report. The step check is what turns that into an operator signal.
     GuardFixture f;
-    const std::int64_t later = kNow + kWindow + 1;
+    // Past the FLOOR (kAuditMinBigStepSec), not merely past the 1-day retention
+    // window: elapsed time cannot tell a jump from an outage, so the check only
+    // fires past a duration where an outage is itself remarkable.
+    const std::int64_t later = kNow + kAuditMinBigStepSec + 1;
 
+    // A survivor must sit INSIDE the datable horizon of the reading it is meant
+    // to survive -- a row beyond `now + window + slack` is treated as
+    // forward-skewed and excluded, which would make the pass decline for the
+    // wrong reason. So each reading gets its own.
     f.seed(kNow - 100, 5);   // expired at both readings
-    f.seed(later + 10, 1);   // a survivor at BOTH readings, so `would_wipe` stays false
+    f.seed(kNow + kWindow, 1); // survivor for pass 1
     REQUIRE(f.store.cleanup_once(kNow) == 5);
     REQUIRE(f.store.clock_anomaly_skips_count() == 0);
 
-    f.seed(kNow - 50, 5); // more expired rows for the jumped pass to find
+    f.seed(kNow - 50, 5);       // more expired rows for the jumped pass to find
+    f.seed(later + kWindow, 1); // survivor for pass 2, so only the STEP can fire
     CHECK(f.store.cleanup_once(later) == 0);
     CHECK(f.store.clock_anomaly_skips_count() == 1);
-    CHECK(f.store.total_count() == 6); // nothing deleted on the declining pass
+    CHECK(f.store.total_count() == 7); // nothing deleted on the declining pass
 }
 
 TEST_CASE("AuditStore #2360: an ordinary over-cap backlog does NOT arm the latch",
@@ -796,7 +804,7 @@ TEST_CASE("AuditStore #2360: the clock-step check survives a restart",
     // test cannot see anything wrong.
     AuditStore second(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
     REQUIRE(second.is_open());
-    const std::int64_t jumped = kNow + kWindow + 1;
+    const std::int64_t jumped = kNow + kAuditMinBigStepSec + 1;
     seed_rows_with_ttl(tmp.path, kNow + 10, 5);       // expired at the new reading
     seed_rows_with_ttl(tmp.path, jumped + 3'600, 1);  // survivor at the new reading
 
@@ -842,4 +850,56 @@ TEST_CASE("AuditStore #2360: a cap-bound pass is counted, not just logged",
     CHECK(f.store.cleanup_once(kNow + 1) == kSurplus);
     CHECK(f.store.cap_reached_count() == 1);
     CHECK(f.store.rows_deleted_count() == kMaxAuditDeletesPerPass + kSurplus);
+}
+
+TEST_CASE("AuditStore #2360: an ordinary outage below the floor is not a clock anomaly",
+          "[audit_store][retention][clock-guard]") {
+    // Governance UP-2. Elapsed time cannot distinguish a forward clock jump from
+    // the server simply not having run. With a short retention setting, an
+    // unfloored check reports every maintenance window as a clock anomaly, which
+    // destroys the signal. The gap here is far past the 1-day retention window
+    // but below the floor, so it must stay silent.
+    GuardFixture f;
+    const std::int64_t later = kNow + kAuditMinBigStepSec - 3'600;
+
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1);
+    REQUIRE(f.store.cleanup_once(kNow) == 5);
+
+    f.seed(kNow - 50, 5);
+    f.seed(later + kWindow, 1);
+    // 6, not 5: pass 1's survivor is itself expired by `later`, so it joins the
+    // backlog. The point is that the pass DELETED rather than declined.
+    CHECK(f.store.cleanup_once(later) == 6);
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+}
+
+TEST_CASE("AuditStore #2360: a stored reading ahead of the clock is an anomaly, and self-heals",
+          "[audit_store][retention][clock-guard]") {
+    // Governance UP-1. The reading is durable state in the same database as the
+    // evidence, so it can come back corrupt, hand-edited, or stamped by an
+    // earlier pass that ran while the clock was skewed forward. Unsanitised,
+    // `now - prev` stays negative until real time catches up -- potentially years
+    // -- silently killing the only detector that survives a restart. INT64_MAX
+    // would make that subtraction signed-overflow UB.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-poison-"}};
+    {
+        // Create the schema first; the raw seeding connection needs the table.
+        AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1); // survivor: only the reading is wrong
+    exec_raw(tmp.path, "INSERT INTO audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', 9223372036854775807) "
+                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    CHECK(store.cleanup_once(kNow) == 0);              // declines rather than trusting it
+    CHECK(store.clock_anomaly_skips_count() == 1);
+
+    // Re-anchored on the current reading, so the next pass proceeds normally.
+    CHECK(store.cleanup_once(kNow + 1) == 5);
+    CHECK(store.clock_anomaly_skips_count() == 1);
 }

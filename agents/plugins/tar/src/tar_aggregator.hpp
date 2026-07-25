@@ -103,6 +103,17 @@ inline constexpr int64_t kTarRetentionFutureSlackSec = 24 * 3600;
 // never sits permanently set. Sized as a drain rate, not a batch guess.
 inline constexpr int64_t kMaxTarDeletesPerTablePerPass = 5000;
 
+// Floor for the elapsed-time check. Elapsed wall time cannot distinguish a
+// forward clock jump from the agent simply not having run, and on an ENDPOINT
+// not-having-run is routine: the shortest time-based window here is 24h, so
+// without a floor every laptop switched off over a weekend, every suspended VM
+// and every upgrade window longer than a day would report a clock anomaly and
+// destroy the fleet signal this counter exists to carry. 30 days is past the
+// point where an endpoint being dark is itself worth noticing, while still
+// catching the cases that motivate the guard (a dead CMOS reporting 1970, a
+// restored snapshot) by orders of magnitude.
+inline constexpr int64_t kTarMinBigStepSec = 30 * 86400;
+
 /**
  * Per-table clock-guard state for time-based retention. Owned by the plugin and
  * passed into every `run_retention` call so the latch survives across passes.
@@ -135,10 +146,11 @@ struct RetentionGuardState {
     /// whose probes fail every pass has silently stopped being retained, and a
     /// declines-only surface reports that as "this endpoint's clock is fine".
     std::map<std::string, int64_t> failures;
-    /// The `now_epoch` the previous pass saw, mirrored from the durable
-    /// `retention_guard_last_pass` config row. 0 means no pass has ever run
-    /// against this database, which suppresses the "clock moved Ns" wording.
-    int64_t last_pass_now{0};
+    /// Cumulative delete/commit failures per table. Separate from `failures`
+    /// (which counts unreadable probes) only in cause, not in meaning: both say
+    /// "this table is not being retained", which is why the status surface sums
+    /// them into one total.
+    std::map<std::string, int64_t> delete_failures;
 };
 
 /// Snapshot of the operator-facing counters, taken under `RetentionGuardState::mu`.

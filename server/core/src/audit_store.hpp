@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -113,6 +114,15 @@ inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86400;
 // exists for, so over-retaining is the safe direction.
 inline constexpr std::size_t kMaxAuditDeletesPerPass = 25000;
 
+// Floor for the elapsed-time check. The check asks "did more than a retention
+// window pass since the last cleanup?", which on a 365-day default is a sound
+// proxy for a clock jump. On a SHORT retention setting it is not: with
+// `--audit-retention-days 1`, any ordinary outage over a day -- a maintenance
+// window, a restore, a host that was simply off -- looks identical to a clock
+// jump and would report one. Elapsed time cannot distinguish those, so the check
+// only fires past a duration where a real outage is itself remarkable.
+inline constexpr std::int64_t kAuditMinBigStepSec = 7 * 86400;
+
 class AuditStore {
 public:
     explicit AuditStore(const std::filesystem::path& db_path, int retention_days = 365,
@@ -189,6 +199,20 @@ public:
         return cap_reached_.load(std::memory_order_relaxed);
     }
 
+    /// 1 while the retention index exists, 0 if it could not be built. Without
+    /// it every pass full-scans `audit_events` under the exclusive lock every
+    /// audit write needs, and that cost grows with the table -- so this is the
+    /// one signal that says the pass's bounded lock hold is no longer bounded.
+    bool retention_index_ok() const noexcept {
+        return retention_index_ok_.load(std::memory_order_relaxed);
+    }
+
+    /// Cumulative failures to persist the retention clock reading. A sustained
+    /// non-zero rate means the restart-surviving half of the guard is degraded.
+    uint64_t persist_failed_count() const noexcept {
+        return persist_failed_.load(std::memory_order_relaxed);
+    }
+
     /// Run exactly ONE retention pass against `now` (epoch seconds) and return
     /// the number of rows deleted. Returns 0 when the pass declined (clock
     /// guard), when nothing was expired, or when the pass failed.
@@ -225,6 +249,8 @@ private:
     std::atomic<uint64_t> cleanup_failed_{0};
     std::atomic<uint64_t> rows_deleted_{0};
     std::atomic<uint64_t> cap_reached_{0};
+    std::atomic<uint64_t> persist_failed_{0};
+    std::atomic<bool> retention_index_ok_{true};
     // Guard state for cleanup_once(). Plain (non-atomic) members: both are read
     // and written only under the exclusive mtx_ that cleanup_once() holds for
     // the whole pass, and no accessor exposes them.
@@ -242,7 +268,7 @@ private:
     // process, so a server that BOOTS with an already-wrong clock would never
     // see a step at all. Zero still means "no comparison point", which
     // suppresses the "clock moved Ns" wording (it would print the Unix epoch).
-    std::int64_t last_pass_now_{0};
+    std::optional<std::int64_t> last_pass_now_;
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
@@ -258,7 +284,7 @@ private:
     /// Durable guard state in `audit_retention_meta`. `load_meta` returns 0 for
     /// an absent key or any read error (indistinguishable, and both correctly
     /// mean "no comparison point"). Caller holds `mtx_` for `store_meta`.
-    std::int64_t load_meta(const char* key) const;
+    std::optional<std::int64_t> load_meta(const char* key) const;
     bool store_meta(const char* key, std::int64_t value);
     /// The accepted, capped delete. Caller holds `mtx_`. On failure returns 0
     /// and sets `out_err`; the caller logs it after releasing the lock.

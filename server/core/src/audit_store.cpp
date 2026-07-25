@@ -91,7 +91,7 @@ void AuditStore::create_tables() {
         // exists for. The per-table decline latch is deliberately NOT persisted:
         // re-declining once after a restart is the safe direction.
         //
-        // Two rows at most, written once per cleanup interval. Nothing here is
+        // One row today, written once per cleanup interval. Nothing here is
         // O(table size), so it is safe inside the startup migration transaction.
         {3, R"(
             CREATE TABLE IF NOT EXISTS audit_retention_meta (
@@ -140,6 +140,12 @@ void AuditStore::ensure_retention_index() {
     if (rc != SQLITE_OK) {
         // Degraded, not broken: retention still runs, just with full scans under
         // the store lock. Surfaced loudly so it is not mistaken for healthy.
+        // Counted, not just logged. Without the index every hourly pass full-scans
+        // audit_events under the exclusive lock that every audit write needs, and
+        // that cost GROWS with the table -- turning a bounded ~315ms/hour hold
+        // into an unbounded one, silently. This is the one failure that
+        // invalidates the "latency, not availability" property of the whole pass.
+        retention_index_ok_.store(false, std::memory_order_relaxed);
         spdlog::error("AuditStore: could not create idx_audit_ttl_id ({}); retention will run "
                       "WITHOUT its index and each pass will scan audit_events",
                       err ? err : "unknown error");
@@ -153,17 +159,22 @@ void AuditStore::ensure_retention_index() {
                      ms);
 }
 
-std::int64_t AuditStore::load_meta(const char* key) const {
+std::optional<std::int64_t> AuditStore::load_meta(const char* key) const {
     if (!db_)
-        return 0;
+        return std::nullopt;
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_, "SELECT value FROM audit_retention_meta WHERE key = ?", -1,
                            stmt.addr(), nullptr) != SQLITE_OK)
-        return 0;
+        return std::nullopt;
     sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW)
         return sqlite3_column_int64(stmt.get(), 0);
-    return 0;
+    // Absent row and read error are both "no comparison point". Returning an
+    // optional rather than 0 matters because 0 is a LEGITIMATE reading: a dead
+    // CMOS reporting the Unix epoch is the motivating case for this whole guard,
+    // and collapsing it into the sentinel would suppress the check on the very
+    // pass after NTP corrects.
+    return std::nullopt;
 }
 
 bool AuditStore::store_meta(const char* key, std::int64_t value) {
@@ -488,8 +499,17 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     // What this pass wants logged, filled in under the lock and emitted after it
     // is released: spdlog formatting is neither cheap nor bounded, and every
     // audit log() blocks on this same exclusive lock.
-    enum class Emit { None, ProbeFailed, DeclineFirstPass, DeclineStep, Deleted, DeleteFailed };
+    enum class Emit {
+        None,
+        ProbeFailed,
+        DeclineFirstPass,
+        DeclineStep,
+        DeclineBackward,
+        Deleted,
+        DeleteFailed
+    };
     Emit emit = Emit::None;
+    bool emit_persist_failed = false;
     std::string emit_err;
     std::size_t deleted = 0;
     std::int64_t emit_delta = 0, emit_window = 0;
@@ -498,10 +518,13 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     {
         std::unique_lock lock(mtx_);
         if (!db_) {
-            // Not a clock anomaly: the store never opened, or a migration failed
-            // and closed it. Retention has stopped permanently, so it must be
-            // counted -- otherwise both counters sit at zero forever and an
-            // ever-growing audit.db reads as a healthy guard.
+            // Defensive only, and deliberately NOT the production signal for a
+            // closed store: start_cleanup() early-returns when db_ is null, so no
+            // thread ever reaches this in a running server. A store closed by a
+            // failed migration surfaces through log()'s emit_failed_ counter and
+            // /healthz, not here. Counted anyway so a direct caller (a test, or a
+            // future scheduler that does not check is_open()) is not silently
+            // told the pass succeeded.
             cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
@@ -522,11 +545,33 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // started. Held in memory alone it compares against zero on the first
         // pass and never fires -- exactly the dead-CMOS-at-boot case. A failed
         // write is not fatal: it costs the NEXT restart its comparison point.
-        const std::int64_t prev_pass_now = last_pass_now_;
+        const std::optional<std::int64_t> raw_prev = last_pass_now_;
         last_pass_now_ = now;
-        if (!store_meta(kLastPassNowKey, now))
-            spdlog::warn("AuditStore: could not persist the retention clock reading; a restart "
-                         "before the next pass will lose its clock-step comparison point");
+        if (!store_meta(kLastPassNowKey, now)) {
+            emit_persist_failed = true;
+            // The restart-surviving half of the guard silently degrades if this
+            // keeps failing, so it gets a counter rather than a log line only.
+            persist_failed_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // SANITISE the reading before doing arithmetic on it. It is durable
+        // state in the same database as the evidence, so it can come back
+        // corrupt, hand-edited, or -- far more mundanely -- stamped by an
+        // earlier pass that ran while the clock was skewed FORWARD. Any of those
+        // leaves `prev > now`, which would make `now - prev` negative for as long
+        // as real time takes to catch up (potentially years), silently killing
+        // the only detector that survives a restart. An INT64_MAX value would
+        // make the subtraction signed-overflow UB outright.
+        //
+        // A reading from the future is itself evidence the clock moved, so it is
+        // treated as an anomaly rather than discarded quietly, and `now` is
+        // persisted above either way so the state self-heals on this pass.
+        std::optional<std::int64_t> prev_pass_now = raw_prev;
+        bool prev_from_future = false;
+        if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now)) {
+            prev_from_future = *prev_pass_now > now;
+            prev_pass_now.reset();
+        }
 
         // Detect by OUTCOME rather than by a clock delta alone, because the
         // outcome test needs no history and so survives a restart with an empty
@@ -592,15 +637,26 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // otherwise report. Persisted across restarts (see above), so unlike
             // the outcome test it still fires when a write has already landed
             // after the jump.
-            const bool big_step = prev_pass_now != 0 && window > 0 && now - prev_pass_now > window;
-            emit_delta = prev_pass_now == 0 ? 0 : now - prev_pass_now;
-            emit_window = window;
+            //
+            // The threshold is floored (kAuditMinBigStepSec). Elapsed time cannot
+            // tell a clock jump from an outage, so on a SHORT retention setting
+            // an ordinary maintenance window would report as a clock anomaly. The
+            // check only fires past a duration where an outage is itself
+            // remarkable -- and the warn text names both causes, because this
+            // signal genuinely cannot distinguish them.
+            const std::int64_t step_threshold = std::max(window, kAuditMinBigStepSec);
+            const bool big_step =
+                prev_pass_now && window > 0 && now - *prev_pass_now > step_threshold;
+            emit_delta = prev_pass_now ? now - *prev_pass_now : 0;
+            emit_window = step_threshold;
             emit_full_wipe = would_wipe;
 
-            if ((would_wipe || big_step) && !clock_anomaly_latched_) {
+            if ((would_wipe || big_step || prev_from_future) && !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 clock_anomaly_latched_ = true;
-                emit = prev_pass_now == 0 ? Emit::DeclineFirstPass : Emit::DeclineStep;
+                emit = prev_from_future  ? Emit::DeclineBackward
+                       : !prev_pass_now  ? Emit::DeclineFirstPass
+                                         : Emit::DeclineStep;
             } else {
                 deleted = delete_capped_locked(now, would_wipe, emit_err);
                 if (!emit_err.empty())
@@ -613,8 +669,16 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         }
     } // lock released before any formatting
 
+    if (emit_persist_failed)
+        spdlog::warn("AuditStore: could not persist the retention clock reading; a restart before "
+                     "the next pass will lose its clock-step comparison point");
     switch (emit) {
     case Emit::None:
+        break;
+    case Emit::DeclineBackward:
+        spdlog::warn("AuditStore: the stored retention clock reading is AHEAD of the current "
+                     "clock, so this server's clock moved backward or that state was tampered "
+                     "with; declining once and re-anchoring on the current reading");
         break;
     case Emit::ProbeFailed:
         spdlog::warn("AuditStore: retention probe failed ({}); skipping this pass", emit_err);
@@ -628,9 +692,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                      "wholesale");
         break;
     case Emit::DeclineStep:
-        spdlog::warn("AuditStore: this retention pass would expire {} (clock moved {}s since the "
-                     "last pass, retention window {}s); declining once so a clock anomaly cannot "
-                     "delete the audit trail wholesale",
+        spdlog::warn("AuditStore: this retention pass would expire {} ({}s since the last pass, "
+                     "threshold {}s -- a forward clock jump OR an outage that long); declining "
+                     "once so a clock anomaly cannot delete the audit trail wholesale",
                      emit_full_wipe ? "EVERY datable audit row" : "an unexpectedly large slice",
                      emit_delta, emit_window);
         break;

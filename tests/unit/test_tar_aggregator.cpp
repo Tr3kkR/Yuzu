@@ -979,18 +979,24 @@ TEST_CASE("TAR #2361: a sub-window forward jump is caught by the step check",
     // retention window. A jump of just over one window expires a large slice
     // while leaving survivors, which the cap bounds but nothing would report.
     TarGuardFixture f;
-    const int64_t later = kT0 + kHourlyCutoffSec + 1;
+    // Past the FLOOR (kTarMinBigStepSec), not merely past the 24h window: on an
+    // endpoint, a day of downtime is routine and must not report as a clock jump.
+    const int64_t later = kT0 + yuzu::tar::kTarMinBigStepSec + 1;
 
+    // Each reading needs its OWN survivor inside its datable horizon: a row
+    // beyond `now + slack` is treated as forward-skewed and excluded, so reusing
+    // one row would make the first pass decline for the wrong reason.
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // expired at both readings
-    seed_process_hourly_at(*f.db, later - 60, 1); // survivor at BOTH readings
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);                  // survivor for pass 1
     run_retention(*f.db, kT0, f.guard);
     REQUIRE(row_count(*f.db, "process_hourly") == 1);
     REQUIRE(declines_of(f.guard, "process_hourly") == 0);
 
     seed_process_hourly_at(*f.db, kT0 - 9 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, later - 3600, 1); // survivor for pass 2
     run_retention(*f.db, later, f.guard);
 
-    CHECK(row_count(*f.db, "process_hourly") == 6); // nothing deleted
+    CHECK(row_count(*f.db, "process_hourly") == 7); // nothing deleted
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
@@ -1172,7 +1178,7 @@ TEST_CASE("TAR #2361: the clock-step check survives an agent restart",
 
     // Agent restarts: brand-new in-memory guard state, same database.
     yuzu::tar::RetentionGuardState fresh;
-    const int64_t jumped = kT0 + kHourlyCutoffSec + 1;
+    const int64_t jumped = kT0 + yuzu::tar::kTarMinBigStepSec + 1;
     seed_process_hourly_at(*f.db, kT0 - 9 * kHourlyCutoffSec, 5); // expired at the new reading
     seed_process_hourly_at(*f.db, jumped - 60, 1);                // survivor at the new reading
 
@@ -1258,4 +1264,89 @@ TEST_CASE("TAR #2361: every registered granularity declares the ts column its su
             CHECK(declared);
         }
     }
+}
+
+TEST_CASE("TAR #2361: an endpoint that was simply switched off is not a clock anomaly",
+          "[tar][retention][clock-guard]") {
+    // Governance UP-2, and the one that mattered most on the agent side: the
+    // shortest time-based window here is 24h, so without a floor every laptop off
+    // over a weekend, every suspended VM and every upgrade window longer than a
+    // day would report "this endpoint's clock moved" and make the fleet-wide
+    // decline counter meaningless.
+    TarGuardFixture f;
+    const int64_t later = kT0 + 3 * 86400; // a long weekend, far past the 24h window
+
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
+    run_retention(*f.db, kT0, f.guard);
+    REQUIRE(declines_of(f.guard, "process_hourly") == 0);
+
+    seed_process_hourly_at(*f.db, kT0 - 9 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, later - 3600, 1);
+    run_retention(*f.db, later, f.guard);
+
+    CHECK(declines_of(f.guard, "process_hourly") == 0); // silent, as it must be
+}
+
+TEST_CASE("TAR #2361: a poisoned last-pass reading declines once and re-anchors",
+          "[tar][retention][clock-guard]") {
+    // Governance UP-1. `tar_config` sits on a device the user may control, so a
+    // far-future value is both a tampering vector and an ordinary consequence of
+    // a pass that ran under a forward-skewed clock. Either way it must not be
+    // trusted into arithmetic.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: only the reading is wrong
+    f.db->set_config("retention_guard_last_pass", "9223372036854775807");
+
+    run_retention(*f.db, kT0, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+    CHECK(row_count(*f.db, "process_hourly") == 6); // nothing deleted
+
+    run_retention(*f.db, kT0 + 1, f.guard); // re-anchored, proceeds normally
+    CHECK(row_count(*f.db, "process_hourly") == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+}
+
+TEST_CASE("TAR #2361: pausing a source clears its latches so the guard is not spent",
+          "[tar][retention][clock-guard][issue539]") {
+    // Governance UP-9. The #539 gate skips a paused source before any guard
+    // bookkeeping, so a latch armed by a live anomaly used to survive the pause
+    // untouched -- and the first pass after the operator re-enabled the source
+    // would delete capped, with no decline, no counter and no warn, even though
+    // the anomaly was still live.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, latch armed
+    REQUIRE(latched_of(f.guard, "process_hourly"));
+
+    f.db->set_config("process_enabled", "false");
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // cleared while paused
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+
+    f.db->set_config("process_enabled", "true");
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 20); // declines again, not deletes
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+}
+
+TEST_CASE("TAR #2361: a failed delete is counted, so the totals stay honest",
+          "[tar][retention][clock-guard]") {
+    // Governance UP-3 / consistency B2: the third call site the first hardening
+    // round did not sweep. The docs promise that a zero declines total only means
+    // the clock is fine IF the failures total is also zero -- which was false
+    // while a DELETE could fail every pass and increment nothing.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: the pass is accepted
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 6);     // nothing removed
+    CHECK(failures_of(f.guard, "process_hourly") >= 1); // and it is reported
+    CHECK(declines_of(f.guard, "process_hourly") == 0); // not misreported as a clock anomaly
 }

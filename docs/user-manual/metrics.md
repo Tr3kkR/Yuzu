@@ -115,6 +115,8 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that **failed** on a database error, or ran against a closed store (a failed migration closes it), so `audit.db` grows without bound. |
 | `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
 | `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_index_ok` | gauge | `1` while the retention index exists. `0` means every cleanup pass full-scans `audit_events` under the exclusive store lock, and that cost grows with the table — the one condition that makes the pass's lock hold unbounded. Alert on `== 0`. |
+| `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
 
 The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical
