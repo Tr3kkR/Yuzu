@@ -699,17 +699,6 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                 }
                 bool point_read_failed = false;
                 for (const auto& key : evict) {
-                    // The per-key stop gate is kept on BOTH the in-memory and the fallback path
-                    // (not only the fallback, as an earlier shape had it): the count/byte
-                    // eviction path is uncapped by design, so an abnormally large evict set must
-                    // still let a stop truncate promptly (the surrounding code maintains that
-                    // posture throughout). The remainder is COUNTED, never silently dropped.
-                    if (stopping_.load(std::memory_order_acquire)) {
-                        evicted_unclassified_.fetch_add(evict.size() - classified,
-                                                        std::memory_order_relaxed);
-                        classified = evict.size();
-                        break;
-                    }
                     // Best-effort classification: a live entry may age out before its batch key
                     // exists, so absence of a sent-label != "never sent".
                     //
@@ -724,6 +713,19 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                     // diagnosing a spike should read it alongside `quarantined` rather than alone.
                     const std::string label = journal_sent_key_from_batch_key(key);
                     if (sent_keys) {
+                        // Scan-OK path (#2470): classification here is a pure in-memory set
+                        // lookup - no I/O, no unbounded per-key cost - so a mid-loop shutdown does
+                        // NOT truncate on this path. The remainder is fully determinable from the
+                        // already-materialized `sent_keys` at negligible cost, so every key is
+                        // classified to its TRUE disposition rather than lumping the tail into
+                        // evicted_unclassified_ (which the fleet HELP calls "PERMANENTLY UNKNOWN",
+                        // and which would leave evicted_without_send_evidence_ - the audit-gap
+                        // floor an auditor reads - looser than the data supports). The earlier
+                        // shape kept a per-key stop gate here too (Sol's L3 D1); the empirical
+                        // panel reverted it (#2470): shutdown-promptness on an abnormally large
+                        // evict set does not justify mislabeling determinable gaps, because these
+                        // lookups are cheap. The per-key stop gate lives on the FALLBACK path
+                        // ONLY, where each key is a KvStore round trip.
                         if (sent_keys->count(label))
                             evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
                         else
@@ -733,14 +735,24 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                             prune_classify_hook_(classified);
                         continue;
                     }
-                    // The scan failed. Fall back to a per-key read bounded by the evict set -
-                    // but a FALLIBLE one. exists() answers false for both "absent" and "the
-                    // read failed", and the read here fails for exactly the reason the scan just
-                    // did, so it would report a whole evict set as "no send evidence" - the
-                    // reading an operator is meant to treat as audit loss. A point error is
-                    // counted as a read failure AND classified as UNCLASSIFIED: an unknown
-                    // disposition is not evidence of absence, and it still belongs to a bucket
-                    // so the invariant holds.
+                    // The scan failed, so each remaining key now costs a KvStore round trip (I/O,
+                    // uncapped by the count/byte eviction path). ONLY here must a mid-loop shutdown
+                    // truncate promptly - and the remainder is genuinely undeterminable, because
+                    // the scan that would classify it already failed, so it is COUNTED as
+                    // unclassified, never silently dropped.
+                    if (stopping_.load(std::memory_order_acquire)) {
+                        evicted_unclassified_.fetch_add(evict.size() - classified,
+                                                        std::memory_order_relaxed);
+                        classified = evict.size();
+                        break;
+                    }
+                    // Fall back to a per-key read bounded by the evict set - but a FALLIBLE one.
+                    // exists() answers false for both "absent" and "the read failed", and the
+                    // read here fails for exactly the reason the scan just did, so it would report
+                    // a whole evict set as "no send evidence" - the reading an operator is meant to
+                    // treat as audit loss. A point error is counted as a read failure AND
+                    // classified as UNCLASSIFIED: an unknown disposition is not evidence of
+                    // absence, and it still belongs to a bucket so the invariant holds.
                     std::expected<std::optional<std::string>, KvStoreError> one;
                     if (inject_fail_prune_sent_reads_.load(std::memory_order_relaxed) > 0) { // test-only
                         inject_fail_prune_sent_reads_.fetch_sub(1, std::memory_order_relaxed);

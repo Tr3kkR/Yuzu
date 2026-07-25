@@ -563,12 +563,14 @@ TEST_CASE("eviction classification: a stop BEFORE classification counts the whol
           j.batches_pruned());
 }
 
-TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts the remainder",
+TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path classifies the whole set (#2470)",
           "[guardian][journal][prune]") {
-    // The per-key stop gate is kept on the in-memory (scan-OK) path too, not only the
-    // fallback: a stop lands after one classification, and the remaining two are counted as
-    // unclassified rather than dropped. Removing the gate would classify all three and leave
-    // unclassified at 0 - the mutation this test pins.
+    // #2470: on the scan-OK path classification is a pure in-memory set lookup - no I/O, no
+    // unbounded per-key cost - so a mid-loop shutdown does NOT truncate here. The remainder is
+    // fully determinable from the materialized scan, so every key is classified to its TRUE
+    // disposition (here: all unlabelled -> no_send_evidence) rather than lumping the tail into
+    // evicted_unclassified ("PERMANENTLY UNKNOWN"). The mutation this pins: re-adding a scan-OK
+    // stop gate would leave a non-zero unclassified.
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
@@ -576,7 +578,7 @@ TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts t
     persist_n_unmarked(j, t, 3); // all unlabelled -> each classifies as no_send_evidence
 
     j.set_prune_classify_hook_for_test([&](std::size_t classified) {
-        if (classified == 1) // after the first key is bucketed
+        if (classified == 1) // a shutdown lands after the first key is bucketed
             j.request_stop();
     });
 
@@ -584,9 +586,9 @@ TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts t
 
     CHECK(stats.evicted == 3);
     CHECK(j.batches_pruned() == 3);
-    CHECK(j.evicted_without_send_evidence() == 1); // the one classified before the stop
+    CHECK(j.evicted_without_send_evidence() == 3); // the stop is ignored; all three classify
     CHECK(j.evicted_sent_unacked() == 0);
-    CHECK(j.evicted_unclassified() == 2);          // the counted remainder
+    CHECK(j.evicted_unclassified() == 0);          // nothing lumped as "PERMANENTLY UNKNOWN"
     CHECK(j.prune_failures() == 0);                // scan succeeded - no read failure
     CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
               j.evicted_unclassified() ==
@@ -681,26 +683,30 @@ TEST_CASE("eviction classification: a read-failure's prune_failures survives a l
 TEST_CASE("eviction classification: sent, no-evidence, and unclassified all non-zero in one pass",
           "[guardian][journal][prune]") {
     // The three-way partition is only meaningfully exact if all three buckets can be non-zero
-    // simultaneously. A mixed evict set - one labelled, one unlabelled classified before a
-    // mid-loop stop - leaves the third key unclassified, exercising all three at once.
+    // simultaneously. Post-#2470 the scan-OK path never lumps a determinable key into
+    // unclassified, so the only way an unclassified key coexists with two classified ones in a
+    // single pass is the FALLBACK path (scan failed -> per-key reads) with one read failure.
+    // Fixture: 3 batches, the LAST-evicted one labelled; the sent-scan fails (fallback); the
+    // FIRST per-key read fails (-> unclassified), the other two reads succeed (one bare ->
+    // no_send_evidence, one labelled -> sent_unacked). evict iterates in key order, so the
+    // injected first-read failure lands on an unlabelled key, not on keys.back().
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100);
     auto keys = persist_n_unmarked(j, t, 3);
-    j.mark_batch_sent(keys.front()); // the first-evicted key carries a sent-label
-    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
-        if (classified == 2) // after the sent key and the unlabelled key are classified
-            j.request_stop();
-    });
+    j.mark_batch_sent(keys.back());                  // the LAST-evicted key carries a sent-label
+    j.inject_prune_sent_scan_failures_for_test(1);   // force the fallback per-key reads
+    j.inject_prune_sent_read_failures_for_test(1);   // ONLY the first per-key read fails
 
     const auto stats = j.prune(0);
 
     CHECK(stats.evicted == 3);
     CHECK(j.batches_pruned() == 3);
-    CHECK(j.evicted_sent_unacked() == 1);          // keys.front() had a label
-    CHECK(j.evicted_without_send_evidence() == 1); // the second, unlabelled
-    CHECK(j.evicted_unclassified() == 1);          // the third, cut off by the stop
+    CHECK(j.evicted_sent_unacked() == 1);          // keys.back() had a label, read OK
+    CHECK(j.evicted_without_send_evidence() == 1); // an unlabelled key, read OK
+    CHECK(j.evicted_unclassified() == 1);          // the first key, read failed
+    CHECK(j.prune_failures() == 1);                // the one read failure, counted once
     CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
               j.evicted_unclassified() ==
           j.batches_pruned());
