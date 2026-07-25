@@ -127,6 +127,13 @@ struct JournalPageStats {
     /// re-offering everything. Counted because that fallback is invisible otherwise: an agent
     /// whose scan fails every pass silently returns to the old redelivery floor (#2345 Gate 8).
     bool sent_scan_failed{false};
+    /// This pass could not read/establish replay state: the candidate scan failed, a considered
+    /// candidate's VALUE read failed, or the boot-prune barrier's own scan failed (the last
+    /// increments prune_failures_, not page_read_failures_, so it carries no counter signal of its
+    /// own). Distinct from deferred_no_token (no token) and sent_scan_failed (fell back but could
+    /// still page): a read_failed pass did NO verifiable replay work, so the drain worker's page
+    /// success stamp must not read it as fresh unless the pass also placed records (#2452).
+    bool read_failed{false};
 };
 
 /// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the

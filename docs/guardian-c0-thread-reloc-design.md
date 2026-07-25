@@ -585,7 +585,9 @@ Whichever PR flips `prefer_spark` MUST also:
    where the `mtx_` guard compiles out and a wedged worker is indistinguishable from an idle
    healthy one.~~ - **DONE** on branch `feat/guardian-journal-age-observability`:
    `yuzu.guardian_journal_page_stale_seconds` + `..._prune_stale_seconds`, success stamps seeded
-   at worker `start()` and re-stamped only by a non-throwing pass, emitted every heartbeat
+   at worker `start()` and re-stamped only by a non-throwing pass (TIGHTENED by #2452 - see
+   UP-11 below - to re-stamp only on a pass that made replay/retention progress or verified
+   there was none, not merely one that did not throw), emitted every heartbeat
    INCLUDING 0 while live and absent while dormant (dormancy = `journal_age_stats()` nullopt,
    never a fabricated zero), fleet rollup as a NEW **MAX** family
    (`yuzu_fleet_guardian_journal_*_seconds_max` - the first non-SUM rollup; a fleet sum of ages
@@ -718,13 +720,17 @@ these are findings against this PR's own code, and if the rest of the stack stal
 otherwise be undocumented on `dev`. A few belong to the later PRs (UP-9/UP-10 to the persist
 bounds, UP-6 to the jitter) and are listed anyway so the set stays in one place.
 
-- **UP-11 — the page SUCCESS stamp advances on passes that did NO work.** A no-token return, a
-  `stopping_` return, or a pass whose every value read failed all refresh
-  `last_page_success_steady_ms_`, so `yuzu.guardian_journal_page_stale_seconds` can read
-  healthy while replay is genuinely stalled. PRE-EXISTING from L1b, not introduced by L2 - but
-  L2 is the rung that makes replay real, and this is the gauge an on-call engineer will trust
+- ~~**UP-11 — the page SUCCESS stamp advances on passes that did NO work.**~~ **RESOLVED by
+  #2452.** A no-token return, a `stopping_` return, or a pass whose every value read failed all
+  refreshed `last_page_success_steady_ms_`, so `yuzu.guardian_journal_page_stale_seconds` could
+  read healthy while replay was genuinely stalled. PRE-EXISTING from L1b, not introduced by L2 -
+  but L2 is the rung that makes replay real, and this is the gauge an on-call engineer will trust
   first once it is. Both compliance and SRE called this the one deferred item that should be a
-  flip PREREQUISITE rather than ordinary backlog. **Highest priority of this list.**
+  flip PREREQUISITE rather than ordinary backlog. **FIX:** the page stamp now advances only on a
+  pass that did not throw, was not stop-aborted, was not `deferred_no_token`, did not
+  `sent_scan_failed`, and raised no `page_read_failures`; the prune stamp gained the sibling
+  `read_ok` gate (a `stopping_` return no longer advances either). The named flip prerequisite is
+  cleared.
 - UP-5 — a pre-planted `quarantine:` twin makes the page-side rename Conflict every pass;
   bounded by the per-pass candidate cap, but can stall the drain behind ~128 KvStore round
   trips. Tampered-DB only. The same shape applies to the size-quarantine branch, where the row

@@ -635,6 +635,135 @@ TEST_CASE("item 6 stamps: a permanently-throwing pass never advances them",
     worker.stop();
 }
 
+TEST_CASE("item 6 stamps: a page pass deferred for want of a token does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The page success stamp is a REPLAY-PROGRESS gauge, not a loop-liveness one: a pass that
+    // returns on deferred_no_token did no replay, so it must NOT read as fresh, or a permanently
+    // token-starved worker (replay stalled) looks healthy - the former UP-4 blind spot #2452
+    // closes. Drain the paging bucket BEFORE start(), then let the running worker's page passes
+    // all defer while prune (which has no token bucket) keeps succeeding.
+    JournalRig rig;
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    // Burn the startup token burst synchronously: page net-new batches until a pass reports
+    // deferred_no_token. The bucket refills at 0.1/s, and everything below completes in a few ms
+    // - far inside the >=10 s to the first refilled token - so the bucket stays dry throughout.
+    rig.persist_batch("seed", 2);
+    REQUIRE(worker.maintenance_once({.page = true}).records_paged == 2); // burst token + boot prune
+    for (int i = 0; i < 12; ++i)
+        rig.persist_batch("f" + std::to_string(i), 1);
+    bool dry = false;
+    for (int i = 0; i < 40 && !dry; ++i)
+        dry = worker.maintenance_once({.page = true}).deferred_no_token;
+    REQUIRE(dry); // the bucket is now empty with net-new work still pending
+
+    worker.start();
+    const auto page_seed = worker.last_page_success_steady_ms();
+    const auto prune_seed = worker.last_prune_success_steady_ms();
+    REQUIRE(page_seed > 0);
+    REQUIRE(prune_seed > 0);
+    // Prune keeps succeeding -> its stamp advances, proving cycles are running. A SECOND advance
+    // guarantees a full cycle (whose page block runs right after the prune block) completed with
+    // the bucket dry.
+    REQUIRE(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_seed; }));
+    const auto prune_mark = worker.last_prune_success_steady_ms();
+    REQUIRE(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_mark; }));
+    // Every page pass deferred, so the page stamp never left its seed. RED before #2452: the old
+    // `if (ok)` advanced it on every deferred pass.
+    CHECK(worker.last_page_success_steady_ms() == page_seed);
+    worker.stop();
+}
+
+TEST_CASE("item 6 stamps: a page pass whose read fails does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The other half of the page gate: a candidate/value read failure leaves the pass unable to
+    // establish what is replayable, so it must not read as fresh. Inject a long run of page
+    // candidate-scan failures - each increments page_read_failures and does no replay - while
+    // prune stays healthy and advances (proving the passes ran).
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    // Latch the boot-prune barrier with one clean synchronous page first (a read failure before
+    // it latches would merely be retried), then fail every subsequent page candidate scan. A
+    // read-failed pass returns before charging a token, so the bucket never drains and every
+    // pass reaches (and fails at) the candidate scan.
+    REQUIRE(worker.maintenance_once({.page = true}).records_paged == 1);
+    rig.journal->inject_page_read_failures_for_test(1'000'000); // outlasts the whole test window
+
+    worker.start();
+    const auto page_seed = worker.last_page_success_steady_ms();
+    const auto prune_seed = worker.last_prune_success_steady_ms();
+    REQUIRE(page_seed > 0);
+    REQUIRE(prune_seed > 0);
+    REQUIRE(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_seed; }));
+    const auto prune_mark = worker.last_prune_success_steady_ms();
+    REQUIRE(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_mark; }));
+    CHECK(worker.last_page_success_steady_ms() == page_seed); // frozen: every pass read-failed
+    CHECK(rig.journal->page_read_failures() > 0);             // ...and the passes really ran
+    worker.stop();
+}
+
+TEST_CASE("item 6 stamps: a prune whose scan fails does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The prune-side sibling of the page gate. A prune whose scan fails returns read_ok=false
+    // WITHOUT throwing (a KvStore read error is fail-safe), so gating the success stamp on "did
+    // not throw" alone would read a permanently-unreadable retention loop as fresh. Inject a long
+    // run of prune scan failures; prune_failures counts the passes that ran while the stamp must
+    // stay at its seed.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h, // keep page out of it
+                                      .prune_interval = 0ms});
+    rig.journal->inject_read_failures_for_test(1'000'000); // every prune scan fails, no throw
+
+    worker.start();
+    const auto prune_seed = worker.last_prune_success_steady_ms();
+    REQUIRE(prune_seed > 0);
+    // Wait for several prune passes to have run and fail-scanned, then confirm the success stamp
+    // never advanced. RED before #2452: `if (ok)` advanced it on every read_ok=false pass.
+    REQUIRE(spin_until([&] { return rig.journal->prune_failures() >= 4; }));
+    CHECK(worker.last_prune_success_steady_ms() == prune_seed);
+    worker.stop();
+}
+
+TEST_CASE("item 6 stamps: a page pass whose boot-prune barrier scan fails does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The boot-prune barrier inside page_into_window runs a prune scan before the FIRST replay can
+    // page anything. If that scan fails, the pass paged nothing and established nothing - but the
+    // failure is counted on prune_failures, NOT page_read_failures, and the pass sets no
+    // deferred/sent-scan flag. Without JournalPageStats::read_failed the page stamp would advance
+    // on this zero-work pass (a residual instance of the same #2452 bug class, found in review).
+    // Inject prune scan failures so the barrier never latches; every page pass takes this exit. Do
+    // NOT pre-page (that would latch the barrier). prune_failures proves cycles ran - both the
+    // maintenance prune and the barrier's own prune increment it - while the page stamp stays put.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    rig.journal->inject_read_failures_for_test(1'000'000); // every prune scan fails; barrier never latches
+
+    worker.start();
+    const auto page_seed = worker.last_page_success_steady_ms();
+    REQUIRE(page_seed > 0);
+    REQUIRE(spin_until([&] { return rig.journal->prune_failures() >= 4; }));
+    CHECK(worker.last_page_success_steady_ms() == page_seed); // frozen: every page pass hit the failing barrier
+    CHECK(rig.journal->page_read_failures() == 0); // the barrier is counted on prune_failures, not here
+    worker.stop();
+}
+
 TEST_CASE("item 6 stamps + episode age: lock-free readers race a live worker (TSan checkpoint)",
           "[spark][guardian][drain][maint][tsan]") {
     // The age telemetry's concurrency shape is lock-free readers (the heartbeat)

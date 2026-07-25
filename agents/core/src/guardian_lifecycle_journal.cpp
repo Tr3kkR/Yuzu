@@ -895,7 +895,15 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // cutover resilience work (#2300); it does not gate this inert path.
     if (!boot_pruned_) {
         // Call prune_locked_ directly: we already hold paging_mutex_ (prune() would re-lock it).
-        if (!prune_locked_(now_ms).read_ok)
+        if (!prune_locked_(now_ms).read_ok) {
+            // The barrier's own prune scan failed (counted on prune_failures_, NOT
+            // page_read_failures_): this pass paged nothing and established nothing, so it must
+            // NOT read as replay progress. Flag it so the drain worker's page success stamp does
+            // not advance (#2452 - the same "clean return, no work" class as the candidate-scan
+            // failures below, reached through the boot barrier before boot_pruned_ latches; in a
+            // read-failure-from-boot regime the barrier never latches and every page pass takes
+            // this exit).
+            stats.read_failed = true;
             return stats; // #2303 C4: the barrier means "prune BEFORE any candidate can page".
                           // Latching only on read_ok (M5) is necessary but not sufficient - on a
                           // failed scan we must also PAGE NOTHING this pass, or we hand the
@@ -903,6 +911,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                           // the barrier on exactly the passes it exists for. Bounded and
                           // self-correcting: the tick's periodic prune and the next token-bearing
                           // pass retry, and expired rows are skipped below regardless.
+        }
         boot_pruned_ = true;
     }
 
@@ -915,6 +924,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     if (inject_fail_page_reads_.load(std::memory_order_relaxed) > 0) { // test-only read fault
         inject_fail_page_reads_.fetch_sub(1, std::memory_order_relaxed);
         page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+        stats.read_failed = true;
         return stats; // same observable as a real scan failure below
     }
     // KEYS ONLY (#2299 perf-P-1). Selection - expiry, ordering, sent-label skip, rotation - is
@@ -936,6 +946,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // scan failures - a page-side read that fails every pass stops ALL replay while prune
         // keeps succeeding, so the two are different operator situations (#2345 Gate 6 SRE).
         page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+        stats.read_failed = true;
         return stats;
     }
 
@@ -1016,6 +1027,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 c.unusable = true;
                 c.read_failed = true;
                 value_read_failed = true;
+                stats.read_failed = true; // pass could not establish this candidate (#2452)
                 page_read_failures_.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;
             }
@@ -1070,6 +1082,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             c.unusable = true;
             c.read_failed = true; // unknown, NOT provably block-free
             value_read_failed = true;
+            stats.read_failed = true; // pass could not establish this candidate (#2452)
             page_read_failures_.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
         }

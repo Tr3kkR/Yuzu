@@ -202,8 +202,12 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
     if (!maint_.journal)
         return result;
     // NOTE: no engine mtx_ anywhere on this path, by construction - see the class doc.
-    if (ops.prune)
-        maint_.journal->prune(journal_now_ms());
+    if (ops.prune) {
+        result.prune_attempted = true;
+        // Capture read_ok: a prune whose scan fails returns without throwing, so the success
+        // stamp cannot use "did not throw" as its liveness signal (#2452).
+        result.prune_read_ok = maint_.journal->prune(journal_now_ms()).read_ok;
+    }
     if (ops.page) {
         result.page_attempted = true;
         const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms(), ops.replay_sent);
@@ -213,6 +217,7 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         result.deferred_no_token = stats.deferred_no_token;
         result.skipped_already_sent = stats.skipped_already_sent;
         result.sent_scan_failed = stats.sent_scan_failed;
+        result.page_read_failed = stats.read_failed;
     }
     return result;
 }
@@ -370,16 +375,22 @@ void GuardianOutboxDrainWorker::loop() {
         };
 
         if (prune_due && !stop_requested()) {
-            const bool ok = firewalled([this] { maintenance_once({.prune = true}); });
+            GuardianMaintenanceResult prune_result;
+            const bool ok = firewalled([&] { prune_result = maintenance_once({.prune = true}); });
             // Stamped AFTER the attempt, so the cadence is a minimum GAP rather than
             // start-to-start. Start-to-start means a pass that runs longer than its own
             // interval is due again the instant it finishes, which under KvStore contention
             // degenerates back into continuous scanning (#2298 Sol review).
             last_prune = std::chrono::steady_clock::now();
-            // The SUCCESS stamp, by contrast, moves only when the pass did not throw - a
-            // permanently-throwing prune must read as a growing age (item 6), while the
-            // cadence stamp above deliberately advances regardless (min-GAP pacing).
-            if (ok)
+            // The SUCCESS stamp moves only when the pass genuinely established the retention
+            // state: it did not throw (ok), a stop did not abort it, and its journal scan read
+            // cleanly (prune_read_ok). A permanently-unreadable prune returns WITHOUT throwing,
+            // so gating on `ok` alone would read a stalled retention loop as fresh - the same
+            // blindness #2452 closes on the page side. The cadence stamp above deliberately
+            // advances regardless (min-GAP pacing). A prune whose scan succeeded but whose DELETE
+            // failed DOES advance here: that is surfaced by prune_failures and is a distinct
+            // operator situation (#2364), not a scan stall.
+            if (ok && prune_result.prune_read_ok && !stop_requested())
                 last_prune_success_steady_ms_.store(success_stamp_now_ms(),
                                                     std::memory_order_relaxed);
         }
@@ -389,7 +400,26 @@ void GuardianOutboxDrainWorker::loop() {
             const bool ok = firewalled(
                 [&] { page_result = maintenance_once({.replay_sent = forced_page, .page = true}); });
             last_page = std::chrono::steady_clock::now();
-            if (ok) // success stamp: non-throwing passes only (see the prune site)
+            // The page success stamp is the age gauge an on-call engineer trusts FIRST once the
+            // journal is live, so it must read fresh ONLY when this pass made real replay progress
+            // OR positively established there was none - never on a pass that returned without
+            // doing (or being able to verify) that work (#2452). It advances iff the pass did not
+            // throw, was not stop-aborted, AND either:
+            //   - it PLACED records (records_paged > 0): replay is demonstrably progressing, so a
+            //     stray degraded/read-failure signal on the same pass does not make it stale (this
+            //     is what keeps a persistently-flaky single candidate from crying wolf while the
+            //     rest of the backlog drains); or
+            //   - it cleanly established there was nothing to page: not deferred_no_token (empty
+            //     token bucket), not sent_scan_failed (fell back), and not page_read_failed (the
+            //     candidate scan, a candidate value read, OR the boot-prune barrier's scan failed).
+            // Any other clean-but-fruitless return (deferred, degraded, read-failing, or aborted)
+            // now reads as a growing age - exactly the UP-11 blindness this gauge exists to close
+            // (L1b #2414). page_read_failed carries the boot-barrier case, which increments
+            // prune_failures_ (not page_read_failures_) and so has no page-side counter of its own.
+            if (ok && !stop_requested() &&
+                (page_result.records_paged > 0 ||
+                 (!page_result.deferred_no_token && !page_result.sent_scan_failed &&
+                  !page_result.page_read_failed)))
                 last_page_success_steady_ms_.store(success_stamp_now_ms(),
                                                    std::memory_order_relaxed);
             // A FORCED page that never ran must not be lost: re-arm so the next cycle
