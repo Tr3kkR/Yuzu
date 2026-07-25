@@ -589,6 +589,17 @@ public:
         for (const auto& tool : mcp::approval_gated_tool_names()) {
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
         }
+        // #2437 handler-side bound denials. The label set is closed on BOTH
+        // axes: `tool` is execute_instruction alone (the only tool that EMITS
+        // this counter today; the two kAgenticParamMaxLen read tools bound in
+        // the handler but audit without a metric) and `reason` is the fixed
+        // literal set below - so this pre-seed is exhaustive and absent() stays
+        // meaningful. Extend both lists together if a second tool gains bounds.
+        for (auto reason : {"ident_len", "scope_len", "param_count", "param_key_len",
+                            "param_value_len", "agent_ids_count", "agent_id_len"}) {
+            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                             {{"tool", "execute_instruction"}, {"reason", reason}});
+        }
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.

@@ -574,6 +574,17 @@ confirming no ticket was created or consumed. Two strictness notes: `integer`
 parameters must be JSON integers (an integral float like `1.0` is rejected),
 and `maxLength` limits are byte counts.
 
+`execute_instruction` goes further: it enforces its published `maxLength` /
+`maxItems` bounds **in the handler, on every tier** — including `operator`,
+which executes with no approval gate and was therefore previously bounded by
+nothing (#2437). A violation answers `-32602`, is audited as
+`mcp.execute_instruction|denied` with detail `input bound exceeded: <reason>`
+carrying the same `correlation_id` as the error you receive, and increments
+`yuzu_mcp_tool_args_too_large_total{tool,reason}`. Two of its bounds — at most 32 `params` keys, and each key at most 256 bytes —
+cannot be expressed in the published schema subset, so they are not visible in
+`tools/list`. They are checked **before any approval ticket is minted
+or consumed**, so violating one never costs you a ticket.
+
 **Examples of key parameters:**
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
