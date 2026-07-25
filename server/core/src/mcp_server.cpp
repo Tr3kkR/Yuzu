@@ -606,8 +606,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope). Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -5264,12 +5264,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                [](unsigned char c) { return std::tolower(c); });
                 std::transform(action.begin(), action.end(), action.begin(),
                                [](unsigned char c) { return std::tolower(c); });
-                if (plugin.empty() || action.empty()) {
-                    res.set_content(
-                        error_response(id, kInvalidParams, "plugin and action are required"),
-                        "application/json");
-                    return;
-                }
                 // ── Server-side input bounds (#2437) ──────────────────────────
                 // These mirror this tool's SERVED inputSchema exactly. Until now
                 // the schema's maxLength/maxItems were enforced only on the
@@ -5383,13 +5377,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         for (const auto& v : a) {
-                            // is_string() guard is load-bearing: get_ref throws
-                            // a type_error on a non-string. (A non-string entry
-                            // is silently DROPPED by the extraction loop below,
-                            // which is a separate hazard - it lands with the
-                            // targeting-safety change, not here.)
-                            if (v.is_string() &&
-                                v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
+                            // Type is guaranteed by check_exec_instruction_shape
+                            // above (and pre-mint in the C8 block), so this is a
+                            // length check only.
+                            if (v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
                                 too_large("agent_id_len", std::format("an agent_ids entry exceeds {} bytes", kExecInstrIdentMaxLen));
                                 return;
                             }
