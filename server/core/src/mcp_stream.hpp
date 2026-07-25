@@ -172,8 +172,14 @@ const char* to_string(McpStreamClose reason);
 /// same A4-shaped body every denial on this route uses (reason / correlation_id / retry_after_ms /
 /// remediation). `extra_params_json` is an optional RAW fragment appended inside `params` — the
 /// caller includes the leading comma, e.g. `,"execution_id":"exec-1","partial":true` (C6c/C7) — or
-/// empty. The frame is off-ring, id-less and non-replayable: a close is a point-in-time terminal
-/// signal, not a resumable frame. Shared by the GET pump and the streamed-POST pump.
+/// empty. CONTRACT (Gate 2 security/architect): the fragment is concatenated VERBATIM, so any
+/// STRING value in it MUST be `detail::json_quoted`-escaped by the caller — an unescaped `"` / `\`
+/// / newline in a value would corrupt the JSON envelope on a live stream (a JSON-injection sink).
+/// Server-minted ids (`exec-*` etc.) are format-safe, but a future producer passing any
+/// agent/execution-derived string must quote it and add a test that a `"`-bearing value cannot
+/// break the envelope. The frame is off-ring, id-less and non-replayable: a close is a
+/// point-in-time terminal signal, not a resumable frame. Shared by the GET pump and the
+/// streamed-POST pump.
 std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
                                      std::string_view extra_params_json = {});
 
@@ -541,7 +547,7 @@ public:
     /// authentication before this exists, and seeding to the epoch would make the very first
     /// indeterminate tick compute an instantly-expired deadline.
     RevalidateGrace(Config cfg, Clock clock)
-        : cfg_(cfg), clock_(std::move(clock)), last_authoritative_ok_(now()) {}
+        : cfg_(std::move(cfg)), clock_(std::move(clock)), last_authoritative_ok_(now()) {}
 
     /// Feed one tick's verdict; updates grace state and returns the wire outcome.
     Outcome on_verdict(StreamRevalidate verdict);

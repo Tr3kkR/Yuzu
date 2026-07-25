@@ -483,7 +483,7 @@ public:
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
                           "gauge");
-        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
+        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
                           "Frames dropped before reaching a connection's per-connection queue — "

@@ -524,7 +524,9 @@ TEST_CASE("McpStreamPump: the close frame is a JSON-RPC-wrapped notifications/yu
     CHECK(wire.contains(R"("remediation":)"));
     // Off-ring + id-less: a close is a point-in-time terminal signal, never replayed, so it
     // carries no SSE `id:` line an out-of-the-box client would persist as a resumable cursor.
-    // (The ring is empty on this fresh attach, so the ONLY frame written is the close.)
+    // (This assertion is exact only because the ring is empty on this fresh attach AND kRevoked
+    // trips the very first pump gate, so the close frame is provably the ONLY bytes written — a
+    // ring frame WOULD carry an `id:` line.)
     CHECK_FALSE(wire.contains("id: "));
 }
 
@@ -548,6 +550,14 @@ TEST_CASE("make_stream_closed_frame: wraps the A4 body and merges caller extras 
     CHECK(je["params"]["reason"] == "cap_expired");
     CHECK(je["params"]["execution_id"] == "exec-9");
     CHECK(je["params"]["partial"] == true);
+
+    // kCompleted is POST-only and never reaches the GET wire, but its to_string / remediation /
+    // envelope must still be valid so the closed metric+audit label set is exhaustive.
+    CHECK(std::string(mcp::to_string(mcp::McpStreamClose::kCompleted)) == "completed");
+    auto jc = nlohmann::json::parse(mcp::make_stream_closed_frame(mcp::McpStreamClose::kCompleted,
+                                                                  "cid-3"));
+    CHECK(jc["params"]["reason"] == "completed");
+    CHECK(jc["params"].contains("remediation"));
 }
 
 TEST_CASE("McpStreamPump/CH-4: an auth-backend outage buys a bounded grace window, not a kill",

@@ -938,8 +938,13 @@ bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     // newer stream on this session, so the only thing that can be waiting on the far
     // end of this socket is the stalled peer that caused the takeover in the first
     // place; writing to it would block this worker for the full write timeout (30 s)
-    // while its lease is still charged. Every other reason gets the frame.
-    if (actual != McpStreamClose::kSuperseded) {
+    // while its lease is still charged. kCompleted likewise writes NO close frame — the
+    // streamed-POST pump delivers its real final then EOFs, and a close frame after a
+    // successful final would be a spurious second terminal (this makes the documented
+    // "kCompleted never produces a close frame" invariant structural, not just a comment;
+    // the GET pump never sets kCompleted, so this is forward-proofing for C6c/C7). Every
+    // other reason gets the frame.
+    if (actual != McpStreamClose::kSuperseded && actual != McpStreamClose::kCompleted) {
         // Decision 15(f): a close is never indistinguishable from a clean completion, and the
         // reason is machine-parseable in the same A4 shape as every denial on this route (so a
         // client has ONE error contract, not two). PENDING 2 (2f PR 3b): the frame is now a

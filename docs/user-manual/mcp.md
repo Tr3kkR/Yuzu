@@ -199,8 +199,9 @@ change: a notification POST now answers `202` instead of `204`).
   own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
   tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
   stream simply does not exist on another replica; the bound above is an API-token
-  property.) Streams end with a final
-  `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
+  property.) Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+  carried as a normal `message` on the stream (not a bespoke `event: stream-closed` frame),
+  whose `params` carry the reason in an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
   auth store was unreachable for longer than the **60 s** grace window — the stream is not
   cut the instant the store hiccups, but the exposure is bounded: a revoked credential
