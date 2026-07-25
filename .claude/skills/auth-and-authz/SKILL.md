@@ -86,14 +86,14 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
-| **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **DESIGN COMPLETE, NOT BUILT** — `docs/auth-engine-principals-design.md` §7 specs overlap-pair rotation (bounded idempotent mint, window-floor, last-used tracking); scoped to engine credentials first (plan PR 4.3), deliberately credential-generic for later human-token adoption. |
+| **API token rotation workflow** — pair-of-tokens overlap. | "rotation process" | CC6.3 | **PARTIAL — built for engine credentials, not adopted for human tokens.** `ApiTokenStore::rotate_engine_credential`/`confirm_rotation` (`api_token_store.hpp:254`, `pg_advisory_xact_lock`-serialized per principal) ship the §7 overlap-pair design behind `POST /api/v1/engine-principals/{id}/credentials/rotate` + `.../confirm`. Written credential-generic for later human-token adoption; no human-owned token has a `rotate` entry point yet (create + revoke only). See Section 3 item 11. |
 | **API token inventory + last-used view** — data layer, Settings → API Tokens dashboard fragment (`render_api_tokens_fragment` in `settings_routes.cpp`), and `GET /api/v1/tokens` REST route all shipped, both surfacing owner/created/last-used columns. | "token inventory" | CC6.6 | **SHIPPED** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **SHIPPED** — `GET /api/v1/access-reviews/export?format=json\|csv` (**grant-table-driven**: one row per principal holding a live grant, enumerates `principal_type IN (user, group, engine)` per the engine-principal program, a grant on a principal outside every roster is surfaced as `source="orphan"` rather than dropped (a disabled-but-still-granted user correctly shows `source="user"`, `lifecycle_state="disabled"` instead), CSV formula-injection neutralized, `AccessReview:Read`, self-audited `access_review.exported`, `503` fail-loud never a silent partial export) + `GET /api/v1/access-reviews` (list every campaign, newest-first, capped 500, `AccessReview:Read`, self-audited `access_review.list`) + attestation-campaign lifecycle (`POST /api/v1/access-reviews` freezes the current grant population as `pending` rows; `POST .../{id}/attestations` records `attested`/`flagged_revoke` (UPSERT — overwrites a prior decision) — **flag ≠ revoke, evidence only**; `POST .../{id}/close`; `GET .../{id}` for full state — all `AccessReview:Attest` except the reads). Every route, reads included, structurally denies an engine-classed caller. MCP twins `export_access_review`/`open_access_review`/`record_attestation`/`get_access_review`/`list_access_reviews`/`close_access_review` (JSON only; `record_attestation` is `destructiveHint:true`, the rest `false`). 4 Prometheus metrics (`yuzu_access_review_export_total{format}`, `_export_duration_seconds`, `_campaigns_opened_total`, `_attestations_total{decision}`). Dedicated **`AccessReview` securable** (`Read`+`Attest` ops) + seeded `Reviewer` role (`AccessReview:Read`+`Attest` only) — **round-2 fix**: the first round gated this surface on `AuditLog:Read`/`AuditLog:Attest`, which over-disclosed the full grant population to `Operator`/`PlatformEngineer` (both seeded `AuditLog:Read` for unrelated reasons); the dedicated securable closes that. Born-on-PG `AccessReviewStore` (no prune — evidence persists). Deliberately gated on a **global** `AccessReview:Read`/`Attest`, not the ADR-0017 confinement filter (#2225 — a scoped slice is useless as fleet-wide CC6.2 evidence). Known gap: user rows list direct grants only (group-inherited access is on the group's own row); `last_activity_kind` is `"n/a"` for every user row (`AuthDB` has no last-login read accessor yet). See `docs/auth-architecture.md` "Periodic access reviews" and `docs/security-reviews/access-reviews-2026-07-21.md`. |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
-| **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **DESIGN COMPLETE, NOT BUILT** — `docs/auth-engine-principals-design.md` specs the `engine` principal type: dedicated identity store, no login surface, credential-only auth, mandatory rotation, default-deny scoped grants. Implementation lands via plan PRs 4.1–4.5. |
+| **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **SHIPPED** — the `engine` principal class (ADR-0031), full 4.1–4.5 ladder merged: `EnginePrincipalStore`, no login surface, credential-only auth, overlap-pair rotation, default-deny scoped grants, per-principal quota cap, live `principal_class="engine"` metric. Resolves authority **RBAC-only** (403 RBAC-off/no-grant, 503 store-unavailable) and can never hold admin/built-in/wildcard. Phase 5 (delegation, RFC 8693 token exchange) remains design-only. See Section 3 item 14. |
 | **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
 | **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **SHIPPED** — `GET /api/v1/audit/auth-sample` (`rest_api_v1.cpp`); `AuditQuery.action_prefixes` + `random_sample` (`audit_store.{hpp,cpp}`); scoped to `auth.`/`mfa.`/`session.`; `AuditLog:Read`; export audited as `audit.auth_sample.exported` |
-| **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. CSR API, lifecycle (issue / renew / revoke), audit chain. Today operators must bring their own PKI for both surfaces. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **MISSING** |
+| **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **PARTIAL — mTLS half shipped, code-signing half not built.** `CaStore`/`ca.db` (`ca_root`/`ca_issued`/`ca_crl_versions`), root private key behind `KeyProvider` and never in the DB, `sign_agent_csr` as the single shared signer for `Register` + `ProxyRegister` (subject/SAN/EKU server-chosen, CSR ignored), `/api/v1/ca/{root,crl,issued,revoke,root-csr,import-chain}` under `Security:*`, full `ca.*` audit chain. Issuance is enrollment-driven — there is deliberately **no** generic `POST /ca/issue`. Not built: code-signing cert issuance (the `codeSigning` EKU exists at `x509_ca.cpp:296` with no caller), so `--plugin-trust-bundle` still needs an external CA. Doc: `docs/pki-architecture.md`. See Section 3 item 10. |
 | **Plugin code-signing trust anchor** — operator-configured PEM trust bundle on the agent, CMS-verify of `<plugin>.sig` against it before `dlopen`. *Trust bundle accepts any X.509 root — Yuzu's self-managed CA (future) or any public CA / operator-internal CA today*. | implicit ("supply-chain integrity") | CC6.1 / CC7.1 | **PARTIAL — verifier shipped, CA upstream pending** |
 
 ### Hard invariants that must NOT regress when adding any of the above
@@ -128,16 +128,30 @@ must check them:
 Recommended order for closing gaps. Each block stands alone; pick whichever
 matches the customer ask.
 
+**Verified against `origin/dev` @ `ef4582be` (2026-07-25)** — every "SHIPPED"
+below was re-confirmed by reading the named file/route on that tree, not by
+trusting a design doc's status header. Re-stamp this line whenever you revise
+the section; a matrix derived from a stale checkout is worse than no matrix
+(the 2026-07-25 revision corrected four items that a 571-commit-behind tree had
+reported as unbuilt). **P0/P1 item numbers are stable** — commits, PR titles,
+and memories cite them (`P0 #3`, `P1 #7`, `P1 #9`). P2 was renumbered 11–14 in
+this revision to fix a duplicate `10`.
+
 ### Priority 0 — needed for first enterprise customer
 
 1. ~~**MFA / TOTP for admin login + high-risk approvals.**~~ **DONE** —
    the full 3-PR ladder shipped: TOTP enrollment + login challenge +
    recovery codes, step-up on 11 high-risk surfaces, enforcement modes
    (`admin-only`/`required`) with login-time enrollment bootstrap, and the
-   OIDC `amr` short-circuit. See `docs/auth-mfa-design.md`. Only the
-   at-rest TOTP-secret encryption follow-up remains — per ADR-0010 it lands
-   as SecretCodec envelope encryption with the `auth` store's Postgres
-   migration (the `auth_kv` scaffolding will NOT be used).
+   OIDC `amr` short-circuit. See `docs/auth-mfa-design.md`. **One tail
+   remains, and it is IN FLIGHT, not unstarted:** at-rest TOTP-secret
+   encryption rides **PR #2394** (auth + SCIM → Postgres), where
+   `users.mfa_totp_secret` becomes a SecretCodec envelope column per ADR-0010
+   — auth is the platform's first SecretCodec consumer. The decrypt path is
+   **fail-closed**: a decrypt failure must surface as an error, NEVER as "no
+   MFA enrolled". The `auth_kv` scaffolding is NOT used and is dropped by that
+   migration. Until #2394 merges, TOTP secrets are plaintext columns in
+   `auth.db` — say so plainly in any customer security questionnaire.
 2. ~~**Account lockout after N failed logins.**~~ **DONE** — `auth.db` v3
    columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) +
    `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`;
@@ -202,10 +216,16 @@ matches the customer ask.
    XSW-verified assertion node as NameID — mirrors the OIDC
    `--oidc-admin-group` guard), else `role=user`. Both flags empty (default)
    reproduces the original all-`role=user` behaviour. **Linux and macOS
-   only** — Windows fails closed at startup. **Remaining (next slice):**
-   AuthnRequest signing, AttributeStatement parsing beyond the group
-   attribute, Windows support, IdP-metadata auto-fetch, Settings-UI
-   reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP".
+   only** — `saml_provider.cpp:10-21` compiles a stub on `_WIN32` and the
+   provider reports disabled at startup. **Remaining (next slice), each
+   verified unbuilt on `origin/dev`:** AuthnRequest signing
+   (`saml_provider.cpp:561` still emits unsigned XML — "HTTP-Redirect binding
+   signing is a follow-up"; no `SigAlg` parameter anywhere), AttributeStatement
+   parsing beyond `--saml-group-attribute`, Windows support, IdP-metadata
+   auto-fetch (all seven `--saml-*` flags are hand-configured), Settings-UI
+   reconfigure. This is the **largest single remaining enterprise-friction
+   gap** — SAML-only IdPs cannot onboard without it, and a Windows-hosted
+   server cannot use SAML at all. See `docs/auth-architecture.md` "SAML 2.0 SP".
 7. ~~**SCIM v2 provisioning**~~ **DONE (Users + Groups→role mapping,
    #2021)** — auto-create/deactivate/reactivate users from the IdP over
    `/scim/v2/*` (`--scim-enable`/`--scim-token`, fail-closed without a
@@ -251,12 +271,21 @@ matches the customer ask.
    distinct from the pre-existing audit-write-failure counter).
    **Remaining:** native email-shaped `userName` support (Yuzu usernames
    are slug-only — a stock Okta/Entra `userName=email` mapping 400s until
-   the operator remaps it), `userName` rename via `PUT`, per-route
-   rate-limiting, API-token revocation on user delete/deactivate (currently
-   only auth sessions are revoked — a pre-existing gap shared with the
-   dashboard's manual disable path, not SCIM-specific), and
-   SCIM-token-at-rest encryption. See `docs/auth-architecture.md` "SCIM v2
-   provisioning".
+   the operator remaps it; this is the **highest-friction** of the four for a
+   real IdP onboarding), `userName` rename via `PUT`, per-route
+   rate-limiting, and **API-token revocation on user delete/deactivate** —
+   `scim_routes.cpp` revokes auth sessions only and makes no
+   `ApiTokenStore` call, so a deprovisioned operator's Bearer tokens keep
+   working. That last one is a **pre-existing gap shared with the dashboard's
+   manual disable path**, not SCIM-specific — fix it at the shared
+   deactivate seam, not inside SCIM. **Struck from this list (2026-07-25):**
+   "SCIM-token-at-rest encryption" — `scim_store.cpp:192,243` stores a
+   verify-only `sha256_hex`, which is the ADR-0010-correct posture for a
+   bearer credential the server only ever compares. It is not a gap; do NOT
+   "fix" it into a SecretCodec envelope. **In flight:** PR #2394 moves this
+   storage off `auth.db` onto a born-on-PG `ScimStore` (schema
+   `scim_store`); the verify-only hash posture is preserved across that move.
+   See `docs/auth-architecture.md` "SCIM v2 provisioning".
 8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
    (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
    0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
@@ -298,50 +327,61 @@ matches the customer ask.
    rejected `401` rather than granted a zero-length window (dead-window guard).
    See `docs/auth-architecture.md` "JIT admin elevation";
    `tests/unit/server/test_auth_jit_elevation.cpp`.
-10. **Self-managed Certificate Authority (mTLS + code signing).** A single
-    PKI root, server-managed, that operators can use instead of standing up
-    their own CA. Two consumers:
-    - **mTLS** — issue server certs and per-agent client certs against the
-      Yuzu CA so an out-of-the-box deployment doesn't require an external
-      PKI. Today `--ca-cert` consumes whatever bundle the operator hands
-      over; the new flow lets the server *be* the CA.
-    - **Plugin code signing** — issue developer signing certs whose chain
-      anchors at the same root, so the agent's `--plugin-trust-bundle`
-      points at one PEM and the operator can sign their own plugins. The
-      verifier (issue #80, shipped) is already deployment-format-agnostic:
-      same code path accepts public-CA, internal-CA, and self-managed-CA
-      issued certs. The CA closes the operator UX gap, not a security gap.
+10. **Self-managed Certificate Authority** — **mTLS half SHIPPED;
+    code-signing half NOT BUILT.** The matrix previously listed this whole
+    item as MISSING; that was stale by the entire PKI ladder (#1237–#1244).
+    Routed doc: `docs/pki-architecture.md`.
 
-    Surface required:
-    - Schema additions via `MigrationRunner`: `ca_root` table (root key +
-      cert + lifecycle), `ca_issued` table (issued cert inventory + status
-      + revocation reason), `ca_crl_versions` table.
-    - REST: `POST /api/v1/ca/issue` (CSR in, cert chain out),
-      `POST /api/v1/ca/revoke`, `GET /api/v1/ca/crl` (DER CRL stream),
-      `GET /api/v1/ca/root` (root cert PEM, public).
-    - Audit actions: `ca.root.created`, `ca.cert.issued`, `ca.cert.revoked`,
-      `ca.crl.published`.
-    - RBAC: gated under the existing `Security` securable type with
-      `Read` (root + CRL) / `Write` (issue) / `Delete` (revoke) ops.
-    - Hardening: root key encrypted at rest using existing
-      `auth.db`-style 0600 file or, preferred, an HSM/keyring abstraction
-      that today wraps OpenSSL `EVP_PKEY` and tomorrow can target PKCS#11.
+    **Shipped (mTLS):** `CaStore` over `ca.db` with `ca_root` / `ca_issued` /
+    `ca_crl_versions` (`ca_store.cpp:157-195`). The root **private key is
+    never in the DB** — `ca_root` holds an opaque `key_ref` and the key lives
+    behind `KeyProvider` (`key_provider.{hpp,cpp}`), which is the seam an
+    HSM/PKCS#11 provider plugs into later. `sign_agent_csr` (`x509_ca.hpp`)
+    is the **single shared signer** for both direct `Register` and gateway
+    `ProxyRegister`, with subject/SAN/EKU **server-chosen and the CSR's own
+    values ignored**. Revoke is serial-scoped. REST (`ca_routes.cpp`):
+    `GET /api/v1/ca/root`, `GET /ca/crl`, `GET /ca/issued` (`Security:Read`),
+    `POST /ca/revoke` (`Security:Delete`), plus `GET /ca/root-csr` and
+    `POST /ca/import-chain` for the subordinate-CA flow — and dashboard twins
+    under `/api/settings/ca/`. Audit: `ca.cert.issued`, `ca.cert.revoked`,
+    `ca.cert.reissue_blocked`, `ca.crl.published`, `ca.root_csr.exported`,
+    `ca.subordinate.imported`.
 
-    Plugin code-signing intersects this: when the CA ships, the agent's
-    `--plugin-trust-bundle` simply points at `/var/lib/yuzu/ca/root.pem`
-    and the operator's plugin build pipeline calls `POST /api/v1/ca/issue`
-    to mint a signing cert. No verifier change required.
+    **Note the shape difference from the original design above:** there is
+    **no generic `POST /api/v1/ca/issue`**. Issuance is enrollment-driven
+    through `sign_agent_csr` on the agent-registration path — deliberately, so
+    the server chooses every field of every cert it signs. Do not add an
+    operator-facing "issue me a cert for X" route without re-deciding that.
+
+    **Remaining — plugin code-signing issuance.** `x509_ca.hpp:95` carries a
+    `code_signing` flag and `x509_ca.cpp:296` emits the `codeSigning` EKU, but
+    **nothing sets it** — there is no route, no CLI, and no caller. So today
+    an operator wanting to sign their own plugins must still bring an external
+    CA for `--plugin-trust-bundle` (`agents/core/src/main.cpp:394`). The
+    verifier (issue #80) is already format-agnostic and needs no change; the
+    work is a gated issuance surface plus the operator workflow. This closes a
+    UX gap, not a security gap.
 
 ### Priority 2 — long-tail polish
 
-10. ~~**API token rotation workflow**~~ **DESIGNED** — `docs/auth-engine-principals-design.md`
-    §7 (overlap-pair, engine credentials first, plan PR 4.3); not yet built.
-11. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
+11. **API token rotation workflow — engine credentials SHIPPED, human tokens
+    NOT ADOPTED.** The overlap-pair state machine designed in
+    `docs/auth-engine-principals-design.md` §7 is built and live:
+    `ApiTokenStore::rotate_engine_credential` / `confirm_rotation`
+    (`api_token_store.hpp:254`), serialized by a `pg_advisory_xact_lock` per
+    principal, surfaced at `POST /api/v1/engine-principals/{id}/credentials/rotate`
+    and `.../confirm`. It was deliberately written **credential-generic** so
+    human operator tokens can adopt it unchanged. **Nothing has:** no
+    `rotate` entry point exists for a human-owned token — only create +
+    revoke. This is the cheapest remaining CC6.3 win, because the hard part
+    (the concurrency-safe state machine and its replay semantics, hardened by
+    #2384/#2404) already exists and is in production use.
+12. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
     (Settings → API Tokens, `settings_routes.cpp`) and `GET /api/v1/tokens`
     (`rest_api_v1.cpp`) both surface owner / created / last-used columns from
     `api_token_store.cpp:325-345`. (The skill matrix previously listed this
     as PARTIAL — it has in fact shipped.)
-12. ~~**Periodic access-review export**~~ **SHIPPED** — `GET
+13. ~~**Periodic access-review export**~~ **SHIPPED** — `GET
     /api/v1/access-reviews/export?format=json|csv` (grant-table-driven,
     orphan grants surfaced, CSV-safe) plus `GET /api/v1/access-reviews`
     (list campaigns) and the attestation-campaign lifecycle (`POST
@@ -352,15 +392,77 @@ matches the customer ask.
     engine)` — unblocked by the engine-principal program landing first, per
     the original note. See `docs/auth-architecture.md` "Periodic access
     reviews".
-13. ~~**Service-account principal type**~~ **DESIGNED** — the `engine`
-    principal class in `docs/auth-engine-principals-design.md` (dedicated
-    identity store, no login surface, credential-only auth, mandatory
-    rotation); not yet built.
+14. ~~**Service-account principal type**~~ **SHIPPED — the full 4.1–4.5
+    ladder is merged** (the matrix previously said "DESIGNED, not yet built";
+    that was stale). The `engine` principal class per ADR-0031: dedicated
+    `EnginePrincipalStore`, **no login surface**, credential-only auth,
+    overlap-pair rotation, default-deny scoped grants. Ladder as merged —
+    **4.1** `ApiTokenStore` → Postgres + `principal_kind` seam (#2188);
+    **4.2** the principal class itself — store, RBAC resolution, audit
+    attribution, `engine:` namespace-collision guard that fails **closed** at
+    boot (#2192/#2202); **4.3** the operator lifecycle surface — REST
+    `/api/v1/engine-principals` + `{id}/credentials{,/rotate,/confirm}` +
+    `{id}/roles` + `{id}/transfer-owner`, MCP twins, console, and the
+    no-admin auditor (#2194/#2284); **4.4** per-principal quota cap
+    (#2309, closed #1973 — gate decision extracted into
+    `principal_quota_gate.hpp`); **4.5** `principal_class="engine"` as a live
+    `yuzu_http_requests_total` label value (#2342), which required the
+    *resolved* `principal_kind` and so could not be done from presentation
+    (`principal_class.hpp:77`).
+
+    **Hard invariants (from `.claude/routed-concerns.md`, do not regress):**
+    an engine principal resolves authority **RBAC-only** — never the pre-RBAC
+    legacy path, never the service-scoped fallback (403 when RBAC is off or
+    no grant, 503 when the store is unavailable) — and can **NEVER** hold
+    admin, a built-in role, or a wildcard grant (`validate_assignment`'s
+    `dangerous`-class gate).
+
+    **Remaining: Phase 5 (delegation).** RFC 8693 token exchange and
+    write-back are still design-only, as is 2c's Decision-14 confinement
+    choice; both consume `docs/auth-engine-principals-design.md` as their
+    reference. Post-ship hardening issues are open — **#2454** (a global
+    revoke generation disables the liveness cache for *all* principals during
+    write churn), **#2466**/**#2406** (REST engine-principal routes are silent
+    on audit-store failure, unlike their MCP twins), **#2343**
+    (consolidate the engine-session discriminator onto `Session::is_engine()`),
+    **#2374** (regression test for MCP stream revocation).
 
 ### Priority 3 — defer
 
-14. **Conditional access policies** (geo / IP / device posture) — large
+15. **Conditional access policies** (geo / IP / device posture) — large
     scope, niche customer ask. Defer until specifically requested.
+
+---
+
+### Open hardening backlog (tracked issues, not features)
+
+Not gaps in the feature matrix — accepted debt on shipped surfaces. Ranked by
+what a security reviewer would flag first:
+
+- **#2376 — sensitive grant-graph reads fall open to any authenticated user
+  when RBAC is off.** The only item here that is an *authorization* defect,
+  and it bites in the **default** deployment posture (RBAC off). Same failure
+  class as #2202. Fix before the cosmetic items below.
+- **#2396** — login availability is hard-coupled to Postgres: a transient blip
+  takes authentication down with no retry or degrade. The direct cost of
+  ADR-0006 fail-closed; worth an explicit decision rather than drift.
+- **#2395** — KEK rotation runbook + rewrap flow for SecretCodec columns.
+  Lands with, or immediately after, PR #2394 — a first SecretCodec consumer
+  with no rotation story is an audit finding waiting to happen.
+- **#2397** — Postgres auth recovery runbook + sweep of the SQLite-era auth
+  docs (`docs/ops-runbooks/auth-db-recovery.md` still assumes a file).
+- **#2399** — MFA store robustness: TOTP counter double-use window +
+  recovery-code store-error handling.
+- **#2401** — `yuzu_auth_secret_unavailable_total` lacks the cardinality to
+  tell a retry storm from a uniform outage (CC7.2 evidence quality).
+- **#2398** — extract a shared `build_auth_stack()`; `main.cpp` and
+  `server.cpp` duplicate the PgPool → FileKeyProvider → SecretCodec → AuthDB
+  construction chain, so a wiring fix has to be made twice.
+- **#2375** — access reviews cannot distinguish a deprovisioned/terminated
+  principal from a temporarily-disabled one in `lifecycle_state`.
+- **#2407** — server-wide HTTP request-body size cap (bodies are read before
+  auth). Not auth-specific, but the auth surface is where it is reachable
+  pre-authentication.
 
 ---
 
