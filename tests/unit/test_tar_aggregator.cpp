@@ -1079,7 +1079,7 @@ TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not decline
           "[tar][retention][clock-guard]") {
     // Fail closed on an unreadable count: a count we could not read is not
     // evidence that deleting is safe. The table is skipped for the pass, its
-    // latch is left alone (an unread count says nothing about the clock), no
+    // latch is CLEARED (re-armed, so a failed pass cannot spend the guard), no
     // decline is recorded against it, and the rest of the sweep still runs.
     //
     // Dropping the table is the cheap way to force the count to error. Note this
@@ -1349,4 +1349,97 @@ TEST_CASE("TAR #2361: a failed delete is counted, so the totals stay honest",
     CHECK(row_count(*f.db, "process_hourly") == 6);     // nothing removed
     CHECK(failures_of(f.guard, "process_hourly") == 1); // exactly once, not double-counted
     CHECK(declines_of(f.guard, "process_hourly") == 0); // not misreported as a clock anomaly
+}
+
+TEST_CASE("TAR #2361: a clean drain clears the latch in the SAME pass",
+          "[tar][retention][clock-guard]") {
+    // Sol / Gate 8, the agent twin. Latching purely on the pre-delete
+    // `would_wipe` left the latch armed after a pass that drained the whole
+    // backlog, so an anomaly arriving before the next 900s tick deleted with no
+    // decline and no counter.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20); // under the cap
+
+    run_retention(*f.db, kT0, f.guard); // decline, latch armed
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    run_retention(*f.db, kT0 + 1, f.guard); // drains it entirely
+    REQUIRE(row_count(*f.db, "process_hourly") == 0);
+    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // cleared by the drain itself
+
+    // A fresh anomaly with no intervening empty pass must still decline.
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 4);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+}
+
+TEST_CASE("TAR #2361: an implausible stored reading is an anomaly, not a quiet reset",
+          "[tar][retention][clock-guard]") {
+    // On an endpoint the operator may control this row outright. Quietly
+    // accepting a value that no pass could have written is precisely how an
+    // adversary disables the step check while `tar status` reports healthy.
+    auto declines_after = [](const char* stored) {
+        TarGuardFixture f;
+        seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+        seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: only the state is wrong
+        f.db->set_config("retention_guard_last_pass", stored);
+        run_retention(*f.db, kT0, f.guard);
+        return declines_of(f.guard, "process_hourly");
+    };
+    CHECK(declines_after("-1") == 1);              // negative
+    CHECK(declines_after("not-a-number") == 1);    // unparseable
+    CHECK(declines_after("99999999999999") == 1);  // far ahead of now
+}
+
+TEST_CASE("TAR #2361: a failed persist of the clock reading is reported",
+          "[tar][retention][clock-guard]") {
+    // `set_config` used to return void, so a write that never landed left the
+    // guard with no comparison point on every future pass, permanently, with
+    // nothing to report -- and on an endpoint an adversary can arrange that.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_cfg BEFORE UPDATE ON tar_config "
+                              "WHEN NEW.key = 'retention_guard_last_pass' "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    // Seed the key so the write is an UPDATE the trigger can block.
+    run_retention(*f.db, kT0, f.guard);
+    const auto first = failures_of(f.guard, "__clock_state__");
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(failures_of(f.guard, "__clock_state__") > first);
+}
+
+TEST_CASE("TAR #2361: a delete failure stops the pass instead of leaking autocommits",
+          "[tar][retention][clock-guard]") {
+    // Some SQLite errors abort the transaction automatically. Continuing the loop
+    // would then run the remaining deletes as AUTOCOMMITS that the guard's
+    // ROLLBACK cannot undo -- deletions escaping the transaction meant to contain
+    // them. The pass now stops at the first failure and reports every queued
+    // table, because the transaction is going to be rolled back anyway.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
+    // tcp_hourly must be ACCEPTED (a survivor, so it is not declined) or it never
+    // reaches the plan list and the leak this test hunts for cannot occur.
+    auto seed_tcp = [&](int64_t ts, int n) {
+        for (int h = 0; h < n; ++h) {
+            REQUIRE(f.db->execute_sql(
+                std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
+                            "process_name,connect_count,disconnect_count) "
+                            "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
+                            ts)));
+        }
+    };
+    seed_tcp(kT0 - 10 * kHourlyCutoffSec, 5); // expired
+    seed_tcp(kT0 - 3600, 1);                  // survivor -> accepted, queued
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
+
+    run_retention(*f.db, kT0, f.guard);
+
+    // Nothing was removed anywhere: the aborting statement stopped the pass and
+    // the rest never ran as autocommits.
+    CHECK(row_count(*f.db, "process_hourly") == 6);
+    CHECK(row_count(*f.db, "tcp_hourly") == 6); // its 5 expired rows survive too
+    CHECK(failures_of(f.guard, "process_hourly") >= 1);
 }

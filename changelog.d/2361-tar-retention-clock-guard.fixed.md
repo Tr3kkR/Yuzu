@@ -14,8 +14,10 @@
   alone bounds it. Rows stamped implausibly far in the future are excluded so one
   forward-skewed row cannot disarm the guard. Row-count retention is deliberately
   untouched (it trims to a fixed ceiling with no clock involved) and still shares the
-  single retention transaction, which now also rolls back rather than leaving the
-  shared connection wedged if a pass throws. The existing paused/errored source gate
+  single retention transaction, which now stops at the first failed statement and
+  rolls back (best-effort -- a rollback that itself fails is logged, not retried)
+  rather than leaving the shared connection wedged or letting later deletes escape
+  as autocommits after SQLite has already aborted the transaction. The existing paused/errored source gate
   still runs first, so a source paused for forensics neither deletes nor reports an
   anomaly. Because the agent has no `/metrics` endpoint, the counters are surfaced
   through the `tar status` action as `retention_guard_declines_total` and

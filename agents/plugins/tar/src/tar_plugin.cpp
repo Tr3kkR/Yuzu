@@ -2757,6 +2757,22 @@ private:
         for (const auto& [src_name, v] : source_toggles) {
             bool transition_ok;
             {
+                // #2361 Gate 8 (Sol): serialise against a whole RETENTION pass,
+                // outermost. run_retention decides which sources are enabled in a
+                // read phase and executes the queued deletes afterwards, so
+                // without this a pause landing between the two still deletes the
+                // rows the operator just asked to preserve -- and reports success
+                // to both sides. The pre-change code raced too (it read the flag
+                // one statement before deleting); the read/write split widened the
+                // window to the whole sweep, so the fix belongs here rather than
+                // in a narrower re-check.
+                //
+                // Lock order is rollup_mu_ ≺ collect_mu_ ≺ software_collect_mu_.
+                // do_rollup takes ONLY rollup_mu_ (then db_->mu_ per statement)
+                // and never collect_mu_, so no cycle exists. Cost: a configure
+                // waits out an in-flight rollup, which is the correct trade for a
+                // mutation whose whole purpose is to stop data being deleted.
+                std::lock_guard rollup_lock(rollup_mu_);
                 // #538: collect_fast/slow hold collect_mu_ for their whole
                 // enumerate→diff→set_state cycle. Taking it here makes the
                 // enabled-flag write + baseline clear atomic w.r.t. a collection

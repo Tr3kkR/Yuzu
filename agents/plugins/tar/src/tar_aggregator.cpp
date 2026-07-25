@@ -351,6 +351,12 @@ namespace {
 // re-declining once after a reboot is the safe direction.
 constexpr std::string_view kRetentionLastPassKey = "retention_guard_last_pass";
 
+// Reported on the `tar status` failure surface when the durable clock reading
+// cannot be written. Deliberately not a table name -- the surface is keyed by
+// table, and this failure belongs to the guard itself, so it gets a name no
+// warehouse table can collide with.
+constexpr std::string_view kClockStateFailureKey = "__clock_state__";
+
 // Does any row match? Runs through the TRUSTED connection. `execute_user_query`
 // is the authorizer-sandboxed path for untrusted operator SQL (tar.sql, #760)
 // and is deliberately NOT used here: this SQL is built from registry constants
@@ -492,11 +498,12 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     };
     std::vector<Plan> plans;
     int declined_tables = 0, time_based_tables = 0, unreadable_tables = 0;
+    bool persist_failed = false;
 
     // Durable across restarts, so the elapsed-time check still fires on the
     // first pass of a process that booted with an already-wrong clock.
     std::optional<int64_t> prev_pass_now;
-    bool prev_from_future = false;
+    bool prev_implausible = false;
     {
         const std::string stored = db.get_config(std::string{kRetentionLastPassKey}, "");
         const auto* first = stored.data();
@@ -508,19 +515,33 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         // device the user may control, and even without tampering an earlier pass
         // that ran while the clock was skewed FORWARD leaves a reading ahead of
         // now -- which would make `now - prev` negative until real time catches
-        // up, silently killing the only detector that survives a reboot. An
-        // INT64_MAX value would make the subtraction signed-overflow UB.
-        // A reading from the future is itself evidence the clock moved, so it is
-        // treated as an anomaly rather than dropped quietly.
+        // up, silently killing the only detector that survives a reboot.
+        // (`now - INT64_MIN` also overflows; `now - INT64_MAX` does not, for a
+        // normal positive epoch.)
+        //
+        // EVERY implausible shape is an anomaly, not a quiet reset: ahead of now,
+        // negative, or unparseable. None can arise from a pass this code ran, so
+        // each means the state was corrupted or tampered with -- and on a
+        // user-controlled endpoint, quietly accepting one is exactly how an
+        // adversary disables the step check while `tar status` reports healthy.
+        if (!stored.empty() && !prev_pass_now)
+            prev_implausible = true; // present but unparseable
         if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now_epoch)) {
-            prev_from_future = *prev_pass_now > now_epoch;
+            prev_implausible = true;
             prev_pass_now.reset();
         }
     }
     // Record the reading for the NEXT pass before any early exit: it is an honest
     // observation of the clock whatever this pass goes on to do, and re-anchoring
     // here is what lets a poisoned or stale value self-heal.
-    db.set_config(std::string{kRetentionLastPassKey}, std::to_string(now_epoch));
+    if (!db.set_config(std::string{kRetentionLastPassKey}, std::to_string(now_epoch))) {
+        // The restart-surviving half of the guard silently degrades if this keeps
+        // failing, and on an endpoint an adversary can ARRANGE for it to fail. It
+        // is a guard failure, reported like any other, not a log line.
+        std::lock_guard lock(guard.mu);
+        ++guard.failures[std::string{kClockStateFailureKey}];
+        persist_failed = true;
+    }
 
     for (const auto& src : capture_sources()) {
         // #539: Skip retention for disabled sources. The configure docstring and
@@ -627,22 +648,37 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             const bool big_step =
                 prev_pass_now && now_epoch - *prev_pass_now > step_threshold;
 
-            if ((would_wipe || big_step || prev_from_future) && !latched) {
+            if ((would_wipe || big_step || prev_implausible) && !latched) {
                 latched = true;
                 ++guard.declines[table_name];
                 ++declined_tables;
-                spdlog::debug("TAR retention: declining {} (wipe={}, backward={}, {}s since last "
+                spdlog::debug("TAR retention: declining {} (wipe={}, bad_state={}, {}s since last "
                               "pass, threshold {}s)",
-                              table_name, would_wipe, prev_from_future,
+                              table_name, would_wipe, prev_implausible,
                               prev_pass_now ? now_epoch - *prev_pass_now : 0, step_threshold);
                 continue;
             }
-            // Hold the latch only while the wipe condition itself persists, so a
-            // genuinely all-expired table drains at cap pace without re-tripping
-            // the guard, and an ordinary over-cap backlog (survivors present)
-            // never arms it -- arming there would mask the decline of a real
-            // anomaly arriving next.
-            latched = would_wipe;
+            // Hold the latch only while an anomaly is STILL BEING WORKED OFF:
+            // the wipe condition held AND the cap will leave rows behind. The
+            // second half is what an earlier round got wrong -- latching purely
+            // on `would_wipe` left the latch armed after a pass that drained the
+            // whole backlog, so a real anomaly arriving before the next tick
+            // deleted with no decline and no counter (#2361 Gate 8 / Sol).
+            //
+            // "Will the cap bind?" is answered by asking whether a (cap+1)th
+            // expired row exists -- bounded, index-driven, and only for a table
+            // that is actually in the wipe condition, so the healthy path pays
+            // nothing. An unreadable answer is treated as "yes", keeping the
+            // latch armed, which is the conservative direction.
+            bool cap_will_bind = false;
+            if (would_wipe) {
+                const auto more = exists_where(
+                    db, table_name,
+                    std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
+                                kMaxTarDeletesPerTablePerPass));
+                cap_will_bind = !more || *more;
+            }
+            latched = would_wipe && cap_will_bind;
             // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
             // KEY` plus an `idx_{table}_{ts_col}` index (generate_warehouse_ddl),
             // so the subquery is an index scan, not a sort.
@@ -667,15 +703,31 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     bool txn_failed = false;
 
     // M17: Wrap all retention deletes -- row-count and guarded time-based alike
-    // -- in a single transaction to amortize fsync cost. Every statement here was
-    // built during the read phase, so nothing in this loop can throw.
+    // -- in a single transaction to amortize fsync cost. Every statement was
+    // built during the read phase, so this loop ALLOCATES nothing. It is not
+    // formally no-throw: execute_sql takes a mutex and logs, neither of which is
+    // declared noexcept. That is why TarTxnGuard's destructor is noexcept and
+    // swallows -- an exception here unwinds through it and rolls back, rather
+    // than terminating.
     if (!db.execute_sql("BEGIN TRANSACTION")) {
         txn_failed = true; // no transaction, so nothing to roll back
     } else {
         TarTxnGuard txn(db);
-        for (std::size_t i = 0; i < plans.size(); ++i)
-            if (!db.execute_sql(plans[i].sql))
-                failed[i] = 1;
+        for (std::size_t i = 0; i < plans.size(); ++i) {
+            if (db.execute_sql(plans[i].sql))
+                continue;
+            // STOP at the first failure. Some SQLite errors (SQLITE_FULL,
+            // SQLITE_IOERR, a RAISE(ROLLBACK) trigger) abort the transaction
+            // automatically; continuing would then run the remaining deletes as
+            // AUTOCOMMITS, which the guard's ROLLBACK cannot undo -- deletions
+            // escaping the transaction that was supposed to contain them
+            // (#2361 Gate 8 / Sol). Everything queued is reported as failed,
+            // because the transaction is now going to be rolled back anyway.
+            for (std::size_t j = 0; j < plans.size(); ++j)
+                failed[j] = 1;
+            txn_failed = true;
+            break;
+        }
         // A failed COMMIT rolls the whole transaction back, so EVERY queued
         // delete is undone -- not just the ones that errored. Attributing the
         // failure to all of them is what keeps the status surface honest: the

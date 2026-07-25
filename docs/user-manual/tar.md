@@ -306,12 +306,15 @@ names the table and its own count:
 retention_guard|process_hourly|3
 retention_guard|tcp_hourly|3
 retention_guard_failed|module_hourly|2
+retention_guard_failed|__clock_state__|1
 retention_guard_declines_total|6
 retention_guard_failures_total|2
 ```
 
 Only tables with a non-zero count appear, so a healthy agent emits just the two
-totals. The per-table counters are in-memory and reset when the agent restarts
+totals. `__clock_state__` is not a table: it reports that the agent could not
+persist its own clock reading, which leaves the guard without a comparison point
+after the next restart. The per-table counters are in-memory and reset when the agent restarts
 (the clock reading they compare against is persisted, so restarting does not
 blind the guard). Scrape this across the fleet to find endpoints whose clocks
 need attention -- the agent has no `/metrics` endpoint, so this action is the
@@ -472,9 +475,10 @@ ahead of the clock (a backward correction, or tampering) -- elapsed time cannot
 separate these, so check the host's time synchronisation *and* its uptime
 history. A non-zero failures total means retention has stopped for that table
 for a reason that is not the clock: either its probes could not be read, or its
-delete failed. A failed transaction rolls back every queued delete, so all
-tables in that pass are reported -- including row-count tables, which are
-otherwise outside the guard.
+delete failed. The pass stops at the first failed delete and rolls the
+transaction back, so every table queued in that pass is reported -- including
+row-count tables, which are otherwise outside the guard. (The rollback is
+best-effort: one that itself fails is logged, not retried.)
 
 **Known dead band.** Because the threshold is floored at 30 days, a forward
 clock error *between* a table's own window and 30 days trips neither detector:

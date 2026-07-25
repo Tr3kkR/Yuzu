@@ -352,7 +352,11 @@ public:
     /**
      * Set a config value.
      */
-    void set_config(const std::string& key, const std::string& value);
+    /// Returns false if the write did not persist. Retention's clock guard
+    /// depends on this: a silently-dropped write leaves the guard with no
+    /// comparison point on the next pass, forever, with nothing to report
+    /// (#2361 Gate 8 / Sol). Most callers may still ignore the result.
+    bool set_config(const std::string& key, const std::string& value);
 
     // ── Warehouse schema management ─────────────────────────────────────────
 
@@ -450,7 +454,7 @@ private:
     explicit TarDatabase(sqlite3* db);
 
     /// Internal set_config that assumes caller already holds mu_.
-    void set_config_locked(const std::string& key, const std::string& value);
+    bool set_config_locked(const std::string& key, const std::string& value);
 
     sqlite3* db_{nullptr};
     // Read-only, authorizer-sandboxed connection used only by execute_user_query

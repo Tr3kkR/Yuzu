@@ -1293,7 +1293,9 @@ The server applies retention policies to stored data to manage disk usage. Reten
 | Audit log entries | `--audit-retention-days` | 365 days | Records of who did what, when, and on which devices. |
 | Guardian (Guaranteed State) events | `--guardian-event-retention-days` | 30 days | Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See [Guaranteed State](guaranteed-state.md) for the feature context. |
 
-Reducing the TTL frees disk space; increasing it preserves history for compliance.
+Increasing a TTL preserves more history for compliance. Reducing one frees disk
+for the response and Guardian-event stores; **for the audit log it does not** --
+see the note below.
 
 > **Audit retention is a floor, not a ceiling.** A cleanup pass declines once
 > when it would expire every datable row, and every accepted pass is capped at

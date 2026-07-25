@@ -663,14 +663,14 @@ std::string TarDatabase::get_config(const std::string& key, const std::string& d
     return default_val;
 }
 
-void TarDatabase::set_config(const std::string& key, const std::string& value) {
+bool TarDatabase::set_config(const std::string& key, const std::string& value) {
     std::lock_guard lock(mu_);
-    set_config_locked(key, value);
+    return set_config_locked(key, value);
 }
 
-void TarDatabase::set_config_locked(const std::string& key, const std::string& value) {
+bool TarDatabase::set_config_locked(const std::string& key, const std::string& value) {
     if (!db_)
-        return;
+        return false;
 
     const char* sql = R"(
         INSERT INTO tar_config (key, value)
@@ -682,7 +682,7 @@ void TarDatabase::set_config_locked(const std::string& key, const std::string& v
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("TarDatabase::set_config prepare failed: {}", sqlite3_errmsg(db_));
-        return;
+        return false;
     }
     StmtPtr stmt(raw_stmt);
 
@@ -692,7 +692,9 @@ void TarDatabase::set_config_locked(const std::string& key, const std::string& v
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE) {
         spdlog::error("TarDatabase::set_config step failed: {}", sqlite3_errmsg(db_));
+        return false;
     }
+    return true;
 }
 
 // ── Warehouse schema management ─────────────────────────────────────────────

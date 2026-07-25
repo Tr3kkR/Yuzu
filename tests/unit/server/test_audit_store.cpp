@@ -1015,3 +1015,86 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     CHECK(skips >= 2);
     CHECK(failures == 0);
 }
+
+TEST_CASE("AuditStore #2360: a clean drain clears the latch in the SAME pass",
+          "[audit_store][retention][clock-guard]") {
+    // Sol / Gate 8. The latch used to be assigned from the PRE-delete
+    // `would_wipe`, so a pass that drained the entire backlog still latched. If a
+    // real anomaly arrived before the next pass could clear it, that anomaly
+    // deleted with no decline, no warn and no counter -- the guard spent on an
+    // anomaly that was already over. The latch now comes from a post-delete fact.
+    GuardFixture f;
+    f.seed(kNow - 100, 10); // all expired, well under the cap
+
+    REQUIRE(f.store.cleanup_once(kNow) == 0);      // decline, latch armed
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+    REQUIRE(f.store.cleanup_once(kNow + 1) == 10); // drains the whole backlog
+    REQUIRE(f.store.total_count() == 0);
+
+    // A fresh anomaly arrives BEFORE any intervening empty pass. The old rule
+    // left the latch armed here and deleted silently.
+    f.seed(kNow - 100, 6);
+    CHECK(f.store.cleanup_once(kNow + 2) == 0);
+    CHECK(f.store.total_count() == 6);
+    CHECK(f.store.clock_anomaly_skips_count() == 2);
+}
+
+TEST_CASE("AuditStore #2360: an exact-cap drain that empties the backlog is not cap-bound",
+          "[audit_store][retention][clock-guard]") {
+    // The cap counter is documented as proving a backlog remains. Deriving it
+    // from `deleted >= cap` alone made an exact-cap drain that emptied the table
+    // report a backlog that was not there.
+    GuardFixture f;
+    f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass));
+    f.seed(kNow + kWindow, 1); // survivor, so the pass is accepted, not declined
+
+    CHECK(f.store.cleanup_once(kNow) == kMaxAuditDeletesPerPass);
+    CHECK(f.store.cap_reached_count() == 0); // nothing left behind
+    CHECK(f.store.total_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360: a negative stored reading is an anomaly, not a quiet reset",
+          "[audit_store][retention][clock-guard]") {
+    // A negative value cannot arise from any pass this code ran, so it means the
+    // state was corrupted or tampered with. Accepting it quietly disabled the
+    // step check for that pass with nothing to report.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-neg-"}};
+    {
+        AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1); // survivor: only the state is wrong
+    exec_raw(tmp.path, "INSERT INTO audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', -1) "
+                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.clock_anomaly_skips_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360: INT64_MIN in the stored reading is rejected before any arithmetic",
+          "[audit_store][retention][clock-guard][chaos]") {
+    // The overflow case that actually exists. `now - INT64_MAX` stays in range
+    // for a normal positive epoch, but `now - INT64_MIN` overflows by ~1.4e18 and
+    // IS reachable with an ordinary expired backlog. An earlier round tested only
+    // INT64_MAX, concluded "no UB", and wrote that into a commit message.
+    // Run under UBSan.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-min-"}};
+    {
+        AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);      // an ordinary expired backlog
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);  // and a survivor
+    exec_raw(tmp.path, "INSERT INTO audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', -9223372036854775808) "
+                       "ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    CHECK(store.cleanup_once(kNow) == 0); // declines; no subtraction is performed
+    CHECK(store.clock_anomaly_skips_count() == 1);
+}

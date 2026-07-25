@@ -509,7 +509,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         ProbeFailed,
         DeclineFirstPass,
         DeclineStep,
-        DeclineBackward,
+        DeclineImplausible,
         Deleted,
         DeleteFailed
     };
@@ -562,19 +562,28 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // SANITISE the reading before doing arithmetic on it. It is durable
         // state in the same database as the evidence, so it can come back
         // corrupt, hand-edited, or -- far more mundanely -- stamped by an
-        // earlier pass that ran while the clock was skewed FORWARD. Any of those
-        // leaves `prev > now`, which would make `now - prev` negative for as long
-        // as real time takes to catch up (potentially years), silently killing
-        // the only detector that survives a restart. An INT64_MAX value would
-        // make the subtraction signed-overflow UB outright.
+        // earlier pass that ran while the clock was skewed FORWARD. `prev > now`
+        // would make `now - prev` negative for as long as real time takes to
+        // catch up (potentially years), silently killing the only detector that
+        // survives a restart.
         //
-        // A reading from the future is itself evidence the clock moved, so it is
-        // treated as an anomaly rather than discarded quietly, and `now` is
-        // persisted above either way so the state self-heals on this pass.
+        // On overflow, precisely: `now - INT64_MAX` stays in range for a normal
+        // positive epoch, but `now - INT64_MIN` overflows by ~1.4e18 and IS
+        // reachable with an ordinary expired backlog. So the sanitiser prevents
+        // both the silent disable and UB -- an earlier version of this comment
+        // claimed only the former, generalising from a test that used INT64_MAX
+        // and never INT64_MIN.
+        //
+        // BOTH out-of-range directions are anomalies, not quiet resets. A
+        // negative reading cannot arise from any pass this code ever ran, so it
+        // means the state was corrupted or tampered with -- reporting nothing
+        // would let a poisoned value disable the step check silently, which is
+        // exactly what the guard is for. `now` is persisted above either way, so
+        // the state self-heals on this pass.
         std::optional<std::int64_t> prev_pass_now = raw_prev;
-        bool prev_from_future = false;
+        bool prev_implausible = false;
         if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now)) {
-            prev_from_future = *prev_pass_now > now;
+            prev_implausible = true;
             prev_pass_now.reset();
         }
 
@@ -656,10 +665,10 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit_window = step_threshold;
             emit_full_wipe = would_wipe;
 
-            if ((would_wipe || big_step || prev_from_future) && !clock_anomaly_latched_) {
+            if ((would_wipe || big_step || prev_implausible) && !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 clock_anomaly_latched_ = true;
-                emit = prev_from_future  ? Emit::DeclineBackward
+                emit = prev_implausible  ? Emit::DeclineImplausible
                        : !prev_pass_now  ? Emit::DeclineFirstPass
                                          : Emit::DeclineStep;
             } else {
@@ -680,10 +689,11 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     switch (emit) {
     case Emit::None:
         break;
-    case Emit::DeclineBackward:
-        spdlog::warn("AuditStore: the stored retention clock reading is AHEAD of the current "
-                     "clock, so this server's clock moved backward or that state was tampered "
-                     "with; declining once and re-anchoring on the current reading");
+    case Emit::DeclineImplausible:
+        spdlog::warn("AuditStore: the stored retention clock reading is not a plausible past "
+                     "reading (negative, or ahead of the current clock), so this server's clock "
+                     "moved backward or that state was corrupted; declining once and re-anchoring "
+                     "on the current reading");
         break;
     case Emit::ProbeFailed:
         spdlog::warn("AuditStore: retention probe failed ({}); skipping this pass", emit_err);
@@ -760,19 +770,39 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
     }
     del.reset();
     rows_deleted_.fetch_add(deleted, std::memory_order_relaxed);
-    if (deleted >= kMaxAuditDeletesPerPass)
-        // The cap bound this pass, so a backlog remains. Counted, not just
-        // logged: a cap that binds on every pass for a sustained period is the
-        // one failure the cap itself introduces (audit.db growing without
-        // bound), and nothing else on /metrics would show it.
-        cap_reached_.fetch_add(1, std::memory_order_relaxed);
 
-    // Hold the latch only while the wipe condition itself persists, so a large
-    // all-expired backlog drains at cap pace without re-tripping the guard --
-    // and, crucially, an ORDINARY over-cap backlog (survivors present, so
-    // `would_wipe` is false) never arms it. Arming on ordinary backlog would
-    // mask the decline+counter signal of a real anomaly arriving next.
-    clock_anomaly_latched_ = would_wipe;
+    // Did this pass actually leave a backlog? One bounded EXISTS, and ONLY when
+    // the cap bound the pass, so the healthy path pays nothing.
+    //
+    // Two separate defects turned on guessing this from `deleted >= cap`
+    // (#2360 Gate 8 / Sol). First, a drain that removed exactly a cap's worth
+    // and emptied the backlog still incremented cap_reached_, while every doc
+    // says that counter proves a backlog remains. Second, and worse, the latch
+    // below was assigned from the PRE-delete `would_wipe`: a pass that drained
+    // the whole backlog still latched, so if a real anomaly arrived before the
+    // next pass could clear it, that anomaly deleted with no decline, no warn
+    // and no counter. The latch must come from a POST-delete fact.
+    bool backlog_remains = false;
+    if (deleted >= kMaxAuditDeletesPerPass) {
+        const std::int64_t binds[] = {now};
+        const auto more = exists_probe(db_,
+                                       "SELECT EXISTS(SELECT 1 FROM audit_events "
+                                       "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
+                                       binds);
+        // Unreadable: assume a backlog remains. That keeps the latch armed and
+        // the counter moving, which is the conservative direction for both.
+        backlog_remains = !more || *more;
+        if (backlog_remains)
+            cap_reached_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Hold the latch only while an anomaly is STILL BEING WORKED OFF: the wipe
+    // condition held for this pass AND the cap left rows behind. Both halves
+    // matter. Dropping the first arms it on an ordinary over-cap backlog, which
+    // masks the decline of a real anomaly arriving next. Dropping the second
+    // leaves it armed after a clean drain, which does the same thing for the
+    // window until the next pass clears it.
+    clock_anomaly_latched_ = would_wipe && backlog_remains;
     return deleted;
 }
 
