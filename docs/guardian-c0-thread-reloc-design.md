@@ -551,13 +551,18 @@ Whichever PR flips `prefer_spark` MUST also:
    sweeps are NOT included - they have their own `yuzu.guardian_sweep_exceptions`, as does
    outbox delivery via `yuzu.guardian_drain_exceptions`) and shifts again in effect at the
    flip. All three carry dormancy framing that must be shed at the same time.
-3. **Close or explicitly risk-accept the shutdown-classification undercount** (Gate 6
-   compliance, CC7.2): when a stop lands mid-classification, the remaining evicted keys are
-   counted in neither `evicted_sent_unacked` nor `evicted_no_send_evidence`, so the counter an
-   auditor reads as "audit gap" reports a SMALLER gap than actually occurred. Under-counting a
-   loss indicator is worse than under-counting a success one. Dormancy caps the severity
-   today; it does not once C0 is live. This needs to be an explicit checklist item on #2298,
-   not prose in a design doc.
+3. ~~**Close or explicitly risk-accept the shutdown-classification undercount**~~ - **DONE**
+   (built, NOT risk-accepted; L3 commit 5a85fcc5) (Gate 6 compliance, CC7.2): when a stop lands
+   mid-classification, the remaining evicted keys were counted in neither `evicted_sent_unacked`
+   nor `evicted_no_send_evidence`, so the counter an auditor reads as "audit gap" reported a
+   SMALLER gap than actually occurred. Under-counting a loss indicator is worse than
+   under-counting a success one. Dormancy capped the severity while dormant; it would not once
+   C0 is live. FIX: the classifier now lands every evicted key in exactly one of three buckets -
+   the new `evicted_unclassified` catches the mid-pass-shutdown remainder, an unreadable-label
+   fallback read, and a mid-classification throw - so `batches_pruned == evicted_sent_unacked +
+   evicted_no_send_evidence + evicted_unclassified` holds every pass, making
+   `evicted_no_send_evidence` a trustworthy floor. The explicit #2298 checklist entry this asked
+   for is added at PR time.
 4. ~~**Land the `yuzu_fleet_guardian_*` server rollup**~~ - **DONE**, merged into this branch as
    PR #2334 (`server/core/src/guardian_journal_fleet_tags.hpp`, the writer/reader bind test, 18
    Guardian journal rules in `docs/prometheus/yuzu-alerts.yml`). Gate 6 sre had this as the item
@@ -677,8 +682,13 @@ Whichever PR flips `prefer_spark` MUST also:
     full token burst in the same cycle, which is exactly what jitter is for. Phase-jitter
     `last_page`/`last_prune` by U[0,interval) and jitter the BOOT page too, since a forced pass
     bypasses the cadence. Do not treat the old sustained number as a live gate.
-13. **Test the loop-death firewall** (Gate 3 QE). Nothing can currently make `loop()`'s own
-    tail throw, so the top-level catch and its counter are unexercised; this needs a seam.
+13. ~~**Test the loop-death firewall**~~ - **DONE** (L3 commit e4d98560) (Gate 3 QE). Nothing
+    could make `loop()`'s own tail throw, so the top-level catch and its counter were
+    unexercised; a one-shot test seam (`inject_loop_tail_throw_for_test`) now injects a throw
+    there, and a test asserts the escape is caught, `journal_maint_exceptions_` increments
+    exactly once, the success stamps freeze (item-6 liveness), and `stop()` still joins cleanly.
+    Mutation-verified: removing the catch aborts the process; removing its increment times out
+    the spin.
     ~~and the pre-join persist~~ - **the pre-join persist half is DONE (round 7)**: a test parks
     the drain worker inside a blocked send, calls `stop()` on another thread, and asserts the
     pending record reaches disk *while the join is still outstanding*. Asserting after `stop()`

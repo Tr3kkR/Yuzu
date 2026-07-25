@@ -87,6 +87,7 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .sent_labels_written = 21,
         .evicted_sent_unacked = 22,
         .evicted_without_send_evidence = 23,
+        .evicted_unclassified = 30,
         .maint_exceptions = 24,
         .drain_exceptions = 25,
         .sweep_exceptions = 26,
@@ -94,7 +95,7 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .lifecycle_backpressure_drops = 29,
     };
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 29);
+    CHECK(tags.size() == 30);
 }
 
 TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",
@@ -156,6 +157,7 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     s.quarantine_failures = s.quarantine_capacity_evicted = s.batches_pruned = 1;
     s.prune_failures = s.write_capacity_rejected = s.pages = s.records_paged = 1;
     s.sent_labels_written = s.evicted_sent_unacked = s.evicted_without_send_evidence = 1;
+    s.evicted_unclassified = 1;
     s.stage_dropped = s.stage_failures = s.field_rejected = s.clock_rejected = 1;
     s.pending_depth = s.maint_exceptions = s.drain_exceptions = s.sweep_exceptions = 1;
     s.journal_bytes = s.journal_batch_count = 1;

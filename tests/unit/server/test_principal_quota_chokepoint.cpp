@@ -534,7 +534,10 @@ TEST_CASE("apply_engine_quota_gate: engine principal, concurrency exhausted on a
     REQUIRE(held.admitted());
 
     httplib::Request req;
-    req.method = "POST"; // POST /mcp/v1/ is not in the (GET-only) streaming allowlist
+    // A POST /mcp/v1/ with NO SSE Accept header is a plain one-shot tool call, not a streaming
+    // path (streamed POST needs `Accept: text/event-stream` — 2f PR 3b, is_streaming_path). This
+    // test exercises the mcp-vs-rest 429 render pick, which does not depend on streaming-ness.
+    req.method = "POST";
     req.path = "/mcp/v1/";
     httplib::Response res;
     bool rejected = false;
@@ -1145,4 +1148,46 @@ TEST_CASE("apply_engine_quota_gate: S1 two-predicate classification — NEITHER 
     }
     CHECK(metric_value(reg, "yuzu_server_principal_quota_admits_total", {{"side", "engine"}}) ==
           0.0);
+}
+
+TEST_CASE("is_streaming_path: POST /mcp/v1/ streams ONLY with an SSE Accept (2f PR 3b streamed-"
+          "POST carve); a plain POST is not a streaming path, and the GET registry is unchanged",
+          "[quota][gate][2f]") {
+    auto post = [](const std::string& path, const char* accept) {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = path;
+        if (accept != nullptr)
+            req.set_header("Accept", accept);
+        return is_streaming_path(req);
+    };
+
+    // The streamed-POST carve: POST /mcp/v1/ is a streaming path IFF the client opted into SSE.
+    CHECK(post("/mcp/v1/", "text/event-stream"));                       // streamed intent
+    CHECK(post("/mcp/v1/", "application/json, text/event-stream"));     // SSE listed among ranges
+    CHECK(post("/mcp/v1/", "text/event-stream; charset=utf-8"));        // params on the SSE range are ignored
+    CHECK_FALSE(post("/mcp/v1/", nullptr));                             // plain one-shot tool call
+    CHECK_FALSE(post("/mcp/v1/", "application/json"));                  // explicit non-SSE
+    CHECK_FALSE(post("/mcp/v1/", "application/json; q=text/event-stream")); // #2073: substring only in a param
+    CHECK_FALSE(post("/other", "text/event-stream"));                   // only /mcp/v1/ streams on POST
+
+    // The GET registry is untouched — every GET route still streams unconditionally, no Accept
+    // required (GET /mcp/v1/, /events, /api/v1/events, /sse/executions/{id}).
+    auto get = [](const std::string& path) {
+        httplib::Request req;
+        req.method = "GET";
+        req.path = path;
+        return is_streaming_path(req);
+    };
+    CHECK(get("/mcp/v1/"));
+    CHECK(get("/events"));
+    CHECK(get("/api/v1/events"));
+    CHECK(get("/sse/executions/abc123"));
+    CHECK_FALSE(get("/api/v1/devices"));
+
+    // Other methods never stream.
+    httplib::Request del;
+    del.method = "DELETE";
+    del.path = "/mcp/v1/";
+    CHECK_FALSE(is_streaming_path(del));
 }

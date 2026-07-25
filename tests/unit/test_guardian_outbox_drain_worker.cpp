@@ -667,6 +667,55 @@ TEST_CASE("item 6 stamps + episode age: lock-free readers race a live worker (TS
     CHECK(age == 0); // nothing blocked in this rig
 }
 
+TEST_CASE("item 13: a throw in loop()'s tail reaches the top-level catch, is counted, joins clean",
+          "[spark][guardian][drain][maint]") {
+    // The loop's own tail (the refill re-arm's rt_.lifecycle_headroom() call - std::mutex::lock
+    // can throw - and the cadence arithmetic) sits OUTSIDE every inner firewall. Nothing in
+    // production can make it throw, so the thread lambda's top-level catch and its
+    // journal_maint_exceptions_ increment were unexercised (flip item 13). The seam injects a
+    // one-shot throw there and this proves the escape is caught, counted once, and the worker
+    // terminates so stop() still joins cleanly.
+    //
+    // MUTATION EVIDENCE (run at verify time, not asserted here):
+    //   (a) remove the thread lambda's top-level catch -> the injected throw escapes a bare
+    //       thread -> std::terminate -> the whole suite process dies (the strongest proof the
+    //       catch is load-bearing);
+    //   (b) remove the catch's journal_maint_exceptions_.fetch_add -> spin_until below never
+    //       reaches 1 and times out -> red.
+    // In this rig nothing in MAINTENANCE throws, so the only thing that can drive the counter
+    // to 1 is the top-level catch - which is what makes (b) a clean pin despite the counter
+    // being shared with the inner firewalls.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    // Armed BEFORE start(): thread creation is the happens-before edge, so the worker's first
+    // cycle observes it without a data race.
+    worker.inject_loop_tail_throw_for_test();
+    CHECK(worker.last_page_success_steady_ms() == 0); // not started yet
+
+    worker.start();
+    // The first cycle runs maintenance (both 0ms-due passes succeed and stamp), then the tail
+    // throws and the loop dies - so the count settles at exactly 1 and never moves again.
+    CHECK(spin_until([&] { return worker.journal_maint_exception_count() == 1; }));
+
+    // The worker is dead: its success stamps are seeded/advanced (> 0) and now FROZEN, which is
+    // exactly the ever-growing-age liveness contract item 6 reads off a dead worker.
+    const auto page_ms = worker.last_page_success_steady_ms();
+    const auto prune_ms = worker.last_prune_success_steady_ms();
+    CHECK(page_ms > 0);
+    CHECK(prune_ms > 0);
+    CHECK(worker.drain_exception_count() == 0); // the DRAIN firewall was not tripped
+
+    worker.stop(); // must still join cleanly despite the dead loop
+    CHECK(worker.journal_maint_exception_count() == 1);       // one-shot: never a second throw
+    CHECK(worker.last_page_success_steady_ms() == page_ms);   // frozen - the loop is gone
+    CHECK(worker.last_prune_success_steady_ms() == prune_ms);
+}
+
 TEST_CASE("a throwing send does not suppress journal maintenance (independent firewalls)",
           "[spark][guardian][drain][maint]") {
     JournalRig rig;

@@ -662,68 +662,125 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         // the skew next scan regardless).
         journal_batch_count_.fetch_sub(static_cast<std::int64_t>(n), std::memory_order_relaxed);
         journal_bytes_.fetch_sub(evicted_bytes, std::memory_order_relaxed);
-        // Classify from the one keys-only scan rather than a point read per evicted key.
-        std::optional<std::set<std::string>> sent_keys;
-        if (const auto& s = sent_scan(); s.has_value()) {
-            sent_keys.emplace(); // labels are presence markers; the key set IS the answer
-            for (const auto& r : *s)
-                sent_keys->insert(r.key);
-        }
-        bool point_read_failed = false;
-        for (const auto& key : evict) {
-            // Shutdown mid-classification: the eviction itself is already committed and counted;
-            // only the best-effort sent/unsent split of the REMAINING keys is skipped (C0 #2298 -
-            // keeps the drain-worker join prompt on a large evict set). The remainder is left
-            // unclassified, so evicted_sent_unacked_ + evicted_without_send_evidence_ can
-            // under-count batches_pruned_ after a shutdown. In-memory counters only - no durable
-            // evidence is lost - but an operator comparing them across a restart should expect
-            // the gap.
-            if (stopping_.load(std::memory_order_acquire))
-                break;
-            // Best-effort classification: a live entry may age out before its batch key exists,
-            // so absence of a sent-label != "never sent".
-            //
-            // SINCE #2299 it also does not mean "was deliverable". A batch with a corrupt
-            // VALUE under a well-formed key is now quarantined by the REPLAY pass rather than
-            // by prune, so one the rotation never reaches within its retention life is
-            // age-evicted here as an ordinary batch - unlabelled, and therefore counted as
-            // evicted_without_send_evidence. That counter is the audit-loss signal, so on a
-            // mass-corruption endpoint it now mixes "never delivered" with "was never
-            // deliverable". Both are genuinely lost evidence, which is why this is a
-            // reporting caveat rather than a bug; an operator diagnosing a spike should read
-            // it alongside `quarantined` rather than alone.
-            const std::string label = journal_sent_key_from_batch_key(key);
-            if (sent_keys) {
-                if (sent_keys->count(label))
-                    evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
-                else
-                    evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            // The scan failed. Fall back to a per-key read bounded by the evict set - but a
-            // FALLIBLE one. exists() answers false for both "absent" and "the read failed", and
-            // the read here fails for exactly the reason the scan just did, so it would report
-            // a whole evict set as "no send evidence" - the reading an operator is meant to
-            // treat as audit loss. A point error is counted as a read failure and classified
-            // as NEITHER: an unknown disposition is not evidence of absence.
-            std::expected<std::optional<std::string>, KvStoreError> one;
-            if (inject_fail_prune_sent_reads_.load(std::memory_order_relaxed) > 0) { // test-only
-                inject_fail_prune_sent_reads_.fetch_sub(1, std::memory_order_relaxed);
-                one = std::unexpected(KvStoreError{"injected sent-label read failure"});
+        // Classify every evicted key into EXACTLY ONE of three dispositions -
+        // evicted_sent_unacked_ / evicted_without_send_evidence_ / evicted_unclassified_ - so
+        // that batches_pruned_ (already advanced by `n` above) == the sum of the three, every
+        // pass (item 3 / sec-M4, #2298 CC7.2). The third bucket is what makes that invariant
+        // exact instead of an undercount: a mid-pass shutdown or an unreadable sent-label must
+        // land the affected keys SOMEWHERE, or evicted_without_send_evidence_ - the audit-gap
+        // signal an auditor reads - would report a SMALLER gap than actually occurred.
+        //
+        // The whole classifier is wrapped so a throw (bad_alloc under memory pressure in the
+        // set build or the per-key string transform) accounts the not-yet-classified remainder
+        // as unclassified before rethrowing to the caller's firewall. Without this the throw
+        // would leave batches_pruned_ counting keys that reached no disposition bucket, and the
+        // "exact" invariant would hold only on non-throwing passes.
+        std::size_t classified = 0;
+        try {
+            // Fires with 0 here (post-delete, pre-shutdown-gate), then with the running count
+            // after each classification. Test-only; null in production.
+            if (prune_classify_hook_)
+                prune_classify_hook_(classified);
+            if (stopping_.load(std::memory_order_acquire)) {
+                // Shutdown after the delete, before classification. Skip the sent-label scan
+                // entirely (one fewer KvStore round trip on the drain-worker join path, #2298
+                // cs-2) and count the WHOLE evict set as unclassified - the gap is reported at
+                // its TRUE size, never a smaller one. The orphaned labels are GC'd by the next
+                // boot's prune, which is idempotent.
+                evicted_unclassified_.fetch_add(evict.size(), std::memory_order_relaxed);
+                classified = evict.size();
             } else {
-                one = kv_->get_entry(kJournalNamespace, label);
+                // Classify from the one keys-only scan rather than a point read per evicted key.
+                std::optional<std::set<std::string>> sent_keys;
+                if (const auto& s = sent_scan(); s.has_value()) {
+                    sent_keys.emplace(); // labels are presence markers; the key set IS the answer
+                    for (const auto& r : *s)
+                        sent_keys->insert(r.key);
+                }
+                bool point_read_failed = false;
+                for (const auto& key : evict) {
+                    // The per-key stop gate is kept on BOTH the in-memory and the fallback path
+                    // (not only the fallback, as an earlier shape had it): the count/byte
+                    // eviction path is uncapped by design, so an abnormally large evict set must
+                    // still let a stop truncate promptly (the surrounding code maintains that
+                    // posture throughout). The remainder is COUNTED, never silently dropped.
+                    if (stopping_.load(std::memory_order_acquire)) {
+                        evicted_unclassified_.fetch_add(evict.size() - classified,
+                                                        std::memory_order_relaxed);
+                        classified = evict.size();
+                        break;
+                    }
+                    // Best-effort classification: a live entry may age out before its batch key
+                    // exists, so absence of a sent-label != "never sent".
+                    //
+                    // SINCE #2299 it also does not mean "was deliverable". A batch with a
+                    // corrupt VALUE under a well-formed key is now quarantined by the REPLAY
+                    // pass rather than by prune, so one the rotation never reaches within its
+                    // retention life is age-evicted here as an ordinary batch - unlabelled, and
+                    // therefore counted as evicted_without_send_evidence. That counter is the
+                    // audit-loss signal, so on a mass-corruption endpoint it now mixes "never
+                    // delivered" with "was never deliverable". Both are genuinely lost evidence,
+                    // which is why this is a reporting caveat rather than a bug; an operator
+                    // diagnosing a spike should read it alongside `quarantined` rather than alone.
+                    const std::string label = journal_sent_key_from_batch_key(key);
+                    if (sent_keys) {
+                        if (sent_keys->count(label))
+                            evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
+                        else
+                            evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+                        ++classified;
+                        if (prune_classify_hook_)
+                            prune_classify_hook_(classified);
+                        continue;
+                    }
+                    // The scan failed. Fall back to a per-key read bounded by the evict set -
+                    // but a FALLIBLE one. exists() answers false for both "absent" and "the
+                    // read failed", and the read here fails for exactly the reason the scan just
+                    // did, so it would report a whole evict set as "no send evidence" - the
+                    // reading an operator is meant to treat as audit loss. A point error is
+                    // counted as a read failure AND classified as UNCLASSIFIED: an unknown
+                    // disposition is not evidence of absence, and it still belongs to a bucket
+                    // so the invariant holds.
+                    std::expected<std::optional<std::string>, KvStoreError> one;
+                    if (inject_fail_prune_sent_reads_.load(std::memory_order_relaxed) > 0) { // test-only
+                        inject_fail_prune_sent_reads_.fetch_sub(1, std::memory_order_relaxed);
+                        one = std::unexpected(KvStoreError{"injected sent-label read failure"});
+                    } else {
+                        one = kv_->get_entry(kJournalNamespace, label);
+                    }
+                    if (!one) {
+                        // Record the pass's read-failure the INSTANT it happens, once (guarded
+                        // by point_read_failed), rather than after the loop. A later key's
+                        // string-build or the caller's classify-hook can throw, and a
+                        // post-loop increment would then be skipped by the catch below - leaving
+                        // this unclassified bump WITHOUT its paired prune_failures signal that
+                        // the docstring and metrics.md promise for an unreadable label
+                        // (Gate 2 sec-INFO / Gate 4 UP-10). Recording it here keeps the pairing
+                        // honest even under a throwing pass; still once per pass, never per key.
+                        if (!point_read_failed)
+                            prune_failures_.fetch_add(1, std::memory_order_relaxed);
+                        point_read_failed = true;
+                        evicted_unclassified_.fetch_add(1, std::memory_order_relaxed);
+                        ++classified;
+                        if (prune_classify_hook_)
+                            prune_classify_hook_(classified);
+                        continue;
+                    }
+                    if (one->has_value())
+                        evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+                    ++classified;
+                    if (prune_classify_hook_)
+                        prune_classify_hook_(classified);
+                }
             }
-            if (!one) {
-                point_read_failed = true;
-                continue;
-            }
-            if (one->has_value())
-                evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
-            else
-                evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+            // Account the not-yet-classified remainder before rethrowing to the caller's
+            // firewall, so the three-way invariant survives a throwing pass too.
+            evicted_unclassified_.fetch_add(evict.size() - classified, std::memory_order_relaxed);
+            throw;
         }
-        if (point_read_failed) // once per pass, not once per key
-            prune_failures_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC. The
