@@ -337,6 +337,43 @@ To preserve audit data beyond the retention window, export events periodically
 using the REST API or forward them to an external system (see Planned Features
 below).
 
+### The retention clock guard
+
+Retention is driven by the server's wall clock, so a clock that jumps forward
+--- a restored VM snapshot, an NTP correction after a dead CMOS battery, a
+hand-set date --- can mark the whole table expired at once. A cleanup pass
+refuses to act on that:
+
+- **It declines a pass that would expire every datable row**, logs a warning,
+  and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
+  applies when more than a whole retention window of wall-clock time has
+  elapsed since the previous pass. The decline is latched, so an audit table
+  that is *legitimately* all-expired still ages out --- it just costs one
+  cleanup interval first.
+- **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
+  default), oldest first. A wipe the guard chose to allow therefore ages out at
+  a paced rate an operator can still catch, rather than in one statement.
+- Rows whose TTL sits implausibly far in the future --- beyond the retention
+  window plus two days, i.e. written while the clock was already skewed forward
+  --- are excluded from the "would this expire everything?" question. Without
+  that, one such row would disarm the guard permanently.
+
+**Retention is a floor, not a ceiling.** The guard errs toward keeping evidence
+longer than configured, which is the safe direction for an evidence store. If
+you have just cut the retention setting or switched retention off, expect one
+declined pass and then paced deletion of the rows stamped under the old window.
+
+Two metrics report on this. Alert on both, and do not collapse them:
+
+| Metric | Meaning |
+|---|---|
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Non-zero means this server's clock moved in a way that would have wiped audit evidence. Investigate the host's time sync. |
+| `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error. The cleanup loop itself is broken. |
+
+Both leave rows undeleted, so an audit table that never shrinks looks identical
+either way --- only the pair distinguishes "the guard is protecting the table"
+from "cleanup is broken".
+
 ## Integration patterns
 
 ### Export to CSV

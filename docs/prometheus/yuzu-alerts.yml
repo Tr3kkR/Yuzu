@@ -393,6 +393,50 @@ groups:
             behavioural routes.
           runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
 
+      # #2360 retention clock guard. The guard declines a cleanup pass that would
+      # expire every datable audit row, so the evidence table survives a forward
+      # clock jump. A decline is not itself an outage, but it means this server's
+      # clock moved in a way that WOULD have wiped audit evidence -- an
+      # unattended host whose time sync is broken is one guard away from losing
+      # its SOC 2 trail.
+      - alert: YuzuAuditRetentionClockAnomaly
+        expr: |
+          increase(yuzu_server_audit_clock_anomaly_skips_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention declined a pass - this server's clock moved"
+          description: >-
+            An audit retention pass would have expired every datable row (or more than a
+            whole retention window elapsed between passes) and was declined. Nothing was
+            deleted, but check the host's time synchronisation: a restored VM snapshot, a
+            dead CMOS battery, or a hand-set date all produce this. A sustained increase
+            means the clock is still moving. Retention resumes automatically, paced at
+            the per-pass cap. Expect one decline after deliberately cutting or disabling
+            the retention setting.
+          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+
+      # The counterpart signal. Both a declined pass and a broken pass leave rows
+      # undeleted, so an audit table that never shrinks looks identical either
+      # way - only the pair separates "the guard is working" from "cleanup is
+      # broken". Without this alert an unbounded audit.db reads as a healthy guard.
+      - alert: YuzuAuditRetentionFailing
+        expr: |
+          increase(yuzu_server_audit_cleanup_failed_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention passes are failing on a database error"
+          description: >-
+            yuzu_server_audit_cleanup_failed_total is rising: the audit retention pass
+            itself is erroring, so audit.db grows without bound. This is NOT the clock
+            guard (that is yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
+            health (/healthz stores.audit), free disk, and the server log for
+            "AuditStore: retention probe failed" / "AuditStore: cleanup error".
+          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
     # (TTL + cap), so cap-eviction silently discards another operator's in-flight

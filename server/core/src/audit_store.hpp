@@ -79,6 +79,40 @@ struct AuditQuery {
 // auditor (#4 / SOC 2 CC7.2 evidence honesty).
 inline constexpr std::size_t kAuditSampleScanCap = 10000;
 
+// ── Retention clock guard (#2360) ──────────────────────────────────────────
+//
+// Rows whose TTL lands more than this far in the future are excluded from the
+// "would this pass delete everything datable?" question. A TTL is stamped
+// `insert_time + retention_days*86400` from the LOCAL clock, so the newest
+// healthy row sits exactly one retention window ahead of `now`; anything beyond
+// window+slack was written under a forward-skewed clock. Such a row can never
+// itself expire, so counting it as a survivor would let ONE bad row veto the
+// guard for the life of the store - the guard would die precisely when it is
+// needed (the reference fix, `guardian_lifecycle_journal.cpp` Gate 8b UP6-1).
+// Slack absorbs ordinary NTP correction and the write-to-cleanup gap.
+//
+// The direction of error is deliberate. Rows stamped under a LONGER retention
+// setting (an operator who just cut retention from 365d to 30d, or a store whose
+// retention is now switched off entirely) also land beyond the horizon, so they
+// are excluded too and `would_wipe` becomes EASIER to fire. Over-firing costs
+// one declined pass and then paced deletion; under-excluding disarms the guard.
+inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86400;
+
+// Upper bound on rows deleted by ONE retention pass. Age is an absolute
+// predicate: a single bad clock reading can mark the whole evidence table
+// expired at once, and the blind `DELETE ... WHERE ttl < now` this replaced
+// would action that in one statement. Capping the pass turns an accepted wipe
+// into a paced ageing-out that an operator can still catch.
+//
+// Sized as a DRAIN RATE, not as a batch-size guess: at the 60-minute default
+// cleanup interval this drains 0.6M rows/day, which is far above any plausible
+// steady-state expiry rate for an audit table, so the accepting path keeps up
+// and the latch never sits permanently set. (Deliberately NOT the 5000 used in
+// `app_perf_daily_store` - that number paces apply-merge INGEST, not deletion.)
+// Retention here is a floor: deleting late harms nothing the evidence store
+// exists for, so over-retaining is the safe direction.
+inline constexpr std::size_t kMaxAuditDeletesPerPass = 25000;
+
 class AuditStore {
 public:
     explicit AuditStore(const std::filesystem::path& db_path, int retention_days = 365,
@@ -123,6 +157,36 @@ public:
         return emit_failed_.load(std::memory_order_relaxed);
     }
 
+    /// Cumulative count of retention passes that DECLINED to delete because the
+    /// pass would have aged out every datable row, or because the clock moved
+    /// more than a whole retention window since the previous pass (#2360). A
+    /// non-zero value means this server's clock moved in a way that would have
+    /// wiped audit evidence; sustained growth means it is still moving.
+    uint64_t clock_anomaly_skips_count() const noexcept {
+        return clock_anomaly_skips_.load(std::memory_order_relaxed);
+    }
+
+    /// Cumulative count of retention passes that failed outright (a probe or the
+    /// delete itself returned a SQLite error). Scraped SEPARATELY from
+    /// `clock_anomaly_skips_count()` on purpose: both leave rows undeleted, but
+    /// one means "the guard is protecting the table" and the other means "the
+    /// cleanup loop is broken". A single counter could not tell an operator
+    /// which, so an unbounded-growth audit table would look like a working guard.
+    uint64_t cleanup_failed_count() const noexcept {
+        return cleanup_failed_.load(std::memory_order_relaxed);
+    }
+
+    /// Run exactly ONE retention pass against `now` (epoch seconds) and return
+    /// the number of rows deleted. Returns 0 when the pass declined (clock
+    /// guard), when nothing was expired, or when the pass failed.
+    ///
+    /// This is the whole body of the cleanup loop, factored out so tests can
+    /// drive a pass at an arbitrary `now` without sleeping the cleanup interval
+    /// and without touching the wall clock. All guard state is read and written
+    /// under `mtx_`, so calling it concurrently with a running cleanup thread is
+    /// safe (if pointless); tests generally do not call `start_cleanup()`.
+    std::size_t cleanup_once(std::int64_t now);
+
     void start_cleanup();
     void stop_cleanup();
 
@@ -140,6 +204,25 @@ private:
     // Persistence-failure counter: rows where the INSERT step returned
     // anything other than SQLITE_DONE.
     std::atomic<uint64_t> emit_failed_{0};
+    // Retention passes that declined to delete on a clock anomaly (#2360), and
+    // passes that failed on a SQLite error. Atomic because the /metrics scrape
+    // thread reads them without taking mtx_; both are only ever incremented from
+    // inside cleanup_once()'s exclusive lock.
+    std::atomic<uint64_t> clock_anomaly_skips_{0};
+    std::atomic<uint64_t> cleanup_failed_{0};
+    // Guard state for cleanup_once(). Plain (non-atomic) members: both are read
+    // and written only under the exclusive mtx_ that cleanup_once() holds for
+    // the whole pass, and no accessor exposes them.
+    //
+    // `clock_anomaly_latched_` makes the decline fire ONCE per anomaly rather
+    // than every pass - a store whose datable rows are all genuinely expired
+    // would otherwise never age out anything at all.
+    bool clock_anomaly_latched_{false};
+    // Wall-clock reading the previous pass saw, or 0 before the first pass.
+    // Zero is load-bearing: the elapsed delta is meaningless on the first pass
+    // of a process, and logging it would print the whole Unix epoch as "the
+    // clock moved" in exactly the restarted-server case this guard exists for.
+    std::int64_t last_pass_now_{0};
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else

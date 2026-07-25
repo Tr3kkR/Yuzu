@@ -78,6 +78,24 @@ void AuditStore::create_tables() {
         {2, R"(
             ALTER TABLE audit_events ADD COLUMN principal_class TEXT NOT NULL DEFAULT '';
         )"},
+        // #2360 retention clock guard. The guarded cleanup pass issues two
+        // EXISTS probes and one ordered LIMIT delete per pass, all keyed on
+        // ttl_expires_at, and it does so under the same exclusive lock every
+        // audit INSERT takes. Without a covering index each of those is a full
+        // scan (plus a sort for the ORDER BY) of a table that grows to millions
+        // of rows on a busy server, so the guard would trade a wipe risk for a
+        // write-stall. Partial on `ttl_expires_at > 0` because rows with
+        // retention disabled (ttl 0) are never cleanup candidates, and because
+        // matching the probes' own predicate is what lets SQLite pick it.
+        //
+        // One-time cost: CREATE INDEX on an existing large audit_events scans
+        // and sorts the whole table at first boot after upgrade. That is
+        // O(N log N) on the order of seconds for a few million rows, paid once,
+        // inside the startup migration transaction.
+        {3, R"(
+            CREATE INDEX IF NOT EXISTS idx_audit_ttl_id
+                ON audit_events(ttl_expires_at, id) WHERE ttl_expires_at > 0;
+        )"},
     };
     if (!MigrationRunner::run(db_, "audit_store", kMigrations)) {
         spdlog::error("AuditStore: schema migration failed, closing database");
@@ -361,6 +379,177 @@ void AuditStore::stop_cleanup() {
 #endif
 }
 
+namespace {
+
+// Run a one-row EXISTS probe. `*out` receives the answer; returns false on any
+// prepare/step error so the caller can fail closed rather than read a default.
+bool exists_probe(sqlite3* db, const char* sql, const std::int64_t* binds, int nbinds, bool* out) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return false;
+    for (int i = 0; i < nbinds; ++i)
+        sqlite3_bind_int64(stmt, i + 1, binds[i]);
+    const int rc = sqlite3_step(stmt);
+    // EXISTS(...) always yields exactly one row holding 0 or 1.
+    const bool ok = (rc == SQLITE_ROW);
+    if (ok)
+        *out = sqlite3_column_int(stmt, 0) != 0;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+} // namespace
+
+std::size_t AuditStore::cleanup_once(std::int64_t now) {
+    std::unique_lock lock(mtx_);
+    if (!db_)
+        return 0;
+
+    // A non-positive retention setting means "never expire": log() stamps ttl 0
+    // on every row, so no row is ever a cleanup candidate and the window below
+    // would be a meaningless zero to compare a clock step against.
+    const std::int64_t window =
+        retention_days_ > 0 ? static_cast<std::int64_t>(retention_days_) * 86400 : 0;
+
+    // Record this pass's reading for the NEXT pass's step check before any early
+    // return. The reading is an honest observation of the clock regardless of
+    // whether the pass went on to delete, decline, or fail, and not recording it
+    // on a failing pass would make a later recovery report a step that was
+    // really just an outage.
+    const std::int64_t prev_pass_now = last_pass_now_;
+    last_pass_now_ = now;
+
+    // Detect by OUTCOME, from live counts, rather than by a clock delta: a
+    // delta check is inert on the first pass after a restart, which is exactly
+    // the restored-VM / dead-CMOS case (the server boots with a wrong clock and
+    // has no previous reading to compare against). Two EXISTS probes answer the
+    // whole question and stay index-driven; a COUNT(*) pair would scan.
+    //
+    // `datable` deliberately EXCLUDES rows whose TTL is implausibly far in the
+    // future (see kAuditTtlFutureSlackSec): they can never expire, so treating
+    // them as ordinary survivors would let one forward-skew row disarm the guard
+    // permanently.
+    const std::int64_t datable_horizon = now + window + kAuditTtlFutureSlackSec;
+    bool has_expired = false;
+    bool has_datable_survivor = false;
+    const std::int64_t expired_binds[] = {now};
+    const std::int64_t survivor_binds[] = {now, datable_horizon};
+    const bool probes_ok =
+        exists_probe(db_,
+                     "SELECT EXISTS(SELECT 1 FROM audit_events "
+                     "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
+                     expired_binds, 1, &has_expired) &&
+        exists_probe(db_,
+                     "SELECT EXISTS(SELECT 1 FROM audit_events "
+                     "WHERE ttl_expires_at > 0 AND ttl_expires_at >= ? AND ttl_expires_at <= ?)",
+                     survivor_binds, 2, &has_datable_survivor);
+    if (!probes_ok) {
+        // Fail closed: delete nothing, and RE-ARM the guard. A failed pass tells
+        // us nothing about the clock, so carrying a set latch across it would
+        // mean the next pass that really would wipe the table deletes with no
+        // decline, no warn line and no counter -- the guard silently spent on an
+        // anomaly that may already be over. Re-arming costs at most one extra
+        // declined pass, and while a failure persists cleanup_failed_ rises
+        // alongside the skips so the two are never confusable.
+        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
+        clock_anomaly_latched_ = false;
+        spdlog::warn("AuditStore: retention probe failed ({}); skipping this pass",
+                     sqlite3_errmsg(db_));
+        return 0;
+    }
+
+    if (!has_expired) {
+        // Nothing to delete, so nothing to guard against. Clearing the latch
+        // here is the same rule the accepting path applies below: the anomaly is
+        // over once no expired backlog remains.
+        clock_anomaly_latched_ = false;
+        return 0;
+    }
+
+    // Every datable row is expired: one more `DELETE ... WHERE ttl < now` empties
+    // the evidence table.
+    const bool would_wipe = !has_datable_survivor;
+    // Supplement, not a replacement: `would_wipe` only fires when a forward jump
+    // exceeds the WHOLE retention window. A half-window jump expires half the
+    // store, which the cap below bounds but nothing would otherwise report. This
+    // is process-local, so it says nothing after a restart -- hence the outcome
+    // test above carries the restart case.
+    const bool big_step = prev_pass_now != 0 && window > 0 && now - prev_pass_now > window;
+
+    if ((would_wipe || big_step) && !clock_anomaly_latched_) {
+        clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+        if (prev_pass_now == 0)
+            spdlog::warn("AuditStore: the first retention pass after start would expire EVERY "
+                         "datable audit row; declining once so a clock anomaly cannot delete the "
+                         "audit trail wholesale");
+        else
+            spdlog::warn("AuditStore: this retention pass would expire {} (clock moved {}s since "
+                         "the last pass, retention window {}s); declining once so a clock anomaly "
+                         "cannot delete the audit trail wholesale",
+                         would_wipe ? "EVERY datable audit row" : "an unexpectedly large slice",
+                         now - prev_pass_now, window);
+        clock_anomaly_latched_ = true;
+        return 0;
+    }
+
+    // Accepted. Bound the pass so that even a wipe this guard chose to allow
+    // ages out at a paced rate instead of in one statement. Oldest-first so the
+    // pacing never strands the oldest evidence behind newer expiries.
+    //
+    // RETURNING carries the deleted count on the statement itself: reading
+    // sqlite3_changes() after step() on this FULLMUTEX connection is the #1033
+    // data race (FULLMUTEX serialises the calls, not the step->changes pair).
+    static constexpr char kDeleteSql[] = R"(
+        DELETE FROM audit_events WHERE id IN (
+            SELECT id FROM audit_events
+             WHERE ttl_expires_at > 0 AND ttl_expires_at < ?
+             ORDER BY ttl_expires_at ASC, id ASC
+             LIMIT ?)
+        RETURNING id
+    )";
+    sqlite3_stmt* del = nullptr;
+    if (sqlite3_prepare_v2(db_, kDeleteSql, -1, &del, nullptr) != SQLITE_OK) {
+        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
+        clock_anomaly_latched_ = false; // re-arm, as on the probe path above
+        spdlog::warn("AuditStore: cleanup prepare failed: {}", sqlite3_errmsg(db_));
+        return 0;
+    }
+    sqlite3_bind_int64(del, 1, now);
+    sqlite3_bind_int64(del, 2, static_cast<std::int64_t>(kMaxAuditDeletesPerPass));
+    std::size_t deleted = 0;
+    int rc = SQLITE_OK;
+    // A RETURNING statement is not finished until it steps to SQLITE_DONE, so
+    // drain it rather than stopping at the first row.
+    while ((rc = sqlite3_step(del)) == SQLITE_ROW)
+        ++deleted;
+    sqlite3_finalize(del);
+    if (rc != SQLITE_DONE) {
+        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("AuditStore: cleanup error: {}", sqlite3_errmsg(db_));
+        clock_anomaly_latched_ = false; // re-arm, as on the probe path above
+        // Report 0, not the RETURNING rows seen so far: SQLite unwinds a failed
+        // statement from its statement journal, so those rows are back.
+        return 0;
+    }
+
+    // Hold the latch only while the wipe condition itself persists, so a large
+    // all-expired backlog drains at cap pace without re-tripping the guard --
+    // and, crucially, an ORDINARY over-cap backlog (survivors present, so
+    // `would_wipe` is false) never arms it. Arming on ordinary backlog would
+    // mask the decline+counter signal of a real anomaly arriving next.
+    clock_anomaly_latched_ = would_wipe;
+
+    if (deleted > 0) {
+        if (deleted >= kMaxAuditDeletesPerPass)
+            spdlog::info("AuditStore: expired {} rows (per-pass cap reached; the remainder ages "
+                         "out on subsequent passes)",
+                         deleted);
+        else
+            spdlog::info("AuditStore: expired {} rows", deleted);
+    }
+    return deleted;
+}
+
 #ifdef __cpp_lib_jthread
 void AuditStore::run_cleanup(std::stop_token stop) {
     while (!stop.stop_requested()) {
@@ -379,28 +568,9 @@ void AuditStore::run_cleanup() {
             break;
 #endif
 
-        auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-
-        {
-            std::unique_lock lock(mtx_);
-            sqlite3_stmt* cleanup_stmt = nullptr;
-            if (sqlite3_prepare_v2(
-                    db_, "DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
-                    -1, &cleanup_stmt, nullptr) == SQLITE_OK) {
-                sqlite3_bind_int64(cleanup_stmt, 1, now);
-                if (sqlite3_step(cleanup_stmt) == SQLITE_DONE) {
-                    auto deleted = sqlite3_changes(db_);
-                    if (deleted > 0) {
-                        spdlog::info("AuditStore: expired {} rows", deleted);
-                    }
-                } else {
-                    spdlog::warn("AuditStore: cleanup error: {}", sqlite3_errmsg(db_));
-                }
-                sqlite3_finalize(cleanup_stmt);
-            }
-        }
+        cleanup_once(std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count());
     }
 }
 

@@ -968,6 +968,18 @@ public:
         // operators that the audit chain itself is degraded.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
                           "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+        // #2360 retention clock guard. The two counters answer DIFFERENT
+        // questions and must not be collapsed: skips means the guard declined a
+        // delete that would have wiped the evidence table (this server's clock
+        // moved), failed means the cleanup pass itself errored. Both leave rows
+        // undeleted, so without the second an operator watching an audit table
+        // that never shrinks would read a broken cleanup loop as a working guard.
+        metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
+                          "Audit retention passes declined because they would have expired every "
+                          "datable row, or because the clock moved more than a retention window",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_cleanup_failed_total",
+                          "Audit retention passes that failed on a SQLite error", "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
         // Increments in the token-create handlers (api_token, device_token)
         // when `secure_random::fill_random` returns prng_failure (entropy
@@ -3791,6 +3803,12 @@ public:
                     // OBS-4: surface audit-pipeline persistence failures.
                     metrics_.gauge("yuzu_server_audit_emit_failed_total")
                         .set(static_cast<double>(audit_store_->emit_failed_count()));
+                    // #2360: retention clock guard. Declined-wipe passes and
+                    // failed passes are scraped separately (see describe above).
+                    metrics_.gauge("yuzu_server_audit_clock_anomaly_skips_total")
+                        .set(static_cast<double>(audit_store_->clock_anomaly_skips_count()));
+                    metrics_.gauge("yuzu_server_audit_cleanup_failed_total")
+                        .set(static_cast<double>(audit_store_->cleanup_failed_count()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore

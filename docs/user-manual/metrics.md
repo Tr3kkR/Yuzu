@@ -101,6 +101,24 @@ Every held-open SSE stream re-validates its credential on each ~3 s pump tick. F
 
 This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
 
+## Audit-store metrics
+
+The audit store is the SOC 2 evidence chain, so both its write path and its
+retention path are scraped. The retention clock guard these describe is
+documented in `docs/user-manual/audit-log.md`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_audit_events_total{result}` | counter | Audit events written, bucketed by `result` (`success` / `failure` / `denied` / `other`). |
+| `yuzu_server_audit_emit_failed_total` | counter | Events that failed to persist. Non-zero means fail-closed behavioural-PII routes are returning `503`; see the `YuzuAuditPersistFailures` alert. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | counter | Retention passes **declined** because the pass would have expired every datable row, or because more than a whole retention window elapsed since the previous pass. Non-zero means this server's clock moved in a way that would have wiped audit evidence - check the host's time sync. Nothing was deleted. |
+| `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that **failed** on a database error, so `audit.db` grows without bound. |
+
+The last two must be alerted on separately and never collapsed into one signal:
+both leave rows undeleted, so an audit table that never shrinks looks identical
+either way. Only the pair distinguishes "the guard is protecting the table" from
+"cleanup is broken".
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a
