@@ -233,7 +233,12 @@ agent_test_exe = executable(
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
   # thread_pool.hpp directly in the test TU, so it needs fmt symbols linked here.
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep],
+  # sqlite3_dep: test_kv_store.cpp opens a SECOND raw connection to the same file to
+  # provoke a genuine SQLite failure (dropping the table so prepare fails), which is the
+  # only way to exercise KvStore's fallible-read branches end to end rather than through
+  # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
+  # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
@@ -439,10 +444,15 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
+      # #2367: test-only definition of EngineLivenessTestAccess::revalidate,
+      # kept OFF the production link line so the private cached path has no
+      # public trampoline in server_core.
+      'unit/server/engine_liveness_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
       'unit/server/test_rest_access_review.cpp',
@@ -500,6 +510,7 @@ if build_server
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
       'unit/server/test_mcp_stream.cpp',
+      'unit/server/test_mcp_stream_bridge.cpp',
       'unit/server/test_sse_saturation.cpp',
       'unit/server/test_mcp_transport.cpp',
       'unit/server/test_process_health.cpp',

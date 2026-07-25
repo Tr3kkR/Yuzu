@@ -281,12 +281,47 @@ public:
     /// — a confirm attempted after a restart is rejected with "rotation
     /// confirmation unavailable", not silently allowed for any caller.
     ///
-    /// Rejected (no DB mutation) if there is no in-flight, recognizable
-    /// rotation pair for `principal_id` (0, 1, or >2 active credentials, or
-    /// 2 active that aren't a linked pair) — same defensive posture as
-    /// `rotate_engine_credential`'s equivalent branches.
+    /// Rejected (no DB mutation) when there is no in-flight, recognizable
+    /// rotation pair for `principal_id`. Since #2404 the rejection is
+    /// state-discriminated (classifier: `rotation_confirm_state.hpp`) so a
+    /// replay after the rotation already resolved gets a TERMINAL conflict the
+    /// caller maps to 409/kInvalidParams, NOT the old blanket retryable error:
+    ///   - 0 active, or 2 active that aren't a linked pair -> "no in-flight
+    ///     rotation to confirm" (RETRYABLE/Transient: 0-active is ambiguous
+    ///     with a swallowed read failure, and a malformed pair is kept
+    ///     conservative);
+    ///   - >2 active -> "more than two active credentials ..." (terminal,
+    ///     manual resolution) — mirrors `rotate_engine_credential`;
+    ///   - 1 active with UNCLEARED rotation linkage -> "... unresolved
+    ///     rotation metadata ... do not rotate ..." (terminal; rotating would
+    ///     strand a malformed pair, #2404 F1);
+    ///   - 1 active, linkage clear, pin matches -> "rotation already
+    ///     confirmed ..." (`confirmed_at != 0`) or "no rotation in flight ...
+    ///     already the sole active credential ..." (`confirmed_at == 0`,
+    ///     resolved by never-rotated / sweep / revoke) — both terminal;
+    ///   - 1 active, linkage clear, pin does NOT match -> "... the rotation
+    ///     was resolved ..." (terminal).
+    /// `confirmed_at` is a sound discriminator ONLY on the pin-MATCH arm: it
+    /// is written solely by confirm, solely on a successor row, and a row is a
+    /// successor exactly once — so `row.confirmed_at != 0` means precisely
+    /// "the rotation in which THIS row was successor was confirmed". It is a
+    /// historical marker retained across later rotations, so it is NEVER used
+    /// to attribute a non-matching pin's resolution cause.
+    ///
+    /// `token_id` pins the exact rotation being confirmed (#2384): it must
+    /// equal the pending pair's SUCCESSOR `token_id` — the value the rotate
+    /// call returned to the caller — or the confirm is rejected (no DB
+    /// mutation) with "token_id does not match the pending rotation
+    /// successor". Without the pin, a blind same-operator retry of an old
+    /// confirm could land after a SECOND rotation started and revoke that
+    /// later rotation's still-live predecessor early. With it, a replay can
+    /// only ever target the pair it was issued for: while that pair is
+    /// pending it confirms it (once); after cutover — or once a later
+    /// rotation is in flight — the stale id mismatches and nothing is
+    /// written.
     [[nodiscard]] std::expected<void, std::string>
-    confirm_rotation(const std::string& principal_id, const std::string& requesting_user);
+    confirm_rotation(const std::string& principal_id, const std::string& token_id,
+                     const std::string& requesting_user);
 
     /// One rotation pair currently in flight, as read by the T12 maintenance
     /// sweep (design doc §7). `predecessor.supersedes_token_id` is always

@@ -31,13 +31,16 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
 namespace detail = yuzu::server::detail;
+using yuzu::agent::emit_guardian_journal_age_tags;
 using yuzu::agent::emit_guardian_journal_heartbeat_tags;
+using yuzu::agent::GuardianJournalAgeStats;
 using yuzu::agent::GuardianJournalStats;
 
 // STRUCTURAL PIN. GuardianJournalStats is an aggregate of std::uint64_t only (no
@@ -46,9 +49,10 @@ using yuzu::agent::GuardianJournalStats;
 // dead metric into a build break - the strongest bind available without server
 // production code including an agent header.
 //
-// When the cutover wires `gauge_underflow` into GuardianJournalStats + the emit
-// function (deliberately deferred, commit 1ffa4299), THIS is what will fail: fix it by
-// adding one row to kGuardianJournalMetrics, not by relaxing the assert.
+// `gauge_underflow` was wired in exactly this way (flip item 5, #2298), and the UP-4
+// send_exceptions / backpressure_drops pair followed. When the NEXT journal counter is
+// added, THIS is what fails if its fleet row is forgotten: fix it by adding one row to
+// kGuardianJournalMetrics, not by relaxing the assert.
 static_assert(sizeof(GuardianJournalStats) ==
                   detail::kNGuardianJournalMetrics * sizeof(std::uint64_t),
               "GuardianJournalStats field count != kGuardianJournalMetrics row count - a "
@@ -61,6 +65,20 @@ static_assert(sizeof(GuardianJournalStats) ==
 static_assert(std::has_unique_object_representations_v<GuardianJournalStats>,
               "GuardianJournalStats gained padding - sizeof/8 is no longer its field "
               "count, so the size pin above silently stops counting fields.");
+
+// The AGE family gets the SAME structural pin against ITS OWN table. The two families
+// are deliberately separate structs/tables (SUM vs MAX rollup, sparse vs
+// emit-including-0 - see both headers), so each carries its own pin: an age added to
+// GuardianJournalAgeStats without a kGuardianJournalAgeMetrics row is a build break
+// here, and it must never be "fixed" by squeezing the age into the 30-counter table.
+static_assert(sizeof(GuardianJournalAgeStats) ==
+                  detail::kNGuardianJournalAgeMetrics * sizeof(std::uint64_t),
+              "GuardianJournalAgeStats field count != kGuardianJournalAgeMetrics row count "
+              "- an age gauge was added or removed without its fleet MAX row. Add/remove "
+              "the matching row in server/core/src/guardian_journal_fleet_tags.hpp.");
+static_assert(std::has_unique_object_representations_v<GuardianJournalAgeStats>,
+              "GuardianJournalAgeStats gained padding - sizeof/8 is no longer its field "
+              "count, so the age size pin above silently stops counting fields.");
 
 namespace {
 
@@ -83,6 +101,7 @@ GuardianJournalStats all_nonzero_stats() {
     s.batches_pruned = 12;
     s.prune_failures = 13;
     s.write_capacity_rejected = 14;
+    s.gauge_underflow = 27;
     s.journal_bytes = 15;
     s.journal_batch_count = 16;
     s.pages = 17;
@@ -95,6 +114,9 @@ GuardianJournalStats all_nonzero_stats() {
     s.clock_jump_skips = 24;
     s.drain_exceptions = 25;
     s.sweep_exceptions = 26;
+    s.send_exceptions = 28;
+    s.lifecycle_backpressure_drops = 29;
+    s.evicted_unclassified = 30;
     return s;
 }
 
@@ -140,6 +162,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_pruned", "12"},
         {"yuzu.guardian_journal_prune_failures", "13"},
         {"yuzu.guardian_journal_write_capacity_rejected", "14"},
+        {"yuzu.guardian_journal_gauge_underflow", "27"},
         {"yuzu.guardian_journal_bytes", "15"},
         {"yuzu.guardian_journal_batch_count", "16"},
         {"yuzu.guardian_journal_pages", "17"},
@@ -152,6 +175,9 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_journal_clock_jump_skips", "24"},
         {"yuzu.guardian_drain_exceptions", "25"},
         {"yuzu.guardian_sweep_exceptions", "26"},
+        {"yuzu.guardian_send_exceptions", "28"},
+        {"yuzu.guardian_journal_backpressure_drops", "29"},
+        {"yuzu.guardian_journal_evicted_unclassified", "30"},
     };
     // Per-key, NOT `CHECK(tags == expected)`. Catch2 has no StringMaker for
     // std::pair and neither CATCH_CONFIG_ENABLE_PAIR_STRINGMAKER nor
@@ -216,6 +242,104 @@ TEST_CASE("guardian journal: a quiescent journal emits no tags at all",
     emit_guardian_journal_heartbeat_tags(one_tag, one);
     REQUIRE(one_tag.size() == 1);
     CHECK(one_tag.count("yuzu.guardian_journal_evicted_no_send_evidence") == 1);
+}
+
+TEST_CASE("guardian journal ages: emit keys bind exactly to the server MAX table",
+          "[guardian][journal][fleet]") {
+    std::set<std::string> table_keys;
+    for (const auto& m : detail::kGuardianJournalAgeMetrics)
+        table_keys.insert(m.tag);
+    REQUIRE(table_keys.size() == detail::kNGuardianJournalAgeMetrics);
+
+    // Distinct values per field, same rationale as all_nonzero_stats(): the key-set
+    // checks cannot catch a page/prune value swap in the emitter, this can.
+    GuardianJournalAgeStats s;
+    s.page_stale_seconds = 31;
+    s.prune_stale_seconds = 62;
+    s.headroom_blocked_seconds = 93;
+    std::map<std::string, std::string> tags;
+    emit_guardian_journal_age_tags(tags, std::optional{s});
+
+    const std::map<std::string, std::string> expected{
+        {"yuzu.guardian_journal_page_stale_seconds", "31"},
+        {"yuzu.guardian_journal_prune_stale_seconds", "62"},
+        {"yuzu.guardian_journal_headroom_blocked_seconds", "93"},
+    };
+    for (const auto& [key, want] : expected) {
+        INFO("tag " << key);
+        REQUIRE(tags.count(key) == 1);
+        CHECK(tags.at(key) == want);
+    }
+    CHECK(tags.size() == expected.size());
+
+    // WRITER -> READER and READER -> WRITER, both directions, like the counter family.
+    for (const auto& [key, val] : tags) {
+        INFO("emitted age key not recognised by the server rollup: " << key);
+        CHECK(table_keys.count(key) == 1);
+    }
+    for (const auto& m : detail::kGuardianJournalAgeMetrics) {
+        INFO("age table key never emitted by the agent: " << m.tag);
+        CHECK(tags.count(m.tag) == 1);
+    }
+}
+
+TEST_CASE("guardian journal ages: gauge names follow the mechanical rule with _max",
+          "[guardian][journal][fleet]") {
+    // gauge == "yuzu_fleet_" + tag minus "yuzu." + "_max" - the suffix is the visible
+    // marker that this family rolls up as MAX, not SUM.
+    constexpr std::string_view kTagNs = "yuzu.";
+    std::set<std::string> gauges;
+    for (const auto& m : detail::kGuardianJournalAgeMetrics) {
+        const std::string_view tag{m.tag};
+        INFO("age tag not in the yuzu. heartbeat namespace: " << m.tag);
+        REQUIRE(tag.substr(0, kTagNs.size()) == kTagNs);
+        const std::string expected =
+            "yuzu_fleet_" + std::string(tag.substr(kTagNs.size())) + "_max";
+        INFO("age tag " << m.tag << " should map to gauge " << expected);
+        CHECK(std::string_view(m.gauge) == expected);
+        INFO("empty HELP for " << m.gauge);
+        CHECK(std::string_view(m.help).size() > 0);
+        gauges.insert(m.gauge);
+    }
+    CHECK(gauges.size() == detail::kNGuardianJournalAgeMetrics);
+    // And no collision with the counter family's gauges - two tables must never fight
+    // over one series.
+    for (const auto& m : detail::kGuardianJournalMetrics) {
+        INFO("age gauge collides with counter gauge: " << m.gauge);
+        CHECK(gauges.count(m.gauge) == 0);
+    }
+}
+
+TEST_CASE("guardian journal ages: emission posture - nullopt silent, zero ages emitted, "
+          "blocked sparse",
+          "[guardian][journal][fleet]") {
+    // Dormancy is the OPTIONAL: nullopt (prefer_spark off / worker not started) ships
+    // nothing - this is what keeps a pre-flip fleet from paging on a "stale" journal
+    // that is deliberately inert.
+    std::map<std::string, std::string> none;
+    emit_guardian_journal_age_tags(none, std::optional<GuardianJournalAgeStats>{});
+    CHECK(none.empty());
+
+    // A LIVE worker with all-zero ages ships the two staleness tags AT 0 - the exact
+    // opposite of the counter family's sparse rule, because a zero age is a real
+    // "fresh" reading and omitting it would make a dead-idle worker read as healthy
+    // idle (the item-6/item-14 gap). The blocked age stays sparse: 0 = "no episode".
+    std::map<std::string, std::string> fresh;
+    emit_guardian_journal_age_tags(fresh, std::optional{GuardianJournalAgeStats{}});
+    REQUIRE(fresh.size() == 2);
+    REQUIRE(fresh.count("yuzu.guardian_journal_page_stale_seconds") == 1);
+    REQUIRE(fresh.count("yuzu.guardian_journal_prune_stale_seconds") == 1);
+    CHECK(fresh.at("yuzu.guardian_journal_page_stale_seconds") == "0");
+    CHECK(fresh.at("yuzu.guardian_journal_prune_stale_seconds") == "0");
+    CHECK(fresh.count("yuzu.guardian_journal_headroom_blocked_seconds") == 0);
+
+    // Blocked appears exactly when non-zero.
+    GuardianJournalAgeStats blocked;
+    blocked.headroom_blocked_seconds = 7;
+    std::map<std::string, std::string> b;
+    emit_guardian_journal_age_tags(b, std::optional{blocked});
+    REQUIRE(b.size() == 3);
+    CHECK(b.at("yuzu.guardian_journal_headroom_blocked_seconds") == "7");
 }
 
 TEST_CASE("parse_guardian_journal_count enforces the forged-value posture",

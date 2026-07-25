@@ -5,6 +5,7 @@
 #include "mcp_transport.hpp"
 #include "rest_a4_envelope.hpp"
 #include "auth_routes.hpp" // detail::sanitize_detail_value — audit-string sanitiser
+#include "engine_principal_store.hpp" // kAuthCacheTtl — the staleness bound this pump clamps to (#2367)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_audit.hpp"
 
@@ -52,6 +53,10 @@ constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
 constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
 constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large_total";
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
+// A committed final response found no free pin slot - never expected (the bridge caps
+// streamed records per session at the pin count); the frame is kept unpinned rather than
+// lost. A non-zero value means the pin bound and the admission cap have drifted.
+constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -176,20 +181,40 @@ McpStreamState::McpStreamState(std::size_t ring_cap, yuzu::MetricsRegistry* metr
 }
 
 std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_view data) noexcept {
-    // HARD exception boundary (#2366) — the pump_once/pump_once_impl pattern. PR 3's
-    // progress bridge calls this from an ExecutionEventBus listener on a worker task
-    // httplib's routing try/catch never sees, so an escaped throw is std::terminate
-    // (the #2037 class). publish_impl contains every post-commit fault itself, so an
-    // exception reaching this catch proves the ring and next_id_ are untouched — 0
-    // ("not published, no id consumed") is the honest answer, and the caller's frame
-    // simply never happened rather than silently gapping Last-Event-ID.
+    return publish_guarded(event_type, data, /*deliver_live=*/true, /*pinned=*/false);
+}
+
+std::uint64_t McpStreamState::publish_ring_only(std::string_view event_type,
+                                                std::string_view data) noexcept {
+    // Ring commit for resume replay, but NO live-GET-sink copy - a streamed POST's frames
+    // ride the POST stream, and duplicating them onto a concurrent GET would be the spec's
+    // "MUST NOT broadcast the same message across multiple streams".
+    return publish_guarded(event_type, data, /*deliver_live=*/false, /*pinned=*/false);
+}
+
+std::uint64_t McpStreamState::publish_final(std::string_view event_type,
+                                            std::string_view data) noexcept {
+    // Ring-only (as above) AND eviction-exempt: the streamed request's final response must
+    // survive a ring wrap so a resume can always recover it (Decision 15(f)).
+    return publish_guarded(event_type, data, /*deliver_live=*/false, /*pinned=*/true);
+}
+
+std::uint64_t McpStreamState::publish_guarded(std::string_view event_type, std::string_view data,
+                                              bool deliver_live, bool pinned) noexcept {
+    // HARD exception boundary (#2366) - the pump_once/pump_once_impl pattern, shared by all
+    // three publish seams so they cannot drift. PR 3's progress bridge calls these from an
+    // ExecutionEventBus listener on a worker task httplib's routing try/catch never sees, so
+    // an escaped throw is std::terminate (the #2037 class). publish_impl contains every
+    // post-commit fault itself, so an exception reaching this catch proves the ring and
+    // next_id_ are untouched - 0 ("not published, no id consumed") is the honest answer, and
+    // the caller's frame simply never happened rather than silently gapping Last-Event-ID.
     //
     // string_view params (not by-value std::string): a by-value parameter is
     // copy-constructed in the CALLER's frame for an lvalue arg, so a bad_alloc there
     // would escape to the unguarded listener BEFORE this try. The views convert without
     // allocating; publish_impl owns them inside the guard.
     try {
-        return publish_impl(event_type, data);
+        return publish_impl(event_type, data, deliver_live, pinned);
     } catch (...) {
         // Best-effort observability only — the metric lookup and the log line both
         // allocate, and under bad_alloc a throw from THIS handler would propagate
@@ -198,20 +223,35 @@ std::uint64_t McpStreamState::publish(std::string_view event_type, std::string_v
             if (metrics_ != nullptr) {
                 metrics_->counter(kMetricPublishFailures).increment();
             }
-            spdlog::warn("MCP stream publish: frame dropped pre-commit (exception contained)");
+            // Enriched so an operator can attribute the loss: the session (log_context_,
+            // set once at mint - safe to read unlocked) and the event_type that never
+            // reached the ring. Both the format and the metric lookup allocate; the nested
+            // guard contains a bad_alloc from either.
+            spdlog::warn("MCP stream publish [{}]: frame dropped pre-commit "
+                         "(event_type={}, exception contained)",
+                         log_context_, event_type);
         } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
         }
         return 0;
     }
 }
 
-void McpStreamState::inject_publish_fault_for_test(PublishFault fault) {
+void McpStreamState::inject_publish_fault_for_test(PublishFault fault, int times) {
     std::lock_guard<std::mutex> lk(mu_);
     publish_fault_ = fault;
+    publish_fault_remaining_ = (fault == PublishFault::kNone) ? 0 : times;
+}
+
+void McpStreamState::set_log_context(std::string context) {
+    // No lock: write-once at mint before the stream is shared (see the header contract).
+    // Locking here would give false comfort - publish()'s reads are unlocked by design and
+    // are made safe by the mint-time happens-before edge, not by this write's own lock.
+    log_context_ = std::move(context);
 }
 
 std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
-                                           std::string_view data_view) {
+                                           std::string_view data_view, bool deliver_live,
+                                           bool pinned) {
     // Own the payload INSIDE the boundary. These two copies are the caller-visible
     // allocations that used to happen in the caller's frame (by-value params); doing them
     // here means a bad_alloc is caught by publish()'s guard as a clean pre-commit 0
@@ -223,6 +263,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     std::uint64_t evicted = 0;
     bool oversized = false;
     bool sink_enqueue_failed = false;
+    bool post_commit_obs_fault = false;  // test seam; tripped inside the post-commit try
     {
         // A single frame must not exceed the ring's byte budget, or the "always keep the
         // newest frame" rule below would admit it whole and the byte cap would bound
@@ -251,11 +292,23 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // injected while no sink is live would otherwise never reach its consumption
         // point below and would silently fire on a LATER real client's first frame.
         // Consuming it here makes both fault phases symmetric (always consumed once).
-        // Test seam only — publish_fault_ is kNone in production.
-        const PublishFault fault = std::exchange(publish_fault_, PublishFault::kNone);
+        // Test seam only - publish_fault_ is kNone in production. `times` (see the
+        // header) lets the same fault fire on N consecutive publishes; the historical
+        // one-shot is times == 1.
+        PublishFault fault = PublishFault::kNone;
+        if (publish_fault_remaining_ > 0) {
+            fault = publish_fault_;
+            if (--publish_fault_remaining_ == 0) {
+                publish_fault_ = PublishFault::kNone;
+            }
+        }
         if (fault == PublishFault::kPreCommit) {
             throw std::bad_alloc{};
         }
+        // Latched out of the block so it can trip the POST-COMMIT observability try below
+        // (after the frame is committed), not here. `fault` is block-scoped and consumed
+        // one-shot above, so carry the intent in a bool like sink_enqueue_failed.
+        post_commit_obs_fault = (fault == PublishFault::kPostCommitObservability);
         // Ordering is the fix for #2366 (the stream_budget.hpp "every allocating step
         // happens before any counter moves" template): read next_id_ WITHOUT
         // incrementing, do every allocating step (sanitize, frame construction, the
@@ -273,12 +326,48 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
             // Bounded on BOTH axes (Decision 15(d)). The frame count alone is not a memory
             // bound — 1024 sessions x 500 frames only bounds memory if you also know what a
             // frame weighs. Always keep at least the newest frame.
-            ring_bytes_ -= frame_bytes(ring_.front());
-            ring_.pop_front();
+            //
+            // Evict the OLDEST UNPINNED frame, not simply the front: a pinned final response
+            // (Decision 15(f)) must survive a ring wrap so a resume can recover it. Scan from
+            // the front for the first evictable frame (unpinned AND not the newest `back()`).
+            // The pin count is bounded by kMaxStreamedPostsPerSession (4) and the ring by
+            // kMcpRingCapDefault (500), so this inner scan is cheap.
+            const auto last = std::prev(ring_.end()); // never evict the newest
+            auto victim = ring_.begin();
+            while (victim != last && is_pinned_locked(victim->id)) {
+                ++victim;
+            }
+            if (victim == last) {
+                // Only pinned frames plus the newest remain - stop even if still over the
+                // byte cap. The overshoot is BOUNDED: at most kMaxStreamedPostsPerSession
+                // pinned finals, each bridge-clamped small, above the nominal cap.
+                break;
+            }
+            ring_bytes_ -= frame_bytes(*victim);
+            ring_.erase(victim);
             ++evictions_;
             ++evicted;
         }
         ring_bytes_ += frame_bytes(ring_.back());
+
+        // Pin the committed final AFTER the commit + eviction (it is the newest frame, which
+        // eviction never touches). Writing the id only now means a pre-commit push_back throw
+        // leaves no ghost pin. A missing slot is not expected - the bridge caps streamed
+        // records per session at the pin count - so commit the final unpinned rather than
+        // lose a real terminal, and count it.
+        if (pinned) {
+            bool slotted = false;
+            for (auto& slot : pinned_ids_) {
+                if (slot == 0) {
+                    slot = id;
+                    slotted = true;
+                    break;
+                }
+            }
+            if (!slotted && metrics_ != nullptr) {
+                metrics_->counter(kMetricFinalUnpinned).increment();
+            }
+        }
 
         // Enqueue to the live sink UNDER mu_, not after releasing it. Two concurrent
         // publishers (PR 3 will have concurrent tool calls on one session) would
@@ -287,7 +376,12 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // Last-Event-ID contract the whole resume mechanism rests on.
         // Safe: this is the DECLARED lock order (mu_ → sink mu), and enqueue_capped
         // never blocks on I/O or calls back into us.
-        live = live_;
+        //
+        // deliver_live == false (publish_ring_only / publish_final) skips the live sink
+        // entirely: the frame is committed to the ring for resume only, never a second live
+        // copy onto a concurrent GET (the spec's no-broadcast rule). A null `live` also
+        // skips the post-lock notify below.
+        live = deliver_live ? live_ : nullptr;
         if (live) {
             // Post-commit containment (#2366): enqueue_capped takes the SseEvent BY
             // VALUE, so the copy of ring_.back() at the call boundary is itself an
@@ -343,13 +437,22 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     // takes the registry lock — a throw here must not turn a committed publish into a
     // 0 return (the boundary's catch cannot tell it apart from a pre-commit failure).
     try {
+        // TEST SEAM: model the observability block itself throwing (a metric increment or
+        // WARN format allocating under memory pressure) AFTER the frame is committed. The
+        // enclosing catch is the #2366 guarantee under test - a fault here must NOT turn a
+        // committed publish into a 0 return, so publish_impl still returns `id`.
+        if (post_commit_obs_fault) {
+            throw std::bad_alloc{};
+        }
         if (sink_enqueue_failed) {
             // Cause-honest and rare: a post-commit allocation fault, NOT a slow consumer
             // (which is counted silently per-event). The client already learns of the gap
             // via events-dropped; this is the server-side breadcrumb an operator correlates
-            // with memory pressure.
-            spdlog::warn("MCP stream publish: live-sink enqueue failed post-commit — frame "
-                         "is in the ring, client resyncs via events-dropped");
+            // with memory pressure. Enriched with the session and the committed frame id
+            // (event_type was moved into the ring above; the id is the useful handle here).
+            spdlog::warn("MCP stream publish [{}]: live-sink enqueue failed post-commit - "
+                         "frame id={} is in the ring, client resyncs via events-dropped",
+                         log_context_, id);
         }
         if (evicted > 0 && metrics_ != nullptr) {
             metrics_->counter(kMetricRingEvictions).increment(static_cast<double>(evicted));
@@ -375,6 +478,16 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
     {
         std::lock_guard<std::mutex> lk(mu_);
 
+        // 0. Poison. A terminal frame could not be delivered (publish_final failed twice),
+        //    so this stream will never carry its final - fail every attach fast with a 410
+        //    + fetch-by-execution_id remediation rather than let a client re-attach and
+        //    heart-beat forever. Checked BEFORE resumability: a poisoned stream is gone
+        //    regardless of cursor.
+        if (terminal_poisoned_) {
+            out.status = AttachStatus::kPoisoned;
+            return out;
+        }
+
         // 1. Resumability. A cursor of 0 is "from the start of what we still have".
         //    Anything else must sit inside the ring window: at or after the frame
         //    before our oldest surviving id, and strictly before the next id we
@@ -387,6 +500,19 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         if (!resumable) {
             out.status = AttachStatus::kGap;
             return out;
+        }
+
+        // 1b. Unpin acknowledged finals (unpin rule (b)): a cursor at or past a pinned
+        //     final's id proves the client already consumed it, so it no longer needs the
+        //     eviction exemption - release it and let its ring space be reclaimed. (A pinned
+        //     final is only replayed to a cursor strictly below its id, so unpinning one at
+        //     or below the cursor never drops a frame this attach would have served.)
+        if (last_event_id != 0) {
+            for (auto& slot : pinned_ids_) {
+                if (slot != 0 && slot <= last_event_id) {
+                    slot = 0;
+                }
+            }
         }
 
         // 2. Admission.
@@ -545,6 +671,60 @@ void McpStreamState::detach(const std::shared_ptr<McpStreamSink>& sink) {
     }
 }
 
+bool McpStreamState::is_pinned_locked(std::uint64_t id) const {
+    if (id == 0) {
+        return false; // 0 is the empty-slot sentinel and never a valid frame id
+    }
+    for (const auto slot : pinned_ids_) {
+        if (slot == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool McpStreamState::is_pinned(std::uint64_t id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return is_pinned_locked(id);
+}
+
+void McpStreamState::unpin(std::uint64_t id) {
+    if (id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& slot : pinned_ids_) {
+        if (slot == id) {
+            slot = 0; // now evictable; a later publish may reclaim its ring space
+            return;   // ids are unique - at most one slot holds it
+        }
+    }
+}
+
+std::size_t McpStreamState::pinned_count() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::size_t n = 0;
+    for (const auto slot : pinned_ids_) {
+        if (slot != 0) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+void McpStreamState::poison_terminal() {
+    std::shared_ptr<McpStreamSink> live;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        terminal_poisoned_ = true; // sticky - every future attach_and_replay 410s
+        live = live_;
+    }
+    // Close any currently-live GET sink honestly rather than leave it heart-beating for a
+    // terminal that will never come. Outside mu_ (lock order), like close(). Idempotent:
+    // a second poison_terminal() just re-sets the flag and re-closes an already-closed sink.
+    close_sink(live, McpStreamClose::kInternalError);
+}
+
 std::uint64_t McpStreamState::current_generation() const {
     std::lock_guard<std::mutex> lk(mu_);
     return generation_;
@@ -590,7 +770,14 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      clock_(std::move(clock)), metrics_(metrics) {}
+      clock_(std::move(clock)), metrics_(metrics) {
+    // #2367: the grace budget is measured from the last authoritative
+    // confirmation, and attach already performed one — GET admission
+    // authenticates the request fully before this pump is constructed. Seeding
+    // to "now" rather than the epoch is what stops the very first
+    // indeterminate tick from computing an instantly-expired deadline.
+    last_authoritative_ok_ = now();
+}
 
 std::chrono::steady_clock::time_point McpStreamPump::now() const {
     return clock_ ? clock_() : std::chrono::steady_clock::now();
@@ -701,7 +888,16 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
             // jitter chosen ONCE here, so streams that all entered grace together do
             // not all die together (Config::revalidate_grace_jitter_max).
             if (!grace_deadline_.has_value()) {
-                grace_start_ = now();
+                // #2367: the budget is measured from the last AUTHORITATIVE
+                // confirmation, not from this tick. A credential re-check that
+                // was served from a cache (kValidStale below) keeps the stream
+                // alive without re-confirming anything, so starting the clock
+                // here would let cache residency and the grace window ADD —
+                // the stream rides the cache, then collects a full fresh grace
+                // window on top. Backdating keeps total survival past a real
+                // confirmation bounded by revalidate_grace, however much of it
+                // was spent on cached answers.
+                grace_start_ = last_authoritative_ok_;
                 std::chrono::milliseconds jitter{0};
                 if (cfg_.revalidate_grace_jitter_max.count() > 0) {
                     // A per-stream offset in [0, jitter_max]. thread_local RNG seeded once
@@ -723,15 +919,72 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
                         static_cast<std::int64_t>(rng()) % (span + 1)};
                 }
                 grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
-            } else if (now() > *grace_deadline_) {
-                stream_->close(McpStreamClose::kAuthUnavailable);
-                return finish(write, McpStreamClose::kAuthUnavailable);
             }
+            // Expiry is tested below, after the switch (kValidStale can clear a
+            // deadline, so the test must run once the verdict is known, not
+            // inline here).
             break;
         case StreamRevalidate::kValid:
-            grace_start_.reset();
-            grace_deadline_.reset();
+            // An AUTHORITATIVE confirmation: the store was asked and answered.
+            last_authoritative_ok_ = now();
+            clear_grace_deadline_();
             break;
+        case StreamRevalidate::kValidStale:
+            // Valid, but nothing was asked of the store on this tick — the
+            // answer came from a cache with a known maximum age.
+            //
+            // Advance the floor. The cache entry is positive evidence that the
+            // store confirmed this principal within `max_staleness`, and
+            // without using it `last_authoritative_ok_` would only refresh on
+            // the tick that happens to MISS. A principal with several
+            // concurrent streams refreshes the shared entry from whichever
+            // stream ticks first, so every OTHER stream would ride cached
+            // answers far longer than the TTL and then face a deadline already
+            // in the past the instant the store blipped: zero grace, all at
+            // once. Clamping to `now - max_staleness` bounds that to one cache
+            // window per stream and can only ever move the floor FORWARD (never
+            // past `now`), so it cannot extend a life.
+            if (cfg_.revalidate_max_staleness.count() > 0) {
+                last_authoritative_ok_ =
+                    std::max(last_authoritative_ok_, now() - cfg_.revalidate_max_staleness);
+            }
+            // Then CLEAR the deadline, exactly as kValid does — a cache hit is
+            // as much a confirmation as a read-through (the entry cannot exist
+            // unless an authoritative read succeeded within the window, and a
+            // revoke erases it synchronously). Leaving a deadline armed here
+            // was the round-1 defect: two streams on one principal, the outage
+            // ends, the first stream re-reads and warms the shared entry, and
+            // the second then rides hits with an outage-era deadline still
+            // counting down — closing `auth_unavailable` against a reachable
+            // store and an Active principal, contradicting CH-4's
+            // recovered-backend invariant. The bound survives because the floor
+            // advanced only to `now - max_staleness`, and a cached answer
+            // cannot outlive a dead store by more than one window (entries
+            // expire and are not renewed without a successful read), so a real
+            // outage still ends the stream within `revalidate_grace` of its
+            // last authoritative confirmation.
+            clear_grace_deadline_();
+            break;
+        default:
+            // Fail CLOSED on an enumerator this pump does not know, matching
+            // auth_routes.cpp's `return R::kRevoked` fall-out. `werror` is off,
+            // so an unhandled value is a warning, not a build failure — and
+            // falling out of the switch would leave the stream RUNNING on an
+            // auth answer nobody interpreted. This PR is itself proof that
+            // enumerators get added.
+            stream_->close(McpStreamClose::kAuthUnavailable);
+            return finish(write, McpStreamClose::kAuthUnavailable);
+        }
+
+        // Fire a backdated kIndeterminate deadline on its OWN arming tick. Only
+        // the kIndeterminate arm leaves a deadline armed past this point (kValid
+        // and kValidStale both cleared it above); its deadline is backdated to
+        // `last_authoritative_ok_`, so it can already be in the past when first
+        // armed, and the pre-#2367 "arm now, test next tick" shape would grant
+        // an extra tick of life to a stream whose budget was already spent.
+        if (grace_deadline_.has_value() && now() > *grace_deadline_) {
+            stream_->close(McpStreamClose::kAuthUnavailable);
+            return finish(write, McpStreamClose::kAuthUnavailable);
         }
     }
 
@@ -914,6 +1167,19 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
              kMcpHandoverRetryAfterMs, sid);
         return;
     }
+    if (attached.status == McpStreamState::AttachStatus::kPoisoned) {
+        // A terminal frame could not be delivered on this stream (publish_final failed
+        // twice). It will never carry its final, so a re-attach would heart-beat forever -
+        // 410 Gone with the durable-fetch remediation, the same honest posture the
+        // /api/v1/events terminal path takes. The execution result stays fetchable by
+        // execution_id (get_execution_status / query_responses).
+        deny(410, kMcpStreamPoisoned, "Stream terminated; final response undeliverable",
+             "terminal_poisoned",
+             "fetch the result by execution_id (get_execution_status / query_responses); "
+             "do not re-POST",
+             std::nullopt, sid);
+        return;
+    }
 
     auto sink = attached.sink;
     const std::uint64_t generation = attached.generation;
@@ -990,6 +1256,21 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
     // deterministic unit tests). At the 60 s default this spreads deaths over [60 s, 90 s].
     McpStreamPump::Config pump_cfg{};
     pump_cfg.revalidate_grace_jitter_max = pump_cfg.revalidate_grace / 2;
+    // #2367: this surface's revalidate callback may answer from the
+    // engine-principal liveness cache, so tell the pump how stale that can be.
+    // Without it, a stream whose sibling keeps refreshing the shared cache
+    // entry never advances its own authoritative floor and gets zero grace on
+    // the first blip.
+    pump_cfg.revalidate_max_staleness =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            EnginePrincipalStore::kAuthCacheTtl);
+    // The coupling is load-bearing, so pin it at compile time rather than in a
+    // comment: an aged cache entry must still leave a usable slice of the grace
+    // window. Lowering the grace window or raising the TTL without re-checking
+    // this would silently make an outage cut engine streams instantly.
+    static_assert(EnginePrincipalStore::kAuthCacheTtl * 4 <= kMcpRevalidateGraceDefault,
+                  "engine liveness cache TTL must stay well under the revalidate grace "
+                  "window (#2367) - otherwise a fully-aged entry leaves no grace at all");
     auto pump = std::make_shared<McpStreamPump>(sink, stream, generation, std::move(revalidate_fn),
                                                 std::move(session_alive), pump_cfg,
                                                 McpStreamPump::ClockFn{}, metrics);

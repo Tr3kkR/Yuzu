@@ -32,6 +32,7 @@
 #include "event_bus.hpp"
 #include "stream_budget.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -127,6 +128,13 @@ inline constexpr std::size_t kMinRingBytesCap = 256;
 /// protected by the budget's global cap alone. This one exists to stop a single agentic
 /// token monopolising the channel, not to ration capacity.
 inline constexpr std::size_t kMcpStreamsPerPrincipalDefault = 4;
+
+/// Max concurrent STREAMED-POST requests per session, and therefore the max eviction-exempt
+/// (pinned) final-response frames the ring can hold at once (Decision 15(f): "one pending
+/// response per streamed request"). The 2f progress bridge caps streamed records per session
+/// at this number at ADMISSION, so publish_final never runs short of a pin slot; the
+/// fixed-size pin array here is the ring-side enforcement of the same bound.
+inline constexpr std::size_t kMaxStreamedPostsPerSession = 4;
 
 /// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
 /// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
@@ -282,23 +290,66 @@ public:
     /// whose cursor falls behind the ring is 404'd on resume, never silently gapped).
     std::uint64_t publish(std::string_view event_type, std::string_view data) noexcept;
 
+    /// Commit a frame to the ring for RESUME replay WITHOUT handing it to the live GET sink.
+    ///
+    /// Track 2f PR 3, Decision 15 + the MCP Streamable HTTP spec ("MUST NOT broadcast the
+    /// same message across multiple streams"): a streamed POST delivers its frames on the
+    /// POST stream, so publishing them onto a concurrently-live GET sink too would be a
+    /// broadcast violation. The ring commit is purely so a GET resume (Last-Event-ID) can
+    /// replay them - never a second live copy. Same return contract and boundary as publish().
+    std::uint64_t publish_ring_only(std::string_view event_type, std::string_view data) noexcept;
+
+    /// Commit a streamed request's FINAL response frame: ring-only (as publish_ring_only)
+    /// AND eviction-EXEMPT (pinned) while the session lives, so a resume always recovers the
+    /// terminal even after the ring wraps (Decision 15(f), bounded one pending per streamed
+    /// request by kMaxStreamedPostsPerSession).
+    ///
+    /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
+    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected -
+    /// the bridge caps streamed records at the pin count) still commits, unpinned, rather
+    /// than losing a real terminal. The pin is released by unpin() (final written on the POST
+    /// wire), by attach_and_replay when a cursor proves consumption (Last-Event-ID >= its id),
+    /// or with the whole object. Same return contract and boundary as publish().
+    std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
+
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
     /// inside publish_impl are internal string/deque allocations with no callback to
-    /// throw through (the repo's usual injection idiom), so the two failure phases the
+    /// throw through (the repo's usual injection idiom), so the THREE failure phases the
     /// #2366 boundary distinguishes get explicit trip points instead. One-shot: the
     /// fault fires on the next publish and resets to kNone.
     enum class PublishFault {
         kNone,
         kPreCommit,    ///< models the ring push_back allocation failing (nothing committed)
         kSinkEnqueue,  ///< models the live-sink enqueue copy failing (frame already committed)
+        /// Models the POST-COMMIT observability block (metric increment / WARN format)
+        /// throwing after the frame is committed. Exercises publish_impl's innermost
+        /// `catch(...)` - the guarantee that a metrics/log allocation fault never turns a
+        /// committed publish into a 0 return. Fires inside that try, so it never reaches
+        /// publish()'s outer boundary: publish returns the committed id.
+        kPostCommitObservability,
     };
-    void inject_publish_fault_for_test(PublishFault fault);
+    /// `times` arms the same fault for the next N publishes (default 1 = the historical
+    /// one-shot). Needed by the bridge's double-terminal-failure -> poison test: both the
+    /// real-final and fallback-final publishes happen inside ONE projector pass, so the
+    /// seam cannot be re-armed between them from the test thread.
+    void inject_publish_fault_for_test(PublishFault fault, int times = 1);
+
+    /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s
+    /// rare WARN lines so an operator can attribute a dropped/anomalous frame to a session.
+    ///
+    /// Threading: WRITE-ONCE, called at mint BEFORE the stream is shared with any other
+    /// thread (McpSessionRegistry::mint, before the Entry is emplaced). Effectively
+    /// immutable thereafter, so publish()'s reads need no lock - the registry mutex + the
+    /// shared_ptr handoff at emplace are the happens-before edge to every later reader.
+    /// Do NOT call it after the stream is live.
+    void set_log_context(std::string context);
 
     enum class AttachStatus {
         kAttached,
         kGap,              ///< cursor outside the ring window → caller 404s, client re-initializes
         kStreamCapHit,     ///< budget rejected → caller 429s
         kHandoverPending,  ///< a superseded provider has not drained yet → caller 429s
+        kPoisoned,         ///< terminal delivery failed twice → caller 410s, fetch by execution_id
     };
 
     struct AttachResult {
@@ -343,6 +394,24 @@ public:
     /// for the worker THAT sink was pinning. Idempotent.
     void detach(const std::shared_ptr<McpStreamSink>& sink);
 
+    /// Release the eviction-exemption on a pinned final frame (unpin rule (a): the final was
+    /// written on the POST wire). Idempotent - an unknown/already-cleared id is a no-op.
+    void unpin(std::uint64_t id);
+
+    /// True while `id` is a pinned (eviction-exempt) final frame. The 2f bridge sweep polls
+    /// this: a parked (ring-only) record whose pin has gone - consumed via a GET resume that
+    /// acked past it - can be torn down. Const, cheap (scans the fixed pin array under mu_).
+    bool is_pinned(std::uint64_t id) const;
+
+    /// Poison the session stream: no terminal frame could be delivered (publish_final failed
+    /// twice) and the durable result must be fetched by execution_id instead. Sets a sticky
+    /// flag so every FUTURE attach fast-fails (AttachStatus::kPoisoned → 410 + remediation)
+    /// rather than a client re-attaching and heart-beating forever for a terminal that will
+    /// never arrive, and closes any currently-live sink with kInternalError. Idempotent.
+    void poison_terminal();
+
+    std::size_t pinned_count() const;  ///< eviction-exempt frames currently held (observability/tests)
+
     std::uint64_t current_generation() const;
     std::uint64_t next_event_id() const;    ///< id the next publish will assign
     std::uint64_t evictions_total() const;  ///< frames dropped from the ring (observability/tests)
@@ -357,12 +426,24 @@ private:
     static void close_sink(const std::shared_ptr<McpStreamSink>& sink, McpStreamClose reason);
     static std::size_t frame_bytes(const McpStreamEvent& ev);
 
-    /// The throwing body publish() guards. Owns the payload from the caller's views up
-    /// front (those copies may throw — pre-commit, so a bad_alloc there is a clean 0).
+    /// The shared noexcept boundary for publish() / publish_ring_only() / publish_final().
+    /// `deliver_live` hands the frame to the live GET sink (false = ring-only, for streamed
+    /// POST frames); `pinned` marks a committed final eviction-exempt. One implementation of
+    /// the #2366 hard boundary so the three public seams cannot drift.
+    std::uint64_t publish_guarded(std::string_view event_type, std::string_view data,
+                                  bool deliver_live, bool pinned) noexcept;
+
+    /// The throwing body publish_guarded() guards. Owns the payload from the caller's views
+    /// up front (those copies may throw - pre-commit, so a bad_alloc there is a clean 0).
     /// After the ring push + next_id_ advance, every step is either noexcept or locally
-    /// contained, so a throw reaching publish()'s catch proves nothing was committed and
+    /// contained, so a throw reaching the guard's catch proves nothing was committed and
     /// 0 is the honest return.
-    std::uint64_t publish_impl(std::string_view event_type, std::string_view data);
+    std::uint64_t publish_impl(std::string_view event_type, std::string_view data,
+                               bool deliver_live, bool pinned);
+
+    /// True if `id` is a pinned final. Assumes mu_ is held (the eviction path and the public
+    /// is_pinned() both funnel through it). Scans the fixed pin array - O(pin count).
+    bool is_pinned_locked(std::uint64_t id) const;
 
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
@@ -373,6 +454,14 @@ private:
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
     PublishFault publish_fault_ = PublishFault::kNone;  ///< test seam; guarded by mu_
+    int publish_fault_remaining_ = 0;  ///< publishes left that consume publish_fault_; guarded by mu_
+    // Write-once at mint before the stream is shared (set_log_context contract); read
+    // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.
+    std::string log_context_;
+    // Eviction-exempt (pinned) final-frame ids; 0 = empty slot. Fixed size = the per-session
+    // streamed-request bound. All access under mu_. Decision 15(f).
+    std::array<std::uint64_t, kMaxStreamedPostsPerSession> pinned_ids_{};
+    bool terminal_poisoned_ = false;  ///< sticky; every future attach 410s (guarded by mu_)
     std::shared_ptr<McpStreamSink> live_;
     std::shared_ptr<McpStreamSink> draining_;  ///< superseded, still pinning its worker
     yuzu::MetricsRegistry* metrics_ = nullptr;
@@ -417,6 +506,20 @@ public:
         // spread (half the grace). A stream picks its own offset once, so the spread is
         // stable for the life of that stream.
         std::chrono::milliseconds revalidate_grace_jitter_max{0};
+
+        // #2367. Maximum age of a `kValidStale` answer — i.e. how stale the
+        // revalidate callback's cache is allowed to be. The pump uses it to
+        // clamp `last_authoritative_ok_` forward on a cached answer, so a
+        // stream that keeps getting cache hits (because a SIBLING stream on the
+        // same principal is the one refreshing the shared entry) still has a
+        // bounded, non-zero grace budget when the store finally blips.
+        //
+        // 0 = "answers are always authoritative": the pump then never advances
+        // the floor on kValidStale. That is the correct default for any surface
+        // whose revalidate callback has no cache, and it is the conservative
+        // direction (less life, never more). Wired from
+        // EnginePrincipalStore::kAuthCacheTtl for the MCP GET surface.
+        std::chrono::milliseconds revalidate_max_staleness{0};
     };
 
     using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
@@ -450,6 +553,16 @@ private:
     bool finish(const WriteFn& write, McpStreamClose reason);
     std::chrono::steady_clock::time_point now() const;
 
+    /// Drop the current indeterminate-grace spell. Called from BOTH the kValid
+    /// and kValidStale arms of the revalidate switch — a cache hit is as much a
+    /// confirmation as a read-through (#2367). Shared so the two arms cannot
+    /// silently diverge: round-1's BLOCKING bug was exactly one of them
+    /// clearing the deadline while the other left it armed.
+    void clear_grace_deadline_() {
+        grace_start_.reset();
+        grace_deadline_.reset();
+    }
+
     std::shared_ptr<McpStreamSink> sink_;
     std::shared_ptr<McpStreamState> stream_;
     std::uint64_t generation_;
@@ -458,11 +571,24 @@ private:
     Config cfg_;
     ClockFn clock_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
+    // #2367. When this stream's credential was last confirmed AUTHORITATIVELY —
+    // the store was asked and answered — as opposed to served from a cache
+    // (StreamRevalidate::kValidStale). The indeterminate grace deadline is
+    // measured from HERE, not from the tick the outage was noticed, so a stream
+    // cannot extend its life by riding cached answers and then collecting a
+    // full fresh grace window once they expire. Seeded at construction: attach
+    // performs a fresh authoritative authentication before this pump exists.
+    std::chrono::steady_clock::time_point last_authoritative_ok_;
+    // Where the current indeterminate spell's budget is measured from: the last
+    // authoritative confirmation (see above), NOT the moment the store first
+    // failed to answer.
     std::optional<std::chrono::steady_clock::time_point> grace_start_;
     // The effective grace deadline for THIS stream's current indeterminate spell,
     // = grace_start_ + revalidate_grace + a per-stream jitter chosen once when
     // grace_start_ is set (see Config::revalidate_grace_jitter_max). Reset alongside
-    // grace_start_ when the credential re-validates.
+    // grace_start_ when the credential re-validates AUTHORITATIVELY. Because
+    // grace_start_ is backdated it can already be in the past when armed, so the
+    // expiry test runs on the arming tick too.
     std::optional<std::chrono::steady_clock::time_point> grace_deadline_;
 };
 

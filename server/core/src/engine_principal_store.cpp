@@ -8,9 +8,11 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <random>
 #include <string_view>
 
 namespace yuzu::server {
@@ -174,6 +176,220 @@ EngineLookup EnginePrincipalStore::get_for_auth(const std::string& principal_id)
     return {EngineLookupStatus::Active, std::move(row)};
 }
 
+namespace {
+
+/// Non-cryptographic per-entry jitter. Decorrelates expiry only — it guards
+/// nothing, so a cheap thread_local PRNG is the right tool. Mirrors the pump's
+/// grace jitter (`mcp_stream.cpp`), including seeding once per worker.
+std::chrono::milliseconds jitter_up_to(std::chrono::milliseconds span) {
+    if (span.count() <= 0)
+        return std::chrono::milliseconds{0};
+    static thread_local std::minstd_rand rng{
+        static_cast<std::uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
+    return std::chrono::milliseconds{static_cast<std::int64_t>(rng()) % (span.count() + 1)};
+}
+
+} // namespace
+
+EngineRevalidate
+EnginePrincipalStore::get_for_auth_revalidate(const std::string& principal_id) const {
+    // #2367. LIVENESS RE-CHECK ONLY — see the hpp contract. This exists so N
+    // engine streams re-validating every ~3 s cost O(cache refresh) instead of
+    // O(streams x tick) uncached Postgres reads, each holding a bounded lease
+    // on a ~16-connection pool. Under a pool brownout that load is the
+    // amplifier: unreachable -> indeterminate -> keep retrying -> starve the
+    // ordinary validate_token and fleet data-plane writes with it.
+
+    // Snapshot the generation BEFORE the lookup so a revoke racing our read is
+    // observable at the cache-write below. Cache-poisoning guard only; see the
+    // revoke_generation_ field comment for the residual single-call window.
+    const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
+    const auto now = clock_();
+
+    {
+        std::lock_guard lk(revalidate_cache_mu_);
+        auto it = revalidate_cache_.find(principal_id);
+        if (it != revalidate_cache_.end()) {
+            if (now < it->second.expires_at) {
+                revalidate_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+                // from_cache: the caller MUST NOT treat this as a fresh
+                // confirmation (hpp contract on EngineRevalidate).
+                return {EngineLookupStatus::Active, /*from_cache=*/true};
+            }
+            revalidate_cache_.erase(it); // expired — fall through and read through
+        }
+
+        // Failure backoff: the store was unreachable moments ago and we agreed
+        // not to ask again yet. Repeat that answer without taking a lease —
+        // this is what stops a sustained brownout from restoring the
+        // O(streams x tick) amplifier once positive entries age out.
+        if (auto bo = revalidate_backoff_.find(principal_id); bo != revalidate_backoff_.end()) {
+            if (now < bo->second) {
+                revalidate_backoff_suppressed_.fetch_add(1, std::memory_order_relaxed);
+                return {EngineLookupStatus::StoreUnreachable, /*from_cache=*/false};
+            }
+            revalidate_backoff_.erase(bo);
+        }
+    }
+    revalidate_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+
+    const EngineLookup fresh = get_for_auth(principal_id);
+
+    // Invoke through a local copy: a hook that reassigns the member would
+    // otherwise destroy the std::function object mid-call (UB).
+    if (const auto hook = test_hook_after_revalidate_read_)
+        hook();
+
+    if (fresh.status == EngineLookupStatus::StoreUnreachable) {
+        const auto stamp = clock_();
+        std::lock_guard lk(revalidate_cache_mu_);
+        // C1 (adversarial review, PR #2462): the SAME generation guard the
+        // Active arm below applies. If a revoke bumped the generation while
+        // this read was in flight, do NOT install a backoff -- it would answer
+        // StoreUnreachable (no read-through) for the whole backoff window once
+        // the store recovers, so a just-revoked principal's stream would ride
+        // its grace window instead of being cut on the next tick (contradicting
+        // ADR-0031's writing-replica "next tick" property). Leave it uncached;
+        // the next tick reads through to MissingOrRevoked. Fail-safe direction
+        // and bounded (the stream still dies at the grace deadline), but a real
+        // revocation delay on the auth path -- close it symmetrically.
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            // The backoff map needs the SAME ceiling discipline as the positive
+            // map, and needs it on THIS path: an outage is the only thing that
+            // fills this map, and the positive-insert arm (the other sweep
+            // site) by definition does not run during one. Without this, a
+            // principal whose stream ends mid-outage leaves an entry resident
+            // for the process lifetime.
+            if (revalidate_backoff_.size() >= max_entries_)
+                sweep_expired_locked(stamp);
+            if (revalidate_backoff_.size() < max_entries_) {
+                revalidate_backoff_.insert_or_assign(
+                    principal_id, stamp + kAuthFailureBackoff + jitter_up_to(kAuthFailureBackoff));
+            }
+        }
+        // Declining to record a backoff is safe in the same way as declining
+        // to cache: the next tick simply reads through again.
+        return {fresh.status, /*from_cache=*/false};
+    }
+
+    // Positive entries ONLY. MissingOrRevoked is terminal and rare, and
+    // negative-caching it would need a create() invalidation hook to avoid
+    // masking a freshly minted principal.
+    if (fresh.status == EngineLookupStatus::Active) {
+        // The generation re-check MUST be taken UNDER the mutex, in the same
+        // critical section as the insert (ApiTokenStore's hard-won rule — a
+        // check-then-lock ordering lets a concurrent revoke's erase land
+        // between the check and the insert, leaving a stale Active alive for
+        // the full TTL).
+        std::lock_guard lk(revalidate_cache_mu_);
+        revalidate_backoff_.erase(principal_id); // reachable again
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            // Age the entry from BEFORE the read, not after it. The consumer
+            // treats a cache hit as "the store confirmed this within the TTL"
+            // and credits its own freshness budget accordingly, so the stamp
+            // must not be later than the instant the fact was actually
+            // observed. A slow-but-successful query (the pool allows up to the
+            // read timeout, and a server-side statement can run longer still)
+            // would otherwise stamp a fact observed at T as T+latency and let
+            // it be served a further TTL, pushing total survival past the
+            // grace window. Using the pre-read timestamp only ever expires the
+            // entry EARLIER, which is the safe direction.
+            //
+            // Known tradeoff (#2460): a read that itself takes longer than the
+            // TTL (a slow-but-successful SELECT, not a hard timeout) is born
+            // already expired, so the cache gives NO relief under a slow-PG
+            // brownout — every stream reads through every tick. That is the
+            // deliberate cost of never over-granting: reliability degrades in
+            // the safe direction. The real fixes are per-principal single-flight
+            // (#2455, collapses the concurrent read-through) and a client-side
+            // read deadline (#2457); they must NOT be "fixed" by stamping
+            // post-read, which reintroduces the over-grant this line closed.
+            const auto stamp = now;
+            if (revalidate_cache_.size() >= max_entries_)
+                sweep_expired_locked(stamp);
+            // Still full after the sweep: decline to cache rather than evict
+            // something live. Read-through is slower, never wrong.
+            if (revalidate_cache_.size() < max_entries_) {
+                revalidate_cache_.insert_or_assign(
+                    principal_id,
+                    CachedAuth{stamp + kAuthCacheTtl - jitter_up_to(kAuthCacheTtlJitter)});
+            }
+        }
+    }
+
+    return {fresh.status, /*from_cache=*/false};
+}
+
+// EngineLivenessTestAccess::revalidate is DELIBERATELY not defined here. It
+// forwards to the private get_for_auth_revalidate, so defining it in this
+// production TU would link a public trampoline to the cached path into the
+// shipping server_core library. Its definition lives in a test-only TU
+// (tests/unit/server/engine_liveness_test_access.cpp), so a production caller
+// that tries to use it gets a LINK error -- the compile/link-time wall that
+// makes "authorization is never served from cache" a structural control, not a
+// convention (#2367, governance architect finding).
+
+void EnginePrincipalStore::sweep_expired_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::erase_if(revalidate_cache_, [&](const auto& kv) { return now >= kv.second.expires_at; });
+    std::erase_if(revalidate_backoff_, [&](const auto& kv) { return now >= kv.second; });
+}
+
+std::size_t EnginePrincipalStore::revalidate_cache_size() const {
+    const auto now = clock_();
+    std::lock_guard lk(revalidate_cache_mu_);
+    return static_cast<std::size_t>(
+        std::count_if(revalidate_cache_.begin(), revalidate_cache_.end(),
+                      [&](const auto& kv) { return now < kv.second.expires_at; }));
+}
+
+std::size_t EnginePrincipalStore::revalidate_cache_resident_for_test() const {
+    std::lock_guard lk(revalidate_cache_mu_);
+    return revalidate_cache_.size();
+}
+
+std::size_t EnginePrincipalStore::revalidate_backoff_resident_for_test() const {
+    std::lock_guard lk(revalidate_cache_mu_);
+    return revalidate_backoff_.size();
+}
+
+void EnginePrincipalStore::set_max_entries_for_test(std::size_t n) {
+    std::lock_guard lk(revalidate_cache_mu_);
+    max_entries_ = n == 0 ? kAuthCacheMaxEntries : n;
+}
+
+void EnginePrincipalStore::set_clock_for_test(ClockFn fn) {
+    // Correctness rests on the before-concurrency contract: `clock_` is read
+    // UNLOCKED on the hot path (get_for_auth_revalidate), so this locked write
+    // does not make a concurrent set/read pair race-free -- it only removes the
+    // unsynchronised WRITE, and the contract (set the clock before any thread
+    // uses the store) is what actually holds. Honoured in practice: every
+    // clock-setting test is single-threaded, and the threaded tests never set
+    // the clock. The lock is cheap defence-in-depth, not the guarantee.
+    std::lock_guard lk(revalidate_cache_mu_);
+    clock_ = fn ? std::move(fn) : ClockFn{[] { return std::chrono::steady_clock::now(); }};
+}
+
+void EnginePrincipalStore::invalidate_revalidate_cache(const std::string& principal_id) {
+    // Bump BEFORE taking the mutex — the ordering half of the poisoning guard
+    // (see revoke_generation_ in the hpp). A reader that already sampled the
+    // old generation and is about to insert will observe the bump under the
+    // mutex and skip its write.
+    revoke_generation_.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard lk(revalidate_cache_mu_);
+    if (principal_id.empty()) {
+        revalidate_cache_.clear();
+        revalidate_backoff_.clear();
+    } else {
+        revalidate_cache_.erase(principal_id);
+        // The backoff entry must go too. Leaving it would answer this
+        // principal StoreUnreachable -> kIndeterminate for up to the backoff
+        // window, keeping a JUST-REVOKED principal's stream alive in grace and
+        // contradicting "the writing replica cuts the stream on the next tick".
+        revalidate_backoff_.erase(principal_id);
+    }
+}
+
 std::expected<EnginePrincipalRow, std::string>
 EnginePrincipalStore::create(const std::string& display_name, const std::string& owner_username,
                              const std::string& justification, const std::string& classification,
@@ -273,21 +489,47 @@ EnginePrincipalStore::revoke(const std::string& principal_id,
     if (principal_id.empty())
         return false; // argument guard, not a DB error — nothing to revoke
 
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected("database unavailable — try again");
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE engine_principal_store.engine_principals "
-        "SET lifecycle_state='revoked', revoked_at=$3::bigint, superseded_by=$2 "
-        "WHERE principal_id=$1 AND lifecycle_state='active' RETURNING principal_id",
-        std::vector<std::string>{principal_id, superseded_by, std::to_string(now_epoch())});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("revoke did not persist: ") +
-                               PQerrorMessage(lease.get()));
+    // The lease is scoped so it is RELEASED before the cache invalidation
+    // below: invalidation takes `revalidate_cache_mu_`, which the metrics tick
+    // and every revalidating stream also contend for, and none of that belongs
+    // inside a held pool connection. The outcome is captured into locals here
+    // because the error text needs the connection.
+    bool persisted = false;
+    bool affected = false;
+    std::string err;
+    {
+        auto lease = pool_.try_acquire_for(kWriteTimeout);
+        if (!lease)
+            return std::unexpected("database unavailable — try again");
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "UPDATE engine_principal_store.engine_principals "
+            "SET lifecycle_state='revoked', revoked_at=$3::bigint, superseded_by=$2 "
+            "WHERE principal_id=$1 AND lifecycle_state='active' RETURNING principal_id",
+            std::vector<std::string>{principal_id, superseded_by, std::to_string(now_epoch())});
+        persisted = res.status() == PGRES_TUPLES_OK;
+        if (persisted)
+            affected = PQntuples(res.get()) > 0;
+        else
+            err = PQerrorMessage(lease.get());
+    }
+
+    // #2367: drop any cached Active for this principal AFTER the write, on
+    // every outcome including the error arm. Ordering is load-bearing —
+    // invalidating BEFORE the UPDATE would leave an unguarded window in which
+    // a concurrent revalidate re-reads the still-active row and installs an
+    // entry that outlives the revoke by a full TTL. After the write, the
+    // generation bump inside invalidate_revalidate_cache makes that racing
+    // revalidate skip its own cache-write. On the error arm we cannot know
+    // whether the UPDATE landed, so we invalidate anyway and let the next tick
+    // read through (fail-closed).
+    invalidate_revalidate_cache(principal_id);
+
+    if (!persisted)
+        return std::unexpected("revoke did not persist: " + err);
     // RETURNING 0 rows ⇒ no such principal or already revoked — a genuine
     // no-op (ADR-0012 §1), distinct from the query-error arm above.
-    return PQntuples(res.get()) > 0;
+    return affected;
 }
 
 std::expected<bool, std::string>
@@ -298,18 +540,35 @@ EnginePrincipalStore::transfer_owner(const std::string& principal_id,
     if (principal_id.empty() || new_owner.empty())
         return false; // argument guard, not a DB error — nothing to transfer
 
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected("database unavailable — try again");
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE engine_principal_store.engine_principals SET owner_username=$2 "
-        "WHERE principal_id=$1 AND lifecycle_state='active' RETURNING principal_id",
-        std::vector<std::string>{principal_id, new_owner});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("transfer_owner did not persist: ") +
-                               PQerrorMessage(lease.get()));
-    return PQntuples(res.get()) > 0;
+    // Lease scoped out before invalidation, same reasoning as revoke().
+    bool persisted = false;
+    bool affected = false;
+    std::string err;
+    {
+        auto lease = pool_.try_acquire_for(kWriteTimeout);
+        if (!lease)
+            return std::unexpected("database unavailable — try again");
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "UPDATE engine_principal_store.engine_principals SET owner_username=$2 "
+            "WHERE principal_id=$1 AND lifecycle_state='active' RETURNING principal_id",
+            std::vector<std::string>{principal_id, new_owner});
+        persisted = res.status() == PGRES_TUPLES_OK;
+        if (persisted)
+            affected = PQntuples(res.get()) > 0;
+        else
+            err = PQerrorMessage(lease.get());
+    }
+
+    // #2367: same post-write invalidation as revoke(). No current caller reads
+    // `row` fields off a revalidate lookup (all five get_for_auth consumers
+    // branch on `.status` alone), so a stale owner_username is not an
+    // authorization bug today — this keeps it from becoming one.
+    invalidate_revalidate_cache(principal_id);
+
+    if (!persisted)
+        return std::unexpected("transfer_owner did not persist: " + err);
+    return affected;
 }
 
 std::vector<EnginePrincipalRow> EnginePrincipalStore::list_all(bool include_revoked) const {

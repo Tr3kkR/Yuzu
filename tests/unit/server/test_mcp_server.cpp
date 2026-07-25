@@ -10,13 +10,19 @@
  * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
+#include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
+#include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
+#include "mcp_session.hpp"         // 2f PR 3a
+#include "mcp_stream.hpp"          // 2f PR 3a: ring inspection
+#include "mcp_stream_bridge.hpp"   // 2f PR 3a
 
 #include "agent_registry.hpp"
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
+#include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
@@ -38,11 +44,14 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>        // REQUIRE_THROWS_WITH (#2383)
+#include <catch2/matchers/catch_matchers_string.hpp> // ContainsSubstring (#2383)
 
 #include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -551,6 +560,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "mcp_server.hpp"
+#include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
@@ -625,6 +635,12 @@ struct McpTestServer {
     yuzu::server::CaStore* ca_store_for_test{nullptr};
     bool crl_publish_succeeds_{true};
     int crl_publish_calls_{0};
+
+    /// #2384: optionally wire an ApiTokenStore as the engine-credential store so
+    /// rotate_engine_credential / confirm_engine_rotation can be exercised
+    /// end-to-end at the MCP surface. Default nullptr keeps every existing test
+    /// on the "engine credential store unavailable" path.
+    yuzu::server::ApiTokenStore* engine_credential_store_for_test{nullptr};
 
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
     /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
@@ -859,6 +875,11 @@ private:
                                            {"arch", "x64"},
                                            {"agent_version", "0.1.3"}}});
         };
+
+        // #2384: the engine-credential store rides a setter, not a
+        // build_handler param — wire before the handlers are built.
+        if (engine_credential_store_for_test)
+            mcp.set_engine_credential_store(engine_credential_store_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -1198,9 +1219,309 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         INFO("write/attest tool = " << e.name);
         CHECK(ann(e.name)["destructiveHint"] == e.destructive);
     }
-    // confirm_engine_rotation is non-idempotent (takes only principal_id, does not
-    // pin the rotation) — the other shipped false-safe this PR corrected.
-    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == false);
+    // confirm_engine_rotation is idempotent since #2384: the required token_id
+    // pins the confirm to the exact pending successor, so a same-args replay
+    // can only target the pair it was issued for — retry-while-pending
+    // confirms it (once); retry-after-cutover or across a later rotation is
+    // REJECTED with zero mutation (it errors, but errors safely — the MCP
+    // hint's no-additional-effect semantics, not same-response semantics).
+    CHECK(ann("confirm_engine_rotation")["idempotentHint"] == true);
+
+    // The pin itself is part of the served contract: token_id must be present
+    // in confirm's input schema AND required — an agentic caller must not be
+    // able to discover an unpinned confirm.
+    for (const auto& t : tools) {
+        if (t["name"].get<std::string>() != "confirm_engine_rotation")
+            continue;
+        const auto& schema = t["inputSchema"];
+        REQUIRE(schema["properties"].contains("token_id"));
+        bool token_id_required = false;
+        for (const auto& r : schema["required"])
+            if (r.get<std::string>() == "token_id")
+                token_id_required = true;
+        CHECK(token_id_required);
+    }
+}
+
+// #2383: C8 fail-closed. The boot validator and the three-way dispatch
+// classifier are exercised through the testonly seam over SYNTHETIC tables —
+// the seam wrappers forward to the REAL functions (no file-static mutation) —
+// plus the real tables through both paths. Supplemental falsification evidence
+// (temporarily deleting a real kToolSecurity row) lives in the PR notes.
+TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    // Real tables: constructing McpServer IS the boot validator — must not throw.
+    REQUIRE_NOTHROW(McpServer{});
+
+    // Real tables fed through the seam explicitly.
+    {
+        auto names = tool_names_for_test();
+        std::vector<ToolSecurityRowOwned> rows;
+        for (const auto& r : tool_security_rows_for_test())
+            rows.push_back(
+                {std::string(r.name), std::string(r.securable), std::string(r.operation)});
+        std::vector<std::string> writes;
+        for (const auto& w : write_tool_names_for_test())
+            writes.emplace_back(w);
+        REQUIRE_NOTHROW(
+            validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test()));
+    }
+
+    // (a) served tool with no security row — the original C8 fail-open state.
+    // Prefix "served tool" is load-bearing in the assert: the kWriteTools-entry
+    // offence ends in the same "has no kToolSecurity row" suffix.
+    CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"},
+                                                          {{"alpha", "Infrastructure", "Read"}},
+                                                          {}, {}),
+                      ContainsSubstring("served tool 'beta' has no kToolSecurity row"));
+
+    // (b) extra security row naming no served tool — a subset-only check would
+    // accept this; exact equality both directions must reject it.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"alpha"}, {{"alpha", "Infrastructure", "Read"}, {"ghost", "Infrastructure", "Read"}},
+            {}, {}),
+        ContainsSubstring("kToolSecurity row 'ghost' names no served tool"));
+
+    // (c) kWriteTools vs non-Read subset, both directions, plus a write entry
+    // with no security row at all.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"w"}, {{"w", "Tag", "Write"}}, {}, {}),
+        ContainsSubstring("non-Read tool 'w' is missing from kWriteTools"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"r"}, {{"r", "Tag", "Read"}}, {"r"}, {}),
+        ContainsSubstring("Read tool 'r' must not be in kWriteTools"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"a"}, {{"a", "Tag", "Read"}}, {"phantom"}, {}),
+        ContainsSubstring("kWriteTools entry 'phantom' has no kToolSecurity row"));
+
+    // (d) operation outside the closed RBAC catalogue. NOT harmlessly
+    // conservative: a typo'd "read" passes supervised tier_allows() (permits
+    // every op) yet misses every exact-string requires_approval() rule — the
+    // tool would skip its intended approval, failing OPEN.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "read"}}, {"t"}, {}),
+        ContainsSubstring("operation 'read' outside the RBAC operation catalogue"));
+    // Attest is a first-class catalogue member (AccessReview) — valid non-Read.
+    CHECK_NOTHROW(
+        validate_tool_registration_for_test({"t"}, {{"t", "AccessReview", "Attest"}}, {"t"}, {}));
+
+    // (e) securable TYPE outside the catalogue — same fail-open class as (d):
+    // supervised tier_allows() permits every type and requires_approval()
+    // exact-matches type strings, so {"Securty","Execute"} would silently skip
+    // the quarantine-class approval rule (governance UP-6).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"q"}, {{"q", "Securty", "Execute"}}, {"q"}, {}),
+        ContainsSubstring("securable type 'Securty' outside the RBAC securable catalogue"));
+
+    // (f) duplicates are offences, not silent collapses: a dropped duplicate
+    // could discard the stricter of two conflicting registrations.
+    CHECK_THROWS_WITH(validate_tool_registration_for_test(
+                          {"d", "d"}, {{"d", "Infrastructure", "Read"}}, {}, {}),
+                      ContainsSubstring("duplicate served tool name 'd'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"d"}, {{"d", "Infrastructure", "Read"}, {"d", "Security", "Execute"}}, {}, {}),
+        ContainsSubstring("duplicate kToolSecurity row for 'd'"));
+    CHECK_THROWS_WITH(validate_tool_registration_for_test(
+                          {"d"}, {{"d", "Tag", "Write"}}, {"d", "d"}, {}),
+                      ContainsSubstring("duplicate kWriteTools entry 'd'"));
+
+    // (g) multiple simultaneous offences: ALL are named, in sorted order (the
+    // std::sort is what makes the thrown message deterministic across
+    // hash-map iteration order — this is the regression net for it).
+    try {
+        validate_tool_registration_for_test({"alpha", "beta"}, {}, {"gamma"}, {});
+        FAIL("expected validator throw");
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        const auto p_gamma = msg.find("kWriteTools entry 'gamma' has no kToolSecurity row");
+        const auto p_alpha = msg.find("served tool 'alpha' has no kToolSecurity row");
+        const auto p_beta = msg.find("served tool 'beta' has no kToolSecurity row");
+        REQUIRE(p_gamma != std::string::npos);
+        REQUIRE(p_alpha != std::string::npos);
+        REQUIRE(p_beta != std::string::npos);
+        // Lexicographic: "kWriteTools..." < "served tool 'alpha'..." < "'beta'...".
+        CHECK(p_gamma < p_alpha);
+        CHECK(p_alpha < p_beta);
+    }
+}
+
+// #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
+// the live rbac_store seed — asserted from the store side in
+// test_rbac_store.cpp ("seeded catalogues match the MCP C8 validator
+// mirrors"); here we only pin the mirror sizes so an accidental edit to one
+// array is caught even when the rbac_store suite is filtered out.
+TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
+    CHECK(rbac_ops_for_test().size() == 7);
+    CHECK(rbac_securables_for_test().size() == 22);
+}
+
+TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
+    // known + registered → normal C7/tier/approval path.
+    CHECK(classify_tool_for_test("x", {"x"}, {"x"}) == ToolClassForTest::kKnownRegistered);
+    // known + missing security row → the fail-closed denial class; the dispatch
+    // branch returns before the approval flow and before any per-handler
+    // perm_fn, so a misregistered tool can neither mint a ticket nor execute.
+    CHECK(classify_tool_for_test("x", {"x"}, {}) == ToolClassForTest::kKnownMissingSecurity);
+    // unknown → "Unknown tool" (kMethodNotFound), untouched by C7/C8.
+    CHECK(classify_tool_for_test("x", {}, {}) == ToolClassForTest::kUnknown);
+    // unknown with a STRAY security row: the row must not make it dispatchable —
+    // knownness (kTools membership) decides first.
+    CHECK(classify_tool_for_test("x", {}, {"x"}) == ToolClassForTest::kUnknown);
+}
+
+// #2384: the confirm token_id pin, exercised end-to-end at the MCP surface —
+// rotate returns the STRUCTURAL successor's token_id, confirm requires it,
+// a wrong/missing id rejects with zero mutation, and the success audit binds
+// the attestation to the confirmed credential id. Mirrors the REST pin test
+// in test_engine_principal_lifecycle.cpp so audit-log.md's "on both REST and
+// MCP" claim is test-backed on both surfaces.
+TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
+          "[mcp][pg][engine_principal][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-pin";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start(); // tier "" -> tier_allows defers to RBAC; mock perm allows
+
+    // Rotate via the MCP tool; the response's token_id must be the STRUCTURAL
+    // successor (the row whose supersedes_token_id links to the predecessor).
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-pin"}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_body = nlohmann::json::parse(rot->body);
+    REQUIRE(rot_body.contains("result"));
+    auto rot_payload =
+        nlohmann::json::parse(rot_body["result"]["content"][0]["text"].get<std::string>());
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+    std::string structural_successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            structural_successor_id = t.token_id;
+    CHECK(successor_token_id == structural_successor_id);
+
+    // Missing token_id -> kInvalidParams with remediation, nothing consumed.
+    auto missing = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,)"
+        R"("params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:mcp-confirm-pin"}}})");
+    REQUIRE(missing->status == 200);
+    CHECK(missing->body.find("token_id is required") != std::string::npos);
+
+    // Mismatched id -> Conflict-classed rejection, both credentials intact.
+    auto mismatch = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":92,)"
+        R"("params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:mcp-confirm-pin","token_id":"feedfacefeedfacefeedface"}}})");
+    REQUIRE(mismatch->status == 200);
+    CHECK(mismatch->body.find("does not match the pending rotation") != std::string::npos);
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+
+    // Correct id -> confirmed; predecessor revoked; the success audit detail
+    // binds the attestation to the confirmed credential id.
+    auto ok = ts.call(
+        nlohmann::json{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 93},
+            {"params",
+             {{"name", "confirm_engine_rotation"},
+              {"arguments",
+               {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+            .dump());
+    REQUIRE(ok->status == 200);
+    auto ok_body = nlohmann::json::parse(ok->body);
+    REQUIRE(ok_body.contains("result"));
+    auto ok_payload =
+        nlohmann::json::parse(ok_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(ok_payload["confirmed"].get<bool>() == true);
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+    bool audit_bound = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("token_id=" + successor_token_id) != std::string::npos)
+            audit_bound = true;
+    CHECK(audit_bound);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams + a conflict "
+          "metric, not kInternalError (#2404)",
+          "[mcp][pg][engine_principal][confirm]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-replay";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.start();
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":90,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-replay"}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    const auto confirm_call = [&](int id) {
+        return ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", id},
+                                      {"params",
+                                       {{"name", "confirm_engine_rotation"},
+                                        {"arguments",
+                                         {{"principal_id", principal},
+                                          {"token_id", successor_token_id}}}}}}
+                           .dump());
+    };
+    const auto confirm_metric = [&](const char* result) {
+        return reg
+            .counter("yuzu_engine_principal_confirm_total",
+                     {{"surface", "mcp"}, {"result", result}})
+            .value();
+    };
+
+    // First confirm succeeds (the real cutover).
+    auto ok = confirm_call(93);
+    REQUIRE(ok->status == 200);
+    CHECK(nlohmann::json::parse(ok->body).contains("result"));
+    CHECK(confirm_metric("success") == 1.0);
+
+    // The replay: SAME args. Before #2404 the store's "no in-flight rotation"
+    // classified kInternalError (-32603, "retryable") and an idempotent-hint-
+    // honouring client would loop forever. Now it is a TERMINAL kInvalidParams
+    // (-32602) already-confirmed conflict.
+    auto replay = confirm_call(94);
+    REQUIRE(replay->status == 200); // JSON-RPC error still rides a 200
+    CHECK(replay->body.find("-32602") != std::string::npos);          // kInvalidParams
+    CHECK(replay->body.find("-32603") == std::string::npos);          // NOT kInternalError
+    CHECK(replay->body.find("rotation already confirmed") != std::string::npos);
+    CHECK(confirm_metric("conflict") == 1.0);
+    CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────
@@ -5371,6 +5692,889 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
     sqlite3_close(raw);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #2405 — C8 pre-approval input-schema validation.
+//
+// A schema-invalid tools/call must neither MINT an approval ticket (an
+// admin's approval wasted on args the handler will reject) nor CONSUME one
+// on recall (a one-time capability burned for nothing). The gate validates
+// the ORIGINAL args against the tool's compiled input schema above the
+// mint/recall fork; boot compiles every served schema via the same subset
+// compiler (validate_tool_security_registration's 4th sequence).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+// Shared fixture bits for the gated-tool schema tests: a TagStore with one
+// tag plus a real sqlite-backed ApprovalManager (the mint/consume evidence).
+struct SchemaGateHarness {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags{tagdb.path};
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    std::optional<yuzu::server::ApprovalManager> appr;
+    McpTestServer ts;
+
+    explicit SchemaGateHarness(const std::string& tier) {
+        tags.set_tag("agent-1", "role", "web", "server");
+        REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+        appr.emplace(raw);
+        appr->create_tables();
+        ts.tag_store_for_test = &tags;
+        ts.approval_manager_for_test = &*appr;
+        ts.start(tier);
+    }
+    ~SchemaGateHarness() {
+        appr.reset();  // destroy the manager BEFORE closing its borrowed handle
+        sqlite3_close(raw);
+    }
+
+    nlohmann::json call(const std::string& body) {
+        auto res = ts.call(body);
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    }
+};
+} // namespace
+
+TEST_CASE("MCP 2405: schema-invalid args cannot mint an approval ticket",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+
+    // delete_tag missing required `key` → -32602 with A4 data, and crucially
+    // NO pending ticket (pre-#2405 this minted, an admin approved, and only
+    // the post-consume handler said kInvalidParams).
+    auto body = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("missing required property 'key'") != std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find(
+              "no approval ticket was created or consumed") != std::string::npos);
+    CHECK(h.appr->pending_count() == 0);
+    REQUIRE(!h.ts.audit_log.empty());
+    CHECK(h.ts.audit_log.back() == "mcp.delete_tag|denied");
+}
+
+TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected and NOT consumed",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+
+    // Seed the pre-#2405 state directly: a ticket already minted for
+    // schema-invalid args (missing `key`) and approved by an admin.
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})");
+    REQUIRE(seeded);
+    REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
+
+    // The recall matches the ticket exactly (definition_id + canon), but the
+    // args are schema-invalid → -32602 BEFORE consume_ticket: the one-time
+    // capability survives. Pre-#2405 this was the exact burn scenario.
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":")" +
+        *seeded + R"("}}})";
+    auto body = h.call(recall);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    auto after = h.appr->get(*seeded);
+    REQUIRE(after);
+    CHECK(after->status == "approved"); // not consumed, not rejected
+    CHECK(after->consumed_at == 0);     // the CAS never ran
+}
+
+TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("supervised");
+
+    auto body = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"quarantine_device","arguments":{"agent_id":42}}})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("'/agent_id'") != std::string::npos);
+    CHECK(h.appr->pending_count() == 0);
+}
+
+TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-declaring tools",
+          "[mcp][integration][approval][schema]") {
+    // approval_id is control-plane: only delete_tag/quarantine_device declare
+    // it in their schemas; on every other gated tool it is injected
+    // undeclared. A non-string one must be rejected uniformly — stripping it
+    // before validation would drop it into param_str's "" and the fresh-MINT
+    // path (Sol review B1).
+    SchemaGateHarness h("operator");
+    auto declaring = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":42}}})");
+    REQUIRE(declaring.contains("error"));
+    CHECK(declaring["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(declaring["error"]["message"].get<std::string>().find("'/approval_id'") !=
+          std::string::npos);
+    CHECK(h.appr->pending_count() == 0);
+
+    yuzu::test::TempDbFile adb2{std::string_view{"mcp-appr-"}};
+    sqlite3* raw2 = nullptr;
+    REQUIRE(sqlite3_open(adb2.path.string().c_str(), &raw2) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr2(raw2);
+        appr2.create_tables();
+        McpTestServer ts2;
+        ts2.approval_manager_for_test = &appr2;
+        auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                           const std::string&,
+                           const std::unordered_map<std::string, std::string>&,
+                           const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-x", 1};
+        };
+        ts2.start_with_dispatch(dispatch, "supervised");
+        auto undeclared = nlohmann::json::parse(
+            ts2.call(
+                   R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","approval_id":42}}})")
+                ->body);
+        REQUIRE(undeclared.contains("error"));
+        CHECK(undeclared["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(undeclared["error"]["message"].get<std::string>().find("'/approval_id'") !=
+              std::string::npos);
+        CHECK(appr2.pending_count() == 0);
+    }
+    sqlite3_close(raw2);
+}
+
+TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declare it",
+          "[mcp][integration][approval][schema]") {
+    // execute_instruction's schema does NOT declare approval_id; the full
+    // mint → approve → recall flow must still execute (undeclared properties
+    // are tolerated — no additionalProperties in the served schemas).
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        bool dispatched = false;
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            dispatched = true;
+            return {"cmd-ok", 1};
+        };
+        ts.start_with_dispatch(dispatch, "supervised");
+
+        auto mint = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})")
+                ->body);
+        REQUIRE(mint.contains("error")); // a clean Catch2 failure beats a json type_error
+        auto approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+        std::string recall =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","approval_id":")" +
+            approval_id + R"("}}})";
+        auto body = nlohmann::json::parse(ts.call(recall)->body);
+        REQUIRE(body.contains("result"));
+        CHECK(dispatched);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        // steps[1] missing required `action` → violation at /steps/1.
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":"a"},{"plugin":"p"}]}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("'/steps/1'") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 0);
+
+        // params is a value-schema map: a non-string value violates at the
+        // WILDCARDED path — the caller-derived key never appears.
+        auto body2 = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":308,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":"a","params":{"XKEYX":3}}]}}})")
+                ->body);
+        REQUIRE(body2.contains("error"));
+        CHECK(body2["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body2["error"]["message"].get<std::string>().find("'/steps/0/params/*'") !=
+              std::string::npos);
+        CHECK(body2.dump().find("XKEYX") == std::string::npos); // key not echoed
+        CHECK(appr.pending_count() == 0);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit detail",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        // A secret-looking, newline-carrying map key inside a value-schema
+        // map. The violation path must be the wildcard, and neither the
+        // response body nor any audit detail row may carry the key.
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":309,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":"a","params":{"SECRET\nTOKEN-XYZZY":7}}]}}})");
+        REQUIRE(res);
+        CHECK(res->body.find("XYZZY") == std::string::npos);
+        for (const auto& d : ts.audit_details)
+            CHECK(d.find("XYZZY") == std::string::npos);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: non-object arguments are rejected at the root",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+    for (const char* args : {"42", "[]", "null", R"("s")"}) {
+        auto body = h.call(
+            std::string(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":310,"params":{"name":"delete_tag","arguments":)") +
+            args + "}}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("expected an object") !=
+              std::string::npos);
+    }
+    CHECK(h.appr->pending_count() == 0);
+}
+
+TEST_CASE("MCP 2405: schema failure wins before ticket lookup and pending handback",
+          "[mcp][integration][approval][schema]") {
+    SchemaGateHarness h("operator");
+
+    // Bogus approval_id + invalid args → -32602, NOT the ticket-mismatch
+    // kPermissionDenied (validation sits above the recall lookup).
+    auto bogus = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":311,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":"deadbeefdeadbeefdeadbeefdeadbeef"}}})");
+    REQUIRE(bogus.contains("error"));
+    CHECK(bogus["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // Mint a VALID pending ticket, then recall with schema-invalid args and
+    // that id → -32602, not the pending handback; the ticket stays pending.
+    auto mint = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":312,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    REQUIRE(mint.contains("error")); // a clean Catch2 failure beats a json type_error
+    auto approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":313,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","approval_id":")" +
+        approval_id + R"("}}})";
+    auto body = h.call(recall);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(h.appr->pending_count() == 1); // still pending, untouched
+}
+
+TEST_CASE("MCP 2405: C7 read-only and tier denials still precede schema validation",
+          "[mcp][integration][approval][schema]") {
+    // Authz ordering is unchanged: an unauthorized caller learns nothing
+    // about argument validity.
+    SECTION("C7 read-only wins") {
+        SchemaGateHarness h("supervised");
+        h.ts.read_only_mode_ = true;
+        auto body = h.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":314,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        CHECK(body["error"]["message"].get<std::string>().find("read-only") !=
+              std::string::npos);
+    }
+    SECTION("tier denial wins") {
+        SchemaGateHarness h("readonly");
+        auto body = h.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":315,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    }
+}
+
+TEST_CASE("MCP 2405: degraded no-approval-manager deny still precedes schema validation",
+          "[mcp][integration][approval][schema]") {
+    // Placement A sits INSIDE the approval block, after the degraded
+    // no-manager deny — a degraded deployment answers exactly as before
+    // (companion to "no approval manager, degraded deny" above).
+    McpTestServer ts;
+    ts.start("supervised"); // approval_manager_for_test == nullptr
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":316,"params":{"name":"quarantine_device","arguments":{"agent_id":42}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("approval manager") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP 2405: schema denial carries one correlation id and a bounded counter",
+          "[mcp][integration][approval][schema]") {
+    yuzu::MetricsRegistry reg;
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.tag_store_for_test = &tags;
+        ts.approval_manager_for_test = &appr;
+        ts.metrics_for_test = &reg;
+        ts.start("operator");
+
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":317,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1"}}})")
+                ->body);
+        const auto cid = body["error"]["data"]["correlation_id"].get<std::string>();
+        REQUIRE(!cid.empty());
+        // The SAME cid is stamped into the audit detail (#2423 one-cid pattern),
+        // inside the exact SIEM-documented prefix (docs/mcp-server.md quotes it).
+        REQUIRE(!ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("correlation_id=" + cid) != std::string::npos);
+        CHECK(ts.audit_details.back().find("arguments do not match the tool input schema at '") !=
+              std::string::npos);
+        // Bounded per-tool counter incremented exactly once.
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", "delete_tag"}})
+                  .value() == 1.0);
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", "quarantine_device"}})
+                  .value() == 0.0);
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: registration validator rejects malformed and unsupported input schemas",
+          "[mcp][2g][schema]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    // Baseline: a well-formed schema row passes.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"t"}, {{"t", "Tag", "Read"}}, {},
+        {{"t", R"({"type":"object","properties":{"x":{"type":"string"}}})"}}));
+
+    // Not JSON at all.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "Read"}}, {},
+                                            {{"t", "not json"}}),
+        ContainsSubstring("tool 't' input schema: input schema is not valid JSON"));
+
+    // Root not an object schema.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test({"t"}, {{"t", "Tag", "Read"}}, {},
+                                            {{"t", R"({"type":"string"})"}}),
+        ContainsSubstring("input schema root is not an object schema"));
+
+    // Closed keyword catalogue: oneOf is a boot offence, not a silent skip.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"oneOf":[]})"}}),
+        ContainsSubstring("unsupported keyword 'oneOf'"));
+
+    // Uncompilable RE2 pattern.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","pattern":"("}}})"}}),
+        ContainsSubstring("'pattern' at '/properties/x' does not compile as RE2"));
+
+    // required naming an undeclared property (the Yuzu authoring lint).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"required":["ghost"]})"}}),
+        ContainsSubstring("requires 'ghost' which is not declared in 'properties'"));
+
+    // Malformed operands: each rejected deterministically, never an nlohmann
+    // throw-first.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"integer","minimum":5,"maximum":1}}})"}}),
+        ContainsSubstring("'minimum' exceeds 'maximum'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","maxLength":-1}}})"}}),
+        ContainsSubstring("'maxLength' at '/properties/x' must be a non-negative integer"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","items":{"type":"string"}}}})"}}),
+        ContainsSubstring("keyword 'items' at '/properties/x' requires type 'array'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","minItems":3,"maxItems":1,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'minItems' exceeds 'maxItems'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","maxItems":-1,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'maxItems' at '/properties/x' must be a non-negative integer"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","minItems":-1,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'minItems' at '/properties/x' must be a non-negative integer"));
+    // Non-integer operands hit the type-check disjunct, not the <0 arm.
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","minItems":"3","items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'minItems' at '/properties/x' must be a non-negative integer"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"array","maxItems":1.5,"items":{"type":"string"}}}})"}}),
+        ContainsSubstring("'maxItems' at '/properties/x' must be a non-negative integer"));
+    // Array-only gating: the same require_type() guard the sibling `items`
+    // keyword carries (cpp-safety + QE: fail-closed but previously untested).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","minItems":1}}})"}}),
+        ContainsSubstring("keyword 'minItems' at '/properties/x' requires type 'array'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"x":{"type":"string","maxItems":1}}})"}}),
+        ContainsSubstring("keyword 'maxItems' at '/properties/x' requires type 'array'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"additionalProperties":true})"}}),
+        ContainsSubstring("'true' is unsupported"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{"a":{"type":"string"}},"anyOf":[{"required":["a"],"extra":1}]})"}}),
+        ContainsSubstring("must be an object containing only a non-empty 'required' array"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":["object","string"],"properties":{}})"}}),
+        ContainsSubstring("must be a single string (unions are unsupported)"));
+
+    // Non-empty schema sequence must be honest (Gate 2 sec-LOW-1): duplicate
+    // rows and name-disparity with the served set are offences — a testonly
+    // caller cannot "pass" by supplying a shorter or disjoint schema list.
+    // ({} still deliberately skips schema checks for #2383-only tests.)
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{}})"},
+             {"t", R"({"type":"object","properties":{}})"}}),
+        ContainsSubstring("duplicate input schema row for 't'"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t", "u"}, {{"t", "Tag", "Read"}, {"u", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{}})"}}),
+        ContainsSubstring("served tool 'u' has no input schema row"));
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{}})"},
+             {"ghost", R"({"type":"object","properties":{}})"}}),
+        ContainsSubstring("input schema row 'ghost' names no served tool"));
+
+    // Multiple simultaneous schema offences: ALL named, sorted alongside the
+    // table offences (the same accumulate-all + sort determinism as #2383).
+    try {
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Read"}}, {},
+            {{"t", R"({"type":"object","properties":{},"oneOf":[],"allOf":[]})"}});
+        FAIL("expected validator throw");
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        const auto p_all = msg.find("unsupported keyword 'allOf'");
+        const auto p_one = msg.find("unsupported keyword 'oneOf'");
+        REQUIRE(p_all != std::string::npos);
+        REQUIRE(p_one != std::string::npos);
+        CHECK(p_all < p_one); // sorted
+    }
+}
+
+TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
+          "[mcp][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+
+    // Strict integer: 1 accepted, 1.0 rejected, out-of-int64 rejected.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":100}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"n":1})")));
+        auto strict = s->validate(nlohmann::json::parse(R"({"n":1.0})"));
+        REQUIRE(strict);
+        CHECK(strict->reason.find("integral floats") != std::string::npos);
+        auto range = s->validate(nlohmann::json::parse(R"({"n":18446744073709551615})"));
+        REQUIRE(range);
+        CHECK(range->reason.find("signed 64-bit") != std::string::npos);
+        // Boundaries: min/max inclusive, one past each rejected.
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"n":100})")));
+        auto over = s->validate(nlohmann::json::parse(R"({"n":101})"));
+        REQUIRE(over);
+        CHECK(over->reason.find("above the maximum 100") != std::string::npos);
+        auto under = s->validate(nlohmann::json::parse(R"({"n":0})"));
+        REQUIRE(under);
+        CHECK(under->reason.find("below the minimum 1") != std::string::npos);
+    }
+    // enum, maxLength (bytes), pattern (unanchored SEARCH semantics).
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"w":{"type":"string","enum":["24h","7d"]},"t":{"type":"string","maxLength":4},"p":{"type":"string","pattern":"b+"},"anch":{"type":"string","pattern":"^b+$"}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"w":"24h"})")));
+        auto bad_enum = s->validate(nlohmann::json::parse(R"({"w":"48h"})"));
+        REQUIRE(bad_enum);
+        CHECK(bad_enum->reason.find("must be one of") != std::string::npos);
+        // maxLength counts BYTES: "éé" is 2 codepoints / 4 bytes → at cap;
+        // "ééa" (5 bytes) is over.
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"t":"éé"})")));
+        CHECK(s->validate(nlohmann::json::parse(R"({"t":"ééa"})")));
+        // JSON Schema pattern is a SEARCH: "b+" matches inside "abc".
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"p":"abc"})")));
+        // A self-anchored pattern still means what it says.
+        CHECK(s->validate(nlohmann::json::parse(R"({"anch":"abc"})")));
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"anch":"bbb"})")));
+    }
+    // anyOf (at-least-one-of) + alternatives named in the failure reason.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"execution_id":{"type":"string"},"instruction_id":{"type":"string"}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"execution_id":"e"})")));
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"instruction_id":"i"})")));
+        auto neither = s->validate(nlohmann::json::parse(R"({})"));
+        REQUIRE(neither);
+        CHECK(neither->reason.find("execution_id") != std::string::npos);
+        CHECK(neither->reason.find("instruction_id") != std::string::npos);
+    }
+    // minItems/maxItems on arrays (2f's execute_bundle/execute_instruction
+    // schemas carry them — the dev merge that added them forced this
+    // catalogue extension; the boot validator caught it fail-closed, by design).
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"steps":{"type":"array","minItems":1,"maxItems":2,"items":{"type":"string"}}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"steps":["a"]})")));
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"steps":["a","b"]})")));
+        auto empty = s->validate(nlohmann::json::parse(R"({"steps":[]})"));
+        REQUIRE(empty);
+        CHECK(empty->reason.find("below the minItems 1 (items)") != std::string::npos);
+        auto over = s->validate(nlohmann::json::parse(R"({"steps":["a","b","c"]})"));
+        REQUIRE(over);
+        CHECK(over->reason.find("exceeds maxItems 2 (items)") != std::string::npos);
+        // maxItems:0 means "must be empty" — a degenerate but legal bound.
+        auto z = compile_input_schema(
+            R"({"type":"object","properties":{"none":{"type":"array","maxItems":0,"items":{"type":"string"}}}})");
+        REQUIRE(z);
+        CHECK_FALSE(z->validate(nlohmann::json::parse(R"({"none":[]})")));
+        CHECK(z->validate(nlohmann::json::parse(R"({"none":["a"]})")));
+    }
+    // Catalogue drift tether: growing kSupportedKeywords must be a deliberate
+    // act that also revisits the header contract comment and the
+    // docs/mcp-server.md bullet (both enumerate the same closed list).
+    CHECK(yuzu::server::mcp::supported_keyword_count() == 15);
+    // additionalProperties:false rejects undeclared keys at the WILDCARD path.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":false})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"a":"x"})")));
+        auto extra = s->validate(nlohmann::json::parse(R"({"a":"x","EVIL":1})"));
+        REQUIRE(extra);
+        CHECK(extra->path == "/*");
+        CHECK(extra->reason.find("EVIL") == std::string::npos);
+    }
+    // boolean + number types; empty schema accepts arbitrary objects.
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"b":{"type":"boolean"},"f":{"type":"number"}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"b":true,"f":1.5})")));
+        CHECK(s->validate(nlohmann::json::parse(R"({"b":"yes"})")));
+        auto e = compile_input_schema(R"({"type":"object","properties":{}})");
+        REQUIRE(e);
+        CHECK_FALSE(e->validate(nlohmann::json::parse(R"({"anything":{"nested":[1]}})")));
+    }
+}
+
+TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully covered",
+          "[mcp][2g][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+    using yuzu::server::mcp::requires_approval;
+
+    // Hand-written minimal valid instance per approval-gated tool. The tether
+    // below derives the gated set from the REAL security rows +
+    // requires_approval(), so adding a gated tool without extending this map
+    // fails here rather than silently shipping unvalidated coverage.
+    const std::map<std::string, nlohmann::json> gated_instances = {
+        {"delete_tag", nlohmann::json::parse(R"({"agent_id":"a","key":"k"})")},
+        {"execute_instruction", nlohmann::json::parse(R"({"plugin":"p","action":"a"})")},
+        {"execute_bundle",
+         nlohmann::json::parse(R"({"agent_id":"a","steps":[{"plugin":"p","action":"a"}]})")},
+        {"quarantine_device", nlohmann::json::parse(R"({"agent_id":"a"})")},
+        {"revoke_certificate", nlohmann::json::parse(R"({"serial_hex":"AB12"})")},
+        {"create_engine_principal",
+         nlohmann::json::parse(
+             R"({"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"internal"})")},
+        {"revoke_engine_principal", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        {"transfer_engine_principal_owner",
+         nlohmann::json::parse(R"({"principal_id":"engine:v","new_owner":"o2"})")},
+        {"mint_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        {"rotate_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        {"confirm_engine_rotation",
+         nlohmann::json::parse(R"({"principal_id":"engine:v","token_id":"t1"})")},
+        {"assign_engine_role",
+         nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
+        {"unassign_engine_role",
+         nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
+    };
+
+    // Tether: the gated set derived from security rows + requires_approval()
+    // must equal the hand-written instance keys (stale-coverage guard).
+    std::set<std::string> gated;
+    for (const auto& row : tool_security_rows_for_test())
+        for (const char* tier : {"operator", "supervised"})
+            if (requires_approval(tier, std::string(row.securable), std::string(row.operation)))
+                gated.insert(std::string(row.name));
+    std::set<std::string> covered;
+    for (const auto& [name, inst] : gated_instances)
+        covered.insert(name);
+    CHECK(gated == covered);
+
+    // The production accessor server.cpp pre-seeds the
+    // yuzu_mcp_tool_args_invalid_total labels from must agree with this same
+    // derivation — drift here would seed stale metric labels.
+    const auto seeded = yuzu::server::mcp::approval_gated_tool_names();
+    CHECK(std::set<std::string>(seeded.begin(), seeded.end()) == gated);
+    CHECK(std::is_sorted(seeded.begin(), seeded.end()));
+
+    // Every served schema compiles; every gated tool's minimal instance is
+    // accepted, both bare and with the injected approval_id.
+    for (const auto& row : input_schemas_for_test()) {
+        auto compiled = compile_input_schema(row.schema_json);
+        REQUIRE(compiled);
+        if (auto it = gated_instances.find(row.name); it != gated_instances.end()) {
+            INFO("gated tool: " << row.name);
+            CHECK_FALSE(compiled->validate(it->second));
+            auto with_ticket = it->second;
+            with_ticket["approval_id"] = "deadbeefdeadbeefdeadbeefdeadbeef";
+            CHECK_FALSE(compiled->validate(with_ticket));
+        }
+    }
+}
+
+TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
+          "[mcp][integration][approval][schema]") {
+    // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
+    // this proves the real served tables carry those keywords through the
+    // live dispatch path — an out-of-range value on a real gated tool is
+    // denied pre-mint (Gate 3 QE-1).
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        auto deny = [&](const char* body, const char* path_frag) {
+            auto b = nlohmann::json::parse(ts.call(body)->body);
+            REQUIRE(b.contains("error"));
+            CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(b["error"]["message"].get<std::string>().find(path_frag) !=
+                  std::string::npos);
+        };
+        // enum: create_engine_principal.classification ∈ {internal, external}.
+        deny(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":320,"params":{"name":"create_engine_principal","arguments":{"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"bogus"}}})",
+            "'/classification'");
+        // maximum: mint_engine_credential.ttl_days <= 90.
+        deny(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":321,"params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:v","ttl_days":91}}})",
+            "'/ttl_days'");
+        // maxLength: confirm_engine_rotation.token_id <= 64 bytes.
+        deny((std::string(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":322,"params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:v","token_id":")") +
+              std::string(65, 'a') + R"("}}})")
+                 .c_str(),
+             "'/token_id'");
+        CHECK(appr.pending_count() == 0);
+
+        // A REALISTIC (non-minimal) execute_instruction payload — scope +
+        // agent_ids + string params — passes validation and mints (-32006).
+        // Deliberate tier-dependent strictness (Gate 4 happy-S1, accepted):
+        // params values must be STRINGS on the approval-gated path even
+        // though the handler would coerce a number via dump(); an
+        // operator-tier caller (validation unreachable) keeps the
+        // pre-existing coercion. Strict typing on the destructive tier is
+        // the documented product decision, not an accident.
+        auto mint = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":323,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","scope":"tag:web","agent_ids":["agent-001","agent-002"],"params":{"verbose":"true","depth":"2"}}}})")
+                ->body);
+        REQUIRE(mint.contains("error"));
+        CHECK(mint["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+        CHECK(appr.pending_count() == 1);
+        // The same payload with a TYPED params value is denied pre-mint.
+        auto typed = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":324,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{"depth":2}}}})")
+                ->body);
+        REQUIRE(typed.contains("error"));
+        CHECK(typed["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.pending_count() == 1); // nothing new minted
+
+        // The array bounds 2f published (minItems/maxItems) are enforced at
+        // the gate on the REAL served schemas — steps:[] is the case the
+        // catalogue extension newly closes (UP-3's example burn), and
+        // over-cap agent_ids is its sibling.
+        auto empty_steps = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":325,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[]}}})")
+                ->body);
+        REQUIRE(empty_steps.contains("error"));
+        CHECK(empty_steps["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(empty_steps["error"]["message"].get<std::string>().find("'/steps'") !=
+              std::string::npos);
+        CHECK(empty_steps["error"]["message"].get<std::string>().find("minItems") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // no ticket minted for the empty bundle
+
+        std::string many_steps =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":326,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[)";
+        for (int i = 0; i < 33; ++i) {
+            if (i)
+                many_steps += ',';
+            many_steps += R"({"plugin":"p","action":"a)" + std::to_string(i) + R"("})";
+        }
+        many_steps += "]}}}";
+        auto over_steps = nlohmann::json::parse(ts.call(many_steps)->body);
+        REQUIRE(over_steps.contains("error"));
+        CHECK(over_steps["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_steps["error"]["message"].get<std::string>().find("maxItems") !=
+              std::string::npos);
+
+        std::string many_agents =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":327,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":[)";
+        for (int i = 0; i < 10001; ++i) {
+            if (i)
+                many_agents += ',';
+            many_agents += R"("a)" + std::to_string(i) + R"(")";
+        }
+        many_agents += "]}}}";
+        auto over_agents = nlohmann::json::parse(ts.call(many_agents)->body);
+        REQUIRE(over_agents.contains("error"));
+        CHECK(over_agents["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_agents["error"]["message"].get<std::string>().find("'/agent_ids'") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // still only the one valid mint
+    }
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP 2405: gated additionalProperties:false without approval_id is a boot offence",
+          "[mcp][2g][schema]") {
+    using Catch::Matchers::ContainsSubstring;
+    // UP-4: such a tool would reject its OWN recall argument — every ticket
+    // unredeemable. Tag:Delete is approval-gated (operator + supervised).
+    CHECK_THROWS_WITH(
+        validate_tool_registration_for_test(
+            {"t"}, {{"t", "Tag", "Delete"}}, {"t"},
+            {{"t",
+              R"({"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false})"}}),
+        ContainsSubstring("approval-gated tool 't' sets additionalProperties:false without "
+                          "declaring approval_id"));
+    // Declaring approval_id makes the same shape legal.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"t"}, {{"t", "Tag", "Delete"}}, {"t"},
+        {{"t",
+          R"({"type":"object","properties":{"agent_id":{"type":"string"},"approval_id":{"type":"string"}},"required":["agent_id"],"additionalProperties":false})"}}));
+    // A NON-gated tool may forbid extras freely.
+    CHECK_NOTHROW(validate_tool_registration_for_test(
+        {"t"}, {{"t", "Tag", "Read"}}, {},
+        {{"t",
+          R"({"type":"object","properties":{"agent_id":{"type":"string"}},"additionalProperties":false})"}}));
+}
+
+TEST_CASE("MCP 2405: schema failure precedes the per-submitter cap deny",
+          "[mcp][integration][approval][schema]") {
+    // Chaos CH-6: validation sits above the mint fork, so an AT-CAP submitter
+    // with schema-invalid args gets -32602 (fix the args), not the cap's
+    // kTierDenied — and the pending set is untouched either way.
+    SchemaGateHarness h("operator");
+    for (int i = 0; i < 25; ++i) {
+        auto b = h.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":330,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-)" +
+            std::to_string(i) + R"(","key":"role"}}})");
+        REQUIRE(b.contains("error"));
+        REQUIRE(b["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    }
+    REQUIRE(h.appr->pending_count() == 25); // at cap
+    auto body = h.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":331,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-x"}}})");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // not kTierDenied
+    CHECK(h.appr->pending_count() == 25);
+}
+
+TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
+          "[mcp][schema]") {
+    // Pins the thread-safety claim in mcp_input_schema.hpp under the nightly
+    // TSan tier: httplib workers share one CompiledInputSchema per tool, and
+    // RE2's lazy DFA build is the only interior mutation (mutex-guarded
+    // upstream). 8 threads × mixed accept/reject on a pattern-bearing schema.
+    using yuzu::server::mcp::compile_input_schema;
+    auto s = compile_input_schema(
+        R"({"type":"object","properties":{"x":{"type":"string","pattern":"^[a-z]{1,8}$"},"n":{"type":"integer","minimum":1,"maximum":100},"a":{"type":"array","minItems":1,"maxItems":2,"items":{"type":"string"}}}})");
+    REQUIRE(s);
+    const auto good = nlohmann::json::parse(R"({"x":"abc","n":5,"a":["p"]})");
+    const auto bad = nlohmann::json::parse(R"({"x":"NOPE!","n":101,"a":[]})");
+    std::vector<std::thread> workers;
+    std::atomic<int> accepts{0}, rejects{0};
+    for (int t = 0; t < 8; ++t)
+        workers.emplace_back([&] {
+            for (int i = 0; i < 200; ++i) {
+                if (!s->validate(good))
+                    ++accepts;
+                if (s->validate(bad))
+                    ++rejects;
+            }
+        });
+    for (auto& w : workers)
+        w.join();
+    CHECK(accepts == 8 * 200);
+    CHECK(rejects == 8 * 200);
+}
+
 TEST_CASE("MCP approve_request approves a pending request as a second principal",
           "[mcp][integration][approval]") {
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
@@ -6450,4 +7654,366 @@ TEST_CASE("MCP 2f/15(j): session cap hit rejects initialize with 429 (never evic
     // the live session survived the cap rejection
     CHECK(reg.validate_and_touch(first, "test-user") ==
           mcp::McpSessionRegistry::ValidateResult::kValid);
+}
+
+// ── 2f PR 3a - execute_instruction progress bridge, GET-only mode ─────────
+//
+// The bridge is injected via McpServer::set_stream_bridge (the setter takes
+// live effect on the next request - the handler captures `this`). Every
+// section asserts the LOAD-BEARING plain-path property first: the POST
+// response is byte-shape-identical with and without a bridge record, and
+// GET-only mode never emits a second final response onto the stream.
+
+namespace {
+
+/// Local poll helper - the bridge projector is asynchronous.
+template <typename F> bool bridge_poll(F&& f, std::chrono::milliseconds d = std::chrono::seconds(5)) {
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < until) {
+        if (f()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return f();
+}
+
+/// Snapshot the session ring (attach at 0, copy, detach).
+std::vector<yuzu::server::mcp::sse_bus::SseEvent>
+bridge_ring(yuzu::server::mcp::McpStreamState& st, const std::string& principal) {
+    auto att = st.attach_and_replay(0, nullptr, principal);
+    REQUIRE(att.status == yuzu::server::mcp::McpStreamState::AttachStatus::kAttached);
+    std::vector<yuzu::server::mcp::sse_bus::SseEvent> out;
+    {
+        std::lock_guard<std::mutex> lk(att.sink->sse->mu);
+        out.assign(att.sink->sse->queue.begin(), att.sink->sse->queue.end());
+    }
+    st.detach(att.sink);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode (2f PR 3a)",
+          "[mcp][integration][execute][bridge][2f]") {
+    namespace smcp = yuzu::server::mcp;
+
+    // Real tracker + bus + session registry + bridge, mock everything else.
+    // :memory: (not a temp FILE) on purpose: this TEST_CASE re-runs its fixture
+    // per SECTION, and file-SQLite create_tables is serialized by Defender on the
+    // Windows CI runner (flake #473 class) - the dominant per-section cost that
+    // pushed the server suite over its 600s meson cap (#2092/#2093). The tracker
+    // uses this single connection, so an in-memory DB is fully equivalent here.
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+
+    auto minted = sessions.mint("test-user"); // harness auth_fn's username
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    auto stream = sessions.stream_for(sid, "test-user");
+    REQUIRE(stream != nullptr);
+
+    const auto call_exec = [&](const std::string& body) {
+        return ts.call_raw("POST", body, {{"Mcp-Session-Id", sid}});
+    };
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+
+    SECTION("plain response byte-shape identical; progress live; no second final; kDone") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-bridge", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res_bridged = call_exec(exec_body(500, /*with_token=*/true));
+        REQUIRE(res_bridged->status == 200);
+        REQUIRE(bridge.record_count() == 1);
+        auto ph = bridge.phase_for(sid, nlohmann::json(500));
+        REQUIRE(ph.has_value());
+        CHECK(*ph == smcp::McpStreamBridge::Phase::kArmedGetOnly);
+
+        // Same request WITHOUT a token: no reservation, and the response body
+        // must be IDENTICAL once the (necessarily fresh) execution_id is
+        // normalized out - the bridge must never change the plain POST bytes.
+        auto res_plain = call_exec(exec_body(500, /*with_token=*/false));
+        REQUIRE(res_plain->status == 200);
+        CHECK(bridge.record_count() == 1); // still just the first record
+        auto exec_of = [](const std::string& body) {
+            auto j = nlohmann::json::parse(body);
+            auto text =
+                nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+            return text["execution_id"].get<std::string>();
+        };
+        const auto exec_bridged = exec_of(res_bridged->body);
+        const auto exec_plain = exec_of(res_plain->body);
+        REQUIRE(!exec_bridged.empty());
+        auto normalize = [](std::string s, const std::string& from) {
+            for (std::size_t pos = s.find(from); pos != std::string::npos;
+                 pos = s.find(from, pos)) {
+                s.replace(pos, from.size(), "EXEC");
+            }
+            return s;
+        };
+        CHECK(normalize(res_bridged->body, exec_bridged) ==
+              normalize(res_plain->body, exec_plain));
+
+        // Progress reaches the session's GET ring LIVE, token echoed verbatim,
+        // execution_id in _meta. NOTE (governance happy-path): S4.5's
+        // refresh_counts already published an automatic "0/2" frame DURING
+        // dispatch, so the ring ends up with two progress frames once this "1/2"
+        // is projected. Poll for the specific 1/2 frame (not just "any frame"),
+        // and assert on the value, so the test cannot pass on the wrong frame or
+        // flake on projector timing.
+        bus.publish(exec_bridged, "execution-progress",
+                    R"({"agents_responded":1,"agents_targeted":2})");
+        REQUIRE(bridge_poll([&] {
+            for (const auto& f : bridge_ring(*stream, "test-user")) {
+                auto j = nlohmann::json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+                if (j.is_object() && j.contains("params") && j["params"]["progress"] == 1) {
+                    return true;
+                }
+            }
+            return false;
+        }));
+        {
+            auto frames = bridge_ring(*stream, "test-user");
+            bool saw_one_of_two = false;
+            for (const auto& f : frames) {
+                auto j = nlohmann::json::parse(f.data);
+                CHECK(j["method"] == "notifications/progress");
+                CHECK(j["params"]["progressToken"] == "tok-1");
+                CHECK(j["params"]["_meta"]["yuzu.execution_id"] == exec_bridged);
+                CHECK(j["params"]["total"] == 2);          // never total:0 (UP-4 clamp)
+                CHECK(j["params"]["progress"] <= 2);       // monotone, never > total
+                if (j["params"]["progress"] == 1) {
+                    saw_one_of_two = true;
+                }
+            }
+            CHECK(saw_one_of_two);  // the 1/2 frame we published actually landed
+        }
+
+        // Terminal (via the real tracker: the second agent responds) - GET-only
+        // mode emits NO final frame and NO pin; the record settles to kDone.
+        yuzu::server::AgentExecStatus a1;
+        a1.agent_id = "agent-001";
+        a1.status = "success";
+        tracker.update_agent_status(exec_bridged, a1);
+        yuzu::server::AgentExecStatus a2;
+        a2.agent_id = "agent-002";
+        a2.status = "success";
+        tracker.update_agent_status(exec_bridged, a2);
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(500));
+            return p.has_value() && *p == smcp::McpStreamBridge::Phase::kDone;
+        }));
+        CHECK(stream->pinned_count() == 0);
+        for (const auto& f : bridge_ring(*stream, "test-user")) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            CHECK((j.is_object() && !j.contains("result"))); // never a second final
+        }
+        bridge.sweep();
+        CHECK(bridge.record_count() == 0);
+    }
+
+    SECTION("duplicate request id degrades silently, counted") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-dup", 1};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto r1 = call_exec(exec_body(7, true));
+        REQUIRE(r1->status == 200);
+        auto r2 = call_exec(exec_body(7, true)); // same jsonrpc id ⇒ dup key
+        REQUIRE(r2->status == 200);              // silent degrade - still a success
+        CHECK(nlohmann::json::parse(r2->body).contains("result"));
+        CHECK(bridge.record_count() == 1);
+        // L1: the degrade counter carries the COARSE reason; the fine
+        // "duplicate_request_id" lives in reject_total (counted inside reserve).
+        CHECK(metrics
+                  .counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_rejected"}})
+                  .value() == 1.0);
+        CHECK(metrics
+                  .counter("yuzu_mcp_bridge_reject_total", {{"reason", "duplicate_request_id"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("dispatch throw abandons the record; error bytes unchanged") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            throw std::runtime_error("boom");
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(8, true));
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["code"] == smcp::kInternalError);
+        CHECK(j["error"]["message"] == "dispatch failed");
+        CHECK(bridge.record_count() == 0); // abandoned, key + caps freed
+    }
+
+    SECTION("zero agents reached abandons the record; response unchanged") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-zero", 0};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(9, true));
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text["status"] == "no_agents_reached");
+        CHECK(bridge.record_count() == 0);
+    }
+
+    SECTION("S4.5: all agents responding before set_agents_targeted still terminates") {
+        // The starvation shape: responses land DURING dispatch (agents_targeted
+        // still 0, so update_agent_status cannot transition the row), and
+        // set_agents_targeted publishes nothing. Without the refresh_counts
+        // chain the row stays `running` forever with no bus terminal.
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string& execution_id) -> std::pair<std::string, int> {
+            yuzu::server::AgentExecStatus a;
+            a.agent_id = "agent-001";
+            a.status = "success";
+            tracker.update_agent_status(execution_id, a);
+            return {"cmd-early", 1};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(10, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        const auto exec_id = text["execution_id"].get<std::string>();
+        REQUIRE(!exec_id.empty());
+
+        auto exec = tracker.get_execution(exec_id);
+        REQUIRE(exec.has_value());
+        CHECK(exec->status == "succeeded"); // refresh_counts rescued the terminal
+        // …and the bridge record saw that terminal: GET-only settles to kDone.
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(10));
+            return p.has_value() && *p == smcp::McpStreamBridge::Phase::kDone;
+        }));
+    }
+
+    SECTION("arm() allocation failure still returns the plain response, leaks no record") {
+        // Sol code-review finding 2: an unguarded arm() throw on a SUCCESSFUL
+        // dispatch turned the response into an httplib 500 and stranded a kArming
+        // record. The handler now contains it - the client still gets the plain
+        // success and the record is abandoned.
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-armfault", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        bridge.inject_arm_fault_for_test(); // next arm() throws pre-flip
+        auto res = call_exec(exec_body(11, true));
+        REQUIRE(res->status == 200); // NOT a 500 - the guard held
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result")); // plain success shape, unchanged
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text.contains("execution_id"));
+        CHECK(text["command_id"] == "cmd-armfault");
+        // The record was abandoned, not stranded in kArming.
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(11)).has_value());
+        CHECK(bridge.record_count() == 0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}}).value() ==
+              1.0);
+    }
+
+    SECTION("reserve() allocation failure degrades to the plain path, counted") {
+        // The reserve guard (governance quality): a bad_alloc in reserve (before
+        // create_execution) must degrade silently - the command still dispatches
+        // and returns the plain success, no bridge record.
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-resvfault", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        bridge.inject_reserve_fault_for_test();
+        auto res = call_exec(exec_body(12, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text["command_id"] == "cmd-resvfault");  // dispatch still happened
+        CHECK(bridge.record_count() == 0);             // no record - degraded before insert
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("subscribe() allocation failure abandons the record, degrades, counted") {
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&) -> std::pair<std::string, int> {
+            return {"cmd-subfault", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        bridge.inject_subscribe_fault_for_test();
+        auto res = call_exec(exec_body(13, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        CHECK(text["command_id"] == "cmd-subfault");
+        CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
+                  .value() == 1.0);
+    }
 }

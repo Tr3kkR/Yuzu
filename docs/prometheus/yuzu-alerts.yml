@@ -131,6 +131,38 @@ groups:
             the proxy. Diagnose via the throttled [ADR-1005] warn lines.
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
 
+  - name: yuzu-mcp
+    rules:
+      - alert: YuzuMcpProgressBridgeAtCapacity
+        expr: |
+          rate(yuzu_mcp_bridge_reject_total{reason="global_cap"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress bridge is rejecting at its record cap"
+          description: >-
+            yuzu_mcp_bridge_reject_total{reason="global_cap"} is moving - the
+            256-record correlation table is full, so new execute_instruction
+            progress requests are silently degrading to the plain (poll) path.
+            Functional (clients that poll are unaffected) but live progress is
+            unavailable. Check for a client holding many warm sessions with
+            never-terminating executions, or raise capacity when 3b lands.
+      - alert: YuzuMcpStreamTerminalPublishFailures
+        expr: |
+          rate(yuzu_mcp_stream_terminal_publish_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "MCP terminal-frame delivery is failing (poison ladder engaged)"
+          description: >-
+            yuzu_mcp_stream_terminal_publish_failures_total is moving - a
+            client-visible terminal result could not be published on the stream
+            and the publish_final → fallback → poison ladder engaged (a double
+            failure poisons that session's stream). Results remain durably
+            fetchable by execution_id, but the streaming surface is degraded;
+            this is an allocation-pressure or stream-state signal worth paging.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon
@@ -883,8 +915,8 @@ groups:
   #       endpoints and the runbook advice to "identify the reporting agents" is
   #       unactionable without it;
   #   (b) the per-agent axis above (#2083-class work);
-  #   (c) a soak at fleet scale with all 22 families live concurrently with the
-  #       revocation sweep - the heartbeat tag-map grows by up to 22 entries per agent
+  #   (c) a soak at fleet scale with all 30 families live concurrently with the
+  #       revocation sweep - the heartbeat tag-map grows by up to 30 entries per agent
   #       the instant prefer_spark flips, which no pre-cutover soak can observe;
   #   (d) runbooks at the docs.yuzu.io URLs below, which do not exist yet.
   #
@@ -898,7 +930,7 @@ groups:
   # alert is the signal; the audit trail is the evidence.
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
-  # published on EVERY sweep including at 0, unlike the 22 counters. They are the only
+  # published on EVERY sweep including at 0, unlike the 30 counters. They are the only
   # rules here that CAN be sound, because they are server-owned counts rather than fleet
   # sums of agent monotonics. They differ from each other: TagRejected is
   # unconditionally sound, while TelemetryDark is sound only once Guardian is actually
@@ -944,6 +976,71 @@ groups:
   #           missing from the fleet sums. Identify the agent, and re-check the ceiling
   #           before raising it. This is a per-sweep count, not a latch.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-tag-rejected"
+  #     # ---- Worker staleness (MAX-rollup ages; flip item 6 + #2364) -----------------
+  #     # STRUCTURALLY DIFFERENT from every counter rule in this group: the _seconds_max
+  #     # gauges are a fleet MAX of live per-endpoint ages with a meaningful absolute
+  #     # threshold, so a plain `> X for: Y` is sound - none of REASON 2's
+  #     # increase()/rate()-over-a-churning-sum failure modes apply, and agent churn can
+  #     # only LOWER the max (a dropped stale agent stops contributing, which is the
+  #     # honest reading). The writer emits the staleness pair including 0 while the
+  #     # worker is live and nothing while dormant, so pre-cutover these series are
+  #     # ABSENT and the rules below would simply never fire - they stay commented
+  #     # anyway so the group enables as one reviewed unit at the cutover (#2390).
+  #     #
+  #     # KNOWN FALSE-POSITIVE SOURCES both rules inherit (record them NOW so #2390 does
+  #     # not rediscover them under incident pressure - governance UP-1/UP-5/UP-15):
+  #     #  1. Flip-day / cold start: a worker's FIRST pass over a near-ceiling journal
+  #     #     (64 MiB / thousands of batches, under KV contention) can legitimately
+  #     #     exceed these thresholds before its first success stamp lands. Do not
+  #     #     enable within the first hour after a fleet-wide prefer_spark flip - or
+  #     #     widen the threshold / `for:` for that window. Measure the real cold-pass
+  #     #     time in the flip validation stage (CH-C) before picking final numbers.
+  #     #  2. Suspend/resume: steady_clock behaviour across sleep is per-OS (Windows
+  #     #     counts suspended time, Linux does not), so a morning wake-wave of laptops
+  #     #     can transiently breach the threshold across many endpoints at once with
+  #     #     no worker fault. `for: 10m` absorbs a single machine, not a wave.
+  #     #  3. Slow-but-alive: a fleet under moderate KV contention (passes ~minutes,
+  #     #     phase-staggered) can hold the MAX above threshold continuously while
+  #     #     every worker is healthy. Confirm via maint_exceptions (flat = hung or
+  #     #     died-earlier; climbing = throwing) AND agent uptime/restart state before
+  #     #     paging.
+  #     # FLIP-DAY BOOTSTRAP: this is a hard cutover - the family goes from absent
+  #     # everywhere to present everywhere in one release. Pre-provisioned dashboard
+  #     # panels referencing these series show "No Data" pre-flip (expected, not an
+  #     # outage), and prerequisite (a) above (a per-agent operator surface) gates
+  #     # sensible triage of THESE rules too, not only the loss counters - a MAX with
+  #     # no attribution axis names no endpoint.
+  #     - alert: YuzuGuardianJournalPageStale
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_page_stale_seconds_max > 300
+  #       for: 10m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "A Guardian journal replay worker has not completed a page pass in >5m"
+  #         description: >-
+  #           The worst endpoint's time since its last successful replay page pass
+  #           exceeds 10x the 30 s cadence. The worker there is dead, hung, or throwing
+  #           on every pass (climbing maint_exceptions alongside means throwing NOW; a
+  #           flat value means hung, OR the loop died earlier - loop death increments
+  #           the counter exactly once and logs a `critical` line, so check the agent
+  #           log): journalled lifecycle records are not being replayed to the server
+  #           from that endpoint.
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
+  #     - alert: YuzuGuardianJournalPruneStale
+  #       expr: |
+  #         yuzu_fleet_guardian_journal_prune_stale_seconds_max > 1200
+  #       for: 10m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "A Guardian journal retention prune has not completed in >20m"
+  #         description: >-
+  #           The worst endpoint's time since its last successful retention prune
+  #           exceeds 10x the 120 s cadence. Retention is not running there: the
+  #           journal grows toward its write ceiling, where new audit batches start
+  #           being refused (write_capacity_rejected).
+  #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
   #     # ---- Loss / fault counters (rising edge; NOT sufficient - see REASON 2) -----
   #     - alert: YuzuGuardianJournalIntegrityGap
   #       expr: |
@@ -962,7 +1059,12 @@ groups:
   #           incident-register entry: classification is BEST-EFFORT, so a crash
   #           between the send and the sent-label write counts a sent batch as
   #           no-evidence, and a mass reboot or OTA manufactures a large benign step
-  #           roughly one retention window (7d) later. Do NOT escalate until agent-side
+  #           roughly one retention window (7d) later. Since #2299 a THIRD benign class
+  #           exists: quarantine of a corrupt-VALUE batch moved to the replay pass, so a
+  #           corrupt batch the rotation never reaches before it ages out is counted here
+  #           rather than as quarantined - cross-check
+  #           yuzu_fleet_guardian_journal_quarantined before treating a spike as pure
+  #           delivery loss. Do NOT escalate until agent-side
   #           corroboration or magnitude analysis rules out that crash-timing artifact
   #           class. No `for:` clause on purpose - the 90s staleness window means an
   #           agent that reports a loss then dies is visible for less than one `for:`
@@ -981,6 +1083,12 @@ groups:
   #           The pending reserve overflowed under sustained write failure - records
   #           never reached the journal; the audit trail has a hole. Correlate with
   #           _write_failures and _pending on the same agents.
+  #           THREE causes need different responses: sustained write failure, capacity
+  #           refusal, and - since #2299 - simply out-running the heartbeat's per-tick
+  #           persist bounds (4 batches / 1024 records). On that third path
+  #           write_failures and write_capacity_rejected are both ZERO and nothing is
+  #           broken; check batches_written's rate against the per-tick ceiling before
+  #           treating the alert as faulty.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-stage-dropped"
   #     - alert: YuzuGuardianJournalWriteFailures
   #       expr: |
