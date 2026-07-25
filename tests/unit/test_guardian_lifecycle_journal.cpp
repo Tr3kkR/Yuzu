@@ -649,6 +649,63 @@ TEST_CASE("eviction classification: a THROW mid-classification accounts the rema
           j.batches_pruned());
 }
 
+TEST_CASE("eviction classification: a read-failure's prune_failures survives a later throw",
+          "[guardian][journal][prune]") {
+    // The unreadable-label -> unclassified bump promises a paired prune_failures increment. It
+    // is recorded the INSTANT the read fails (not after the loop), so a later key's throw cannot
+    // lose it (Gate 2 sec-INFO / Gate 4 UP-10). Fixture: 3 batches, sent-scan fails (fallback),
+    // ONLY the first per-key read fails (records prune_failures + unclassified), then the
+    // classify hook throws on the next key.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3);
+    j.inject_prune_sent_scan_failures_for_test(1); // force the fallback path
+    j.inject_prune_sent_read_failures_for_test(1); // ONLY the first per-key read fails
+    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
+        if (classified == 1) // after the read-failed first key is bucketed
+            throw std::runtime_error("classification boom");
+    });
+
+    CHECK_THROWS_AS(j.prune(0), std::runtime_error);
+
+    CHECK(j.batches_pruned() == 3);
+    CHECK(j.prune_failures() == 1);       // recorded before the throw, not lost
+    CHECK(j.evicted_unclassified() == 3); // the read-failed key + the 2-key catch remainder
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
+}
+
+TEST_CASE("eviction classification: sent, no-evidence, and unclassified all non-zero in one pass",
+          "[guardian][journal][prune]") {
+    // The three-way partition is only meaningfully exact if all three buckets can be non-zero
+    // simultaneously. A mixed evict set - one labelled, one unlabelled classified before a
+    // mid-loop stop - leaves the third key unclassified, exercising all three at once.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    auto keys = persist_n_unmarked(j, t, 3);
+    j.mark_batch_sent(keys.front()); // the first-evicted key carries a sent-label
+    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
+        if (classified == 2) // after the sent key and the unlabelled key are classified
+            j.request_stop();
+    });
+
+    const auto stats = j.prune(0);
+
+    CHECK(stats.evicted == 3);
+    CHECK(j.batches_pruned() == 3);
+    CHECK(j.evicted_sent_unacked() == 1);          // keys.front() had a label
+    CHECK(j.evicted_without_send_evidence() == 1); // the second, unlabelled
+    CHECK(j.evicted_unclassified() == 1);          // the third, cut off by the stop
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
+}
+
 // ── Fault-injection + capacity hardening (governance Gate 7) ──────────────────
 
 TEST_CASE("journal prune: an injected read failure is fail-safe (counted, read_ok false, retried)",

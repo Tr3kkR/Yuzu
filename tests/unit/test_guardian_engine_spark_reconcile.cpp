@@ -713,7 +713,11 @@ TEST_CASE("journal_stats() surfaces evicted_unclassified from the engine's real 
             .kind = "armed", .guard_type = "file", .rule_name = "n"})};
     REQUIRE(journal->persist(pending, nullptr, yuzu::agent::kJournalPersistUnbounded,
                              yuzu::agent::kJournalPersistUnbounded) == 1);
-    // A correlated scan+read failure makes the single evicted batch land in unclassified.
+    // A correlated scan+read failure makes the single evicted batch land in unclassified. This
+    // seam drives only the READ-FAILURE cause of unclassified; the shutdown-mid-pass and
+    // throw-mid-classification causes are pinned at the component level in
+    // test_guardian_lifecycle_journal.cpp. That is sufficient here because the plumbing line
+    // under test (journal_stats()'s assignment) is cause-agnostic - it copies one atomic.
     journal->inject_prune_sent_scan_failures_for_test(1);
     journal->inject_prune_sent_read_failures_for_test(5);
     REQUIRE(journal->prune(0).evicted == 1);

@@ -419,7 +419,9 @@ void GuardianOutboxDrainWorker::loop() {
         // the real lifecycle_headroom() runs only inside the refill condition below; the point
         // is only to reach the thread lambda's TOP-LEVEL catch, so do not "tighten" this into
         // the refill condition. Inert in production (default false; one relaxed load per cycle).
-        // Placed after the stop gate above, so it cannot fire once a stop has been observed.
+        // Placed after the top-of-cycle stop gate, so it cannot fire on a cycle where a stop was
+        // already observed; a stop landing mid-drain is only seen next cycle, but the throw kills
+        // this one-shot worker so no next cycle runs regardless.
         if (inject_loop_tail_throw_.exchange(false, std::memory_order_relaxed))
             throw std::runtime_error{"injected loop-tail throw (item 13 seam)"};
 

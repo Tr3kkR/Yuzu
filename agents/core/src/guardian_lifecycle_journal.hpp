@@ -299,13 +299,16 @@ public:
     /// auditor read evicted_without_send_evidence as a trustworthy FLOOR on lost evidence
     /// rather than a value a mid-pass shutdown could silently shrink.
     ///
-    /// TWO causes, both "disposition permanently unknown", not "loss" and not "success":
+    /// THREE causes, all "disposition permanently unknown", not "loss" and not "success":
     ///  - a stop landing after the delete but before/mid classification (the remainder is
     ///    counted here rather than dropped) - at most ONE such bump per process lifetime,
     ///    since stopping_ latches;
-    ///  - a sent-label read that itself failed on the scan-failure fallback (an unreadable
-    ///    label is unknown, not absence) - always paired with a same-pass prune_failures
-    ///    increment, and can climb repeatedly.
+    ///  - a sent-label read that returned an error on the scan-failure fallback (an unreadable
+    ///    label is unknown, not absence) - paired with a same-pass prune_failures increment
+    ///    recorded the instant the read fails, and can climb repeatedly;
+    ///  - a throw mid-classification (bad_alloc under memory pressure) - the not-yet-classified
+    ///    remainder is accounted here before the rethrow; the throw itself is separately counted
+    ///    as a maintenance exception (journal_maint_exceptions) by the drain-worker firewall.
     /// In-memory only, resets on restart, like its two siblings. NOTE the shutdown-skip case
     /// may never reach a final heartbeat before the process exits: this closes IN-PROCESS
     /// accounting, it is not durable evidence that a skip occurred.
@@ -416,7 +419,10 @@ public:
     /// remainder-accounting deterministically, and so a hook that THROWS can exercise the
     /// classification firewall's remainder-accounting (the drain worker cannot make this loop
     /// throw from outside). Null in production. Set BEFORE any concurrent pass can run - the
-    /// write is unsynchronized, same discipline as the pre/post_scan hooks.
+    /// write is unsynchronized, same discipline as the pre/post_scan hooks. The hook fires
+    /// UNDER paging_mutex_ (prune_locked_ holds it), which is non-recursive: a hook re-entering
+    /// a paging_mutex_-taking journal method self-deadlocks. The delivered tests only call
+    /// request_stop() (a bare atomic store) or throw, both safe.
     void set_prune_classify_hook_for_test(std::function<void(std::size_t classified)> hook) {
         prune_classify_hook_ = std::move(hook);
     }

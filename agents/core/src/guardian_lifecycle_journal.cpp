@@ -749,6 +749,16 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                         one = kv_->get_entry(kJournalNamespace, label);
                     }
                     if (!one) {
+                        // Record the pass's read-failure the INSTANT it happens, once (guarded
+                        // by point_read_failed), rather than after the loop. A later key's
+                        // string-build or the caller's classify-hook can throw, and a
+                        // post-loop increment would then be skipped by the catch below - leaving
+                        // this unclassified bump WITHOUT its paired prune_failures signal that
+                        // the docstring and metrics.md promise for an unreadable label
+                        // (Gate 2 sec-INFO / Gate 4 UP-10). Recording it here keeps the pairing
+                        // honest even under a throwing pass; still once per pass, never per key.
+                        if (!point_read_failed)
+                            prune_failures_.fetch_add(1, std::memory_order_relaxed);
                         point_read_failed = true;
                         evicted_unclassified_.fetch_add(1, std::memory_order_relaxed);
                         ++classified;
@@ -764,8 +774,6 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                     if (prune_classify_hook_)
                         prune_classify_hook_(classified);
                 }
-                if (point_read_failed) // once per pass, not once per key
-                    prune_failures_.fetch_add(1, std::memory_order_relaxed);
             }
         } catch (...) {
             // Account the not-yet-classified remainder before rethrowing to the caller's

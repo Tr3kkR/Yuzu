@@ -268,12 +268,14 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "point is accounting exactness: pruned == sent_unacked + no_send_evidence + "
      "unclassified every pass, which is what lets evicted_no_send_evidence be read as a "
      "trustworthy FLOOR on lost evidence rather than a value a mid-pass shutdown could "
-     "silently shrink. NEITHER loss NOR success. Two causes: a stop landing mid-pass counts "
+     "silently shrink. NEITHER loss NOR success. Three causes: a stop landing mid-pass counts "
      "the unclassified remainder here (at most ONE such bump per process lifetime, since the "
-     "stop latches), and an UNREADABLE sent-label on the scan-failure fallback (always paired "
-     "with a same-pass prune_failures increment - a repeated climber, unlike the shutdown "
-     "bump). MONITOR-ONLY - see the alerting note; neither increase() nor bare > 0 is sound "
-     "over a fleet sum. NOTE the unit is BATCHES, each up to 256 records"},
+     "stop latches); an UNREADABLE sent-label on the scan-failure fallback (paired with a "
+     "same-pass prune_failures increment - a repeated climber, unlike the shutdown bump); and a "
+     "throw mid-classification (bad_alloc), whose remainder lands here while the throw itself is "
+     "separately counted as journal_maint_exceptions. MONITOR-ONLY - see the alerting note; "
+     "neither increase() nor bare > 0 is sound over a fleet sum. NOTE the unit is BATCHES, each "
+     "up to 256 records"},
     {"yuzu.guardian_drain_exceptions", "yuzu_fleet_guardian_drain_exceptions",
      "Fleet sum of firewalled throws in the outbox DELIVERY machinery. Distinct from the "
      "journal counters beside it: events are buffered but not shipping, which is a "
