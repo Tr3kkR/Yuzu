@@ -371,7 +371,7 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   }
 }
 
-Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
+Step 'Windows Defender exclusions for CI hot paths (runner work + test temp + Postgres)' {
   # THE dominant [pg]-shard cost on Windows: Postgres has no fork(), so it
   # CreateProcess()es a fresh postgres.exe backend PER CONNECTION, and Defender
   # scans that binary on every spawn. Measured 570 ms/connection unexcluded vs
@@ -385,21 +385,24 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   # Path-scoped, not a bare filename: 'postgres.exe' alone excludes any
   # process with that name machine-wide. $pgbin is the one bin dir every
   # agent's service (agent-0 + agents 1..N-1) launches postgres.exe from.
-  if($pgbin){
-    Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue   # per-connection backend spawn (the big one)
+  $postgresProcessExclusion = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { $null }
+  if($postgresProcessExclusion){
+    Add-MpPreference -ExclusionProcess $postgresProcessExclusion -EA Stop   # per-connection backend spawn (the big one)
   } else {
     Write-Warning "pgbin not found - skipping the postgres.exe Defender exclusion; the [pg]-shard perf fix this step exists for is NOT applied on this runner"
   }
-  # The Catch2 test binaries drive the SQLite .db/-wal/-shm temp churn behind the
-  # tar (~104x Linux) and server (~5-18x) suites. A PROCESS exclusion skips
-  # scanning ALL of a binary's file I/O wherever it lands — including the
-  # LOCAL SYSTEM-context C:\Windows\Temp that the per-runner _temp routing cannot
-  # reach — so it is broader than the C:\Windows\Temp\yuzu* path exclusion below
-  # and complements it. Bare names (not full paths): these binaries live under the
-  # per-build tests dir (which varies) and are ours alone on a CI runner, unlike
-  # 'postgres.exe' which must stay path-scoped.
-  $testExes = @('yuzu_server_tests.exe','yuzu_agent_tests.exe','yuzu_tar_tests.exe')
-  foreach($exe in $testExes){ Add-MpPreference -ExclusionProcess $exe -EA SilentlyContinue }
+  # Catch2 test binaries and their SQLite .db/-wal/-shm churn stay path-scoped.
+  # Bare executable-name process exclusions apply machine-wide and would let an
+  # unrelated binary with the same name bypass scanning. The runner work roots
+  # cover each checkout/build and native temp path; the narrow SYSTEM-temp yuzu*
+  # wildcard covers the LOCAL SYSTEM children that cannot inherit that routing.
+  $legacyTestProcessExclusions = @('yuzu_server_tests.exe','yuzu_agent_tests.exe','yuzu_tar_tests.exe')
+  $configuredProcessExclusions = @((Get-MpPreference -EA Stop).ExclusionProcess)
+  foreach($legacyExclusion in $legacyTestProcessExclusions){
+    if($configuredProcessExclusions -contains $legacyExclusion){
+      Remove-MpPreference -ExclusionProcess $legacyExclusion -EA Stop
+    }
+  }
   $paths = @()
   # Each registered runner's work root contains both its GitHub RUNNER_TEMP
   # (`_temp`) and its checkout/build outputs. Wee Tam already carries these
@@ -422,31 +425,54 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     $paths += (Join-Path (Split-Path $pgbin -Parent) 'data')  # agent-0 cluster data dir
   }
   $paths += (Join-Path $CacheRoot 'pg')                       # per-agent cluster data dirs (D:\ci\pg\agent-*)
-  foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
-  $activeExclusions = @((Get-MpPreference).ExclusionPath)
-  $missingWorkPaths = @($runnerWorkPaths | Where-Object { $activeExclusions -notcontains $_ })
-  if($missingWorkPaths.Count -gt 0){
-    throw "Defender runner-work exclusions did not apply: $($missingWorkPaths -join ', ')"
+  foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA Stop }
+  $activePreference = Get-MpPreference -EA Stop
+  $activePathExclusions = @($activePreference.ExclusionPath)
+  $missingPaths = @($paths | Where-Object { $activePathExclusions -notcontains $_ })
+  if($missingPaths.Count -gt 0){
+    throw "Defender path exclusions did not apply: $($missingPaths -join ', ')"
+  }
+  if($postgresProcessExclusion){
+    $activeProcessExclusions = @($activePreference.ExclusionProcess)
+    if($activeProcessExclusions -notcontains $postgresProcessExclusion){
+      throw "Defender process exclusion did not apply: $postgresProcessExclusion"
+    }
+  }
+  $remainingLegacyProcessExclusions = @($legacyTestProcessExclusions | Where-Object {
+    @($activePreference.ExclusionProcess) -contains $_
+  })
+  if($remainingLegacyProcessExclusions.Count -gt 0){
+    throw "Machine-wide Catch2 process exclusions remain: $($remainingLegacyProcessExclusions -join ', ')"
   }
   # Validate the effective child paths with Defender itself. A parent folder
   # exclusion is recursive, but this catches policy-merging or path-resolution
   # surprises that a Get-MpPreference string comparison would miss.
   $mpCmdRun = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -EA SilentlyContinue |
     Sort-Object LastWriteTime | Select-Object -Last 1
-  if(-not $mpCmdRun){ throw 'MpCmdRun.exe not found — cannot validate runner temp exclusions' }
-  $failedTempPaths = @()
+  if(-not $mpCmdRun){ throw 'MpCmdRun.exe not found — cannot validate CI test-I/O exclusions' }
+  $testIoPaths = @()
   foreach($runnerWorkPath in $runnerWorkPaths){
     $runnerTemp = Join-Path $runnerWorkPath '_temp'
     New-Item -ItemType Directory -Force $runnerTemp | Out-Null
-    & $mpCmdRun.FullName -CheckExclusion -Path $runnerTemp | Out-Host
-    if($LASTEXITCODE -ne 0){ $failedTempPaths += $runnerTemp }
+    $testIoPaths += $runnerTemp
   }
-  if($failedTempPaths.Count -gt 0){
-    throw "Defender runner-temp exclusions are ineffective: $($failedTempPaths -join ', ')"
+  $systemTempProbe = 'C:\Windows\Temp\yuzu_defender_exclusion_probe'
+  New-Item -ItemType Directory -Force $systemTempProbe | Out-Null
+  $testIoPaths += $systemTempProbe
+  $failedTestIoPaths = @()
+  try {
+    foreach($testIoPath in $testIoPaths){
+      & $mpCmdRun.FullName -CheckExclusion -Path $testIoPath | Out-Host
+      if($LASTEXITCODE -ne 0){ $failedTestIoPaths += $testIoPath }
+    }
+  } finally {
+    Remove-Item $systemTempProbe -Force -EA SilentlyContinue
   }
-  $pgExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(postgres.exe skipped - pgbin not found)' }
-  $procExcl = @($pgExcl) + $testExes
-  "Defender exclusions added: process=" + ($procExcl -join ', ') + "; paths=" + ($paths -join ', ')
+  if($failedTestIoPaths.Count -gt 0){
+    throw "Defender CI test-I/O exclusions are ineffective: $($failedTestIoPaths -join ', ')"
+  }
+  $processSummary = if($postgresProcessExclusion){ $postgresProcessExclusion } else { '(postgres.exe skipped - pgbin not found)' }
+  "Defender exclusions verified: process=$processSummary; paths=" + ($paths -join ', ')
 }
 
 Step 'Scheduled sweep of leaked C:\Windows\Temp\yuzu* (NTFS dir-index hygiene)' {
