@@ -239,3 +239,53 @@ TEST_CASE("check_scoped_permission: preserved through the shared-resolver refact
     REQUIRE(r.rbac.assign_role({"user", "gadmin", "RespReader"}).has_value());
     CHECK(r.rbac.check_scoped_permission("gadmin", "Response", "Read", "a_s", &r.mgmt));
 }
+
+// ── INV-7 set-equivalence over a DEEP tree (≥3 levels) with a mid-tree deny ───
+// Exercises the ancestor-ward ⟷ descendant-ward duality past one level:
+// a grandchild inherits a root allow AND a mid-tree deny; a sibling branch is
+// isolated from the deny (architect + consistency-auditor SHOULD).
+//
+//   R(allow) ── DP ──┬── DC1(deny) ── DGC          members: a_R,a_dp,a_dc1,a_dgc,a_dc2
+//                    └── DC2
+TEST_CASE("authorize_list_read: INV-7 holds over a 4-level tree with a mid-tree deny",
+          "[list_read][rbac][inv7]") {
+    Rig r; // reuses RespReader/RespDenier roles + RBAC-enabled store
+    auto R = r.make_group("R", "");
+    auto DP = r.make_group("DP", R);
+    auto DC1 = r.make_group("DC1", DP);
+    auto DGC = r.make_group("DGC", DC1); // depth 3 — within create_group's cap of 5
+    auto DC2 = r.make_group("DC2", DP);
+    REQUIRE(r.mgmt.add_member(R, "a_R").has_value());
+    REQUIRE(r.mgmt.add_member(DP, "a_dp").has_value());
+    REQUIRE(r.mgmt.add_member(DC1, "a_dc1").has_value());
+    REQUIRE(r.mgmt.add_member(DGC, "a_dgc").has_value());
+    REQUIRE(r.mgmt.add_member(DC2, "a_dc2").has_value());
+
+    r.group_assign(R, "deep", "RespReader");   // allow on the root (covers whole tree)
+    r.group_assign(DC1, "deep", "RespDenier");  // deny mid-tree (covers DC1 + DGC)
+
+    const std::vector<std::string> all_agents{"a_R", "a_dp", "a_dc1", "a_dgc", "a_dc2"};
+
+    auto visible = r.rbac.visible_agents_for_permission("deep", "Response", "Read", &r.mgmt);
+    REQUIRE(visible.has_value());
+    // Expected: allow(R-subtree) minus deny(DC1-subtree) = {a_R,a_dp,a_dc2}.
+    CHECK(contains(*visible, "a_R"));
+    CHECK(contains(*visible, "a_dp"));
+    CHECK(contains(*visible, "a_dc2"));  // sibling of the denied branch — survives
+    CHECK(!contains(*visible, "a_dc1")); // denied directly
+    CHECK(!contains(*visible, "a_dgc")); // grandchild inherits the mid-tree deny
+    CHECK(visible->size() == 3);
+
+    // The set-equivalence property AND the INV-7 cross-check, past one level.
+    for (const auto& a : all_agents) {
+        bool per_row = r.rbac.check_scoped_permission("deep", "Response", "Read", a, &r.mgmt);
+        INFO("agent=" << a);
+        CHECK(contains(*visible, a) == per_row);
+    }
+    auto d = r.rbac.authorize_list_read("deep", "Response", "Read", &r.mgmt);
+    REQUIRE(d.decision == ListReadDecision::AdmitScoped);
+    auto lhs = d.visible_agents, rhs = *visible;
+    std::sort(lhs.begin(), lhs.end());
+    std::sort(rhs.begin(), rhs.end());
+    CHECK(lhs == rhs);
+}

@@ -1945,6 +1945,38 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
     return groups;
 }
 
+std::expected<std::unordered_map<std::string, int>, std::string>
+RbacStore::role_effects_for(const std::string& securable_type, const std::string& operation) const {
+    std::shared_lock lock(mtx_);
+    std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT role_name, effect FROM role_permissions "
+                           "WHERE securable_type = ? AND operation = ?;",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, securable_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, operation.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        const auto* role = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        const auto* effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        if (!role || !effect)
+            continue;
+        int& e = role_effect[role];
+        if (std::string_view(effect) == "deny")
+            e = -1; // deny wins within a role, regardless of order
+        else if (std::string_view(effect) == "allow" && e == 0)
+            e = 1;
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return role_effect;
+}
+
 std::expected<RbacStore::PermGroups, std::string>
 RbacStore::resolve_perm_groups(const std::string& username, const std::string& securable_type,
                                const std::string& operation,
@@ -1960,21 +1992,14 @@ RbacStore::resolve_perm_groups(const std::string& username, const std::string& s
     if (!assignments)
         return std::unexpected(assignments.error());
 
-    // Memoize each role's verdict for THIS (sec,op) over ALL roles in one query
-    // (INV-10), rather than per-assignment. -1 deny (wins), 1 allow, 0 none.
-    auto all_perms = list_all_role_permissions_checked();
-    if (!all_perms)
-        return std::unexpected(all_perms.error());
-    std::unordered_map<std::string, int> role_effect;
-    for (const auto& p : *all_perms) {
-        if (p.securable_type != securable_type || p.operation != operation)
-            continue;
-        int& e = role_effect[p.role_name];
-        if (p.effect == "deny")
-            e = -1; // deny wins within a role, regardless of order
-        else if (p.effect == "allow" && e == 0)
-            e = 1;
-    }
+    // Per-role deny-wins verdict for THIS (sec,op) via ONE targeted query
+    // (ADR-0017 perf F5) — resolve_perm_groups runs per-agent in fleet-list
+    // loops, so materializing the whole role_permissions table per call was a
+    // hot-path regression.
+    auto role_effect_r = role_effects_for(securable_type, operation);
+    if (!role_effect_r)
+        return std::unexpected(role_effect_r.error());
+    const auto& role_effect = *role_effect_r;
 
     PermGroups pg;
     std::unordered_set<std::string> allow_seen, deny_seen;

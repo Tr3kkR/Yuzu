@@ -96,6 +96,15 @@ void ManagementGroupStore::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_mgmt_groups_parent
                 ON management_groups(parent_id);
         )"},
+        // v2 (ADR-0017 perf F3): the PK on management_group_roles leads with
+        // group_id, so `get_assignments_for_principal`'s
+        // (principal_type, principal_id) lookup — on the per-agent-check hot
+        // path via resolve_perm_groups — fell to a full table SCAN. This index
+        // turns it into a SEARCH.
+        {2, R"(
+            CREATE INDEX IF NOT EXISTS idx_mgmt_roles_principal
+                ON management_group_roles(principal_type, principal_id);
+        )"},
     };
     if (!MigrationRunner::run(db_, "management_group_store", kMigrations)) {
         spdlog::error("ManagementGroupStore: schema migration failed, closing database");
@@ -470,6 +479,12 @@ void ManagementGroupStore::refresh_dynamic_membership(
 
 // ── Hierarchy ────────────────────────────────────────────────────────────────
 
+// Ancestor-ward hierarchy walk. DUAL of `get_member_agents_in_subtrees`
+// (descendant-ward): this feeds `check_scoped_permission`'s per-agent admit
+// (an agent is reachable via its group OR any ancestor), while the subtree
+// query feeds the list gate's visible set (a group grant covers its subtree).
+// The two MUST share the depth cap below (`depth < 10`) so admit and visible-set
+// agree on an over-deep/corrupt tree (ADR-0017 INV-7).
 std::vector<std::string> ManagementGroupStore::get_ancestor_ids(const std::string& group_id) const {
     std::vector<std::string> ancestors;
     if (!db_)
@@ -708,14 +723,25 @@ ManagementGroupStore::get_member_agents_in_subtrees(
     std::string in;
     for (size_t i = 0; i < seed_groups.size(); ++i)
         in += (i ? ",?" : "?");
-    // Recursive CTE: seeds ∪ all descendants (UNION dedups → cycle-safe),
-    // joined to members. One query (INV-10), descendant-ward (INV-4).
-    std::string sql = "WITH RECURSIVE subtree(id) AS ("
-                      "  SELECT id FROM management_groups WHERE id IN (" +
+    // Recursive CTE: seeds ∪ descendants (UNION dedups → cycle-safe), joined to
+    // members. One query (INV-10), descendant-ward (INV-4). This is the exact
+    // DESCENDANT-WARD DUAL of `get_ancestor_ids` (ancestor-ward): a role grant
+    // on group G applies to G and every descendant, so the visible/denied agent
+    // set for a perm-holding group is its subtree's members — the inverse of
+    // `check_scoped_permission` admitting an agent via its group OR any ancestor.
+    // The depth bound MUST match `get_ancestor_ids`' cap (`depth < 10`) so the
+    // two traversals stay SYMMETRIC on a corrupt/over-deep tree (ADR-0017 INV-7 /
+    // unhappy UP-1): a deny beyond the shared cap is missed by BOTH the per-row
+    // ancestor walk and this descendant walk — they agree (both weaker), rather
+    // than the point-check over-admitting what the list gate would suppress.
+    // Validated trees never approach it (`create_group` caps hierarchy at 5).
+    std::string sql = "WITH RECURSIVE subtree(id, depth) AS ("
+                      "  SELECT id, 0 FROM management_groups WHERE id IN (" +
                       in +
                       ")"
                       "  UNION "
-                      "  SELECT g.id FROM management_groups g JOIN subtree s ON g.parent_id = s.id"
+                      "  SELECT g.id, s.depth + 1 FROM management_groups g "
+                      "  JOIN subtree s ON g.parent_id = s.id WHERE s.depth < 10"
                       ") "
                       "SELECT DISTINCT m.agent_id FROM management_group_members m "
                       "JOIN subtree ON m.group_id = subtree.id;";

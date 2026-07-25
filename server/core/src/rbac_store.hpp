@@ -385,6 +385,14 @@ private:
     std::expected<std::vector<std::string>, std::string>
     user_rbac_group_names(const std::string& username) const;
 
+    /// Deny-wins (sec,op) verdict per role, from ONE targeted query
+    /// (`WHERE securable_type=? AND operation=?`) rather than materializing the
+    /// whole `role_permissions` table client-side — the ADR-0017 perf-F5 hot-path
+    /// fix (resolve_perm_groups runs per-agent in fleet-list loops). Map values:
+    /// -1 deny (wins), 1 allow, 0 none. Fail-closed: unexpected on store error.
+    std::expected<std::unordered_map<std::string, int>, std::string>
+    role_effects_for(const std::string& securable_type, const std::string& operation) const;
+
     // Permission cache (G3-PERF-004): avoids 2+ SQL queries per REST request.
     // Invalidated by incrementing cache_generation_ on any permission/role mutation.
     mutable std::mutex cache_mtx_;
