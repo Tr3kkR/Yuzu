@@ -40,22 +40,26 @@ namespace {
 // v5 '' backfill) stay on plain YUZU_REQUIRE_PG_DB — they need to stage a
 // pre-migration schema by hand.
 yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
-    PgPool pool{{.conninfo = dsn, .size = 1}};
-    SoftwareInventoryStore store{pool};
-    // Throw, don't return: a silently-unmigrated template would make every
-    // clone fall back to in-test migration — correct but slow, defeating the
-    // point. PgTestTemplate::build records the throw as a fixture error.
-    if (!store.is_open())
-        throw std::runtime_error("swinv template: store failed to migrate");
-}};
+                                         PgPool pool{{.conninfo = dsn, .size = 1}};
+                                         SoftwareInventoryStore store{pool};
+                                         // Throw, don't return: a silently-unmigrated template
+                                         // would make every clone fall back to in-test migration —
+                                         // correct but slow, defeating the point.
+                                         // PgTestTemplate::build records the throw as a fixture
+                                         // error.
+                                         if (!store.is_open())
+                                             throw std::runtime_error(
+                                                 "swinv template: store failed to migrate");
+                                     }};
 
 // One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
 // between tests instead of a fresh CREATE DATABASE + new pool per test. Each
 // per-test clone/pool opens several backends, and on Windows Postgres is
 // EXEC_BACKEND (a fresh postgres.exe per connection) — the dominant [pg]-shard
 // cost. Behaviour-preserving: identical store calls and CHECKs; only the DB
-// provisioning/isolation substrate changes. Built lazily; the clone is dropped
-// at testRunEnded (keep_until_run_end), never in a static destructor.
+// provisioning/isolation substrate changes. Built lazily; at testRunEnded the
+// pool is drained and the clone dropped (keep_until_run_end), leaving both
+// function-local static destructors inert.
 //
 // CARVE-OUTS keep their own per-test database and are NOT converted: tests that
 // DROP SCHEMA / rewind public.schema_meta / DROP COLUMN to force a degrade or
@@ -64,11 +68,12 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
 // stay on YUZU_REQUIRE_PG_DB_TPL (clone) or YUZU_REQUIRE_PG_DB (fresh).
 struct SwinvShared {
     yuzu::test::PostgresTestDb db{swinv_tpl};
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    std::optional<PgPool> pool;
     SwinvShared() {
         REQUIRE(db.available());
-        REQUIRE(pool.valid());
-        db.keep_until_run_end();
+        pool.emplace(PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
     }
 };
 SwinvShared& swinv_shared() {
@@ -84,7 +89,7 @@ SwinvShared& swinv_shared() {
 // ctor finds the schema current and skips migration (a cheap SELECT, no new
 // backend).
 void swinv_reset() {
-    auto lease = swinv_shared().pool.acquire();
+    auto lease = swinv_shared().pool->acquire();
     REQUIRE(lease);
     auto trunc = pg::exec_params(
         lease.get(),
@@ -94,12 +99,12 @@ void swinv_reset() {
         "RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
-    auto seed = pg::exec_params(
-        lease.get(),
-        "INSERT INTO software_inventory_store.catalog_rollup_meta "
-        "(id, refreshed_at, total_titles, total_devices) VALUES (1, 0, 0, 0) "
-        "ON CONFLICT (id) DO NOTHING",
-        std::vector<std::string>{});
+    auto seed =
+        pg::exec_params(lease.get(),
+                        "INSERT INTO software_inventory_store.catalog_rollup_meta "
+                        "(id, refreshed_at, total_titles, total_devices) VALUES (1, 0, 0, 0) "
+                        "ON CONFLICT (id) DO NOTHING",
+                        std::vector<std::string>{});
     REQUIRE(seed.status() == PGRES_COMMAND_OK);
 }
 
@@ -108,13 +113,13 @@ void swinv_reset() {
 // pool) + `store` (fresh; the ctor's migration check is a no-op on the already-
 // migrated clone, opening no new backend). `pool` is [[maybe_unused]] — most
 // tests only touch `store`.
-#define SWINV_SHARED(store, pool)                                                              \
-    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                           \
-        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                        \
-    }                                                                                          \
-    swinv_reset();                                                                             \
-    [[maybe_unused]] PgPool& pool = swinv_shared().pool;                                       \
-    SoftwareInventoryStore store{pool};                                                        \
+#define SWINV_SHARED(store, pool)                                                                  \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    swinv_reset();                                                                                 \
+    [[maybe_unused]] PgPool& pool = *swinv_shared().pool;                                          \
+    SoftwareInventoryStore store{pool};                                                            \
     REQUIRE(store.is_open())
 
 // THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the agent
@@ -419,20 +424,20 @@ TEST_CASE("migration v5 backfills '' into v2 columns for pre-existing rows and r
       // rewind the recorded version to 4
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
-        pg::PgResult drop = pg::exec_params(
-            lease.get(),
-            "ALTER TABLE software_inventory_store.installed_software "
-            "DROP COLUMN kind, DROP COLUMN ecosystem, DROP COLUMN epoch, "
-            "DROP COLUMN release, DROP COLUMN arch, DROP COLUMN signature_status, "
-            "DROP COLUMN distro_id, DROP COLUMN distro_version",
-            std::vector<std::string>{});
+        pg::PgResult drop =
+            pg::exec_params(lease.get(),
+                            "ALTER TABLE software_inventory_store.installed_software "
+                            "DROP COLUMN kind, DROP COLUMN ecosystem, DROP COLUMN epoch, "
+                            "DROP COLUMN release, DROP COLUMN arch, DROP COLUMN signature_status, "
+                            "DROP COLUMN distro_id, DROP COLUMN distro_version",
+                            std::vector<std::string>{});
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
-        pg::PgResult ins = pg::exec_params(
-            lease.get(),
-            "INSERT INTO software_inventory_store.installed_software "
-            "(agent_id, name, version, publisher, install_date) "
-            "VALUES ('agent-legacy', 'OldApp', '1.0', 'OldCo', '2025-01-01')",
-            std::vector<std::string>{});
+        pg::PgResult ins =
+            pg::exec_params(lease.get(),
+                            "INSERT INTO software_inventory_store.installed_software "
+                            "(agent_id, name, version, publisher, install_date) "
+                            "VALUES ('agent-legacy', 'OldApp', '1.0', 'OldCo', '2025-01-01')",
+                            std::vector<std::string>{});
         REQUIRE(ins.status() == PGRES_COMMAND_OK);
         pg::PgResult back = pg::exec_params(
             lease.get(),
@@ -477,8 +482,9 @@ TEST_CASE("ingest boundary-truncates an over-long multibyte field so PG accepts 
     CHECK((*rows)[0].name == std::string(1023, 'a')); // boundary-truncated, valid UTF-8
 }
 
-TEST_CASE("ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches the agent (UP-IN1)",
-          "[pg][software_inventory][seam]") {
+TEST_CASE(
+    "ingest scrubs invalid UTF-8 to U+FFFD so PG accepts it + hash matches the agent (UP-IN1)",
+    "[pg][software_inventory][seam]") {
     // A non-conforming agent (or a future SyncSource that does not pre-scrub) sends a
     // RAW cp1252 byte 0xE9 ("Café" = 43 61 66 E9) in the name. PG's UTF8 TEXT column
     // would reject it (22021) → kError → permanent resend (UP-IN1). The seam must
@@ -523,10 +529,10 @@ TEST_CASE("ingest scrub: PG-strict edge-branch parity vector (UP-IN1 drift guard
     // the other fails one of these two tests (gov Gate-8 drift guard).
     const std::string raw = std::string("X") + "\xc0\x80" + "\xed\xa0\x80" + "\xf4\x90\x80\x80" +
                             "\xc3\xa9" + "\xf0\x9f\x98\x80" + "\xf5";
-    const std::string expected =
-        std::string("X") + "\xef\xbf\xbd\xef\xbf\xbd" + "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" +
-        "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" + "\xc3\xa9" + "\xf0\x9f\x98\x80" +
-        "\xef\xbf\xbd";
+    const std::string expected = std::string("X") + "\xef\xbf\xbd\xef\xbf\xbd" +
+                                 "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" +
+                                 "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd" + "\xc3\xa9" +
+                                 "\xf0\x9f\x98\x80" + "\xef\xbf\xbd";
 
     SWINV_SHARED(store, pool);
 
@@ -617,7 +623,7 @@ TEST_CASE("reads are AUTHORITATIVE: a degrade returns nullopt, distinct from a t
         }
         SoftwareFleetQuery q;
         q.name = "Chrome";
-        CHECK_FALSE(store.query_software(q).has_value());          // degraded → nullopt
+        CHECK_FALSE(store.query_software(q).has_value());             // degraded → nullopt
         CHECK_FALSE(store.get_agent_software("agent-a").has_value()); // not a silent empty
     }
 }
@@ -853,8 +859,7 @@ TEST_CASE("read-degrade store_not_open reason fires when the store failed to ope
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
         pg::PgResult del = pg::exec_params(
-            lease.get(),
-            "DELETE FROM public.schema_meta WHERE store = 'software_inventory_store'",
+            lease.get(), "DELETE FROM public.schema_meta WHERE store = 'software_inventory_store'",
             std::vector<std::string>{});
         REQUIRE(del.status() == PGRES_COMMAND_OK);
     }
@@ -922,11 +927,11 @@ TEST_CASE("migration v3 backfill clamps pre-fix future last_seen/first_seen at r
     {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
-        pg::PgResult sel = pg::exec_params(
-            lease.get(),
-            "SELECT first_seen FROM software_inventory_store.inventory_state "
-            "WHERE agent_id = 'agent-future'",
-            std::vector<std::string>{});
+        pg::PgResult sel =
+            pg::exec_params(lease.get(),
+                            "SELECT first_seen FROM software_inventory_store.inventory_state "
+                            "WHERE agent_id = 'agent-future'",
+                            std::vector<std::string>{});
         REQUIRE(sel.status() == PGRES_TUPLES_OK);
         REQUIRE(PQntuples(sel.get()) == 1);
         const std::int64_t first_seen = std::stoll(PQgetvalue(sel.get(), 0, 0));
@@ -953,8 +958,9 @@ TEST_CASE("read-degrade sampler is data-race-free under concurrent degraded read
     {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
-        pg::PgResult drop = pg::exec_params(
-            lease.get(), "DROP SCHEMA software_inventory_store CASCADE", std::vector<std::string>{});
+        pg::PgResult drop =
+            pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                            std::vector<std::string>{});
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
     }
     constexpr int kThreads = 8;
@@ -966,7 +972,7 @@ TEST_CASE("read-degrade sampler is data-race-free under concurrent degraded read
             for (int i = 0; i < kPerThread; ++i) {
                 SoftwareFleetQuery q;
                 q.name = "Chrome";
-                (void)store.query_software(q);       // → query_error degrade
+                (void)store.query_software(q);             // → query_error degrade
                 (void)store.get_agent_software("agent-x"); // → query_error degrade
             }
         });
@@ -1065,14 +1071,15 @@ TEST_CASE("SoftwareInventoryStore catalogue + version aggregates", "[pg][softwar
     // 3 devices: Google Chrome on all 3 (versions 126 ×2, 125 ×1); 7-Zip on 1.
     using Rows = std::vector<SoftwareEntry>;
     REQUIRE(store.apply_installed_software(
-                "cat-a1", "", Rows{{"Google Chrome", "126", "Google", ""}, {"7-Zip", "24", "Igor", ""}},
+                "cat-a1", "",
+                Rows{{"Google Chrome", "126", "Google", ""}, {"7-Zip", "24", "Igor", ""}},
                 1) == InventoryIngestOutcome::kStored);
-    REQUIRE(store.apply_installed_software(
-                "cat-a2", "", Rows{{"Google Chrome", "126", "Google", ""}}, 1) ==
-            InventoryIngestOutcome::kStored);
-    REQUIRE(store.apply_installed_software(
-                "cat-a3", "", Rows{{"Google Chrome", "125", "Google", ""}}, 1) ==
-            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("cat-a2", "",
+                                           Rows{{"Google Chrome", "126", "Google", ""}},
+                                           1) == InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("cat-a3", "",
+                                           Rows{{"Google Chrome", "125", "Google", ""}},
+                                           1) == InventoryIngestOutcome::kStored);
 
     // The catalogue/version reads are served from the PRECOMPUTED rollup — recompute it
     // from the just-seeded rows before asserting.
@@ -1147,8 +1154,8 @@ TEST_CASE("SoftwareInventoryStore catalogue rollup is empty + 'building' before 
     SWINV_SHARED(store, pool);
 
     REQUIRE(store.apply_installed_software(
-                "pre-a1", "", std::vector<SoftwareEntry>{{"Google Chrome", "126", "Google", ""}}, 1) ==
-            InventoryIngestOutcome::kStored);
+                "pre-a1", "", std::vector<SoftwareEntry>{{"Google Chrome", "126", "Google", ""}},
+                1) == InventoryIngestOutcome::kStored);
 
     // No refresh yet: meta is the building sentinel, reads are empty (NOT degraded/nullopt).
     auto meta = store.catalog_rollup_meta();
@@ -1200,9 +1207,9 @@ TEST_CASE("refresh_catalog_rollup skips (success, no recompute) when a peer hold
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
 
-    REQUIRE(store.apply_installed_software(
-                "lock-a1", "", std::vector<SoftwareEntry>{{"App", "1", "P", ""}}, 1) ==
-            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("lock-a1", "",
+                                           std::vector<SoftwareEntry>{{"App", "1", "P", ""}},
+                                           1) == InventoryIngestOutcome::kStored);
 
     // Hold the cluster-wide rollup advisory lock on a separate session connection (the "peer").
     auto holder = pool.try_acquire_for(std::chrono::seconds{5});

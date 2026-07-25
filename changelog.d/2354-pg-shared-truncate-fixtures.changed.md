@@ -9,5 +9,6 @@
   or hold a session-level advisory lock keep their own per-test database. Converted:
   `test_software_inventory_store.cpp` (reference), `test_software_licensing_store.cpp`,
   `test_software_licensing_ingestion.cpp`, and `test_product_registry_store.cpp`.
-  `test_helpers.hpp` gains `SharedPgDbRegistry`, which drops the shared clones at
-  `testRunEnded` (never a static destructor, avoiding the OpenSSL-atexit teardown hazard).
+  `test_helpers.hpp` gains `SharedPgDbRegistry`, which drains each persistent pool and then
+  drops its shared clone at `testRunEnded` (never a static destructor, avoiding the
+  OpenSSL-atexit teardown hazard).

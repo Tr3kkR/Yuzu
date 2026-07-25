@@ -82,27 +82,30 @@ AgentLicenseRow small_row(const std::string& product, const std::string& state,
 // between tests instead of a fresh CREATE DATABASE + new pool per test — the
 // same substrate swap already applied in test_software_inventory_store.cpp.
 // Behaviour-preserving: identical store calls + CHECKs; only the DB
-// provisioning/isolation substrate changes. The clone is dropped at
-// testRunEnded (keep_until_run_end), never in a static destructor. CARVE-OUTS
+// provisioning/isolation substrate changes. At testRunEnded the pool is drained
+// and the clone dropped (keep_until_run_end), leaving static destruction inert. CARVE-OUTS
 // that DROP SCHEMA / wipe public.schema_meta / hold a SESSION advisory lock are
 // NOT converted — TRUNCATE cannot undo DDL and schema_meta lives in `public`,
 // so they keep their own per-test database (YUZU_REQUIRE_PG_DB).
 yuzu::test::PgTestTemplate sle_tpl{"slestore", [](const std::string& dsn) {
-    PgPool pool{{.conninfo = dsn, .size = 1}};
-    SoftwareLicensingStore store{pool};
-    // Throw, don't return: a silently-unmigrated template would make every clone
-    // fall back to in-test migration — correct but slow, defeating the point.
-    if (!store.is_open())
-        throw std::runtime_error("slestore template: store failed to migrate");
-}};
+                                       PgPool pool{{.conninfo = dsn, .size = 1}};
+                                       SoftwareLicensingStore store{pool};
+                                       // Throw, don't return: a silently-unmigrated template would
+                                       // make every clone fall back to in-test migration — correct
+                                       // but slow, defeating the point.
+                                       if (!store.is_open())
+                                           throw std::runtime_error(
+                                               "slestore template: store failed to migrate");
+                                   }};
 
 struct SleShared {
     yuzu::test::PostgresTestDb db{sle_tpl};
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    std::optional<PgPool> pool;
     SleShared() {
         REQUIRE(db.available());
-        REQUIRE(pool.valid());
-        db.keep_until_run_end();
+        pool.emplace(PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
     }
 };
 SleShared& sle_shared() {
@@ -114,13 +117,12 @@ SleShared& sle_shared() {
 // public.schema_meta is deliberately untouched, so the per-test store ctor finds
 // the schema current and skips migration (a cheap SELECT, no new backend).
 void sle_reset() {
-    auto lease = sle_shared().pool.acquire();
+    auto lease = sle_shared().pool->acquire();
     REQUIRE(lease);
-    auto trunc = pg::exec_params(
-        lease.get(),
-        "TRUNCATE software_licensing_store.agent_license_state, "
-        "software_licensing_store.agent_licenses RESTART IDENTITY CASCADE",
-        std::vector<std::string>{});
+    auto trunc = pg::exec_params(lease.get(),
+                                 "TRUNCATE software_licensing_store.agent_license_state, "
+                                 "software_licensing_store.agent_licenses RESTART IDENTITY CASCADE",
+                                 std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }
 
@@ -128,13 +130,13 @@ void sle_reset() {
 // then TRUNCATE-reset the shared DB and bind `pool` (reference to the persistent
 // pool) + `store` (fresh; the ctor's migration check is a no-op on the already-
 // migrated clone). `pool` is [[maybe_unused]] — most tests only touch `store`.
-#define SLE_SHARED(store, pool)                                                                \
-    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                           \
-        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                        \
-    }                                                                                          \
-    sle_reset();                                                                               \
-    [[maybe_unused]] PgPool& pool = sle_shared().pool;                                         \
-    SoftwareLicensingStore store{pool};                                                        \
+#define SLE_SHARED(store, pool)                                                                    \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    sle_reset();                                                                                   \
+    [[maybe_unused]] PgPool& pool = *sle_shared().pool;                                            \
+    SoftwareLicensingStore store{pool};                                                            \
     REQUIRE(store.is_open())
 
 } // namespace
@@ -258,8 +260,8 @@ TEST_CASE("SoftwareLicensingStore full-replace is atomic per agent and preserves
                                          "omit"));
 
     SECTION("a second replace atomically swaps the row set — old rows gone") {
-        REQUIRE(store.replace_agent_licenses("agent-r", {small_row("New-C", "grace")}, "h2",
-                                             "hash"));
+        REQUIRE(
+            store.replace_agent_licenses("agent-r", {small_row("New-C", "grace")}, "h2", "hash"));
         auto got = store.agent_licenses("agent-r");
         REQUIRE(got.has_value());
         REQUIRE(got->size() == 1);
@@ -296,8 +298,8 @@ TEST_CASE("SoftwareLicensingStore full-replace is atomic per agent and preserves
                 std::vector<std::string>{});
             REQUIRE(upd.status() == PGRES_COMMAND_OK);
         }
-        REQUIRE(store.replace_agent_licenses("agent-r", {small_row("New", "licensed")}, "h3",
-                                             "hash"));
+        REQUIRE(
+            store.replace_agent_licenses("agent-r", {small_row("New", "licensed")}, "h3", "hash"));
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
         pg::PgResult sel = pg::exec_params(
@@ -409,11 +411,11 @@ TEST_CASE("SoftwareLicensingStore delete_agent serialises against an in-flight i
     // delete_agent's transaction-level lock on the same key.
     auto holder = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(holder);
-    REQUIRE(pg::exec_params(
-                holder.get(),
-                "SELECT pg_advisory_lock(hashtextextended('software_licensing:' || $1, 0))",
-                std::vector<std::string>{"agent-erase"})
-                .status() == PGRES_TUPLES_OK);
+    REQUIRE(
+        pg::exec_params(holder.get(),
+                        "SELECT pg_advisory_lock(hashtextextended('software_licensing:' || $1, 0))",
+                        std::vector<std::string>{"agent-erase"})
+            .status() == PGRES_TUPLES_OK);
 
     std::atomic<bool> done{false};
     std::thread eraser([&] {
@@ -463,8 +465,8 @@ TEST_CASE("SoftwareLicensingStore count_stale_agents keys on server-receipt last
     AgentLicenseRow skewed = small_row("P", "licensed");
     skewed.collected_at = now + 100'000'000;
     REQUIRE(store.replace_agent_licenses("agent-skew", {skewed}, "h1", "hash"));
-    REQUIRE(store.replace_agent_licenses("agent-honest", {small_row("Q", "licensed")}, "h2",
-                                         "hash"));
+    REQUIRE(
+        store.replace_agent_licenses("agent-honest", {small_row("Q", "licensed")}, "h2", "hash"));
 
     auto fresh = store.count_stale_agents(now - 1000);
     REQUIRE(fresh.has_value());
@@ -523,8 +525,8 @@ TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; wr
         CHECK(h.error() == LicensingReadError::kDegraded);
         CHECK_FALSE(store.count_stale_agents(1'000'000).has_value()); // never a false 0
         // Writes fail SOFT — false, never a throw across the API.
-        CHECK_FALSE(store.replace_agent_licenses("agent-a", {small_row("P", "licensed")}, "h2",
-                                                 "hash"));
+        CHECK_FALSE(
+            store.replace_agent_licenses("agent-a", {small_row("P", "licensed")}, "h2", "hash"));
         CHECK_FALSE(store.touch("agent-a"));
         // delete_agent (the live DELETE /sle/agents/{id} erasure primitive) must also
         // fail SOFT on a degraded store — a rolled-back DELETE returns false, so the
@@ -559,8 +561,7 @@ TEST_CASE("SoftwareLicensingStore store_not_open: constructor failure degrades e
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
         pg::PgResult del = pg::exec_params(
-            lease.get(),
-            "DELETE FROM public.schema_meta WHERE store = 'software_licensing_store'",
+            lease.get(), "DELETE FROM public.schema_meta WHERE store = 'software_licensing_store'",
             std::vector<std::string>{});
         REQUIRE(del.status() == PGRES_COMMAND_OK);
     }

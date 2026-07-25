@@ -36,23 +36,26 @@ namespace {
 // test_software_inventory_store.cpp for the rationale). RESTART IDENTITY matters
 // here — product_id is a minted sequence, so a reset must rewind it too.
 // Behaviour-preserving: identical store calls + CHECKs; only the DB
-// provisioning/isolation changes. CARVE-OUTS that DROP SCHEMA / wipe
-// public.schema_meta are NOT converted — TRUNCATE cannot undo that DDL, so they
-// keep their own per-test database (YUZU_REQUIRE_PG_DB).
+// provisioning/isolation changes. At testRunEnded the pool is drained before
+// the clone is dropped, leaving static destruction inert. CARVE-OUTS that DROP
+// SCHEMA / wipe public.schema_meta are NOT converted — TRUNCATE cannot undo that
+// DDL, so they keep their own per-test database (YUZU_REQUIRE_PG_DB).
 yuzu::test::PgTestTemplate prod_tpl{"prodreg", [](const std::string& dsn) {
-    PgPool pool{{.conninfo = dsn, .size = 1}};
-    ProductRegistryStore store{pool};
-    if (!store.is_open())
-        throw std::runtime_error("prodreg template: store failed to migrate");
-}};
+                                        PgPool pool{{.conninfo = dsn, .size = 1}};
+                                        ProductRegistryStore store{pool};
+                                        if (!store.is_open())
+                                            throw std::runtime_error(
+                                                "prodreg template: store failed to migrate");
+                                    }};
 
 struct ProdShared {
     yuzu::test::PostgresTestDb db{prod_tpl};
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    std::optional<PgPool> pool;
     ProdShared() {
         REQUIRE(db.available());
-        REQUIRE(pool.valid());
-        db.keep_until_run_end();
+        pool.emplace(PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
     }
 };
 ProdShared& prod_shared() {
@@ -64,23 +67,22 @@ ProdShared& prod_shared() {
 // clears the FK-linked aliases); public.schema_meta is untouched so the per-test
 // store ctor finds the clone migrated and skips migration.
 void prod_reset() {
-    auto lease = prod_shared().pool.acquire();
+    auto lease = prod_shared().pool->acquire();
     REQUIRE(lease);
-    auto trunc = pg::exec_params(
-        lease.get(),
-        "TRUNCATE product_registry_store.products, "
-        "product_registry_store.product_aliases RESTART IDENTITY CASCADE",
-        std::vector<std::string>{});
+    auto trunc = pg::exec_params(lease.get(),
+                                 "TRUNCATE product_registry_store.products, "
+                                 "product_registry_store.product_aliases RESTART IDENTITY CASCADE",
+                                 std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }
 
-#define PROD_SHARED(store, pool)                                                               \
-    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                           \
-        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                        \
-    }                                                                                          \
-    prod_reset();                                                                              \
-    [[maybe_unused]] PgPool& pool = prod_shared().pool;                                        \
-    ProductRegistryStore store{pool};                                                          \
+#define PROD_SHARED(store, pool)                                                                   \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    prod_reset();                                                                                  \
+    [[maybe_unused]] PgPool& pool = *prod_shared().pool;                                           \
+    ProductRegistryStore store{pool};                                                              \
     REQUIRE(store.is_open())
 
 } // namespace
@@ -118,15 +120,15 @@ TEST_CASE("ProductRegistryStore upsert_product mints, is idempotent by norm_key,
         REQUIRE(id2.has_value());
         CHECK(*id2 == *id1); // no duplicate row minted
         auto got = store.get_product("microsoft:sql server:standard");
-        REQUIRE(got.has_value());       // not degraded
-        REQUIRE(got->has_value());      // found
+        REQUIRE(got.has_value());  // not degraded
+        REQUIRE(got->has_value()); // found
         CHECK((*got)->product_id == *id1);
         CHECK((*got)->vendor == "microsoft corp"); // refreshed
         CHECK((*got)->title == "sql server db");
         CHECK((*got)->edition == "standard");
         CHECK((*got)->platform == "windows");
-        CHECK((*got)->created_at > 0);                         // seeded on insert
-        CHECK((*got)->updated_at >= (*got)->created_at);       // refreshed on conflict
+        CHECK((*got)->created_at > 0);                   // seeded on insert
+        CHECK((*got)->updated_at >= (*got)->created_at); // refreshed on conflict
     }
 
     SECTION("a different norm_key mints a different id; list is norm_key-sorted") {
@@ -162,8 +164,8 @@ TEST_CASE("ProductRegistryStore alias upsert/resolve round-trip + re-point seman
 
     SECTION("resolve on a cold registry → absent value (a miss, not a degrade)") {
         auto r = store.resolve_alias("software_licensing", "Acme Reader", "Acme Inc.");
-        REQUIRE(r.has_value());        // read succeeded
-        CHECK_FALSE(r->has_value());   // no link yet → the matcher should run
+        REQUIRE(r.has_value());      // read succeeded
+        CHECK_FALSE(r->has_value()); // no link yet → the matcher should run
     }
 
     SECTION("upsert then resolve returns the linked product_id") {
@@ -328,8 +330,7 @@ TEST_CASE("ProductRegistryStore store_not_open: constructor failure degrades rea
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
         pg::PgResult del = pg::exec_params(
-            lease.get(),
-            "DELETE FROM public.schema_meta WHERE store = 'product_registry_store'",
+            lease.get(), "DELETE FROM public.schema_meta WHERE store = 'product_registry_store'",
             std::vector<std::string>{});
         REQUIRE(del.status() == PGRES_COMMAND_OK);
     }

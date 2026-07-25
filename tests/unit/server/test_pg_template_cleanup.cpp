@@ -8,17 +8,18 @@
 //    in every test-database name; the threshold is far beyond a server-
 //    suite job's lifetime, so a live concurrent suite on the shared
 //    instance can never be swept.
-//  - testRunEnded: drop this process's template databases AND the shared-DB +
-//    TRUNCATE fixtures' per-file clones (SharedPgDbRegistry) while libpq's TLS
-//    stack is still alive. The Registry static dtor is only a backstop: its
-//    __cxa_atexit slot is claimed when the first [pg] fixture runs, so on
-//    Catch2-filtered runs OpenSSL's own atexit cleanup can land AFTER it
-//    and the exit-time PQconnectdb fails (see PgTestTemplate::drop_all_built
-//    in test_helpers.hpp). The shared-DB clones would hit the same window in a
-//    function-local static's dtor, so they register for this same drop.
+//  - testRunEnded: drain the shared-DB + TRUNCATE fixtures' persistent pools,
+//    then drop their per-file clones and this process's template databases
+//    while libpq's TLS stack is still alive. PgTestTemplate::Registry's static
+//    dtor is only a backstop: its __cxa_atexit slot is claimed when the first
+//    [pg] fixture runs, so on Catch2-filtered runs OpenSSL's own atexit cleanup
+//    can land AFTER it and the exit-time PQconnectdb fails (see
+//    PgTestTemplate::drop_all_built in test_helpers.hpp). Both the shared pools'
+//    PQfinish and the clones' DROP would hit that window in function-local
+//    static dtors, so they register for this same lifecycle boundary.
 //
 // The TEST_CASEs below are the regression net the 2091 review asked for: a
-// change that no-ops the drop paths, breaks the shared-key replay
+// change that no-ops the pool-drain/drop paths, breaks the shared-key replay
 // verification, breaks the build-failure/retry contract, mis-ages database
 // names, or breaks the sweep SQL now fails the suite itself rather than
 // only an external leftover-database check.
@@ -26,6 +27,8 @@
 #if defined(YUZU_TEST_ENABLE_PG)
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -36,6 +39,7 @@
 
 #include <libpq-fe.h>
 
+#include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
@@ -53,10 +57,10 @@ public:
     }
 
     void testRunEnded(Catch::TestRunStats const& /*stats*/) override {
-        // Both drops run here (not in a static dtor) while libpq's TLS stack is
-        // alive: templates AND the shared-DB+TRUNCATE fixtures' per-file clones.
+        // The shared cleanup primitive drains every persistent pool BEFORE it
+        // drops any clone. All libpq work runs here, while TLS is alive.
+        yuzu::test::SharedPgDbRegistry::cleanup_all_shared();
         yuzu::test::PgTestTemplate::drop_all_built();
-        yuzu::test::SharedPgDbRegistry::drop_all_shared();
     }
 };
 
@@ -73,12 +77,15 @@ void probe_exec(const std::string& dsn, const char* sql) {
         throw std::runtime_error(std::string("probe sql failed: ") + PQerrorMessage(conn.get()));
 }
 
-constexpr const char* kProbeSchema =
-    "CREATE SCHEMA IF NOT EXISTS tplprobe;"
-    "CREATE TABLE IF NOT EXISTS tplprobe.t1 (id INTEGER)";
+constexpr const char* kProbeSchema = "CREATE SCHEMA IF NOT EXISTS tplprobe;"
+                                     "CREATE TABLE IF NOT EXISTS tplprobe.t1 (id INTEGER)";
 
-void probe_setup(const std::string& dsn) { probe_exec(dsn, kProbeSchema); }
-void probe_setup_twin(const std::string& dsn) { probe_exec(dsn, kProbeSchema); }
+void probe_setup(const std::string& dsn) {
+    probe_exec(dsn, kProbeSchema);
+}
+void probe_setup_twin(const std::string& dsn) {
+    probe_exec(dsn, kProbeSchema);
+}
 void probe_setup_divergent(const std::string& dsn) {
     probe_exec(dsn, kProbeSchema);
     probe_exec(dsn, "CREATE TABLE IF NOT EXISTS tplprobe.t2 (id INTEGER)");
@@ -114,15 +121,28 @@ std::string probe_salt() {
     return salt;
 }
 
+std::optional<bool> try_database_exists(const std::string& admin_dsn,
+                                        const std::string& db_name) noexcept {
+    try {
+        yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            return std::nullopt;
+        const char* values[] = {db_name.c_str()};
+        yuzu::server::pg::PgResult res{PQexecParams(conn.get(),
+                                                    "SELECT 1 FROM pg_database WHERE datname = $1",
+                                                    1, nullptr, values, nullptr, nullptr, 0)};
+        if (PQresultStatus(res.get()) != PGRES_TUPLES_OK)
+            return std::nullopt;
+        return PQntuples(res.get()) == 1;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 bool database_exists(const std::string& admin_dsn, const std::string& db_name) {
-    yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
-    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-    const char* values[] = {db_name.c_str()};
-    yuzu::server::pg::PgResult res{PQexecParams(
-        conn.get(), "SELECT 1 FROM pg_database WHERE datname = $1", 1, nullptr, values, nullptr,
-        nullptr, 0)};
-    REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
-    return PQntuples(res.get()) == 1;
+    const auto exists = try_database_exists(admin_dsn, db_name);
+    REQUIRE(exists.has_value());
+    return *exists;
 }
 
 // Count databases whose name ends with the given suffix (finds a template
@@ -132,9 +152,9 @@ int databases_with_suffix(const std::string& admin_dsn, const std::string& suffi
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
     const std::string pattern = "%" + suffix;
     const char* values[] = {pattern.c_str()};
-    yuzu::server::pg::PgResult res{PQexecParams(
-        conn.get(), "SELECT count(*) FROM pg_database WHERE datname LIKE $1", 1, nullptr, values,
-        nullptr, nullptr, 0)};
+    yuzu::server::pg::PgResult res{
+        PQexecParams(conn.get(), "SELECT count(*) FROM pg_database WHERE datname LIKE $1", 1,
+                     nullptr, values, nullptr, nullptr, 0)};
     REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
     return std::atoi(PQgetvalue(res.get(), 0, 0));
 }
@@ -161,8 +181,7 @@ TEST_CASE("test_db_is_stale: name-embedded epoch + staleness window", "[template
     }
     SECTION("fresh names never sweep") {
         CHECK_FALSE(yuzu::test::test_db_is_stale("yuzu_test_" + fresh_epoch + "_123456789_0", now));
-        CHECK_FALSE(
-            yuzu::test::test_db_is_stale("yuzu_test_tpl_" + fresh_epoch + "_1_swinv", now));
+        CHECK_FALSE(yuzu::test::test_db_is_stale("yuzu_test_tpl_" + fresh_epoch + "_1_swinv", now));
     }
     SECTION("pre-epoch-format names never sweep (rollout safety: a concurrent "
             "old-binary job may own them)") {
@@ -182,8 +201,7 @@ TEST_CASE("test_db_is_stale: name-embedded epoch + staleness window", "[template
     }
 }
 
-TEST_CASE("PgTestTemplate: build, shared-key replay verification, scoped drop",
-          "[pg][template]") {
+TEST_CASE("PgTestTemplate: build, shared-key replay verification, scoped drop", "[pg][template]") {
     if (yuzu::test::pg_admin_dsn_env() == nullptr) {
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
     }
@@ -281,6 +299,50 @@ TEST_CASE("PgTestTemplate: build failure fails loudly, stays reclaimable, and is
     }
 }
 
+TEST_CASE("SharedPgDbRegistry drains the pool before dropping its shared clone", "[pg][template]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    const std::string admin = yuzu::test::pg_admin_dsn_env();
+    const std::string key = "sh" + probe_salt(); // salted: shared-instance safe
+    yuzu::test::PgTestTemplate tpl{key, &probe_setup};
+    yuzu::test::PostgresTestDb db{tpl};
+    INFO("shared-clone error: " << db.error());
+    REQUIRE(db.available());
+    const std::string db_name = db.db_name();
+
+    struct ProbeState {
+        std::optional<yuzu::server::pg::PgPool> pool;
+        std::optional<bool> clone_existed_during_drain;
+        bool drained{false};
+    };
+    const auto state = std::make_shared<ProbeState>();
+    state->pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 1});
+    REQUIRE(state->pool->valid());
+    {
+        auto lease = state->pool->acquire();
+        REQUIRE(lease);
+    }
+    CHECK(state->pool->open() == 1);
+
+    db.keep_until_run_end([state, admin, db_name]() noexcept {
+        // Temporal assertion seam: reversed drop-before-drain ordering records
+        // false here even though the final pool/DB state would look correct.
+        state->clone_existed_during_drain = try_database_exists(admin, db_name);
+        state->pool.reset();
+        state->drained = true;
+    });
+    CHECK(database_exists(admin, db_name));
+
+    yuzu::test::SharedPgDbRegistry::cleanup_shared(db_name);
+    CHECK(state->drained);
+    REQUIRE(state->clone_existed_during_drain.has_value());
+    CHECK(*state->clone_existed_during_drain);
+    CHECK_FALSE(state->pool.has_value());
+    CHECK_FALSE(database_exists(admin, db_name));
+    yuzu::test::PgTestTemplate::drop_built(key);
+}
+
 TEST_CASE("sweep_stale_test_databases: end-to-end against a live instance", "[pg][template]") {
     if (yuzu::test::pg_admin_dsn_env() == nullptr) {
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
@@ -299,8 +361,8 @@ TEST_CASE("sweep_stale_test_databases: end-to-end against a live instance", "[pg
 
     yuzu::test::sweep_stale_test_databases(admin);
 
-    CHECK_FALSE(database_exists(admin, stale));    // stale epoch-named: swept
-    CHECK(database_exists(admin, old_format));     // pre-epoch format: spared
+    CHECK_FALSE(database_exists(admin, stale)); // stale epoch-named: swept
+    CHECK(database_exists(admin, old_format));  // pre-epoch format: spared
     admin_exec(admin, "DROP DATABASE IF EXISTS \"" + old_format + "\"");
 }
 

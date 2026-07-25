@@ -26,6 +26,7 @@
  * `test_kv_store.cpp`.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +46,7 @@
 #include <chrono>
 #include <expected>
 #include <format>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -359,59 +361,56 @@ inline void sweep_stale_test_databases(const std::string& admin_dsn) {
 /// NEVER in the function-local static's destructor: that static-dtor DROP
 /// races OpenSSL's atexit cleanup on filtered runs and leaks — the exact
 /// hazard PgTestTemplate::drop_all_built documents. A shared fixture calls
-/// PostgresTestDb::keep_until_run_end(), which hands its clone here; the
-/// test_pg_template_cleanup listener calls drop_all_shared() right next to
-/// PgTestTemplate::drop_all_built().
+/// PostgresTestDb::keep_until_run_end(), which hands its clone and a pool-drain
+/// callback here; the test_pg_template_cleanup listener calls
+/// cleanup_all_shared(), which drains every pool and drops every shared clone
+/// before PgTestTemplate::drop_all_built() removes the templates.
 class SharedPgDbRegistry {
 public:
-    static void add(std::string admin_dsn, std::string db_name) {
+    using Drain = std::function<void()>;
+
+    static void add(std::string admin_dsn, std::string db_name, Drain drain) {
         Reg& r = reg();
         const std::lock_guard<std::mutex> lock(r.mu);
-        r.dbs.push_back({std::move(admin_dsn), std::move(db_name)});
+        r.dbs.push_back({std::move(admin_dsn), std::move(db_name), std::move(drain)});
     }
 
-    /// Drop every registered shared database WITH FORCE — which terminates any
-    /// connection the file's persistent pool still holds, so the pool itself
-    /// needs no explicit shutdown (its static PQfinish at process exit then
-    /// closes already-dead sockets harmlessly). Best-effort + announced, the
-    /// same philosophy as PgTestTemplate's drop.
-    static void drop_all_shared() {
+    /// Drain every shared fixture's persistent pool, then drop every clone,
+    /// while libpq/OpenSSL are still alive. Taking the entries first keeps
+    /// callbacks and network cleanup outside the registry mutex.
+    static void cleanup_all_shared() {
+        std::vector<Entry> entries;
         Reg& r = reg();
-        const std::lock_guard<std::mutex> lock(r.mu);
-        const std::size_t total = r.dbs.size();
-        for (const auto& e : r.dbs) {
-            yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
-            if (PQstatus(conn.get()) != CONNECTION_OK) {
-                std::fputs("SharedPgDbRegistry: teardown admin connect failed — leaked a "
-                           "yuzu_test_* database (next sweep reclaims it)\n",
-                           stderr);
-                continue;
-            }
-            const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
-            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
-            if (!res.ok())
-                std::fputs(std::format("SharedPgDbRegistry: drop of {} failed: {}\n", e.db_name,
-                                       PQerrorMessage(conn.get()))
-                               .c_str(),
-                           stderr);
+        {
+            const std::lock_guard<std::mutex> lock(r.mu);
+            entries.swap(r.dbs);
         }
-        r.dbs.clear();
-        if (total > 0) {
-            try {
-                std::fputs(
-                    std::format("SharedPgDbRegistry: dropped {} shared test database(s) at run end\n",
-                                total)
-                        .c_str(),
-                    stderr);
-            } catch (...) {
-            }
+        cleanup_entries(entries);
+    }
+
+    /// Scoped counterpart used by the mechanism regression test. It follows
+    /// the exact drain-then-drop entry path without invalidating shared
+    /// fixtures from other files when Catch2 randomises test order.
+    static void cleanup_shared(const std::string& db_name) {
+        std::vector<Entry> entries;
+        Reg& r = reg();
+        {
+            const std::lock_guard<std::mutex> lock(r.mu);
+            const auto it = std::find_if(r.dbs.begin(), r.dbs.end(),
+                                         [&](const Entry& e) { return e.db_name == db_name; });
+            if (it == r.dbs.end())
+                return;
+            entries.push_back(std::move(*it));
+            r.dbs.erase(it);
         }
+        cleanup_entries(entries);
     }
 
 private:
     struct Entry {
         std::string admin_dsn;
         std::string db_name;
+        Drain drain;
     };
     struct Reg {
         std::mutex mu;
@@ -420,6 +419,71 @@ private:
     static Reg& reg() {
         static Reg r;
         return r;
+    }
+
+    static bool drain_entry(Entry& e) noexcept {
+        if (!e.drain)
+            return true;
+        std::fprintf(stderr, "SharedPgDbRegistry: draining pool for %s\n", e.db_name.c_str());
+        try {
+            e.drain();
+            e.drain = {};
+            std::fprintf(stderr, "SharedPgDbRegistry: drained pool for %s\n", e.db_name.c_str());
+            return true;
+        } catch (...) {
+            e.drain = {};
+            std::fprintf(stderr,
+                         "SharedPgDbRegistry: pool drain for %s threw; continuing with forced "
+                         "clone cleanup\n",
+                         e.db_name.c_str());
+            return false;
+        }
+    }
+
+    static bool drop_entry(const Entry& e) noexcept {
+        try {
+            yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
+            if (PQstatus(conn.get()) != CONNECTION_OK) {
+                std::fprintf(stderr,
+                             "SharedPgDbRegistry: teardown admin connect failed for %s — leaked "
+                             "a yuzu_test_* database (next sweep reclaims it)\n",
+                             e.db_name.c_str());
+                return false;
+            }
+            const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+            if (!res.ok()) {
+                std::fprintf(stderr, "SharedPgDbRegistry: drop of %s failed: %s\n",
+                             e.db_name.c_str(), PQerrorMessage(conn.get()));
+                return false;
+            }
+            return true;
+        } catch (...) {
+            std::fprintf(stderr,
+                         "SharedPgDbRegistry: teardown of %s threw — leaked a yuzu_test_* "
+                         "database (next sweep reclaims it)\n",
+                         e.db_name.c_str());
+            return false;
+        }
+    }
+
+    static void cleanup_entries(std::vector<Entry>& entries) noexcept {
+        if (entries.empty())
+            return;
+        std::size_t drain_failures = 0;
+        for (auto& e : entries) {
+            if (!drain_entry(e))
+                ++drain_failures;
+        }
+        std::size_t dropped = 0;
+        for (const auto& e : entries) {
+            if (drop_entry(e))
+                ++dropped;
+        }
+        std::fprintf(stderr,
+                     "SharedPgDbRegistry: cleanup complete; dropped %zu/%zu shared test "
+                     "database(s), drain failures=%zu\n",
+                     dropped, entries.size(), drain_failures);
     }
 };
 
@@ -483,16 +547,17 @@ public:
     [[nodiscard]] const std::string& dsn() const noexcept { return dsn_; }
     [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
 
-    /// Hand this database's teardown to SharedPgDbRegistry — it is dropped at
-    /// testRunEnded instead of in this object's destructor. For the shared-DB
-    /// + TRUNCATE fixture, where a process-lifetime PostgresTestDb held in a
-    /// function-local static would otherwise DROP in its static destructor,
-    /// racing OpenSSL's atexit teardown (the PgTestTemplate hazard). No-op when
+    /// Hand this database and its persistent-pool drain callback to
+    /// SharedPgDbRegistry. At testRunEnded the pool is destroyed first and the
+    /// database is then dropped, while libpq/OpenSSL are still alive. The
+    /// registry retains the callback until cleanup: captures must outlive that
+    /// point, and the callback must synchronously destroy the pool without
+    /// throwing, retaining a lease, or re-entering this registry. No-op when
     /// the database never came up.
-    void keep_until_run_end() {
+    void keep_until_run_end(SharedPgDbRegistry::Drain drain) {
         if (!available_ || db_name_.empty() || admin_dsn_.empty())
             return;
-        SharedPgDbRegistry::add(admin_dsn_, db_name_);
+        SharedPgDbRegistry::add(admin_dsn_, db_name_, std::move(drain));
         detached_ = true;
     }
 
@@ -798,8 +863,7 @@ public:
                                 total)
                         .c_str(),
                     stderr);
-            } catch (...) {
-            }
+            } catch (...) {}
         }
     }
 
@@ -820,8 +884,8 @@ public:
 
 private:
     struct Entry {
-        std::string db_name; ///< empty only when CREATE DATABASE itself failed
-        std::string error;   ///< nonempty = build failed (db_name may still be set)
+        std::string db_name;   ///< empty only when CREATE DATABASE itself failed
+        std::string error;     ///< nonempty = build failed (db_name may still be set)
         std::string admin_dsn; ///< for the cleanup drop
         /// Structural fingerprint of the built template (schemas, columns,
         /// indexes, constraints).
@@ -911,13 +975,15 @@ private:
         {
             yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
             if (PQstatus(conn.get()) != CONNECTION_OK) {
-                e.error = std::string("template admin connect failed: ") + PQerrorMessage(conn.get());
+                e.error =
+                    std::string("template admin connect failed: ") + PQerrorMessage(conn.get());
                 return e;
             }
             const std::string create = "CREATE DATABASE \"" + db_name + "\"";
             yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
             if (!res.ok()) {
-                e.error = std::string("template CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
+                e.error =
+                    std::string("template CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
                 return e;
             }
         }
