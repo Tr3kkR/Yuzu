@@ -500,6 +500,7 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.sent_labels_written = lifecycle_journal_->sent_labels_written();
         s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
         s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
+        s.evicted_unclassified = lifecycle_journal_->evicted_unclassified();
     }
     // maint_exceptions keeps its NAME's meaning: journal work only - the heartbeat's
     // retry-persist plus the drain worker's prune/page, which is where prune/page throws were
