@@ -1,6 +1,9 @@
 #include "management_group_store.hpp"
 #include "migration_runner.hpp"
 #include "rbac_store.hpp" // RbacStore::validate_assignment — shared engine-principal assignment guard
+#include "sqlite_raii.hpp"
+
+#include <shared_mutex>
 
 #include <spdlog/spdlog.h>
 
@@ -644,6 +647,93 @@ ManagementGroupStore::get_group_roles(const std::string& group_id) const {
         result.push_back(std::move(a));
     }
     sqlite3_finalize(s);
+    return result;
+}
+
+std::expected<std::vector<GroupRoleAssignment>, std::string>
+ManagementGroupStore::get_assignments_for_principal(
+    const std::string& user, const std::vector<std::string>& rbac_groups) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GroupRoleAssignment> result;
+    if (!db_)
+        return std::unexpected("management group store not open");
+
+    // (principal_type='user' AND principal_id=?) OR
+    // (principal_type='group' AND principal_id IN (?,?,...))  — the user arm is
+    // always present; the group arm is appended only when the user is in RBAC
+    // groups, matching check_scoped_permission's user∪group principal matching.
+    std::string sql = "SELECT group_id, principal_type, principal_id, role_name "
+                      "FROM management_group_roles "
+                      "WHERE (principal_type='user' AND principal_id=?)";
+    if (!rbac_groups.empty()) {
+        sql += " OR (principal_type='group' AND principal_id IN (";
+        for (size_t i = 0; i < rbac_groups.size(); ++i)
+            sql += (i ? ",?" : "?");
+        sql += "))";
+    }
+    sql += ';';
+
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, user.c_str(), -1, SQLITE_TRANSIENT);
+    for (size_t i = 0; i < rbac_groups.size(); ++i)
+        sqlite3_bind_text(s.get(), static_cast<int>(2 + i), rbac_groups[i].c_str(), -1,
+                          SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        GroupRoleAssignment a;
+        a.group_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
+        a.principal_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
+        a.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
+        a.role_name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
+        result.push_back(std::move(a));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return result;
+}
+
+std::expected<std::vector<std::string>, std::string>
+ManagementGroupStore::get_member_agents_in_subtrees(
+    const std::vector<std::string>& seed_groups) const {
+    std::vector<std::string> result;
+    if (seed_groups.empty())
+        return result; // no seeds → empty (no query)
+    std::shared_lock lock(mtx_);
+    if (!db_)
+        return std::unexpected("management group store not open");
+
+    std::string in;
+    for (size_t i = 0; i < seed_groups.size(); ++i)
+        in += (i ? ",?" : "?");
+    // Recursive CTE: seeds ∪ all descendants (UNION dedups → cycle-safe),
+    // joined to members. One query (INV-10), descendant-ward (INV-4).
+    std::string sql = "WITH RECURSIVE subtree(id) AS ("
+                      "  SELECT id FROM management_groups WHERE id IN (" +
+                      in +
+                      ")"
+                      "  UNION "
+                      "  SELECT g.id FROM management_groups g JOIN subtree s ON g.parent_id = s.id"
+                      ") "
+                      "SELECT DISTINCT m.agent_id FROM management_group_members m "
+                      "JOIN subtree ON m.group_id = subtree.id;";
+
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    for (size_t i = 0; i < seed_groups.size(); ++i)
+        sqlite3_bind_text(s.get(), static_cast<int>(1 + i), seed_groups[i].c_str(), -1,
+                          SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        if (auto* a = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)))
+            result.emplace_back(a);
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
     return result;
 }
 
