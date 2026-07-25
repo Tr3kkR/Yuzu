@@ -364,9 +364,13 @@ refuses to act on that:
   that, one such row would disarm the guard permanently.
 
 **Retention is a floor, not a ceiling.** The guard errs toward keeping evidence
-longer than configured, which is the safe direction for an evidence store. If
-you have just cut the retention setting or switched retention off, expect one
-declined pass and then paced deletion of the rows stamped under the old window.
+longer than configured, which is the safe direction for an evidence store.
+Changing `--audit-retention-days` does **not** re-date existing rows:
+`ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
+expires nothing retroactively and reclaims no disk. What it does change is this
+guard's survivor horizon, which is derived from the current window -- so after a
+reduction (and a restart, per issue #483) the older long-TTL rows stop counting
+as survivors, and a single declined pass becomes more likely.
 
 **What this does and does not promise.** The cap is the half that always
 applies: it bounds the damage of any allowed wipe unconditionally. The two
@@ -377,12 +381,12 @@ case, which is why the elapsed-time reading is persisted across restarts. Taken
 together the guard converts an instantaneous wipe into a paced one plus an
 operator signal; it does not guarantee every clock anomaly is detected.
 
-Four metrics report on this. Alert on all of them, and do not collapse the
+Six metrics report on this. Alert on all of them, and do not collapse the
 first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Non-zero means this server's clock moved in a way that would have wiped audit evidence. Investigate the host's time sync. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded the threshold (the retention window, floored at 7 days); or the stored reading was *ahead* of the clock. The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
 | `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

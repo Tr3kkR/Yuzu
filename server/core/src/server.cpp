@@ -975,11 +975,15 @@ public:
         // undeleted, so without the second an operator watching an audit table
         // that never shrinks would read a broken cleanup loop as a working guard.
         metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
-                          "Audit retention passes declined because they would have expired every "
-                          "datable row, or because the clock moved more than a retention window",
+                          "Audit retention passes declined: the pass would have expired every "
+                          "datable row, the gap since the previous pass exceeded the floored "
+                          "threshold (a forward clock jump OR an outage that long), or the stored "
+                          "clock reading was ahead of the current clock",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
-                          "Audit retention passes that failed on a SQLite error", "counter");
+                          "Audit retention passes that failed on a SQLite error or ran against a "
+                          "closed store",
+                          "counter");
         // The cap that makes an allowed wipe pace out introduces its own failure
         // mode: if it binds on EVERY pass for a sustained period, expiry is
         // outrunning the drain and audit.db grows without bound. Neither counter

@@ -145,7 +145,6 @@ void AuditStore::ensure_retention_index() {
         // that cost GROWS with the table -- turning a bounded ~315ms/hour hold
         // into an unbounded one, silently. This is the one failure that
         // invalidates the "latency, not availability" property of the whole pass.
-        retention_index_ok_.store(false, std::memory_order_relaxed);
         spdlog::error("AuditStore: could not create idx_audit_ttl_id ({}); retention will run "
                       "WITHOUT its index and each pass will scan audit_events",
                       err ? err : "unknown error");
@@ -153,6 +152,12 @@ void AuditStore::ensure_retention_index() {
         return;
     }
     sqlite3_free(err);
+    // Set only on the success path, and the member defaults to FALSE. A store
+    // whose migration failed returns from create_tables() before ever reaching
+    // here, so an initialise-true/clear-on-failure scheme would publish "index
+    // healthy" for a database that does not exist -- backwards for the one gauge
+    // whose entire job is to say the pass is degraded.
+    retention_index_ok_.store(true, std::memory_order_relaxed);
     if (ms >= 1000)
         spdlog::info("AuditStore: built idx_audit_ttl_id in {} ms (one-time, first boot after "
                      "upgrade on an existing audit_events)",

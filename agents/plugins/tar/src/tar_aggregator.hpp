@@ -121,11 +121,12 @@ inline constexpr int64_t kTarMinBigStepSec = 30 * 86400;
  * Deliberately IN-MEMORY, not persisted: a reboot re-declines, which is the
  * right behaviour for the wrong-RTC-at-boot case this exists to catch.
  *
- * NOT thread-safe. `run_retention` reads and writes it without holding the
- * database mutex, and a manual `tar rollup` instruction can arrive while the
- * 900-second `tar.rollup` trigger is mid-pass, so the CALLER must serialise
- * whole rollup passes against each other (TarPlugin holds `rollup_mu_` for
- * exactly that).
+ * The state carries its own mutex for the individual map touches, so reading
+ * the counters (e.g. from `tar status`) never waits on a pass. That does NOT
+ * make a pass atomic: each table's probe / decide / update-latch sequence spans
+ * several statements, so the CALLER must still serialise whole rollup passes
+ * against each other -- a manual `tar rollup` can arrive while the 900-second
+ * trigger is mid-pass. TarPlugin holds `rollup_mu_` for exactly that.
  */
 struct RetentionGuardState {
     /// Guards every member below. Held only for the brief map touches, NEVER
@@ -141,7 +142,7 @@ struct RetentionGuardState {
     /// The agent has no /metrics endpoint, so this is the operator's only
     /// fleet-readable signal that an endpoint's clock is wrong.
     std::map<std::string, int64_t> declines;
-    /// Cumulative COUNT-read failures per table. Kept SEPARATE from `declines`
+    /// Cumulative probe-read failures per table. Kept SEPARATE from `declines`
     /// for the same reason the audit store separates its two counters: a table
     /// whose probes fail every pass has silently stopped being retained, and a
     /// declines-only surface reports that as "this endpoint's clock is fine".
@@ -163,8 +164,9 @@ struct RetentionGuardCounters {
 
 /// The exact `tar status` lines for the retention guard, in emission order:
 /// a `retention_guard|<table>|<declines>` line per table that has declined, a
-/// `retention_guard_failed|<table>|<failures>` line per table whose probes have
-/// failed, then the always-present totals. Split out from `do_status` purely so
+/// `retention_guard_failed|<table>|<failures>` line per table whose probes OR
+/// deletes have failed (the two are merged -- both mean "not being retained"),
+/// then the always-present totals. Split out from `do_status` purely so
 /// the operator-facing format has a test seam -- `TarPlugin` is a
 /// translation-unit-local class and cannot be reached from a test.
 [[nodiscard]] std::vector<std::string>

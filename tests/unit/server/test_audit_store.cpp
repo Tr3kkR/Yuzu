@@ -13,6 +13,7 @@
 
 #include <sqlite3.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -860,7 +861,10 @@ TEST_CASE("AuditStore #2360: an ordinary outage below the floor is not a clock a
     // destroys the signal. The gap here is far past the 1-day retention window
     // but below the floor, so it must stay silent.
     GuardFixture f;
-    const std::int64_t later = kNow + kAuditMinBigStepSec - 3'600;
+    // A literal 5 days, deliberately NOT derived from kAuditMinBigStepSec: this
+    // pins the floor's VALUE, so shrinking it back toward the retention window
+    // reddens here instead of passing silently.
+    const std::int64_t later = kNow + 5 * 86400;
 
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1);
@@ -902,4 +906,112 @@ TEST_CASE("AuditStore #2360: a stored reading ahead of the clock is an anomaly, 
     // Re-anchored on the current reading, so the next pass proceeds normally.
     CHECK(store.cleanup_once(kNow + 1) == 5);
     CHECK(store.clock_anomaly_skips_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disable, self-heals",
+          "[audit_store][retention][clock-guard][chaos]") {
+    // Gate 5 CH-1, the one chaos scenario scoped to block this change. It
+    // compounds the round-2 sanitiser fix (UP-1) with the per-pass cap and the
+    // re-arm-on-failure rule, driving four different hostile values through the
+    // durable guard state in sequence.
+    //
+    // Run this under UBSan: the pre-fix code computed `now - prev` on whatever
+    // the row held, so INT64_MAX is signed-overflow UB, not merely a wrong answer.
+    constexpr std::size_t kSurplus = 7;
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-ch1-"}};
+    {
+        AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    seed_rows_with_ttl(tmp.path, kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1); // a survivor throughout
+
+    auto poison = [&](const char* value) {
+        exec_raw(tmp.path, (std::string("INSERT INTO audit_retention_meta (key, value) VALUES "
+                                        "('last_pass_now', ") +
+                            value +
+                            ") ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+                               .c_str());
+    };
+    auto stored_reading = [&]() -> std::int64_t {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &raw) == SQLITE_OK);
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(raw,
+                                   "SELECT value FROM audit_retention_meta WHERE key='last_pass_now'",
+                                   -1, &st, nullptr) == SQLITE_OK);
+        std::int64_t v = -1;
+        if (sqlite3_step(st) == SQLITE_ROW)
+            v = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        sqlite3_close(raw);
+        return v;
+    };
+
+    std::size_t before = 0;
+    {
+        AuditStore probe(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        before = probe.total_count();
+    }
+    std::size_t pass = 0;
+    std::uint64_t skips = 0, failures = 0;
+    std::size_t remaining = before;
+    // INT64_MAX and a far-future value are "ahead of now" -> anomaly, decline.
+    // -1 is out of range -> no comparison point, but not itself an anomaly.
+    // The final pass runs with the row deleted entirely (a fresh-install shape).
+    for (const char* value : std::array<const char*, 4>{"9223372036854775807", "-1",
+                                                        "1799999999", nullptr}) {
+        if (value)
+            poison(value);
+        else
+            exec_raw(tmp.path, "DELETE FROM audit_retention_meta");
+        const std::int64_t now = kNow + static_cast<std::int64_t>(pass);
+        INFO("pass " << pass << " value=" << (value ? value : "<row deleted>"));
+        // A FRESH store per poisoning, deliberately: the reading is loaded once
+        // at construction and held in memory, so tampering with the row while the
+        // server runs is inert. The realistic threat is a row edited (or left
+        // skewed by an earlier pass) while the process is DOWN, which is what a
+        // restart models.
+        AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(store.is_open());
+        const std::size_t deleted = store.cleanup_once(now);
+        // No pass may ever exceed the cap, whatever the guard state said.
+        CHECK(deleted <= kMaxAuditDeletesPerPass);
+        // Every pass re-anchors the durable reading on its own clock, so a
+        // poisoned value can never persist beyond the pass that saw it.
+        CHECK(stored_reading() == now);
+        skips += store.clock_anomaly_skips_count();
+        failures += store.cleanup_failed_count();
+        remaining = store.total_count();
+        ++pass;
+    }
+
+    // A PRE-1970 clock against a far-future stored reading -- a dead CMOS, the
+    // motivating case for the whole guard.
+    //
+    // A note on the signed-overflow concern this case was written for, because
+    // it did NOT hold up: `now - INT64_MAX` stays in range for any positive
+    // `now` (it lands around -9.22e18, just inside INT64_MIN), so an underflow
+    // needs `now <= -2`; and reaching that subtraction at all requires an
+    // EXPIRED row relative to `now`, which for a negative `now` means a negative
+    // `ttl_expires_at` that log() never writes. Verified empirically: with the
+    // sanitiser removed, UBSan reports nothing here. The sanitiser earns its
+    // place by preventing the guard from being silently DISABLED (which the
+    // passes above do catch), not by preventing UB.
+    {
+        poison("9223372036854775807");
+        AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(store.is_open());
+        CHECK(store.cleanup_once(-86'400) == 0); // nothing is expired against a 1969 clock
+        CHECK(store.cleanup_failed_count() == 0);
+    }
+
+    // The survivor is untouched and the store was never emptied: the hostile
+    // state could not cause a wipe, only pace or decline.
+    CHECK(remaining > 0);
+    CHECK(remaining < before);
+    // The two readings ahead of `now` were each reported as an anomaly, and none
+    // of this was misreported as a cleanup failure.
+    CHECK(skips >= 2);
+    CHECK(failures == 0);
 }

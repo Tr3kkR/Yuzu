@@ -1347,6 +1347,6 @@ TEST_CASE("TAR #2361: a failed delete is counted, so the totals stay honest",
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(row_count(*f.db, "process_hourly") == 6);     // nothing removed
-    CHECK(failures_of(f.guard, "process_hourly") >= 1); // and it is reported
+    CHECK(failures_of(f.guard, "process_hourly") == 1); // exactly once, not double-counted
     CHECK(declines_of(f.guard, "process_hourly") == 0); // not misreported as a clock anomaly
 }

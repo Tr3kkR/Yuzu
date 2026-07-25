@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <ctime>
@@ -391,9 +392,17 @@ std::optional<bool> exists_where(TarDatabase& db, std::string_view table,
 class TarTxnGuard {
 public:
     explicit TarTxnGuard(TarDatabase& db) : db_(db) {}
-    ~TarTxnGuard() {
-        if (!committed_)
+    ~TarTxnGuard() noexcept {
+        if (committed_)
+            return;
+        // This destructor's whole purpose is to run during an exception unwind,
+        // and execute_sql is not noexcept (it locks a mutex and logs). A throw
+        // here would be std::terminate -- the guard turning the failure it exists
+        // to contain into a crash.
+        try {
             db_.execute_sql("ROLLBACK");
+        } catch (...) {
+        }
     }
     TarTxnGuard(const TarTxnGuard&) = delete;
     TarTxnGuard& operator=(const TarTxnGuard&) = delete;

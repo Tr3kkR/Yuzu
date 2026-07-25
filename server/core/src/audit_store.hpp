@@ -167,11 +167,13 @@ public:
         return emit_failed_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that DECLINED to delete because the
-    /// pass would have aged out every datable row, or because the clock moved
-    /// more than a whole retention window since the previous pass (#2360). A
-    /// non-zero value means this server's clock moved in a way that would have
-    /// wiped audit evidence; sustained growth means it is still moving.
+    /// Cumulative count of retention passes that DECLINED to delete. Three
+    /// triggers: the pass would have aged out every datable row; the gap since
+    /// the previous pass exceeded the threshold (the retention window, floored
+    /// at kAuditMinBigStepSec); or the stored reading was AHEAD of the current
+    /// clock. The middle one cannot distinguish a forward clock jump from an
+    /// outage that long, so a non-zero value means "this server's clock moved,
+    /// or it was down that long" -- not the clock alone.
     uint64_t clock_anomaly_skips_count() const noexcept {
         return clock_anomaly_skips_.load(std::memory_order_relaxed);
     }
@@ -250,7 +252,7 @@ private:
     std::atomic<uint64_t> rows_deleted_{0};
     std::atomic<uint64_t> cap_reached_{0};
     std::atomic<uint64_t> persist_failed_{0};
-    std::atomic<bool> retention_index_ok_{true};
+    std::atomic<bool> retention_index_ok_{false};
     // Guard state for cleanup_once(). Plain (non-atomic) members: both are read
     // and written only under the exclusive mtx_ that cleanup_once() holds for
     // the whole pass, and no accessor exposes them.
@@ -260,14 +262,19 @@ private:
     // would otherwise never age out anything at all. Deliberately NOT persisted:
     // re-declining once after a restart is the safe direction.
     bool clock_anomaly_latched_{false};
-    // Wall-clock reading the previous pass saw, or 0 if no pass has ever run
-    // against this database. PERSISTED in `audit_retention_meta` and reloaded at
-    // construction, because the elapsed-time check is the only half of this
-    // guard that still works once a write has landed after the clock moved - and
-    // held in memory alone it compares against zero on the first pass of a
-    // process, so a server that BOOTS with an already-wrong clock would never
-    // see a step at all. Zero still means "no comparison point", which
-    // suppresses the "clock moved Ns" wording (it would print the Unix epoch).
+    // Wall-clock reading the previous pass saw. PERSISTED in
+    // `audit_retention_meta` and reloaded at construction, because the
+    // elapsed-time check is the only half of this guard that still works once a
+    // write has landed after the clock moved -- held in memory alone it has no
+    // comparison point on the first pass of a process, so a server that BOOTS
+    // with an already-wrong clock would never see a step at all.
+    //
+    // DISENGAGED means "no comparison point": no pass has run against this
+    // database, the row could not be read, or the stored value was rejected by
+    // the sanitiser in cleanup_once. Deliberately not spelled 0 -- zero is a
+    // legitimate reading (a dead CMOS reporting the Unix epoch is the case this
+    // guard exists for), and collapsing the two suppressed the check on the pass
+    // right after NTP corrected.
     std::optional<std::int64_t> last_pass_now_;
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
@@ -281,9 +288,9 @@ private:
     /// Build `idx_audit_ttl_id` best-effort, OUTSIDE the migration runner. See
     /// the definition for why it must not be a Migration entry.
     void ensure_retention_index();
-    /// Durable guard state in `audit_retention_meta`. `load_meta` returns 0 for
-    /// an absent key or any read error (indistinguishable, and both correctly
-    /// mean "no comparison point"). Caller holds `mtx_` for `store_meta`.
+    /// Durable guard state in `audit_retention_meta`. `load_meta` returns
+    /// `std::nullopt` for an absent key or a read error -- never 0, which is a
+    /// legitimate clock reading. Caller holds `mtx_` for `store_meta`.
     std::optional<std::int64_t> load_meta(const char* key) const;
     bool store_meta(const char* key, std::int64_t value);
     /// The accepted, capped delete. Caller holds `mtx_`. On failure returns 0

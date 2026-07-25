@@ -466,12 +466,23 @@ persistently wrong clock will still drain the window over several ticks.
 The operator surface is `retention_guard_declines_total` and
 `retention_guard_failures_total` (plus the per-table `retention_guard|<table>|<n>`
 and `retention_guard_failed|<table>|<n>` lines) in the `status` action, described
-above. A non-zero declines total means that endpoint's clock moved in a way that
-would have wiped its forensic window; check the host's time synchronisation. A
-non-zero failures total means retention has stopped for that table for a reason
-that is not the clock -- either its row counts could not be read, or its delete
-failed (a failed transaction rolls back every table's delete, so all of them are
-reported). Retention resumes automatically, paced, once the
+above. A non-zero declines total means the endpoint's clock moved **or** the
+endpoint was dark for longer than the threshold, **or** the stored reading was
+ahead of the clock (a backward correction, or tampering) -- elapsed time cannot
+separate these, so check the host's time synchronisation *and* its uptime
+history. A non-zero failures total means retention has stopped for that table
+for a reason that is not the clock: either its probes could not be read, or its
+delete failed. A failed transaction rolls back every queued delete, so all
+tables in that pass are reported -- including row-count tables, which are
+otherwise outside the guard.
+
+**Known dead band.** Because the threshold is floored at 30 days, a forward
+clock error *between* a table's own window and 30 days trips neither detector:
+the step check is below its floor, and the outcome test is separately defeated
+by the rollup minting fresh rows before retention runs. In that band the table
+drains at the capped rate with no decline and no counter. The cap still bounds
+the damage; the detection does not fire. This is the deliberate cost of not
+reporting every switched-off laptop as a clock anomaly. Retention resumes automatically, paced, once the
 condition clears.
 
 > **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
