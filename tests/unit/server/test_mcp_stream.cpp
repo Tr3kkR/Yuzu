@@ -132,6 +132,31 @@ TEST_CASE("StreamBudget: the per-principal map is bounded by LIVE principals",
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "principal-7") == 0);
 }
 
+TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principal cap does not "
+          "ration the GET surface, and vice versa (2f PR 3b)",
+          "[mcp][stream][ch5][2f]") {
+    // The metric label for the new streamed-POST surface.
+    CHECK(std::string(detail::to_string(detail::SseSurface::kMcpPost)) == "mcp_post");
+
+    detail::StreamBudget budget{{.global_cap = 100}};
+    // Fill alice's streamed-POST allowance to the per-principal cap.
+    std::vector<detail::StreamBudget::Lease> posts;
+    for (std::size_t i = 0; i < detail::kPerPrincipalMcpPost; ++i) {
+        auto r = budget.try_acquire(detail::SseSurface::kMcpPost, "alice", detail::kPerPrincipalMcpPost);
+        REQUIRE(r.lease);
+        posts.push_back(std::move(r.lease));
+    }
+    // One more streamed POST for alice is rejected on the per-principal cap...
+    auto over = budget.try_acquire(detail::SseSurface::kMcpPost, "alice", detail::kPerPrincipalMcpPost);
+    CHECK_FALSE(over.lease);
+    CHECK(std::string(over.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
+    // ...but her GET streams are a separate (surface, principal) key, so a GET admits.
+    auto get = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", mcp::kMcpStreamsPerPrincipalDefault);
+    CHECK(get.lease);
+    CHECK(budget.active_for(detail::SseSurface::kMcpPost, "alice") == detail::kPerPrincipalMcpPost);
+    CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
+}
+
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
           "[mcp][stream][ch6]") {
     // Each permitted stream must be able to pin kMaxProvidersPerStream (2) workers —

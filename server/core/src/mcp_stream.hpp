@@ -136,6 +136,15 @@ inline constexpr std::size_t kMcpStreamsPerPrincipalDefault = 4;
 /// fixed-size pin array here is the ring-side enforcement of the same bound.
 inline constexpr std::size_t kMaxStreamedPostsPerSession = 4;
 
+/// The streamed-POST admission cap (StreamBudget, per principal) and this ring-side per-session
+/// pin-slot cap are the SAME bound seen from two sides (2f PR 3b): admission must never let in
+/// more streamed POSTs than the ring can pin finals for. `sse_bus` aliases the detail namespace
+/// where the budget constant lives (stream_budget.hpp is included above; the reverse include
+/// would be a cycle, which is why the assert lives here, not there).
+static_assert(kMaxStreamedPostsPerSession == sse_bus::kPerPrincipalMcpPost,
+              "streamed-POST per-principal budget cap must equal the ring's per-session pin-slot "
+              "cap — else admission could admit a streamed POST the ring cannot pin a final for");
+
 /// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
 /// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
 /// to tell "your credential was revoked" from "our auth backend is down".
