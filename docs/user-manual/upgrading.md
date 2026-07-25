@@ -708,6 +708,17 @@ How it works:
 - Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.
 - Multiple stores share one database connection but keep independent version counters.
 
+**Index builds are deliberately kept OUT of the migration runner.** A failed
+migration closes the store, and for `audit_store` that means every audit write
+then fails — so an `O(N log N)` index build on a multi-million-row table is not
+routed through the fail-closed path. The `audit_store` retention index
+(`idx_audit_ttl_id`, #2360) is created best-effort after migrations instead: on a
+large existing `audit_events` this is a one-time build at first boot after
+upgrade (~1.4 s and ~81 MB at 5M rows, extrapolating to ~16 s at 50M), and the
+elapsed time is logged when it exceeds a second. If it fails, retention still
+runs — each pass just scans instead of seeking, and the failure is logged as an
+error.
+
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 
 **No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:
@@ -738,6 +749,29 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse)
+
+Both retention paths used to issue an unbounded `DELETE` driven by the local wall
+clock, so one forward clock step could wipe a store in a single statement. They
+are now guarded and capped. Two operator-visible consequences on upgrade:
+
+- **Audit retention is now a floor, not a ceiling.** A pass that would expire
+  every datable row declines once and then drains at 25,000 rows per hourly pass.
+  Reducing `--audit-retention-days` therefore no longer frees disk immediately:
+  the cut expires the whole old window at once, and a 365→30 day cut on a
+  5-million-row table drains over roughly a week. Watch
+  `yuzu_server_audit_retention_cap_reached_total` and
+  `yuzu_server_audit_rows_deleted_total` while it drains. Full behaviour:
+  [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
+- **`audit_store` gains schema v3** (a two-row `audit_retention_meta` table for
+  the durable clock reading — instant) plus the best-effort index build described
+  under Schema Migrations above.
+- **Agents surface new `tar status` lines** (`retention_guard_declines_total`,
+  `retention_guard_failures_total`, and per-table detail). Existing consumers
+  filter on the `config|` prefix and ignore unknown lines, so nothing breaks; see
+  [tar.md](tar.md) if you scrape this output. TAR persists its own clock reading
+  in `tar_config` (`retention_guard_last_pass`) — no schema change.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 

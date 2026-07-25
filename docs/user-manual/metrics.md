@@ -112,9 +112,11 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_events_total{result}` | counter | Audit events written, bucketed by `result` (`success` / `failure` / `denied` / `other`). |
 | `yuzu_server_audit_emit_failed_total` | counter | Events that failed to persist. Non-zero means fail-closed behavioural-PII routes are returning `503`; see the `YuzuAuditPersistFailures` alert. |
 | `yuzu_server_audit_clock_anomaly_skips_total` | counter | Retention passes **declined** because the pass would have expired every datable row, or because more than a whole retention window elapsed since the previous pass. Non-zero means this server's clock moved in a way that would have wiped audit evidence - check the host's time sync. Nothing was deleted. |
-| `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that **failed** on a database error, so `audit.db` grows without bound. |
+| `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that **failed** on a database error, or ran against a closed store (a failed migration closes it), so `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
+| `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 
-The last two must be alerted on separately and never collapsed into one signal:
+The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical
 either way. Only the pair distinguishes "the guard is protecting the table" from
 "cleanup is broken".

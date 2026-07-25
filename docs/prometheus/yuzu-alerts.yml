@@ -437,6 +437,29 @@ groups:
             "AuditStore: retention probe failed" / "AuditStore: cleanup error".
           runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
 
+      # The per-pass delete cap is what turns an allowed wipe into a paced drain,
+      # but it introduces its own failure: if it binds on every pass, expiry is
+      # outrunning the drain and audit.db grows without bound. Neither counter
+      # above moves in that state, so this is the only signal for it. Expect a
+      # burst after deliberately CUTTING the retention setting -- that legitimately
+      # expires the whole old window and drains over days.
+      - alert: YuzuAuditRetentionCapBinding
+        expr: |
+          increase(yuzu_server_audit_retention_cap_reached_total[6h]) >= 6
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention is not keeping up with expiry"
+          description: >-
+            Every audit retention pass in the last 6 hours hit the per-pass delete cap,
+            so a backlog is carried forward each hour and audit.db is growing. Check
+            yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
+            all. Expected transiently after reducing --audit-retention-days; sustained
+            growth otherwise means the fixed drain rate is below this fleet's audit
+            volume and the cap needs raising.
+          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
     # (TTL + cap), so cap-eviction silently discards another operator's in-flight

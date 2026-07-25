@@ -347,8 +347,10 @@ refuses to act on that:
 - **It declines a pass that would expire every datable row**, logs a warning,
   and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
   applies when more than a whole retention window of wall-clock time has
-  elapsed since the previous pass. The decline is latched, so an audit table
-  that is *legitimately* all-expired still ages out --- it just costs one
+  elapsed since the previous pass; that elapsed-time reading is persisted, so
+  it still fires on the first pass after a restart --- including a server that
+  *booted* with an already-wrong clock. The decline is latched, so an audit
+  table that is *legitimately* all-expired still ages out --- it just costs one
   cleanup interval first.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
   default), oldest first. A wipe the guard chose to allow therefore ages out at
@@ -363,16 +365,29 @@ longer than configured, which is the safe direction for an evidence store. If
 you have just cut the retention setting or switched retention off, expect one
 declined pass and then paced deletion of the rows stamped under the old window.
 
-Two metrics report on this. Alert on both, and do not collapse them:
+**What this does and does not promise.** The cap is the half that always
+applies: it bounds the damage of any allowed wipe unconditionally. The two
+detectors are best-effort, and the outcome test has a known blind spot --- it is
+defeated by *any* audit row written after the clock moved, because a fresh row
+counts as a survivor. On a server that is up and serving, that is the common
+case, which is why the elapsed-time reading is persisted across restarts. Taken
+together the guard converts an instantaneous wipe into a paced one plus an
+operator signal; it does not guarantee every clock anomaly is detected.
+
+Four metrics report on this. Alert on all of them, and do not collapse the
+first two:
 
 | Metric | Meaning |
 |---|---|
 | `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Non-zero means this server's clock moved in a way that would have wiped audit evidence. Investigate the host's time sync. |
-| `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error. The cleanup loop itself is broken. |
+| `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
+| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
+| `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 
-Both leave rows undeleted, so an audit table that never shrinks looks identical
-either way --- only the pair distinguishes "the guard is protecting the table"
-from "cleanup is broken".
+The first two both leave rows undeleted, so an audit table that never shrinks
+looks identical either way --- only the pair distinguishes "the guard is
+protecting the table" from "cleanup is broken". The third covers the failure the
+cap itself introduces, which neither of the first two would show.
 
 ## Integration patterns
 

@@ -1295,6 +1295,17 @@ The server applies retention policies to stored data to manage disk usage. Reten
 
 Reducing the TTL frees disk space; increasing it preserves history for compliance.
 
+> **Audit retention is a floor, not a ceiling, and reducing it does not free
+> space immediately.** The audit cleanup pass declines once when it would expire
+> every datable row -- which is exactly what cutting the TTL produces, since rows
+> stamped under the old, longer window all fall past the new horizon at once --
+> and then drains at a capped 25,000 rows per hourly pass. A large reduction
+> therefore reclaims disk over days, not minutes: cutting 365 days to 30 on a
+> 5-million-row table expires ~4.6M rows and drains over roughly a week.
+> Retention over-retains rather than over-deletes by design. See
+> [The retention clock guard](audit-log.md#the-retention-clock-guard) for the
+> counters and alerts that report it.
+
 > **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/v1/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/v1/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
 
 ---

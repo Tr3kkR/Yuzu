@@ -1,16 +1,25 @@
 - Audit retention no longer trusts the server's wall clock. The hourly cleanup pass
   was a blind `DELETE FROM audit_events WHERE ttl_expires_at < now`, so a single
   forward clock step (restored VM snapshot, NTP correction after a dead CMOS
-  battery, a hand-set date) emptied the SOC 2 evidence table in one statement with
-  no counter and no actionable log line. A pass now declines once, latched, when it
-  would expire every datable row or when more than a whole retention window has
-  elapsed since the previous pass, and every accepted pass is capped at 25,000 rows
-  oldest-first so a wipe the guard allows ages out at a paced rate. Rows whose TTL
-  sits implausibly far in the future are excluded from the decision, so one
-  forward-skewed row cannot disarm the guard. Two new counters,
-  `yuzu_server_audit_clock_anomaly_skips_total` (declined) and
-  `yuzu_server_audit_cleanup_failed_total` (errored), report the two ways a pass can
-  leave rows behind; both ship with Prometheus alert rules. Adds a partial index on
-  `audit_events(ttl_expires_at, id)` (schema v3) so the guarded pass stays
-  index-driven under the store lock - expect a one-time index build at first boot
-  after upgrade on a large existing audit database.
+  battery, a hand-set date) could empty the SOC 2 evidence table in one statement
+  with no counter and no actionable log line. A pass now declines once, latched,
+  when it would expire every datable row or when more than a whole retention window
+  has elapsed since the previous pass -- that reading is persisted, so the check
+  still fires on a server that BOOTED with an already-wrong clock -- and every
+  accepted pass is capped at 25,000 rows oldest-first. Rows whose TTL sits
+  implausibly far in the future are excluded from the decision, so one
+  forward-skewed row cannot disarm the guard. The cap is the half that always
+  applies; the detectors are best effort, so this converts an instantaneous wipe
+  into a paced one plus an operator signal rather than preventing every anomaly.
+  Four counters report it: `yuzu_server_audit_clock_anomaly_skips_total` (declined),
+  `yuzu_server_audit_cleanup_failed_total` (errored or store closed),
+  `yuzu_server_audit_retention_cap_reached_total` (the backlog is not draining) and
+  `yuzu_server_audit_rows_deleted_total`, each with a Prometheus alert rule. A
+  partial index on `audit_events(ttl_expires_at, id)` keeps the pass index-driven;
+  it is built best-effort outside the migration runner, so a failure to create it
+  degrades retention to full scans instead of taking the audit trail offline.
+
+- **Behaviour change:** audit retention is now a floor, not a ceiling. Reducing
+  `--audit-retention-days` no longer frees disk immediately -- the cut expires the
+  whole old window at once, which the guard declines once and then drains at
+  25,000 rows/hour.
