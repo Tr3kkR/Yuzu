@@ -856,8 +856,9 @@ private:
     // atomic, and rollup is a background maintenance tick where a rare wait costs
     // nothing. Also makes the aggregate-then-retain ordering below atomic.
     std::mutex rollup_mu_;
-    // Per-table retention clock-guard state. Guarded by rollup_mu_ while
-    // run_retention mutates it; do_status reads it under the same lock.
+    // Per-table retention clock-guard state. rollup_mu_ serialises whole PASSES;
+    // the state carries its own mutex for the brief map touches, so do_status can
+    // read the counters without waiting for a pass to finish.
     yuzu::tar::RetentionGuardState retention_guard_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
@@ -1926,22 +1927,16 @@ private:
         // has no /metrics endpoint, so this action is the ONLY fleet-readable
         // signal that an endpoint's clock moved in a way that would have wiped
         // its forensic window - a `spdlog::warn` on an unattended endpoint is not
-        // an operator surface. A server-side instruction reads these to find the
-        // hosts whose clocks need attention. Absent lines mean zero declines;
-        // only tables that have actually declined are emitted, so a healthy fleet
-        // pays nothing for this. State is in-memory, so it resets on agent
-        // restart - deliberately, since a reboot re-declines anyway.
-        {
-            std::lock_guard rollup_lock(rollup_mu_);
-            int64_t total_declines = 0;
-            for (const auto& [table, count] : retention_guard_.declines) {
-                if (count <= 0)
-                    continue;
-                total_declines += count;
-                ctx.write_output(std::format("retention_guard|{}|{}", table, count));
-            }
-            ctx.write_output(std::format("retention_guard_declines_total|{}", total_declines));
-        }
+        // an operator surface. Only tables with a non-zero count are emitted, so
+        // a healthy fleet pays two lines; both totals are always present.
+        // Per-table state is in-memory and resets on agent restart, deliberately,
+        // since a reboot re-declines anyway.
+        //
+        // Reads the guard's OWN mutex (inside format_retention_guard_lines), NOT
+        // rollup_mu_. Taking rollup_mu_ here would make the diagnostic an
+        // operator runs WHEN TAR IS MISBEHAVING block for a full rollup pass.
+        for (const auto& line : yuzu::tar::format_retention_guard_lines(retention_guard_))
+            ctx.write_output(line);
 
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");

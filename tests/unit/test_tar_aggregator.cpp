@@ -16,6 +16,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <mutex>
@@ -875,6 +876,24 @@ struct TarGuardFixture {
     }
 };
 
+// The guard's maps are mutex-protected, so read them through the public
+// snapshot rather than touching the members directly.
+int64_t declines_of(const yuzu::tar::RetentionGuardState& g, const std::string& table) {
+    const auto c = yuzu::tar::retention_guard_counters(g);
+    auto it = c.declines.find(table);
+    return it == c.declines.end() ? 0 : it->second;
+}
+int64_t failures_of(const yuzu::tar::RetentionGuardState& g, const std::string& table) {
+    const auto c = yuzu::tar::retention_guard_counters(g);
+    auto it = c.failures.find(table);
+    return it == c.failures.end() ? 0 : it->second;
+}
+bool latched_of(const yuzu::tar::RetentionGuardState& g, const std::string& table) {
+    std::lock_guard lock(g.mu);
+    auto it = g.latched.find(table);
+    return it != g.latched.end() && it->second;
+}
+
 // A fixed "now" far from both the epoch and the real clock.
 constexpr int64_t kT0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC
 
@@ -890,7 +909,7 @@ TEST_CASE("TAR #2361: a pass that would delete every datable row declines once",
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(row_count(*f.db, "process_hourly") == 20); // nothing deleted
-    CHECK(f.guard.declines["process_hourly"] == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
 TEST_CASE("TAR #2361: the decline is latched, so a genuine backlog still drains",
@@ -905,7 +924,7 @@ TEST_CASE("TAR #2361: the decline is latched, so a genuine backlog still drains"
 
     run_retention(*f.db, kT0 + 1, f.guard); // latched: accepted this time
     CHECK(row_count(*f.db, "process_hourly") == 0);
-    CHECK(f.guard.declines["process_hourly"] == 1); // not counted twice
+    CHECK(declines_of(f.guard, "process_hourly") == 1); // not counted twice
 }
 
 TEST_CASE("TAR #2361: the latch clears once the backlog drains, re-arming the guard",
@@ -921,7 +940,7 @@ TEST_CASE("TAR #2361: the latch clears once the backlog drains, re-arming the gu
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // fresh anomaly
     run_retention(*f.db, kT0 + 3, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 5);
-    CHECK(f.guard.declines["process_hourly"] == 2);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
 }
 
 TEST_CASE("TAR #2361: one future-dated row cannot disarm the guard",
@@ -938,7 +957,7 @@ TEST_CASE("TAR #2361: one future-dated row cannot disarm the guard",
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(row_count(*f.db, "process_hourly") == 21); // still declines
-    CHECK(f.guard.declines["process_hourly"] == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
 TEST_CASE("TAR #2361: an in-window survivor means no wipe, so the pass deletes immediately",
@@ -951,7 +970,7 @@ TEST_CASE("TAR #2361: an in-window survivor means no wipe, so the pass deletes i
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(row_count(*f.db, "process_hourly") == 1);
-    CHECK(f.guard.declines["process_hourly"] == 0);
+    CHECK(declines_of(f.guard, "process_hourly") == 0);
 }
 
 TEST_CASE("TAR #2361: a sub-window forward jump is caught by the step check",
@@ -966,13 +985,13 @@ TEST_CASE("TAR #2361: a sub-window forward jump is caught by the step check",
     seed_process_hourly_at(*f.db, later - 60, 1); // survivor at BOTH readings
     run_retention(*f.db, kT0, f.guard);
     REQUIRE(row_count(*f.db, "process_hourly") == 1);
-    REQUIRE(f.guard.declines["process_hourly"] == 0);
+    REQUIRE(declines_of(f.guard, "process_hourly") == 0);
 
     seed_process_hourly_at(*f.db, kT0 - 9 * kHourlyCutoffSec, 5);
     run_retention(*f.db, later, f.guard);
 
     CHECK(row_count(*f.db, "process_hourly") == 6); // nothing deleted
-    CHECK(f.guard.declines["process_hourly"] == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
 TEST_CASE("TAR #2361: an ordinary over-cap backlog does NOT arm the latch",
@@ -989,18 +1008,18 @@ TEST_CASE("TAR #2361: an ordinary over-cap backlog does NOT arm the latch",
 
     run_retention(*f.db, kT0, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == kSurplus + 1); // one cap's worth deleted
-    CHECK(f.guard.declines["process_hourly"] == 0);
+    CHECK(declines_of(f.guard, "process_hourly") == 0);
 
     run_retention(*f.db, kT0 + 1, f.guard); // finish the backlog
     CHECK(row_count(*f.db, "process_hourly") == 1);
-    CHECK(f.guard.declines["process_hourly"] == 0);
+    CHECK(declines_of(f.guard, "process_hourly") == 0);
 
     // Now a real anomaly. An armed latch would let this delete silently.
     REQUIRE(f.db->execute_sql("DELETE FROM process_hourly"));
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 3);
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 3);
-    CHECK(f.guard.declines["process_hourly"] == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
 TEST_CASE("TAR #2361: a disabled source with all-expired rows neither declines nor deletes",
@@ -1018,7 +1037,7 @@ TEST_CASE("TAR #2361: a disabled source with all-expired rows neither declines n
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(row_count(*f.db, "process_hourly") == 20);
-    CHECK(f.guard.declines["process_hourly"] == 0);
+    CHECK(declines_of(f.guard, "process_hourly") == 0);
 }
 
 TEST_CASE("TAR #2361: row-count retention still trims, unguarded, under a bad clock",
@@ -1046,8 +1065,8 @@ TEST_CASE("TAR #2361: row-count retention still trims, unguarded, under a bad cl
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(row_count(*f.db, "netqual_boot") == kBootCeiling);
-    CHECK(f.guard.declines["netqual_boot"] == 0);
-    CHECK(f.guard.latched["netqual_boot"] == false);
+    CHECK(declines_of(f.guard, "netqual_boot") == 0);
+    CHECK(latched_of(f.guard, "netqual_boot") == false);
 }
 
 TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not declined",
@@ -1074,26 +1093,31 @@ TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not decline
 
     run_retention(*f.db, kT0, f.guard);
 
-    CHECK(f.guard.declines["process_hourly"] == 0); // unreadable, not "anomalous"
-    CHECK(f.guard.latched["process_hourly"] == false);
+    CHECK(declines_of(f.guard, "process_hourly") == 0); // unreadable, not "anomalous"
+    CHECK(latched_of(f.guard, "process_hourly") == false);
     // The sweep kept going: tcp_hourly is all-expired, so it declines normally.
-    CHECK(f.guard.declines["tcp_hourly"] == 1);
+    CHECK(declines_of(f.guard, "tcp_hourly") == 1);
     CHECK(row_count(*f.db, "tcp_hourly") == 20);
 }
 
 TEST_CASE("TAR #2361: concurrent rollup passes are race-free when the caller serialises",
           "[tar][retention][clock-guard]") {
     // do_rollup is reachable from two places at once: the 900s `tar.rollup`
-    // trigger and an operator-issued manual `tar rollup`. RetentionGuardState is
-    // plain in-memory maps that run_retention reads and writes WITHOUT holding
-    // db_->mu_ (that mutex only serialises individual statements), so two
-    // concurrent passes would race the latch and the decline counters.
+    // trigger and an operator-issued manual `tar rollup`.
     //
-    // TarPlugin owns `rollup_mu_` for exactly this. TarPlugin itself is not
-    // reachable from a unit test (it is a translation-unit-local class), so this
-    // exercises the same shape the plugin uses and is the TSan target for the
-    // contract: remove the lock_guard below and TSan reports on guard.latched /
-    // guard.declines.
+    // BE PRECISE ABOUT WHAT THIS PROVES. RetentionGuardState now carries its own
+    // mutex, so the raw data race on the maps is gone: removing the lock_guard
+    // below does NOT make TSan report (verified, not assumed). What the caller's
+    // lock still buys is PASS-level atomicity -- each table's probe / decide /
+    // update-latch sequence spans several statements, so two interleaved passes
+    // could both see an unlatched table and both decline it, or both queue a
+    // delete for it. TSan cannot see that; it is a logical race, not a data race.
+    //
+    // So this case is a coherence check under real concurrency, NOT a proof of
+    // the plugin's locking. TarPlugin is translation-unit-local and unreachable
+    // from a test, so `rollup_mu_` itself has no direct coverage. The audit
+    // store's sibling test IS a genuine TSan target, because its latch is a plain
+    // bool guarded only by the store mutex (verified: removing it reports).
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200);
 
@@ -1114,7 +1138,7 @@ TEST_CASE("TAR #2361: concurrent rollup passes are race-free when the caller ser
     // pinned -- what is pinned is that the state stays coherent: the table ends
     // empty and exactly one decline was recorded.
     CHECK(row_count(*f.db, "process_hourly") == 0);
-    CHECK(f.guard.declines["process_hourly"] == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
 TEST_CASE("TAR #2361: retention_sql's SQL text is unchanged (the guard reroutes at the caller)",
@@ -1127,4 +1151,111 @@ TEST_CASE("TAR #2361: retention_sql's SQL text is unchanged (the guard reroutes 
     CHECK(time_based == std::format("DELETE FROM process_hourly WHERE hour_ts < {}",
                                     kT0 - kHourlyCutoffSec));
     CHECK(time_based.find("LIMIT") == std::string::npos);
+}
+
+TEST_CASE("TAR #2361: the clock-step check survives an agent restart",
+          "[tar][retention][clock-guard]") {
+    // The governance finding this pins. The outcome test is defeated by any row
+    // written after the jump -- and `do_rollup` reliably produces one, since
+    // `run_aggregation` runs FIRST and mints rows into the very tables retention
+    // then reads. That leaves the elapsed-time check as the only detector, and
+    // held in memory it compares against zero on the first pass of a process, so
+    // an agent that BOOTS with a wrong RTC would never see a step at all.
+    //
+    // Persisting the reading in tar_config closes it: a fresh guard state (the
+    // agent restarting) still knows when the last pass ran.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // expired
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);                  // survivor
+    run_retention(*f.db, kT0, f.guard);
+    REQUIRE(declines_of(f.guard, "process_hourly") == 0);
+
+    // Agent restarts: brand-new in-memory guard state, same database.
+    yuzu::tar::RetentionGuardState fresh;
+    const int64_t jumped = kT0 + kHourlyCutoffSec + 1;
+    seed_process_hourly_at(*f.db, kT0 - 9 * kHourlyCutoffSec, 5); // expired at the new reading
+    seed_process_hourly_at(*f.db, jumped - 60, 1);                // survivor at the new reading
+
+    run_retention(*f.db, jumped, fresh);
+
+    CHECK(declines_of(fresh, "process_hourly") == 1);
+    CHECK(row_count(*f.db, "process_hourly") == 7); // nothing deleted on the declining pass
+}
+
+TEST_CASE("TAR #2361: an unreadable table re-arms the guard and is counted separately",
+          "[tar][retention][clock-guard]") {
+    // Two contracts in one. (1) A failed probe must RE-ARM the latch, not carry
+    // it: the audit store learned this and the TAR sibling originally did not, so
+    // a table that declined, then failed to read for a while, would delete the
+    // next real anomaly silently. (2) A read failure is NOT a clock anomaly, so
+    // it gets its own counter -- otherwise `retention_guard_declines_total|0`
+    // reports "this endpoint's clock is fine" about a table whose retention has
+    // actually stopped.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, latch set
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(latched_of(f.guard, "process_hourly"));
+
+    // Probes fail for exactly one pass.
+    REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly RENAME TO process_hourly_hidden"));
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(failures_of(f.guard, "process_hourly") == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1); // NOT counted as a clock anomaly
+    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // re-armed
+    REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly_hidden RENAME TO process_hourly"));
+
+    // The same wipe condition, still unresolved: must decline again rather than
+    // delete on a latch spent by the failure.
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+}
+
+TEST_CASE("TAR #2361: the status lines always carry both totals",
+          "[tar][retention][clock-guard]") {
+    // `do_status` lives on a translation-unit-local class and cannot be reached
+    // from a test, so the operator-facing FORMAT is pinned here instead. A zero
+    // declines total is only meaningful alongside a zero failures total: without
+    // the second line, a table whose probes fail every pass reports as a healthy
+    // clock.
+    yuzu::tar::RetentionGuardState g;
+    auto lines = yuzu::tar::format_retention_guard_lines(g);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0] == "retention_guard_declines_total|0");
+    CHECK(lines[1] == "retention_guard_failures_total|0");
+
+    {
+        std::lock_guard lock(g.mu);
+        g.declines["process_hourly"] = 3;
+        g.declines["tcp_hourly"] = 0; // zero entries are not emitted
+        g.failures["module_hourly"] = 2;
+    }
+    lines = yuzu::tar::format_retention_guard_lines(g);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "retention_guard|process_hourly|3");
+    CHECK(lines[1] == "retention_guard_failed|module_hourly|2");
+    CHECK(lines[2] == "retention_guard_declines_total|3");
+    CHECK(lines[3] == "retention_guard_failures_total|2");
+}
+
+TEST_CASE("TAR #2361: every registered granularity declares the ts column its suffix maps to",
+          "[tar][retention][clock-guard][registry]") {
+    // `ts_column_for_suffix` is public API with three consumers now (the DDL's
+    // index, retention_sql's time branch, and this guard) and it falls back to
+    // "ts" for an unknown suffix. A future granularity with a suffix it does not
+    // know -- `weekly`/`week_ts` -- would silently get an index on a column that
+    // does not exist, aborting the warehouse DDL, and a guard that counts a
+    // different column from the one the delete acts on.
+    for (const auto& src : capture_sources()) {
+        for (const auto& g : src.granularities) {
+            const auto ts_col = ts_column_for_suffix(g.suffix);
+            const bool declared =
+                std::any_of(g.columns.begin(), g.columns.end(),
+                            [&](const auto& c) { return c.name == ts_col; });
+            INFO("source=" << src.name << " granularity=" << g.suffix << " ts_col=" << ts_col);
+            CHECK(declared);
+        }
+    }
 }

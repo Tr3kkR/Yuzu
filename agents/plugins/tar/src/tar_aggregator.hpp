@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -116,6 +117,12 @@ inline constexpr int64_t kMaxTarDeletesPerTablePerPass = 5000;
  * exactly that).
  */
 struct RetentionGuardState {
+    /// Guards every member below. Held only for the brief map touches, NEVER
+    /// across a database call -- so `tar status` can read the counters without
+    /// waiting for a whole rollup pass to finish. Serialising the passes
+    /// themselves is a separate obligation the caller still owns (TarPlugin's
+    /// `rollup_mu_`); this mutex does not provide it.
+    mutable std::mutex mu;
     /// "This table already declined for the current anomaly." Keyed by real
     /// table name. Cleared once the wipe condition stops holding.
     std::map<std::string, bool> latched;
@@ -123,11 +130,33 @@ struct RetentionGuardState {
     /// The agent has no /metrics endpoint, so this is the operator's only
     /// fleet-readable signal that an endpoint's clock is wrong.
     std::map<std::string, int64_t> declines;
-    /// The `now_epoch` the previous pass saw, or 0 before the first pass. Zero
-    /// is load-bearing: the elapsed delta is meaningless on the first pass of a
-    /// process and would report the whole Unix epoch as "the clock moved".
+    /// Cumulative COUNT-read failures per table. Kept SEPARATE from `declines`
+    /// for the same reason the audit store separates its two counters: a table
+    /// whose probes fail every pass has silently stopped being retained, and a
+    /// declines-only surface reports that as "this endpoint's clock is fine".
+    std::map<std::string, int64_t> failures;
+    /// The `now_epoch` the previous pass saw, mirrored from the durable
+    /// `retention_guard_last_pass` config row. 0 means no pass has ever run
+    /// against this database, which suppresses the "clock moved Ns" wording.
     int64_t last_pass_now{0};
 };
+
+/// Snapshot of the operator-facing counters, taken under `RetentionGuardState::mu`.
+struct RetentionGuardCounters {
+    std::map<std::string, int64_t> declines;
+    std::map<std::string, int64_t> failures;
+};
+
+[[nodiscard]] RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard);
+
+/// The exact `tar status` lines for the retention guard, in emission order:
+/// a `retention_guard|<table>|<declines>` line per table that has declined, a
+/// `retention_guard_failed|<table>|<failures>` line per table whose probes have
+/// failed, then the always-present totals. Split out from `do_status` purely so
+/// the operator-facing format has a test seam -- `TarPlugin` is a
+/// translation-unit-local class and cannot be reached from a test.
+[[nodiscard]] std::vector<std::string>
+format_retention_guard_lines(const RetentionGuardState& guard);
 
 /**
  * Run retention cleanup for all warehouse tables.
