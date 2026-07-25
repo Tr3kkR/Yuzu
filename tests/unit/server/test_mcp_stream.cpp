@@ -746,6 +746,58 @@ TEST_CASE("McpStreamPump/#2367: a cached answer clears a grace deadline armed du
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
 }
 
+TEST_CASE("RevalidateGrace: the extracted grace state machine, exercised directly (2f PR 3b)",
+          "[mcp][stream][ch4][2f]") {
+    using RG = mcp::RevalidateGrace;
+    using R = mcp::StreamRevalidate;
+    // Deterministic: an injected clock and jitter_max=0. RevalidateGrace seeds
+    // last_authoritative_ok_ to now() at construction, so build it at t0 = epoch.
+    auto at = [](std::int64_t ms) {
+        return std::chrono::steady_clock::time_point{std::chrono::milliseconds(ms)};
+    };
+    std::chrono::steady_clock::time_point clock_now = at(0);
+    auto clock = [&clock_now] { return clock_now; };
+    RG::Config cfg;
+    cfg.grace = std::chrono::milliseconds(1000);
+
+    SECTION("kRevoked is an immediate kill, no grace") {
+        RG grace{cfg, clock};
+        CHECK(grace.on_verdict(R::kRevoked) == RG::Outcome::kCloseCredentialRevoked);
+    }
+
+    SECTION("kIndeterminate rides a bounded grace window, then closes auth_unavailable") {
+        RG grace{cfg, clock};                              // last_authoritative_ok_ = 0
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline armed @1000
+        clock_now = at(1001);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+
+    SECTION("an authoritative kValid clears an armed deadline and re-bases the window (#2367)") {
+        RG grace{cfg, clock};
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @1000
+        CHECK(grace.on_verdict(R::kValid) == RG::Outcome::kContinue);         // clears it, floor=500
+        clock_now = at(1001);                                                // past the OLD deadline
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // new deadline @1500
+        clock_now = at(1600);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+
+    SECTION("a kValidStale cache hit clears the deadline but only advances the floor one window") {
+        cfg.max_staleness = std::chrono::milliseconds(250);
+        RG grace{cfg, clock};
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @1000
+        clock_now = at(2000);
+        CHECK(grace.on_verdict(R::kValidStale) == RG::Outcome::kContinue);    // clears; floor=1750
+        // A fresh outage re-arms from the clamped floor (1750 + 1000 = 2750), not from t0.
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @2750
+        clock_now = at(2751);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+}
+
 TEST_CASE("McpStreamPump: a terminated session ends the stream with its own reason",
           "[mcp][stream]") {
     auto state = std::make_shared<mcp::McpStreamState>();
