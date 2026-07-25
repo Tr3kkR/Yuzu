@@ -292,6 +292,26 @@ public:
     [[nodiscard]] std::uint64_t evicted_without_send_evidence() const noexcept {
         return evicted_without_send_evidence_.load(std::memory_order_relaxed);
     }
+    /// Batches retention evicted whose sent/unsent disposition was never determined - the
+    /// THIRD, mutually-exclusive eviction outcome that makes the per-pass accounting exact:
+    /// batches_pruned == evicted_sent_unacked + evicted_without_send_evidence +
+    /// evicted_unclassified (item 3 / sec-M4, #2298 CC7.2). Its existence is what lets an
+    /// auditor read evicted_without_send_evidence as a trustworthy FLOOR on lost evidence
+    /// rather than a value a mid-pass shutdown could silently shrink.
+    ///
+    /// TWO causes, both "disposition permanently unknown", not "loss" and not "success":
+    ///  - a stop landing after the delete but before/mid classification (the remainder is
+    ///    counted here rather than dropped) - at most ONE such bump per process lifetime,
+    ///    since stopping_ latches;
+    ///  - a sent-label read that itself failed on the scan-failure fallback (an unreadable
+    ///    label is unknown, not absence) - always paired with a same-pass prune_failures
+    ///    increment, and can climb repeatedly.
+    /// In-memory only, resets on restart, like its two siblings. NOTE the shutdown-skip case
+    /// may never reach a final heartbeat before the process exits: this closes IN-PROCESS
+    /// accounting, it is not durable evidence that a skip occurred.
+    [[nodiscard]] std::uint64_t evicted_unclassified() const noexcept {
+        return evicted_unclassified_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::uint64_t write_capacity_rejected() const noexcept {
         return write_capacity_rejected_.load(std::memory_order_relaxed);
     }
@@ -387,6 +407,18 @@ public:
     /// drain worker's read would be a TSan-visible data race).
     void set_post_classify_hook_for_test(std::function<void()> hook) {
         post_classify_hook_ = std::move(hook);
+    }
+
+    /// TEST-ONLY: invoked by prune's EVICTION classifier - once immediately after the delete
+    /// with `classified == 0` (before the shutdown gate), then again after each key is placed
+    /// in a disposition bucket with the running count (1, 2, ...). Exists so a test can land
+    /// request_stop() at an EXACT classification boundary and drive the mid-pass truncation
+    /// remainder-accounting deterministically, and so a hook that THROWS can exercise the
+    /// classification firewall's remainder-accounting (the drain worker cannot make this loop
+    /// throw from outside). Null in production. Set BEFORE any concurrent pass can run - the
+    /// write is unsynchronized, same discipline as the pre/post_scan hooks.
+    void set_prune_classify_hook_for_test(std::function<void(std::size_t classified)> hook) {
+        prune_classify_hook_ = std::move(hook);
     }
 
     /// TEST-ONLY: force the next `n` journal SCANS (the keys-only scan at the head of a prune
@@ -516,6 +548,7 @@ private:
     std::atomic<std::uint64_t> sent_labels_written_{0}; ///< sent-labels written (best-effort)
     std::atomic<std::uint64_t> evicted_sent_unacked_{0};          ///< aged out WITH a sent-label
     std::atomic<std::uint64_t> evicted_without_send_evidence_{0}; ///< aged out with NO sent-label (alert)
+    std::atomic<std::uint64_t> evicted_unclassified_{0};          ///< aged out, disposition unknown (item 3)
     std::atomic<std::uint64_t> write_capacity_rejected_{0};       ///< new batch refused: journal at cap (UP-1)
     std::atomic<std::uint64_t> quarantine_capacity_evicted_{0};   ///< over-cap quarantined batches shed (UP-7)
     // Size gauges are SIGNED running counters (#2303 gauge-race fix): persist fetch_adds,
@@ -530,6 +563,7 @@ private:
     std::function<void()> post_scan_hook_;              ///< test-only prune interleaving seam (null in prod)
     std::function<void()> pre_scan_hook_;               ///< test-only pre-scan interleaving seam (UP-3)
     std::function<void()> post_classify_hook_;          ///< test-only per-candidate seam (mid-loop stop, null in prod)
+    std::function<void(std::size_t)> prune_classify_hook_; ///< test-only eviction-classify seam (indexed; null in prod)
     std::atomic<int> inject_fail_writes_{0};            ///< test-only forced-failure countdown
     std::atomic<int> inject_skip_writes_{0};            ///< test-only: skip this many writes before failing
     std::atomic<int> inject_fail_reads_{0};             ///< test-only: force the next N prune scans to fail

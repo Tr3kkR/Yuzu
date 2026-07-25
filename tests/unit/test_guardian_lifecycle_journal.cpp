@@ -17,6 +17,7 @@
 #include <chrono>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -472,13 +473,18 @@ TEST_CASE("eviction classification falls back to a per-key read when the label s
     CHECK(j.evicted_without_send_evidence() == 1); // and correctly found none for r2
 }
 
-TEST_CASE("eviction classification: an UNREADABLE sent-label counts NEITHER outcome",
+TEST_CASE("eviction classification: an UNREADABLE sent-label counts as UNCLASSIFIED, not loss",
           "[guardian][journal][prune]") {
     // The fallback has to be the FALLIBLE per-key read. exists() answers false for both
     // "absent" and "the read failed", and the per-key read fails for exactly the reason the
     // scan just did - one broken database, not one broken key - so an exists()-based fallback
     // would report every evicted batch as "no send evidence", which is the reading an operator
     // is meant to treat as audit loss. Unknown is not evidence of absence.
+    //
+    // Item 3 changed the DESTINATION of an unreadable key: it used to land in NO counter (so
+    // batches_pruned silently exceeded the classified sum). It now lands in evicted_unclassified
+    // - a real third bucket - so pruned == the three summed holds exactly, and the read failure
+    // is still counted once in prune_failures.
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
@@ -497,7 +503,150 @@ TEST_CASE("eviction classification: an UNREADABLE sent-label counts NEITHER outc
     CHECK(j.batches_pruned() == 1);
     CHECK(j.evicted_sent_unacked() == 0);
     CHECK(j.evicted_without_send_evidence() == 0); // NOT reported as lost evidence
-    CHECK(j.prune_failures() >= 1);                // counted instead - once, not per key
+    CHECK(j.evicted_unclassified() == 1);          // unknown disposition - the third bucket
+    CHECK(j.prune_failures() == 1);                // counted once per pass, not per key
+    // The exact three-way invariant: every evicted batch is in exactly one bucket.
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
+}
+
+// ── Item 3 / sec-M4: the shutdown-classification undercount, closed via the exact
+//    three-way invariant  pruned == sent_unacked + no_send_evidence + unclassified ──
+
+namespace {
+// Persist `n` distinct single-record batches (r1..rn), each an "armed" record, and return
+// their batch keys in key order. A count cap of 0 then makes prune(0) evict them all.
+std::vector<std::string> persist_n_unmarked(GuardianLifecycleJournal& j, TestKv& t, int n) {
+    for (int i = 1; i <= n; ++i)
+        REQUIRE(persist_all(j, one("r" + std::to_string(i), "armed")) == 1);
+    auto rows = t.kv->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    std::vector<std::string> keys;
+    for (const auto& r : *rows)
+        keys.push_back(r.key);
+    return keys;
+}
+} // namespace
+
+TEST_CASE("eviction classification: a stop BEFORE classification counts the whole set unclassified",
+          "[guardian][journal][prune]") {
+    // The design-doc undercount (item 3): a stop landing after the delete but before the
+    // sent/unsent split used to leave the evicted keys in NO bucket, so an auditor read a
+    // SMALLER gap than occurred. They must now all land in evicted_unclassified, and the
+    // sent-label scan must be skipped entirely (the pre-gate branch).
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    auto keys = persist_n_unmarked(j, t, 3);
+    j.mark_batch_sent(keys.front()); // one carries a real sent-label
+
+    std::vector<std::size_t> hook_args;
+    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
+        hook_args.push_back(classified);
+        if (classified == 0) // the pre-gate call, immediately after the delete
+            j.request_stop();
+    });
+
+    const auto stats = j.prune(0);
+
+    CHECK(stats.evicted == 3);
+    CHECK(j.batches_pruned() == 3);
+    CHECK(j.evicted_unclassified() == 3);
+    CHECK(j.evicted_sent_unacked() == 0);          // the labelled batch was NOT credited
+    CHECK(j.evicted_without_send_evidence() == 0);
+    // The hook fired exactly once (pre-gate), proving the per-candidate scan was skipped.
+    CHECK(hook_args == std::vector<std::size_t>{0});
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
+}
+
+TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts the remainder",
+          "[guardian][journal][prune]") {
+    // The per-key stop gate is kept on the in-memory (scan-OK) path too, not only the
+    // fallback: a stop lands after one classification, and the remaining two are counted as
+    // unclassified rather than dropped. Removing the gate would classify all three and leave
+    // unclassified at 0 - the mutation this test pins.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // all unlabelled -> each classifies as no_send_evidence
+
+    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
+        if (classified == 1) // after the first key is bucketed
+            j.request_stop();
+    });
+
+    const auto stats = j.prune(0);
+
+    CHECK(stats.evicted == 3);
+    CHECK(j.batches_pruned() == 3);
+    CHECK(j.evicted_without_send_evidence() == 1); // the one classified before the stop
+    CHECK(j.evicted_sent_unacked() == 0);
+    CHECK(j.evicted_unclassified() == 2);          // the counted remainder
+    CHECK(j.prune_failures() == 0);                // scan succeeded - no read failure
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
+}
+
+TEST_CASE("eviction classification: a stop MID-loop on the FALLBACK path counts the remainder",
+          "[guardian][journal][prune]") {
+    // Same remainder-accounting on the scan-FAILURE fallback path. The sent-label scan fails
+    // (forcing per-key reads), the per-key reads themselves succeed, and a stop after one
+    // classification leaves the remaining two in unclassified.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3);
+    j.inject_prune_sent_scan_failures_for_test(1); // take the fallback; per-key reads still work
+
+    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
+        if (classified == 1)
+            j.request_stop();
+    });
+
+    const auto stats = j.prune(0);
+
+    CHECK(stats.evicted == 3);
+    CHECK(j.batches_pruned() == 3);
+    CHECK(j.evicted_without_send_evidence() == 1);
+    CHECK(j.evicted_unclassified() == 2);
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
+}
+
+TEST_CASE("eviction classification: a THROW mid-classification accounts the remainder, then rethrows",
+          "[guardian][journal][prune]") {
+    // The exact invariant must survive a throwing pass (bad_alloc under memory pressure in the
+    // set build or a per-key string transform). batches_pruned advances right after the delete,
+    // so a throw between there and full classification would otherwise leave the remainder in no
+    // bucket. The classifier's try/catch accounts the remainder as unclassified, then rethrows
+    // to the caller's firewall. The throwing hook stands in for the arbitrary throw.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3);
+
+    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
+        if (classified == 1) // one key already bucketed; throw before the rest
+            throw std::runtime_error("classification boom");
+    });
+
+    CHECK_THROWS_AS(j.prune(0), std::runtime_error); // the rethrow reaches the caller
+
+    CHECK(j.batches_pruned() == 3);
+    CHECK(j.evicted_without_send_evidence() == 1); // the one classified before the throw
+    CHECK(j.evicted_unclassified() == 2);          // the remainder, accounted by the catch
+    CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
+              j.evicted_unclassified() ==
+          j.batches_pruned());
 }
 
 // ── Fault-injection + capacity hardening (governance Gate 7) ──────────────────

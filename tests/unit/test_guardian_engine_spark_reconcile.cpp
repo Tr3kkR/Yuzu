@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -672,6 +673,53 @@ TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertnes
     std::map<std::string, std::string> tags;
     yuzu::agent::emit_guardian_journal_heartbeat_tags(tags, engine.journal_stats());
     CHECK(tags.empty());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("journal_stats() surfaces evicted_unclassified from the engine's real journal",
+          "[spark][guardian][reconcile][journal]") {
+    // The one plumbing seam the fleet-tags sizeof static_assert cannot cover: the
+    // GuardianEngine::journal_stats() assignment that copies the journal's counter into the
+    // struct. Every other test reads the journal accessor or builds GuardianJournalStats
+    // directly, so a dropped assignment there leaves them all green while the sparse emitter
+    // ships field 0 -> the fleet gauge is permanently ABSENT, reading as "nothing to report".
+    // This drives the engine's OWN journal to one unclassified eviction and asserts it arrives
+    // through journal_stats(). Deleting the assignment turns this red (item 3, consult gap 1).
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    // Wiring the spark path is what constructs the lifecycle journal (prefer_spark=false only
+    // gates the drain worker's start, not the journal), so journal_stats() has a real source.
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+
+    auto* journal = engine.lifecycle_journal_for_test();
+    REQUIRE(journal != nullptr);
+    journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0,
+                                           /*max_bytes=*/std::numeric_limits<std::size_t>::max(),
+                                           /*max_quarantine=*/100); // count cap 0 -> evict all
+    const std::vector<std::shared_ptr<const yuzu::agent::JournalRecord>> pending{
+        std::make_shared<const yuzu::agent::JournalRecord>(yuzu::agent::JournalRecord{
+            .rule_id = "r1", .generation = 1, .event_id = "e1", .enqueued_ns = 1,
+            .kind = "armed", .guard_type = "file", .rule_name = "n"})};
+    REQUIRE(journal->persist(pending, nullptr, yuzu::agent::kJournalPersistUnbounded,
+                             yuzu::agent::kJournalPersistUnbounded) == 1);
+    // A correlated scan+read failure makes the single evicted batch land in unclassified.
+    journal->inject_prune_sent_scan_failures_for_test(1);
+    journal->inject_prune_sent_read_failures_for_test(5);
+    REQUIRE(journal->prune(0).evicted == 1);
+    REQUIRE(journal->evicted_unclassified() == 1);
+
+    CHECK(engine.journal_stats().evicted_unclassified == 1); // the assignment under test
 
     engine.stop();
     spark_engine.stop();
