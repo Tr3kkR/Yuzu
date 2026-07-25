@@ -176,6 +176,19 @@ public:
         return cleanup_failed_.load(std::memory_order_relaxed);
     }
 
+    /// Cumulative rows deleted by retention, and the number of passes that hit
+    /// the per-pass cap. The cap is what turns an allowed wipe into a paced
+    /// ageing-out, but it introduces its own failure: if it binds on every pass
+    /// for a sustained period, expiry is outrunning the drain and `audit.db`
+    /// grows without bound. Neither the skip counter nor the failure counter
+    /// moves in that state, so without this pair it is invisible on /metrics.
+    uint64_t rows_deleted_count() const noexcept {
+        return rows_deleted_.load(std::memory_order_relaxed);
+    }
+    uint64_t cap_reached_count() const noexcept {
+        return cap_reached_.load(std::memory_order_relaxed);
+    }
+
     /// Run exactly ONE retention pass against `now` (epoch seconds) and return
     /// the number of rows deleted. Returns 0 when the pass declined (clock
     /// guard), when nothing was expired, or when the pass failed.
@@ -210,19 +223,27 @@ private:
     // inside cleanup_once()'s exclusive lock.
     std::atomic<uint64_t> clock_anomaly_skips_{0};
     std::atomic<uint64_t> cleanup_failed_{0};
+    std::atomic<uint64_t> rows_deleted_{0};
+    std::atomic<uint64_t> cap_reached_{0};
     // Guard state for cleanup_once(). Plain (non-atomic) members: both are read
     // and written only under the exclusive mtx_ that cleanup_once() holds for
     // the whole pass, and no accessor exposes them.
     //
     // `clock_anomaly_latched_` makes the decline fire ONCE per anomaly rather
     // than every pass - a store whose datable rows are all genuinely expired
-    // would otherwise never age out anything at all.
+    // would otherwise never age out anything at all. Deliberately NOT persisted:
+    // re-declining once after a restart is the safe direction.
     bool clock_anomaly_latched_{false};
-    // Wall-clock reading the previous pass saw, or 0 before the first pass.
-    // Zero is load-bearing: the elapsed delta is meaningless on the first pass
-    // of a process, and logging it would print the whole Unix epoch as "the
-    // clock moved" in exactly the restarted-server case this guard exists for.
+    // Wall-clock reading the previous pass saw, or 0 if no pass has ever run
+    // against this database. PERSISTED in `audit_retention_meta` and reloaded at
+    // construction, because the elapsed-time check is the only half of this
+    // guard that still works once a write has landed after the clock moved - and
+    // held in memory alone it compares against zero on the first pass of a
+    // process, so a server that BOOTS with an already-wrong clock would never
+    // see a step at all. Zero still means "no comparison point", which
+    // suppresses the "clock moved Ns" wording (it would print the Unix epoch).
     std::int64_t last_pass_now_{0};
+    static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else
@@ -231,6 +252,17 @@ private:
 #endif
 
     void create_tables();
+    /// Build `idx_audit_ttl_id` best-effort, OUTSIDE the migration runner. See
+    /// the definition for why it must not be a Migration entry.
+    void ensure_retention_index();
+    /// Durable guard state in `audit_retention_meta`. `load_meta` returns 0 for
+    /// an absent key or any read error (indistinguishable, and both correctly
+    /// mean "no comparison point"). Caller holds `mtx_` for `store_meta`.
+    std::int64_t load_meta(const char* key) const;
+    bool store_meta(const char* key, std::int64_t value);
+    /// The accepted, capped delete. Caller holds `mtx_`. On failure returns 0
+    /// and sets `out_err`; the caller logs it after releasing the lock.
+    std::size_t delete_capped_locked(std::int64_t now, bool would_wipe, std::string& out_err);
 #ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
 #else

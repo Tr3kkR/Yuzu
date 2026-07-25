@@ -980,6 +980,18 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that failed on a SQLite error", "counter");
+        // The cap that makes an allowed wipe pace out introduces its own failure
+        // mode: if it binds on EVERY pass for a sustained period, expiry is
+        // outrunning the drain and audit.db grows without bound. Neither counter
+        // above moves in that state, so this pair is the only way it is visible.
+        // Counted rather than measured with a COUNT(*) backlog gauge on purpose
+        // -- that query would scan under the same lock every audit write takes.
+        metrics_.describe("yuzu_server_audit_rows_deleted_total",
+                          "Audit rows deleted by retention", "counter");
+        metrics_.describe("yuzu_server_audit_retention_cap_reached_total",
+                          "Audit retention passes that hit the per-pass delete cap, leaving a "
+                          "backlog for the next pass",
+                          "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
         // Increments in the token-create handlers (api_token, device_token)
         // when `secure_random::fill_random` returns prng_failure (entropy
@@ -3809,6 +3821,10 @@ public:
                         .set(static_cast<double>(audit_store_->clock_anomaly_skips_count()));
                     metrics_.gauge("yuzu_server_audit_cleanup_failed_total")
                         .set(static_cast<double>(audit_store_->cleanup_failed_count()));
+                    metrics_.gauge("yuzu_server_audit_rows_deleted_total")
+                        .set(static_cast<double>(audit_store_->rows_deleted_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_cap_reached_total")
+                        .set(static_cast<double>(audit_store_->cap_reached_count()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore

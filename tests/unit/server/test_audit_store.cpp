@@ -767,3 +767,79 @@ TEST_CASE("AuditStore #2360: cleanup passes race-free against concurrent writers
     CHECK(f.store.total_count() > 0);
     CHECK(f.store.cleanup_failed_count() == 0);
 }
+
+TEST_CASE("AuditStore #2360: the clock-step check survives a restart",
+          "[audit_store][retention][clock-guard]") {
+    // The governance finding this pins. The outcome test is defeated by ANY
+    // write landing after the clock moves -- a fresh row is a datable survivor,
+    // so `would_wipe` goes false -- which on a serving server is the common case.
+    // That leaves the elapsed-time check as the only detector, and held in
+    // memory alone it compares against zero on the first pass of a process, so a
+    // server that BOOTS with an already-wrong clock never sees a step at all.
+    // That is the dead-CMOS / restored-snapshot case the guard exists for.
+    //
+    // Persisting the reading closes it: a fresh AuditStore over the same file
+    // still knows when the last pass ran.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-restart-"}};
+
+    {
+        AuditStore first(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(first.is_open());
+        seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+        seed_rows_with_ttl(tmp.path, kNow + kWindow, 1); // survivor: no `would_wipe`
+        REQUIRE(first.cleanup_once(kNow) == 5);
+        REQUIRE(first.clock_anomaly_skips_count() == 0);
+    }
+
+    // Process restarts. The clock is now more than a whole retention window
+    // ahead, and a write has already landed at the new time -- so the outcome
+    // test cannot see anything wrong.
+    AuditStore second(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(second.is_open());
+    const std::int64_t jumped = kNow + kWindow + 1;
+    seed_rows_with_ttl(tmp.path, kNow + 10, 5);       // expired at the new reading
+    seed_rows_with_ttl(tmp.path, jumped + 3'600, 1);  // survivor at the new reading
+
+    CHECK(second.cleanup_once(jumped) == 0);
+    CHECK(second.clock_anomaly_skips_count() == 1);
+    CHECK(second.total_count() == 7); // nothing deleted on the declining pass
+}
+
+TEST_CASE("AuditStore #2360: a closed store counts a failed pass, not silence",
+          "[audit_store][retention][clock-guard]") {
+    // A store that never opened, or whose migration failed and closed it, has
+    // stopped retaining permanently. If that returned 0 without counting, both
+    // counters would sit at zero forever and an ever-growing audit.db would read
+    // as a healthy guard -- the exact confusion the second counter exists to
+    // prevent.
+    yuzu::test::TempDbFile dir{std::string_view{"audit-clockguard-closed-"}};
+    std::filesystem::create_directories(dir.path); // a directory is not openable
+    AuditStore store(dir.path / "nested" / "audit.db", kGuardRetentionDays,
+                     /*cleanup_interval_min=*/0);
+    REQUIRE_FALSE(store.is_open());
+
+    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.cleanup_failed_count() == 1);
+    CHECK(store.clock_anomaly_skips_count() == 0);
+}
+
+TEST_CASE("AuditStore #2360: a cap-bound pass is counted, not just logged",
+          "[audit_store][retention][clock-guard]") {
+    // The cap converts an allowed wipe into a paced drain, but it introduces its
+    // own failure: if it binds on every pass, expiry outruns the drain and
+    // audit.db grows without bound. Neither the skip counter nor the failure
+    // counter moves in that state.
+    constexpr std::size_t kSurplus = 7;
+    GuardFixture f;
+    f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
+    f.seed(kNow + kWindow, 1);
+
+    CHECK(f.store.cleanup_once(kNow) == kMaxAuditDeletesPerPass);
+    CHECK(f.store.cap_reached_count() == 1);
+    CHECK(f.store.rows_deleted_count() == kMaxAuditDeletesPerPass);
+
+    // The pass that clears the backlog does NOT count as cap-reached.
+    CHECK(f.store.cleanup_once(kNow + 1) == kSurplus);
+    CHECK(f.store.cap_reached_count() == 1);
+    CHECK(f.store.rows_deleted_count() == kMaxAuditDeletesPerPass + kSurplus);
+}
