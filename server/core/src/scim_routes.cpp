@@ -595,8 +595,21 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
     }
 
     // Step 3: resolve the role from CURRENT group membership.
+    //
+    // ★ SECURITY (2026-07-25 review, HIGH #3): an UNDETERMINED membership read
+    // is not "member of no groups". Resolving nullopt as an empty set would
+    // demote a SCIM-provisioned admin to `user` on a momentary store blip —
+    // the same fail-open shape step 4 below already refuses for the current
+    // role. Decline the recompute instead; the next Group mutation or User
+    // reprovision recomputes it (Model A stays eventually-authoritative).
     auto groups = scim_store->list_group_display_names_for_user(user_scim_id);
-    auth::Role resolved = auth::resolve_role_from_groups(groups, scim_admin_group);
+    if (!groups.has_value()) {
+        spdlog::warn("SCIM: recompute_scim_user_role — could not determine current group "
+                     "membership for '{}' (scim_id={}); declining to recompute (fail-closed)",
+                     resource->username, user_scim_id);
+        return;
+    }
+    auth::Role resolved = auth::resolve_role_from_groups(*groups, scim_admin_group);
 
     // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
     // posture, matching db_authoritative_role's every other caller).
@@ -1753,8 +1766,16 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     record_request(auth_mgr, "group_get", 404);
                     return;
                 }
+                // Fail closed: rendering an undetermined membership as an
+                // empty `members[]` tells the IdP the group is empty, and a
+                // reconciling connector may then "restore" that emptiness.
                 auto members = scim_store->list_group_member_user_scim_ids(id);
-                res.set_content(scim::group_to_json(*group, members, groups_location_base(req),
+                if (!members.has_value()) {
+                    send_scim_error(res, 503, "membership unavailable");
+                    record_request(auth_mgr, "group_get", 503);
+                    return;
+                }
+                res.set_content(scim::group_to_json(*group, *members, groups_location_base(req),
                                                     location_base(req))
                                     .dump(),
                                 kScimJson);
@@ -1808,7 +1829,12 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     int total = 0;
                     if (auto group = scim_store->get_group_by_display_name(*filter_name)) {
                         auto members = scim_store->list_group_member_user_scim_ids(group->scim_id);
-                        resources.push_back(scim::group_to_json(*group, members, gbase, ubase));
+                        if (!members.has_value()) { // fail closed, never "empty group"
+                            send_scim_error(res, 503, "membership unavailable");
+                            record_request(auth_mgr, "group_list", 503);
+                            return;
+                        }
+                        resources.push_back(scim::group_to_json(*group, *members, gbase, ubase));
                         total = 1;
                     }
                     res.set_content(
@@ -1826,7 +1852,12 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 resources.reserve(page.size());
                 for (const auto& g : page) {
                     auto members = scim_store->list_group_member_user_scim_ids(g.scim_id);
-                    resources.push_back(scim::group_to_json(g, members, gbase, ubase));
+                    if (!members.has_value()) { // fail closed, never "empty group"
+                        send_scim_error(res, 503, "membership unavailable");
+                        record_request(auth_mgr, "group_list", 503);
+                        return;
+                    }
+                    resources.push_back(scim::group_to_json(g, *members, gbase, ubase));
                 }
                 res.set_content(scim::list_response(resources, total, start_index,
                                                     static_cast<int>(resources.size()))
@@ -1935,7 +1966,29 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     // below can cover the union of old+new (a PUT replace can
                     // both add and remove members in the same call — spec
                     // trigger (a), "for PUT also the REMOVED members").
-                    auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                    //
+                    // ★ Fail closed on an undetermined snapshot (2026-07-25
+                    // review, HIGH #3) — BEFORE the write, not after. The
+                    // replace itself uses `input.member_values`, so an empty
+                    // `old_members` does not corrupt the stored set here; what
+                    // it silently drops is the recompute fan-out over REMOVED
+                    // members, leaving a just-demoted operator holding
+                    // `role=admin` until some later mutation happens to touch
+                    // them. Refusing the whole PUT is the safe outcome: the
+                    // IdP retries, and no partial state is written.
+                    auto old_members_read = scim_store->list_group_member_user_scim_ids(id);
+                    if (!old_members_read.has_value()) {
+                        spdlog::error("ScimRoutes: PUT Groups — could not snapshot current "
+                                     "membership for group scim_id={}; refusing the replace "
+                                     "(fail-closed, role recompute would be incomplete)",
+                                     id);
+                        send_scim_error(res, 503, "membership unavailable");
+                        audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
+                             "membership snapshot unavailable", "Group");
+                        record_request(auth_mgr, "group_replace", 503);
+                        return;
+                    }
+                    const std::vector<std::string>& old_members = *old_members_read;
                     new_members = resolve_member_values(scim_store, input.member_values);
 
                     // #2127 review MEDIUM fix: persist the rename AND the
@@ -2071,7 +2124,33 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // CURRENT membership (raw ids, not yet resolved against
                       // live Users) — see fold_group_member_ops's doc comment
                       // for why order matters ([HIGH] finding #1).
-                      auto old_members = scim_store->list_group_member_user_scim_ids(id);
+                      //
+                      // ★ SECURITY (2026-07-25 review, HIGH #3) — THE durable
+                      // data-loss path, and the reason this read had to become
+                      // a tri-state. PATCH folds its ops onto the CURRENT
+                      // membership and then persists the whole folded set via
+                      // `replace_group_and_members`. When the read failed open
+                      // as an empty vector, a momentary pool-lease timeout made
+                      // the fold start from "this group has no members", and
+                      // the replace below COMMITTED that emptiness — one blip
+                      // silently and permanently wiped a group's entire
+                      // membership, and (via the recompute) every admin role
+                      // that membership conferred. Refuse the PATCH instead:
+                      // nothing is written, and the IdP's retry succeeds.
+                      auto old_members_read = scim_store->list_group_member_user_scim_ids(id);
+                      if (!old_members_read.has_value()) {
+                          spdlog::error("ScimRoutes: PATCH Groups — could not read current "
+                                       "membership for group scim_id={}; refusing the patch "
+                                       "(fail-closed, folding onto an empty set would delete "
+                                       "the real membership)",
+                                       id);
+                          send_scim_error(res, 503, "membership unavailable");
+                          audit(auth_mgr, audit_store, req, "scim.group.updated", "failure", id,
+                               "membership read unavailable", "Group");
+                          record_request(auth_mgr, "group_patch", 503);
+                          return;
+                      }
+                      const std::vector<std::string>& old_members = *old_members_read;
                       auto final_members_raw =
                           fold_group_member_ops(old_members, patch.member_ops);
 
@@ -2209,7 +2288,30 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        // scim_group_members rows alongside the group
                        // (ScimStore::delete_group's doc comment) — these are
                        // the users who lose this group.
-                       auto former_members = scim_store->list_group_member_user_scim_ids(id);
+                       //
+                       // ★ Fail closed BEFORE the delete (2026-07-25 review,
+                       // HIGH #3). Deleting the admin group is exactly when the
+                       // recompute matters most: every member must be demoted.
+                       // An undetermined snapshot read as "no members" would
+                       // tear the group down and demote nobody, leaving the
+                       // whole former membership holding `role=admin` with no
+                       // group left to justify it and no later mutation that
+                       // would ever revisit them.
+                       auto former_members_read =
+                           scim_store->list_group_member_user_scim_ids(id);
+                       if (!former_members_read.has_value()) {
+                           spdlog::error("ScimRoutes: DELETE Groups — could not snapshot "
+                                        "membership for group scim_id={}; refusing the delete "
+                                        "(fail-closed, members would keep a role this group "
+                                        "conferred)",
+                                        id);
+                           send_scim_error(res, 503, "membership unavailable");
+                           audit(auth_mgr, audit_store, req, "scim.group.deleted", "failure", id,
+                                "membership snapshot unavailable", "Group");
+                           record_request(auth_mgr, "group_delete", 503);
+                           return;
+                       }
+                       const std::vector<std::string>& former_members = *former_members_read;
 
                        auto delete_result = scim_store->delete_group(id);
                        if (!delete_result.has_value()) {

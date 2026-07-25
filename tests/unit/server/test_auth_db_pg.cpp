@@ -87,6 +87,19 @@ void corrupt_secret(PGconn* conn, const std::string& username) {
     REQUIRE(res.ok());
 }
 
+// NULL the secret while LEAVING `mfa_enrolled_at` set — the row state the
+// 2026-07-25 review reproduced against live PG (HIGH #1). Distinct from
+// corrupt_secret above: there the blob is present but undecryptable; here the
+// column is absent entirely, which took a different (and, until the fix, a
+// silently-wrong) branch in mfa_verify_login_code.
+void null_secret_keep_enrolled(PGconn* conn, const std::string& username) {
+    const char* values[] = {username.c_str()};
+    PgResult res{PQexecParams(conn,
+                              "UPDATE auth.users SET mfa_totp_secret = NULL WHERE username = $1",
+                              1, nullptr, values, nullptr, nullptr, 0)};
+    REQUIRE(res.ok());
+}
+
 std::string read_secret_hex(PGconn* conn, const std::string& username) {
     const char* values[] = {username.c_str()};
     PgResult res{PQexecParams(conn, "SELECT encode(mfa_totp_secret,'hex') FROM auth.users WHERE username = $1",
@@ -617,6 +630,117 @@ TEST_CASE("AuthDB MFA fail-closed: corrupted ENROLLED secret -> SecretUnavailabl
     auto login = h.db.mfa_verify_login_code("corrupt1", "123456");
     REQUIRE_FALSE(login.has_value());
     CHECK(login.error() == AuthDBError::SecretUnavailable);
+}
+
+// ── 2026-07-25 review regressions (HIGH #1 / HIGH #2) ────────────────────────
+//
+// Both of these row states were previously graded as ordinary business
+// outcomes ("wrong code" / "no secret"), which is what let a broken second
+// factor look like a user typo and a store outage look like a fresh
+// enrollment. They are asserted separately from the corrupted-blob cases
+// above because they take different branches.
+
+TEST_CASE("AuthDB MFA fail-closed: ENROLLED but NULL secret is SecretUnavailable, never a "
+          "silent 'wrong code'",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("nullsec1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto init = h.db.mfa_init_enrollment("nullsec1", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw_secret.has_value());
+    auto secret_view =
+        std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
+    auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
+    REQUIRE(h.db.mfa_verify_enrollment("nullsec1", yuzu::server::mfa::generate(secret_view, counter))
+                .has_value());
+
+    null_secret_keep_enrolled(h.conn.get(), "nullsec1");
+
+    // mfa_status graded this correctly all along...
+    auto status = h.db.mfa_status("nullsec1");
+    REQUIRE_FALSE(status.has_value());
+    CHECK(status.error() == AuthDBError::SecretUnavailable);
+
+    // ...but mfa_verify_login_code folded it into `false`, i.e. "wrong code",
+    // so every login attempt failed with no signal that the second factor had
+    // become unreadable. It must now agree with mfa_status.
+    auto login = h.db.mfa_verify_login_code("nullsec1", "123456");
+    REQUIRE_FALSE(login.has_value());
+    CHECK(login.error() == AuthDBError::SecretUnavailable);
+    CHECK(yuzu::server::is_store_unavailable(login.error()));
+}
+
+// Inject a statement-level failure that hits ONLY `load_mfa_row`. Its SELECT
+// is the sole MFA read that touches `mfa_last_counter`, so dropping that
+// column leaves `mfa_status` (which runs first in both call sites below)
+// working while load_mfa_row's statement comes back non-PGRES_TUPLES_OK —
+// exactly the outage shape HIGH #2 says used to be indistinguishable from
+// "this user has no secret". Each test gets its own cloned DB, so the DDL is
+// contained.
+void break_load_mfa_row_only(PGconn* conn) {
+    PgResult res{PQexec(conn, "ALTER TABLE auth.users DROP COLUMN mfa_last_counter")};
+    REQUIRE(res.ok());
+}
+
+TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read is not 'no secret' — init refuses to "
+          "mint over a live provisional secret",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("qfail1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto init = h.db.mfa_init_enrollment("qfail1", "Yuzu");
+    REQUIRE(init.has_value());
+    auto before_hex = read_secret_hex(h.conn.get(), "qfail1");
+    REQUIRE_FALSE(before_hex.empty());
+
+    break_load_mfa_row_only(h.conn.get());
+
+    // Before the fix the failed statement returned the same empty answer as
+    // "no provisional secret", and this call minted a FRESH secret over the
+    // live one — silently invalidating a QR the operator had already scanned.
+    auto reinit = h.db.mfa_init_enrollment("qfail1", "Yuzu");
+    REQUIRE_FALSE(reinit.has_value());
+    CHECK(reinit.error() == AuthDBError::WriteFailed);
+    CHECK(yuzu::server::is_store_unavailable(reinit.error()));
+
+    // The decisive assertion: the stored bytes are untouched.
+    CHECK(read_secret_hex(h.conn.get(), "qfail1") == before_hex);
+}
+
+TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read surfaces as a store outage, not "
+          "UserNotFound",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("qfail2", "h", "s", yuzu::server::auth::Role::user).has_value());
+    REQUIRE(h.db.mfa_init_enrollment("qfail2", "Yuzu").has_value());
+
+    break_load_mfa_row_only(h.conn.get());
+
+    // A 404-shaped UserNotFound would tell the caller "enroll first" and burn
+    // the in-progress enrollment; the caller needs a 503-shaped retry.
+    auto verify = h.db.mfa_verify_enrollment("qfail2", "123456");
+    REQUIRE_FALSE(verify.has_value());
+    CHECK(verify.error() == AuthDBError::QueryFailed);
+    CHECK(yuzu::server::is_store_unavailable(verify.error()));
+}
+
+TEST_CASE("AuthDB MFA: a genuinely NOT-enrolled user still verifies as a plain false",
+          "[pg][auth_db][secrets]") {
+    // Guard against over-correcting HIGH #1: only the ENROLLED-with-no-secret
+    // state is SecretUnavailable. A user who never enrolled must stay an
+    // ordinary `false`, or every non-MFA login would start 503-ing.
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("noenroll", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto login = h.db.mfa_verify_login_code("noenroll", "123456");
+    REQUIRE(login.has_value());
+    CHECK(*login == false);
 }
 
 TEST_CASE("AuthDB MFA fail-closed: mfa_init_enrollment never mints a fresh secret over a "

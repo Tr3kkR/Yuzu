@@ -788,6 +788,15 @@ public:
                           "Cooldown entries evicted at the capacity bound", "counter");
         metrics_.describe("yuzu_server_dex_alert_routed_types",
                           "Number of obs_types currently routed to alerts", "gauge");
+        // ADR-0010 §Decision 3. Carried in the gauge family because the
+        // authoritative cumulative count lives in SecretCodec and is exported
+        // pull-model at scrape time, but it IS a monotonic counter — declared
+        // as one here so the scrape emits `# TYPE ... counter` and the `_total`
+        // suffix matches docs/observability-conventions.md.
+        metrics_.describe("yuzu_server_secret_decrypt_failures_total",
+                          "Envelope-encrypted secret decrypt failures by store and failure class "
+                          "(tamper, unresolvable KEK, malformed blob)",
+                          "counter");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -2260,6 +2269,49 @@ public:
             // both initialised; that ordering is fixed here.
             if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
                 fleet_topology_store_->set_audit_store(audit_store_.get());
+
+            // ── ADR-0010 §Decision 3 evidence surface ────────────────────
+            //
+            // This PR is SecretCodec's FIRST production consumer, and
+            // ADR-0010 puts the observability wiring on "the per-store
+            // migration PRs" — i.e. here. Without it the codec's KEK
+            // lifecycle verbs (`kek.generated`/`kek.rotated`/`kek.retired`)
+            // and, most importantly, `secret.decrypt_failure` — the tamper /
+            // wrong-KEK / corrupt-blob signal — are computed and then
+            // discarded, so a fleet could be failing every MFA decrypt with
+            // nothing in the audit log to say so. (Flagged by the 2026-07-25
+            // review, HIGH #4: `set_audit_hook` was called only from tests.)
+            //
+            // Wired HERE rather than at the codec's construction above
+            // because `audit_store_` does not exist yet at that point.
+            //
+            // Lifetime: the lambda captures `this` and reads `audit_store_`
+            // at call time rather than capturing the pointer, so a reset
+            // store cannot dangle; `stop()` additionally clears the hook
+            // before destroying the codec. Attribution is system-level by
+            // design (ADR-0010 arch-7) — operator attribution for
+            // rotate/retire rides the route-level audit event of whichever
+            // surface invoked them.
+            if (auth_secret_codec_) {
+                auth_secret_codec_->set_audit_hook(
+                    [this](std::string_view verb, const std::string& detail_json) {
+                        if (!audit_store_ || !audit_store_->is_open())
+                            return;
+                        const bool failure = (verb == "secret.decrypt_failure");
+                        (void)audit_store_->log(
+                            {.timestamp = std::time(nullptr),
+                             .principal = "system:secret-codec",
+                             .principal_role = "system",
+                             .action = std::string(verb),
+                             .target_type = "Secret",
+                             .target_id = "auth",
+                             // detail_json carries AAD coordinates, kek_version
+                             // and the failure class ONLY — never ciphertext,
+                             // plaintext, DEK or key bytes (secret_codec.hpp).
+                             .detail = detail_json,
+                             .result = failure ? "failure" : "success"});
+                    });
+            }
 
             // Gate 7 compliance F-1 — durable evidence that the viz
             // kill-switch took effect. The per-request `kill_switch` audit
@@ -3953,6 +4005,26 @@ public:
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
                         .set(static_cast<double>(baseline_store_->baseline_count()));
                 }
+                // ADR-0010 §Decision 3 — `yuzu_server_secret_decrypt_failures_total`
+                // {store, failure_class}. The codec accumulates these
+                // internally; before the 2026-07-25 review (HIGH #4) nothing
+                // read them, so the metric existed only as a comment in
+                // secret_codec.hpp. Exported pull-model at scrape time (#1909
+                // pattern) — the codec keeps the authoritative cumulative
+                // count, so this is a `set()` of a monotonic total, not an
+                // increment, and a scrape that races a failure simply reports
+                // it on the next one.
+                if (auth_secret_codec_) {
+                    for (const auto& [key, count] : auth_secret_codec_->decrypt_failure_counts()) {
+                        const auto& [store, cls] = key;
+                        metrics_
+                            .gauge("yuzu_server_secret_decrypt_failures_total",
+                                   {{"store", store},
+                                    {"failure_class",
+                                     std::string(pg::SecretCodec::to_string(cls))}})
+                            .set(static_cast<double>(count));
+                    }
+                }
                 // Process health sampling (22.1)
                 {
                     auto ph = process_health_sampler_.sample();
@@ -4558,6 +4630,13 @@ public:
         // key provider → pool.
         scim_store_.reset();
         auth_db_.reset();
+        // Clear the ADR-0010 audit hook before the codec dies. The hook
+        // captures `this` and reads audit_store_ at call time, so it cannot
+        // dangle on a reset store — but dropping it here keeps the codec's
+        // documented contract ("the wiring must set_audit_hook({}) before
+        // destroying the target") satisfied unconditionally.
+        if (auth_secret_codec_)
+            auth_secret_codec_->set_audit_hook({});
         auth_secret_codec_.reset();
         auth_key_provider_.reset();
         pg_pool_.reset();

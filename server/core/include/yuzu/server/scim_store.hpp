@@ -225,16 +225,32 @@ public:
     /// absent member returns true (no-op), not an error.
     bool remove_group_member(const std::string& group_scim_id, const std::string& user_scim_id);
 
-    /// All `user_scim_id`s currently a member of `group_scim_id`. Empty
-    /// vector on no members or an unknown/absent group (not distinguished —
-    /// callers that need existence should check `get_group_by_id` first).
-    std::vector<std::string> list_group_member_user_scim_ids(const std::string& group_scim_id) const;
+    /// All `user_scim_id`s currently a member of `group_scim_id`.
+    ///
+    /// ★ SECURITY (2026-07-25 review, HIGH #3): returns `nullopt` when the
+    /// store could not answer (pool-lease timeout, failed statement) —
+    /// DISTINCT from an engaged-but-empty vector, which means the group
+    /// genuinely has no members. These were fused into a bare empty vector,
+    /// and because this read feeds a read-modify-write membership replace,
+    /// a momentary blip read as "no current members" and the subsequent
+    /// write then DURABLY DELETED the real membership. Callers MUST fail
+    /// closed on `nullopt` and never treat it as an empty set. Existence of
+    /// the group itself is still not distinguished — check `get_group_by_id`
+    /// first if you need that.
+    std::optional<std::vector<std::string>>
+    list_group_member_user_scim_ids(const std::string& group_scim_id) const;
 
     /// Reverse lookup: every group `displayName` that `user_scim_id` is
     /// currently a member of (join scim_group_members -> scim_groups). This
-    /// is the primary read the role-application task (a later, separate
-    /// task) consumes to decide SCIM-group-to-Yuzu-role mapping.
-    std::vector<std::string>
+    /// is the primary read the role-application task consumes to decide
+    /// SCIM-group-to-Yuzu-role mapping.
+    ///
+    /// ★ SECURITY (same finding): `nullopt` on store failure. An empty vector
+    /// here resolves the user to `role=user`, so a blip that read as "member
+    /// of no groups" would silently demote a SCIM-provisioned admin — the
+    /// authoritative-read-fails-open anti-pattern `docs/postgres-store-playbook.md`
+    /// rejects, and the same argument this PR makes for MFA.
+    std::optional<std::vector<std::string>>
     list_group_display_names_for_user(const std::string& user_scim_id) const;
 
 private:

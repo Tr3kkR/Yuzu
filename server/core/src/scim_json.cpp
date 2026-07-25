@@ -90,6 +90,16 @@ std::expected<std::string, ScimError> parse_eq_filter(std::string_view filter,
         }
     }
 
+    // 2026-07-25 review (LOW): the helper's contract says "every SCIM text
+    // field is rejected" on an embedded NUL, but filter values took this
+    // return path without the check. Low impact — the surface is
+    // authorized-reader-only and Postgres text columns reject the NUL on the
+    // way in anyway, so the worst case was prefix-aliasing a lookup — but a
+    // documented invariant with one unchecked exit is how the next reader
+    // gets it wrong.
+    if (has_embedded_nul(value))
+        return fail();
+
     return value;
 }
 

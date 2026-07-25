@@ -702,15 +702,16 @@ bool ScimStore::remove_group_member(const std::string& group_scim_id,
     return res.status() == PGRES_COMMAND_OK;
 }
 
-std::vector<std::string>
+std::optional<std::vector<std::string>>
 ScimStore::list_group_member_user_scim_ids(const std::string& group_scim_id) const {
-    std::vector<std::string> results;
-    if (!open_ || group_scim_id.empty())
-        return results;
+    if (!open_)
+        return std::nullopt; // store unusable — never "no members"
+    if (group_scim_id.empty())
+        return std::vector<std::string>{}; // no group asked for → genuinely nothing
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -718,24 +719,26 @@ ScimStore::list_group_member_user_scim_ids(const std::string& group_scim_id) con
         "ORDER BY user_scim_id ASC",
         std::vector<std::string>{group_scim_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return results;
+        return std::nullopt;
 
     const int rows = PQntuples(res.get());
+    std::vector<std::string> results;
     results.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
         results.push_back(col(res.get(), i, 0));
     return results;
 }
 
-std::vector<std::string>
+std::optional<std::vector<std::string>>
 ScimStore::list_group_display_names_for_user(const std::string& user_scim_id) const {
-    std::vector<std::string> results;
-    if (!open_ || user_scim_id.empty())
-        return results;
+    if (!open_)
+        return std::nullopt; // store unusable — never "member of no groups"
+    if (user_scim_id.empty())
+        return std::vector<std::string>{};
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     // Read the role-application task consumes; a display_name containing an
     // embedded NUL cannot be stored by Postgres text columns at all (the
@@ -748,9 +751,10 @@ ScimStore::list_group_display_names_for_user(const std::string& user_scim_id) co
         "WHERE m.user_scim_id = $1 ORDER BY g.display_name ASC",
         std::vector<std::string>{user_scim_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return results;
+        return std::nullopt;
 
     const int rows = PQntuples(res.get());
+    std::vector<std::string> results;
     results.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
         results.push_back(col(res.get(), i, 0));

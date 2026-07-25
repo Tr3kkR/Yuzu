@@ -744,7 +744,7 @@ TEST_CASE("ScimRoutes: concurrent Group PATCH-promote + User DELETE on the same 
     // not a race-specific correctness bug.
     auto still_there = f.scim_store->get_by_scim_id(user_id);
     if (still_there.has_value()) {
-        auto groups = f.scim_store->list_group_display_names_for_user(user_id);
+        auto groups = f.scim_store->list_group_display_names_for_user(user_id).value();
         auto expected = auth::resolve_role_from_groups(groups, "Yuzu-Admins");
         auto actual = f.auth_mgr.get_user_role("victor");
         REQUIRE(actual.has_value());
@@ -798,7 +798,7 @@ TEST_CASE("ScimRoutes: concurrent conflicting Group membership ops on the same u
             t.join();
         CHECK_FALSE(saw_unexpected.load());
 
-        auto groups = f.scim_store->list_group_display_names_for_user(user_id);
+        auto groups = f.scim_store->list_group_display_names_for_user(user_id).value();
         auto expected = auth::resolve_role_from_groups(groups, "Yuzu-Admins");
         auto actual = f.auth_mgr.get_user_role("wendy");
         REQUIRE(actual.has_value());
@@ -918,7 +918,7 @@ TEST_CASE("ScimRoutes: concurrent Group PATCHes adding DIFFERENT members never l
             t.join();
         CHECK_FALSE(saw_unexpected.load());
 
-        auto members = f.scim_store->list_group_member_user_scim_ids(group_id);
+        auto members = f.scim_store->list_group_member_user_scim_ids(group_id).value();
         auto has = [&](const std::string& id) {
             return std::find(members.begin(), members.end(), id) != members.end();
         };
@@ -987,7 +987,7 @@ TEST_CASE("ScimRoutes: concurrent Group PATCH remove + add on DIFFERENT members 
             t.join();
         CHECK_FALSE(saw_unexpected.load());
 
-        auto members = f.scim_store->list_group_member_user_scim_ids(group_id);
+        auto members = f.scim_store->list_group_member_user_scim_ids(group_id).value();
         auto has = [&](const std::string& id) {
             return std::find(members.begin(), members.end(), id) != members.end();
         };
@@ -2944,7 +2944,7 @@ TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit 
         REQUIRE(res.has_value());
         REQUIRE(ts.scim_store->add_group_member(group_id, res->scim_id));
     }
-    REQUIRE(ts.scim_store->list_group_member_user_scim_ids(group_id).size() == 5000);
+    REQUIRE(ts.scim_store->list_group_member_user_scim_ids(group_id).value().size() == 5000);
 
     auto one_more = ts.scim_store->create_resource("capuser-over");
     REQUIRE(one_more.has_value());
@@ -2972,7 +2972,7 @@ TEST_CASE("Groups integration: PATCH rejected by the member cap must not commit 
     // ...and membership was not committed either — still exactly the 5000
     // pre-existing members, NOT 5001 (asserts real state, not just the
     // rename).
-    CHECK(ts.scim_store->list_group_member_user_scim_ids(group_id).size() == 5000);
+    CHECK(ts.scim_store->list_group_member_user_scim_ids(group_id).value().size() == 5000);
 
     // No stale demotion-skip: the rename was rejected, so the member stays
     // admin and the pre-existing session stays valid.
@@ -3066,7 +3066,7 @@ TEST_CASE("Groups integration: PATCH [{add:U},{remove:U}] leaves U NOT a member 
 
     // The falsifier: U must NOT be a member (store-level, real state), and
     // must NOT be promoted.
-    CHECK(ts.scim_store->list_group_member_user_scim_ids(group_id).empty());
+    CHECK(ts.scim_store->list_group_member_user_scim_ids(group_id).value().empty());
     CHECK(ts.auth_mgr.get_user_role("orderfelix").value() == auth::Role::user);
 }
 
@@ -3102,7 +3102,7 @@ TEST_CASE("Groups integration: PATCH [{remove:U},{add:U}] leaves U a member and 
     REQUIRE(res);
     CHECK(res->status == 200);
 
-    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id);
+    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id).value();
     REQUIRE(members.size() == 1);
     CHECK(members[0] == user_id);
     CHECK(ts.auth_mgr.get_user_role("orderginny").value() == auth::Role::admin);
@@ -3140,7 +3140,7 @@ TEST_CASE("Groups integration: PATCH with bogus removes cannot buy cap headroom 
         REQUIRE(res.has_value());
         REQUIRE(ts.scim_store->add_group_member(group_id, res->scim_id));
     }
-    REQUIRE(ts.scim_store->list_group_member_user_scim_ids(group_id).size() == 5000);
+    REQUIRE(ts.scim_store->list_group_member_user_scim_ids(group_id).value().size() == 5000);
 
     auto real_add = ts.scim_store->create_resource("bypassuser-real-add");
     REQUIRE(real_add.has_value());
@@ -3165,7 +3165,7 @@ TEST_CASE("Groups integration: PATCH with bogus removes cannot buy cap headroom 
     CHECK(res->status == 400);
 
     // Group unchanged — still exactly the 5000 pre-existing members.
-    CHECK(ts.scim_store->list_group_member_user_scim_ids(group_id).size() == 5000);
+    CHECK(ts.scim_store->list_group_member_user_scim_ids(group_id).value().size() == 5000);
 }
 
 TEST_CASE("Groups integration: PATCH whose net final size stays within cap succeeds even "
@@ -3202,7 +3202,7 @@ TEST_CASE("Groups integration: PATCH whose net final size stays within cap succe
     REQUIRE(res);
     CHECK(res->status == 200);
 
-    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id);
+    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id).value();
     std::sort(members.begin(), members.end());
     std::vector<std::string> expected{add1, add2};
     std::sort(expected.begin(), expected.end());
@@ -3281,7 +3281,7 @@ TEST_CASE("Groups integration: PATCH persist failure leaves displayName, members
     REQUIRE(get_res->status == 200);
     CHECK(json::parse(get_res->body)["displayName"].get<std::string>() == "Yuzu-Admins");
 
-    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id);
+    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id).value();
     REQUIRE(members.size() == 1);
     CHECK(members[0] == member_id);
 
@@ -3360,7 +3360,7 @@ TEST_CASE("Groups integration: PUT persist failure leaves displayName, membershi
     REQUIRE(get_res->status == 200);
     CHECK(json::parse(get_res->body)["displayName"].get<std::string>() == "Yuzu-Admins");
 
-    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id);
+    auto members = ts.scim_store->list_group_member_user_scim_ids(group_id).value();
     REQUIRE(members.size() == 1);
     CHECK(members[0] == member_id);
 

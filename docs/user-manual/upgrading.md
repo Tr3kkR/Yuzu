@@ -411,9 +411,12 @@ command fails closed with "requires the Postgres auth store" and does nothing.
 `docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (its SQL-surgery
 sections elsewhere are SQLite-era and superseded — see its banner).
 
-**Migration.** AuthDB migration **v4** adds a nullable `break_glass_armed_until`
-column to `users` — automatic, additive, data-safe. **Rollback** below 0.x after
-v4 has run is data-safe (the column is simply ignored).
+**Migration.** `break_glass_armed_until` is a nullable column on `auth.users`.
+It arrived as SQLite `auth.db` migration v4, but the AuthDB→Postgres cutover
+folded every historical migration into the born-on-PG schema, which starts at
+**v1** — there is no v4 to apply and no rollback-past-v4 question. See the
+AuthDB→Postgres section above for the (fresh-start, no-backfill) upgrade
+contract that replaces it.
 
 ## ⚠️ Breaking: server generates default TLS certificates on first boot (v0.13.0)
 

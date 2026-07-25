@@ -16,8 +16,10 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using yuzu::server::ScimGroup;
 using yuzu::server::ScimResource;
@@ -319,29 +321,29 @@ TEST_CASE("ScimStore group CRUD, membership, and displayName-keyed lookup", "[pg
         REQUIRE(g.has_value());
         CHECK(store.add_group_member(g->scim_id, "user-a"));
         CHECK(store.add_group_member(g->scim_id, "user-a")); // idempotent no-op
-        auto members = store.list_group_member_user_scim_ids(g->scim_id);
+        auto members = store.list_group_member_user_scim_ids(g->scim_id).value();
         REQUIRE(members.size() == 1);
         CHECK(members[0] == "user-a");
 
         CHECK(store.remove_group_member(g->scim_id, "user-a"));
         CHECK(store.remove_group_member(g->scim_id, "user-a")); // idempotent no-op
-        CHECK(store.list_group_member_user_scim_ids(g->scim_id).empty());
+        CHECK(store.list_group_member_user_scim_ids(g->scim_id).value().empty());
     }
 
     SECTION("set_group_members replaces the entire membership set") {
         auto g = store.create_group("Membership2");
         REQUIRE(g.has_value());
         REQUIRE(store.set_group_members(g->scim_id, {"u1", "u2", "u3"}));
-        auto members = store.list_group_member_user_scim_ids(g->scim_id);
+        auto members = store.list_group_member_user_scim_ids(g->scim_id).value();
         CHECK(members.size() == 3);
 
         REQUIRE(store.set_group_members(g->scim_id, {"u4"}));
-        members = store.list_group_member_user_scim_ids(g->scim_id);
+        members = store.list_group_member_user_scim_ids(g->scim_id).value();
         REQUIRE(members.size() == 1);
         CHECK(members[0] == "u4");
 
         REQUIRE(store.set_group_members(g->scim_id, {})); // empty set is a real value
-        CHECK(store.list_group_member_user_scim_ids(g->scim_id).empty());
+        CHECK(store.list_group_member_user_scim_ids(g->scim_id).value().empty());
     }
 
     SECTION("list_group_display_names_for_user reverse lookup") {
@@ -352,12 +354,12 @@ TEST_CASE("ScimStore group CRUD, membership, and displayName-keyed lookup", "[pg
         REQUIRE(store.add_group_member(g1->scim_id, "shared-user"));
         REQUIRE(store.add_group_member(g2->scim_id, "shared-user"));
 
-        auto names = store.list_group_display_names_for_user("shared-user");
+        auto names = store.list_group_display_names_for_user("shared-user").value();
         REQUIRE(names.size() == 2);
         CHECK(names[0] == "Alpha"); // ordered by display_name ASC
         CHECK(names[1] == "Beta");
 
-        CHECK(store.list_group_display_names_for_user("no-such-user").empty());
+        CHECK(store.list_group_display_names_for_user("no-such-user").value().empty());
     }
 
     SECTION("replace_group_and_members atomically renames + replaces membership") {
@@ -376,7 +378,7 @@ TEST_CASE("ScimStore group CRUD, membership, and displayName-keyed lookup", "[pg
         CHECK(updated->external_id == "new-ext");
         CHECK(updated->etag_version == 2);
 
-        auto members = store.list_group_member_user_scim_ids(g->scim_id);
+        auto members = store.list_group_member_user_scim_ids(g->scim_id).value();
         REQUIRE(members.size() == 1);
         CHECK(members[0] == "new-member");
     }
@@ -397,10 +399,194 @@ TEST_CASE("ScimStore group CRUD, membership, and displayName-keyed lookup", "[pg
         CHECK(*first == true);
         CHECK_FALSE(store.get_group_by_id(g->scim_id).has_value());
         // The reverse lookup must not dangle after the cascade.
-        CHECK(store.list_group_member_user_scim_ids(g->scim_id).empty());
+        CHECK(store.list_group_member_user_scim_ids(g->scim_id).value().empty());
 
         auto second = store.delete_group(g->scim_id);
         REQUIRE(second.has_value());
         CHECK(*second == false); // idempotent: already gone
     }
+}
+
+// ── Transaction-rollback coverage (re-ported from the deleted SQLite
+//    test_scim_group_store.cpp; 2026-07-25 review MEDIUM) ──────────────────
+//
+// The SQLite suite proved all three `with_txn_for` writers roll back FULLY —
+// not just the failed statement — by poisoning a member id with a trigger so
+// the INSERT loop aborts after the transaction's earlier DELETE/UPDATE have
+// already run. Those three cases were dropped in the PG migration and had no
+// replacement, leaving every rollback path untested. This is the same
+// technique in Postgres (plpgsql RAISE EXCEPTION instead of RAISE(ABORT)).
+//
+// This matters more on PG than it did on SQLite: `replace_group_and_members`
+// is what the SCIM PUT/PATCH routes commit, so a partial apply here is a
+// torn group membership and, through the role recompute, a wrong admin set.
+
+namespace {
+
+// Abort any INSERT of the sentinel member id, mid-transaction.
+void install_member_insert_poison(PGconn* conn) {
+    PgResult fn{PQexec(conn, R"(
+        CREATE OR REPLACE FUNCTION scim_store.poison_member_insert() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.user_scim_id = 'POISON' THEN
+                RAISE EXCEPTION 'induced failure';
+            END IF;
+            RETURN NEW;
+        END; $$ LANGUAGE plpgsql;
+    )")};
+    REQUIRE(fn.ok());
+    PgResult trg{PQexec(conn, "CREATE TRIGGER poison_member_insert BEFORE INSERT ON "
+                              "scim_store.scim_group_members FOR EACH ROW "
+                              "EXECUTE FUNCTION scim_store.poison_member_insert()")};
+    REQUIRE(trg.ok());
+}
+
+// Abort the group DELETE itself, after the membership rows have been removed
+// earlier in the same transaction.
+void install_group_delete_poison(PGconn* conn) {
+    PgResult fn{PQexec(conn, R"(
+        CREATE OR REPLACE FUNCTION scim_store.poison_group_delete() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'induced failure';
+        END; $$ LANGUAGE plpgsql;
+    )")};
+    REQUIRE(fn.ok());
+    PgResult trg{PQexec(conn, "CREATE TRIGGER poison_group_delete BEFORE DELETE ON "
+                              "scim_store.scim_groups FOR EACH ROW "
+                              "EXECUTE FUNCTION scim_store.poison_group_delete()")};
+    REQUIRE(trg.ok());
+}
+
+std::vector<std::string> sorted_members(ScimStore& store, const std::string& scim_id) {
+    auto members = store.list_group_member_user_scim_ids(scim_id);
+    REQUIRE(members.has_value());
+    auto out = *members;
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("ScimStore: replace_group_and_members rolls back fully on a mid-transaction failure",
+          "[pg][scim][group][transaction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto grp = store.create_group("Sales", "ext-1");
+    REQUIRE(grp.has_value());
+    REQUIRE(store.set_group_members(grp->scim_id, {"old-a", "old-b"}));
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    install_member_insert_poison(conn.get());
+
+    auto result = store.replace_group_and_members(grp->scim_id, "Sales EMEA", "ext-2",
+                                                  {"new-1", "POISON", "new-2"});
+    REQUIRE_FALSE(result.has_value());
+
+    // Neither half of the write leaked: the rename did NOT persist...
+    auto after = store.get_group_by_id(grp->scim_id);
+    REQUIRE(after.has_value());
+    CHECK(after->display_name == "Sales");
+    CHECK(after->external_id == "ext-1");
+
+    // ...and the membership-clearing DELETE that ran earlier in the SAME
+    // transaction rolled back too. A half-applied outcome (just "new-1", or
+    // an empty set) is the bug this guards.
+    auto members = sorted_members(store, grp->scim_id);
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "old-a");
+    CHECK(members[1] == "old-b");
+}
+
+TEST_CASE("ScimStore: set_group_members rolls back fully on a mid-transaction failure",
+          "[pg][scim][group][transaction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto grp = store.create_group("Team");
+    REQUIRE(grp.has_value());
+    REQUIRE(store.set_group_members(grp->scim_id, {"old-a", "old-b"}));
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    install_member_insert_poison(conn.get());
+
+    CHECK_FALSE(store.set_group_members(grp->scim_id, {"new-1", "POISON", "new-2"}));
+
+    auto members = sorted_members(store, grp->scim_id);
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "old-a");
+    CHECK(members[1] == "old-b");
+}
+
+TEST_CASE("ScimStore: delete_group rolls back fully on a mid-transaction failure",
+          "[pg][scim][group][transaction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto grp = store.create_group("Doomed");
+    REQUIRE(grp.has_value());
+    REQUIRE(store.set_group_members(grp->scim_id, {"m1", "m2"}));
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    install_group_delete_poison(conn.get());
+
+    // nullopt = "could not determine" (fail closed / retry), never a silent
+    // "already gone" — the tri-state delete_by_scim_id contract.
+    auto result = store.delete_group(grp->scim_id);
+    CHECK_FALSE(result.has_value());
+
+    // The group AND its membership both survive — the cascade DELETE that ran
+    // first in the transaction was rolled back with it.
+    CHECK(store.get_group_by_id(grp->scim_id).has_value());
+    auto members = sorted_members(store, grp->scim_id);
+    REQUIRE(members.size() == 2);
+    CHECK(members[0] == "m1");
+    CHECK(members[1] == "m2");
+}
+
+// ── 2026-07-25 review HIGH #3: authoritative membership reads fail CLOSED ──
+//
+// The reviewer's scenario: a transient read failure was indistinguishable
+// from "this group has no members", and because the SCIM PATCH route folds
+// its ops onto that read and then persists the whole set, one blip durably
+// deleted a group's entire membership. The store-level contract that makes
+// the route fix possible is that a failed read is `nullopt`, never an
+// engaged-but-empty vector.
+TEST_CASE("ScimStore: a FAILED membership read is nullopt, never an empty member set",
+          "[pg][scim][group][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto grp = store.create_group("RealMembers");
+    REQUIRE(grp.has_value());
+    REQUIRE(store.set_group_members(grp->scim_id, {"u1", "u2"}));
+
+    // Sanity: a genuinely empty group is an ENGAGED empty vector, which must
+    // stay distinguishable from the failure below.
+    auto empty_grp = store.create_group("NoMembers");
+    REQUIRE(empty_grp.has_value());
+    auto empty_read = store.list_group_member_user_scim_ids(empty_grp->scim_id);
+    REQUIRE(empty_read.has_value());
+    CHECK(empty_read->empty());
+
+    // Break the reads' statements only (the join table for the forward read,
+    // which the reverse read also traverses).
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop{PQexec(conn.get(), "DROP TABLE scim_store.scim_group_members")};
+    REQUIRE(drop.ok());
+
+    CHECK_FALSE(store.list_group_member_user_scim_ids(grp->scim_id).has_value());
+    CHECK_FALSE(store.list_group_display_names_for_user("u1").has_value());
 }

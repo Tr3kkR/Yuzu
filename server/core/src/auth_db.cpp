@@ -297,32 +297,42 @@ struct LoadedMfaRow {
     int64_t last_counter{0};
 };
 
-// `acquire_failed` (optional out-param, default nullptr — every pre-existing
-// call site is unaffected) is set true iff the pool lease itself could not
-// be acquired, DISTINCT from every other nullopt cause (no such
-// active user, query failure, or genuinely no secret column). Added for
-// mfa_init_enrollment's provisional-secret reuse-load (security-guardian
-// LOW, governance hardening round): that call site must NOT treat a
-// transient pool-acquire timeout the same as "no secret" — doing so would
-// mint a fresh secret over (and silently invalidate) an in-progress
-// enrollment during a momentary outage. The other two callers
-// (mfa_verify_enrollment, mfa_verify_login_code) keep their existing nullopt
-// contract unchanged.
-std::optional<LoadedMfaRow> load_mfa_row(pg::PgPool& pool, const std::string& username,
-                                         bool* acquire_failed = nullptr) {
+// ★ SECURITY (2026-07-25 review, HIGH #2): this helper returns a TYPED
+// result, never a bare `optional`, because every one of its failure modes has
+// a different correct response and an `optional` cannot carry them:
+//
+//   * `QueryFailed`   — the pool lease timed out OR the SELECT came back
+//                       non-`PGRES_TUPLES_OK` (connection reset,
+//                       `statement_timeout`, failover). BOTH are store
+//                       outages. The second used to collapse into the same
+//                       empty answer as "this user has no secret", which let
+//                       `mfa_init_enrollment` mint a fresh secret over a live
+//                       provisional one during a blip — precisely the outcome
+//                       its own comment below says must never happen. The
+//                       earlier `acquire_failed` out-param only ever covered
+//                       the lease half, so it closed half the hole.
+//   * `UserNotFound`  — no active row for this username. A real business
+//                       outcome, not an outage.
+//   * success         — the row was read. `secret_blob` MAY be empty; that is
+//                       data, not an error, and the CALLER decides what it
+//                       means (for an enrolled row it is `SecretUnavailable`;
+//                       for a provisional one it is "mint a fresh secret").
+//                       Folding it into a failure here is what erased the
+//                       enrolled-vs-absent distinction from every caller.
+[[nodiscard]] std::expected<LoadedMfaRow, AuthDBError> load_mfa_row(pg::PgPool& pool,
+                                                                    const std::string& username) {
     auto lease = pool.try_acquire_for(kReadTimeout);
-    if (!lease) {
-        if (acquire_failed)
-            *acquire_failed = true;
-        return std::nullopt;
-    }
+    if (!lease)
+        return std::unexpected(AuthDBError::QueryFailed);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), mfa_last_counter "
         "FROM auth.users WHERE username = $1 AND is_active = TRUE",
         std::vector<std::string>{username});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return std::nullopt;
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::QueryFailed);
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected(AuthDBError::UserNotFound);
 
     LoadedMfaRow out;
     out.id = to_i64(col(res.get(), 0, 0));
@@ -330,8 +340,6 @@ std::optional<LoadedMfaRow> load_mfa_row(pg::PgPool& pool, const std::string& us
         out.secret_blob = auth::AuthManager::hex_to_bytes(col_str(res.get(), 0, 1));
     out.enrolled = to_bool(col(res.get(), 0, 2));
     out.last_counter = to_i64(col(res.get(), 0, 3));
-    if (out.secret_blob.empty())
-        return std::nullopt; // no secret present at all (provisional or enrolled)
     return out;
 }
 
@@ -1206,15 +1214,22 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
     // than replaced, so re-initialising mid-enrollment (two tabs, a retried
     // bootstrap) doesn't invalidate a QR the operator already scanned.
     //
-    // ★ SECURITY (security-guardian LOW, governance hardening round): a pool
-    // lease-acquire TIMEOUT on this reuse-load is NOT "no provisional secret"
-    // — falling through to mint-fresh below on a transient outage would
-    // silently invalidate an in-progress enrollment the caller merely
-    // couldn't currently read. Distinguish it via `acquire_failed` and fail
-    // closed (WriteFailed) instead.
-    bool reuse_load_acquire_failed = false;
-    if (auto existing = load_mfa_row(impl_->pool, username, &reuse_load_acquire_failed);
-        existing && !existing->secret_blob.empty()) {
+    // ★ SECURITY (security-guardian LOW, governance hardening round; widened
+    // by the 2026-07-25 review's HIGH #2): a store outage on this reuse-load
+    // is NOT "no provisional secret" — falling through to mint-fresh below
+    // during a transient failure would silently invalidate an in-progress
+    // enrollment the caller merely couldn't currently read. `load_mfa_row`
+    // now reports BOTH outage shapes (lease timeout AND non-TUPLES_OK result)
+    // as QueryFailed, where the old `acquire_failed` out-param caught only the
+    // first; either one fails closed here.
+    auto existing = load_mfa_row(impl_->pool, username);
+    if (!existing && existing.error() == AuthDBError::QueryFailed) {
+        spdlog::error("mfa_init_enrollment: reuse-load failed for '{}' (store outage) — refusing "
+                      "to mint a fresh secret over a possibly-existing provisional one",
+                      username);
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    if (existing && !existing->secret_blob.empty()) {
         // TOCTOU re-check: load_mfa_row's SELECT is a separate statement from
         // mfa_status's — a concurrent mfa_verify_enrollment could have
         // stamped enrolled between the two. Re-check the freshly-loaded row.
@@ -1234,12 +1249,10 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
         auto secret_b32 = mfa::base32_encode(secret_view);
         auto uri = mfa::otpauth_uri(issuer, username, secret_b32);
         return MfaEnrollmentInit{std::move(secret_b32), std::move(uri)};
-    } else if (reuse_load_acquire_failed) {
-        spdlog::error("mfa_init_enrollment: reuse-load pool acquire failed for '{}' — refusing "
-                      "to mint a fresh secret over a possibly-existing provisional one",
-                      username);
-        return std::unexpected(AuthDBError::WriteFailed);
     }
+    // Falling through means the row exists and genuinely carries no secret
+    // (UserNotFound is impossible here — mfa_status above already proved an
+    // active row — and QueryFailed already returned). Mint a fresh one.
 
     // Fresh secret. Need the row id for the SecretId AAD before encrypting.
     auto lease0 = impl_->pool.try_acquire_for(kReadTimeout);
@@ -1297,11 +1310,12 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         return std::unexpected(AuthDBError::MfaAlreadyEnrolled);
     }
 
-    bool acquire_failed = false;
-    auto row = load_mfa_row(impl_->pool, username, &acquire_failed);
-    if (acquire_failed)
-        return std::unexpected(AuthDBError::QueryFailed); // store outage → fail closed (503)
-    if (!row) {
+    // Store outage (lease timeout OR failed statement) → fail closed (503),
+    // never "no provisional secret". UserNotFound passes through unchanged.
+    auto row = load_mfa_row(impl_->pool, username);
+    if (!row)
+        return std::unexpected(row.error());
+    if (row->secret_blob.empty()) {
         // No provisional secret — caller must call mfa_init_enrollment first.
         return std::unexpected(AuthDBError::UserNotFound);
     }
@@ -1379,8 +1393,21 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
             row.secret_blob = auth::AuthManager::hex_to_bytes(col_str(sel.get(), 0, 1));
         row.enrolled = to_bool(col(sel.get(), 0, 2));
         row.last_counter = to_i64(col(sel.get(), 0, 3));
-        if (!row.enrolled || row.secret_blob.empty()) {
-            result = false; // not enrolled — nothing to verify against
+        if (!row.enrolled) {
+            result = false; // genuinely not enrolled — nothing to verify against
+            return false;
+        }
+        // ★ SECURITY: enrolled-but-NULL-secret is NOT "wrong code". These two
+        // states were fused into a single `false` until the 2026-07-25 review
+        // — an enrolled row whose `mfa_totp_secret` went NULL (partial write,
+        // operator UPDATE, restore from a backup taken mid-enrollment) would
+        // report every login code as invalid rather than telling anyone the
+        // second factor had become unreadable. `mfa_status` has always graded
+        // the identical row state as SecretUnavailable (see above); this path
+        // now matches it, which is what AuthDBError::SecretUnavailable's
+        // contract and docs/auth-architecture.md already claimed.
+        if (row.secret_blob.empty()) {
+            err = AuthDBError::SecretUnavailable;
             return false;
         }
         // ★ Decrypt failure NEVER silently reads as "code didn't match" — SecretUnavailable.
