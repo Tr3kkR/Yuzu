@@ -2776,15 +2776,34 @@ McpServer::HandlerFn McpServer::build_handler(
                     // guarded helper rather than incrementing inline, so the
                     // guard cannot land on one path and not the other. (The
                     // handler's own `too_large` has carried the same guard
-                    // since #2437; before this the two C8 sites were the
+                    // since #2437; before this BOTH C8 sites were the
                     // outliers.) MetricsRegistry::counter is a lock_guard plus
                     // a map insert with no backend and no cardinality limit,
                     // so in practice only bad_alloc escapes - the guard costs
                     // nothing and removes the question.
-                    auto count_denial = [metrics](const char* family,
-                                                  const yuzu::Labels& labels) noexcept {
+                    //
+                    // SCOPE, stated precisely because the first version of this
+                    // comment overclaimed: this closes the two rejection paths
+                    // in the C8 block. It is NOT a file-wide guarantee -
+                    // `yuzu_mcp_tool_security_misconfig_total` and
+                    // `yuzu_mcp_stream_rejects_total` still increment inline
+                    // elsewhere in this file. Both of those fail CLOSED, so
+                    // they are hardening rather than defects; lifting this
+                    // helper to cover them is #2437 follow-up work, not a
+                    // property to assume here.
+                    //
+                    // The label vector is built INSIDE the try on purpose. An
+                    // earlier signature took a `const yuzu::Labels&`, which
+                    // materialised the vector plus its strings at the CALL
+                    // site - outside the guard - making this helper strictly
+                    // weaker than the `too_large` sibling it was modelled on.
+                    auto count_denial = [metrics, &tool_name](const char* family,
+                                                              const char* reason) noexcept {
                         if (metrics == nullptr) return;
                         try {
+                            yuzu::Labels labels{{"tool", tool_name}};
+                            if (reason != nullptr)
+                                labels.emplace_back("reason", reason);
                             metrics->counter(family, labels).increment();
                         } catch (...) { // NOLINT(bugprone-empty-catch)
                         }
@@ -2819,8 +2838,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             // caller-derived keys are wildcarded to '*').
                             const std::string cid =
                                 yuzu::server::detail::make_correlation_id();
-                            count_denial("yuzu_mcp_tool_args_invalid_total",
-                                         {{"tool", tool_name}});
+                            count_denial("yuzu_mcp_tool_args_invalid_total", nullptr);
                             mcp_audit("denied",
                                       "arguments do not match the tool input schema at '" +
                                           violation->path + "' correlation_id=" + cid);
@@ -2851,8 +2869,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         if (auto bv = check_exec_instruction_shape(args)) {
                             const std::string cid =
                                 yuzu::server::detail::make_correlation_id();
-                            count_denial("yuzu_mcp_tool_args_too_large_total",
-                                         {{"tool", tool_name}, {"reason", bv->reason}});
+                            count_denial("yuzu_mcp_tool_args_too_large_total", bv->reason);
                             mcp_audit("denied",
                                       std::string("input bound exceeded: ") + bv->reason +
                                           " correlation_id=" + cid);

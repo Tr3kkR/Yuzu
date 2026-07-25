@@ -3779,6 +3779,8 @@ TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamp
     // decide whether ANOTHER widening is safe — it was stale for exactly one
     // review round after the 8 KiB -> 64 KiB params change, overstating the
     // remaining room by ~3.5x in the unsafe direction.
+    INFO("docs/mcp-server.md publishes '~3.27 MiB decoded, about 18% headroom' - "
+         "recompute both from this constant and update the doc before changing this CHECK");
     CHECK(kExecInstrWorstCaseBody == 3'426'080);
     const double headroom_pct =
         100.0 * static_cast<double>(kMcpMaxRequestBodyBytes - kExecInstrWorstCaseBody) /
@@ -3792,6 +3794,13 @@ TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamp
     // transport. A stated product clamp, NOT a derivation error.
     constexpr std::size_t kMaxBundleBody = kMaxBundleSteps * kOneSaturatedBundleStep;
     CHECK(kMaxBundleBody > kMcpMaxRequestBodyBytes);
+
+    // server.cpp pre-seeds from kExecInstrBoundReasons, so THAT copy cannot
+    // drift. docs/user-manual/metrics.md is a third copy that can - pin the
+    // size so adding a reason without documenting it fails here rather than
+    // shipping an undocumented label.
+    INFO("adding a reason? update docs/user-manual/metrics.md and this count");
+    CHECK(kExecInstrBoundReasons.size() == 7);
 }
 
 // ── 26d. Schema <-> handler-constant cross-check (#2437) ─────────────────
@@ -6644,7 +6653,16 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
     {
         yuzu::server::ApprovalManager appr(raw);
         appr.create_tables();
+        // Declared BEFORE `ts` so the server tears down before the registry it
+        // borrows. Wired because this is the ONLY test that reaches the C8
+        // block: without it `metrics` is null there and `count_denial` runs
+        // just its early return, so the gate's two counter increments — the
+        // ones whose whole purpose is to make a pre-mint denial visible —
+        // would have no coverage at all. The operator-tier bounds test
+        // exercises the HANDLER's `too_large`, a different site.
+        yuzu::MetricsRegistry reg;
         McpTestServer ts;
+        ts.metrics_for_test = &reg;
         ts.approval_manager_for_test = &appr;
         ts.start("supervised");
 
@@ -6670,6 +6688,17 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
                  .c_str(),
              "'/token_id'");
         CHECK(appr.pending_count() == 0);
+        // The C8 gate's #2405 counter: the three schema denials above all went
+        // through `count_denial`. No `reason` label on this family.
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                          {{"tool", "create_engine_principal"}})
+                  .value() == 1.0);
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                          {{"tool", "mint_engine_credential"}})
+                  .value() == 1.0);
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                          {{"tool", "confirm_engine_rotation"}})
+                  .value() == 1.0);
 
         // A REALISTIC (non-minimal) execute_instruction payload — scope +
         // agent_ids + string params — passes validation and mints (-32006).
@@ -6763,6 +6792,12 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         CHECK(over_params["error"]["message"].get<std::string>().find("at most 32 keys") !=
               std::string::npos);
         CHECK(appr.pending_count() == 1); // NOT minted — the point of the C8 placement
+        // Counted at the GATE, under the same closed reason set the handler
+        // uses. A pre-mint denial invisible to metrics is how an operator ends
+        // up unable to see a client burning itself on a bound.
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "execute_instruction"}, {"reason", "param_count"}})
+                  .value() == 1.0);
 
         const std::string long_key(yuzu::server::mcp::kExecInstrParamKeyMaxLen + 1, 'k');
         auto over_key = nlohmann::json::parse(
@@ -6775,6 +6810,9 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         CHECK(over_key["error"]["message"].get<std::string>().find("exceeds 256 bytes") !=
               std::string::npos);
         CHECK(appr.pending_count() == 1); // still not minted
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "execute_instruction"}, {"reason", "param_key_len"}})
+                  .value() == 1.0);
 
         // And the boundary ACCEPTS: exactly-at-cap key count mints normally.
         // Without this an off-by-one (>= for >) would pass every rejection case

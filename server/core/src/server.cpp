@@ -83,6 +83,7 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
@@ -595,10 +596,13 @@ public:
         // the handler but audit without a metric) and `reason` is the fixed
         // literal set below - so this pre-seed is exhaustive and absent() stays
         // meaningful. Extend both lists together if a second tool gains bounds.
-        for (auto reason : {"ident_len", "scope_len", "param_count", "param_key_len",
-                            "param_value_len", "agent_ids_count", "agent_id_len"}) {
+        // Iterated from the ONE array in mcp_input_bounds.hpp rather than
+        // restated here: a second literal list is how a new rule ends up
+        // emitted-but-unseeded, which passes its own test and silently breaks
+        // absent() alerting.
+        for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
             metrics_.counter("yuzu_mcp_tool_args_too_large_total",
-                             {{"tool", "execute_instruction"}, {"reason", reason}});
+                             {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
         }
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the

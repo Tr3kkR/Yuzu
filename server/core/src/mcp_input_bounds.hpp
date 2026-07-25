@@ -1,13 +1,17 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
 #include "bundle_service.hpp" // kMaxParamCountPerStep / kMaxParamKeyLen / kMaxParamValueLen
+                              // (also kMaxBundleSteps, which the sizing test reaches
+                              // through this header)
 #include "mcp_jsonrpc.hpp"    // kMcpMaxRequestBodyBytes, for the sizing static_asserts below
 
 /// @file mcp_input_bounds.hpp
@@ -48,6 +52,25 @@ inline constexpr std::size_t kExecInstrAgentIdsMaxItems = 10000; // agent_ids le
 inline constexpr std::size_t kExecInstrParamCountMax = kMaxParamCountPerStep; // 32
 inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      // 256
 
+/// The CLOSED `reason` label set for `yuzu_mcp_tool_args_too_large_total`.
+///
+/// This array is the single source: `server.cpp` pre-seeds the counter by
+/// iterating it at boot, so the emitted set and the pre-seeded set cannot
+/// drift apart. Before it existed the two were independent literal lists, and
+/// a rule landing with an unseeded reason would still pass its own test (the
+/// registry creates a series on demand) while silently breaking `absent()`
+/// alerting — the dashboard reads zero while calls are being refused.
+///
+/// ADDING A REASON: append it here, emit it from `check_exec_instruction_shape`
+/// or the handler's `too_large`, and document it in
+/// `docs/user-manual/metrics.md`. The boot pre-seed follows automatically; the
+/// docs copy does not, and a test asserts this array's size so the third copy
+/// cannot be forgotten quietly.
+inline constexpr std::array<std::string_view, 7> kExecInstrBoundReasons{
+    "ident_len",       "scope_len",       "param_count",    "param_key_len",
+    "param_value_len", "agent_ids_count", "agent_id_len",
+};
+
 // ── Sizing: the per-field caps must fit under the TRANSPORT cap ───────────
 // #2478 refuses a /mcp/ body over kMcpMaxRequestBodyBytes before reading it.
 // The caps above are what a caller may legitimately fill, so their sum has to
@@ -66,11 +89,22 @@ inline constexpr std::size_t kExecInstrWorstCaseBody =
 
 // A MARGIN, not merely ">". The params widening took the headroom from 62% to
 // 18% and nobody recomputed it until review, so the next careless bump should
-// fail to compile rather than ship a cap that refuses schema-legal calls. 10%
-// is what the current numbers actually support - a 25% rule was tried first and
-// does NOT hold at 64 KiB, and weakening an assertion until it passes is worse
-// than not having one.
-static_assert(kMcpMaxRequestBodyBytes > kExecInstrWorstCaseBody * 11 / 10,
+// fail to compile rather than ship a cap that refuses schema-legal calls.
+//
+// 10% is a FLOOR, not "what the numbers support" - an earlier version of this
+// comment said the latter and was wrong. The true ceiling is 22.4% (the actual
+// headroom); 25% fails, 20% would still hold. 10% is deliberately slack so a
+// small legitimate change does not fail the build, which means this assert
+// alone would permit drift to ~9% headroom while the docs publish 18%. Closing
+// that gap is the job of the exact-figure CHECK in test_mcp_server.cpp, not of
+// a tighter bound here - the assert pins the RELATION, the test pins the
+// PUBLISHED NUMBER. Both are needed; neither substitutes for the other.
+//
+// Written as cap/11*10 rather than worst*11/10: the latter multiplies a value
+// that grows with the field bounds, and on a 32-bit size_t would WRAP above
+// ~390 MB and satisfy the assert spuriously - precisely the careless-bump case
+// it exists to catch. cap is a fixed 4 MiB, so cap*10 cannot overflow.
+static_assert(kMcpMaxRequestBodyBytes / 11 * 10 > kExecInstrWorstCaseBody,
               "a maximal execute_instruction must fit with room for JSON escaping - if this "
               "fires, raise the transport cap or lower a field bound, and update the figures "
               "in docs/mcp-server.md");
