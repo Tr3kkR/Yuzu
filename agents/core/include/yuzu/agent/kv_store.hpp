@@ -44,6 +44,14 @@ struct KvNamespaceSize {
     std::uint64_t bytes = 0;
 };
 
+/// A key with its value's BYTE length from list_keys_sized() - the row shape for a
+/// scan that must size and order a namespace without paying to materialize it.
+/// `bytes` matches KvRow::value.size() (see namespace_size()'s octet_length note).
+struct KvKeySize {
+    std::string key;
+    std::uint64_t bytes = 0;
+};
+
 /// Result of insert_if_absent(): row created, already present, or op failed.
 enum class KvInsert { Inserted, Exists, Error };
 
@@ -110,6 +118,32 @@ public:
      */
     [[nodiscard]] std::expected<KvNamespaceSize, KvStoreError>
     namespace_size(std::string_view plugin, std::string_view prefix);
+
+    /**
+     * Per-row keys and value BYTE lengths for a (plugin, prefix) scan, WITHOUT
+     * materializing any value - the per-row sibling of namespace_size() and the
+     * O(work) alternative to list_entries() for a caller that selects rows by key
+     * and reads only the few values it actually needs. Rows come back ORDER BY
+     * key, so a key whose ordering field is a fixed-width prefix scans in that
+     * field's order for free.
+     *
+     * Same fallible contract as list_entries(): an empty result is an empty
+     * vector while a DB error is unexpected. `bytes` uses octet_length(value) for
+     * byte parity with KvRow::value.size() (see namespace_size()).
+     */
+    [[nodiscard]] std::expected<std::vector<KvKeySize>, KvStoreError>
+    list_keys_sized(std::string_view plugin, std::string_view prefix);
+
+    /**
+     * Fallible, byte-exact point read: the single-key sibling of list_entries().
+     * nullopt means the key is ABSENT; unexpected means the read FAILED - a
+     * distinction get() cannot make (it returns nullopt for both) and which a
+     * caller that must not treat "cannot tell" as "not there" depends on. Reads
+     * the value as a blob, so embedded NULs survive get()'s column_text
+     * truncation and a corrupt value reaches the parser intact.
+     */
+    [[nodiscard]] std::expected<std::optional<std::string>, KvStoreError>
+    get_entry(std::string_view plugin, std::string_view key);
 
     /**
      * Insert only if (plugin, key) is absent. Uses INSERT ... ON CONFLICT DO

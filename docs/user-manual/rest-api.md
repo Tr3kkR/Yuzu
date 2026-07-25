@@ -942,6 +942,8 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 `token_id` (required) is the successor's token id **returned by the `rotate` response above** — it pins this confirm to that exact rotation. A stale or mismatched id (for example a blind retry of an old confirm after a *second* rotation has started) is rejected with `409` and **no state change**, so a replayed confirm can never resolve a later rotation early. The success audit row records the confirmed id (`token_id=<id>`).
 
+Replaying a confirm **after its own success** (a network-dropped `200`, a double-submit) is a terminal `409` conflict, not a retryable `503`: once the rotation has resolved the successor is the sole active credential, and the confirm returns an explicit `already confirmed` / `already resolved` answer with no state change. Treat it as done and stop retrying (rotate again only if you genuinely need a fresh rotation). See the error table below for the full state matrix.
+
 **Response:**
 
 ```json
@@ -960,9 +962,13 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | `token_id` missing from the body, empty, not a string, or the body is malformed/non-object JSON | `400` — `token_id required` |
 | The supplied `token_id` is not the pending rotation's successor (stale id from an earlier rotation, or the predecessor's id passed by mistake) | `409` — `token_id does not match the pending rotation successor; pass the token_id returned by rotate`. No state change. |
 | Confirm attempted by a **different** operator than the one who initiated the rotation | `409` — `rotation in progress by a different operator` |
-| The in-memory grace-cache entry needed to resolve the initiating operator is gone (process restart, or the rotation already resolved) | `409` — `rotation confirmation unavailable — retry via rotate or fall back to revoke` |
-| No in-flight rotation exists for this principal (zero, one, or an unrecognized pair of active credentials) | `503` — **not** `400`. Same ambiguity-avoidance rationale as `credentials/rotate` above: the internal read can't distinguish "genuinely nothing in flight" from a silently-failed read, so this is classified retryable rather than a definitive client error. |
-| A non-engine-kind active credential is present for this principal (defensive check) | `503` |
+| The in-memory grace-cache entry needed to resolve the initiating operator is gone while the pair is still present (process restart mid-overlap) | `409` — `rotation confirmation unavailable — retry via rotate or fall back to revoke` |
+| **Replay after the rotation already resolved** — the successor is now the principal's sole active credential and the supplied `token_id` matches it | `409`, terminal, **do not retry**: `rotation already confirmed - the supplied token_id is the sole active credential; nothing to confirm` (an explicit confirm resolved it) or `no rotation in flight - the supplied token_id is already the sole active credential; nothing to confirm` (never rotated, or resolved by the auto-revoke sweep or a manual revoke) |
+| One credential is active with its rotation state clear, but the supplied `token_id` is a **different** id (the pinned rotation has moved on) | `409`, terminal — `no rotation in flight for the supplied token_id - the rotation was resolved (confirmed, revoked, or cut over); rotate again if a new rotation is needed` |
+| One credential is active but still carries **unresolved rotation metadata** (a best-effort pair-resolve failed, or its partner expired before cleanup while the sweep was down) | `409` — `one active credential with unresolved rotation metadata - inspect the credential state and do not rotate; revoke only if it is confirmed stale`. Rotating from here would strand a malformed pair; **inspect before revoking** — in the sweep-outage case this sole credential is the good survivor. |
+| **More than two** active credentials for this principal (one minted outside the rotation path) | `400` — `more than two active credentials for this principal - resolve manually before confirming` |
+| No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
+| A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
 | Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed | `403` |
@@ -6253,7 +6259,9 @@ curl -N -H "Authorization: Bearer $TOKEN" \
 ```
 
 Every error body carries the A4 envelope (`correlation_id`, nullable `retry_after_ms`,
-`remediation`). Streams end with a final `stream-closed` frame naming the reason.
+`remediation`). Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+(a normal `message` on the stream, not a bespoke `event: stream-closed` frame) whose `params`
+name the reason in that same A4 shape.
 
 #### `DELETE /mcp/v1/`
 

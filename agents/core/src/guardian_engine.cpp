@@ -244,7 +244,8 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // audit-durability gap. Match the B4a maintenance-tick posture: catch here and count it.
     journal_flush.fn = [this] {
         try {
-            persist_lifecycle_journal_locked();
+            persist_lifecycle_journal_locked(kJournalPersistUnbounded,
+                                             kJournalPersistUnbounded);
         } catch (...) {
             journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -329,7 +330,7 @@ void GuardianEngine::stop() {
     // staged while it was winding down, and re-running is safe because persist() erases the
     // durably-written prefix, so a record is never written under two keys.
     try {
-        persist_lifecycle_journal_locked();
+        persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
     } catch (...) {
         journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -346,7 +347,7 @@ void GuardianEngine::stop() {
     // from the (implicitly noexcept) ~GuardianEngine destructor, so a throw here would
     // std::terminate (review B4a).
     try {
-        persist_lifecycle_journal_locked();
+        persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
     } catch (...) {
         journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -376,7 +377,8 @@ void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
 #endif
 }
 
-void GuardianEngine::persist_lifecycle_journal_locked() {
+void GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
+                                                     std::size_t max_records) {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
     // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
     // journal is neither written, pruned, nor paged. Precise exception (#2303 Sol): the
@@ -397,7 +399,8 @@ void GuardianEngine::persist_lifecycle_journal_locked() {
     // ONLY the prefix persist() durably wrote (circuit-broken on the first failure - the
     // rest stay pending for the maintenance-tick retry, C3).
     std::vector<PersistedBatch> batches;
-    const std::size_t written = lifecycle_journal_->persist(pending, &batches);
+    const std::size_t written =
+        lifecycle_journal_->persist(pending, &batches, max_batches, max_records);
     if (written > 0) {
         // Erase the durably-written staging prefix FIRST - it is the durability-completion step:
         // once a batch is committed it must NEVER be re-persisted under a fresh key. Provenance
@@ -428,7 +431,14 @@ void GuardianEngine::journal_maintenance_tick() {
     // bad_alloc from the persist path must be swallowed + counted, never std::terminate
     // (review B4a).
     try {
-        persist_lifecycle_journal_locked();
+        // BOUNDED (C0 flip-checklist item 11). This is the one caller that runs on the bare
+        // heartbeat thread on a cadence, so it is the one that must not be able to sit under
+        // mtx_ for an unbounded number of KvStore round trips when writes are merely SLOW
+        // rather than failing. The remainder stays staged and the next tick continues it.
+        // Boot, apply_rules and both shutdown flushes stay unbounded: each is a one-shot that
+        // has to drain what it was given.
+        persist_lifecycle_journal_locked(kJournalPersistMaxBatchesPerTick,
+                                        kJournalPersistMaxRecordsPerTick);
     } catch (...) {
         journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -490,6 +500,7 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         s.sent_labels_written = lifecycle_journal_->sent_labels_written();
         s.evicted_sent_unacked = lifecycle_journal_->evicted_sent_unacked();
         s.evicted_without_send_evidence = lifecycle_journal_->evicted_without_send_evidence();
+        s.evicted_unclassified = lifecycle_journal_->evicted_unclassified();
     }
     // maint_exceptions keeps its NAME's meaning: journal work only - the heartbeat's
     // retry-persist plus the drain worker's prune/page, which is where prune/page throws were
@@ -565,7 +576,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // audit-durability gap. Match the B4a maintenance-tick posture: catch here and count it.
     journal_flush.fn = [this] {
         try {
-            persist_lifecycle_journal_locked();
+            persist_lifecycle_journal_locked(kJournalPersistUnbounded,
+                                             kJournalPersistUnbounded);
         } catch (...) {
             journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1262,6 +1274,7 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // The same pointer also drives the worker's journal-maintenance pass (prune + page),
         // relocated off the heartbeat / reconnect threads by C0.
         GuardianMaintenanceConfig maint{.journal = journal};
+        maint.jitter = maintenance_jitter_;
         if (test_page_interval_.count() > 0)
             maint.page_interval = test_page_interval_;
         if (test_prune_interval_.count() > 0)

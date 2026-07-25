@@ -88,6 +88,39 @@ The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bou
 | `yuzu_server_live_requests_total{kind, outcome}` | counter | Live-read requests by `kind` (`uptime` / `processes` / `unknown`) and terminal HTTP `outcome` (`200` / `400` / `403` / `429` / `500` / `502` / `503` / `504`). A rising `outcome="429"` rate means the concurrency cap is shedding load. |
 | `yuzu_server_live_inflight` | gauge | Current in-flight synchronous live-read polls. Approaching the cap (default 4) indicates saturation; sustained at the cap alongside 429s means the live surface is a bottleneck. |
 
+## Engine-principal revalidation-cache metrics
+
+Every held-open SSE stream re-validates its credential on each ~3 s pump tick. For a stream authenticated by an **engine** principal that check consults `EnginePrincipalStore`, and these metrics show whether it is being served from the short-TTL liveness cache (#2367) or reaching Postgres. The cache exists to keep that per-tick load off the connection pool, where it was previously self-amplifying under a pool brownout.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_engine_revalidate_cache_hits_total` | counter | Liveness re-checks answered from cache — no Postgres read. In steady state hits should dominate misses by roughly `TTL / tick`. |
+| `yuzu_server_engine_revalidate_cache_misses_total` | counter | Re-checks that read through to Postgres (cold, expired, or invalidated by a revoke). A rate approaching one per stream per tick means the cache is not doing its job — look for a revoke loop or a clock problem. |
+| `yuzu_server_engine_revalidate_cache_size` | gauge | Principals with a live (unexpired) entry. Bounded by construction; sustained residence at the ceiling means engine-principal churn worth investigating. |
+| `yuzu_server_engine_revalidate_backoff_suppressed_total` | counter | Re-checks answered `StoreUnreachable` from the failure backoff **without** taking a pool lease. **This is the brownout signal**: it only moves while the store is unreachable, and while it moves the per-tick retry amplifier is being held off. Any movement means the store is unreachable — see the `EngineRevalidateStoreUnreachable` alert and `docs/ops-runbooks/engine-principal-store-recovery.md`. Read it alongside `yuzu_pg_acquire_wait_seconds` and `yuzu_mcp_stream_closes_total{reason="auth_unavailable"}` — streams are riding their grace windows and some will end. |
+
+This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
+
+## MCP progress-bridge metrics
+
+The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a
+session's `GET` stream when `execute_instruction` is called with a `_meta.progressToken`
+(see `docs/user-manual/mcp.md`). It is in-memory and bounded (256 correlation records).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_mcp_bridge_records_active` | gauge | Correlation records currently live (global cap 256). Approaching the cap means new progress requests will degrade to the plain path. |
+| `yuzu_mcp_bridge_reject_total{reason}` | counter | Reservation rejections, by closed-set `reason` (`disabled` / `unknown_session` / `shutdown` / `duplicate_request_id` / `global_cap` / `pin_slots`). A rising `global_cap` rate means the bridge is at capacity. |
+| `yuzu_mcp_bridge_degrade_total{reason}` | counter | `execute_instruction` progress requests that silently fell back to the plain (poll) path, by `reason` (`reserve_rejected` - a reservation was rejected, with the finer reason in `reject_total`; `reserve_threw` / `no_execution_row` / `subscribe_failed` / `arm_threw` - an allocation/tracker failure). The plain response is self-sufficient (carries `execution_id`); a non-zero rate is a reliability signal, not an error. |
+| `yuzu_mcp_bridge_listener_failures_total` | counter | Bus-listener copy failures contained at the noexcept boundary (the event was not latched). The durable `execution_id` fetch is the backstop. Should be ~0. |
+| `yuzu_mcp_bridge_mailbox_drops_total` | counter | Oldest-progress frames dropped from a record's bounded 16-slot arming mailbox (a fast producer outrunning the projector); terminals are never dropped. |
+| `yuzu_mcp_bridge_projector_cycles_total` | counter | Projector wake cycles - an event-driven liveness signal. `yuzu_mcp_bridge_records_active > 0` with a flat rate here means the projector thread is wedged. |
+| `yuzu_mcp_stream_terminal_publish_failures_total` | counter | Terminal-frame publish failures seen by the bridge's `publish_final → fallback → poison` ladder. Non-zero means a client-visible result could not be delivered on the stream (recoverable by `execution_id`). Alert-worthy. |
+| `yuzu_mcp_stream_final_unpinned_total` | counter | Committed terminal frames that found no free pin slot and were published **unpinned** (a real terminal is committed rather than lost to preserve a pin). Not expected: the bridge caps streamed records per session at the pin count, so any non-zero value means that admission accounting was violated and the affected final is evictable from the replay ring - still recoverable by `execution_id`. Alert on `> 0`. |
+
+All reason-label sets are closed (every value is a static literal seeded to 0 at boot),
+so `absent()`/`rate()` alerting is meaningful on a healthy server.
+
 ## Pre-flight runner metrics
 
 | Metric | Type | Meaning |
@@ -160,6 +193,14 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
   expr: increase(yuzu_viz_pushed_cap_evictions_total[10m]) > 0
   annotations:
     summary: "FleetTopologyStore is evicting agents at the 100000-entry hard cap — fleet outgrew the cap or a cap-flood attack is in progress"
+
+- alert: EngineRevalidateStoreUnreachable
+  expr: increase(yuzu_server_engine_revalidate_backoff_suppressed_total[10m]) > 0
+  labels:
+    severity: warning
+  annotations:
+    summary: "Engine-principal liveness re-checks are being answered from the failure backoff - the principal store is unreachable and engine streams are riding their grace windows"
+    description: "This counter only moves while the store cannot be reached. First rule out real impact: a flat yuzu_mcp_stream_closes_total{reason=\"auth_unavailable\"} means the backoff is absorbing the blip and no streams have ended. Then correlate with yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use for pool exhaustion. Runbook: docs/ops-runbooks/engine-principal-store-recovery.md."
 
 - alert: VizFleetPushedMapNearCap
   expr: yuzu_viz_pushed_map_size > 80000
@@ -318,6 +359,63 @@ generous fleet-wide. Alert on `increase(yuzu_server_principal_quota_exhausted_to
 if you want notification that an engine principal is regularly hitting its
 cap (may indicate the cap is tuned too low for its workload, or a runaway
 caller).
+
+## Engine-credential confirm metric (#2404)
+
+```
+# HELP yuzu_engine_principal_confirm_total Engine-credential rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded (#2404)
+# TYPE yuzu_engine_principal_confirm_total counter
+yuzu_engine_principal_confirm_total{surface="rest",result="success"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="conflict"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="client_error"} 0
+yuzu_engine_principal_confirm_total{surface="rest",result="transient"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="success"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="conflict"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="client_error"} 0
+yuzu_engine_principal_confirm_total{surface="mcp",result="transient"} 0
+```
+
+All 8 series (the closed `surface` × `result` cross-product) are pre-seeded to
+`0` at startup so `absent()` alerts stay meaningful. The family makes a
+credential-**confirm** retry storm alertable, which `yuzu_http_requests_total`
+cannot show (it has no per-route label). `result` mirrors the shared
+store-error taxonomy (`engine_store_error_class.hpp`): `conflict` is a terminal
+409/kInvalidParams (a replay after the rotation already resolved, a moved-on
+pin, or unresolved rotation metadata — the client must not blindly retry),
+`client_error` is a 400 (more-than-two or non-engine active credentials),
+`transient` is a retryable 503 (store unavailable, lock contention, a persist
+failure, or the ambiguous empty/malformed-pair "no in-flight rotation"), and
+`success` is a completed confirm.
+
+**Scope contract.** Counted only when a confirm reaches `ApiTokenStore::confirm_rotation`
+**or** trips the store-open guard (which increments `result="transient"`);
+pre-store denials — permission, MFA step-up, input validation, and the MCP
+supervised approval-gate's consumed-ticket replay (`approval already used`) —
+are deliberately **excluded**, so the label set stays a fact about store
+outcomes rather than a catch-all endpoint tally. The increment is stamped
+**before** the audit emission, so an audit-store failure cannot suppress it.
+Wired on **both** surfaces (the `surface` label prevents double-count) because
+either a REST or an agentic MCP client can drive the #2404 replay shape.
+
+**Operational, not `event="security"`.** A replay conflict is an expected
+agent-retry pattern, not an attack signal; the counter carries no `principal_id`
+label (bounded cardinality only) — pair it with the
+`engine_principal.credential.confirm` audit rows for per-principal forensics
+(metric-is-the-signal / audit-row-is-the-evidence). A useful alert is
+`increase(yuzu_engine_principal_confirm_total{result="conflict"}[15m]) > <n>`
+to catch a client stuck replaying a resolved confirm, and
+`increase(...{result="transient"}[15m])` for a genuine store-health storm.
+
+**Semantics for alert authors:** this counts confirm **attempts** that reach
+the store, not logical rotations — a client retrying a `transient` blip 20 times
+before it succeeds adds 20 to `transient` for one rotation. Pick the threshold
+`<n>` relative to your fleet's typical retry count, not your rotation cadence.
+Also cross-reference `yuzu_engine_principal_rotation_sweep_failures_total`: a
+`result="conflict"` cluster correlating with a non-zero, sustained sweep-failure
+count is the prolonged-sweep-outage signature (a predecessor's overlap window
+never closes, so a confirm surfaces the `unresolved rotation metadata` state) —
+**inspect the credential before revoking**, since in that state the sole active
+credential is the good survivor.
 
 ## Access review metrics
 
@@ -673,7 +771,7 @@ reading.
 
 **Two meta-signals are the exception.** `yuzu_fleet_guardian_journal_reporting` and
 `..._tag_rejected` are server-owned counts published on **every completed sweep,
-including at `0`**, unlike the 29. Two consequences, and the second is easy to miss:
+including at `0`**, unlike the 30. Two consequences, and the second is easy to miss:
 
 - `_reporting == 0` while `yuzu_fleet_agents_healthy > 0` narrows the pipeline-dark
   question - but only once Guardian is actually deployed, since the sparse writer means
@@ -717,7 +815,7 @@ window later that is population churn, not a new incident.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed under sustained write failure. A **loss** channel - these records never reached the journal. Monitor-only |
+| `yuzu_fleet_guardian_journal_stage_dropped` | gauge | Fleet sum of records dropped at staging - the pending reserve overflowed. A **loss** channel - these records never reached the journal. THREE causes, and they need different responses: sustained write failure (see `_write_failures`); capacity refusal (see `_write_capacity_rejected`); and, since #2299, simply out-running the heartbeat's per-tick persist bounds - up to 4 batches / 1024 records per tick, which in the byte-split regime is the lower figure by far. On that third path `_write_failures` and `_write_capacity_rejected` are both **zero** and nothing is broken; compare `_batches_written`'s rate against the per-tick ceiling before concluding the alert is faulty. Monitor-only |
 | `yuzu_fleet_guardian_journal_stage_failures` | gauge | Fleet sum of disarm records that could not be built post-teardown. A **loss** channel: the lifecycle end of a rule is unrecorded |
 | `yuzu_fleet_guardian_journal_field_rejected` | gauge | Fleet sum of records kept out by a field failing validation (embedded NUL, oversized, non-UTF-8). A **loss** channel and a malformed-input signal |
 | `yuzu_fleet_guardian_journal_clock_rejected` | gauge | Fleet sum of records kept out by a skewed clock (timestamp ≤ 0). A **loss** channel, and the fleet's clock-health canary - a journal timestamp that cannot be trusted is not admissible evidence |
@@ -738,7 +836,8 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_records_paged` | gauge | Fleet sum of journalled records newly enqueued into the replay window. Activity signal for how much backlog is being re-delivered |
 | `yuzu_fleet_guardian_journal_sent_labels` | gauge | Fleet sum of sent-labels written, in **batches** (best-effort delivery evidence). **Not** a valid denominator for the eviction counters despite the matching unit: labels are counted in the current agent process, while evictions cover batches written up to 7 days earlier across a churning fleet, so after a restart the numerator can exceed it. Read as activity, never as a rate base |
 | `yuzu_fleet_guardian_journal_evicted_sent_unacked` | gauge | Fleet sum of **batches** aged out of the journal **with** a sent-label but no ack (each batch holds up to 256 records). **Monitor, do not page**: their records were sent and are very likely stored server-side; only the ack did not come back. Read against its no-evidence sibling |
-| `yuzu_fleet_guardian_journal_evicted_no_send_evidence` | gauge | Fleet sum of **batches** aged out with **no** sent-label - no evidence their records were ever transmitted (each batch holds up to 256 records, so this understates the record count). This is the **integrity-gap** counter: `> 0` suggests lifecycle audit records were lost between endpoint and server. A CC7.3-relevant evidence signal. Treat a rise as a **ticket to investigate**, not an incident-register entry: classification is **best-effort** (a crash between the send and the sent-label write counts a sent batch as no-evidence), so a mass reboot or OTA manufactures a large benign step about a retention window later. Do not escalate until agent-side corroboration or magnitude analysis rules out that artifact class. Monitor-only |
+| `yuzu_fleet_guardian_journal_evicted_no_send_evidence` | gauge | Fleet sum of **batches** aged out with **no** sent-label - no evidence their records were ever transmitted (each batch holds up to 256 records, so this understates the record count). This is the **integrity-gap** counter: `> 0` suggests lifecycle audit records were lost between endpoint and server. A CC7.3-relevant evidence signal. Treat a rise as a **ticket to investigate**, not an incident-register entry: classification is **best-effort** (a crash between the send and the sent-label write counts a sent batch as no-evidence), so a mass reboot or OTA manufactures a large benign step about a retention window later. Do not escalate until agent-side corroboration or magnitude analysis rules out that artifact class. Monitor-only. Since #2299 also cross-check `yuzu_fleet_guardian_journal_quarantined`: corrupt-VALUE quarantine moved to the replay pass, so a corrupt batch the rotation never reaches before it ages out is counted here instead - both are lost evidence, but this no longer separates "never delivered" from "never deliverable". |
+| `yuzu_fleet_guardian_journal_evicted_unclassified` | gauge | Fleet sum of **batches** aged out whose sent/unsent disposition was **permanently unknown** - the third, mutually-exclusive eviction outcome. It exists for accounting exactness: `pruned == evicted_sent_unacked + evicted_no_send_evidence + evicted_unclassified` every pass, which is what lets `_evicted_no_send_evidence` be read as a trustworthy **floor** on lost evidence rather than a value a mid-pass shutdown could silently shrink. **Neither loss nor success.** Three causes: a stop landing mid-pass counts the unclassified remainder here (at most **once** per process lifetime, since the stop latches); an **unreadable** sent-label on the scan-failure fallback (paired with a same-pass `_prune_failures` increment - a repeated climber, unlike the single shutdown bump); and a mid-classification `bad_alloc`, whose remainder lands here while the throw itself is counted as `_maint_exceptions`. Monitor-only. Unit is **batches** of up to 256 records |
 | `yuzu_fleet_guardian_journal_maint_exceptions` | gauge | Fleet sum of exceptions swallowed by the journal maintenance tick (page/flush). Swallowed so maintenance cannot kill the agent - which is exactly why they must be visible here: a climbing value means maintenance is failing silently and the counters beside it are **understating** reality |
 | `yuzu_fleet_guardian_journal_backpressure_drops` | gauge | Fleet sum of lifecycle-audit entries **rejected** at outbox enqueue for capacity. A **loss** channel: arm/disarm still succeeds, but the audit record of it is dropped. A non-zero value means the audit trail is missing lifecycle edges under sustained delivery backpressure |
 | `yuzu_fleet_guardian_send_exceptions` | gauge | Fleet sum of per-entry drain **sends** that threw. Finer-grained than `_drain_exceptions`: one entry couldn't be serialized/sent, so that log's drain stops and jams delivery behind it. Spans the lifecycle log and the general outbox. **Wire key `yuzu.guardian_send_exceptions` (no `_journal_` infix)** |
@@ -747,7 +846,7 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_page_stale_seconds_max` | gauge | Fleet **MAX** (worst endpoint, `_max` suffix - not a sum like the rest of the family; two 30 s-stale agents are not one 60 s-stale agent) of seconds since the drain worker's last non-throwing replay **page** pass, seeded from worker start. A **liveness** gauge for the maintenance loop: a dead worker thread or a permanently-throwing pass grows without bound - which is what makes silent worker death visible at all, since a dead worker's sparse counters just stay absent. Unlike the counters, the wire tag is emitted every heartbeat **including `0`** while the worker is live, and is **absent entirely** while dormant (`prefer_spark` off). Expect it to hover around the 30 s page cadence on a healthy fleet |
 | `yuzu_fleet_guardian_journal_prune_stale_seconds_max` | gauge | Fleet **MAX** of seconds since the drain worker's last non-throwing retention **prune** pass - the prune sibling of `_page_stale_seconds_max`, separate because the cadences differ (120 s vs 30 s) and stall independently. A growing value means retention is not running on some endpoint: the journal grows toward its cap, where writes start being refused (`_write_capacity_rejected`). Expect ~120 s on a healthy fleet. Same emit-including-`0` / absent-while-dormant posture as its page sibling |
 | `yuzu_fleet_guardian_journal_headroom_blocked_seconds_max` | gauge | Fleet **MAX** of the age of the oldest current **headroom-blocked replay-congestion episode** (#2364): somewhere a journal batch could not be placed in the send window for lack of room, continuously since the value's start. Episode-scoped and sampled at pass granularity: clears only after a proven block-free sweep of all of that journal's *candidates* (the batches a replay pass currently considers - unexpired, unquarantined journal batches), resets on agent restart, and a forced (boot/reconnect) pass can start an episode from already-delivered batches - read it as **replay-window congestion**, not proof of unsent loss. Its loss-relevant threshold is the 7-day retention window (604 800 s): an episode approaching that means never-sent records on that endpoint are nearing deletion - read with `_evicted_no_send_evidence`. **Caveat**: a clear can *coincide* with the blocked batch's own terminal eviction (an evicted batch stops being a candidate, so coverage completes) - corroborate a clear against `_evicted_no_send_evidence` before reading it as recovery. **Sparse**: absent means no endpoint is blocked |
-| `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 29 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 29; it does not resolve it. **Counts the 29 counter tags only - an agent reporting only the three `_seconds` age tags does not count here** |
+| `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 30 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 30; it does not resolve it. **Counts the 30 counter tags only - an agent reporting only the three `_seconds` age tags does not count here** |
 | `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 
 ## NVD CVE sync metrics
@@ -888,9 +987,10 @@ path is dormant.
 | `yuzu.guardian_journal_write_capacity_rejected` | Records refused because the journal is at its hard write ceiling. | Check whether prune is failing (`yuzu.guardian_journal_prune_failures`) or the store is unwritable. |
 | `yuzu.guardian_journal_gauge_underflow` | The write-ceiling check read the live size gauge as **negative** - a size-accounting bug. Persist then fails **closed** (RAM staging only) until a prune rebase restores the gauge. `yuzu.guardian_journal_batch_count` clamps the negative to 0, so the journal looks empty while it is actually refusing writes; this tag is the only signal of that state. | Any nonzero is a real bug - capture the agent log and file it. A sustained climb alongside `yuzu.guardian_journal_stage_dropped` means the underflow is now costing records. |
 | `yuzu.guardian_journal_prune_failures` | Retention passes that could not read the journal. | A sustained nonzero value means the shared `kv_store.db` is busy or corrupt. |
-| `yuzu.guardian_journal_page_read_failures` | Replay passes that could not read the journal. | Separate from `prune_failures` on purpose: retention can be succeeding while replay is stalled, in which case records are being deleted on schedule and shipped never. A sustained nonzero value with a healthy `prune_failures` is the worse of the two. |
+| `yuzu.guardian_journal_page_read_failures` | Replay READS that could not read the journal - the candidate scan (at most once per pass) plus, since #2299, each per-candidate value read a pass attempts (bounded by the 128-candidate cap). The unit is failed READS, not failed passes: one pass can add several, so do not read a rate off this as a pass-failure rate. | Separate from `prune_failures` on purpose: retention can be succeeding while replay is stalled, in which case records are being deleted on schedule and shipped never. A sustained nonzero value with a healthy `prune_failures` is the worse of the two. |
 | `yuzu.guardian_journal_clock_jump_skips` | Retention passes that declined to age-evict because the pass would have aged out the ENTIRE journal at once. | NOT an error: the journal deliberately kept evidence it would otherwise have deleted. It fires when such a pass follows one that was not already working off a backlog, so it reports the ONSET of the condition, not every pass of it. The usual cause is a clock that moved - a VM restored from an old snapshot, or a bad NTP correction - but a legitimately long-offline endpoint whose whole (small) journal expired together looks identical. Check the endpoint's clock first. If it jumped forward, replay keeps ATTEMPTING delivery of the survivors either way - the paced ageing-out deliberately stops treating them as unshippable - but the per-pass cap keeps deleting the oldest ones out from under it, and deletion currently outruns replay by roughly five to one. Correcting the clock is what stops that race rather than what starts delivery, and it takes effect on the next retention pass. Expect a burst of redelivered events during a paced ageing-out; the server de-duplicates them. Note the cap applies to AGE only - if the journal is also over its COUNT ceiling, that ceiling is uncapped and trims the oldest batches in a single pass regardless. |
-| `yuzu.guardian_journal_evicted_no_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. A spike alongside `yuzu.guardian_journal_clock_jump_skips` means the endpoint's clock moved rather than that the link was down - check the clock before concluding evidence was genuinely lost. |
+| `yuzu.guardian_journal_evicted_no_send_evidence` | Batches aged out with no record of ever being sent - a possible audit gap. | Correlate with connectivity outages for that endpoint. A spike alongside `yuzu.guardian_journal_clock_jump_skips` means the endpoint's clock moved rather than that the link was down - check the clock before concluding evidence was genuinely lost. Since #2299 also cross-check `yuzu.guardian_journal_quarantined`: quarantine of a corrupt-VALUE batch moved to the replay pass, so a corrupt batch the replay rotation never reaches before it ages out is counted HERE rather than as quarantined. Both are genuinely lost evidence, but on a mass-corruption endpoint this counter no longer separates "never delivered" from "never deliverable". |
+| `yuzu.guardian_journal_evicted_unclassified` | Batches aged out whose sent/unsent disposition was never determined - the third eviction outcome, mutually exclusive with the two above. It makes the eviction accounting exact (`pruned` == the three summed), so `_evicted_no_send_evidence` reads as a floor rather than an undercount. **Neither** an audit gap **nor** a delivered batch. | Read by cause. A single one-off increment coinciding with an agent shutdown is the mid-pass-truncation case (benign, at most once per process lifetime). A value that climbs with `yuzu.guardian_journal_prune_failures` is the unreadable-sent-label case - investigate the shared `kv_store.db` as for that counter. A jump alongside `yuzu.guardian_journal_maint_exceptions` is a mid-classification `bad_alloc` (memory pressure) - the remainder is accounted here and the throw counted there. In-memory only; resets on restart, and the shutdown-skip increment may not survive to a final heartbeat. |
 | `yuzu.guardian_drain_exceptions` | Firewalled throws in the outbox DELIVERY machinery on the drain worker. | Events are buffered but not shipping. Distinct from the journal counter - delivery failing and retention failing need different responses. |
 | `yuzu.guardian_send_exceptions` | Per-entry drain **sends** that threw - finer-grained than `_drain_exceptions`: a single entry could not be serialized/sent, so its log's head is retained and that drain **stops**, jamming delivery behind a permanently-failing entry. Spans the lifecycle log and the general outbox. | A sustained nonzero value with otherwise-healthy streaming means an entry is stuck at the head; capture the agent log for that entry. |
 | `yuzu.guardian_journal_backpressure_drops` | Lifecycle-audit entries **rejected** at outbox enqueue because it was at capacity. A **loss** channel: the arm/disarm still succeeds (the audit trail never blocks a real detection-capability change) but the record of that change is dropped. | A nonzero value means the audit trail is missing lifecycle edges under sustained delivery backpressure - investigate why delivery is not draining. |

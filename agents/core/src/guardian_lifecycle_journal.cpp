@@ -10,8 +10,10 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <expected>
 #include <format>
 #include <limits>
+#include <optional>
 #include <random>
 #include <set>
 #include <unordered_set>
@@ -131,9 +133,11 @@ void GuardianLifecycleJournal::seed_size_gauges_() {
 
 std::size_t
 GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalRecord>> pending,
-                                  std::vector<PersistedBatch>* out_batches) {
+                                  std::vector<PersistedBatch>* out_batches,
+                                  std::size_t max_batches, std::size_t max_records) {
     if (!kv_ || pending.empty())
         return 0;
+    std::size_t batches_this_call = 0;
 
     // `written` is the count of leading pending SLOTS durably committed. The caller passes it
     // to erase_persisted_prefix, so it must map 1:1 to the front of `pending`; snapshot never
@@ -173,7 +177,9 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
                                            std::chrono::system_clock::now().time_since_epoch())
                                            .count();
             const std::string value = serialize_journal_batch(ts_ms, entries);
-            const std::string key = journal_batch_key(boot_nonce_, batch_seq_);
+            // Same ts into the key and the value: the key is what retention and replay ORDER
+            // by (a keys-only scan is the whole point), the value keeps its copy for replay.
+            const std::string key = journal_batch_key(ts_ms, boot_nonce_, batch_seq_);
 
             // Write-side ceiling (review UP-1): retention (prune) is the only shrink path and it
             // can fail indefinitely (chronic SQLITE_BUSY / a corrupt page). Without a write-side
@@ -244,6 +250,24 @@ GuardianLifecycleJournal::persist(std::span<const std::shared_ptr<const JournalR
                         pb.event_ids.push_back(e.event_id);
                     out_batches->push_back(std::move(pb));
                 }
+                // PER-CALL BATCH CAP (C0 flip-checklist item 11). Checked HERE, at the very end
+                // of the Inserted case, and nowhere earlier: everything above - batch_seq_, the
+                // gauges, `i`, `written`, the provenance record - describes a batch that is
+                // already durable. Returning before `written` advances would leave a committed
+                // batch staged and re-persist it under a new key on the next call (a duplicate
+                // durable record); returning before the provenance record would keep durability
+                // but silently drop the sent-label evidence for the batch just written.
+                //
+                // The remainder simply stays staged. That is not a new state: it is exactly what
+                // the Exists and Error circuit-breakers below already produce, and the caller
+                // handles it the same way - it erases the returned prefix and the next tick
+                // re-snapshots the rest.
+                // Whichever bound is reached first. `written` is the record count, so the
+                // record cap is read straight off it.
+                if (max_batches != kJournalPersistUnbounded && ++batches_this_call >= max_batches)
+                    return written;
+                if (max_records != kJournalPersistUnbounded && written >= max_records)
+                    return written;
                 break;
             case KvInsert::Exists:
                 // ~2^-64 boot-nonce+seq collision: DON'T overwrite. Count it, advance the seq
@@ -294,7 +318,7 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     if (inject_fail_reads_.load(std::memory_order_relaxed) > 0) { // test-only injected read fault
         inject_fail_reads_.fetch_sub(1, std::memory_order_relaxed);
         prune_failures_.fetch_add(1, std::memory_order_relaxed);
-        return stats; // read_ok stays false, same as a real list_entries failure
+        return stats; // read_ok stays false, same as a real scan failure
     }
     // #2303 gauge-race fix (rebase-as-delta). Snapshot the gauge count IMMEDIATELY before the
     // scan; after the scan we fetch_add the SIGNED difference (scanned-actual minus this
@@ -307,23 +331,27 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
 
     // TEST-ONLY interleaving seam (#2303 UP-3): fire a simulated concurrent persist AFTER the
     // pre_count snapshot but BEFORE the scan - the window where the inserted row is BOTH seen by
-    // list_entries and carries its own fetch_add (the transient double-count). Null in production.
+    // the scan and carries its own fetch_add (the transient double-count). Null in production.
     if (pre_scan_hook_)
         pre_scan_hook_();
 
-    auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    // KEYS ONLY (#2299 perf-P-1). Everything this pass decides - order, age, size, eviction -
+    // comes from the key and the value's BYTE LENGTH, so it never pays to materialize a single
+    // value. Reading them cost ~670 ms and a +162 MiB transient allocation on a journal at its
+    // byte ceiling, of which 97% was parsing rows the 128-candidate cap then discarded.
+    auto rows = kv_->list_keys_sized(kJournalNamespace, kBatchKeyPrefix);
     if (!rows) {
         prune_failures_.fetch_add(1, std::memory_order_relaxed); // read error: fail-safe, retry next pass
         return stats; // read_ok stays false: the boot barrier will NOT latch on a failed scan (M5)
     }
     stats.read_ok = true;
 
-    // Rebase to what the scan actually observed on disk (all lc: rows, parseable or not); the
+    // Rebase to what the scan actually observed on disk (all lc: rows, well-keyed or not); the
     // quarantine + eviction below then fetch_sub exactly what they REMOVE, so the gauge lands
     // at the true post-prune size without ever taking an absolute snapshot.
     std::int64_t scanned_bytes = 0;
     for (const auto& row : *rows)
-        scanned_bytes += static_cast<std::int64_t>(row.value.size());
+        scanned_bytes += static_cast<std::int64_t>(row.bytes);
     journal_batch_count_.fetch_add(static_cast<std::int64_t>(rows->size()) - pre_count,
                                    std::memory_order_relaxed);
     journal_bytes_.fetch_add(scanned_bytes - pre_bytes, std::memory_order_relaxed);
@@ -341,7 +369,7 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     std::vector<Live> live;
     live.reserve(rows->size());
     for (auto& row : *rows) {
-        // Shutdown mid-scan: this loop issues one rename_key per UNPARSEABLE row, so on a
+        // Shutdown mid-scan: this loop issues one rename_key per MALFORMED-KEY row, so on a
         // corrupted journal it can be up to hard_max_batches_ KvStore writes, each able to
         // block on the 5 s busy timeout. Bailing here is what makes the post-request_stop()
         // exit bounded (#2298 governance sec-M2): GuardianEngine::stop() holds mtx_ across
@@ -351,28 +379,85 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         // next boot re-scans.
         if (stopping_.load(std::memory_order_acquire))
             return stats;
-        auto parsed = parse_journal_batch(row.value);
-        if (!parsed) {
-            // Unparseable → move aside atomically so replay never re-parses it.
+        // Retention now judges a row by its KEY. A key that fails the strict shape check is
+        // corruption - the journal is dormant until the prefer_spark flip, so no key in the
+        // pre-ts format can exist on disk - and it has no trustworthy timestamp, so it cannot
+        // be aged or ordered: quarantine it exactly as an unparseable value used to be.
+        //
+        // A corrupt VALUE under a well-formed key is no longer prune's business. It is
+        // discovered by the replay pass when that batch is actually considered, which is the
+        // only pass that has to read the value at all, and quarantined there (see
+        // page_into_window). Until then the row is an ordinary retention candidate - bounded
+        // by the same age, count and byte ceilings as any other - so a corrupt journal is
+        // still bounded, it is just bounded without paying to parse the whole journal every
+        // 120 s. One observable consequence: under mass corruption a row may now be counted
+        // as `batches_pruned` rather than `quarantined`, depending on which pass reaches it
+        // first.
+        // Two size/shape checks, both from the SCAN alone - no value is read here.
+        //  - a malformed KEY has no trustworthy timestamp, so it can be neither aged nor
+        //    ordered;
+        //  - an IMPLAUSIBLY LARGE value cannot have been written by persist(), and if it is
+        //    left in the candidate set it counts its full size toward the byte ceiling, whose
+        //    eviction is deliberately uncapped - so one such row would evict every older batch
+        //    in a single pass. Before #2299 the value parse caught this incidentally; the size
+        //    check is how the property survives a keys-only prune (Gate 4 UP-1).
+        auto key_ts = parse_journal_batch_key_ts(row.key);
+        const bool implausible_size = row.bytes > kMaxPlausibleJournalValueBytes;
+        if (!key_ts || implausible_size) {
+            // Say WHICH kind of malformed, once per process. The pre-#2299 key shape
+            // (`lc:<nonce>:<seq12>`, no timestamp) cannot legitimately exist - the journal was
+            // dormant when the format changed - but the one place it plausibly turns up is a
+            // dev or UAT box that ran with prefer_spark patched on before the flip, which is
+            // exactly the kind of box doing flip work. Quarantining is right either way;
+            // reporting it as indistinguishable corruption would send someone hunting a
+            // corrupt page instead of recognising a stale journal (governance Gate 3
+            // architect). Delete this branch a release after the flip.
+            if (!key_ts && !old_format_key_warned_ && looks_like_pre_ts_batch_key(row.key)) {
+                old_format_key_warned_ = true;
+                // SANITIZED: the key comes off disk, and on a tampered kv_store.db the nonce
+                // field is unconstrained apart from ':' - so a raw key could carry newlines or
+                // terminal escapes into a forwarded agent log, and be arbitrarily long.
+                // ALLOWLIST printable ASCII rather than denying a list of controls: a denylist
+                // of <0x20 and 0x7F still passes UTF-8-encoded C1 (0xC2 0x9B is CSI, which
+                // xterm and VTE act on), and truncating raw bytes can cut a multi-byte
+                // sequence mid-character and produce invalid UTF-8 that a JSON log forwarder
+                // drops - losing the diagnostic entirely (Gate 8 security).
+                std::string safe;
+                safe.reserve(64);
+                for (const char c : row.key.substr(0, 64)) {
+                    const auto u = static_cast<unsigned char>(c);
+                    safe.push_back((u >= 0x20 && u <= 0x7E) ? c : '?');
+                }
+                if (row.key.size() > 64)
+                    safe += "...";
+                spdlog::warn("Guardian journal: batch key '{}' is in the PRE-TIMESTAMP format. "
+                             "That format was retired while the journal was dormant, so no "
+                             "released agent can have written it - the likely cause is a local "
+                             "build that enabled the spark backend before the cutover. "
+                             "Quarantining it; this is not corrupt-page data loss.",
+                             safe);
+            }
+            // Malformed key → move aside atomically so replay never considers it.
             if (kv_->rename_key(kJournalNamespace, row.key, journal_quarantine_key(row.key)) ==
                 KvRename::Renamed) {
                 quarantined_.fetch_add(1, std::memory_order_relaxed);
                 ++stats.quarantined;
                 // Left the lc: namespace: subtract it from the rebased gauge (RMW, #2303).
                 journal_batch_count_.fetch_sub(1, std::memory_order_relaxed);
-                journal_bytes_.fetch_sub(static_cast<std::int64_t>(row.value.size()),
+                journal_bytes_.fetch_sub(static_cast<std::int64_t>(row.bytes),
                                          std::memory_order_relaxed);
             } else {
                 quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
             }
             continue;
         }
-        live.push_back(Live{row.key, parsed->ts_ms, row.value.size()});
+        live.push_back(Live{row.key, *key_ts, static_cast<std::size_t>(row.bytes)});
     }
 
-    // Oldest-first by (ts_ms, key) - NOT lexical key (the boot-nonce is random) - with batches
-    // stamped implausibly far in the FUTURE ordered FIRST, so the count and byte ceilings shed
-    // them before they shed real evidence.
+    // Oldest-first by (ts_ms, key) - which the ts-leading key format now delivers for free, so
+    // `live` arrives in that order from the scan's ORDER BY key - with batches stamped
+    // implausibly far in the FUTURE ordered FIRST, so the count and byte ceilings shed them
+    // before they shed real evidence.
     //
     // Without that they are immortal: such a batch can never be "too old", and oldest-first
     // count eviction never reaches it either - so once enough exist (a bad RTC, a VM clone, a
@@ -387,14 +472,14 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // the count and byte ceilings were not already going to delete; if the clock is wrong
     // enough that every row looks future, they all compare equal here and the ceilings simply
     // trim in key order.
+    //
+    // A stable PARTITION, not a sort: `live` is already in (ts_ms, key) order, and the only
+    // reordering this rule asks for is "move the future-dated group to the front, each group
+    // keeping its order". A sort would produce the identical sequence at O(n log n) string
+    // comparisons; the partition gets there in one linear pass.
     const std::int64_t future_cutoff = now_ms + kJournalFutureSlackMs;
-    const auto order_key = [future_cutoff](const Live& l) {
-        return l.ts_ms > future_cutoff ? std::numeric_limits<std::int64_t>::min() : l.ts_ms;
-    };
-    std::sort(live.begin(), live.end(), [&order_key](const Live& a, const Live& b) {
-        const auto ka = order_key(a), kb = order_key(b);
-        return ka != kb ? ka < kb : a.key < b.key;
-    });
+    std::stable_partition(live.begin(), live.end(),
+                          [future_cutoff](const Live& l) { return l.ts_ms > future_cutoff; });
 
     // now_ms is used directly. An earlier round clamped it upward with the previous pass's
     // reading, on the theory that a BACKWARD clock step stops age eviction, lets the journal
@@ -521,6 +606,25 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     if (stopping_.load(std::memory_order_acquire))
         return stats;
 
+    // ONE keys-only scan of the sent-label namespace serves both consumers below - the
+    // eviction classifier and the label GC - where the classifier used to issue a separate
+    // point read per evicted key and the GC its own value-materializing scan. Labels are
+    // presence markers, so their values are never needed. Fetched lazily, though note the
+    // label GC below calls it unconditionally - so on a pass that reaches the GC this is one
+    // scan, not zero (the saving is the value materialization, not the round trip).
+    std::optional<std::expected<std::vector<KvKeySize>, KvStoreError>> sent_scan_cache;
+    const auto sent_scan = [&]() -> const std::expected<std::vector<KvKeySize>, KvStoreError>& {
+        if (!sent_scan_cache) {
+            if (inject_fail_prune_sent_scans_.load(std::memory_order_relaxed) > 0) { // test-only
+                inject_fail_prune_sent_scans_.fetch_sub(1, std::memory_order_relaxed);
+                sent_scan_cache = std::unexpected(KvStoreError{"injected sent-scan failure"});
+            } else {
+                sent_scan_cache = kv_->list_keys_sized(kJournalNamespace, kSentKeyPrefix);
+            }
+        }
+        return *sent_scan_cache;
+    };
+
     if (!evict.empty()) {
         // del_keys is one all-or-nothing transaction: a 0 return with a non-empty evict list is
         // a delete FAILURE (review M4). Only AFTER a successful delete do we count the eviction,
@@ -558,22 +662,124 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         // the skew next scan regardless).
         journal_batch_count_.fetch_sub(static_cast<std::int64_t>(n), std::memory_order_relaxed);
         journal_bytes_.fetch_sub(evicted_bytes, std::memory_order_relaxed);
-        for (const auto& key : evict) {
-            // Shutdown mid-classification: the eviction itself is already committed and counted;
-            // only the best-effort sent/unsent split of the REMAINING keys is skipped, one KvStore
-            // read each (C0 #2298 - keeps the drain-worker join prompt on a large evict set).
-            // The remainder is left unclassified, so evicted_sent_unacked_ +
-            // evicted_without_send_evidence_ can under-count batches_pruned_ after a
-            // shutdown. In-memory counters only - no durable evidence is lost - but an
-            // operator comparing them across a restart should expect the gap.
-            if (stopping_.load(std::memory_order_acquire))
-                break;
-            // Best-effort classification: a live entry may age out before its batch key exists,
-            // so absence of a sent-label != "never sent".
-            if (kv_->exists(kJournalNamespace, journal_sent_key_from_batch_key(key)))
-                evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
-            else
-                evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+        // Classify every evicted key into EXACTLY ONE of three dispositions -
+        // evicted_sent_unacked_ / evicted_without_send_evidence_ / evicted_unclassified_ - so
+        // that batches_pruned_ (already advanced by `n` above) == the sum of the three, every
+        // pass (item 3 / sec-M4, #2298 CC7.2). The third bucket is what makes that invariant
+        // exact instead of an undercount: a mid-pass shutdown or an unreadable sent-label must
+        // land the affected keys SOMEWHERE, or evicted_without_send_evidence_ - the audit-gap
+        // signal an auditor reads - would report a SMALLER gap than actually occurred.
+        //
+        // The whole classifier is wrapped so a throw (bad_alloc under memory pressure in the
+        // set build or the per-key string transform) accounts the not-yet-classified remainder
+        // as unclassified before rethrowing to the caller's firewall. Without this the throw
+        // would leave batches_pruned_ counting keys that reached no disposition bucket, and the
+        // "exact" invariant would hold only on non-throwing passes.
+        std::size_t classified = 0;
+        try {
+            // Fires with 0 here (post-delete, pre-shutdown-gate), then with the running count
+            // after each classification. Test-only; null in production.
+            if (prune_classify_hook_)
+                prune_classify_hook_(classified);
+            if (stopping_.load(std::memory_order_acquire)) {
+                // Shutdown after the delete, before classification. Skip the sent-label scan
+                // entirely (one fewer KvStore round trip on the drain-worker join path, #2298
+                // cs-2) and count the WHOLE evict set as unclassified - the gap is reported at
+                // its TRUE size, never a smaller one. The orphaned labels are GC'd by the next
+                // boot's prune, which is idempotent.
+                evicted_unclassified_.fetch_add(evict.size(), std::memory_order_relaxed);
+                classified = evict.size();
+            } else {
+                // Classify from the one keys-only scan rather than a point read per evicted key.
+                std::optional<std::set<std::string>> sent_keys;
+                if (const auto& s = sent_scan(); s.has_value()) {
+                    sent_keys.emplace(); // labels are presence markers; the key set IS the answer
+                    for (const auto& r : *s)
+                        sent_keys->insert(r.key);
+                }
+                bool point_read_failed = false;
+                for (const auto& key : evict) {
+                    // The per-key stop gate is kept on BOTH the in-memory and the fallback path
+                    // (not only the fallback, as an earlier shape had it): the count/byte
+                    // eviction path is uncapped by design, so an abnormally large evict set must
+                    // still let a stop truncate promptly (the surrounding code maintains that
+                    // posture throughout). The remainder is COUNTED, never silently dropped.
+                    if (stopping_.load(std::memory_order_acquire)) {
+                        evicted_unclassified_.fetch_add(evict.size() - classified,
+                                                        std::memory_order_relaxed);
+                        classified = evict.size();
+                        break;
+                    }
+                    // Best-effort classification: a live entry may age out before its batch key
+                    // exists, so absence of a sent-label != "never sent".
+                    //
+                    // SINCE #2299 it also does not mean "was deliverable". A batch with a
+                    // corrupt VALUE under a well-formed key is now quarantined by the REPLAY
+                    // pass rather than by prune, so one the rotation never reaches within its
+                    // retention life is age-evicted here as an ordinary batch - unlabelled, and
+                    // therefore counted as evicted_without_send_evidence. That counter is the
+                    // audit-loss signal, so on a mass-corruption endpoint it now mixes "never
+                    // delivered" with "was never deliverable". Both are genuinely lost evidence,
+                    // which is why this is a reporting caveat rather than a bug; an operator
+                    // diagnosing a spike should read it alongside `quarantined` rather than alone.
+                    const std::string label = journal_sent_key_from_batch_key(key);
+                    if (sent_keys) {
+                        if (sent_keys->count(label))
+                            evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
+                        else
+                            evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+                        ++classified;
+                        if (prune_classify_hook_)
+                            prune_classify_hook_(classified);
+                        continue;
+                    }
+                    // The scan failed. Fall back to a per-key read bounded by the evict set -
+                    // but a FALLIBLE one. exists() answers false for both "absent" and "the
+                    // read failed", and the read here fails for exactly the reason the scan just
+                    // did, so it would report a whole evict set as "no send evidence" - the
+                    // reading an operator is meant to treat as audit loss. A point error is
+                    // counted as a read failure AND classified as UNCLASSIFIED: an unknown
+                    // disposition is not evidence of absence, and it still belongs to a bucket
+                    // so the invariant holds.
+                    std::expected<std::optional<std::string>, KvStoreError> one;
+                    if (inject_fail_prune_sent_reads_.load(std::memory_order_relaxed) > 0) { // test-only
+                        inject_fail_prune_sent_reads_.fetch_sub(1, std::memory_order_relaxed);
+                        one = std::unexpected(KvStoreError{"injected sent-label read failure"});
+                    } else {
+                        one = kv_->get_entry(kJournalNamespace, label);
+                    }
+                    if (!one) {
+                        // Record the pass's read-failure the INSTANT it happens, once (guarded
+                        // by point_read_failed), rather than after the loop. A later key's
+                        // string-build or the caller's classify-hook can throw, and a
+                        // post-loop increment would then be skipped by the catch below - leaving
+                        // this unclassified bump WITHOUT its paired prune_failures signal that
+                        // the docstring and metrics.md promise for an unreadable label
+                        // (Gate 2 sec-INFO / Gate 4 UP-10). Recording it here keeps the pairing
+                        // honest even under a throwing pass; still once per pass, never per key.
+                        if (!point_read_failed)
+                            prune_failures_.fetch_add(1, std::memory_order_relaxed);
+                        point_read_failed = true;
+                        evicted_unclassified_.fetch_add(1, std::memory_order_relaxed);
+                        ++classified;
+                        if (prune_classify_hook_)
+                            prune_classify_hook_(classified);
+                        continue;
+                    }
+                    if (one->has_value())
+                        evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        evicted_without_send_evidence_.fetch_add(1, std::memory_order_relaxed);
+                    ++classified;
+                    if (prune_classify_hook_)
+                        prune_classify_hook_(classified);
+                }
+            }
+        } catch (...) {
+            // Account the not-yet-classified remainder before rethrowing to the caller's
+            // firewall, so the three-way invariant survives a throwing pass too.
+            evicted_unclassified_.fetch_add(evict.size() - classified, std::memory_order_relaxed);
+            throw;
         }
     }
 
@@ -589,13 +795,14 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
 
     // Shutdown: skip the two remaining housekeeping scans (label GC + quarantine bounding). Both
     // are best-effort and idempotent - the next boot's prune redoes them - and each is another
-    // full list_entries + del_keys against a possibly-contended KvStore (C0 #2298).
+    // full scan + del_keys against a possibly-contended KvStore (C0 #2298).
     if (stopping_.load(std::memory_order_acquire))
         return stats;
 
     // Sent-label GC: drop any sent:<...> whose batch no longer survives - an evicted batch's
     // label, or an orphan from a crash between the pop-after-send label write and eviction.
-    if (auto sent = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+    // Reuses the pass's single keys-only sent scan (fetched here if the classifier did not).
+    if (const auto& sent = sent_scan()) {
         // The gate above covered ENTERING this block; a stop can still land during the list
         // itself, and each remaining step is another KvStore round trip (#2298 Sol review).
         if (stopping_.load(std::memory_order_acquire))
@@ -613,12 +820,12 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         return stats; // do not START the quarantine scan
 
     // Bound the quarantine set (drop oldest-by-key; corrupt batches have no trusted ts_ms).
-    if (auto q = kv_->list_entries(kJournalNamespace, kQuarantineKeyPrefix)) {
+    if (auto q = kv_->list_keys_sized(kJournalNamespace, kQuarantineKeyPrefix)) {
         if (q->size() > max_quarantine_ && !stopping_.load(std::memory_order_acquire)) {
             std::vector<std::string> drop;
             const std::size_t excess = q->size() - max_quarantine_;
             for (std::size_t i = 0; i < excess; ++i)
-                drop.push_back((*q)[i].key); // list_entries is key-sorted
+                drop.push_back((*q)[i].key); // the scan is key-sorted
             // Count + warn the shed (review UP-7 / sre): a fleet quietly discarding over-cap
             // corrupt batches was previously invisible - an operator needs to see quarantine churn.
             if (stopping_.load(std::memory_order_acquire))
@@ -688,7 +895,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     }
 
     // Re-check after the boot-prune barrier above: that barrier runs a FULL prune pass, so a
-    // stop can arrive while it is in flight, and this list_entries is page's own heaviest read
+    // stop can arrive while it is in flight, and this scan is page's own heaviest read
     // (#2298 governance cs-2).
     if (stopping_.load(std::memory_order_acquire))
         return stats;
@@ -696,9 +903,22 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     if (inject_fail_page_reads_.load(std::memory_order_relaxed) > 0) { // test-only read fault
         inject_fail_page_reads_.fetch_sub(1, std::memory_order_relaxed);
         page_read_failures_.fetch_add(1, std::memory_order_relaxed);
-        return stats; // same observable as a real list_entries failure below
+        return stats; // same observable as a real scan failure below
     }
-    auto rows = kv_->list_entries(kJournalNamespace, kBatchKeyPrefix);
+    // KEYS ONLY (#2299 perf-P-1). Selection - expiry, ordering, sent-label skip, rotation - is
+    // entirely a function of the key, so the pass reads the VALUE of a candidate only when it
+    // CONSIDERS one: at most kJournalPageMaxBatchesPerPass per pass, against a scan that used
+    // to materialize and parse the whole namespace.
+    //
+    // STANDING INVARIANT, because it is not obvious from here: this pass is now also the ONLY
+    // thing that detects a corrupt VALUE (prune reads no values at all). Corrupt-value
+    // quarantine is therefore a side-effect of replay SCHEDULING - it happens only for
+    // candidates this pass reaches, downstream of the token bucket, the expiry filter and the
+    // sent-label skip. Anything that narrows what page considers narrows integrity coverage
+    // with it, and no test will go red. If replay is ever gated off, rate-limited much harder,
+    // or given a don't-retry set, prune must regain the value check (governance Gate 3
+    // architect).
+    auto rows = kv_->list_keys_sized(kJournalNamespace, kBatchKeyPrefix);
     if (!rows) {
         // Read error: fail-safe, page nothing this pass. Counted separately from prune's own
         // scan failures - a page-side read that fails every pass stops ALL replay while prune
@@ -707,12 +927,16 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         return stats;
     }
 
-    // Order candidates by (ts_ms, key) - NOT lexical key (the boot-nonce is random). Skip
-    // expired batches (prune removes them; don't re-send an aged-out event).
+    // Candidates arrive from the scan already in (ts_ms, key) order - that is what the
+    // ts-leading key format buys - so there is no sort here any more. Skip expired batches
+    // (prune removes them; don't re-send an aged-out event).
     struct Cand {
         std::string key;
-        std::int64_t ts_ms;
-        JournalBatch batch;
+        std::int64_t ts_ms;              ///< from the KEY, authoritative for ordering
+        std::uint64_t bytes = 0;         ///< on-disk value size, for the gauge on removal
+        std::optional<JournalBatch> batch; ///< filled by ensure_batch on first consideration
+        bool unusable = false;           ///< quarantined, vanished, or unreadable this pass
+        bool read_failed = false;        ///< specifically: the value read FAILED (unknown state)
     };
     std::vector<Cand> cands;
     cands.reserve(rows->size());
@@ -726,51 +950,118 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         pruned_cutoff_valid_ ? last_age_cutoff_
                              : now_ms - static_cast<std::int64_t>(retention_days_) * 86400 * 1000;
     for (auto& row : *rows) {
-        // Shutdown mid-scan: this loop can issue one rename_key per corrupt row, so bail rather
-        // than finish quarantining a large journal (C0 #2298). Nothing has been paged yet, so
-        // returning here mutates no window and counts no pass; the next boot re-scans.
+        // Shutdown mid-scan: bail rather than finish walking a large journal (C0 #2298).
+        // Nothing has been paged yet, so returning here mutates no window and counts no pass;
+        // the next boot re-scans.
         if (stopping_.load(std::memory_order_acquire))
             return stats;
-        auto b = parse_journal_batch(row.value);
-        if (!b)
-            continue; // unparseable: prune quarantines it (runs before page via the barrier + tick)
-        if (b->ts_ms < min_ts)
-            continue; // valid but expired: prune evicts it; do not re-send, do not quarantine
-        // Re-validate every record before replay (review M6): a corrupt/tampered v4 row on disk
-        // (enqueued_ns<=0, an oversized/non-UTF-8 field, or a kind other than armed/disarmed)
-        // would poison the server compare into a false Conflict every reconnect -- the exact
-        // failure the M6 MINT gate prevents. QUARANTINE the whole batch (the quarantine unit per
-        // section 2/9) so it is never replayed and the removal is COUNTED, not silently skipped.
-        bool replayable = true;
-        for (const auto& r : b->entries) {
-            if (validate_record(r) != JournalReject::None ||
-                (r.kind != "armed" && r.kind != "disarmed")) {
-                replayable = false;
-                break;
-            }
-        }
-        if (!replayable) {
-            if (kv_->rename_key(kJournalNamespace, row.key, journal_quarantine_key(row.key)) ==
-                KvRename::Renamed) {
-                quarantined_.fetch_add(1, std::memory_order_relaxed);
-                // The row left the lc: namespace here too - keep the running-counter gauges
-                // exact (#2303), matching prune's quarantine fetch_sub. Page does not rebase,
-                // so without this the gauge over-counts the renamed-away row until the next
-                // prune scan (safe direction, but the "RMW exactly what leaves lc:" invariant
-                // must hold on every remover, not just prune).
-                journal_batch_count_.fetch_sub(1, std::memory_order_relaxed);
-                journal_bytes_.fetch_sub(static_cast<std::int64_t>(row.value.size()),
-                                         std::memory_order_relaxed);
-            } else {
-                quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
-            }
-            continue;
-        }
-        cands.push_back(Cand{row.key, b->ts_ms, std::move(*b)});
+        auto key_ts = parse_journal_batch_key_ts(row.key);
+        if (!key_ts)
+            continue; // malformed key: prune quarantines it (barrier + tick both run prune).
+                      // Page deliberately does NOT rename here - it stays write-free for rows
+                      // it will not consider, and prune reaches every row on its own cadence.
+        if (*key_ts < min_ts)
+            continue; // expired: prune evicts it; do not re-send, do not quarantine
+        cands.push_back(
+            Cand{.key = row.key, .ts_ms = *key_ts, .bytes = row.bytes, .batch = std::nullopt});
     }
-    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-        return a.ts_ms != b.ts_ms ? a.ts_ms < b.ts_ms : a.key < b.key;
-    });
+
+    // Lazily read, parse and re-validate ONE candidate's value, at most once per pass. This is
+    // where the value-side work that used to run over the entire namespace now happens - only
+    // for a candidate the pass actually reaches, and memoized so the headroom re-scan below
+    // cannot double it. Returns nullptr when the candidate must not be considered.
+    //
+    // `value_read_failed` is a PASS-level flag, not merely a per-candidate one: see the episode
+    // footer. A failed read leaves that candidate's headroom disposition UNKNOWN, and unknown
+    // is not evidence of "not blocked".
+    bool value_read_failed = false;
+    // A throw here would unwind the whole pass BEFORE page_cursor_ advances past this
+    // candidate, so the next pass restarts on the same row and throws again - a permanent
+    // rotation wedge that starves every batch behind it (Gate 4 unhappy-path UP-2). The
+    // realistic source is a bad_alloc on an oversized value. Treat it exactly like a failed
+    // read: unknown disposition, counted, rotation advances. The pass-level firewall on the
+    // worker stays as the backstop for anything this cannot catch.
+    const auto ensure_batch = [&](Cand& c) -> JournalBatch* {
+        if (c.batch)
+            return &*c.batch;
+        if (c.unusable)
+            return nullptr;
+        try {
+            candidate_value_fetches_.fetch_add(1, std::memory_order_relaxed);
+
+            std::expected<std::optional<std::string>, KvStoreError> got;
+            if (inject_fail_value_reads_.load(std::memory_order_relaxed) > 0) { // test-only fault
+                inject_fail_value_reads_.fetch_sub(1, std::memory_order_relaxed);
+                got = std::unexpected(KvStoreError{"injected value-read failure"});
+            } else {
+                got = kv_->get_entry(kJournalNamespace, c.key);
+            }
+            if (!got) {
+                // The read FAILED. Distinct from absence, and the reason get_entry exists rather
+                // than get(): this candidate's disposition is unknown, so it is neither placed nor
+                // provably block-free. Counted on the page-side read counter, the same signal a
+                // failing candidate scan raises.
+                c.unusable = true;
+                c.read_failed = true;
+                value_read_failed = true;
+                page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
+            }
+            if (!*got) {
+                // ABSENT: the row was evicted or quarantined between the scan and here. It is
+                // definitively gone, which is a known disposition - it waits on no headroom.
+                c.unusable = true;
+                return nullptr;
+            }
+            auto b = parse_journal_batch(**got);
+            // Re-validate every record before replay (review M6): a corrupt/tampered v4 row on disk
+            // (enqueued_ns<=0, an oversized/non-UTF-8 field, or a kind other than armed/disarmed)
+            // would poison the server compare into a false Conflict every reconnect -- the exact
+            // failure the M6 MINT gate prevents. QUARANTINE the whole batch (the quarantine unit per
+            // section 2/9) so it is never replayed and the removal is COUNTED, not silently skipped.
+            //
+            // An UNPARSEABLE value is quarantined here too. It used to be prune's job, but prune no
+            // longer reads values at all, so the pass that does read a value is the pass that must
+            // act on it. Bounded: at most one quarantine per considered candidate per pass, and
+            // retention still bounds a corrupt journal by age, count and bytes meanwhile.
+            bool replayable = b.has_value();
+            if (replayable) {
+                for (const auto& r : b->entries) {
+                    if (validate_record(r) != JournalReject::None ||
+                        (r.kind != "armed" && r.kind != "disarmed")) {
+                        replayable = false;
+                        break;
+                    }
+                }
+            }
+            if (!replayable) {
+                if (kv_->rename_key(kJournalNamespace, c.key, journal_quarantine_key(c.key)) ==
+                    KvRename::Renamed) {
+                    quarantined_.fetch_add(1, std::memory_order_relaxed);
+                    // The row left the lc: namespace here too - keep the running-counter gauges
+                    // exact (#2303), matching prune's quarantine fetch_sub. Page does not rebase,
+                    // so without this the gauge over-counts the renamed-away row until the next
+                    // prune scan (safe direction, but the "RMW exactly what leaves lc:" invariant
+                    // must hold on every remover, not just prune).
+                    journal_batch_count_.fetch_sub(1, std::memory_order_relaxed);
+                    journal_bytes_.fetch_sub(static_cast<std::int64_t>(c.bytes),
+                                             std::memory_order_relaxed);
+                } else {
+                    quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
+                }
+                c.unusable = true;
+                return nullptr;
+            }
+            c.batch = std::move(*b);
+            return &*c.batch;
+        } catch (...) {
+            c.unusable = true;
+            c.read_failed = true; // unknown, NOT provably block-free
+            value_read_failed = true;
+            page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+    };
 
     // Fair rotation (review B2): resume at the first candidate strictly greater than the
     // last-considered (ts_ms, key) and WRAP, so the never-sent tail is reached instead of the
@@ -841,12 +1132,23 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // ingested server-side, on an agent that then neither reboots nor reconnects, is no longer
     // re-offered. That is the case the DEFERRED server ack closes properly; until it lands this
     // is the honest boundary of at-least-once here.
+    // Shutdown before the label scan. This is a full namespace scan able to block on the 5 s
+    // busy timeout, on the thread GuardianEngine::stop() joins while holding mtx_ - the one
+    // heavy KvStore call on this path that the candidate-build loop's gate does not cover,
+    // because that gate is INSIDE the loop above. Prune states the rule for its identical
+    // call: the stopping_ gates must PRECEDE the heavy calls, not merely straddle them
+    // (#2298 governance cs-2). Returning here pages nothing, which is the safe direction.
+    if (stopping_.load(std::memory_order_acquire))
+        return stats;
+
     std::unordered_set<std::string> sent_labels;
     if (!replay_sent) {
-        std::optional<std::vector<KvRow>> labels;
+        // Keys only: a label is a presence marker, so its value was never read even before
+        // #2299 - and skipping a delivered batch now costs no value I/O at all.
+        std::optional<std::vector<KvKeySize>> labels;
         if (inject_fail_sent_scans_.load(std::memory_order_relaxed) > 0) { // test-only fault
             inject_fail_sent_scans_.fetch_sub(1, std::memory_order_relaxed);
-        } else if (auto rows_ok = kv_->list_entries(kJournalNamespace, kSentKeyPrefix)) {
+        } else if (auto rows_ok = kv_->list_keys_sized(kJournalNamespace, kSentKeyPrefix)) {
             labels = std::move(*rows_ok);
         }
         if (labels) {
@@ -891,6 +1193,21 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             page_cursor_ = std::pair{c.ts_ms, c.key}; // advance: never pin the rotation
             continue;
         }
+        // Only now is the value worth reading: this candidate is not expired, not already
+        // delivered, and inside the pass's cap.
+        JournalBatch* batch = ensure_batch(c);
+        if (!batch) {
+            // Quarantined or vanished: a removed batch waits on no headroom, so it must not
+            // pin the episode's coverage set (same rationale as the sent-skip above). But a
+            // candidate whose value could not be READ is different - its disposition is
+            // unknown, and recording unknown as block-free would let the footer clear an
+            // episode while a still-blocking batch went unread. Advance the rotation either
+            // way so a bad row cannot pin it.
+            if (!c.read_failed)
+                note_clean(c.key);
+            page_cursor_ = std::pair{c.ts_ms, c.key};
+            continue;
+        }
         // Check headroom BEFORE building anything. Two reasons (#2298 Gate 4 UP-2 + f-2):
         // try_page_batch's own headroom gate is all-or-nothing per batch, so a full window
         // means every OutboxEntry constructed below - up to 256 per batch, each carrying
@@ -905,7 +1222,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // read would misclassify every later candidate in the pass.
         const std::size_t headroom = rt.lifecycle_headroom();
         const auto id = std::pair{c.ts_ms, c.key};
-        const std::size_t need = net_new_of(c.batch);
+        const std::size_t need = net_new_of(*batch);
         if (need == 0) {
             // Already fully windowed: no work, and emphatically NOT a blockage.
             note_clean(c.key);
@@ -940,7 +1257,40 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 // (#2345 Gate 3 - found independently by three reviewers).
                 std::size_t smallest = need; // seeded from a candidate that does need room
                 for (std::size_t m = n + 1; m < limit; ++m) {
-                    const std::size_t nn = net_new_of(cands[(start + m) % cands.size()].batch);
+                    // Shutdown mid-scan. This loop used to be pure in-memory arithmetic; since
+                    // the value read became lazy it issues a KvStore point read per candidate
+                    // and can issue a quarantine rename, so at the 128 cap it is up to ~127
+                    // round trips each able to block on the 5 s busy timeout - on the thread
+                    // GuardianEngine::stop() is joining while it holds mtx_. Every other
+                    // KvStore-round-trip loop in this file is gated; this one has to be too
+                    // (#2298 bounded-shutdown invariant). Breaking early is safe: `smallest` is
+                    // seeded from `need`, so the pass reports a CONSERVATIVE (larger)
+                    // requirement and the caller merely re-arms later than it might have.
+                    if (stopping_.load(std::memory_order_acquire))
+                        break;
+                    Cand& mc = cands[(start + m) % cands.size()];
+                    // Apply the SAME sent-label filter the outer loop applies. Without it this
+                    // scan reads and parses already-delivered batches - and it runs exactly when
+                    // headroom is 0, the link-down steady state where most candidates carry a
+                    // label, so it degenerated "read only what you might place" into "read the
+                    // whole cap" in the one regime the lazy read was built for. It also folded
+                    // delivered batches into min_blocked_headroom, sizing the caller's re-arm
+                    // against a batch that will never be paged.
+                    //
+                    // NOTE this narrows corrupt-value quarantine a little further (a corrupt
+                    // sent-labelled batch is now caught only on a FORCED pass) - see the
+                    // standing invariant at the head of this function. No corrupt data is
+                    // replayed and nothing is lost; discovery is delayed.
+                    if (!sent_labels.empty() &&
+                        sent_labels.count(journal_sent_key_from_batch_key(mc.key)) != 0)
+                        continue;
+                    // Reads each remaining candidate's value, memoized - so a pass pays for a
+                    // given candidate once whether it is reached here or by the outer loop, and
+                    // the per-pass value-read count stays bounded by the candidate cap.
+                    const JournalBatch* mb = ensure_batch(mc);
+                    if (!mb)
+                        continue; // unreadable/removed: it cannot be the smallest pending need
+                    const std::size_t nn = net_new_of(*mb);
                     if (nn > 0)
                         smallest = std::min(smallest, nn);
                     if (smallest == 1)
@@ -955,13 +1305,13 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         const bool have_token = page_bucket_.ready(now_ms); // refills for elapsed time
 
         std::vector<OutboxEntry> entries;
-        entries.reserve(c.batch.entries.size());
-        for (std::size_t i = 0; i < c.batch.entries.size(); ++i) {
-            const auto& r = c.batch.entries[i];
+        entries.reserve(batch->entries.size());
+        for (std::size_t i = 0; i < batch->entries.size(); ++i) {
+            const auto& r = batch->entries[i];
             OutboxEntry e = OutboxEntry::lifecycle(r.rule_id, r.generation, r.event_id,
                                                    r.enqueued_ns, r.kind, r.guard_type, r.rule_name);
             e.journal_batch_key = c.key; // replay provenance for the sent-label (wire-ignored)
-            e.journal_last_in_batch = (i + 1 == c.batch.entries.size());
+            e.journal_last_in_batch = (i + 1 == batch->entries.size());
             entries.push_back(std::move(e));
         }
         const auto outcome = rt.try_page_batch(std::move(entries));
@@ -1021,6 +1371,13 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     //  - A stop-truncated pass with no blocked observation proves neither state: touch
     //    nothing. (Every earlier return above - no KV, stopping, no token, boot-prune fail,
     //    scan fail - already touches nothing by construction.)
+    //  - Likewise a pass in which any candidate's VALUE READ FAILED. Since #2299 a candidate's
+    //    records are read only when it is considered, so a failed point read leaves that
+    //    candidate's headroom disposition unknown - and unknown is not evidence of block-free.
+    //    Treating it as clean would let a chronically unreadable row complete the coverage set
+    //    and clear a live episode while the batch that is actually blocking went unread. Same
+    //    rule as the slice and the count-vs-set-size doors before it: clear only on positive
+    //    evidence for EVERY current candidate.
     //  - An empty candidate set has nothing to block: clear.
     // Single writer (paging_mutex_ serialises passes); the atomic exists for the lock-free
     // heartbeat read - the heartbeat must never queue behind an in-flight O(journal) pass.
@@ -1032,7 +1389,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                                         .count();
             headroom_blocked_since_steady_ms_.store(now_steady, std::memory_order_relaxed);
         }
-    } else if (!stop_truncated && episode_active) {
+    } else if (!stop_truncated && !value_read_failed && episode_active) {
         bool covered = true; // empty set: trivially covered -> clear
         for (const Cand& c : cands) {
             if (clean_keys_since_block_.count(c.key) == 0) {
@@ -1044,6 +1401,30 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             headroom_blocked_since_steady_ms_.store(-1, std::memory_order_relaxed);
             clean_keys_since_block_.clear(); // release the epoch's memory
         }
+    }
+    // Bound the coverage set to keys that still EXIST, whatever the branch above decided.
+    // Neither branch runs on a pass that proves nothing (stop-truncated, or one where a value
+    // read failed), so an episode held open by a chronically unreadable row would otherwise
+    // accumulate every newly-persisted key forever, and never release the keys of batches
+    // retention has already deleted - a slow leak reclaimed only by restart. This is exact,
+    // not a heuristic: an `lc:` key never returns once it leaves the namespace, so a key
+    // absent from this pass's scan can never be required for coverage again. It also cannot
+    // change the decision above - that reads only keys that ARE current candidates.
+    //
+    // Binary-searched over the scan rather than copied into a set: `*rows` is already
+    // ORDER BY key, and this runs on every pass with a live episode - i.e. exactly the
+    // congestion regime whose peak memory this change exists to reduce, so allocating a full
+    // copy of every key here would give some of that back (Gate 8 security).
+    if (!clean_keys_since_block_.empty()) {
+        std::erase_if(clean_keys_since_block_, [&](const std::string& k) {
+            return !std::binary_search(rows->begin(), rows->end(), k,
+                                       [](const auto& a, const auto& b) {
+                                           if constexpr (std::is_same_v<decltype(a), const KvKeySize&>)
+                                               return a.key < b;
+                                           else
+                                               return a < b.key;
+                                       });
+        });
     }
 
     pages_.fetch_add(1, std::memory_order_relaxed);

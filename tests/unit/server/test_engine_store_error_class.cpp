@@ -10,8 +10,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-using yuzu::server::detail::EngineStoreErrorClass;
+#include <string_view>
+
 using yuzu::server::detail::classify_engine_store_error;
+using yuzu::server::detail::confirm_result_label;
+using yuzu::server::detail::EngineStoreErrorClass;
 
 TEST_CASE("classify_engine_store_error: transient / conflict / client classes",
           "[engine_store_error]") {
@@ -62,4 +65,50 @@ TEST_CASE("classify_engine_store_error: transient / conflict / client classes",
 
     // #2384: the confirm token_id input guard is a permanent client error.
     CHECK(classify_engine_store_error("token_id required") == E::ClientValidation);
+}
+
+TEST_CASE("classify_engine_store_error: #2404 confirm-replay terminal strings",
+          "[engine_store_error]") {
+    using E = EngineStoreErrorClass;
+
+    // The confirm-replay conflicts (emitted only after a POSITIVE row read, so
+    // terminal — a client must not blindly retry them). All four MUST classify
+    // as Conflict, and none may collide with the transient/client arms.
+    CHECK(classify_engine_store_error(
+              "rotation already confirmed - the supplied token_id is the sole active "
+              "credential; nothing to confirm") == E::Conflict);
+    CHECK(classify_engine_store_error(
+              "no rotation in flight - the supplied token_id is already the sole active "
+              "credential; nothing to confirm") == E::Conflict);
+    CHECK(classify_engine_store_error(
+              "no rotation in flight for the supplied token_id - the rotation was resolved "
+              "(confirmed, revoked, or cut over); rotate again if a new rotation is needed") ==
+          E::Conflict);
+    CHECK(classify_engine_store_error(
+              "one active credential with unresolved rotation metadata - inspect the "
+              "credential state and do not rotate; revoke only if it is confirmed stale") ==
+          E::Conflict);
+
+    // The >2-active confirm string is a permanent client condition (mirrors
+    // rotate's), not a conflict.
+    CHECK(classify_engine_store_error(
+              "more than two active credentials for this principal - resolve manually "
+              "before confirming") == E::ClientValidation);
+
+    // REGRESSION (load-bearing): the deliberately-ambiguous 0-active/malformed-pair
+    // string MUST stay Transient — the #2404 conflict needles must not have
+    // widened to swallow it (that would turn a retryable read hiccup into a
+    // terminal 409, the opposite failure).
+    CHECK(classify_engine_store_error("no in-flight rotation to confirm") == E::Transient);
+}
+
+TEST_CASE("confirm_result_label maps every class to a pre-seeded metric label",
+          "[engine_store_error]") {
+    using E = EngineStoreErrorClass;
+    // The three failure labels must exactly match the closed set pre-seeded in
+    // server.cpp (surface x {success,conflict,client_error,transient}); `success`
+    // is stamped by the caller, not this function.
+    CHECK(std::string_view(confirm_result_label(E::ClientValidation)) == "client_error");
+    CHECK(std::string_view(confirm_result_label(E::Conflict)) == "conflict");
+    CHECK(std::string_view(confirm_result_label(E::Transient)) == "transient");
 }

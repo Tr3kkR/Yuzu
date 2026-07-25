@@ -15,6 +15,11 @@
 /// so the specific conflict matches MUST be tested before the broad transient
 /// ones. None of the client-validation substrings contain a transient
 /// substring, so they are safely tested last, before the retryable default.
+///
+/// POSITIVE-READ EXEMPTION (#2404, detailed at step 3): the confirm-replay
+/// conflict strings are emitted only after a non-empty active-credential read,
+/// so — unlike the deliberately-transient "no in-flight rotation to confirm"
+/// (0-active, ambiguous with a swallowed read failure) — they are terminal.
 
 #include <string>
 #include <string_view>
@@ -43,8 +48,19 @@ enum class EngineStoreErrorClass {
     //    "does not match the pending rotation": the confirm token_id pin
     //    (#2384) — a stale/wrong successor id, i.e. the rotation state has
     //    moved on. 409, don't blindly retry with the same id.
+    //    The #2404 confirm-replay strings are terminal conflicts too: they are
+    //    emitted ONLY after a POSITIVE row read (a non-empty active set — see
+    //    rotation_confirm_state.hpp), so unlike the transient "no in-flight
+    //    rotation to confirm" (0-active, ambiguous with a swallowed read
+    //    failure) they carry no read-failure ambiguity and must not be retried:
+    //      "sole active credential"       -> already confirmed / already resolved (pin match);
+    //      "the rotation was resolved"    -> a different credential survives (pin mismatch, 1 active);
+    //      "unresolved rotation metadata" -> a best-effort pair-resolve left stale linkage (#2404 F1).
+    //    None contains a broad transient substring ("not open"/"unavailable"/
+    //    "rotation lock"), so their placement here (before step 5) is safe.
     if (has("grace window elapsed") || has("different operator") ||
-        has("does not match the pending rotation"))
+        has("does not match the pending rotation") || has("sole active credential") ||
+        has("the rotation was resolved") || has("unresolved rotation metadata"))
         return EngineStoreErrorClass::Conflict;
 
     // 4. Advisory-lock contention — transient/retryable.
@@ -111,6 +127,24 @@ enum class EngineStoreErrorClass {
     //    is far more likely a transient infrastructure failure than a client
     //    error — fail SAFE (retryable), never a misleading 400/kInvalidParams.
     return EngineStoreErrorClass::Transient;
+}
+
+/// Metric `result`-label for a store error class, shared by the REST and MCP
+/// confirm handlers so `yuzu_engine_principal_confirm_total{result=...}` reads
+/// identically on both surfaces (#2404). `success` is stamped by the caller on
+/// the ok path; this maps only the failure classes. The four labels
+/// (success|conflict|client_error|transient) are the closed set pre-seeded in
+/// server.cpp — keep the two in sync.
+[[nodiscard]] inline const char* confirm_result_label(EngineStoreErrorClass cls) {
+    switch (cls) {
+    case EngineStoreErrorClass::ClientValidation:
+        return "client_error";
+    case EngineStoreErrorClass::Conflict:
+        return "conflict";
+    case EngineStoreErrorClass::Transient:
+        return "transient";
+    }
+    return "transient"; // unreachable — all enum cases return above
 }
 
 } // namespace yuzu::server::detail

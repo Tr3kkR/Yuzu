@@ -7,6 +7,7 @@
  */
 
 #include "management_group_store.hpp"
+#include "mcp_server_testonly.hpp" // rbac_ops/securables_for_test (#2383 mirror binding)
 #include "migration_runner.hpp"
 #include "rbac_store.hpp"
 
@@ -83,6 +84,24 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
     // distribute-rules-to-fleet operation; design v1.1 §9.2), Attest (added
     // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off).
     REQUIRE(ops.size() == 7);
+}
+
+// #2383 (governance C-3/UP-6): the MCP C8 boot validator carries closed-catalogue
+// MIRRORS of this store's seeded `ops[]` and `types[]` (kRbacOps /
+// kRbacSecurables in mcp_server.cpp). This test binds mirror to seed by NAME,
+// both directions, so adding/removing an operation or securable in one place
+// without the other fails here instead of drifting silently.
+TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
+          "[rbac_store][mcp][2g]") {
+    RbacStore store(":memory:");
+
+    auto sorted = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    CHECK(sorted(store.list_operations()) == sorted(yuzu::server::mcp::rbac_ops_for_test()));
+    CHECK(sorted(store.list_securable_types()) ==
+          sorted(yuzu::server::mcp::rbac_securables_for_test()));
 }
 
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {

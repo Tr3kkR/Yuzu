@@ -199,8 +199,9 @@ change: a notification POST now answers `202` instead of `204`).
   own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
   tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
   stream simply does not exist on another replica; the bound above is an API-token
-  property.) Streams end with a final
-  `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
+  property.) Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+  carried as a normal `message` on the stream (not a bespoke `event: stream-closed` frame),
+  whose `params` carry the reason in an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
   auth store was unreachable for longer than the **60 s** grace window — the stream is not
   cut the instant the store hiccups, but the exposure is bounded: a revoked credential
@@ -208,9 +209,23 @@ change: a notification POST now answers `202` instead of `204`).
   Streams are held open, so a proxy in front of Yuzu must not buffer them. The server
   sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare
   need their own response-buffering opt-out.
-  In this release the channel carries heartbeats and replayed frames;
-  `notifications/progress` for long-running tools arrives in the next 2f rung (see
-  `docs/mcp-server.md`).
+  **Live progress (`notifications/progress`).** Call `execute_instruction` on a
+  Streamable-HTTP session with a `_meta.progressToken` (a string ≤512 bytes, or an
+  integer) in the `tools/call` params, and as the fleet responds the server pushes
+  `notifications/progress` frames onto *this session's `GET` stream*: `params.progress`
+  = agents responded, `params.total` = agents targeted, `params.progressToken` echoed
+  verbatim, and `params._meta["yuzu.execution_id"]` carrying the durable handle. The
+  token is opaque and echoed unchanged; anything that is not a string ≤512 bytes or an
+  integer is treated as "no progress requested". You will typically see an immediate
+  `0/N` frame (emitted as soon as the target count is known) followed by frames as
+  agents report in; these frames are part of the same per-session ring, so
+  **`Last-Event-ID` resume replays missed progress frames** exactly like any other.
+  Progress is **best-effort**: even after supplying a token you MUST still be prepared
+  to poll (`query_responses` / `get_execution_status`) - a reservation can silently
+  degrade to the plain path under load (e.g. the 256-record cap), and zero progress
+  frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
+  **not** emit progress (poll `get_bundle_result`). Progress delivery is on the `GET`
+  stream only in this release; SSE-on-`POST` arrives in a later 2f rung.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
@@ -360,7 +375,10 @@ for the tool to execute.
 > `token_id` a required argument, pinning the confirm to the exact pending
 > rotation — a stale id is rejected with no state change — so its
 > `idempotentHint` is corrected back to `true`. `destructiveHint` stays
-> `true`.)*
+> `true`. #2404 preserves `idempotentHint:true`: a replay after the rotation
+> resolved still writes nothing, it just returns a **terminal** already-confirmed
+> / already-resolved conflict instead of a retryable error, so a hint-honouring
+> client stops rather than looping.)*
 >
 > Because MCP advertises `tools.listChanged:false`, an already-connected client
 > that cached `tools/list` keeps the old (pre-fix) hints until it reconnects —
@@ -433,7 +451,7 @@ for the tool to execute.
 | 58 | `revoke_engine_principal` | Terminally revoke an engine principal: revokes every active credential first, then flips `lifecycle_state` to revoked. TERMINAL and irreversible — a false-positive response mints a successor principal instead. Mirrors `DELETE /api/v1/engine-principals/{id}`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 59 | `mint_engine_credential` | Mint the FIRST credential for an engine principal (minted credential is hard-locked to MCP tier `readonly`, 90-day ceiling — design doc §7/§8). Returns the raw credential value exactly once; use `rotate_engine_credential` once a credential already exists (a second mint call errors). Mirrors `POST /api/v1/engine-principals/{id}/credentials`. Destructive — live credential issuance; requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 60 | `rotate_engine_credential` | Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): mints a successor (both credentials valid during a default/minimum 7-day overlap, 24h floor — rejected outright, never truncated, below it), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal, original or replay, is independently audited as `engine_principal.credential.reveal`); once the grace window lapses a re-call errors. Mirrors `POST /api/v1/engine-principals/{id}/credentials/rotate`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
-| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. **Requires the successor `token_id` the rotate call returned** — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change (#2384), so a blind retry can never confirm a later rotation. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. **Requires the successor `token_id` the rotate call returned** — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change (#2384), so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error, so a client honouring `idempotentHint` stops instead of looping (#2404); an exact supervised replay carrying the same consumed `approval_id` is denied even earlier at the approval gate. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 62 | `transfer_engine_principal_owner` | Reassign an engine principal's named responsible owner. Admin-forced — independent of the outgoing owner's cooperation. `new_owner` is FK-validated against the user store. Mirrors `POST /api/v1/engine-principals/{id}/transfer-owner`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 63 | `audit_engine_no_admin` | Auditor-runnable proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — joins `principal_type=engine` against each principal's resolved role assignments AND effective permissions, and reports any violating row (literal admin/system role, or a full securable × operation wildcard grant). A `503`/internal-error result means the RBAC reference data needed to compute the wildcard bound could not be resolved — treat as "unable to verify," never as "clean." Mirrors `GET /api/v1/engine-principals/audit/no-admin` exactly (same checks — the two auditors must never diverge). | `AuditLog:Read` |
 | 64 | `export_access_review` (SOC 2 CC6.2) | Stateless cross-principal grant export — every user/group/engine-principal's **direct** role grants right now, with `effective_permission_count`, last activity, `classification`, `lifecycle_state`, and `source` (provenance). Mirrors `GET /api/v1/access-reviews/export` exactly, JSON only (the REST twin's `?format=csv` has no MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately gated on a **global** `AccessReview:Read`, not a management-group-confined read — a scoped slice would be useless as fleet-wide CC6.2 evidence (#2225). Self-audited as `access_review.exported`. | `AccessReview:Read` |
@@ -541,6 +559,20 @@ for the tool to execute.
 Tools accept parameters via the `arguments` object in the `tools/call` request.
 Required parameters are validated server-side; missing required fields return a
 `-32602 Invalid params` error.
+
+For **approval-gated tools**, arguments are additionally validated against the
+tool's published `inputSchema` (from `tools/list`) *before* any approval-ticket
+work (#2405): a call with missing, mistyped, or out-of-bounds arguments (per
+the published `inputSchema`) answers `-32602` immediately — it never creates an approval
+request, and a re-call carrying an `approval_id` with schema-invalid arguments
+never consumes the ticket. (Semantic checks the schema cannot express — an
+unknown plugin name, a nonexistent agent — still happen in the handler and are
+not pre-empted by this gate.) The error
+message names the offending field as a JSON-pointer-style path (e.g.
+`/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
+confirming no ticket was created or consumed. Two strictness notes: `integer`
+parameters must be JSON integers (an integral float like `1.0` is rejected),
+and `maxLength` limits are byte counts.
 
 **Examples of key parameters:**
 
@@ -691,7 +723,14 @@ proposes.
 
 1. The AI assistant calls a tool that requires approval (e.g., executing an
    instruction on the `supervised` tier, or `delete_tag` on `operator`).
-2. The MCP server creates an **approval request** with status `pending`
+2. The server validates the arguments against the tool's `inputSchema`
+   **first** (#2405): schema-invalid arguments answer `-32602` with no
+   approval request created — an admin's approval can no longer be wasted on
+   a call that fails schema validation, and a recall with schema-invalid
+   arguments cannot burn its one-time ticket. Arguments that pass the schema
+   but fail a handler's semantic check (e.g. an unknown plugin/action name)
+   are unaffected by this gate and can still consume a ticket. Then the MCP
+   server creates an **approval request** with status `pending`
    (`definition_id = "mcp.<tool>"`, the tool arguments captured as the
    canonical scope expression).
 3. The server returns a JSON-RPC error with code `-32006` (`ApprovalRequired`)
@@ -955,6 +994,21 @@ second).
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
 
+### -32014: Streamed result no longer buffered
+
+**Symptom**: On a `GET`-stream resume you receive a JSON-RPC error frame with code
+`-32014` echoing a request id, its A4 `error.data` carrying the `execution_id` and a
+"fetch by execution_id" remediation.
+
+**Cause**: The server force-expired a parked streamed result under memory pressure
+before it could be delivered on the stream (the buffered-result population hit its cap).
+The real result was never lost - only its *streamed* copy was dropped.
+
+**Fix**: Fetch the result durably with the supplied `execution_id`
+(`get_execution_status` / `query_responses`). This code cannot occur for
+`execute_instruction` progress in the current release (the parked-result path activates
+with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
+
 ### -32004: MCP tier does not allow this operation
 
 **Symptom**: A tool call returns error code `-32004`.
@@ -1019,10 +1073,17 @@ recall once it is approved.
 
 **Cause**: A required parameter is missing or invalid. For example, calling
 `get_agent_details` without `agent_id`, or calling `query_responses` with
-neither `execution_id` nor `instruction_id`.
+neither `execution_id` nor `instruction_id`. For an approval-gated tool this
+can also fire on a **recall** carrying `approval_id`: if the arguments fail
+schema validation the call is denied `-32602` immediately, before the ticket
+is even looked up (nothing consumed) — distinct from `-32003`'s "arguments
+don't match the ticket", which applies only to schema-*valid* mismatched
+arguments (#2405).
 
-**Fix**: Include all required parameters in the `arguments` object. See the
-[Available Tools](#available-tools) section for parameter requirements.
+**Fix**: Include all required parameters in the `arguments` object, typed as
+the tool's `inputSchema` declares (integers must be JSON integers — `1.0` is
+rejected). See the [Available Tools](#available-tools) section for parameter
+requirements.
 
 ### MCP client cannot connect
 

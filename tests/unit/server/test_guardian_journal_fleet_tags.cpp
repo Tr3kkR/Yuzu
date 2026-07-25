@@ -70,7 +70,7 @@ static_assert(std::has_unique_object_representations_v<GuardianJournalStats>,
 // are deliberately separate structs/tables (SUM vs MAX rollup, sparse vs
 // emit-including-0 - see both headers), so each carries its own pin: an age added to
 // GuardianJournalAgeStats without a kGuardianJournalAgeMetrics row is a build break
-// here, and it must never be "fixed" by squeezing the age into the 29-counter table.
+// here, and it must never be "fixed" by squeezing the age into the 30-counter table.
 static_assert(sizeof(GuardianJournalAgeStats) ==
                   detail::kNGuardianJournalAgeMetrics * sizeof(std::uint64_t),
               "GuardianJournalAgeStats field count != kGuardianJournalAgeMetrics row count "
@@ -116,6 +116,7 @@ GuardianJournalStats all_nonzero_stats() {
     s.sweep_exceptions = 26;
     s.send_exceptions = 28;
     s.lifecycle_backpressure_drops = 29;
+    s.evicted_unclassified = 30;
     return s;
 }
 
@@ -176,6 +177,7 @@ TEST_CASE("guardian journal: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_sweep_exceptions", "26"},
         {"yuzu.guardian_send_exceptions", "28"},
         {"yuzu.guardian_journal_backpressure_drops", "29"},
+        {"yuzu.guardian_journal_evicted_unclassified", "30"},
     };
     // Per-key, NOT `CHECK(tags == expected)`. Catch2 has no StringMaker for
     // std::pair and neither CATCH_CONFIG_ENABLE_PAIR_STRINGMAKER nor

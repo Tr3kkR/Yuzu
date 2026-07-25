@@ -164,7 +164,7 @@ struct JournalRig {
                 .event_id = "e-" + tag + "-" + std::to_string(i),
                 .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                 .guard_type = "file", .rule_name = "n"}));
-        REQUIRE(journal->persist(pending) == n);
+        REQUIRE(journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == n);
     }
     /// Persist one record as its own durable batch (one persist call = one batch key),
     /// WITHOUT going through the runtime - so the only way it can reach the send window
@@ -175,7 +175,7 @@ struct JournalRig {
                 JournalRecord{.rule_id = rule, .generation = 1, .event_id = "e-" + rule,
                               .enqueued_ns = 1'700'000'000'000'000'000, .kind = "armed",
                               .guard_type = "file", .rule_name = "n"})};
-        REQUIRE(journal->persist(pending) == 1);
+        REQUIRE(journal->persist(pending, nullptr, kJournalPersistUnbounded, kJournalPersistUnbounded) == 1);
     }
 };
 
@@ -667,6 +667,55 @@ TEST_CASE("item 6 stamps + episode age: lock-free readers race a live worker (TS
     CHECK(age == 0); // nothing blocked in this rig
 }
 
+TEST_CASE("item 13: a throw in loop()'s tail reaches the top-level catch, is counted, joins clean",
+          "[spark][guardian][drain][maint]") {
+    // The loop's own tail (the refill re-arm's rt_.lifecycle_headroom() call - std::mutex::lock
+    // can throw - and the cadence arithmetic) sits OUTSIDE every inner firewall. Nothing in
+    // production can make it throw, so the thread lambda's top-level catch and its
+    // journal_maint_exceptions_ increment were unexercised (flip item 13). The seam injects a
+    // one-shot throw there and this proves the escape is caught, counted once, and the worker
+    // terminates so stop() still joins cleanly.
+    //
+    // MUTATION EVIDENCE (run at verify time, not asserted here):
+    //   (a) remove the thread lambda's top-level catch -> the injected throw escapes a bare
+    //       thread -> std::terminate -> the whole suite process dies (the strongest proof the
+    //       catch is load-bearing);
+    //   (b) remove the catch's journal_maint_exceptions_.fetch_add -> spin_until below never
+    //       reaches 1 and times out -> red.
+    // In this rig nothing in MAINTENANCE throws, so the only thing that can drive the counter
+    // to 1 is the top-level catch - which is what makes (b) a clean pin despite the counter
+    // being shared with the inner firewalls.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    // Armed BEFORE start(): thread creation is the happens-before edge, so the worker's first
+    // cycle observes it without a data race.
+    worker.inject_loop_tail_throw_for_test();
+    CHECK(worker.last_page_success_steady_ms() == 0); // not started yet
+
+    worker.start();
+    // The first cycle runs maintenance (both 0ms-due passes succeed and stamp), then the tail
+    // throws and the loop dies - so the count settles at exactly 1 and never moves again.
+    CHECK(spin_until([&] { return worker.journal_maint_exception_count() == 1; }));
+
+    // The worker is dead: its success stamps are seeded/advanced (> 0) and now FROZEN, which is
+    // exactly the ever-growing-age liveness contract item 6 reads off a dead worker.
+    const auto page_ms = worker.last_page_success_steady_ms();
+    const auto prune_ms = worker.last_prune_success_steady_ms();
+    CHECK(page_ms > 0);
+    CHECK(prune_ms > 0);
+    CHECK(worker.drain_exception_count() == 0); // the DRAIN firewall was not tripped
+
+    worker.stop(); // must still join cleanly despite the dead loop
+    CHECK(worker.journal_maint_exception_count() == 1);       // one-shot: never a second throw
+    CHECK(worker.last_page_success_steady_ms() == page_ms);   // frozen - the loop is gone
+    CHECK(worker.last_prune_success_steady_ms() == prune_ms);
+}
+
 TEST_CASE("a throwing send does not suppress journal maintenance (independent firewalls)",
           "[spark][guardian][drain][maint]") {
     JournalRig rig;
@@ -725,7 +774,7 @@ TEST_CASE("a running worker's maintenance races a persister + reconnect kicks (T
             if (pending.empty())
                 continue;
             std::vector<PersistedBatch> batches;
-            const std::size_t written = rig.journal->persist(pending, &batches);
+            const std::size_t written = rig.journal->persist(pending, &batches, kJournalPersistUnbounded, kJournalPersistUnbounded);
             if (written > 0) {
                 rig.rt->erase_persisted_prefix(written, snap.drops_at_snapshot);
                 for (const auto& b : batches)
@@ -931,7 +980,7 @@ TEST_CASE("a link-down/reconnect cycle with REAL Retain semantics loses nothing"
                 auto& pending = snap.records;
         if (!pending.empty()) {
             std::vector<PersistedBatch> batches;
-            const std::size_t written = rig.journal->persist(pending, &batches);
+            const std::size_t written = rig.journal->persist(pending, &batches, kJournalPersistUnbounded, kJournalPersistUnbounded);
             if (written > 0)
                 rig.rt->erase_persisted_prefix(written, snap.drops_at_snapshot);
         }
@@ -1737,7 +1786,7 @@ TEST_CASE("a batch repeating an event_id is sized by its distinct records",
     // persist() never writes such a row, which is exactly why this needs writing by hand.
     // RED without the de-duplication: the batch is reported blocked and pages nothing.
     JournalRig rig;
-    const auto key = std::string{kBatchKeyPrefix} + "dup:000000000001";
+    const auto key = journal_batch_key(1'700'000'000'000LL, "dup", 1);
     const std::string row =
         R"({"v":4,"ts_ms":1700000000000,"entries":[)"
         R"({"rule_id":"r","event_id":"dup","kind":"armed","guard_type":"file","rule_name":"n",)"
@@ -1901,4 +1950,176 @@ TEST_CASE("CH-11: a failed sent-label scan falls back to re-offering, and says s
     CHECK(rig.journal->sent_scan_failures() == 1);
     CHECK(degraded.skipped_already_sent == 0); // skipped nothing...
     CHECK(degraded.records_paged == 2);        // ...and re-offered, the safe direction
+}
+
+// ── Maintenance phase + forced-page jitter (C0 flip-checklist item 12) ─────────
+
+TEST_CASE("guardian_jitter_offset is uniform over [0, upper) and safe at zero",
+          "[spark][guardian][drain][maint]") {
+    std::mt19937 rng(12345);
+    for (int i = 0; i < 500; ++i) {
+        const auto off = guardian_jitter_offset(rng, 30'000ms);
+        CHECK(off >= 0ms);
+        CHECK(off < 30'000ms); // half-open: an offset of a full interval is a whole skipped pass
+    }
+    // A zero interval means "no cadence", not "divide by zero".
+    CHECK(guardian_jitter_offset(rng, 0ms) == 0ms);
+    CHECK(guardian_jitter_offset(rng, -5ms) == 0ms);
+
+    // Two agents seeded differently must not draw the same SEQUENCE - the entire point.
+    // Compared as a sequence, not a single draw: uniform_int_distribution's mapping is
+    // implementation-defined, so "seed 1 and seed 2 differ on their first draw" is a property
+    // of one STL and one collision (~1/30000) away from a cross-toolchain failure that no
+    // code change would explain.
+    std::mt19937 a(1), b(2);
+    std::vector<std::chrono::milliseconds> sa, sb;
+    for (int i = 0; i < 8; ++i) {
+        sa.push_back(guardian_jitter_offset(a, 30'000ms));
+        sb.push_back(guardian_jitter_offset(b, 30'000ms));
+    }
+    CHECK(sa != sb);
+}
+
+TEST_CASE("jitter DEFERS a forced page rather than dropping it",
+          "[spark][guardian][drain][maint]") {
+    // The forced page is the correlated one: a gateway bounce or a mass restart hands every
+    // agent a boot/reconnect replay - a full journal scan plus a token burst - in the same
+    // second. Jitter must spread that WITHOUT ever losing a kick, so the deadline is observed
+    // through the seam rather than by asserting a wall-clock upper bound on the work.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h, // only a FORCED page can fire
+                                      .prune_interval = 1h,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(4242);
+    worker.start();
+
+    // The boot force is deferred within the (hour-long) page interval, so it is still pending
+    // and still carries a deadline well into the future.
+    const auto deadline = worker.force_page_not_before_ms_for_test();
+    CHECK(deadline > 0);
+    std::this_thread::sleep_for(40ms); // many periodic bounds: a DROP would show up here
+    CHECK(rig.journal->pages() == 0);
+    CHECK(worker.force_page_not_before_ms_for_test() == deadline); // still pending, not consumed
+
+    worker.stop();
+}
+
+TEST_CASE("a jittered forced page still runs once its deadline passes",
+          "[spark][guardian][drain][maint]") {
+    // The other half of the contract: deferral is not suppression. With a tiny page interval
+    // the boot force's offset is bounded by that interval, so the pass must happen - and the
+    // deadline must be cleared once it is consumed, or a later kick would inherit it.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 10ms, // jitter bound: offset < 10ms
+                                      .prune_interval = 1h,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(99);
+    worker.start();
+    // Spin on the OBSERVABLE (a page happened), never on a wall-clock upper bound: a slower
+    // runner takes longer to get here, it does not make the assertion wrong.
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (rig.journal->pages() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+    CHECK(rig.journal->pages() >= 1);
+    worker.stop();
+}
+
+TEST_CASE("jitter is OFF unless asked for, so every other cadence test is deterministic",
+          "[spark][guardian][drain][maint]") {
+    // Enablement is explicit (production wiring calls set_maintenance_jitter). Inferring it
+    // from some other configured field would silently defer the boot page in tests that
+    // depend on it running immediately, turning a real assertion into a hollow pass.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h,
+                                      .prune_interval = 1h});
+    CHECK(worker.force_page_not_before_ms_for_test() == 0);
+    worker.start();
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (rig.journal->pages() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+    CHECK(rig.journal->pages() >= 1); // the boot force ran immediately, undeferred
+    CHECK(worker.force_page_not_before_ms_for_test() == 0);
+    worker.stop();
+}
+
+TEST_CASE("a kick storm cannot keep postponing an already-deferred forced page",
+          "[spark][guardian][drain][maint]") {
+    // First kick wins. Re-drawing the deadline on every notify() would let a FLAPPING link
+    // postpone the forced replay indefinitely: each reconnect lands a fresh offset, so the
+    // pass that re-offers sent-labelled batches (whose in-flight send may have been lost)
+    // keeps being pushed back by exactly the event it exists to respond to. One draw is all
+    // the fleet spread needs. RED if notify() sets the deadline unconditionally: the observed
+    // deadline moves with each kick.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h, // only a forced page can fire
+                                      .prune_interval = 1h,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(7);
+    // No start(): the loop must not consume the force while the deadlines are compared, so
+    // this exercises notify()'s own state transition rather than racing the worker thread.
+    worker.notify();
+    const auto first = worker.force_page_not_before_ms_for_test();
+    CHECK(first > 0);
+    for (int i = 0; i < 20; ++i)
+        worker.notify();
+    CHECK(worker.force_page_not_before_ms_for_test() == first); // monotone, not re-drawn
+}
+
+TEST_CASE("jitter: concurrent notify() against a live jittered loop is race-free",
+          "[spark][guardian][drain][maint]") {
+    // TSan coverage for the shape the other jitter tests deliberately avoid. The kick-storm
+    // test omits start() so it can compare deadlines deterministically, and the deferral test
+    // starts the worker but never notifies - so the new sig_->mu critical sections
+    // (notify() writing force_page_not_before_ms_ and drawing from jitter_rng_, while the
+    // loop reads both to compute its wait deadline and to consume the force) were never
+    // executed CONCURRENTLY under the sanitizer (governance Gate 3 cpp-safety).
+    //
+    // Asserts liveness only. Any timing assertion here would be a wall-clock upper bound,
+    // which is the standing flake source on a contended runner.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/2,
+                                     {.journal = rig.journal,
+                                      .page_interval = 5ms, // tiny, so forces land constantly
+                                      .prune_interval = 5ms,
+                                      .jitter = true});
+    worker.seed_jitter_rng_for_test(31337);
+    worker.start();
+
+    std::atomic<bool> stop_kicking{false};
+    std::thread kicker([&] {
+        while (!stop_kicking.load(std::memory_order_relaxed))
+            worker.notify();
+    });
+
+    // Spin on the observable rather than sleeping a fixed time: a slower runner takes longer
+    // to get here, it does not make the assertion wrong.
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (rig.journal->pages() == 0 && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+
+    stop_kicking.store(true, std::memory_order_relaxed);
+    kicker.join();
+    worker.stop();
+
+    CHECK(rig.journal->pages() >= 1); // the loop stayed live under a continuous kick storm
+    // A stopped worker leaves no pending deferral that a later observer could misread.
+    CHECK(worker.force_page_not_before_ms_for_test() >= 0);
 }

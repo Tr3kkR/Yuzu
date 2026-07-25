@@ -313,6 +313,18 @@ public:
         test_prune_interval_ = prune_interval;
     }
 
+    /// Spread this agent's journal-maintenance phase and its forced pages over their
+    /// intervals (C0 flip-checklist item 12). MUST be called BEFORE wire_spark_engine(),
+    /// which is what constructs the worker.
+    ///
+    /// OFF by default and turned on EXPLICITLY by the production wiring in agent.cpp. The
+    /// alternative - inferring it from whether a test-timing override was installed - is
+    /// wrong: several tests drive a live worker without overriding timing at all, and the
+    /// production-boot-order regression in particular depends on the worker running
+    /// immediately, so an inferred jitter would turn a real race assertion into a hollow
+    /// pass rather than a failure (Sol review).
+    void set_maintenance_jitter(bool on) { maintenance_jitter_ = on; }
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -372,7 +384,16 @@ private:
     /// on the first write failure. prefer_spark_-gated (inert when spark is not the
     /// active backend). Fired via a terminate-safe guard on every apply_rules /
     /// start_local exit.
-    void persist_lifecycle_journal_locked();
+    ///
+    /// `max_batches` / `max_records` bound ONE call; pass `kJournalPersistUnbounded`
+    /// for either to disable it. NEITHER is defaulted, so every caller states its
+    /// intent and a future cadence caller cannot silently inherit unbounded behaviour.
+    /// Only the heartbeat's retry-persist passes real bounds - it is the sole cadence
+    /// caller, and the one that must not sit under mtx_ for an unbounded number of
+    /// slow-but-successful KvStore writes. Every one-shot caller (boot re-arm,
+    /// apply_rules, and both shutdown flushes) passes unbounded because each has to
+    /// drain what it was given.
+    void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,
@@ -445,6 +466,9 @@ private:
     std::uint64_t test_periodic_bound_ms_{0};
     std::chrono::milliseconds test_page_interval_{0};
     std::chrono::milliseconds test_prune_interval_{0};
+    /// Maintenance phase/forced-page jitter (see set_maintenance_jitter). OFF unless the
+    /// production wiring turns it on, so every test's cadence stays deterministic.
+    bool maintenance_jitter_{false};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---

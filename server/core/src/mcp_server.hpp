@@ -61,10 +61,21 @@ class AgentRegistry;
 
 namespace yuzu::server::mcp {
 
+// Progress bridge core (track 2f PR 3a). Forward-declared (pointer-only here,
+// injected via set_stream_bridge); the .cpp includes mcp_stream_bridge.hpp.
+class McpStreamBridge;
+
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
 /// Mirrors the RestApiV1 pattern: receives store pointers + auth/perm/audit callbacks.
 class McpServer {
 public:
+    /// C8 fail-closed boot validator (#2383): throws std::runtime_error naming
+    /// the offenders when the served kTools[] names, the kToolSecurity
+    /// registrations, and the kWriteTools read-only guard set disagree — a
+    /// misregistered build refuses to construct (and therefore to boot) instead
+    /// of silently skipping the generic tier+approval gate for the missing tool.
+    McpServer();
+
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
     using PermFn =
@@ -220,6 +231,14 @@ public:
     /// `revoke_for_principal`.
     void set_engine_credential_store(ApiTokenStore* store) { engine_credential_store_ = store; }
     void set_owner_exists_fn(OwnerExistsFn fn) { owner_exists_fn_ = std::move(fn); }
+
+    /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
+    /// set_engine_principal_store above (the handler's `[=]` lambda captures
+    /// `this`, so the injection is a live read on the next request). Nullable:
+    /// unset ⇒ execute_instruction never reserves a bridge record and the
+    /// pre-bridge behaviour is byte-identical. server.cpp wires the ServerImpl-
+    /// owned bridge; tests inject their own.
+    void set_stream_bridge(McpStreamBridge* bridge) { stream_bridge_ = bridge; }
 
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
@@ -383,10 +402,20 @@ private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     ApiTokenStore* engine_credential_store_{nullptr};
     OwnerExistsFn owner_exists_fn_;
+    // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
+    McpStreamBridge* stream_bridge_{nullptr};
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here
 // were relocated to mcp_server_testonly.hpp (issue #2385) — production callers
 // have no reason to see them.
+
+// The served tool names whose calls can reach the #2405 pre-approval
+// input-schema gate — every tool whose (securable, operation) makes
+// requires_approval() true for some tier. Sorted, deterministic. This is the
+// closed label set server.cpp pre-seeds for yuzu_mcp_tool_args_invalid_total
+// (docs/observability-conventions.md: bounded-label counters are pre-seeded
+// to 0 so absent() alerts stay meaningful).
+std::vector<std::string> approval_gated_tool_names();
 
 } // namespace yuzu::server::mcp
