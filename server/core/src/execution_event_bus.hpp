@@ -65,6 +65,16 @@ public:
     /// restore real time. governance round qe-S3.
     using ClockFn = std::function<std::int64_t()>;
 
+    /// C5 (#2409): the terminal verdict `unsubscribe_and_visit_terminal` hands to
+    /// its callback. `kTerminalKnownLost` means the channel is flagged terminal but
+    /// the payload aged out of the buffer - benign; the caller maps it to a
+    /// success-shaped fallback, never a synthesized error.
+    enum class TerminalVisit { kNeverTerminal, kTerminalBuffered, kTerminalKnownLost };
+    /// Operational status of the visit (distinct from the terminal verdict). The
+    /// caller MUST fail closed on kAbsentChannel/kInternalError - never infer
+    /// kNeverTerminal from them, which would re-open #2409.
+    enum class VisitStatus { kVisited, kStaleSub, kAbsentChannel, kInternalError };
+
     static constexpr std::size_t kBufferCap = 1000;
     static constexpr std::int64_t kRetentionAfterTerminalSec = 60;
     /// Min time between full GC sweeps. Gate `gc_terminal_channels` on
@@ -141,6 +151,77 @@ public:
     /// silently no-ops if the channel or sub_id no longer exists.
     void unsubscribe(const std::string& execution_id, std::size_t sub_id);
 
+    /// C5 (#2409): atomically, under a SINGLE hold of the per-execution channel
+    /// mutex - (1) compute a terminal verdict, (2) invoke `f(verdict, ev)` (which
+    /// does the record-side claim/latch under ITS OWN lock), (3) erase the listener
+    /// IFF `f` returns true (it committed a teardown claim). This is the
+    /// linearization point that closes #2409: because `publish` fans out under the
+    /// same channel mutex, no terminal can slip between the verdict and the claim.
+    ///
+    /// Erase-only-on-claim is load-bearing: every DEFER (`f` returns false) KEEPS
+    /// the listener, so an unclaimed terminal-bearing channel can never go
+    /// listener-less and be GC'd out from under the record.
+    ///
+    /// `f` contract (caller-enforced, NOT checkable here): genuinely `noexcept`;
+    /// takes only ITS record mutex; MUST NOT call any ExecutionEventBus method (it
+    /// runs UNDER Channel::mu; a bus call taking `map_mu_` would invert the
+    /// `map_mu_ -> Channel::mu` order publish/GC rely on). It returns `true` iff it
+    /// claimed. CF-3: `f` is invoked strictly AFTER every throwing step below, and
+    /// the post-`f` erase is noexcept, so a `kInternalError` return always means
+    /// "`f` did not run", never "ran then threw".
+    ///
+    /// The verdict scan keys on `first_terminal_id` (the FIRST terminal-flagged
+    /// event - which in the `refresh_counts` split is a terminal-flagged
+    /// `execution-progress`, NOT `execution-completed`; a type scan would
+    /// misclassify). On a marker miss (aged out past `kBufferCap`) it recovers to
+    /// any buffered `execution-completed` before concluding `kTerminalKnownLost`.
+    /// `ev` points into the channel buffer and is valid only for the `f` call.
+    ///
+    /// Returns `kAbsentChannel` (no channel -> no barrier) or `kInternalError` (a
+    /// lock/alloc threw) WITHOUT running `f`; `kStaleSub` (channel present, sub_id
+    /// already gone) still runs `f` - a stale sub means a prior visit ran and `f`'s
+    /// record-state-first checks make the re-run idempotent.
+    template <class F>
+    VisitStatus unsubscribe_and_visit_terminal(const std::string& execution_id,
+                                               std::size_t sub_id, F&& f) noexcept {
+        try {
+            auto ch = find(execution_id);
+            if (!ch) return VisitStatus::kAbsentChannel;
+            std::lock_guard<std::mutex> g(ch->mu);
+            TerminalVisit verdict = TerminalVisit::kNeverTerminal;
+            const ExecutionEvent* ev = nullptr;
+            if (ch->terminal) {
+                for (const auto& e : ch->buffer) {
+                    if (e.id == ch->first_terminal_id) {
+                        ev = &e;
+                        break;
+                    }
+                }
+                if (ev == nullptr) {
+                    // Marker aged out: recover any still-buffered completed event.
+                    for (const auto& e : ch->buffer) {
+                        if (e.event_type == "execution-completed") {
+                            ev = &e;
+                            break;
+                        }
+                    }
+                }
+                verdict = ev != nullptr ? TerminalVisit::kTerminalBuffered
+                                        : TerminalVisit::kTerminalKnownLost;
+            }
+            const bool sub_present = ch->listeners.find(sub_id) != ch->listeners.end();
+            // f runs after every throwing step (find/lock/scan); its return is the
+            // sole erase trigger. f itself is noexcept by contract.
+            const bool claimed = f(verdict, ev);
+            if (claimed) {
+                ch->listeners.erase(sub_id);  // noexcept (erase by key)
+            }
+            return sub_present ? VisitStatus::kVisited : VisitStatus::kStaleSub;
+        } catch (...) {
+            return VisitStatus::kInternalError;
+        }
+    }
+
     /// Publish an event onto a per-execution channel. Assigns a monotonic
     /// id, appends to the ring buffer (evicting the oldest if at cap),
     /// then fans out to listeners under the channel mutex.
@@ -184,6 +265,13 @@ private:
         std::size_t next_sub_id{0};
         bool terminal{false};
         std::int64_t terminal_at_ms{0};
+        /// C5 (#2409): id of the FIRST terminal-flagged event, set atomically with
+        /// the `terminal` flag flip under `mu`. Names the exact terminal event so a
+        /// consumer need not event-type-search - which would misclassify, because
+        /// `refresh_counts` flags an `execution-progress` terminal before publishing
+        /// `execution-completed` (two publishes, `mu` released between). 0 until the
+        /// first terminal. Consumed by `unsubscribe_and_visit_terminal`.
+        std::uint64_t first_terminal_id{0};
     };
 
     /// Returns the channel pointer, allocating it if missing. The shared

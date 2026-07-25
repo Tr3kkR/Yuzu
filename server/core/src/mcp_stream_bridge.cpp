@@ -910,7 +910,7 @@ void McpStreamBridge::sweep() {
             claimed = true;
         }
         if (claimed) {
-            teardown_claimed(rec, /*synthesize_unavailable=*/false, action);
+            teardown_claimed(rec, TeardownFinal::kNone, action);
         }
     }
 
@@ -937,50 +937,15 @@ void McpStreamBridge::sweep() {
         if (ring_only <= cfg_.ring_only_pressure_cap || !oldest) {
             return;
         }
-        // Stage 1: freeze new progress work on the victim; decide deferral.
-        bool synthesize = false;
+        // Stage 1: mark the victim so the projector starts no NEW progress batch
+        // (project_record gates on pressure_requested). ALL disposition logic
+        // lives in the atomic visit below - one source of truth (CORE-2).
         {
             std::lock_guard<std::mutex> rlk(oldest->mu);
             oldest->pressure_requested = true;
-            if (oldest->projection_in_flight && !oldest->terminal_accepted) {
-                // E1: a progress-only projection is mid-flight. Defer WITHOUT
-                // unsubscribing - the live subscription retains a terminal that
-                // arrives before the next sweep. Never evict a newer record.
-                return;
-            }
-            if (oldest->terminal_accepted && !oldest->terminal_projected) {
-                // A real terminal is secured but not yet on the ring. Let the
-                // projector settle it; the NEXT sweep can then claim this same
-                // (still oldest) record. Never synthesize over a real result,
-                // never evict a newer record instead.
-                wake(*core_);
-                return;
-            }
-            // SETTLED (terminal_projected - the real final is pinned in the ring,
-            // or the stream is poisoned) or terminal-less: claimable. Spec E3:
-            // a torn-down real-final victim keeps its pin (truth stays in the
-            // ring); synthesis is only for a victim that never saw a terminal.
-            synthesize = !oldest->terminal_accepted;
         }
-        // Stage 2: quiesce - after unsubscribe returns, no listener can be
-        // in flight for this record and none will ever run again.
-        //
-        // KNOWN GAP - 3b-gated (tracked in issue #2409; Sol code-review). Once
-        // unsubscribe() removes the listener, a terminal published to the BUS in
-        // the window before the revalidate below is no longer latched into
-        // terminal_slot (there is no listener to do it), so the revalidate's
-        // `terminal_accepted` check is blind to it and a `-32014`
-        // terminal-unavailable can be synthesized over a real terminal that is
-        // sitting in the bus buffer + durable execution state. This path is
-        // UNREACHABLE in 3a: nothing reaches kRingOnly (on_post_closed is the
-        // only entry and is a 3b pump seam with no production caller), so the
-        // pressure hatch never fires. When 3b wires the pump, close this by
-        // making the final bus-terminal check, the record claim, and the listener
-        // removal atomic under Channel::mu (a new bus query in the declared
-        // bridge_mu_ → Channel::mu → record mu order). Even when it fires the
-        // synthesized frame carries the execution_id + "fetch by execution_id"
-        // remediation, so the real result stays recoverable (Decision 15(f)) -
-        // bounded, recoverable, and off the live surface until then.
+        // Re-validate map identity before the visit (the victim was selected in a
+        // prior bridge_mu_ section; a concurrent teardown may have moved it).
         {
             std::lock_guard<std::mutex> lk(bridge_mu_);
             if (shutdown_started_) {
@@ -990,51 +955,136 @@ void McpStreamBridge::sweep() {
             if (it == records_.end() || it->second != oldest) {
                 continue;  // torn down concurrently - recount
             }
-            if (oldest->subscribed && bus_ != nullptr) {
-                bus_->unsubscribe(oldest->execution_id, oldest->sub_id);
-            }
-            oldest->subscribed = false;
         }
-        // Revalidate + claim (the unsubscribed interval could still have
-        // delivered a terminal before unsubscribe returned).
-        bool claimed = false;
-        {
-            std::lock_guard<std::mutex> lk(bridge_mu_);
-            if (shutdown_started_) {
-                return;
+        // Stage 2: the atomic visit that closes #2409 (was the KNOWN GAP here).
+        // Under a SINGLE hold of the bus channel mutex, `f` computes the
+        // disposition from record state (the bus verdict arbitrates ONLY a record
+        // with no secured terminal) and claims kDone via a torn_down CAS under
+        // record mu; the bus erases the listener ONLY on that committed claim.
+        // bridge_mu_ is NOT held across the visit (it takes Channel::mu → record
+        // mu, a valid suffix of the declared hierarchy; `f` must not take
+        // bridge_mu_ or call a bus method). Every DEFER keeps the listener, so a
+        // deferred terminal channel can never be GC'd out from under the record.
+        bool claimed_by_me = false;
+        TeardownFinal decision = TeardownFinal::kNone;
+        ExecutionEventBus::VisitStatus status = ExecutionEventBus::VisitStatus::kAbsentChannel;
+        if (bus_ != nullptr) {
+            auto f = [&](ExecutionEventBus::TerminalVisit verdict,
+                         const ExecutionEvent* ev) noexcept -> bool {
+                std::lock_guard<std::mutex> rlk(oldest->mu);
+                const Phase ph = oldest->phase.load(std::memory_order_acquire);
+                if (oldest->torn_down || ph != Phase::kRingOnly) {
+                    return false;  // stale: a competing claimant already owns it
+                }
+                // Record-side state dominates the bus verdict (CORE-2).
+                if (oldest->terminal_accepted && oldest->terminal_projected) {
+                    // Settled real final already pinned: claim, publish nothing.
+                    oldest->phase.store(Phase::kDone, std::memory_order_release);
+                    oldest->torn_down = true;
+                    claimed_by_me = true;
+                    decision = TeardownFinal::kNone;
+                    return true;
+                }
+                if (oldest->terminal_accepted && !oldest->terminal_projected) {
+                    return false;  // latched, not pinned: defer; projector settles
+                }
+                if (oldest->projection_in_flight) {
+                    return false;  // a progress projection is mid-flight: defer
+                }
+                // No secured terminal: the bus verdict arbitrates. Secure any
+                // terminal record-side BEFORE the (claim-driven) erase.
+                switch (verdict) {
+                    case ExecutionEventBus::TerminalVisit::kTerminalBuffered:
+                        if (ev != nullptr) {
+                            try {
+                                // Construct fully OUTSIDE the slot, then commit with
+                                // a noexcept move - a copy OOM leaves the slot and
+                                // terminal_accepted untouched (mirror the listener).
+                                MailboxEntry tmp{ev->id, ev->data};
+                                oldest->terminal_slot = std::move(tmp);
+                                oldest->terminal_accepted = true;
+                            } catch (...) {
+                                // Copy OOM: nothing secured. Defer, keep the
+                                // listener (a retry latches next sweep).
+                            }
+                        }
+                        return false;  // defer; the projector publishes the real final
+                    case ExecutionEventBus::TerminalVisit::kTerminalKnownLost:
+                        oldest->terminal_known_lost = true;  // named third state
+                        oldest->phase.store(Phase::kDone, std::memory_order_release);
+                        oldest->torn_down = true;
+                        claimed_by_me = true;
+                        decision = TeardownFinal::kFallbackFinal;
+                        return true;
+                    case ExecutionEventBus::TerminalVisit::kNeverTerminal:
+                    default:
+                        oldest->phase.store(Phase::kDone, std::memory_order_release);
+                        oldest->torn_down = true;
+                        claimed_by_me = true;
+                        decision = TeardownFinal::kSynthesizeUnavailable;
+                        return true;
+                }
+            };
+            status = bus_->unsubscribe_and_visit_terminal(oldest->execution_id,
+                                                          oldest->sub_id, f);
+        }
+        if (claimed_by_me) {
+            // f won the claim (FA-1: the captured flag, NOT record-state inference -
+            // a concurrent sweep's winner leaves the record kDone-in-map until its
+            // teardown erases it). teardown_claimed re-validates identity itself.
+            teardown_claimed(oldest, decision, "mcp.bridge.forced_expire");
+            continue;  // recount
+        }
+        if (status == ExecutionEventBus::VisitStatus::kAbsentChannel ||
+            status == ExecutionEventBus::VisitStatus::kInternalError) {
+            // f did NOT run (no channel / a lock threw). CF-2: claim from record
+            // state ONLY when unambiguous (settled real final, or a secured
+            // terminal-known-lost with no projection in flight); else defer +
+            // retry. NEVER infer kNeverTerminal from a missing channel (#2409).
+            // Near-unreachable under erase-only-on-claim (a deferred record keeps
+            // its listener, so its channel never GCs), but kept for robustness.
+            bool guard_claim = false;
+            TeardownFinal guard_decision = TeardownFinal::kNone;
+            {
+                std::lock_guard<std::mutex> lk(bridge_mu_);
+                if (shutdown_started_) {
+                    return;
+                }
+                auto it = records_.find(oldest->key);
+                if (it == records_.end() || it->second != oldest) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> rlk(oldest->mu);
+                if (!oldest->torn_down &&
+                    oldest->phase.load(std::memory_order_acquire) == Phase::kRingOnly) {
+                    if (oldest->terminal_accepted && oldest->terminal_projected) {
+                        guard_claim = true;
+                        guard_decision = TeardownFinal::kNone;
+                    } else if (oldest->terminal_known_lost && !oldest->projection_in_flight) {
+                        guard_claim = true;
+                        guard_decision = TeardownFinal::kFallbackFinal;
+                    }
+                    if (guard_claim) {
+                        oldest->phase.store(Phase::kDone, std::memory_order_release);
+                        oldest->torn_down = true;
+                    }
+                }
             }
-            auto it = records_.find(oldest->key);
-            if (it == records_.end() || it->second != oldest) {
+            if (guard_claim) {
+                teardown_claimed(oldest, guard_decision, "mcp.bridge.forced_expire");
                 continue;
             }
-            std::lock_guard<std::mutex> rlk(oldest->mu);
-            if ((oldest->terminal_accepted && !oldest->terminal_projected) ||
-                oldest->projection_in_flight) {
-                // A real terminal slipped in before unsubscribe returned (or a
-                // projection started): defer while unsubscribed - safe, the
-                // payload is locally secured and the projector will publish it;
-                // the next sweep claims the then-settled record.
-                wake(*core_);
-                return;
-            }
-            synthesize = !oldest->terminal_accepted;  // re-derive on fresh state
-            if (oldest->phase.load(std::memory_order_acquire) != Phase::kRingOnly ||
-                oldest->torn_down) {
-                continue;
-            }
-            oldest->phase.store(Phase::kDone, std::memory_order_release);
-            oldest->torn_down = true;
-            claimed = true;
         }
-        if (claimed) {
-            teardown_claimed(oldest, synthesize, "mcp.bridge.forced_expire");
-        }
-        // Loop: recount and keep reaping until the population is at the cap.
+        // Deferred (not claimed, or a bus-less build): wake the projector to settle
+        // any secured terminal, then return. Defer-class exits the loop so we never
+        // re-visit the same oldest victim in a tight cycle within one sweep (FA-4).
+        wake(*core_);
+        return;
     }
 }
 
 void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
-                                       bool synthesize_unavailable, const char* audit_action) {
+                                       TeardownFinal decision, const char* audit_action) {
     // Claimant owns the record (phase == kDone, stored under record mu).
     std::string exec_id;
     {
@@ -1048,30 +1098,49 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
         }
         rec->subscribed = false;
     }
-    if (synthesize_unavailable) {
-        // Pressure victim with NO secured terminal (revalidated at claim): pin a
-        // machine-readable terminal-unavailable so a later resume still finds
-        // truth in the ring. A4 grammar: error.data carries the durable handle.
-        try {
-            std::string data = std::string(R"({"execution_id":)") + detail::json_quoted(exec_id) +
-                               R"(,"correlation_id":)" +
-                               detail::json_quoted(yuzu::server::detail::make_correlation_id()) +
-                               R"(,"retry_after_ms":null,"remediation":)" +
-                               detail::json_quoted("result no longer buffered - fetch it by "
-                                                   "execution_id (get_execution_status / "
-                                                   "query_responses)") +
-                               "}";
-            std::string frame =
-                error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
-                               "streamed result forced-expired under memory pressure", data);
-            publish_terminal_ladder(rec, std::move(frame));  // 0 twice ⇒ poison (A6a)
-        } catch (...) {
-            // Build-side OOM: nothing published. The record is gone either way;
-            // the durable execution fetch remains, and the failure is counted.
-            if (metrics_ != nullptr) {
-                obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
+    switch (decision) {
+        case TeardownFinal::kSynthesizeUnavailable:
+            // Pressure victim that genuinely NEVER saw a terminal (verified at
+            // claim under Channel::mu): pin a machine-readable terminal-unavailable
+            // so a later resume still finds truth in the ring. A4 grammar:
+            // error.data carries the durable handle.
+            try {
+                std::string data =
+                    std::string(R"({"execution_id":)") + detail::json_quoted(exec_id) +
+                    R"(,"correlation_id":)" +
+                    detail::json_quoted(yuzu::server::detail::make_correlation_id()) +
+                    R"(,"retry_after_ms":null,"remediation":)" +
+                    detail::json_quoted("result no longer buffered - fetch it by "
+                                        "execution_id (get_execution_status / "
+                                        "query_responses)") +
+                    "}";
+                std::string frame =
+                    error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
+                                   "streamed result forced-expired under memory pressure", data);
+                publish_terminal_ladder(rec, std::move(frame));  // 0 twice ⇒ poison (A6a)
+            } catch (...) {
+                // Build-side OOM: nothing published. The record is gone either way;
+                // the durable execution fetch remains, and the failure is counted.
+                if (metrics_ != nullptr) {
+                    obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
+                }
             }
-        }
+            break;
+        case TeardownFinal::kFallbackFinal:
+            // Terminal existed but its payload aged out of the bus buffer
+            // (kTerminalKnownLost): publish the prebuilt success-shaped final
+            // ("fetch by execution_id"), NEVER -32014. Contain the by-value copy of
+            // fallback_final (may OOM).
+            try {
+                publish_terminal_ladder(rec, rec->fallback_final);  // 0 twice ⇒ poison
+            } catch (...) {
+                if (metrics_ != nullptr) {
+                    obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
+                }
+            }
+            break;
+        case TeardownFinal::kNone:
+            break;  // real final already pinned, or nothing to publish
     }
     release_charge(rec);
     flush_record_obs(*rec);
@@ -1085,9 +1154,12 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
         active = records_.size();
     }
     publish_records_gauge(active);
-    audit_contained(audit_action, exec_id, synthesize_unavailable
-                                               ? "terminal-unavailable synthesized (pressure)"
-                                               : "");
+    const char* audit_detail = decision == TeardownFinal::kSynthesizeUnavailable
+                                   ? "terminal-unavailable synthesized (pressure)"
+                                   : decision == TeardownFinal::kFallbackFinal
+                                         ? "fallback final published (terminal payload lost)"
+                                         : "";
+    audit_contained(audit_action, exec_id, audit_detail);
 }
 
 void McpStreamBridge::release_charge(const std::shared_ptr<BridgeRecord>& rec) {

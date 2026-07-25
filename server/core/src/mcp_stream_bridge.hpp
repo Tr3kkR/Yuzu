@@ -84,6 +84,14 @@
 //   projector). bridge_mu_ holders MAY call the bus (subscribe under bridge_mu_
 //   serializes installation against teardown, A3; shutdown's unsubscribe walk) -
 //   legal precisely because listeners never take bridge_mu_.
+//
+//   C5 (#2409) pressure visitor: the sweep calls unsubscribe_and_visit_terminal
+//   WITHOUT holding bridge_mu_ (it re-validates map identity, releases bridge_mu_,
+//   then calls the bus). The visit takes Channel::mu → record mu (a valid suffix);
+//   its callback runs under Channel::mu and, like a listener, touches record mu +
+//   WakeCore::mu ONLY - never bridge_mu_, never the bus (either would invert the
+//   order). The streamed-charge decrement it would owe is deferred to the
+//   post-visit teardown_claimed (under bridge_mu_), preserving exactly-once.
 
 #include "execution_event_bus.hpp"
 
@@ -166,6 +174,13 @@ public:
         kAcceptedPending,  ///< recorded; arm()/abandon() will arbitrate (C1 - no audit yet)
         kNoOp,             ///< not kArming (nothing to cancel in 3a), duplicate, or unknown
     };
+
+    /// C5 (#2409): the terminal frame a claimed pressure-teardown publishes.
+    /// kNone = real final already pinned (or nothing to publish); kFallbackFinal =
+    /// success-shaped "fetch by execution_id" for a terminal-known-payload-lost
+    /// record; kSynthesizeUnavailable = the -32014 error, reachable ONLY for a
+    /// record that genuinely never saw a terminal.
+    enum class TeardownFinal { kNone, kSynthesizeUnavailable, kFallbackFinal };
 
     struct ReserveResult {
         bool ok = false;
@@ -360,6 +375,12 @@ private:
         std::uint64_t last_progress_sent = 0;
         bool progress_sent_any = false;
         bool terminal_projected = false;   ///< settled (published, GET-only-consumed, or poisoned)
+        /// C5 (#2409): the named third terminal state - "terminal existed, payload
+        /// lost" (bus flagged terminal but the event aged out of the buffer). Set by
+        /// the pressure visitor; NEVER sets terminal_accepted (hpp forbids inferring
+        /// a secured payload). Maps to kFallbackFinal, never -32014. Read by the
+        /// absent-channel recovery path (guarded by mu).
+        bool terminal_known_lost = false;
         bool final_published = false;      ///< a REAL final committed to the ring
         /// A5/C3: the per-session streamed-admission charge. Released exactly
         /// once (pin proof, cancel-degrade, pinless settle incl. poison, or
@@ -399,9 +420,11 @@ private:
     std::uint64_t publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
                                           std::string frame);
 
-    /// Claimed-kDone teardown: unsubscribe, optional -32014 synthesis (pressure
-    /// victims without a secured terminal), charge settle, obs transfer, erase.
-    void teardown_claimed(const std::shared_ptr<BridgeRecord>& rec, bool synthesize_unavailable,
+    /// Claimed-kDone teardown: unsubscribe, publish the decided terminal frame
+    /// (kSynthesizeUnavailable = -32014 for a never-terminal victim; kFallbackFinal
+    /// = success-shaped for a terminal-known-payload-lost victim; kNone = nothing),
+    /// charge settle, obs transfer, erase.
+    void teardown_claimed(const std::shared_ptr<BridgeRecord>& rec, TeardownFinal decision,
                           const char* audit_action);
     /// Release the streamed charge exactly once (clears under record mu - caller
     /// must NOT hold it - then decrements under bridge_mu_).

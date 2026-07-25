@@ -661,6 +661,47 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
     }
 }
 
+TEST_CASE("bridge pressure #2409 - a terminal-flagged progress is never lost to -32014",
+          "[mcp][bridge][2f][2409]") {
+    // The regression that closes #2409. refresh_counts publishes a terminal-flagged
+    // execution-progress BEFORE execution-completed (two publishes, ch->mu released
+    // between). The bridge listener latches ONLY execution-completed, so
+    // terminal_accepted stays FALSE while the BUS channel is terminal with a
+    // buffered, usable payload. The pre-C5 pressure sweep (unsubscribe, then a
+    // terminal_accepted re-check blind to the bus) synthesized -32014 over that real
+    // terminal. The first_terminal_id marker + the atomic visit must instead secure
+    // the buffered terminal and publish the REAL final.
+    //
+    // Under the pre-C5 code this asserts 0 results / 1 error - i.e. it FAILS,
+    // exactly the property a regression test must have.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2409"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    // The terminal-flagged progress: bus terminal=true, listener does NOT latch it.
+    fx.bus.publish(
+        "exec-2409", "execution-progress",
+        R"({"status":"succeeded","agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
+        /*is_terminal=*/true);
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // NEVER -32014
+    CHECK(count_results(frames) == 1);                                   // a REAL final instead
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["status"] == "succeeded");  // built from the marked payload
+        }
+    }
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);
+}
+
 TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched",
           "[mcp][bridge][2f]") {
     Fx fx;
