@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <random>
+#include <stdexcept>
 
 namespace yuzu::agent {
 
@@ -411,6 +412,16 @@ void GuardianOutboxDrainWorker::loop() {
         if (stop_requested())
             break;
         const auto drained = firewalled_drain();
+
+        // TEST-ONLY item-13 seam: model a throw from the loop's OWN tail (the refill re-arm's
+        // rt_.lifecycle_headroom() - std::mutex::lock can throw - and the cadence arithmetic),
+        // which sits outside every inner firewall. It fires unconditionally when armed, whereas
+        // the real lifecycle_headroom() runs only inside the refill condition below; the point
+        // is only to reach the thread lambda's TOP-LEVEL catch, so do not "tighten" this into
+        // the refill condition. Inert in production (default false; one relaxed load per cycle).
+        // Placed after the stop gate above, so it cannot fire once a stop has been observed.
+        if (inject_loop_tail_throw_.exchange(false, std::memory_order_relaxed))
+            throw std::runtime_error{"injected loop-tail throw (item 13 seam)"};
 
         // Reconnect refill: while disconnected the send window is normally FULL, so the
         // kick's page finds no headroom and places nothing. The drain that follows empties

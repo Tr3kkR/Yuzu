@@ -257,6 +257,19 @@ public:
         return force_page_not_before_ms_;
     }
 
+    /// TEST-ONLY: arm a ONE-SHOT throw in loop()'s own tail - the un-firewalled arithmetic and
+    /// the refill re-arm's rt_.lifecycle_headroom() call (std::mutex::lock can throw
+    /// std::system_error), which sit OUTSIDE every inner firewall. Nothing in production can
+    /// make that tail throw, so the thread lambda's top-level catch and its
+    /// journal_maint_exceptions_ increment are otherwise unexercised (flip item 13). The seam
+    /// fires exactly once and kills this one-shot worker, so it is a boolean, not a countdown -
+    /// a second cycle can never consume a second throw. Relaxed atomic, written before start()
+    /// (thread creation is the happens-before edge), read only on the worker thread; no lock,
+    /// no mtx_ contact. No production caller.
+    void inject_loop_tail_throw_for_test() noexcept {
+        inject_loop_tail_throw_.store(true, std::memory_order_relaxed);
+    }
+
     /// Deterministic test seam (also the worker thread's own loop body): run the
     /// maintenance passes named by `ops` synchronously on the caller's thread. Holds no
     /// timer state of its own, so unlike a cadence-owning variant it is safe to call
@@ -347,6 +360,9 @@ private:
     /// Seeded TRUE so the first cycle replays the journal at boot without waiting out
     /// kDefaultPageInterval.
     std::atomic<bool> force_page_{true};
+    /// TEST-ONLY one-shot: make loop()'s tail throw once (item 13). Consumed by exchange, so it
+    /// arms a single throw. Default false = inert in production (one relaxed load per cycle).
+    std::atomic<bool> inject_loop_tail_throw_{false};
     /// Earliest steady-clock ms at which a pending forced page may be consumed (item 12).
     /// 0 = no deferral. Written under sig_->mu (by notify() and the loop) so the loop can
     /// derive its wait deadline from it without a second synchronisation point.
