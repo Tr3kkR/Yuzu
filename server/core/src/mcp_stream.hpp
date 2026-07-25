@@ -145,9 +145,9 @@ static_assert(kMaxStreamedPostsPerSession == sse_bus::kPerPrincipalMcpPost,
               "streamed-POST per-principal budget cap must equal the ring's per-session pin-slot "
               "cap — else admission could admit a streamed POST the ring cannot pin a final for");
 
-/// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
-/// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
-/// to tell "your credential was revoked" from "our auth backend is down".
+/// Why a stream ended. Wire-visible (the JSON-RPC-wrapped `notifications/yuzu.stream_closed`
+/// notification, 2f PR 3b), audited (`mcp.stream.close` `reason=`), and distinct per CH-4 — a
+/// client must be able to tell "your credential was revoked" from "our auth backend is down".
 enum class McpStreamClose {
     kNone,               ///< still open
     kClientGone,         ///< peer disconnected / write failed
@@ -156,8 +156,26 @@ enum class McpStreamClose {
     kCredentialRevoked,  ///< re-validation said the credential is definitively gone
     kAuthUnavailable,    ///< re-validation was indeterminate past the grace window
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
+    // The next three are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
+    // never emits them. Declared here so to_string / close_remediation / the metric seed cover
+    // the whole closed reason set from C4, before their producers land in C6c/C7.
+    kCancelled,          ///< the client sent notifications/cancelled; the execution continues
+    kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
+    kCompleted,          ///< the final was delivered then EOF — no close frame is written for this
 };
 const char* to_string(McpStreamClose reason);
+
+/// Build the JSON-RPC-wrapped stream-close notification body (2f PR 3b, PENDING 2):
+///   {"jsonrpc":"2.0","method":"notifications/yuzu.stream_closed","params":{ A4 body ... }}
+/// carried under the DEFAULT `message` SSE event type (NOT a bespoke `event: stream-closed`, which
+/// a spec MCP client parsing JSON-RPC messages off the stream would never see). `params` is the
+/// same A4-shaped body every denial on this route uses (reason / correlation_id / retry_after_ms /
+/// remediation). `extra_params_json` is an optional RAW fragment appended inside `params` — the
+/// caller includes the leading comma, e.g. `,"execution_id":"exec-1","partial":true` (C6c/C7) — or
+/// empty. The frame is off-ring, id-less and non-replayable: a close is a point-in-time terminal
+/// signal, not a resumable frame. Shared by the GET pump and the streamed-POST pump.
+std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
+                                     std::string_view extra_params_json = {});
 
 /// Tri-state credential re-validation (Decision 15(c)+(i)). The distinction is
 /// load-bearing: kRevoked kills the stream NOW, kIndeterminate starts a bounded

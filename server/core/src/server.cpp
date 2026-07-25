@@ -590,7 +590,10 @@ public:
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
         }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
-                            "credential_revoked", "auth_unavailable", "internal_error"}) {
+                            "credential_revoked", "auth_unavailable", "internal_error",
+                            // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
+                            // pre-seeded here so the closed label set is complete from C4.
+                            "cancelled", "cap_expired", "completed"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");

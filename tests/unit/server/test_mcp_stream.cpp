@@ -19,6 +19,8 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include <nlohmann/json.hpp> // parse the JSON-RPC-wrapped close frame (2f PR 3b)
+
 #include <atomic>
 #include <chrono>
 #include <future> // the two-thread handshake test parks the pump on another thread
@@ -497,6 +499,55 @@ TEST_CASE("McpStreamPump/CH-4: a revoked credential kills the stream within one 
     // The client is TOLD why — a revoked stream must not look like a clean EOF.
     CHECK(wire.contains(R"("reason":"credential_revoked")"));
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kCredentialRevoked);
+}
+
+TEST_CASE("McpStreamPump: the close frame is a JSON-RPC-wrapped notifications/yuzu.stream_closed "
+          "under the default `message` event type, off-ring and id-less (2f PR 3b, PENDING 2)",
+          "[mcp][stream][ch4][2f]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kRevoked; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer())); // revocation closes on the first tick
+
+    // A normal JSON-RPC message on the stream, NOT the old bespoke `event: stream-closed` (which
+    // a spec MCP client parsing JSON-RPC off the stream would never see).
+    CHECK(wire.contains("event: message"));
+    CHECK_FALSE(wire.contains("event: stream-closed"));
+    CHECK(wire.contains(R"("jsonrpc":"2.0")"));
+    CHECK(wire.contains(R"("method":"notifications/yuzu.stream_closed")"));
+    // The A4-shaped params carry the machine-parseable reason + remediation.
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
+    CHECK(wire.contains(R"("retry_after_ms":null)"));
+    CHECK(wire.contains(R"("remediation":)"));
+    // Off-ring + id-less: a close is a point-in-time terminal signal, never replayed, so it
+    // carries no SSE `id:` line an out-of-the-box client would persist as a resumable cursor.
+    // (The ring is empty on this fresh attach, so the ONLY frame written is the close.)
+    CHECK_FALSE(wire.contains("id: "));
+}
+
+TEST_CASE("make_stream_closed_frame: wraps the A4 body and merges caller extras (2f PR 3b)",
+          "[mcp][stream][2f]") {
+    // Bare: just the A4 body inside the JSON-RPC params.
+    const auto bare = mcp::make_stream_closed_frame(mcp::McpStreamClose::kCancelled, "cid-1");
+    auto j = nlohmann::json::parse(bare);
+    CHECK(j["jsonrpc"] == "2.0");
+    CHECK(j["method"] == "notifications/yuzu.stream_closed");
+    CHECK(j["params"]["reason"] == "cancelled");
+    CHECK(j["params"]["correlation_id"] == "cid-1");
+    CHECK(j["params"]["retry_after_ms"].is_null());
+    CHECK(j["params"].contains("remediation"));
+
+    // With extras: the raw fragment (leading comma) merges into params as further fields — the
+    // shape C6c/C7 use to carry execution_id + partial status on a cap/cancel close.
+    const auto extra = mcp::make_stream_closed_frame(mcp::McpStreamClose::kCapExpired, "cid-2",
+                                                     R"(,"execution_id":"exec-9","partial":true)");
+    auto je = nlohmann::json::parse(extra);
+    CHECK(je["params"]["reason"] == "cap_expired");
+    CHECK(je["params"]["execution_id"] == "exec-9");
+    CHECK(je["params"]["partial"] == true);
 }
 
 TEST_CASE("McpStreamPump/CH-4: an auth-backend outage buys a bounded grace window, not a kill",

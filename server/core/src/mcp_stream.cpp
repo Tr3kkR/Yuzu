@@ -101,6 +101,16 @@ const char* close_remediation(McpStreamClose reason) {
     case McpStreamClose::kInternalError:
         return "a server-side fault ended this stream — reconnect; durable results remain "
                "fetchable by execution_id";
+    case McpStreamClose::kCancelled:
+        return "cancellation acknowledged — the execution continues server-side; fetch the "
+               "result by execution_id";
+    case McpStreamClose::kCapExpired:
+        return "the streamed-response time cap elapsed — the execution continues server-side; "
+               "fetch the result by execution_id, or reconnect via GET to resume";
+    case McpStreamClose::kCompleted:
+        // kCompleted never produces a close FRAME (the final is written then EOF); this exists
+        // only so the audit/metric label set is exhaustive. No client action is warranted.
+        return "the stream completed normally — no action needed";
     case McpStreamClose::kClientGone:
     case McpStreamClose::kSuperseded:
     case McpStreamClose::kNone:
@@ -108,6 +118,7 @@ const char* close_remediation(McpStreamClose reason) {
     }
     return "reconnect with Last-Event-ID to resume within the replay window";
 }
+
 
 // Strict, non-throwing cursor parse. std::stoull would be wrong twice over: it does
 // not throw on "-1" (it WRAPS to UINT64_MAX, which lands past the ring window and so
@@ -158,8 +169,31 @@ const char* to_string(McpStreamClose reason) {
         return "auth_unavailable";
     case McpStreamClose::kInternalError:
         return "internal_error";
+    case McpStreamClose::kCancelled:
+        return "cancelled";
+    case McpStreamClose::kCapExpired:
+        return "cap_expired";
+    case McpStreamClose::kCompleted:
+        return "completed";
     }
     return "unknown";
+}
+
+// PENDING 2 (2f PR 3b): the JSON-RPC-wrapped stream-close notification. See the declaration in
+// mcp_stream.hpp for the shape + the `extra_params_json` contract. Public (matches the header);
+// close_remediation above is TU-local but name-visible here.
+std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
+                                     std::string_view extra_params_json) {
+    std::string body =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/yuzu.stream_closed\",\"params\":{\"reason\":";
+    body += detail::json_quoted(to_string(reason));
+    body += ",\"correlation_id\":";
+    body += detail::json_quoted(correlation_id);
+    body += ",\"retry_after_ms\":null,\"remediation\":";
+    body += detail::json_quoted(close_remediation(reason));
+    body += extra_params_json; // raw ,"key":val fragment (leading comma) from the caller, or empty
+    body += "}}";
+    return body;
 }
 
 // ── McpStreamState ──────────────────────────────────────────────────────────
@@ -906,18 +940,15 @@ bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     // place; writing to it would block this worker for the full write timeout (30 s)
     // while its lease is still charged. Every other reason gets the frame.
     if (actual != McpStreamClose::kSuperseded) {
-        // Decision 15(f): a close is never indistinguishable from a clean completion,
-        // and the reason is machine-parseable in the same A4 shape as every denial on
-        // this route (so a client has ONE error contract, not two).
+        // Decision 15(f): a close is never indistinguishable from a clean completion, and the
+        // reason is machine-parseable in the same A4 shape as every denial on this route (so a
+        // client has ONE error contract, not two). PENDING 2 (2f PR 3b): the frame is now a
+        // JSON-RPC-wrapped `notifications/yuzu.stream_closed` under the default `message` event
+        // type, so it is a normal message on the stream rather than a bespoke `event:
+        // stream-closed` a spec client would not see. Off-ring, id-less (SseEvent default id 0).
         const auto cid = yuzu::server::detail::make_correlation_id();
-        std::string body = "{\"reason\":";
-        body += detail::json_quoted(to_string(actual));
-        body += ",\"correlation_id\":";
-        body += detail::json_quoted(cid);
-        body += ",\"retry_after_ms\":null,\"remediation\":";
-        body += detail::json_quoted(close_remediation(actual));
-        body += "}";
-        (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"stream-closed", body}));
+        (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{
+                                   "message", make_stream_closed_frame(actual, cid)}));
     }
     return false;
 }
