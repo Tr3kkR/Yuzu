@@ -3603,7 +3603,9 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
 
 TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the operator tier",
           "[mcp][integration][execute][bounds]") {
+    yuzu::MetricsRegistry reg;
     McpTestServer ts;
+    ts.metrics_for_test = &reg;
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
@@ -3621,8 +3623,16 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
                        arguments_json + "}}");
     };
     // Every rejection must be a JSON-RPC error (HTTP 200), kInvalidParams,
-    // must carry the A4 correlation id, and must NOT have dispatched.
-    auto expect_rejected = [&](const std::unique_ptr<httplib::Response>& res) {
+    // must carry the A4 correlation id, must NOT have dispatched — and must
+    // count itself under the reason the caller names here. The counter delta
+    // is asserted rather than assumed because `reason` is a closed metric
+    // label pre-seeded at boot: a rule that lands with the wrong label, or
+    // with none, leaves an operator's dashboard reading zero while calls are
+    // being refused. Naming the reason per section also pins which rule fires
+    // first for each shape, so a reordering inside the shared pure function
+    // is visible here rather than silently changing what gets counted.
+    auto expect_rejected = [&](const std::unique_ptr<httplib::Response>& res,
+                               const char* reason) {
         REQUIRE(res);
         CHECK(res->status == 200);
         auto body = nlohmann::json::parse(res->body);
@@ -3633,30 +3643,40 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
         CHECK(data.contains("correlation_id"));
         CHECK(!data["correlation_id"].get<std::string>().empty());
         CHECK_FALSE(dispatched);
+        INFO("expected reason label: " << reason);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "execute_instruction"}, {"reason", reason}})
+                  .value() == 1.0);
     };
 
     SECTION("plugin over 128 bytes") {
         const std::string big(129, 'a');
-        expect_rejected(call_with(R"({"plugin":")" + big + R"(","action":"version"})"));
+        expect_rejected(call_with(R"({"plugin":")" + big + R"(","action":"version"})"),
+                        "ident_len");
     }
     SECTION("action over 128 bytes") {
         const std::string big(129, 'a');
-        expect_rejected(call_with(R"({"plugin":"os_info","action":")" + big + R"("})"));
+        expect_rejected(call_with(R"({"plugin":"os_info","action":")" + big + R"("})"),
+                        "ident_len");
     }
     SECTION("scope over 8192 bytes") {
         const std::string big(8193, 'x');
         expect_rejected(
-            call_with(R"({"plugin":"os_info","action":"version","scope":")" + big + R"("})"));
+            call_with(R"({"plugin":"os_info","action":"version","scope":")" + big + R"("})"),
+            "scope_len");
     }
     SECTION("a params value over the 64 KiB cap") {
         const std::string big(kExecInstrParamValueMaxLen + 1, 'x');
         expect_rejected(call_with(
-            R"({"plugin":"os_info","action":"version","params":{"k":")" + big + R"("}})"));
+                            R"({"plugin":"os_info","action":"version","params":{"k":")" + big +
+                            R"("}})"),
+                        "param_value_len");
     }
     SECTION("a params key over 256 bytes") {
         const std::string big_key(257, 'k');
         expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{")" +
-                                  big_key + R"(":"v"}})"));
+                                  big_key + R"(":"v"}})"),
+                        "param_key_len");
     }
     SECTION("more than 32 params") {
         std::string params = "{";
@@ -3664,7 +3684,8 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
             params += (i ? "," : "") + ("\"k" + std::to_string(i) + "\":\"v\"");
         params += "}";
         expect_rejected(
-            call_with(R"({"plugin":"os_info","action":"version","params":)" + params + "}"));
+            call_with(R"({"plugin":"os_info","action":"version","params":)" + params + "}"),
+            "param_count");
     }
     SECTION("more than 10000 agent_ids") {
         std::string ids = "[";
@@ -3672,12 +3693,14 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
             ids += (i ? "," : "") + ("\"a" + std::to_string(i) + "\"");
         ids += "]";
         expect_rejected(
-            call_with(R"({"plugin":"os_info","action":"version","agent_ids":)" + ids + "}"));
+            call_with(R"({"plugin":"os_info","action":"version","agent_ids":)" + ids + "}"),
+            "agent_ids_count");
     }
     SECTION("an agent_ids entry over 128 bytes") {
         const std::string big(129, 'a');
         expect_rejected(call_with(R"({"plugin":"os_info","action":"version","agent_ids":[")" +
-                                  big + R"("]})"));
+                                  big + R"("]})"),
+                        "agent_id_len");
     }
 
     // Boundary: EXACTLY at each cap must still dispatch. Without this the
@@ -3738,52 +3761,36 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
 // the transport cap must stay comfortably above the largest body the
 // per-field caps permit, or a legitimate maximal call would 413 before the
 // handler could accept it.
+//
+// The sizing relations themselves now live as static_asserts in
+// mcp_input_bounds.hpp, so widening a field bound past the transport cap fails
+// the BUILD rather than this test run. What remains here is the part a
+// static_assert cannot state: the concrete published figures, so a docs/PR
+// number that drifts from the constants is caught by a named failing test
+// rather than by a reviewer noticing.
 TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamps bundles",
           "[mcp][bounds]") {
     using namespace yuzu::server::mcp;
 
-    // (a) A maximal execute_instruction must FIT. Derived from the shared
-    // constants, not restated, so this cannot drift away from what is enforced.
-    constexpr std::size_t kAgentIds =
-        kExecInstrAgentIdsMaxItems * (kExecInstrIdentMaxLen + 3);  // "<ident>",
-    constexpr std::size_t kParams =
-        kExecInstrParamCountMax * (kExecInstrParamKeyMaxLen + kExecInstrParamValueMaxLen + 6);
-    constexpr std::size_t kScope = kExecInstrScopeMaxLen + 16;
-    constexpr std::size_t kIdents = 2 * (kExecInstrIdentMaxLen + 16);
-    constexpr std::size_t kEnvelope = 2048;  // jsonrpc/method/id/_meta.progressToken
-    constexpr std::size_t kExecInstrWorstCase = kAgentIds + kParams + kScope + kIdents + kEnvelope;
-
-    // A MARGIN, not merely ">". The params widening took the headroom from
-    // 62% to 18% and nobody recomputed it until review, so the next careless
-    // bump should fail to compile rather than ship a cap that refuses
-    // schema-legal calls. 10% is what the current numbers actually support -
-    // a 25% rule was tried first and does NOT hold at 64 KiB, and weakening an
-    // assertion until it passes is worse than not having one.
-    static_assert(kMcpMaxRequestBodyBytes > kExecInstrWorstCase * 11 / 10,
-                  "a maximal execute_instruction must fit with room for JSON escaping - "
-                  "if this fires, raise the transport cap or lower a field bound, and "
-                  "update the figures in docs/mcp-server.md");
-    static_assert(kMcpMaxRequestBodyBytes > kExecInstrWorstCase,
-                  "the transport cap must admit the largest execute_instruction the "
-                  "per-field caps permit — below that, a legitimate maximal call would "
-                  "413 before the handler ever saw it");
     CHECK(kMcpMaxRequestBodyBytes == 4 * 1024 * 1024);
 
-    // (b) The cap is DELIBERATELY below what execute_bundle's own validator
+    // The figure docs/mcp-server.md publishes as "~3.27 MiB decoded, about 18%
+    // headroom". Pinned because that number is what the next person reads to
+    // decide whether ANOTHER widening is safe — it was stale for exactly one
+    // review round after the 8 KiB -> 64 KiB params change, overstating the
+    // remaining room by ~3.5x in the unsafe direction.
+    CHECK(kExecInstrWorstCaseBody == 3'426'080);
+    const double headroom_pct =
+        100.0 * static_cast<double>(kMcpMaxRequestBodyBytes - kExecInstrWorstCaseBody) /
+        static_cast<double>(kMcpMaxRequestBodyBytes);
+    CHECK(headroom_pct == Catch::Approx(18.3).margin(0.5));
+
+    // The cap is DELIBERATELY below what execute_bundle's own validator
     // accepts, and that clamp is the part most likely to be "fixed" by someone
-    // who reads only (a). A single saturated bundle step is ~2 MiB, so a
+    // who reads only the assert above. One saturated step is ~2 MiB, so a
     // 2-step bundle validate_bundle_steps would accept is refused at the
-    // transport. This is a stated product clamp (docs/mcp-server.md), NOT a
-    // derivation error — pin it so neither side moves silently.
-    constexpr std::size_t kOneSaturatedStep =
-        kMaxParamCountPerStep * (kMaxParamValueLen + kMaxParamKeyLen + 6);
-    constexpr std::size_t kMaxBundleBody = kMaxBundleSteps * kOneSaturatedStep;
-    static_assert(kOneSaturatedStep < kMcpMaxRequestBodyBytes,
-                  "one saturated bundle step must still fit, or execute_bundle is "
-                  "unusable at its own declared per-step limits over MCP");
-    static_assert(2 * kOneSaturatedStep > kMcpMaxRequestBodyBytes,
-                  "the bundle clamp documented in docs/mcp-server.md — if this stops "
-                  "holding, the clamp changed and the docs must change with it");
+    // transport. A stated product clamp, NOT a derivation error.
+    constexpr std::size_t kMaxBundleBody = kMaxBundleSteps * kOneSaturatedBundleStep;
     CHECK(kMaxBundleBody > kMcpMaxRequestBodyBytes);
 }
 
@@ -6732,6 +6739,58 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         CHECK(over_agents["error"]["message"].get<std::string>().find("'/agent_ids'") !=
               std::string::npos);
         CHECK(appr.pending_count() == 1); // still only the one valid mint
+
+        // #2437: the two bounds the CLOSED subset CANNOT express — params key
+        // COUNT and params key LENGTH. Every denial above came from the schema
+        // compiler; these two come from check_exec_instruction_shape running in
+        // the C8 block, and they are the whole reason it is called there rather
+        // than in the handler alone. A client cannot avoid them by reading
+        // tools/list (neither bound is publishable in the subset), so a
+        // handler-only check would mint a ticket, spend a human's approval,
+        // consume the one-time ticket and only THEN fail. pending_count()
+        // unchanged is the assertion that matters; the message is secondary.
+        std::string many_params =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":328,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{)";
+        for (int i = 0; i < 33; ++i) { // cap is 32
+            if (i)
+                many_params += ',';
+            many_params += R"("k)" + std::to_string(i) + R"(":"v")";
+        }
+        many_params += "}}}}";
+        auto over_params = nlohmann::json::parse(ts.call(many_params)->body);
+        REQUIRE(over_params.contains("error"));
+        CHECK(over_params["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_params["error"]["message"].get<std::string>().find("at most 32 keys") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // NOT minted — the point of the C8 placement
+
+        const std::string long_key(yuzu::server::mcp::kExecInstrParamKeyMaxLen + 1, 'k');
+        auto over_key = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":329,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{")" +
+                  long_key + R"(":"v"}}}})")
+                ->body);
+        REQUIRE(over_key.contains("error"));
+        CHECK(over_key["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_key["error"]["message"].get<std::string>().find("exceeds 256 bytes") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // still not minted
+
+        // And the boundary ACCEPTS: exactly-at-cap key count mints normally.
+        // Without this an off-by-one (>= for >) would pass every rejection case
+        // above and quietly refuse legitimate maximal calls.
+        std::string at_cap =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":330,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{)";
+        for (int i = 0; i < 32; ++i) {
+            if (i)
+                at_cap += ',';
+            at_cap += R"("k)" + std::to_string(i) + R"(":"v")";
+        }
+        at_cap += "}}}}";
+        auto at_cap_res = nlohmann::json::parse(ts.call(at_cap)->body);
+        REQUIRE(at_cap_res.contains("error"));
+        CHECK(at_cap_res["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+        CHECK(appr.pending_count() == 2); // minted, so the bound is > not >=
     }
     sqlite3_close(raw);
 }

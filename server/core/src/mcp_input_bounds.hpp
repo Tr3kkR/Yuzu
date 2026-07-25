@@ -7,8 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "bundle_service.hpp" // kMaxParamCountPerStep / kMaxParamKeyLen (kMaxBundleSteps
-                              // is used by the sizing test, not by this header)
+#include "bundle_service.hpp" // kMaxParamCountPerStep / kMaxParamKeyLen / kMaxParamValueLen
+#include "mcp_jsonrpc.hpp"    // kMcpMaxRequestBodyBytes, for the sizing static_asserts below
 
 /// @file mcp_input_bounds.hpp
 /// The ONE home for MCP request-size bounds (#2437) — transport and handler.
@@ -47,6 +47,52 @@ inline constexpr std::size_t kExecInstrAgentIdsMaxItems = 10000; // agent_ids le
 // documented as deliberate before anyone checked why it existed.
 inline constexpr std::size_t kExecInstrParamCountMax = kMaxParamCountPerStep; // 32
 inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      // 256
+
+// ── Sizing: the per-field caps must fit under the TRANSPORT cap ───────────
+// #2478 refuses a /mcp/ body over kMcpMaxRequestBodyBytes before reading it.
+// The caps above are what a caller may legitimately fill, so their sum has to
+// stay UNDER that cap — otherwise a maximal-but-legal execute_instruction is
+// 413'd at the transport before the handler could ever accept it.
+//
+// These are static_asserts in the HEADER, not checks in a test, so widening a
+// field bound past the transport cap fails the BUILD rather than a test run.
+// Derived from the constants rather than restated, so the relation cannot
+// drift away from what is enforced.
+inline constexpr std::size_t kExecInstrWorstCaseBody =
+    kExecInstrAgentIdsMaxItems * (kExecInstrIdentMaxLen + 3) +  // "<ident>",
+    kExecInstrParamCountMax * (kExecInstrParamKeyMaxLen + kExecInstrParamValueMaxLen + 6) +
+    (kExecInstrScopeMaxLen + 16) + 2 * (kExecInstrIdentMaxLen + 16) +
+    2048; // jsonrpc/method/id/_meta.progressToken envelope
+
+// A MARGIN, not merely ">". The params widening took the headroom from 62% to
+// 18% and nobody recomputed it until review, so the next careless bump should
+// fail to compile rather than ship a cap that refuses schema-legal calls. 10%
+// is what the current numbers actually support - a 25% rule was tried first and
+// does NOT hold at 64 KiB, and weakening an assertion until it passes is worse
+// than not having one.
+static_assert(kMcpMaxRequestBodyBytes > kExecInstrWorstCaseBody * 11 / 10,
+              "a maximal execute_instruction must fit with room for JSON escaping - if this "
+              "fires, raise the transport cap or lower a field bound, and update the figures "
+              "in docs/mcp-server.md");
+static_assert(kMcpMaxRequestBodyBytes > kExecInstrWorstCaseBody,
+              "the transport cap must admit the largest execute_instruction the per-field "
+              "caps permit — below that, a legitimate maximal call would 413 before the "
+              "handler ever saw it");
+
+// The cap is DELIBERATELY below what execute_bundle's own validator accepts,
+// and that clamp is the part most likely to be "fixed" by someone reading only
+// the assert above. One saturated bundle step is ~2 MiB, so a 2-step bundle
+// validate_bundle_steps would accept is refused at the transport. A stated
+// product clamp (docs/mcp-server.md), NOT a derivation error.
+inline constexpr std::size_t kOneSaturatedBundleStep =
+    kMaxParamCountPerStep * (kMaxParamValueLen + kMaxParamKeyLen + 6);
+
+static_assert(kOneSaturatedBundleStep < kMcpMaxRequestBodyBytes,
+              "one saturated bundle step must still fit, or execute_bundle is unusable at "
+              "its own declared per-step limits over MCP");
+static_assert(2 * kOneSaturatedBundleStep > kMcpMaxRequestBodyBytes,
+              "the bundle clamp documented in docs/mcp-server.md — if this stops holding, "
+              "the clamp changed and the docs must change with it");
 
 /// One violated bound. Neither field is ever caller-derived.
 struct BoundViolation {

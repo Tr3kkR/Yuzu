@@ -2770,6 +2770,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string mint_detail_prefix =
                         audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
 
+                    // Observability must never fail a dispatch. Both C8
+                    // rejection paths below - the #2405 schema violation and
+                    // the #2437 bound violation - count through this ONE
+                    // guarded helper rather than incrementing inline, so the
+                    // guard cannot land on one path and not the other. (The
+                    // handler's own `too_large` has carried the same guard
+                    // since #2437; before this the two C8 sites were the
+                    // outliers.) MetricsRegistry::counter is a lock_guard plus
+                    // a map insert with no backend and no cardinality limit,
+                    // so in practice only bad_alloc escapes - the guard costs
+                    // nothing and removes the question.
+                    auto count_denial = [metrics](const char* family,
+                                                  const yuzu::Labels& labels) noexcept {
+                        if (metrics == nullptr) return;
+                        try {
+                            metrics->counter(family, labels).increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    };
+
                     // ── #2405: input-schema validation BEFORE any ticket work ──
                     // A schema-invalid call must neither MINT a ticket (an
                     // admin's approval would be wasted on args the handler
@@ -2799,11 +2819,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             // caller-derived keys are wildcarded to '*').
                             const std::string cid =
                                 yuzu::server::detail::make_correlation_id();
-                            if (metrics != nullptr)
-                                metrics
-                                    ->counter("yuzu_mcp_tool_args_invalid_total",
-                                              {{"tool", tool_name}})
-                                    .increment();
+                            count_denial("yuzu_mcp_tool_args_invalid_total",
+                                         {{"tool", tool_name}});
                             mcp_audit("denied",
                                       "arguments do not match the tool input schema at '" +
                                           violation->path + "' correlation_id=" + cid);
@@ -2820,39 +2837,35 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
 
-                        // #2437: the two bounds the CLOSED subset cannot
-                        // express (params key count, params key length) get
-                        // checked HERE too, not only in the handler. A
-                        // handler-only check would mint a ticket, spend a
-                        // human's approval, CONSUME the one-time ticket, and
-                        // only then fail — the exact waste this gate exists to
-                        // prevent, and unavoidable for a client since neither
-                        // bound is published in the schema. Same
-                        // deny-without-consume shape as the schema violation
-                        // above; the handler keeps its own copy as defense in
-                        // depth for the ungated tiers.
-                        if (tool_name == "execute_instruction") {
-                            if (auto bv = check_exec_instruction_shape(args)) {
-                                const std::string cid =
-                                    yuzu::server::detail::make_correlation_id();
-                                if (metrics != nullptr)
-                                    metrics
-                                        ->counter("yuzu_mcp_tool_args_too_large_total",
-                                                  {{"tool", tool_name},
-                                                   {"reason", bv->reason}})
-                                        .increment();
-                                mcp_audit("denied",
-                                          std::string("input bound exceeded: ") + bv->reason +
-                                              " correlation_id=" + cid);
-                                res.set_content(
-                                    a4_error(kInvalidParams, bv->message,
-                                             "reduce the argument and re-call; no approval "
-                                             "ticket was created or consumed",
-                                             -1, cid),
-                                    "application/json");
-                                return;
-                            }
+                    // #2437: the two bounds the CLOSED subset cannot express
+                    // (params key count, params key length) get checked HERE
+                    // too, not only in the handler. A handler-only check would
+                    // mint a ticket, spend a human's approval, CONSUME the
+                    // one-time ticket, and only then fail — the exact waste
+                    // this gate exists to prevent, and unavoidable for a client
+                    // since neither bound is published in the schema. Same
+                    // deny-without-consume shape as the schema violation above;
+                    // the handler keeps its own copy as defense in depth for
+                    // the ungated tiers.
+                    if (tool_name == "execute_instruction") {
+                        if (auto bv = check_exec_instruction_shape(args)) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            count_denial("yuzu_mcp_tool_args_too_large_total",
+                                         {{"tool", tool_name}, {"reason", bv->reason}});
+                            mcp_audit("denied",
+                                      std::string("input bound exceeded: ") + bv->reason +
+                                          " correlation_id=" + cid);
+                            res.set_content(
+                                a4_error(kInvalidParams, bv->message,
+                                         "reduce the argument and re-call; no approval "
+                                         "ticket was created or consumed",
+                                         -1, cid),
+                                "application/json");
+                            return;
                         }
+                    }
+
                     if (supplied_id.empty()) {
                         // First call → mint a ticket, but DEDUP first (governance
                         // UP-1 BLOCKING): if this principal already has a pending
