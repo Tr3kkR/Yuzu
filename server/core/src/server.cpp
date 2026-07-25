@@ -483,7 +483,7 @@ public:
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
                           "gauge");
-        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
+        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
                           "Frames dropped before reaching a connection's per-connection queue — "
@@ -590,7 +590,10 @@ public:
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
         }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
-                            "credential_revoked", "auth_unavailable", "internal_error"}) {
+                            "credential_revoked", "auth_unavailable", "internal_error",
+                            // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
+                            // pre-seeded here so the closed label set is complete from C4.
+                            "cancelled", "cap_expired", "completed"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
