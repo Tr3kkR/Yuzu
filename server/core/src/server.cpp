@@ -589,6 +589,16 @@ public:
         for (const auto& tool : mcp::approval_gated_tool_names()) {
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
         }
+        // #2437 transport-layer body rejection (pre-routing, pre-auth). No
+        // `tool` label: the body is never read, so nothing is known about the
+        // call beyond its path — a tool label here would be a fabrication.
+        // `reason` distinguishes a measured over-cap body (413) from one this
+        // server refuses to measure at all (411: chunked, or POST with no
+        // Content-Length — both would otherwise revert to httplib's 100 MB
+        // default and evade the cap entirely).
+        for (auto reason : {"over_cap", "unmeasurable"}) {
+            metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
+        }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error",
                             // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
@@ -5955,6 +5965,177 @@ private:
                     R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
+            }
+
+            // MCP request-body bound (#2437). Placed HERE, after the rate
+            // limiter and before auth, for two reasons that are easy to get
+            // wrong:
+            //   * httplib calls this pre-routing handler BEFORE it reads the
+            //     request body (httplib.h: pre_routing_handler_ in routing(),
+            //     read_content later in the same function), so returning
+            //     Handled costs a header parse and never buffers the payload.
+            //     Enforcing the same bound inside the MCP handler would be too
+            //     late — the body is already in memory by then.
+            //   * it is per-path, NOT the server-global
+            //     `set_payload_max_length` knob, which would also cap the
+            //     multipart certificate upload and content distribution on
+            //     this same httplib instance. httplib's 100 MB default stays
+            //     as the outer backstop for every other route.
+            // Unlike the on-behalf-of guard above, this sits AFTER the rate
+            // limiter: there is no diagnostic reason to let an oversized-body
+            // flood bypass the limiter, and no misconfiguration it would mask.
+            // A chunked or Content-Length-less POST/PUT/PATCH is REFUSED 411,
+            // not admitted: httplib consults Transfer-Encoding before
+            // Content-Length and reads a header-less POST to EOF, so either
+            // shape would revert to the 100 MB default and evade this cap
+            // entirely. A bound removable by deleting a header is not a bound.
+            // ON THE UNREAD BODY (checked at primary source against the
+            // vendored httplib 0.37.1 — don't re-derive, and re-check on a
+            // vcpkg baseline bump). Returning Handled means the body is never
+            // read off the socket. What ACTUALLY happens next:
+            //   * write_response_core stamps `Connection: close` on any status
+            //     >= 400 (httplib.h:10789, "Don't leave connections open after
+            //     errors"), so a conforming client closes.
+            //   * but NOTHING sets httplib's `connection_closed` flag for an
+            //     error response, so process_server_socket_core loops again
+            //     (httplib.h:5516-5531). A client that already transmitted the
+            //     declared body — which it always has under
+            //     `Expect: 100-continue`, since process_request auto-answers
+            //     100 BEFORE routing — leaves those bytes to be parsed as
+            //     subsequent request lines on this same socket.
+            //   * bounded: <= keep_alive_max_count_ (100) parses and the idle
+            //     timeout, then teardown. Malformed lines 400 before
+            //     pre-routing runs (so they skip the rate limiter); a
+            //     well-formed smuggled request goes through the FULL middleware
+            //     chain including auth, so there is no auth bypass.
+            // Same shape as the two early returns above (on-behalf-of 403,
+            // rate-limit 429), which have always returned Handled on POSTs
+            // carrying bodies — this adds an instance of an existing pattern,
+            // not a new one.
+            // CAVEAT IF A REVERSE PROXY IS EVER PUT IN FRONT: an unread
+            // Content-Length body is a textbook request-smuggling primitive
+            // between proxy and origin. The shipped rigs expose the server
+            // directly, so this is a documented constraint, not a live bug.
+            // The DECISION lives in web_utils.hpp so it has direct unit
+            // coverage (same reason is_login_exempt_path was extracted from
+            // this lambda); only this call site is review-only.
+            // The path test is hoisted to the CALL SITE, not left inside the
+            // predicate: get_header_value_u64 is a function ARGUMENT and is
+            // therefore evaluated unconditionally, so the predicate's internal
+            // && cannot short-circuit it. Measured at 14.22 ns/request
+            // unguarded vs 0.84 ns guarded, on EVERY request server-wide
+            // (governance perf-S1).
+            if (is_mcp_path(req.path)) {
+              // Hoisted ABOVE the try so the catch below can answer with the
+              // right status: collapsing an unmeasurable-body refusal into a
+              // 413 would tell the client to shrink a body whose size was
+              // never the problem.
+              bool unmeasurable_cause = false;
+              // CONTAIN THE WHOLE BRANCH, not just the metric (governance Gate 8,
+              // security + cpp-safety). httplib invokes this handler from TWO
+              // sites: routing() (inside process_request's try/catch) and the
+              // WebSocket-upgrade path at httplib.h:11741, which is NOT — and
+              // ThreadPool::worker runs tasks bare. A GET /mcp/v1/ carrying
+              // `Upgrade: websocket` and an oversized Content-Length reaches
+              // here via that second site, so a bad_alloc from the header read,
+              // the log, the sanitizers, the counter OR the envelope build is
+              // std::terminate. The first attempt guarded only the one operation
+              // it had been told about; the hazard is the path.
+              try {
+                const bool oversize = mcp_body_exceeds_cap(
+                    req.path, req.get_header_value_u64("Content-Length", 0),
+                    mcp::kMcpMaxRequestBodyBytes);
+                // Header VALUES passed through, not a re-implementation of
+                // httplib's parsing — matching its decision by hand is what
+                // let `Transfer-Encoding: Chunked` through last round.
+                const bool unmeasurable = mcp_body_unmeasurable(
+                    req.path, req.method, req.has_header("Content-Length"),
+                    req.get_header_value("Transfer-Encoding"),
+                    req.get_header_value("Content-Encoding"));
+                unmeasurable_cause = unmeasurable;
+                if (oversize || unmeasurable) {
+                    // Throttled log: this is a pre-auth ingress rejection with
+                    // NO principal to audit, and observability-conventions.md
+                    // requires metric + sampled log for exactly that shape.
+                    // Mirrors the on-behalf-of guard above, whose sanitizer
+                    // this reuses (httplib percent-decodes req.path, so raw
+                    // control bytes would otherwise forge log lines).
+                    // OWN throttle, NOT onbehalf::note_rejection (governance
+                    // Gate 8 security HIGH-1). Reusing it fed
+                    // yuzu_onbehalf_rejected_total, which carries a CRITICAL
+                    // alert reading "likely a header-injecting proxy" — so an
+                    // unauthenticated chunked-POST flood would have paged
+                    // someone about an ADR-1005 breach that never happened,
+                    // and would have consumed the shared 1-in-100 log slot
+                    // that the genuine on-behalf-of warnings need. Never
+                    // borrow a security control's counter for a transport
+                    // bound.
+                    // ONE COUNTER PER REASON. A shared counter lets a cheap
+                    // over_cap flood (huge Content-Length, no body sent)
+                    // suppress ~99% of the unmeasurable lines, hiding the
+                    // rarer signal behind the noisier one.
+                    static std::atomic<std::uint64_t> over_cap_hits{0};
+                    static std::atomic<std::uint64_t> unmeasurable_hits{0};
+                    constexpr std::uint64_t kBodyLogEvery = 100;
+                    auto& hits = unmeasurable ? unmeasurable_hits : over_cap_hits;
+                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
+                        spdlog::warn("[#2437] rejected {} {} from {}: {} (1 log per {} "
+                                     "rejections; the counter records all)",
+                                     onbehalf::sanitize_for_log(req.method, 16),
+                                     onbehalf::sanitize_for_log(req.path),
+                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                     unmeasurable ? "unmeasurable body" : "body over cap",
+                                     kBodyLogEvery);
+                    }
+                    try {
+                        metrics_
+                            .counter("yuzu_mcp_body_too_large_total",
+                                     {{"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // Guarded because this call site is NOT inside
+                        // httplib's try/catch on the WebSocket-upgrade path
+                        // (httplib.h:11741 vs routing()'s at :11811), and
+                        // ThreadPool::worker invokes tasks bare — an escaped
+                        // throw here is std::terminate (cpp-safety S1 / UP-9).
+                        // The sibling handler-side increment is guarded the
+                        // same way; observability must never kill the process.
+                    }
+                    res.status = unmeasurable ? 411 : 413;
+                    res.set_content(
+                        unmeasurable
+                            ? detail::a4_denial(
+                                  res, 411,
+                                  "MCP requests must carry a body this server can size "
+                                  "in advance",
+                                  detail::A4ErrorOpts{
+                                      .remediation =
+                                          "send the JSON-RPC body with a Content-Length "
+                                          "header, no Transfer-Encoding, and no "
+                                          "Content-Encoding other than identity; a body "
+                                          "whose size cannot be checked before reading it "
+                                          "cannot be admitted under the 4 MiB MCP cap "
+                                          "(see docs/mcp-server.md)"})
+                            : detail::a4_denial(
+                                  res, 413, "request body exceeds the MCP transport limit",
+                                  detail::A4ErrorOpts{
+                                      .remediation =
+                                          "the largest accepted MCP request body is 4 MiB; "
+                                          "reduce the arguments, or for a large "
+                                          "execute_bundle use the REST twin POST "
+                                          "/api/v1/bundles (see docs/mcp-server.md)"}),
+                        "application/json");
+                  return httplib::Server::HandlerResponse::Handled;
+                }
+              } catch (...) { // NOLINT(bugprone-empty-catch)
+                  // Last-resort containment for the WHOLE branch, including the
+                  // header read that decides it. We cannot build an envelope if
+                  // we got here, but we can still refuse rather than let the
+                  // throw reach httplib's UNGUARDED WebSocket-upgrade call site
+                  // and take the process down.
+                  res.status = unmeasurable_cause ? 411 : 413;
+                  return httplib::Server::HandlerResponse::Handled;
+              }
             }
 
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
