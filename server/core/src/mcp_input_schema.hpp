@@ -39,8 +39,12 @@
 //     default — the exact validated-but-ignored mismatch #2405 closes.
 //     Integers outside int64 range are rejected for the same reason
 //     (param_int returns int64_t).
-//   * "maxLength" counts BYTES, not codepoints (stricter-or-equal; matches
-//     the byte-cap kAgenticParamMaxLen the handlers enforce).
+//   * "maxLength" counts BYTES, not codepoints (stricter-or-equal), so a
+//     schema bound and its handler-side twin can be compared literally.
+//     (This line used to claim it "matches the byte-cap kAgenticParamMaxLen
+//     the handlers enforce" — that constant serves two unrelated READ tools
+//     and was never a general handler cap. The real handler-side twins are
+//     the per-tool kExecInstr* bounds in mcp_server.cpp, #2437.)
 //   * "required" names must be declared in "properties" (a Yuzu authoring
 //     lint — legal JSON Schema, but in a closed server-authored table an
 //     undeclared required name is always a typo).

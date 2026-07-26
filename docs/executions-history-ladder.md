@@ -203,6 +203,33 @@ successor PR that restructures `gc_terminal_channels` or adds a new path
 that erases from `channels_` while holding a channel mutex must preserve
 this ordering. Lock hierarchy is `map_mu_` → `ch->mu`, never reversed.
 
+### Terminal-visit primitive (#2409)
+
+`ExecutionEventBus::unsubscribe_and_visit_terminal(execution_id, sub_id, f)`
+runs a caller-supplied claim callback `f` under a **single hold of one
+channel's mutex**, then erases the listener **iff `f` claimed**. It is the
+MCP progress bridge's fix for a race where the sweep could unsubscribe a
+parked streamed record and then synthesize a spurious `-32014`
+terminal-unavailable frame over an execution that had actually completed —
+because a terminal published into the unsubscribe→re-check window was never
+latched. Two invariants a successor PR must not break:
+
+- **The verdict keys on `Channel::first_terminal_id`, not an event-type
+  scan.** `refresh_counts` publishes a terminal-flagged `execution-progress`
+  *before* `execution-completed` (two publishes, `ch->mu` released between),
+  so the *first* terminal-flagged event is a progress event; a scan for
+  `event_type == "execution-completed"` misclassifies. A marker that has
+  aged out of the ring is `kTerminalKnownLost` → the caller's safe
+  success-shaped fallback ("fetch by execution_id"); it deliberately does
+  **not** recover a later buffered `execution-completed`, which could be a
+  spurious `mark_cancelled` terminal (#2409 UP-1).
+- **`f` runs under `ch->mu` and must never call back into the bus** (a bus
+  call taking `map_mu_` would invert the `map_mu_` → `ch->mu` order above)
+  and must be erase-only-on-claim: every *defer* keeps the listener, so a
+  deferred terminal channel is never listener-less and never GC-eligible
+  out from under the record. The full contract lives on the method in
+  `execution_event_bus.hpp`.
+
 ### Client-side bootstrap is data-attribute-driven
 
 The list-row markup carries `data-execution-id` and

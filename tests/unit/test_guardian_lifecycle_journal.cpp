@@ -563,12 +563,14 @@ TEST_CASE("eviction classification: a stop BEFORE classification counts the whol
           j.batches_pruned());
 }
 
-TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts the remainder",
+TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path classifies the whole set (#2470)",
           "[guardian][journal][prune]") {
-    // The per-key stop gate is kept on the in-memory (scan-OK) path too, not only the
-    // fallback: a stop lands after one classification, and the remaining two are counted as
-    // unclassified rather than dropped. Removing the gate would classify all three and leave
-    // unclassified at 0 - the mutation this test pins.
+    // #2470: on the scan-OK path classification is a pure in-memory set lookup - no I/O, no
+    // unbounded per-key cost - so a mid-loop shutdown does NOT truncate here. The remainder is
+    // fully determinable from the materialized scan, so every key is classified to its TRUE
+    // disposition (here: all unlabelled -> no_send_evidence) rather than lumping the tail into
+    // evicted_unclassified ("PERMANENTLY UNKNOWN"). The mutation this pins: re-adding a scan-OK
+    // stop gate would leave a non-zero unclassified.
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
@@ -576,7 +578,7 @@ TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts t
     persist_n_unmarked(j, t, 3); // all unlabelled -> each classifies as no_send_evidence
 
     j.set_prune_classify_hook_for_test([&](std::size_t classified) {
-        if (classified == 1) // after the first key is bucketed
+        if (classified == 1) // a shutdown lands after the first key is bucketed
             j.request_stop();
     });
 
@@ -584,9 +586,9 @@ TEST_CASE("eviction classification: a stop MID-loop on the scan-OK path counts t
 
     CHECK(stats.evicted == 3);
     CHECK(j.batches_pruned() == 3);
-    CHECK(j.evicted_without_send_evidence() == 1); // the one classified before the stop
+    CHECK(j.evicted_without_send_evidence() == 3); // the stop is ignored; all three classify
     CHECK(j.evicted_sent_unacked() == 0);
-    CHECK(j.evicted_unclassified() == 2);          // the counted remainder
+    CHECK(j.evicted_unclassified() == 0);          // nothing lumped as "PERMANENTLY UNKNOWN"
     CHECK(j.prune_failures() == 0);                // scan succeeded - no read failure
     CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
               j.evicted_unclassified() ==
@@ -681,29 +683,150 @@ TEST_CASE("eviction classification: a read-failure's prune_failures survives a l
 TEST_CASE("eviction classification: sent, no-evidence, and unclassified all non-zero in one pass",
           "[guardian][journal][prune]") {
     // The three-way partition is only meaningfully exact if all three buckets can be non-zero
-    // simultaneously. A mixed evict set - one labelled, one unlabelled classified before a
-    // mid-loop stop - leaves the third key unclassified, exercising all three at once.
+    // simultaneously. Post-#2470 the scan-OK path never lumps a determinable key into
+    // unclassified, so the only way an unclassified key coexists with two classified ones in a
+    // single pass is the FALLBACK path (scan failed -> per-key reads) with one read failure.
+    // Fixture: 3 batches, the LAST-evicted one labelled; the sent-scan fails (fallback); the
+    // FIRST per-key read fails (-> unclassified), the other two reads succeed (one bare ->
+    // no_send_evidence, one labelled -> sent_unacked). evict iterates in key order, so the
+    // injected first-read failure lands on an unlabelled key, not on keys.back().
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
                                     /*max_quarantine=*/100);
     auto keys = persist_n_unmarked(j, t, 3);
-    j.mark_batch_sent(keys.front()); // the first-evicted key carries a sent-label
-    j.set_prune_classify_hook_for_test([&](std::size_t classified) {
-        if (classified == 2) // after the sent key and the unlabelled key are classified
-            j.request_stop();
-    });
+    j.mark_batch_sent(keys.back());                  // the LAST-evicted key carries a sent-label
+    j.inject_prune_sent_scan_failures_for_test(1);   // force the fallback per-key reads
+    j.inject_prune_sent_read_failures_for_test(1);   // ONLY the first per-key read fails
 
     const auto stats = j.prune(0);
 
     CHECK(stats.evicted == 3);
     CHECK(j.batches_pruned() == 3);
-    CHECK(j.evicted_sent_unacked() == 1);          // keys.front() had a label
-    CHECK(j.evicted_without_send_evidence() == 1); // the second, unlabelled
-    CHECK(j.evicted_unclassified() == 1);          // the third, cut off by the stop
+    CHECK(j.evicted_sent_unacked() == 1);          // keys.back() had a label, read OK
+    CHECK(j.evicted_without_send_evidence() == 1); // an unlabelled key, read OK
+    CHECK(j.evicted_unclassified() == 1);          // the first key, read failed
+    CHECK(j.prune_failures() == 1);                // the one read failure, counted once
     CHECK(j.evicted_sent_unacked() + j.evicted_without_send_evidence() +
               j.evicted_unclassified() ==
           j.batches_pruned());
+}
+
+// ── prune progress_or_verified: the prune stamp's positive gate signal (#2452 Gate 8) ──
+// The prune-side mirror of page's progress_or_verified_idle. True iff retention was APPLIED (the
+// delete succeeded) or VERIFIED IDLE (nothing eligible). The drain worker's prune success stamp
+// advances only on this, so a scan failure, a DELETE failure (UP-7), or a stop before the delete
+// reads a growing age instead of lying "retention healthy".
+
+TEST_CASE("prune flag: a clean pass with nothing to evict is verified (progress_or_verified true)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/100, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // 3 batches, well under the 100 cap -> nothing eligible
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.evicted == 0);
+    CHECK(stats.progress_or_verified); // scanned clean, verified nothing to evict
+}
+
+TEST_CASE("prune flag: a pass that evicts is progress (progress_or_verified true)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // over the 0 cap -> all evicted
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.evicted == 3);
+    CHECK(stats.progress_or_verified);
+}
+
+TEST_CASE("prune flag: a DELETE-failing pass is NOT verified (progress_or_verified false, UP-7)",
+          "[guardian][journal][prune]") {
+    // Scan is clean (read_ok true) but the retention delete fails, so retention did NOT run - the
+    // stamp must read a growing age, not fresh. This is the case that distinguishes the positive
+    // flag from the old read_ok gate (which advanced here); mutation-reddens if the flag is set
+    // before the delete rather than after.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // over-cap -> would evict
+    j.inject_delete_failures_for_test(1); // the retention delete fails
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);                    // scan succeeded
+    CHECK(stats.evicted == 0);               // delete failed, nothing removed
+    CHECK(j.prune_failures() >= 1);          // counted
+    CHECK_FALSE(stats.progress_or_verified); // retention did not run
+}
+
+TEST_CASE("prune flag: a scan-failing pass is NOT verified (progress_or_verified false)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    persist_n_unmarked(j, t, 1);
+    j.inject_read_failures_for_test(1); // the initial scan fails
+    const auto stats = j.prune(0);
+    CHECK_FALSE(stats.read_ok);
+    CHECK_FALSE(stats.progress_or_verified);
+}
+
+TEST_CASE("prune flag: a quarantine-rename-FAILING pass is NOT verified (progress_or_verified false, UPR-1)",
+          "[guardian][journal][prune]") {
+    // A malformed key whose quarantine rename FAILS leaves a corrupt row stuck in lc: (re-failing
+    // every pass, eating ceiling). Like the page side's any_quarantine_this_pass guard, that is not
+    // a clean verified-idle pass - it must read stale. Focused re-review UPR-1 (the page-side guard
+    // the first prune cut missed). Pre-plant the quarantine twin so the rename conflicts.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/100, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    const std::string bad = "lc:corrupt:000000000000"; // malformed key -> quarantined on sight
+    REQUIRE(t.kv->set(kJournalNamespace, bad, "not valid json"));
+    REQUIRE(t.kv->set(kJournalNamespace, journal_quarantine_key(bad), "pre-existing twin"));
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.evicted == 0);               // nothing age/count/byte-eligible
+    CHECK(j.quarantine_failures() >= 1);     // the rename really failed
+    CHECK_FALSE(stats.progress_or_verified); // stuck corrupt row -> not verified idle
+}
+
+TEST_CASE("prune flag: a quarantine-only SUCCESS pass is verified (progress_or_verified true)",
+          "[guardian][journal][prune]") {
+    // The by-contract true case (distinct from the FAILURE above): a successful quarantine removed
+    // the corrupt row and retention found nothing else to evict -> verified idle. Pins that the
+    // UPR-1 guard fires ONLY on a quarantine FAILURE, not on every quarantine.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/100, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    REQUIRE(t.kv->set(kJournalNamespace, "lc:corrupt:000000000000", "not valid json"));
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.quarantined >= 1);      // the malformed key was quarantined successfully
+    CHECK(stats.evicted == 0);
+    CHECK(stats.progress_or_verified);  // quarantine succeeded + nothing to evict -> verified
+}
+
+TEST_CASE("prune flag: a stop in the mid-scan loop (pre-delete) is NOT verified (progress_or_verified false)",
+          "[guardian][journal][prune]") {
+    // A stop landing AFTER read_ok is set but BEFORE the delete (via the post-scan seam) reaches an
+    // early return that never sets the flag. Directly pins a pre-delete stop -> false - the UP8-3
+    // class the "bracketed by delete-fail + scan-fail" claim only argued structurally (focused
+    // re-review QA: the mid-scan-loop stop at read_ok=true/evicted=0 was previously untested).
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // over-cap: would evict, but the stop truncates before the delete
+    j.set_post_scan_hook_for_test([&] { j.request_stop(); });
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);      // the scan succeeded before the stop
+    CHECK(stats.evicted == 0); // truncated before the delete
+    CHECK_FALSE(stats.progress_or_verified);
 }
 
 // ── Fault-injection + capacity hardening (governance Gate 7) ──────────────────
@@ -1107,9 +1230,13 @@ TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock ju
     CHECK(declined.evicted == 0);
     CHECK(j.clock_jump_skips() == 1); // counted, and the trail survives the first pass
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+    // #2452 Gate 8 UPR-2: the pass declined age eviction of rows that WERE expired, so retention was
+    // deferred and the journal is NOT idle - the prune stamp must read a growing age, not fresh.
+    CHECK_FALSE(declined.progress_or_verified);
 
     const auto accepted = j.prune(now + 6000); // ...and the next pass proceeds
     CHECK(accepted.evicted == 2);
+    CHECK(accepted.progress_or_verified); // retention actually ran -> verified
 }
 
 TEST_CASE("journal prune: an IMPLAUSIBLY LARGE value cannot evict the rest of the journal",

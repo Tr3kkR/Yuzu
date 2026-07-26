@@ -87,7 +87,11 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 - **Defender CI exclusions.** Provisioning preserves Wee Tam's four exact runner
   work-root exclusions (`D:\ci\work-0` … `work-3`), which cover each runner's
   `_temp` directory and checkout/build outputs. PostgreSQL's executable and
-  disposable data paths are also excluded. Provisioning verifies every `_temp`
+  disposable data paths are also excluded, as are the Catch2 test binaries
+  (`yuzu_{server,agent,tar}_tests.exe`) via process exclusions — a process
+  exclusion skips scanning that binary's file I/O wherever it lands, which covers
+  the SQLite temp churn even in the LOCAL SYSTEM `%TEMP%` the routing can't reach.
+  Provisioning verifies every `_temp`
   path with Defender's own `MpCmdRun.exe -CheckExclusion`. It deliberately does
   not exempt the whole of user/system `%TEMP%` or `D:\ci` — only the scoped
   `C:\Windows\Temp\yuzu*` wildcard, for tests that run in a LOCAL SYSTEM context

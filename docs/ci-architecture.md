@@ -392,11 +392,16 @@ Big Tam cutover the legacy shared `yuzu-ci-postgres` container on
 `:15432` is unused there and can be `docker rm -f`'d.
 
 **Test-database lifecycle (PR #2091).** Ephemeral per-case databases
-(`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`)
-coexist with per-process **template** databases
+(`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`) coexist
+with run-lifetime shared clones (one clone and persistent pool for each
+instantiated eligible high-volume test file) and per-process **template** databases
 (`yuzu_test_tpl_<epoch>_<salt>_<key>`, built once by `PgTestTemplate` and
-dropped at `testRunEnded`) — during a run, each of a box's 4 runner agents
-legitimately holds up to ~a dozen template databases. A pile-up is NOT
+dropped at `testRunEnded`). At run end the listener invokes one ordered shared
+cleanup primitive: it drains every persistent pool first, drops those clones,
+then drops the templates, all before libpq/OpenSSL teardown. The active footprint
+is therefore the per-case databases currently in flight, one clone per
+instantiated shared-fixture file, and up to ~a dozen templates for each of the
+box's 4 runner agents. A pile-up is NOT
 automatically "teardown is failing": names embed their creation epoch, and
 every suite start sweeps names older than 6 h (`kTestDbStaleAfterSeconds`),
 so leaks from killed runs self-heal within that window; the sweep prints a
