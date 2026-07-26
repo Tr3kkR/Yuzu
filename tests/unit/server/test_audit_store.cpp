@@ -1640,5 +1640,131 @@ TEST_CASE("AuditStore #2360: durable state that cannot be READ is an anomaly, no
     CHECK(store.cleanup_once(kNow + 120) == 0);   // declined, not treated as fresh
     CHECK(store.clock_anomaly_skips_count() == 1);
     CHECK(log.says("not usable"));
+    CHECK(log.says("unreadable")); // the shape THIS case exercises, named explicitly
     CHECK_FALSE(log.says("elapsed since the last retention pass"));
+
+    // The flag is consumed, not sticky. The next pass DRAINS -- decline once,
+    // then delete, which is the whole point of the latch -- so the assertion is
+    // that it does not REPORT again, not that it does nothing.
+    log.clear();
+    CHECK(store.cleanup_once(kNow + 240) == 5); // the backlog ages out normally
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    CHECK_FALSE(log.says("not usable"));
+}
+
+TEST_CASE("AuditStore #2360: corrupt durable state is reported on a retention-DISABLED store",
+          "[audit_store][retention][clock-guard]") {
+    // The branch that exists BECAUSE of this case, previously untested. With
+    // `retention_days <= 0` nothing is ever a deletion candidate, so
+    // `has_expired` is false forever and the nothing-expired branch is the ONLY
+    // one that ever runs. If the corruption is not reported there it is never
+    // reported at all -- which is exactly the hole the earlier "clear only where
+    // consumed" fix left open.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-corruptoff-"}};
+    {
+        AuditStore seed(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+        REQUIRE(seed.is_open());
+    }
+    exec_raw(tmp.path, "INSERT INTO audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', 'not-a-number')");
+
+    AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+
+    LogCapture log;
+    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.clock_anomaly_skips_count() == 1); // REPORTED, not swallowed
+    CHECK(store.cleanup_failed_count() == 0);      // not a failed pass
+    CHECK(log.says("re-anchored"));
+    // It must not claim a backlog was held back: nothing was pending here.
+    CHECK_FALSE(log.says("declining once and re-anchoring"));
+
+    // Second pass on the same store: consumed, so silent and not double-counted.
+    log.clear();
+    CHECK(store.cleanup_once(kNow + 1) == 0);
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    CHECK_FALSE(log.says("re-anchored"));
+}
+
+TEST_CASE("AuditStore #2360: an out-of-range durable VALUE is reported even with no backlog",
+          "[audit_store][retention][clock-guard]") {
+    // The sibling carrier. `prev_implausible` derived from a value that PARSED
+    // but is out of range (here: ahead of `now`) was silently dropped on the
+    // nothing-expired branch -- the row is re-anchored before the probes, so the
+    // anomaly vanished with no counter and no warn. A backward NTP correction on
+    // a store with no expired backlog went unreported.
+    GuardFixture f;
+    f.seed(kNow + kWindow, 1); // a survivor only -- nothing is expired
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 0); // healthy baseline
+
+    exec_raw(f.tmp.path, "UPDATE audit_retention_meta SET value = 9000000000 "
+                         "WHERE key = 'last_pass_now'");
+    AuditStore reopened(f.tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(reopened.is_open());
+
+    LogCapture log;
+    CHECK(reopened.cleanup_once(kNow + 60) == 0);
+    CHECK(reopened.clock_anomaly_skips_count() == 1); // reported, not dropped
+    CHECK(log.says("re-anchored"));
+
+    // Latched: this carrier is NOT one-shot, so a second pass must stay quiet.
+    log.clear();
+    CHECK(reopened.cleanup_once(kNow + 120) == 0);
+    CHECK(reopened.clock_anomaly_skips_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360: an index that seeks but makes the DELETE sort reports degraded",
+          "[audit_store][retention][clock-guard]") {
+    // The shape that defeats a probe-only plan check. `(ttl_expires_at,
+    // timestamp)` seeks perfectly well for the EXISTS probes -- so planning only
+    // the probe ACCEPTS it -- but the ordered delete then needs
+    // `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`, an unbounded sort under the
+    // exclusive lock every audit write takes. That is precisely the unbounded
+    // hold the gauge exists to deny, so it must read 0.
+    //
+    // Measured on the shipped SQLite, which is why the check plans the DELETE:
+    //   (ttl_expires_at, id)        probe SEARCH   delete SEARCH               ok
+    //   (ttl_expires_at)            probe SEARCH   delete SEARCH               ok
+    //   (ttl_expires_at, timestamp) probe SEARCH   delete SEARCH + TEMP B-TREE degraded
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-sortidx-"}};
+    {
+        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(seed.is_open());
+        REQUIRE(seed.retention_index_ok());
+    }
+    exec_raw(tmp.path, "DROP INDEX idx_audit_ttl_id");
+    exec_raw(tmp.path, "CREATE INDEX idx_audit_ttl_id ON audit_events(ttl_expires_at, timestamp) "
+                       "WHERE ttl_expires_at > 0");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    CHECK_FALSE(store.retention_index_ok()); // seeks, but sorts -- not healthy
+
+    // Still correct, just slower: the guard does not depend on the index.
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
+    CHECK(store.cleanup_once(kNow) == 5);
+    CHECK(store.cleanup_failed_count() == 0);
+}
+
+TEST_CASE("AuditStore #2360: a single-column index on ttl_expires_at is accepted",
+          "[audit_store][retention][clock-guard]") {
+    // The false-NEGATIVE guard. `(ttl_expires_at)` alone serves both the probes
+    // and the ordered delete -- rowid is the implicit tiebreak, so there is no
+    // sort -- and an earlier structural check would have called it degraded.
+    // Rejecting a perfectly good index would send an operator chasing a
+    // non-problem.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-onecol-"}};
+    {
+        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(seed.is_open());
+    }
+    exec_raw(tmp.path, "DROP INDEX idx_audit_ttl_id");
+    exec_raw(tmp.path, "CREATE INDEX idx_audit_ttl_id ON audit_events(ttl_expires_at) "
+                       "WHERE ttl_expires_at > 0");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_index_ok());
 }

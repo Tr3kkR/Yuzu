@@ -357,11 +357,13 @@ private:
     // Set at construction when durable state EXISTED but could not be used --
     // either not an integer, or unreadable (corruption, busy, I/O error).
     // Absent is NOT carried: that is the ordinary fresh-install shape.
-    // Cleared only where it is CONSUMED -- the pass that declines on it, or the
-    // pass that accepts and deletes -- never on a pass that returns early
-    // (unreadable probe, nothing expired). Clearing early would swallow the
-    // corruption signal with no decline, no counter and no warn, which is the
-    // failure mode this flag exists to prevent.
+    // Cleared at exactly three sites, all of which REPORT it first: the decline
+    // branch, the nothing-expired branch (which reports it via
+    // Emit::CorruptStateReported), and the accepting path that goes on to
+    // delete. It is NOT cleared on a pass that reaches no verdict -- an
+    // unreadable probe, or a closed store -- because those say nothing about
+    // the state. Clearing without reporting would swallow the corruption signal
+    // entirely, which is the failure mode this flag exists to prevent.
     bool loaded_meta_unusable_{false};
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread

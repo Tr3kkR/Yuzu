@@ -1018,8 +1018,8 @@ public:
                           "Audit retention passes declined. Triggers: the pass would have expired "
                           "every datable row; the gap since the previous pass exceeded a fixed "
                           "7 days (a forward clock jump OR an outage that long); or the stored "
-                          "reading was not usable - ahead of the clock, negative, or present "
-                          "but not an integer. Reducing audit_retention_days can also cause a "
+                          "reading was not usable - ahead of the clock, negative, present but "
+                          "not an integer, or unreadable. Reducing audit_retention_days can also cause a "
                           "decline by design",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",

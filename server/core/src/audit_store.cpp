@@ -6,7 +6,6 @@
 #include <sqlite3.h>
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <exception>
 #include <random>
@@ -174,45 +173,44 @@ void AuditStore::ensure_retention_index() {
     // "the lock hold is no longer bounded" reports healthy while every pass
     // full-scans.
     {
-        // Ask the PLANNER, do not pattern-match the DDL. Both previous
-        // attempts were wrong in the same direction: a substring test passed an
-        // index on the wrong column, and the structural column check left a
-        // TAUTOLOGICAL predicate test (`index_info` had already proved the
-        // column list, so searching the DDL for `ttl_expires_at` was free) which
-        // passed `... (ttl_expires_at, id) WHERE id > 0`. It also produced a
-        // FALSE NEGATIVE: a plain non-partial index on the same columns serves
-        // these queries strictly better and would have reported degraded.
+        // Ask the PLANNER, about the statement that actually matters.
         //
-        // EXPLAIN QUERY PLAN over the real probe asserts the only property that
-        // matters -- SQLite will actually use this index for this query -- and
-        // is immune to formatting, case and predicate spelling.
+        // Three attempts got this wrong in three different ways: a DDL substring
+        // test passed a wrong-column index; a "structural" column check left a
+        // TAUTOLOGICAL predicate half; and planning only the PROBE accepted
+        // `(ttl_expires_at, timestamp)`, which seeks fine for the probe but makes
+        // the ordered DELETE sort. Measured on the shipped SQLite:
+        //
+        //   (ttl_expires_at, id)        probe SEARCH   delete SEARCH              accept
+        //   (ttl_expires_at)            probe SEARCH   delete SEARCH              accept
+        //   (ttl_expires_at, timestamp) probe SEARCH   delete SEARCH + TEMP B-TREE reject
+        //   (timestamp) WHERE ttl>0     probe SCAN     -                          reject
+        //
+        // So plan the DELETE, require a SEARCH naming the index, and reject any
+        // TEMP B-TREE: an unbounded sort under the exclusive lock every audit
+        // write takes is precisely the unbounded hold this gauge exists to deny.
+        // `EXPLAIN QUERY PLAN` never executes the statement.
         bool matches = false;
         {
             SqliteStmt eqp;
             if (sqlite3_prepare_v2(db_.get(),
-                                   "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM audit_events "
-                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < 1)",
+                                   "EXPLAIN QUERY PLAN DELETE FROM audit_events WHERE id IN ("
+                                   "SELECT id FROM audit_events "
+                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < 1 "
+                                   "ORDER BY ttl_expires_at ASC, id ASC LIMIT 1)",
                                    -1, eqp.addr(), nullptr) == SQLITE_OK) {
+                bool seeks = false, sorts = false;
                 while (sqlite3_step(eqp.get()) == SQLITE_ROW) {
                     const auto* detail =
                         reinterpret_cast<const char*>(sqlite3_column_text(eqp.get(), 3));
-                    // SEARCH, not merely a mention. Measured on the shipped
-                    // SQLite for the three shapes that matter:
-                    //   (ttl_expires_at, id) WHERE ttl>0  -> SEARCH ... COVERING INDEX
-                    //   (ttl_expires_at, id) no predicate -> SEARCH ... COVERING INDEX
-                    //   (timestamp)          WHERE ttl>0  -> SCAN ... USING INDEX
-                    // The wrong-column index IS used, as a full SCAN, which is
-                    // exactly the degraded state the gauge must report -- so
-                    // matching the index name alone accepts it. Requiring a seek
-                    // also correctly ACCEPTS a non-partial index on the right
-                    // columns, which serves these queries strictly better.
                     const std::string_view d{detail ? detail : ""};
                     if (d.find("SEARCH") != std::string_view::npos &&
-                        d.find("idx_audit_ttl_id") != std::string_view::npos) {
-                        matches = true;
-                        break;
-                    }
+                        d.find("idx_audit_ttl_id") != std::string_view::npos)
+                        seeks = true;
+                    if (d.find("TEMP B-TREE") != std::string_view::npos)
+                        sorts = true;
                 }
+                matches = seeks && !sorts;
             }
         }
         if (!matches) {
@@ -763,14 +761,30 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // on a retention-disabled store (`window == 0`, nothing ever
             // expires) this is the ONLY branch ever taken, so the anomaly would
             // never be reported at all. Report once, then clear.
-            if (loaded_meta_unusable_) {
+            // BOTH carriers of "the durable reading was not usable" must be
+            // reported here, not just the load-time one. `prev_implausible` also
+            // comes from a VALUE that parsed but is out of range (negative, or
+            // ahead of now), and the row has already been re-anchored above, so
+            // dropping it here loses the anomaly with no counter and no warn --
+            // the identical defect the load-time carrier was just fixed for.
+            // On a retention-disabled store this is the ONLY branch ever taken.
+            //
+            // The value-derived arm is NOT one-shot, so unlike the load-time
+            // flag it must honour the latch, exactly as every other decline does.
+            if (loaded_meta_unusable_ || (prev_implausible && !clock_anomaly_latched_)) {
+                if (prev_implausible && !loaded_meta_unusable_)
+                    clock_anomaly_latched_ = true;
                 // Deliberately NOT gated on `clock_anomaly_latched_`, unlike
                 // every other decline. The latch exists to stop a PERSISTENT
                 // condition re-declining every pass; this one is one-shot by
                 // construction -- the flag is set once at construction and
                 // cleared here -- so it cannot spam. It gets its own message
-                // because nothing was pending deletion on this branch, so
-                // calling it a "decline" would misdescribe the pass.
+                // and counts on the same counter as every other decline: the
+                // guard fired and the pass deleted nothing, which is what
+                // `clock_anomaly_skips_` means. The separate message exists
+                // because there was nothing expired to delete on this branch
+                // either way, so the operator should not go looking for a
+                // backlog that was held back.
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 loaded_meta_unusable_ = false;
                 emit = Emit::CorruptStateReported;
@@ -833,15 +847,17 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         break;
     case Emit::DeclineImplausible:
         spdlog::warn("AuditStore: the stored retention clock reading is not usable (negative, "
-                     "ahead of the current clock, or present but not an integer), so this "
+                     "ahead of the current clock, present but not an integer, or unreadable), "
+                     "so this "
                      "server's clock moved backward or that durable state was corrupted; "
                      "declining once and re-anchoring on the current reading");
         break;
     case Emit::CorruptStateReported:
-        spdlog::warn("AuditStore: the stored retention clock reading was unusable (corrupted or "
-                     "not an integer) and has been re-anchored. Nothing was pending deletion on "
-                     "this pass, so nothing was declined -- but the restart-surviving half of the "
-                     "clock guard had no comparison point until now");
+        spdlog::warn("AuditStore: the stored retention clock reading was unusable (corrupted, "
+                     "not an integer, or unreadable) and has been re-anchored. This pass declined "
+                     "to trust it and deleted nothing -- there was nothing expired to delete "
+                     "either way -- so the restart-surviving half of the clock guard had no "
+                     "comparison point until now");
         break;
     case Emit::ProbeFailed:
         spdlog::warn("AuditStore: retention probe failed ({}); skipping this pass", emit_err);

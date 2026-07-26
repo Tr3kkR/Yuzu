@@ -353,7 +353,7 @@ refuses to act on that:
   negative, present but not an integer, or unreadable. Reducing
   `audit_retention_days` also declines a pass by design, because it narrows the
   survivor horizon. None of the unusable shapes can be reasoned about, so the
-  pass declines either way. They are NOT proof of tampering: this code itself
+  pass declines in every case. They are NOT proof of tampering: this code itself
   persists a negative reading on a dead-CMOS machine, and an ordinary backward
   NTP correction leaves a legitimate earlier reading ahead of `now`. That reading is
   persisted, so the check still fires on the first pass after a restart --- including
