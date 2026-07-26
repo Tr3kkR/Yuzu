@@ -300,7 +300,7 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
 
 Five secret classes are currently stored **plaintext inside 0600-mode server-side
 database files** (not encrypted at the column level): MFA TOTP secrets and session
-tokens (`auth.db`), webhook signing secrets (`webhooks.db`), offload-target
+tokens (Postgres schema `auth`), webhook signing secrets (`webhooks.db`), offload-target
 credentials (`offload_targets.db`), and the OIDC client secret
 (`runtime-config.db`). Protection today is file permissions + the host-level
 encryption above. ADR-0010 (`docs/adr/0010-secrets-at-rest-envelope-encryption.md`)

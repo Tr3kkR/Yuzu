@@ -804,7 +804,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Collate a dispatched bundle", "tags": ["Bundles"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^bundle-[a-f0-9]+$"}}], "responses": {"200": {"description": "Server-grouped {complete, received, succeeded, expected, steps[]} in request order. complete is terminal, NOT success — check succeeded==expected. Invalid-UTF-8 bytes in step output are replaced with U+FFFD."}, "403": {"description": "Requires Response:Read"}, "404": {"description": "Not found, expired, or not owned (no enumeration oracle)"}, "503": {"description": "Service unavailable"}}}
     },
     "/users/{username}/unlock": {
-      "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "auth.db write failed"}, "503": {"description": "Lockout subsystem unavailable (no auth.db / --data-dir)"}}}
+      "post": {"summary": "Clear a user's account-lockout counter (admin unlock, SOC 2 CC6.3)", "tags": ["Users"], "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Lockout cleared: {username, unlocked, audit_emitted}"}, "400": {"description": "Username empty or malformed"}, "403": {"description": "Requires UserManagement:Write (and MFA step-up when enrolled)"}, "500": {"description": "Auth store write failed"}, "503": {"description": "Lockout subsystem unavailable (auth store not configured or unreachable \u2014 see --postgres-dsn)"}}}
     },
     "/users/{username}/elevation-eligibility": {
       "post": {"summary": "Grant or revoke a user's JIT-admin-elevation eligibility (SOC 2 CC6.3/CC6.6)", "tags": ["Users"], "description": "Admin (or an active elevation) + MFA step-up. Sets the per-user users.elevation_eligible flag. Self-grant is blocked. Setting eligible=false also terminates any in-flight elevation for that user. Errors use the A4 envelope (correlation_id + remediation).", "parameters": [{"name": "username", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["eligible"], "properties": {"eligible": {"type": "boolean"}}}}}}, "responses": {"200": {"description": "{status: ok}"}, "400": {"description": "Invalid username or non-boolean body"}, "401": {"description": "Not authenticated"}, "403": {"description": "Not admin, MFA step-up refused, or self-grant"}, "404": {"description": "User not found"}, "503": {"description": "No auth.db (--data-dir unset)"}}}
@@ -3267,9 +3267,11 @@ void RestApiV1::register_routes(
 
     // ── Sessions (/api/v1/sessions) ──────────────────────────────────────
     //
-    // Two entry points to `AuthManager::invalidate_user_sessions` (the
-    // dual-write primitive that wipes both `auth.db` rows and the
-    // in-memory `sessions_` map):
+    // Two entry points to `AuthManager::invalidate_user_sessions`, which wipes
+    // the in-memory `sessions_` map. (Pre-ADR-0006 this was a dual-write that
+    // also deleted `auth.db` session rows; sessions are now in-memory-ONLY —
+    // there is no durable session table on the Postgres auth store, so a
+    // restart is itself a fleet-wide revocation.):
     //   - DELETE /api/v1/sessions?username=<name> — admin force-logout
     //     of another user. Cookie sessions only; API tokens deliberately
     //     left intact (operator might be revoking a leaked cookie while
@@ -3522,8 +3524,8 @@ void RestApiV1::register_routes(
                 res.set_content(
                     detail::error_json_a4(503, "lockout subsystem unavailable", cid,
                                           /*retry_after_ms=*/5000,
-                                          "account lockout requires the persistent auth.db; start "
-                                          "the server with --data-dir"),
+                                          "account lockout requires the Postgres auth store; "
+                                          "start the server with --postgres-dsn"),
                     "application/json");
                 return;
             }

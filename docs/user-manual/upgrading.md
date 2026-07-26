@@ -360,9 +360,8 @@ second factor for an external identity, so **before enabling
 claim containing a recognized MFA method** (Entra: `mfa`; others:
 `otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
 unable to reach high-risk endpoints — recoverable by restarting in
-`optional` (see `docs/ops-runbooks/auth-db-recovery.md`; note that runbook's
-file-based SQL steps are SQLite-era and superseded post-AuthDB→Postgres
-migration — the restart-with-`optional` procedure itself is unaffected).
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md` § "Locked out by MFA
+enforcement misconfiguration"; that runbook is now Postgres-native throughout).
 Under `optional`, no IdP `amr` configuration is required (SSO sessions pass
 the gate).
 

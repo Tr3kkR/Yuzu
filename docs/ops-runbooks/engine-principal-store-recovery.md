@@ -6,9 +6,9 @@ autonomous **engine principals** (`docs/auth-engine-principals-design.md`
 §3.1). Covers the `/readyz` probe, the client-visible 503-vs-401 split on
 `get_for_auth`, and the `engine:` namespace collision-scan boot failure.
 
-Unlike `auth.db` (per-node SQLite, `docs/ops-runbooks/auth-db-recovery.md`),
-this store lives in the shared Postgres substrate — recovery is Postgres
-recovery, not a local-file procedure. See `docs/postgres-store-playbook.md`
+Like the auth store (`docs/ops-runbooks/auth-db-recovery.md`), this store
+lives in the shared Postgres substrate — recovery is Postgres recovery, not a
+local-file procedure. See `docs/postgres-store-playbook.md`
 for the substrate-wide primitives (pool, migration runner, `/readyz`
 conjunction) this runbook assumes.
 
@@ -116,9 +116,9 @@ step, not a routine failure mode.
    sqlite3 /var/lib/yuzu/auth.db \
      "SELECT username, is_active, identity_source FROM users WHERE username LIKE 'engine:%';"
 
-   # Stop the service and back up auth.db first (see
-   # docs/ops-runbooks/auth-db-recovery.md for the general auth.db surgery
-   # cautions). Then EITHER rename the colliding row out of the reserved
+   # Stop the service and take a Postgres dump first (see
+   # docs/ops-runbooks/auth-db-recovery.md for the backup rules, including
+   # the KEK pairing). Then EITHER rename the colliding row out of the reserved
    # namespace (preferred — preserves the account's audit history), OR
    # hard-delete it if it is genuinely stale and unwanted.
    #
