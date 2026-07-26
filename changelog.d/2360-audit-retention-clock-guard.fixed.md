@@ -15,17 +15,17 @@
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe
   into a paced one plus an operator signal rather than preventing every anomaly.
-  Eight metrics report it: `yuzu_server_audit_clock_anomaly_skips_total` (declined),
+  Seven metrics report it: `yuzu_server_audit_clock_anomaly_skips_total` (declined),
   `yuzu_server_audit_cleanup_failed_total` (errored or store closed),
   `yuzu_server_audit_retention_cap_reached_total` (the backlog is not draining),
-  `yuzu_server_audit_rows_deleted_total`, `yuzu_server_audit_retention_index_ok`,
-  `yuzu_server_audit_retention_persist_failed_total`, and the two LIVENESS signals
+  `yuzu_server_audit_rows_deleted_total`, `yuzu_server_audit_retention_persist_failed_total`, and the two LIVENESS signals
   `yuzu_server_audit_retention_passes_total` + `..._retention_last_pass_unixtime` --
   every other counter is silence-means-healthy, so these are what distinguish a
   quiet healthy store from a reaper that stopped. All are counters except
-  `retention_index_ok` and `retention_last_pass_unixtime`, which are gauges. Six
-  Prometheus alert rules ship; `rows_deleted_total` and `retention_last_pass_unixtime`
+  `retention_last_pass_unixtime`, which is a gauge. Five Prometheus alert rules
+  ship; `rows_deleted_total` and `retention_last_pass_unixtime`
   are read alongside the others rather than alerted on directly. A partial index on `audit_events(ttl_expires_at, id)`
   keeps the pass index-driven; it is built best-effort outside the migration
   runner, so a failure to create it degrades retention to full scans instead of
-  taking the audit trail offline.
+  taking the audit trail offline, and is logged as an error (there is no health
+  metric for it - see #2526).

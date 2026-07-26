@@ -1317,21 +1317,22 @@ TEST_CASE("AuditStore #2360: a pass that cannot persist its clock reading counts
     CHECK(f.store.clock_anomaly_skips_count() == 0);
 }
 
-TEST_CASE("AuditStore #2360: a store whose retention index cannot be built opens degraded, not "
-          "closed",
+TEST_CASE("AuditStore #2360: a store whose retention index cannot be built stays fully usable",
           "[audit_store][retention][clock-guard]") {
-    // The index is a PERFORMANCE artifact, built outside the migration runner so
-    // that a failure degrades retention to full scans instead of taking the
-    // audit trail offline. Occupying the index's name with a table makes
-    // `CREATE INDEX IF NOT EXISTS` fail for real ("there is already another
-    // table or index with this name") rather than by injection.
+    // The index is a PERFORMANCE artifact, built best-effort outside the
+    // migration runner so a failure degrades retention to full scans rather than
+    // taking the audit trail offline. Occupying the index's name with a table
+    // makes `CREATE INDEX IF NOT EXISTS` fail for real rather than by injection.
+    //
+    // There is deliberately NO health gauge for this state (#2526): three
+    // implementations of one each shipped a defect. The guarantee tested here is
+    // the one that matters -- the store opens, writes, and retains correctly
+    // without the index.
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-noidx-"}};
     exec_raw(tmp.path, "CREATE TABLE idx_audit_ttl_id (x INTEGER)");
 
     AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-    // Open, writable, and retention still works -- only the gauge is 0.
     REQUIRE(store.is_open());
-    CHECK_FALSE(store.retention_index_ok());
 
     seed_rows_with_ttl(tmp.path, kNow - 100, 5);
     seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
@@ -1344,14 +1345,6 @@ TEST_CASE("AuditStore #2360: a store whose retention index cannot be built opens
     e.action = "auth.login";
     e.result = "success";
     CHECK(store.log(e));
-}
-
-TEST_CASE("AuditStore #2360: the healthy path reports the retention index as present",
-          "[audit_store][retention][clock-guard]") {
-    // The counterpart to the test above: without this one, a change that made
-    // `retention_index_ok()` return false unconditionally would still pass.
-    GuardFixture f;
-    CHECK(f.store.retention_index_ok());
 }
 
 TEST_CASE("AuditStore #2360: a second pass at the same `now` is a clean no-op",
@@ -1586,34 +1579,6 @@ TEST_CASE("AuditStore #2360: a non-integer stored reading is rejected, not coerc
     }
 }
 
-TEST_CASE("AuditStore #2360: a wrong index squatting the name reports degraded, not healthy",
-          "[audit_store][retention][clock-guard]") {
-    // `CREATE INDEX IF NOT EXISTS` is a NO-OP against an existing index of the
-    // same name, whatever its shape, so SQLITE_OK never meant "index-driven".
-    // This shape specifically defeats a substring heuristic: it indexes the WRONG
-    // column while still mentioning `ttl_expires_at` and `WHERE`, so a text match
-    // passes it and only a structural check (PRAGMA index_info) catches it.
-    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-wrongidx-"}};
-    {
-        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-        REQUIRE(seed.is_open());
-        REQUIRE(seed.retention_index_ok()); // the real index was built
-    }
-    exec_raw(tmp.path, "DROP INDEX idx_audit_ttl_id");
-    exec_raw(tmp.path, "CREATE INDEX idx_audit_ttl_id ON audit_events(timestamp) "
-                       "WHERE ttl_expires_at > 0");
-
-    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-    REQUIRE(store.is_open());       // still usable
-    CHECK_FALSE(store.retention_index_ok()); // but honest about being degraded
-
-    // And retention still works, just unindexed -- the guard is correct without it.
-    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
-    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
-    CHECK(store.cleanup_once(kNow) == 5);
-    CHECK(store.cleanup_failed_count() == 0);
-}
-
 TEST_CASE("AuditStore #2360: durable state that cannot be READ is an anomaly, not a clean slate",
           "[audit_store][retention][clock-guard]") {
     // The third MetaReadError arm. A read failure -- corruption, SQLITE_BUSY, an
@@ -1714,57 +1679,3 @@ TEST_CASE("AuditStore #2360: an out-of-range durable VALUE is reported even with
     CHECK(reopened.clock_anomaly_skips_count() == 1);
 }
 
-TEST_CASE("AuditStore #2360: an index that seeks but makes the DELETE sort reports degraded",
-          "[audit_store][retention][clock-guard]") {
-    // The shape that defeats a probe-only plan check. `(ttl_expires_at,
-    // timestamp)` seeks perfectly well for the EXISTS probes -- so planning only
-    // the probe ACCEPTS it -- but the ordered delete then needs
-    // `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`, an unbounded sort under the
-    // exclusive lock every audit write takes. That is precisely the unbounded
-    // hold the gauge exists to deny, so it must read 0.
-    //
-    // Measured on the shipped SQLite, which is why the check plans the DELETE:
-    //   (ttl_expires_at, id)        probe SEARCH   delete SEARCH               ok
-    //   (ttl_expires_at)            probe SEARCH   delete SEARCH               ok
-    //   (ttl_expires_at, timestamp) probe SEARCH   delete SEARCH + TEMP B-TREE degraded
-    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-sortidx-"}};
-    {
-        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-        REQUIRE(seed.is_open());
-        REQUIRE(seed.retention_index_ok());
-    }
-    exec_raw(tmp.path, "DROP INDEX idx_audit_ttl_id");
-    exec_raw(tmp.path, "CREATE INDEX idx_audit_ttl_id ON audit_events(ttl_expires_at, timestamp) "
-                       "WHERE ttl_expires_at > 0");
-
-    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-    REQUIRE(store.is_open());
-    CHECK_FALSE(store.retention_index_ok()); // seeks, but sorts -- not healthy
-
-    // Still correct, just slower: the guard does not depend on the index.
-    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
-    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
-    CHECK(store.cleanup_once(kNow) == 5);
-    CHECK(store.cleanup_failed_count() == 0);
-}
-
-TEST_CASE("AuditStore #2360: a single-column index on ttl_expires_at is accepted",
-          "[audit_store][retention][clock-guard]") {
-    // The false-NEGATIVE guard. `(ttl_expires_at)` alone serves both the probes
-    // and the ordered delete -- rowid is the implicit tiebreak, so there is no
-    // sort -- and an earlier structural check would have called it degraded.
-    // Rejecting a perfectly good index would send an operator chasing a
-    // non-problem.
-    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-onecol-"}};
-    {
-        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-        REQUIRE(seed.is_open());
-    }
-    exec_raw(tmp.path, "DROP INDEX idx_audit_ttl_id");
-    exec_raw(tmp.path, "CREATE INDEX idx_audit_ttl_id ON audit_events(ttl_expires_at) "
-                       "WHERE ttl_expires_at > 0");
-
-    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
-    REQUIRE(store.is_open());
-    CHECK(store.retention_index_ok());
-}

@@ -438,7 +438,7 @@ case, which is why the elapsed-time reading is persisted across restarts. Taken
 together the guard converts an instantaneous wipe into a paced one plus an
 operator signal; it does not guarantee every clock anomaly is detected.
 
-Eight metrics report on this. All but `rows_deleted_total` and
+Seven metrics report on this. All but `rows_deleted_total` and
 `retention_last_pass_unixtime` ship with an alert rule in
 `docs/prometheus/yuzu-alerts.yml`; those two are read alongside the others
 (is the backlog moving? when did the reaper last run?) rather than alerted on
@@ -450,9 +450,8 @@ directly. Do not collapse the first two:
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
-| `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. **Evaluated once at startup**, so it will not detect an index dropped while the server is running. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
-| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the six *counters* here stay flat at 0, which looks exactly like a quiet, healthy store. (`retention_index_ok` is the exception: a startup-evaluated gauge, so its alert fires either way.) Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the six *counters* here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass ran; `0` if none has in this process. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks

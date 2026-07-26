@@ -234,15 +234,6 @@ public:
         return cap_reached_.load(std::memory_order_relaxed);
     }
 
-    /// True while the retention index exists. Evaluated once, at construction,
-    /// so it cannot detect an index dropped at runtime. Without the index every
-    /// pass full-scans `audit_events` under the exclusive lock every audit write
-    /// needs, and that cost grows with the table -- this is the one signal that
-    /// says the pass's bounded lock hold is no longer bounded.
-    bool retention_index_ok() const noexcept {
-        return retention_index_ok_.load(std::memory_order_relaxed);
-    }
-
     /// Cumulative retention passes ATTEMPTED, and the wall-clock reading of the
     /// most recent pass WHOSE CLOCK WAS USABLE (0 if none has run in this
     /// process). The two differ deliberately: a pass refused for an implausible
@@ -253,13 +244,9 @@ public:
     /// clock" -- a different fault from "stopped".
     ///
     /// These exist because every other COUNTER here is silence-means-healthy: a
-    /// cleanup thread that never starts, dies, or is stopped leaves all six flat
-    /// at 0 forever, which is indistinguishable from a quiet, healthy store.
-    /// (`retention_index_ok` is the exception -- a startup-evaluated gauge whose
-    /// alert fires whether or not the reaper runs.) `audit.db` then grows without bound and rows are retained past
-    /// the stated window with no signal at all. An operator alerts on ABSENCE
-    /// here (`passes_total` not increasing, or `last_pass_unixtime` going
-    /// stale), which is the only way to detect a reaper that is not running.
+    /// cleanup thread that never starts, dies, or is stopped leaves them all
+    /// flat at 0 forever, which is indistinguishable from a quiet, healthy
+    /// store. An operator alerts on ABSENCE here.
     std::uint64_t retention_passes_count() const noexcept {
         return retention_passes_.load(std::memory_order_relaxed);
     }
@@ -324,12 +311,6 @@ private:
     // not the same question as "did it delete anything".
     std::atomic<uint64_t> retention_passes_{0};
     std::atomic<std::int64_t> last_pass_unixtime_{0};
-    // Defaults FALSE and is set true only on the index-build success path. A
-    // store whose migration failed never reaches the build at all, so an
-    // initialise-true/clear-on-failure scheme would publish "index healthy" for
-    // a database that does not exist -- backwards for the one gauge whose whole
-    // job is to say the pass is degraded.
-    std::atomic<bool> retention_index_ok_{false};
 
     // Guard state for cleanup_once(). Plain (non-atomic) members: both are read
     // and written only under the exclusive mtx_ that cleanup_once() holds for

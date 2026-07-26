@@ -134,15 +134,13 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that did not fully do their job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One of the seven sites fires after a SUCCESSFUL delete** (the post-delete backlog probe), so this means "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
 | `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
-| `yuzu_server_audit_retention_index_ok` | gauge | `1` while the retention index exists. Evaluated once at startup, so it cannot detect an index dropped at runtime. `0` means every cleanup pass full-scans `audit_events` under the exclusive store lock, and that cost grows with the table - the one condition that makes the pass's lock hold unbounded. Alert on `== 0`. |
 | `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
-| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: every other *counter* here is silence-means-healthy, so a cleanup thread that never runs leaves all six flat at 0 (`retention_index_ok` is a startup-evaluated gauge and is the exception) - identical to a quiet, healthy store, while `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: every other *counter* here is silence-means-healthy, so a cleanup thread that never runs leaves all six flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | gauge | Wall-clock reading of the most recent pass; `0` if none has run in this process. Read WITH the counter above: stale here while that RISES means the reaper is alive but refusing an implausible clock -- a different fault from stopped. |
 
-**Alert on absence, not just on rising counters.** Five of these fire on something going
+**Alert on absence, not just on rising counters.** Four of these fire on something going
 wrong; `..._retention_passes_total` is the only one that catches the reaper not running at
-all, which is the state in which none of the other *counter*-driven rules can fire (the
-`retention_index_ok` gauge rule is evaluated at startup and is unaffected). The `YuzuAuditRetentionNotRunning`
+all, which is the state in which none of the other *counter*-driven rules can fire. The `YuzuAuditRetentionNotRunning`
 rule covers it.
 
 The skips and failed counters must be alerted on separately and never collapsed:

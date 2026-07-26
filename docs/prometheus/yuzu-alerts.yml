@@ -532,40 +532,9 @@ groups:
             escalation rather than a config change.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
-      # The docs tell operators to alert on this gauge; ship the rule so that
-      # instruction is not a dead letter. A failed index build turns the pass's
-      # bounded sub-second hourly lock hold (measured ~285-315 ms for a full capped
-      # pass, varying with backlog composition and hardware) into an unbounded one
-      # that grows with the
-      # table -- and every audit write waits on that lock. Also reads 0 for a
-      # store closed by a failed migration, which is the same "retention is not
-      # working" conclusion.
-      - alert: YuzuAuditRetentionIndexMissing
-        expr: |
-          yuzu_server_audit_retention_index_ok == 0
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Audit retention is running without its index"
-          description: >-
-            idx_audit_ttl_id is absent OR present with the wrong shape, so every hourly
-            retention pass full-scans audit_events under the exclusive store lock that every
-            audit write needs, and that cost grows with the table. TWO causes, two different
-            log lines: "could not create idx_audit_ttl_id" (the build failed) and
-            "idx_audit_ttl_id exists but does not match the expected definition" (an index of
-            that name exists on the wrong columns or with a different partial predicate, so
-            CREATE INDEX IF NOT EXISTS was a no-op). Finding the index present in
-            sqlite_master does NOT clear this alert - check its columns. Also check for a
-            migration failure. NOTE this gauge is evaluated
-            once at startup, so it does not detect an index dropped while the server runs.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
-
       # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
       # a counter RISING, so none of those fires when the cleanup thread never
-      # runs. (`YuzuAuditRetentionIndexMissing` is the exception: it reads a
-      # startup-evaluated gauge and fires either way.) No counter-driven rule
-      # detects a reaper that never ran
+      # runs. No rule detects a reaper that never ran
       # (never started because the store was closed at boot, died, or was
       # stopped and not restarted). In that state all six other series sit flat
       # at 0 -- indistinguishable from a quiet, healthy store -- while audit.db
@@ -588,9 +557,7 @@ groups:
             No audit retention pass has been attempted in 3 hours, so audit.db is not
             being drained and rows are being retained past the configured window. Note the
             other five retention COUNTERS cannot move in this state - they all key on a
-            counter rising, and nothing is running to raise one. (The
-            yuzu_server_audit_retention_index_ok gauge is the exception: it is evaluated at
-            startup and its alert fires independently of whether the reaper runs.) The
+            counter rising, and nothing is running to raise one. The
             uptime guard on this rule exists because run_cleanup sleeps BEFORE its first
             pass, so a freshly started server legitimately has no pass for one interval.
             Check the server log for

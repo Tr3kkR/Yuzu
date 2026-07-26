@@ -157,69 +157,15 @@ void AuditStore::ensure_retention_index() {
             .count();
     if (rc != SQLITE_OK) {
         // Degraded, not broken: retention still runs, just with full scans under
-        // the store lock. Counted as well as logged, because this is the one
-        // failure that invalidates the "latency, not availability" property of
-        // the whole pass -- the hold stops being bounded and grows with the
-        // table, silently.
+        // the store lock, which makes the hold grow with the table. LOG ONLY --
+        // there is deliberately no metric for this state (#2526): three separate
+        // implementations of a health gauge here each shipped a defect, for a
+        // signal about a PERFORMANCE artifact the guard is correct without.
         spdlog::error("AuditStore: could not create idx_audit_ttl_id ({}); retention will run "
                       "WITHOUT its index and each pass will scan audit_events",
                       err.c_str());
         return;
     }
-    // `CREATE INDEX IF NOT EXISTS` succeeds as a NO-OP when an index of that name
-    // already exists with different columns or a different predicate -- so
-    // SQLITE_OK alone does not mean the pass is index-driven. Verify the stored
-    // definition before publishing a healthy gauge, or the one signal that says
-    // "the lock hold is no longer bounded" reports healthy while every pass
-    // full-scans.
-    {
-        // Ask the PLANNER, about the statement that actually matters.
-        //
-        // Three attempts got this wrong in three different ways: a DDL substring
-        // test passed a wrong-column index; a "structural" column check left a
-        // TAUTOLOGICAL predicate half; and planning only the PROBE accepted
-        // `(ttl_expires_at, timestamp)`, which seeks fine for the probe but makes
-        // the ordered DELETE sort. Measured on the shipped SQLite:
-        //
-        //   (ttl_expires_at, id)        probe SEARCH   delete SEARCH              accept
-        //   (ttl_expires_at)            probe SEARCH   delete SEARCH              accept
-        //   (ttl_expires_at, timestamp) probe SEARCH   delete SEARCH + TEMP B-TREE reject
-        //   (timestamp) WHERE ttl>0     probe SCAN     -                          reject
-        //
-        // So plan the DELETE, require a SEARCH naming the index, and reject any
-        // TEMP B-TREE: an unbounded sort under the exclusive lock every audit
-        // write takes is precisely the unbounded hold this gauge exists to deny.
-        // `EXPLAIN QUERY PLAN` never executes the statement.
-        bool matches = false;
-        {
-            SqliteStmt eqp;
-            if (sqlite3_prepare_v2(db_.get(),
-                                   "EXPLAIN QUERY PLAN DELETE FROM audit_events WHERE id IN ("
-                                   "SELECT id FROM audit_events "
-                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < 1 "
-                                   "ORDER BY ttl_expires_at ASC, id ASC LIMIT 1)",
-                                   -1, eqp.addr(), nullptr) == SQLITE_OK) {
-                bool seeks = false, sorts = false;
-                while (sqlite3_step(eqp.get()) == SQLITE_ROW) {
-                    const auto* detail =
-                        reinterpret_cast<const char*>(sqlite3_column_text(eqp.get(), 3));
-                    const std::string_view d{detail ? detail : ""};
-                    if (d.find("SEARCH") != std::string_view::npos &&
-                        d.find("idx_audit_ttl_id") != std::string_view::npos)
-                        seeks = true;
-                    if (d.find("TEMP B-TREE") != std::string_view::npos)
-                        sorts = true;
-                }
-                matches = seeks && !sorts;
-            }
-        }
-        if (!matches) {
-            spdlog::error("AuditStore: idx_audit_ttl_id exists but does not match the expected "
-                          "definition; retention will run WITHOUT a usable index");
-            return;
-        }
-    }
-    retention_index_ok_.store(true, std::memory_order_relaxed);
     if (ms >= 1000)
         spdlog::info("AuditStore: built idx_audit_ttl_id in {} ms (one-time, first boot after "
                      "upgrade on an existing audit_events)",

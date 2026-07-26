@@ -1041,11 +1041,6 @@ public:
                           "Audit retention passes that hit the per-pass delete cap, leaving a "
                           "backlog for the next pass",
                           "counter");
-        metrics_.describe("yuzu_server_audit_retention_index_ok",
-                          "1 while the audit retention index exists; 0 means every cleanup pass "
-                          "full-scans audit_events under the store lock. Evaluated once at "
-                          "startup, so it cannot detect an index dropped at runtime",
-                          "gauge");
         // Liveness. Every other retention series is silence-means-healthy, so a
         // cleanup thread that never runs leaves them all flat at 0 -- identical
         // to a quiet, healthy store, while audit.db grows without bound. These
@@ -1056,11 +1051,11 @@ public:
                           "other retention counters cannot report",
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
-                          "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK WAS "
-                          "USABLE; 0 if none has run in this process. Read WITH "
+                          "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
+                          "WAS USABLE; 0 if none has run in this process. Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
-                          "is alive but refusing an implausible clock, which is a different "
-                          "fault from stopped",
+                          "is alive but refusing an implausible clock, which is a different fault "
+                          "from stopped",
                           "gauge");
         metrics_.describe("yuzu_server_audit_retention_persist_failed_total",
                           "Failures to persist the audit retention clock reading, which degrades "
@@ -4033,8 +4028,6 @@ public:
                         .set(static_cast<double>(audit_store_->rows_deleted_count()));
                     metrics_.gauge("yuzu_server_audit_retention_cap_reached_total")
                         .set(static_cast<double>(audit_store_->cap_reached_count()));
-                    metrics_.gauge("yuzu_server_audit_retention_index_ok")
-                        .set(audit_store_->retention_index_ok() ? 1.0 : 0.0);
                     metrics_.gauge("yuzu_server_audit_retention_persist_failed_total")
                         .set(static_cast<double>(audit_store_->persist_failed_count()));
                     metrics_.gauge("yuzu_server_audit_retention_passes_total")

@@ -829,8 +829,7 @@ no-op. If the build fails, retention still runs, but each pass then scans the
 table AND sorts the whole expired backlog for its `ORDER BY ... LIMIT` (measured
 2.0 s versus ~285-315 ms for the same capped pass WITH the index; the range
 reflects different benchmark runs, not two different operations) - still far better than the unguarded code it
-replaced, but the failure is logged as an error and
-`yuzu_server_audit_retention_index_ok` reads 0.
+replaced, but the failure is logged as an error.
 
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 
@@ -885,13 +884,12 @@ consequences on upgrade:
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
 
-Six new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
+Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
 declined-pass and failed-pass counters must be alerted on separately: both leave
 rows undeleted, so an audit table that never shrinks looks identical either way.
 One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
 state in which none of the other counter-driven rules can fire, because they all
-key on a counter rising. (`YuzuAuditRetentionIndexMissing` reads a
-startup-evaluated gauge and is the exception.)
+key on a counter rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 
