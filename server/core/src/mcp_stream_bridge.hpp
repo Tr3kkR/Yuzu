@@ -370,6 +370,13 @@ public:
     /// reserve/subscribe guards degrade to the plain path (governance quality).
     void inject_reserve_fault_for_test();
     void inject_subscribe_fault_for_test();
+    /// One-shot: the NEXT reserve() throws std::bad_alloc in the window BETWEEN
+    /// the streamed-charge ledger bump and the records_ insert - the window
+    /// inject_reserve_fault_for_test fires too early to model. Proves the two
+    /// mutations commit together: a throw here must leave the ledger AND the map
+    /// unchanged, because a surviving bump is a phantom charge that rejects that
+    /// session's streamed reserves with pin_slots for the life of the process.
+    void inject_reserve_commit_fault_for_test();
     /// The NEXT `times` pressure-visitor terminal-payload copies (kTerminalBuffered
     /// latch) throw std::bad_alloc, modelling a copy OOM. A persistent fault (times
     /// large) makes the record NEVER settle (the copy never latches), which is what
@@ -669,6 +676,7 @@ private:
     std::atomic<int> obs_fault_remaining_{0};  ///< C5 fault seam
     std::atomic<bool> arm_fault_{false};       ///< one-shot arm() throw seam
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
+    std::atomic<bool> reserve_commit_fault_{false};  ///< one-shot ledger-vs-insert window seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
     std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
     std::atomic<int> claim_lock_fault_{0};     ///< remaining ~ClaimGuard lock throws (test seam)

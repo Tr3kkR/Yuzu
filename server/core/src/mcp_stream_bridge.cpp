@@ -284,11 +284,45 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
         }
         if (reject == nullptr) {
             rec->seq = next_seq_++;
+            // C6a: the ledger bump and the map insert must commit TOGETHER. Both
+            // allocate - `operator[]` inserts a node, `emplace` allocates a node
+            // and copies the key - so either can throw with the other already
+            // applied. A ledger bump that survives a failed insert is a PHANTOM
+            // charge: no record exists that will ever release it, so this
+            // session's `pinned_count() + unpinned` stays permanently inflated
+            // and every later streamed reserve on it rejects pin_slots for the
+            // life of the process. Reordering to "emplace first" does NOT fix
+            // this - it only swaps which mutation is left orphaned.
+            struct LedgerRollback {
+                McpStreamBridge* self;
+                const std::string& session;
+                BridgeRecord& rec;
+                bool armed = false;
+                bool committed = false;
+                ~LedgerRollback() noexcept {
+                    if (armed && !committed) {
+                        // Runs while bridge_mu_ is still held (declared after the
+                        // lock_guard, so it destructs first). find/decrement/erase
+                        // allocates nothing, so it cannot throw out of here.
+                        self->decrement_streamed_locked(session);
+                        rec.streamed_charge_held = false;
+                    }
+                }
+            } rollback{this, session_id, *rec};
+
             if (streamed_intent) {
-                rec->streamed_charge_held = true;
                 ++streamed_unpinned_[session_id];
+                rollback.armed = true;
+                rec->streamed_charge_held = true;
+            }
+            if (reserve_commit_fault_.exchange(false, std::memory_order_acq_rel)) {
+                // Test seam: an allocation failure in the window BETWEEN the
+                // ledger bump and the insert. The post-admission seam above fires
+                // before the record is even constructed, so it cannot model this.
+                throw std::bad_alloc{};
             }
             records_.emplace(rec->key, rec);
+            rollback.committed = true;
             active = records_.size();
         }
     }
@@ -1777,6 +1811,10 @@ void McpStreamBridge::inject_subscribe_fault_for_test() {
 
 void McpStreamBridge::inject_visit_copy_fault_for_test(int times) {
     visit_copy_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_reserve_commit_fault_for_test() {
+    reserve_commit_fault_.store(true, std::memory_order_release);
 }
 
 void McpStreamBridge::inject_claim_lock_fault_for_test(int times) {
