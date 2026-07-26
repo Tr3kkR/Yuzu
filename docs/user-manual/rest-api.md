@@ -1181,7 +1181,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the `auth.db` write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -1217,7 +1217,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 
@@ -6418,10 +6418,12 @@ username=admin&password=secretpass
 | `202` (`mfa_required`) | Credentials valid; user **has** TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
 | `202` (`mfa_enrollment_required`) | Credentials valid; user is **un-enrolled** and `--mfa-enforcement` (`admin-only` for admins / `required` for all) requires MFA | `{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","qr_svg":"<inline SVG, or empty>","expires_in":120}` — show the QR/secret and complete enrollment via `POST /login/mfa/enroll` |
 | `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
-| `503` | Enforcement applies but `auth.db` is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
+| `503` | Enforcement applies but the auth store is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
 | `503` | The in-memory pending-challenge map is at capacity (server under a `/login` flood; transient load-shed) | `{"error":{"code":503,"message":"too many pending authentications, retry shortly"}}` — retry after a short back-off; emits `yuzu_auth_mfa_pending_load_shed_total` |
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `qr_svg` field on the enrollment variant is a server-rendered inline SVG QR code encoding `otpauth_uri` — inject it into the DOM **without** HTML-escaping (it is pure shape geometry, no user content). If `qr_svg` is the empty string, QR encoding failed; fall back to displaying `secret_base32` / `otpauth_uri` for manual entry. The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
+
+**Errors:** a `503` from this endpoint can also mean the enrolled user's MFA secret could not be read (PG/KEK unavailable, tamper, or a rotated/unresolvable key) rather than the pending-challenge-map load-shed above — this fails closed rather than silently falling back to "not enrolled." See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 #### `POST /login/mfa`
 
@@ -6443,8 +6445,11 @@ The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII 
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
 | `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
+| `503` | The user's MFA secret could not be read/decrypted (PG outage mid-read, tamper, an unresolvable/rotated KEK, or a corrupt blob) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
 An enrollment-pending token issued by the `mfa_enrollment_required` branch is **rejected** here (use `POST /login/mfa/enroll`); a login-challenge token is likewise rejected at the enroll endpoint.
+
+**Errors:** the `503` above is a deliberate fail-closed outcome, never collapsed into the `401` "code rejected" case (which would burn one of the user's limited verification attempts against a transient outage). See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 #### `POST /login/mfa/enroll`
 
@@ -6465,8 +6470,10 @@ Only a 6-digit TOTP code is accepted (recovery codes do not exist until enrollme
 | Status | Condition | Body |
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted; enrollment complete, session minted | `{"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", … 10 total]}` — revealed **once**; save them |
-| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, or attempts exhausted | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
-| `503` | `auth.db` unavailable | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, attempts exhausted, **or the auth store is not configured at all** (null DB) | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
+| `503` | Auth store reachable but the secret could not be verified — decrypt/store failure (e.g. KEK unresolvable) | `{"error":{"code":503,"message":"authentication store is temporarily unavailable"}}` |
+
+A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt.
 
 **Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on failure `mfa.enroll.failed`.
 
@@ -6492,6 +6499,8 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up — the body points to `/auth/oidc/start`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+
+**Errors:** the `503` above includes the case where the session owner's MFA secret specifically could not be read/decrypted (PG/KEK unavailable, tamper, or a rotated/unresolvable key) — `require_mfa_step_up` fails closed on this rather than treating it as "not enrolled." See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 **Audit verbs:** `mfa.step_up.passed` on success (`detail=method=totp` or `method=recovery`); `mfa.step_up.failed` on each rejection with the rejection reason in `detail`.
 
@@ -6577,7 +6586,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 **Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the auth store is unavailable.
 
 **Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 

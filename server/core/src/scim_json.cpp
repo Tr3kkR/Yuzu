@@ -9,6 +9,19 @@ namespace yuzu::server::scim {
 
 namespace {
 
+/// True if `s` contains an embedded NUL byte. PostgreSQL `text` columns
+/// cannot round-trip one — `pg::exec_params` hands libpq a NUL-terminated
+/// C string regardless of the caller's `std::string` length, so anything
+/// after the first NUL is silently dropped on write, not stored. Rather
+/// than let a value be silently truncated (which let a crafted
+/// "Admins\0decoy" `displayName` collapse to the literal "Admins" and match
+/// `--scim-admin-group`, spuriously promoting the submitting member — UP-3 /
+/// #2018), every SCIM text field is rejected fail-closed at this parse
+/// boundary the moment it contains one.
+bool has_embedded_nul(std::string_view s) {
+    return s.find('\0') != std::string_view::npos;
+}
+
 /// Case-insensitive ASCII compare — SCIM attribute names and op verbs are
 /// case-insensitive per RFC 7644 §3.5.2.
 bool ieq(std::string_view a, std::string_view b) {
@@ -77,6 +90,16 @@ std::expected<std::string, ScimError> parse_eq_filter(std::string_view filter,
         }
     }
 
+    // 2026-07-25 review (LOW): the helper's contract says "every SCIM text
+    // field is rejected" on an embedded NUL, but filter values took this
+    // return path without the check. Low impact — the surface is
+    // authorized-reader-only and Postgres text columns reject the NUL on the
+    // way in anyway, so the worst case was prefix-aliasing a lookup — but a
+    // documented invariant with one unchecked exit is how the next reader
+    // gets it wrong.
+    if (has_embedded_nul(value))
+        return fail();
+
     return value;
 }
 
@@ -109,14 +132,20 @@ std::expected<std::vector<std::string>, ScimError> extract_member_values(const n
     std::vector<std::string> out;
     out.reserve(arr.size());
     for (const auto& item : arr) {
+        std::string v;
         if (item.is_object() && item.contains("value") && item["value"].is_string()) {
-            out.push_back(item["value"].get<std::string>());
+            v = item["value"].get<std::string>();
         } else if (item.is_string()) {
-            out.push_back(item.get<std::string>());
+            v = item.get<std::string>();
         } else {
             return std::unexpected(
                 ScimError{400, "invalidValue", "each members entry requires a string 'value'"});
         }
+        if (has_embedded_nul(v)) {
+            return std::unexpected(
+                ScimError{400, "invalidValue", "members value contains an invalid NUL byte"});
+        }
+        out.push_back(std::move(v));
     }
     return out;
 }
@@ -161,6 +190,10 @@ std::expected<ScimUserInput, ScimError> parse_user(const nlohmann::json& body) {
         return std::unexpected(ScimError{400, "invalidValue", "userName must be a string"});
     }
     input.user_name = body.value("userName", std::string{});
+    if (has_embedded_nul(input.user_name)) {
+        return std::unexpected(
+            ScimError{400, "invalidValue", "userName contains an invalid NUL byte"});
+    }
     if (input.user_name.empty()) {
         return std::unexpected(ScimError{400, "invalidValue", "userName is required"});
     }
@@ -169,6 +202,10 @@ std::expected<ScimUserInput, ScimError> parse_user(const nlohmann::json& body) {
         return std::unexpected(ScimError{400, "invalidValue", "externalId must be a string"});
     }
     input.external_id = body.value("externalId", std::string{});
+    if (has_embedded_nul(input.external_id)) {
+        return std::unexpected(
+            ScimError{400, "invalidValue", "externalId contains an invalid NUL byte"});
+    }
     if (input.external_id.size() > kMaxExternalIdLength) {
         return std::unexpected(
             ScimError{400, "invalidValue",
@@ -241,11 +278,19 @@ std::expected<ScimPatch, ScimError> parse_patch(const nlohmann::json& body) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "userName value must be a string"});
                 }
+                if (has_embedded_nul(value.get_ref<const std::string&>())) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue", "userName contains an invalid NUL byte"});
+                }
                 patch.user_name = value.get<std::string>();
             } else if (ieq(path, "externalId")) {
                 if (!value.is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                if (has_embedded_nul(value.get_ref<const std::string&>())) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue", "externalId contains an invalid NUL byte"});
                 }
                 if (value.get_ref<const std::string&>().size() > kMaxExternalIdLength) {
                     return std::unexpected(ScimError{
@@ -279,12 +324,20 @@ std::expected<ScimPatch, ScimError> parse_patch(const nlohmann::json& body) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "userName value must be a string"});
                 }
+                if (has_embedded_nul(value["userName"].get_ref<const std::string&>())) {
+                    return std::unexpected(
+                        ScimError{400, "invalidValue", "userName contains an invalid NUL byte"});
+                }
                 patch.user_name = value["userName"].get<std::string>();
             }
             if (value.contains("externalId")) {
                 if (!value["externalId"].is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                if (has_embedded_nul(value["externalId"].get_ref<const std::string&>())) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue", "externalId contains an invalid NUL byte"});
                 }
                 if (value["externalId"].get_ref<const std::string&>().size() >
                     kMaxExternalIdLength) {
@@ -345,6 +398,10 @@ std::expected<ScimGroupInput, ScimError> parse_group(const nlohmann::json& body)
         return std::unexpected(ScimError{400, "invalidValue", "displayName must be a string"});
     }
     input.display_name = body.value("displayName", std::string{});
+    if (has_embedded_nul(input.display_name)) {
+        return std::unexpected(
+            ScimError{400, "invalidValue", "displayName contains an invalid NUL byte"});
+    }
     if (input.display_name.empty()) {
         return std::unexpected(ScimError{400, "invalidValue", "displayName is required"});
     }
@@ -359,6 +416,10 @@ std::expected<ScimGroupInput, ScimError> parse_group(const nlohmann::json& body)
         return std::unexpected(ScimError{400, "invalidValue", "externalId must be a string"});
     }
     input.external_id = body.value("externalId", std::string{});
+    if (has_embedded_nul(input.external_id)) {
+        return std::unexpected(
+            ScimError{400, "invalidValue", "externalId contains an invalid NUL byte"});
+    }
     if (input.external_id.size() > kMaxExternalIdLength) {
         return std::unexpected(
             ScimError{400, "invalidValue",
@@ -413,6 +474,10 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                     return std::unexpected(
                         ScimError{400, "invalidValue", "displayName value must be a string"});
                 }
+                if (has_embedded_nul(value.get_ref<const std::string&>())) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue", "displayName contains an invalid NUL byte"});
+                }
                 patch.display_name = value.get<std::string>();
                 if (patch.display_name->size() > kMaxDisplayNameLen) {
                     return std::unexpected(
@@ -424,6 +489,10 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                 if (!value.is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                if (has_embedded_nul(value.get_ref<const std::string&>())) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue", "externalId contains an invalid NUL byte"});
                 }
                 patch.external_id = value.get<std::string>();
                 if (patch.external_id->size() > kMaxExternalIdLength) {
@@ -482,6 +551,10 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                         return std::unexpected(
                             ScimError{400, "invalidValue", "displayName value must be a string"});
                     }
+                    if (has_embedded_nul(value["displayName"].get_ref<const std::string&>())) {
+                        return std::unexpected(ScimError{
+                            400, "invalidValue", "displayName contains an invalid NUL byte"});
+                    }
                     patch.display_name = value["displayName"].get<std::string>();
                     if (patch.display_name->size() > kMaxDisplayNameLen) {
                         return std::unexpected(
@@ -494,6 +567,10 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                     if (!value["externalId"].is_string()) {
                         return std::unexpected(
                             ScimError{400, "invalidValue", "externalId value must be a string"});
+                    }
+                    if (has_embedded_nul(value["externalId"].get_ref<const std::string&>())) {
+                        return std::unexpected(ScimError{
+                            400, "invalidValue", "externalId contains an invalid NUL byte"});
                     }
                     patch.external_id = value["externalId"].get<std::string>();
                     if (patch.external_id->size() > kMaxExternalIdLength) {
@@ -521,6 +598,10 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                     return std::unexpected(
                         ScimError{400, "invalidValue", "displayName value must be a string"});
                 }
+                if (has_embedded_nul(value.get_ref<const std::string&>())) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue", "displayName contains an invalid NUL byte"});
+                }
                 patch.display_name = value.get<std::string>();
                 if (patch.display_name->size() > kMaxDisplayNameLen) {
                     return std::unexpected(
@@ -532,6 +613,10 @@ std::expected<ScimGroupPatch, ScimError> parse_group_patch(const nlohmann::json&
                 if (!value.is_string()) {
                     return std::unexpected(
                         ScimError{400, "invalidValue", "externalId value must be a string"});
+                }
+                if (has_embedded_nul(value.get_ref<const std::string&>())) {
+                    return std::unexpected(ScimError{
+                        400, "invalidValue", "externalId contains an invalid NUL byte"});
                 }
                 patch.external_id = value.get<std::string>();
                 if (patch.external_id->size() > kMaxExternalIdLength) {

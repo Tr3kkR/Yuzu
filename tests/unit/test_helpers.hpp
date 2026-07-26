@@ -35,6 +35,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #if defined(_WIN32)
 #include <process.h> // _getpid — part of the process-salt seed (#486 UP-R12)
@@ -1189,5 +1190,44 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
     REQUIRE(var.available())
 
 #endif // YUZU_TEST_ENABLE_PG
+
+/// RAII owner for a raw `sqlite3*` a test opened itself (typically `:memory:`).
+/// Closes on scope exit so a fatal REQUIRE between open and close cannot leak the
+/// handle. Non-copyable AND non-movable: the implicit copy would double-close, and
+/// clang-tidy's cppcoreguidelines-special-member-functions wants all five named
+/// once a destructor exists.
+///
+/// Added when a fifth test needed the pattern that four server test files had each
+/// hand-rolled as `SqliteHandleGuard` (test_chrome_ir_chain, test_workflow_routes,
+/// test_rest_api_events, test_rest_result_sets_async). NOTE those four have NOT been
+/// migrated - they still carry their own copies, still using plain `sqlite3_close`,
+/// which is the leak this one fixes. Migrating them is #2521; until then there are
+/// five copies, not one. Callers include <sqlite3.h> themselves; this header
+/// deliberately does not, so tests with no SQLite dependency stay clean.
+template <typename Sqlite3T> struct SqliteHandleOwner;
+template <typename T>
+inline constexpr bool kSqliteOwnerIsSealed = !std::is_copy_constructible_v<SqliteHandleOwner<T>> &&
+                                             !std::is_move_constructible_v<SqliteHandleOwner<T>> &&
+                                             !std::is_copy_assignable_v<SqliteHandleOwner<T>> &&
+                                             !std::is_move_assignable_v<SqliteHandleOwner<T>>;
+template <typename Sqlite3T> struct SqliteHandleOwner {
+    Sqlite3T* db{nullptr};
+    SqliteHandleOwner() = default;
+    SqliteHandleOwner(const SqliteHandleOwner&) = delete;
+    SqliteHandleOwner& operator=(const SqliteHandleOwner&) = delete;
+    SqliteHandleOwner(SqliteHandleOwner&&) = delete;
+    SqliteHandleOwner& operator=(SqliteHandleOwner&&) = delete;
+    ~SqliteHandleOwner() {
+        if (db != nullptr) {
+            // _v2, not sqlite3_close: plain close returns SQLITE_BUSY and LEAKS the
+            // handle when a statement is still outstanding, which a destructor
+            // cannot report. _v2 defers the close instead, so the handle is always
+            // reclaimed.
+            sqlite3_close_v2(db);
+        }
+    }
+};
+/// Pins the sealing above: a copy or a move would double-close.
+static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
 
 } // namespace yuzu::test

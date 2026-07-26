@@ -160,6 +160,10 @@ groups:
             Functional (clients that poll are unaffected) but live progress is
             unavailable. Check for a client holding many warm sessions with
             never-terminating executions, or raise capacity when 3b lands.
+            Distinguish transient load from a PERMANENT strand via
+            yuzu_mcp_bridge_teardown_incomplete_total: if that is non-zero the
+            occupancy will not recede on its own and only a restart clears it.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpStreamTerminalPublishFailures
         expr: |
           rate(yuzu_mcp_stream_terminal_publish_failures_total[15m]) > 0
@@ -174,7 +178,73 @@ groups:
             failure poisons that session's stream). Results remain durably
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
-
+      - alert: YuzuMcpBridgeTeardownIncomplete
+        expr: |
+          sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge teardown could not complete (resource retained)"
+          description: >-
+            reason={{ $labels.reason }}. A claimed teardown could not finish on the
+            maintenance thread. The sweep's claim is one-way, so the record is
+            NEVER retried: whatever it still owns is held until the server
+            restarts - unsubscribe = its event-bus subscription (which also
+            blocks that execution's channel and replay buffer from being
+            collected), release_charge = a per-session admission slot,
+            erase = the correlation record and a global slot. A retained record
+            also pins that session's whole stream state and any pinned finals.
+            Client results stay durably fetchable by execution_id. NOTE this is a
+            defence-in-depth counter: on current code only a mutex failure can
+            reach these steps, so for allocation pressure watch
+            yuzu_mcp_stream_terminal_publish_failures_total instead.
+            DELIBERATELY a raw counter test, not increase() over a window: the
+            retention lasts until the process restarts, so an alert that cleared
+            after 15 minutes would contradict the contract it exists to report.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpMaintenanceTickFailing
+        expr: |
+          sum by (tick) (increase(yuzu_mcp_maintenance_tick_failures_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP maintenance tick is throwing (work skipped every cycle)"
+          description: >-
+            tick={{ $labels.tick }}. bridge_sweep = pin-ack, session-death and
+            memory-pressure teardown are all stalled, so bridge records and their
+            pins accumulate. session_gc = expired sessions keep their streams and
+            pinned finals. The two are guarded separately, so this names exactly
+            which one is failing. Before this containment existed the same
+            exception aborted the whole process, so a firing here is strictly
+            better than the alternative - but a sustained rate means that class of
+            maintenance is not running at all. Correlate with host memory pressure.
+            DELIBERATELY increase() over a window, unlike the teardown-incomplete
+            rule next to it: a skipped tick is retried on the next cycle, so this
+            condition is self-healing and the alert must clear when it stops. The
+            raw-counter form is correct ONLY where the retention it reports is
+            permanent until restart, which is true of teardown_incomplete and not
+            of this.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpBridgeRecordsNearCap
+        expr: |
+          yuzu_mcp_bridge_records_active >= 205
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress bridge is near its correlation-record cap"
+          description: >-
+            yuzu_mcp_bridge_records_active has been at or above 80% of the 256
+            record cap for 10 minutes. At the cap every execute_instruction call
+            carrying a progressToken silently degrades to the plain (poll) path -
+            functional, but live progress stops fleet-wide. This is the LEADING
+            indicator for the teardown-strand failure mode: if
+            yuzu_mcp_bridge_teardown_incomplete_total is also non-zero the
+            occupancy is permanent and only a restart clears it, whereas ordinary
+            load recedes on its own. Check both before restarting.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBodyTooLargeRejecting
         expr: |
           sum by (reason) (increase(yuzu_mcp_body_too_large_total[15m])) > 20
@@ -297,33 +367,34 @@ groups:
   #       annotations:
   #         summary: "Response store write failure rate exceeds 1%"
 
-  # ── yuzu-secrets (DISABLED until the first secret-bearing store ships) ──
-  # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per
-  # store + failure class; the wiring PR exports them as
-  # yuzu_server_secret_decrypt_failures_total. Uncomment when live.
-  #
-  # - name: yuzu-secrets
-  #   rules:
-  #     - alert: YuzuSecretDecryptKekUnresolvable
-  #       # Sustained kek_unresolvable = backup skew / wrong keys dir —
-  #       # retries will NOT self-heal; restore the paired keys directory.
-  #       expr: |
-  #         rate(yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable"}[5m]) > 0
-  #       for: 2m
-  #       labels:
-  #         severity: critical
-  #       annotations:
-  #         summary: "Secret decrypts failing: KEK unresolvable (backup skew?)"
-  #
-  #     - alert: YuzuSecretDecryptTamperSignal
-  #       # A single tag_mismatch is the tamper signal — investigate via the
-  #       # secret.decrypt_failure audit trail; never retry-and-ignore.
-  #       expr: |
-  #         increase(yuzu_server_secret_decrypt_failures_total{failure_class="tag_mismatch"}[1h]) > 0
-  #       labels:
-  #         severity: critical
-  #       annotations:
-  #         summary: "Secret blob failed GCM authentication (tamper signal)"
+  # ── yuzu-secrets — LIVE as of the auth store's Postgres migration ──────
+  # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per store
+  # + failure class. These rules were parked "uncomment when live"; the auth
+  # store (`auth.users.mfa_totp_secret`) is the first secret-bearing store to
+  # ship, and its migration PR wired both the audit hook and the metric
+  # export, so they are now active. `store="auth"` is the only value today.
+  - name: yuzu-secrets
+    rules:
+      - alert: YuzuSecretDecryptKekUnresolvable
+        # Sustained kek_unresolvable = backup skew / wrong keys dir —
+        # retries will NOT self-heal; restore the paired keys directory.
+        expr: |
+          rate(yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secret decrypts failing: KEK unresolvable (backup skew?)"
+
+      - alert: YuzuSecretDecryptTamperSignal
+        # A single tag_mismatch is the tamper signal — investigate via the
+        # secret.decrypt_failure audit trail; never retry-and-ignore.
+        expr: |
+          increase(yuzu_server_secret_decrypt_failures_total{failure_class="tag_mismatch"}[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secret blob failed GCM authentication (tamper signal)"
 
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is

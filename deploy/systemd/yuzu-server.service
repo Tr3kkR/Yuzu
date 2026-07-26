@@ -11,13 +11,19 @@ After=network-online.target postgresql.service
 Wants=network-online.target postgresql.service
 # Restart-loop guard. If the process crashes more than StartLimitBurst
 # times within StartLimitIntervalSec, systemd stops restarting it and
-# the unit enters `failed` state. Without this, an auth.db corruption
-# (e.g. WAL truncation, disk-full, Defender quarantine on Windows) that
-# fails the integrity check at startup would put the unit into a tight
-# crash-restart loop that masks the underlying problem behind log noise.
-# Operators reading `systemctl status yuzu-server` see a clean failure
-# instead. See docs/ops-runbooks/auth-db-recovery.md for the recovery
-# procedure once the unit lands in `failed`. Keys live in [Unit] in
+# the unit enters `failed` state. Without this, a startup failure — e.g.
+# an unreachable/misconfigured Postgres auth substrate (ADR-0006;
+# authentication now lives in Postgres, not a local SQLite file), or a
+# corrupt remaining SQLite store (WAL truncation, disk-full, Defender
+# quarantine on Windows) failing its integrity check — would put the
+# unit into a tight crash-restart loop that masks the underlying problem
+# behind log noise. Operators reading `systemctl status yuzu-server` see
+# a clean failure instead. For a Postgres auth-substrate failure, check
+# `journalctl -u yuzu-server` for the PG connection error and verify
+# YUZU_POSTGRES_DSN / the postgresql.service dependency below; for a
+# remaining-SQLite-store failure see
+# docs/ops-runbooks/auth-db-recovery.md (now SQLite-era/superseded for
+# auth specifically — see its banner). Keys live in [Unit] in
 # systemd >= 230; older releases ignore them here, which is acceptable.
 StartLimitIntervalSec=60
 StartLimitBurst=3
@@ -32,10 +38,15 @@ Group=yuzu
 # external DSNs are first-class, just edit the file. Mode 0600 yuzu:yuzu
 # (the DSN embeds a credential).
 EnvironmentFile=-/etc/yuzu/yuzu-server.env
-# --data-dir is REQUIRED for the persistent auth.db: without it the server
-# falls back to in-memory auth, which silently disables account lockout
-# (SOC 2 CC6.3) and session persistence. /var/lib/yuzu matches StateDirectory,
-# WorkingDirectory, and the ReadWritePaths grant below.
+# --data-dir points the remaining server-side SQLite stores (response,
+# audit, RBAC, Guardian/guaranteed-state, tag, policy, and others still on
+# ADR-0006's migration ladder — see docs/postgres-migration-ladder.md) at a
+# writable directory, plus runtime state files. Authentication itself is
+# no longer here: AuthDB/ScimStore moved to the Postgres substrate
+# (YUZU_POSTGRES_DSN / EnvironmentFile above; ADR-0006) and account lockout
+# / session state now live there, not in a local auth.db. /var/lib/yuzu
+# matches StateDirectory, WorkingDirectory, and the ReadWritePaths grant
+# below.
 ExecStart=/usr/local/bin/yuzu-server \
     --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \
