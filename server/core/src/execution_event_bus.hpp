@@ -173,12 +173,14 @@ public:
     /// mutation) and contain any payload copy internally, so `kInternalError` still
     /// means "record untouched" == "`f` did not run", never "ran then threw".
     ///
-    /// The verdict scan keys on `first_terminal_id` (the FIRST terminal-flagged
+    /// The verdict scan keys ONLY on `first_terminal_id` (the FIRST terminal-flagged
     /// event - which in the `refresh_counts` split is a terminal-flagged
     /// `execution-progress`, NOT `execution-completed`; a type scan would
-    /// misclassify). On a marker miss (aged out past `kBufferCap`) it recovers to
-    /// any buffered `execution-completed` before concluding `kTerminalKnownLost`.
-    /// `ev` points into the channel buffer and is valid only for the `f` call.
+    /// misclassify). A marker miss (aged out past `kBufferCap`) is
+    /// `kTerminalKnownLost` -> the caller's safe success-shaped fallback; we do NOT
+    /// recover a later buffered `execution-completed`, which could be a spurious
+    /// terminal (#2409 UP-1). `ev` points into the channel buffer, valid only for
+    /// the `f` call.
     ///
     /// Returns `kAbsentChannel` (no channel -> no barrier) WITHOUT running `f`, or
     /// `kInternalError` (a lock/alloc threw - in the wrapped body OR propagated out
@@ -195,19 +197,20 @@ public:
             TerminalVisit verdict = TerminalVisit::kNeverTerminal;
             const ExecutionEvent* ev = nullptr;
             if (ch->terminal) {
+                // The ONLY scan: the FIRST terminal-flagged event, by id. NOT an
+                // event-type scan (the marker's target is a terminal-flagged
+                // execution-progress in the refresh_counts split; a completed-type
+                // scan misclassifies). If the marker aged out we deliberately do NOT
+                // recover a later buffered execution-completed: one present after the
+                // marker evicted is more likely a spurious LATER terminal (a
+                // mark_cancelled on the same id) than the real one (#2409 UP-1) and
+                // would build a WRONG final. kTerminalKnownLost -> the caller's
+                // success-shaped fallback ("fetch by execution_id") is always safe:
+                // the durable execution result is authoritative.
                 for (const auto& e : ch->buffer) {
                     if (e.id == ch->first_terminal_id) {
                         ev = &e;
                         break;
-                    }
-                }
-                if (ev == nullptr) {
-                    // Marker aged out: recover any still-buffered completed event.
-                    for (const auto& e : ch->buffer) {
-                        if (e.event_type == "execution-completed") {
-                            ev = &e;
-                            break;
-                        }
                     }
                 }
                 verdict = ev != nullptr ? TerminalVisit::kTerminalBuffered
@@ -215,7 +218,8 @@ public:
             }
             const bool sub_present = ch->listeners.find(sub_id) != ch->listeners.end();
             // f runs after every throwing step (find/lock/scan); its return is the
-            // sole erase trigger. f itself is noexcept by contract.
+            // sole erase trigger. f may throw ONLY at its initial record-lock (before
+            // any mutation); the catch below maps that to kInternalError.
             const bool claimed = f(verdict, ev);
             if (claimed) {
                 ch->listeners.erase(sub_id);  // noexcept (erase by key)

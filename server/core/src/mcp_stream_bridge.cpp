@@ -1003,8 +1003,19 @@ void McpStreamBridge::sweep() {
                 // terminal record-side BEFORE the (claim-driven) erase.
                 switch (verdict) {
                     case ExecutionEventBus::TerminalVisit::kTerminalBuffered:
+                        // `ev` is the FIRST terminal-flagged event, which in the
+                        // refresh_counts split is a terminal-flagged execution-progress
+                        // (NOT execution-completed). build_real_final consumes it
+                        // correctly ONLY because refresh_counts stamps status +
+                        // agents_success/failure onto that terminal progress payload
+                        // (execution_tracker.cpp ~:477-482) - a load-bearing coupling
+                        // (#2409 cons-S5/UP-3): if that stamping is ever removed, the
+                        // final would silently degrade to status:"unknown".
                         if (ev != nullptr) {
                             try {
+                                if (visit_copy_fault_.exchange(false, std::memory_order_acq_rel)) {
+                                    throw std::bad_alloc{};  // inject_visit_copy_fault_for_test
+                                }
                                 // Construct fully OUTSIDE the slot, then commit with
                                 // a noexcept move - a copy OOM leaves the slot and
                                 // terminal_accepted untouched (mirror the listener).
@@ -1018,7 +1029,8 @@ void McpStreamBridge::sweep() {
                         }
                         return false;  // defer; the projector publishes the real final
                     case ExecutionEventBus::TerminalVisit::kTerminalKnownLost:
-                        oldest->terminal_known_lost = true;  // named third state
+                        // Terminal existed but its payload aged out of the bus buffer:
+                        // claim + publish the success-shaped fallback, never -32014.
                         oldest->phase.store(Phase::kDone, std::memory_order_release);
                         oldest->torn_down = true;
                         claimed_by_me = true;
@@ -1078,19 +1090,18 @@ void McpStreamBridge::sweep() {
                     continue;
                 }
                 std::lock_guard<std::mutex> rlk(oldest->mu);
+                // Defensive only (near-unreachable: a non-claimed kRingOnly record
+                // keeps its listener, so its channel is never GC'd -> f runs, no
+                // kAbsentChannel). Claim ONLY an unambiguous settled real final; a
+                // record that never secured a terminal defers (NEVER synthesize
+                // -32014 from an absent channel - that would re-open #2409).
                 if (!oldest->torn_down &&
-                    oldest->phase.load(std::memory_order_acquire) == Phase::kRingOnly) {
-                    if (oldest->terminal_accepted && oldest->terminal_projected) {
-                        guard_claim = true;
-                        guard_decision = TeardownFinal::kNone;
-                    } else if (oldest->terminal_known_lost && !oldest->projection_in_flight) {
-                        guard_claim = true;
-                        guard_decision = TeardownFinal::kFallbackFinal;
-                    }
-                    if (guard_claim) {
-                        oldest->phase.store(Phase::kDone, std::memory_order_release);
-                        oldest->torn_down = true;
-                    }
+                    oldest->phase.load(std::memory_order_acquire) == Phase::kRingOnly &&
+                    oldest->terminal_accepted && oldest->terminal_projected) {
+                    guard_claim = true;
+                    guard_decision = TeardownFinal::kNone;
+                    oldest->phase.store(Phase::kDone, std::memory_order_release);
+                    oldest->torn_down = true;
                 }
             }
             if (guard_claim) {
@@ -1177,6 +1188,9 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
         active = records_.size();
     }
     publish_records_gauge(active);
+    // kNone detail stays empty: teardown_claimed(kNone) is shared with pass-2
+    // (session-death / pin-ack reaps) whose records need not hold a real final, so a
+    // "real final pinned" string would be inaccurate there (sec-INFO1 declined).
     const char* audit_detail = decision == TeardownFinal::kSynthesizeUnavailable
                                    ? "terminal-unavailable synthesized (pressure)"
                                    : decision == TeardownFinal::kFallbackFinal
@@ -1338,6 +1352,10 @@ void McpStreamBridge::inject_reserve_fault_for_test() {
 
 void McpStreamBridge::inject_subscribe_fault_for_test() {
     subscribe_fault_.store(true, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_visit_copy_fault_for_test() {
+    visit_copy_fault_.store(true, std::memory_order_release);
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }

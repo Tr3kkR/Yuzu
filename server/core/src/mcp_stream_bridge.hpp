@@ -293,6 +293,10 @@ public:
     /// reserve/subscribe guards degrade to the plain path (governance quality).
     void inject_reserve_fault_for_test();
     void inject_subscribe_fault_for_test();
+    /// One-shot: the NEXT pressure-visitor terminal-payload copy (kTerminalBuffered
+    /// latch) throws std::bad_alloc, modelling a copy OOM. Proves the visit defers +
+    /// keeps the listener + leaves terminal_accepted false (#2409 safety-S1).
+    void inject_visit_copy_fault_for_test();
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -375,12 +379,6 @@ private:
         std::uint64_t last_progress_sent = 0;
         bool progress_sent_any = false;
         bool terminal_projected = false;   ///< settled (published, GET-only-consumed, or poisoned)
-        /// C5 (#2409): the named third terminal state - "terminal existed, payload
-        /// lost" (bus flagged terminal but the event aged out of the buffer). Set by
-        /// the pressure visitor; NEVER sets terminal_accepted (hpp forbids inferring
-        /// a secured payload). Maps to kFallbackFinal, never -32014. Read by the
-        /// absent-channel recovery path (guarded by mu).
-        bool terminal_known_lost = false;
         bool final_published = false;      ///< a REAL final committed to the ring
         /// A5/C3: the per-session streamed-admission charge. Released exactly
         /// once (pin proof, cancel-degrade, pinless settle incl. poison, or
@@ -462,6 +460,7 @@ private:
     std::atomic<bool> arm_fault_{false};       ///< one-shot arm() throw seam
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
+    std::atomic<bool> visit_copy_fault_{false};///< one-shot pressure-visit copy throw seam
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
 
     std::chrono::steady_clock::time_point now() const {

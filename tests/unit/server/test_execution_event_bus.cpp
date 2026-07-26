@@ -496,24 +496,26 @@ TEST_CASE("visit_terminal - kTerminalKnownLost when the marker aged out of the b
     CHECK_FALSE(p.had_ev);  // benign: caller maps this to a success-shaped fallback
 }
 
-TEST_CASE("visit_terminal - recovers a still-buffered completed when the marker aged out",
+TEST_CASE("visit_terminal - a completed buffered AFTER the marker aged out is NOT recovered (#2409 UP-1)",
           "[execution_event_bus][2f][2409]") {
-    // Marker (the terminal-progress at id 1) evicted, but a later execution-completed
-    // is still buffered: the secondary scan finds it -> kTerminalBuffered, not lost.
+    // The marker (terminal-progress at id 1) is evicted; a LATER execution-completed
+    // is still buffered. We deliberately do NOT recover it: a completed present after
+    // the marker evicted is more likely a spurious later terminal (e.g. a
+    // mark_cancelled on the same id) than the real one, and building a final from it
+    // would emit a WRONG result. The verdict is kTerminalKnownLost -> the caller's
+    // safe success-shaped fallback ("fetch by execution_id").
     ExecutionEventBus bus;
-    auto sub = bus.subscribe("exec-recover", [](const ExecutionEvent&) {});
-    bus.publish("exec-recover", "execution-progress", "{}", /*is_terminal=*/true);  // id 1 (marker)
+    auto sub = bus.subscribe("exec-norecover", [](const ExecutionEvent&) {});
+    bus.publish("exec-norecover", "execution-progress", "{}", /*is_terminal=*/true);  // id 1 (marker)
     for (int i = 0; i < static_cast<int>(ExecutionEventBus::kBufferCap) - 1; ++i) {
-        bus.publish("exec-recover", "execution-progress", "{}");
+        bus.publish("exec-norecover", "execution-progress", "{}");
     }
-    // Now publish a completed - pushes the marker (id 1) out of the 1000-cap ring
-    // but itself remains buffered.
-    bus.publish("exec-recover", "execution-completed", R"({"status":"succeeded"})",
+    // Publishing this completed pushes the marker (id 1) out of the 1000-cap ring.
+    bus.publish("exec-norecover", "execution-completed", R"({"status":"cancelled"})",
                 /*is_terminal=*/true);
-    auto p = visit(bus, "exec-recover", sub, /*claim=*/false);
-    CHECK(p.verdict == TV::kTerminalBuffered);
-    REQUIRE(p.had_ev);
-    CHECK(p.ev_type == "execution-completed");  // recovered by the secondary scan
+    auto p = visit(bus, "exec-norecover", sub, /*claim=*/false);
+    CHECK(p.verdict == TV::kTerminalKnownLost);  // NOT recovered as buffered
+    CHECK_FALSE(p.had_ev);
 }
 
 TEST_CASE("visit_terminal - erases the listener ONLY on a committed claim",
