@@ -201,7 +201,7 @@ TarDatabase::~TarDatabase() {
 }
 
 TarDatabase::TarDatabase(TarDatabase&& other) noexcept
-    : db_{other.db_}, query_db_{other.query_db_} {
+    : db_{other.db_.load()}, query_db_{other.query_db_} {
     other.db_ = nullptr;
     other.query_db_ = nullptr;
 }
@@ -212,7 +212,7 @@ TarDatabase& TarDatabase::operator=(TarDatabase&& other) noexcept {
             sqlite3_close(db_);
         if (query_db_)
             sqlite3_close(query_db_);
-        db_ = other.db_;
+        db_ = other.db_.load();
         query_db_ = other.query_db_;
         other.db_ = nullptr;
         other.query_db_ = nullptr;

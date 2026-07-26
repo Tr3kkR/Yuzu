@@ -11,13 +11,18 @@
  *   tar_state  — last-known state per collector for diff computation
  *   tar_config — key/value config (retention_days, redaction patterns, etc.)
  *
- * Thread-safe: a std::mutex guards all sqlite3* operations.
+ * Thread-safe: a std::mutex guards all sqlite3* operations. The ONE exception is
+ * the `db_`/`query_db_` liveness probes (is_open / query_engine_available),
+ * which read the handle without the mutex on purpose so a status query cannot
+ * block behind a rollup; `db_` is atomic for that reason. See the member
+ * declarations for why that is safe and what it does not promise.
  * Uses WAL mode, busy_timeout=5000, secure_delete=ON.
  */
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -520,10 +525,30 @@ private:
     /// Internal set_config that assumes caller already holds mu_.
     bool set_config_locked(const std::string& key, const std::string& value);
 
-    sqlite3* db_{nullptr};
+    // ATOMIC because it is written at RUNTIME, not only at open/close: the
+    // wedged-rollback path in execute_atomic_batch nulls it under mu_ while
+    // is_open() reads it WITHOUT mu_ from another thread (do_status runs on the
+    // command-dispatch thread, the wedge on the rollup thread). Before that
+    // runtime write existed the unlocked read was benign; adding it made this a
+    // data race (#2361 governance Gate 2).
+    //
+    // Atomic rather than "lock mu_ in is_open()" on purpose: do_status
+    // deliberately avoids taking rollup-scale locks so the diagnostic an
+    // operator runs WHEN TAR IS MISBEHAVING cannot block behind a rollup pass
+    // (see tar_plugin.cpp do_status). A lock-free probe keeps that property and
+    // keeps is_open() const noexcept.
+    //
+    // The probe is still only a POINT-IN-TIME answer: a caller can see `true`
+    // and have the connection close underneath it. That is safe because every
+    // method re-tests `if (!db_)` under mu_ and fails closed, so the worst case
+    // is one status reply that reports ok for a store that died microseconds
+    // later -- self-correcting on the next call.
+    std::atomic<sqlite3*> db_{nullptr};
     // Read-only, authorizer-sandboxed connection used only by execute_user_query
     // for untrusted operator SQL (#760). Null if it could not be opened, in
-    // which case user queries fail closed.
+    // which case user queries fail closed. NOT atomic: unlike db_ it is never
+    // written after construction publishes the object (no runtime close path),
+    // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
     std::mutex mu_;
     std::mutex query_mu_;
