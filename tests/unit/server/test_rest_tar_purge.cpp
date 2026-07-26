@@ -12,10 +12,11 @@
  *   - the success dispatch shape (tar/purge_source targeting the one device, {source}).
  *
  * The DashboardRoutes HTML fragment (/fragments/tar/retention-paused/purge) shares
- * these properties but is registered on a raw httplib::Server (not HttpRouteSink),
- * so it is not reachable by this in-process sink — its route-handler coverage is a
- * tracked follow-up (migrate those fragments to HttpRouteSink — Tr3kkR/Yuzu#1786).
- * The fragment's render-time button gating is covered in test_dashboard_tar_retention.cpp.
+ * these properties and has its own route-handler coverage since #1786 moved
+ * DashboardRoutes onto HttpRouteSink — see test_dashboard_tar_fragments.cpp (the
+ * fragment additionally gates a CSRF same-site check that this REST twin, being the
+ * programmatic surface, does not). The fragment's render-time button gating is
+ * covered in test_dashboard_tar_retention.cpp.
  */
 
 #include "rest_api_v1.hpp"
