@@ -96,10 +96,11 @@ inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
 /// the caller had never sent. A tether added to prevent drift had produced a
 /// lie. These labels are honest about which field was wrong, and are excluded
 /// from the MCP set because MCP has neither a request body nor a `parent_id`.
-inline constexpr std::array<std::string_view, 3> kRouteRejectReasons{
-    "body_type",       ///< the request body was not a JSON object
-    "parent_id_type",  ///< parent_id was supplied and is not a string
-    "parent_id_empty", ///< parent_id was supplied and is an empty string
+inline constexpr std::array<std::string_view, 4> kRouteRejectReasons{
+    "body_type",         ///< the request body was not a JSON object
+    "parent_id_type",    ///< parent_id was supplied and is not a string
+    "parent_id_empty",   ///< parent_id was supplied and is an empty string
+    "closure_no_target", ///< a dispatch closure was called naming no target
 };
 
 /// Reject a targeting argument that was SUPPLIED but names nothing.

@@ -5926,9 +5926,13 @@ void RestApiV1::register_routes(
                         ->counter("yuzu_server_dispatch_target_rejected_total",
                                   {{"route", "result_set_parent"}, {"reason", reason}})
                         .increment();
+                bool audit_ok = true;
                 if (audit_fn)
-                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                             std::string("reason=") + reason);
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        std::string("reason=") + reason +
+                                            " source_kind=" + std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 rs_err(res, 400,
                        "RESULT_SET_BAD_PARENT: parent_id was supplied but names no parent set; "
                        "omit it entirely to dispatch to all agents");
@@ -6186,9 +6190,14 @@ void RestApiV1::register_routes(
                                   ->counter("yuzu_server_dispatch_target_rejected_total",
                                             {{"route", "result_set_parent"}, {"reason", reason}})
                                   .increment();
+                          bool audit_ok = true;
                           if (audit_fn)
-                              audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                                       std::string("reason=") + reason);
+                              audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
+                                                  "",
+                                                  std::string("reason=") + reason +
+                                                      " source_kind=inventory_query");
+                          if (!audit_ok)
+                              res.set_header("Sec-Audit-Failed", "true");
                           rs_err(res, 400,
                                  "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
                                  "parent set; omit it entirely to search all devices");

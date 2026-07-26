@@ -240,7 +240,16 @@ new rows.
 **Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
 sends `__all__` instead of an empty string.
 
-**How to find affected clients before they break.** Refusals are counted by
+**Detecting affected clients — and the limit of what is possible.** There is no reliable way to
+find them *before* upgrading. The audit trail records the OUTCOME of a dispatch, not the request
+shape that produced it: `command.dispatch|success` stores `plugin:action -> N agent(s)` and
+`instruction.execute|success` stores `agents=<sent>`, and neither preserves the `agent_ids` or
+`scope` the caller actually sent. So a historical broadcast that was deliberate and one that was
+an accidentally-widened three-device request are indistinguishable in existing rows. The closest
+available pre-upgrade signal is reviewing automation you believe targets a subset for dispatches
+whose agent count is suspiciously close to your full fleet size.
+
+After upgrading, refusals are counted by
 `yuzu_server_dispatch_target_rejected_total{route,reason}` (all series pre-seeded at boot, so
 `absent()` stays meaningful) and audited as `command.dispatch|denied`,
 `instruction.execute|denied` or `result_set.create|denied` with `detail=reason=<reason>`. The

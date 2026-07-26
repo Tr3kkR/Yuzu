@@ -617,6 +617,12 @@ public:
         // stays meaningful. A reason added at an emit site instead of in that array
         // is emitted-but-unseeded: it passes its own test while the dashboard reads
         // zero and the alert never fires.
+        metrics_.describe("yuzu_server_dispatch_target_rejected_total",
+                          "REST dispatch calls refused because a supplied targeting argument "
+                          "named no device, plus dispatch-closure calls that named no target at "
+                          "all (#2500). Both labels are closed sets; every reachable pair is "
+                          "pre-seeded at boot so absent() stays meaningful.",
+                          "counter");
         // Seeded PER ROUTE rather than as a cross-product: `result_set_parent`
         // can only ever emit the two parent_id reasons, and the dispatch routes
         // can never emit them. Seeding the full product would publish series
@@ -632,6 +638,12 @@ public:
         for (const char* reason : {"parent_id_type", "parent_id_empty"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "result_set_parent"}, {"reason", reason}});
+        // The shared dispatch closure's last-line-of-defence arm. Its own route
+        // label because it is not a REST surface — background runners reach it
+        // too — and a non-zero value here means a CALLER forgot to name a
+        // target, which is a code defect rather than a client one.
+        metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                         {{"route", "dispatch_closure"}, {"reason", "closure_no_target"}});
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -7961,11 +7973,23 @@ private:
                     .counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "command"}, {"reason", "body_type"}})
                     .increment();
-                (void)audit_log(req, "command.dispatch", "denied", "command", "",
-                                "reason=body_type");
+                // Capture the audit return and surface partial-success, per the
+                // AuditFn contract (SOC 2 CC6.6, PR #883) and the
+                // instruction.import precedent. The status stays 400 — the
+                // request WAS invalid, and answering 503 because we could not
+                // record that would trade a correct refusal for an outage.
+                const bool audit_ok = audit_log(req, "command.dispatch", "denied", "command", "",
+                                                "reason=body_type");
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = 400;
                 res.set_content(
-                    R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
+                    nlohmann::json({{"error",
+                                     {{"code", 400},
+                                      {"message", "request body must be a JSON object"}}},
+                                    {"audit_emitted", audit_ok},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
                 return;
             }
@@ -7974,10 +7998,20 @@ private:
                     .counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "command"}, {"reason", bv->reason}})
                     .increment();
-                (void)audit_log(req, "command.dispatch", "denied", "command", "",
-                                std::string("reason=") + bv->reason);
+                // The detail carries WHAT was being attempted, not just why it
+                // was refused. The success row records `plugin:action -> N
+                // agent(s)`; a denial that records only `reason=` lets an
+                // auditor show that an operator was blocked but not what they
+                // were trying to run — on a control whose whole purpose is
+                // reconstructing near-miss blast radius (governance, compliance).
+                const bool audit_ok =
+                    audit_log(req, "command.dispatch", "denied", "command", "",
+                              std::string("reason=") + bv->reason + " " + plugin + ":" + action);
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
+                                                {"audit_emitted", audit_ok},
                                                 {"meta", {{"api_version", "v1"}}}})
                                     .dump(),
                                 "application/json");
@@ -8012,7 +8046,7 @@ private:
                     if (!require_permission(req, res, it->second.first, it->second.second))
                         return;
                     // Destructive dispatch must be explicitly targeted + in scope.
-                    if (agent_ids.empty() || !extract_json_string(req.body, "scope").empty()) {
+                    if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
                         res.status = 400;
                         res.set_content(
                             R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
@@ -8061,15 +8095,15 @@ private:
 
             // Parameters: pass-through key-value pairs to the agent plugin
             {
-                auto params_map = extract_json_string_map(req.body, "params");
+                auto params_map = extract_json_string_map(body, "params");
                 for (const auto& [k, v] : params_map) {
                     (*cmd.mutable_parameters())[k] = v;
                 }
             }
 
             // Stagger/delay: prevent thundering herd on large-fleet dispatch
-            auto stagger = extract_json_int(req.body, "stagger", 0);
-            auto delay = extract_json_int(req.body, "delay", 0);
+            auto stagger = extract_json_int(body, "stagger", 0);
+            auto delay = extract_json_int(body, "delay", 0);
             if (stagger > 0)
                 cmd.set_stagger_seconds(stagger);
             if (delay > 0)
@@ -8169,11 +8203,21 @@ private:
                     // same verb must not carry two different target shapes, and a
                     // command_id for a command that was never dispatched reads in
                     // the audit trail as though one was.
-                    (void)audit_log(req, "command.dispatch", "denied", "command", "",
-                                    "reason=agent_ids_empty");
+                    const bool audit_ok =
+                        audit_log(req, "command.dispatch", "denied", "command", "",
+                                  "reason=agent_ids_empty " + plugin + ":" + action);
+                    if (!audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
                     res.status = 400;
                     res.set_content(
-                        R"({"error":{"code":400,"message":"a targeting argument was supplied but resolved to no target; omit it entirely to target all agents"},"meta":{"api_version":"v1"}})",
+                        nlohmann::json(
+                            {{"error",
+                              {{"code", 400},
+                               {"message", "a targeting argument was supplied but resolved to no "
+                                           "target; omit it entirely to target all agents"}}},
+                             {"audit_emitted", audit_ok},
+                             {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
                         "application/json");
                     return;
                 }
@@ -10827,6 +10871,19 @@ private:
                 // No behaviour changed when this landed: every existing caller
                 // either guards its inputs, passes a specific id, or was updated
                 // in the same commit to name the sentinel.
+                // COUNTED, not just logged. This branch is the actual last line
+                // of defence across all ten callers of this closure, and it had
+                // strictly weaker observability than the `/api/command` inline
+                // branch that this PR's own argument called dead code — an
+                // invisible refusal cannot reach the alert this change ships
+                // (governance, SRE). There is no `req` here, so no audit row is
+                // possible: this closure is called by background runners as well
+                // as routes, and a fabricated request context would be worse
+                // evidence than none. The counter is the durable signal.
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "dispatch_closure"}, {"reason", "closure_no_target"}})
+                    .increment();
                 spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
                              "no agents; pass scope \"{}\" to broadcast deliberately",
                              plugin, norm_action, kBroadcastScope);
@@ -13123,6 +13180,39 @@ private:
             }
         } catch (...) {}
         return {};
+    }
+
+    // ── json-taking overloads (#2500) ─────────────────────────────────────
+    // The string-taking helpers above each parse the whole body. /api/command
+    // called them eight times and this fix added a ninth parse of the same
+    // string, on a route with no size cap beyond httplib's 100 MB default.
+    // These let a handler that has ALREADY parsed reuse the object. Semantics
+    // are deliberately identical to their string twins — same key checks, same
+    // type checks, same fallbacks — so reusing the parse cannot change what a
+    // field resolves to. Consolidating the remaining pre-auth parses needs the
+    // plugin/action check moved relative to require_permission and is tracked
+    // separately.
+    static std::string extract_json_string(const nlohmann::json& j, const std::string& key) {
+        if (j.is_object() && j.contains(key) && j[key].is_string())
+            return j[key].get<std::string>();
+        return {};
+    }
+
+    static std::unordered_map<std::string, std::string>
+    extract_json_string_map(const nlohmann::json& j, const std::string& key) {
+        std::unordered_map<std::string, std::string> result;
+        if (j.is_object() && j.contains(key) && j[key].is_object()) {
+            for (auto& [k, v] : j[key].items())
+                result[k] = v.is_string() ? v.get<std::string>() : v.dump();
+        }
+        return result;
+    }
+
+    static int32_t extract_json_int(const nlohmann::json& j, const std::string& key,
+                                    int32_t default_value = 0) {
+        if (j.is_object() && j.contains(key) && j[key].is_number_integer())
+            return j[key].get<int32_t>();
+        return default_value;
     }
 
     static int32_t extract_json_int(const std::string& body, const std::string& key,
