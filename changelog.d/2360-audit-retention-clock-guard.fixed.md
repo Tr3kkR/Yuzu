@@ -18,7 +18,7 @@
   Eight metrics report it: `yuzu_server_audit_clock_anomaly_skips_total` (declined),
   `yuzu_server_audit_cleanup_failed_total` (errored or store closed),
   `yuzu_server_audit_retention_cap_reached_total` (the backlog is not draining),
-  `yuzu_server_audit_rows_deleted_total`, `yuzu_server_audit_retention_index_ok`
+  `yuzu_server_audit_rows_deleted_total`, `yuzu_server_audit_retention_index_ok`,
   `yuzu_server_audit_retention_persist_failed_total`, and the two LIVENESS signals
   `yuzu_server_audit_retention_passes_total` + `..._retention_last_pass_unixtime` --
   every other counter is silence-means-healthy, so these are what distinguish a

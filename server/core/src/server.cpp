@@ -1015,10 +1015,12 @@ public:
         // undeleted, so without the second an operator watching an audit table
         // that never shrinks would read a broken cleanup loop as a working guard.
         metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
-                          "Audit retention passes declined: the pass would have expired every "
-                          "datable row, the gap since the previous pass exceeded a fixed 7 days "
-                          "(a forward clock jump OR an outage that long), or the stored clock "
-                          "reading was ahead of the current clock",
+                          "Audit retention passes declined. Triggers: the pass would have expired "
+                          "every datable row; the gap since the previous pass exceeded a fixed "
+                          "7 days (a forward clock jump OR an outage that long); or the stored "
+                          "reading was not usable - ahead of the clock, negative, or present "
+                          "but not an integer. Reducing audit_retention_days can also cause a "
+                          "decline by design",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that did not fully do their job: an unreadable "
@@ -1054,8 +1056,11 @@ public:
                           "other retention counters cannot report",
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
-                          "Wall-clock reading of the most recent audit retention pass, 0 if none "
-                          "has run in this process. Staleness means the reaper stopped",
+                          "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK WAS "
+                          "USABLE; 0 if none has run in this process. Read WITH "
+                          "retention_passes_total: stale here while that RISES means the reaper "
+                          "is alive but refusing an implausible clock, which is a different "
+                          "fault from stopped",
                           "gauge");
         metrics_.describe("yuzu_server_audit_retention_persist_failed_total",
                           "Failures to persist the audit retention clock reading, which degrades "

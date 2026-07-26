@@ -650,8 +650,13 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         std::optional<std::int64_t> prev_pass_now = raw_prev;
         // A row that existed but was not an integer is corrupted durable state,
         // which is an anomaly in its own right -- distinct from no row at all.
+        // NOT cleared here. This pass may still return before the decline is
+        // decided -- an unreadable probe, or simply nothing expired -- and
+        // clearing on those paths swallows the corruption signal with no
+        // decline, no counter and no warn. It is cleared only where it is
+        // actually CONSUMED, below. (The durable row is already re-anchored, so
+        // the flag is the only remaining carrier of "the state was corrupt".)
         bool prev_implausible = loaded_meta_malformed_;
-        loaded_meta_malformed_ = false; // consumed; the re-anchor above self-heals it
         if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now)) {
             prev_implausible = true;
             prev_pass_now.reset();
@@ -739,6 +744,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             if ((would_wipe || big_step || prev_implausible) && !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 clock_anomaly_latched_ = true;
+                loaded_meta_malformed_ = false; // consumed: reported and re-anchored
                 // Name the trigger that actually fired. Reporting an elapsed
                 // delta for a would_wipe-only decline attributes a clock step or
                 // outage that did not happen, in a SOC 2-relevant log line.
@@ -747,6 +753,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                        : !prev_pass_now ? Emit::DeclineFirstPass
                                         : Emit::DeclineWipe;
             } else {
+                loaded_meta_malformed_ = false; // consumed: the pass acted on it
                 auto outcome = delete_capped_locked(now, would_wipe);
                 if (!outcome) {
                     emit = Emit::DeleteFailed;

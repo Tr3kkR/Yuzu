@@ -516,8 +516,10 @@ groups:
             Every audit retention pass in the last 6 hours hit the per-pass delete cap, so
             a backlog is carried forward each hour and audit.db is growing. Note the
             counter is incremented on an OBSERVED backlog or, when the post-delete probe
-            could not be read, a conservatively ASSUMED one - a "retention probe failed"
-            warning in the log means the remainder was assumed, not measured. Check
+            could not be read, a conservatively ASSUMED one - an "AuditStore: the post-delete
+            backlog probe failed" warning in the log means the remainder was assumed, not
+            measured. (Do NOT look for "retention probe failed": that is the PRE-delete
+            probe, on which the pass skips entirely and this counter cannot have moved.) Check
             yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
             all. Sustained firing means the fixed drain rate (25,000 rows per cleanup
             pass) is below this fleet's audit volume, so audit.db grows without bound;
@@ -542,17 +544,23 @@ groups:
         annotations:
           summary: "Audit retention is running without its index"
           description: >-
-            idx_audit_ttl_id is absent, so every hourly retention pass full-scans
-            audit_events under the exclusive store lock that every audit write needs,
-            and that cost grows with the table. Check the server log for "could not create
-            idx_audit_ttl_id" and for a migration failure. NOTE this gauge is evaluated
+            idx_audit_ttl_id is absent OR present with the wrong shape, so every hourly
+            retention pass full-scans audit_events under the exclusive store lock that every
+            audit write needs, and that cost grows with the table. TWO causes, two different
+            log lines: "could not create idx_audit_ttl_id" (the build failed) and
+            "idx_audit_ttl_id exists but does not match the expected definition" (an index of
+            that name exists on the wrong columns or with a different partial predicate, so
+            CREATE INDEX IF NOT EXISTS was a no-op). Finding the index present in
+            sqlite_master does NOT clear this alert - check its columns. Also check for a
+            migration failure. NOTE this gauge is evaluated
             once at startup, so it does not detect an index dropped while the server runs.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
       # a counter RISING, so none of those fires when the cleanup thread never
       # runs. (`YuzuAuditRetentionIndexMissing` is the exception: it reads a
-      # startup-evaluated gauge and fires either way.) None of them detects
+      # startup-evaluated gauge and fires either way.) No counter-driven rule
+      # detects a reaper that never ran
       # (never started because the store was closed at boot, died, or was
       # stopped and not restarted). In that state all six other series sit flat
       # at 0 -- indistinguishable from a quiet, healthy store -- while audit.db

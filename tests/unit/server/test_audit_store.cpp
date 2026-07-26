@@ -1155,9 +1155,10 @@ TEST_CASE("AuditStore #2360: an exact-cap drain that empties the backlog is not 
 
 TEST_CASE("AuditStore #2360: a negative stored reading is an anomaly, not a quiet reset",
           "[audit_store][retention][clock-guard]") {
-    // A negative value cannot arise from any pass this code ran, so it means the
-    // state was corrupted or tampered with. Accepting it quietly disabled the
-    // step check for that pass with nothing to report.
+    // A negative value is not something the guard can compare against. It is NOT
+    // proof of tampering -- this very code persists one on a dead-CMOS machine,
+    // since the caller-clock guard is upper-bound only -- but accepting it
+    // quietly disabled the step check for that pass with nothing to report.
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-neg-"}};
     {
         AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
@@ -1477,7 +1478,7 @@ TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired"
         f.seed(kNow - 100, 5);
         f.seed(kNow + kWindow, 1);
         REQUIRE(f.store.cleanup_once(kNow) == 5);
-        // A reading AHEAD of now cannot come from any pass this code ran.
+        // A reading AHEAD of now cannot be compared against (an ordinary backward NTP correction produces one).
         exec_raw(f.tmp.path, "UPDATE audit_retention_meta SET value = 9000000000 "
                              "WHERE key = 'last_pass_now'");
         f.seed(kNow - 50, 5);

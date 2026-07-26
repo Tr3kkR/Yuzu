@@ -353,9 +353,11 @@ private:
     // corrects.
     std::optional<std::int64_t> last_pass_now_;
     // Set at construction when the durable row EXISTED but was not an integer.
-    // Consumed and cleared by the first pass, which declines on it and
-    // re-anchors a good value -- so corrupted state self-heals but is never
-    // silently accepted.
+    // Cleared only where it is CONSUMED -- the pass that declines on it, or the
+    // pass that accepts and deletes -- never on a pass that returns early
+    // (unreadable probe, nothing expired). Clearing early would swallow the
+    // corruption signal with no decline, no counter and no warn, which is the
+    // failure mode this flag exists to prevent.
     bool loaded_meta_malformed_{false};
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
