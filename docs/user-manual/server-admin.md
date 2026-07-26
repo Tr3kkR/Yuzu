@@ -251,8 +251,10 @@ whose agent count is suspiciously close to your full fleet size.
 
 After upgrading, refusals are counted by
 `yuzu_server_dispatch_target_rejected_total{route,reason}` (all series pre-seeded at boot, so
-`absent()` stays meaningful) and audited as `command.dispatch|denied`,
-`instruction.execute|denied` or `result_set.create|denied` with `detail=reason=<reason>`. The
+`absent()` stays meaningful) and audited as `command.dispatch|denied`
+(`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
+(`detail=reason=<reason>`) or `result_set.create|denied`
+(`detail=reason=<reason> source_kind=<kind>`). The
 `YuzuDispatchTargetRejected` alert fires on any non-zero rate — deliberately more sensitive than
 the MCP equivalent, because before this change these same calls reached the entire fleet and
 reported success.

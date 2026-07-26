@@ -23,9 +23,11 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <string>
 
 using yuzu::server::check_targeting_shape;
+using yuzu::server::kRouteRejectReasons;
 using yuzu::server::kTargetingShapeReasons;
 using yuzu::server::classify_dispatch_arm;
 using yuzu::server::DispatchArm;
@@ -171,4 +173,34 @@ TEST_CASE("#2500 — a real scope expression outranks both ids and broadcast",
 TEST_CASE("#2500 — ids-only and the empty-string scope are unchanged",
           "[targeting][dispatch]") {
     CHECK(classify_dispatch_arm(true, "") == DispatchArm::Ids);
+}
+
+TEST_CASE("#2500 — the route-level reason set matches what the routes actually emit",
+          "[targeting][dispatch][metrics]") {
+    // `kRouteRejectReasons` was flagged in review as an INERT tether: nothing
+    // referenced it, and the boot pre-seed spells its literals out by hand
+    // (deliberately — each applies to a different route subset, so one loop
+    // would seed unreachable pairs). An array nothing checks is documentation
+    // wearing a constant's clothes, and the seed comment claimed it was
+    // iterated. This binds the two: a reason emitted by a route without a home
+    // here, or a reason added here that no route emits, fails.
+    //
+    // Keep in step with the emit sites: `body_type` (server.cpp /api/command,
+    // workflow_routes.cpp execute), `parent_id_type`/`parent_id_empty`
+    // (rest_api_v1.cpp run_async + from-inventory-query), `closure_no_target`
+    // (server.cpp shared command_dispatch_fn).
+    const std::array<std::string_view, 4> emitted_by_routes{
+        "body_type", "parent_id_type", "parent_id_empty", "closure_no_target"};
+
+    CHECK(kRouteRejectReasons.size() == emitted_by_routes.size());
+    for (const auto r : emitted_by_routes) {
+        CHECK(std::find(kRouteRejectReasons.begin(), kRouteRejectReasons.end(), r) !=
+              kRouteRejectReasons.end());
+    }
+    // And the two halves stay disjoint — a reason in both arrays would be
+    // pre-seeded twice under different routes and read as two distinct causes.
+    for (const auto r : kRouteRejectReasons) {
+        CHECK(std::find(kTargetingShapeReasons.begin(), kTargetingShapeReasons.end(), r) ==
+              kTargetingShapeReasons.end());
+    }
 }

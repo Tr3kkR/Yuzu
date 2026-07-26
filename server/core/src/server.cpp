@@ -623,6 +623,14 @@ public:
                           "all (#2500). Both labels are closed sets; every reachable pair is "
                           "pre-seeded at boot so absent() stays meaningful.",
                           "counter");
+        // The route-level reasons below are the literals in `kRouteRejectReasons`
+        // (dispatch_target_shape.hpp). They are spelled out here rather than
+        // iterated because each applies to a DIFFERENT route subset, and a
+        // single loop over the array would seed unreachable pairs — which is
+        // exactly what the per-route seeding fixes. `test_dispatch_target_shape.cpp`
+        // binds the two lists so a reason added at an emit site without a home
+        // in the array fails a test.
+        //
         // Seeded PER ROUTE rather than as a cross-product: `result_set_parent`
         // can only ever emit the two parent_id reasons, and the dispatch routes
         // can never emit them. Seeding the full product would publish series
@@ -7983,14 +7991,17 @@ private:
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = 400;
-                res.set_content(
-                    nlohmann::json({{"error",
-                                     {{"code", 400},
-                                      {"message", "request body must be a JSON object"}}},
-                                    {"audit_emitted", audit_ok},
-                                    {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
-                    "application/json");
+                // `audit_emitted` is omitted entirely when no audit store is
+                // configured: audit_log() returns true in that case, so
+                // reporting `true` would assert a row landed on a deployment
+                // that keeps none. Absent means "no claim", not "false".
+                nlohmann::json err{{"error",
+                                    {{"code", 400},
+                                     {"message", "request body must be a JSON object"}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
                 return;
             }
             if (auto bv = yuzu::server::check_targeting_shape(body)) {
@@ -8004,9 +8015,21 @@ private:
                 // auditor show that an operator was blocked but not what they
                 // were trying to run — on a control whose whole purpose is
                 // reconstructing near-miss blast radius (governance, compliance).
+                // `plugin`/`action` are CALLER-SUPPLIED and this route bounds
+                // neither length nor charset (unlike MCP's kExecInstrIdentMaxLen).
+                // Concatenating them raw into an evidence field let a caller
+                // forge a row that mimics the success format
+                // (`plugin:action -> N agent(s)`) and write an arbitrarily large
+                // durable row before any dispatch — turning the field this fold
+                // added FOR blast-radius reconstruction into the thing an
+                // attacker writes. Sanitised through the same helper the
+                // on-behalf-of guard uses for untrusted log text: control chars
+                // and CR/LF become '?', length capped (governance, security).
                 const bool audit_ok =
                     audit_log(req, "command.dispatch", "denied", "command", "",
-                              std::string("reason=") + bv->reason + " " + plugin + ":" + action);
+                              std::string("reason=") + bv->reason + " " +
+                                  onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                  onbehalf::sanitize_for_log(action, 128));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = 400;
@@ -8111,8 +8134,11 @@ private:
 
             agent_service_.record_send_time(command_id);
 
-            // Check for scope-based targeting
-            auto scope_expr = extract_json_string(req.body, "scope");
+            // Check for scope-based targeting. Reuses the parsed body like the
+            // other post-auth reads; this site was missed when the rest were
+            // converted and re-parsed the whole body to read a key the handler
+            // already had (governance).
+            auto scope_expr = extract_json_string(body, "scope");
 
             int sent = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
@@ -8205,7 +8231,9 @@ private:
                     // the audit trail as though one was.
                     const bool audit_ok =
                         audit_log(req, "command.dispatch", "denied", "command", "",
-                                  "reason=agent_ids_empty " + plugin + ":" + action);
+                                  "reason=agent_ids_empty " +
+                                      onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                      onbehalf::sanitize_for_log(action, 128));
                     if (!audit_ok)
                         res.set_header("Sec-Audit-Failed", "true");
                     res.status = 400;
