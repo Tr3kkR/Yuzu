@@ -128,6 +128,14 @@ void AuditStore::ensure_retention_index() {
     // is correct without it. Measured cost at 5M rows: ~1.4s and ~81MB, paid
     // once; the elapsed time is logged so an operator can see it on a large
     // table (extrapolating to ~16s at 50M rows).
+    // Logged BEFORE the build, not only after (Gate 3 performance). On a large
+    // audit_events this runs for seconds -- measured 4.09 s at 5M rows -- inside
+    // the constructor, which completes long before the listener binds. An
+    // operator watching a slow start-up, or reading logs after a healthcheck
+    // killed the container mid-build, otherwise sees an unexplained gap with no
+    // line naming what is running.
+    spdlog::debug("AuditStore: ensuring idx_audit_ttl_id (one-time on an existing audit_events; "
+                  "the server does not accept connections until this finishes)");
     const auto t0 = std::chrono::steady_clock::now();
     char* err = nullptr;
     const int rc = sqlite3_exec(db_,
@@ -668,8 +676,16 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // both causes -- but a server down for eight days now declines once,
             // which is cheap, instead of a 30-day clock jump passing silently.
             const std::int64_t step_threshold = kAuditMinBigStepSec;
-            const bool big_step =
-                prev_pass_now && window > 0 && now - *prev_pass_now > step_threshold;
+            // NOT gated on `window > 0` (Gate 2 sec-L1). Rows carry a non-zero
+            // ttl_expires_at stamped under a PREVIOUS retention setting, so a
+            // server switched to `--audit-retention-days 0` still has a legacy
+            // backlog that this pass will delete -- while a window-gated step
+            // check would be silently off for exactly that server, and the
+            // decline would come out under the "No unusual gap since the last
+            // pass" text on a host that had been down a month. `*has_expired`
+            // already gates this branch, which is the condition that matters.
+            // The TAR sibling never had the gate; the asymmetry was the tell.
+            const bool big_step = prev_pass_now && now - *prev_pass_now > step_threshold;
             emit_delta = prev_pass_now ? now - *prev_pass_now : 0;
             emit_window = step_threshold;
             emit_full_wipe = would_wipe;

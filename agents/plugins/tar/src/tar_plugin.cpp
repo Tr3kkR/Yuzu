@@ -28,6 +28,7 @@
 #include "tar_module_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
+#include "tar_status_format.hpp"
 #include "tar_netconn.hpp"
 #include "tar_netqual_boot.hpp"
 #include "tar_perf.hpp"
@@ -1887,22 +1888,13 @@ private:
             // operator opens to ask "why is this device's data missing" rendered
             // identically to a healthy device (#2361 Gate 6, enterprise-readiness).
             //
-            // Only PROMISE the `tar sql` read path when it is actually there. It
-            // survives this failure by construction -- the close takes the WRITE
-            // connection, not the read-only one -- but that connection is
-            // optional at open time (a failure there is warned and tolerated,
-            // tar_db.cpp), and telling an operator their data is still readable
-            // when it is not sends them down a dead end during the one incident
-            // where they are already blind.
-            ctx.write_output(std::format(
-                "error|TAR storage is offline on this endpoint; the database was closed after a "
-                "transaction could not be rolled back. Collection and retention are both stopped. "
-                "{} Restart the agent to recover.",
-                db_->query_engine_available()
-                    ? "Historical data remains readable via `tar sql`."
-                    : "The read-only query connection is unavailable too, so `tar sql` cannot "
-                      "read the historical data either."));
-            ctx.write_output("storage_state|offline");
+            // Built by a free function in tar_status_format.hpp rather than
+            // inline, because the ORDER above is a contract with the server and
+            // TarPlugin is TU-local -- nothing could assert it here. See that
+            // header, and the test that pins `lines[0]` starting with `error|`.
+            for (const auto& line :
+                 yuzu::tar::format_storage_offline_lines(db_->query_engine_available()))
+                ctx.write_output(line);
             return 1;
         }
         ctx.write_output("storage_state|ok");

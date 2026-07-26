@@ -12,6 +12,7 @@
 #include "tar_aggregator.hpp"
 #include "tar_db.hpp"
 #include "tar_schema_registry.hpp"
+#include "tar_status_format.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -1897,4 +1898,54 @@ TEST_CASE("TAR #2361: a closed store skips the pass instead of reporting clock t
     CHECK(retention_guard_counters(fresh).failures.empty());
     // The data is untouched (it lives on the moved-to connection).
     CHECK(row_count(live, "process_hourly") == 10);
+}
+
+TEST_CASE("TAR #2361: the offline status reply leads with error|, not storage_state",
+          "[tar][retention][clock-guard]") {
+    // Governance Gate 3 (quality-engineer) BLOCKING: this ordering is the fix
+    // for the blank-capture-sources incident and NOTHING pinned it, because
+    // TarPlugin is TU-local. The lines are now built by a free function so this
+    // can assert the contract directly.
+    //
+    // The server gates failure on `output.starts_with("error|")`
+    // (tar_tree_routes.cpp, device_routes.cpp, dex_routes.cpp,
+    // result_set_matcher.cpp -- it is a repo-wide convention). Leading with
+    // `storage_state|` makes that gate miss, and the frame falls through to a
+    // renderer that parses only `config|` lines: a dead endpoint draws
+    // identically to a healthy one.
+    const auto lines = yuzu::tar::format_storage_offline_lines(/*query_engine_available=*/true);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("error|"));
+    CHECK(lines[1] == "storage_state|offline");
+    CHECK(lines[0].find("tar sql") != std::string::npos);
+
+    // And when the read-only connection is gone too, the line must NOT promise
+    // a read path that is not there.
+    const auto dark = yuzu::tar::format_storage_offline_lines(/*query_engine_available=*/false);
+    REQUIRE(dark.size() == 2);
+    CHECK(dark[0].starts_with("error|"));
+    CHECK(dark[1] == "storage_state|offline");
+    CHECK(dark[0].find("cannot read") != std::string::npos);
+}
+
+TEST_CASE("TAR #2361: a row INSIDE the future-slack band still counts as a survivor",
+          "[tar][retention][clock-guard]") {
+    // The TAR half of the audit store's slack-boundary case. Every existing
+    // slack test here places its poison row far OUTSIDE `now + slack`, so
+    // deleting the `+ kTarRetentionFutureSlackSec` term left the suite green --
+    // the row was excluded either way. The term only earns its keep at the
+    // boundary.
+    //
+    // A row half a slack-width ahead is a legitimate survivor. Excluding it
+    // would remove the one row keeping `would_wipe` false, so the table would
+    // decline and then, on the pass after, delete -- the guard mis-firing in
+    // the direction that costs forensic history.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // expired
+    seed_process_hourly_at(*f.db, kT0 + yuzu::tar::kTarRetentionFutureSlackSec / 2, 1);
+
+    run_retention(*f.db, kT0, f.guard);
+
+    CHECK(row_count(*f.db, "process_hourly") == 1); // survivor recognised -> deleted normally
+    CHECK(declines_of(f.guard, "process_hourly") == 0);
 }
