@@ -163,6 +163,50 @@ groups:
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
 
+      - alert: YuzuMcpBodyTooLargeRejecting
+        expr: |
+          sum by (reason) (increase(yuzu_mcp_body_too_large_total[15m])) > 20
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP requests are being rejected at the transport body cap"
+          description: >-
+            reason={{ $labels.reason }}. over_cap = a declared
+            Content-Length above 4 MiB, rejected 413 in pre-routing.
+            unmeasurable = a body this server cannot size in advance - any
+            Transfer-Encoding, any non-identity Content-Encoding, or a
+            Content-Length-less POST/PUT/PATCH - rejected 411. NOTE this fires for
+            UNAUTHENTICATED callers too - the cap runs ahead of the auth check -
+            so there is no principal to correlate. The throttled "[#2437]"
+            warn in the server journal carries the sanitized method, path and
+            source address (1 line per 100 rejections OF EACH REASON -
+            the two throttles are independent so a noisy reason cannot hide a
+            rare one; the counter records all). reason=unmeasurable means a body this server cannot size in
+            advance (any Transfer-Encoding, any non-identity Content-Encoding,
+            or a Content-Length-less POST/PUT/PATCH) is being refused 411, which is usually a client that needs
+            reconfiguring rather than an attack. Rule out the legitimate cause
+            first: an
+            execute_bundle call with multi-MiB params, which the MCP transport
+            clamps tighter than validate_bundle_steps accepts (see
+            docs/mcp-server.md); the REST twin POST /api/v1/bundles is not
+            capped this way.
+
+
+      - alert: YuzuMcpInputBoundsRejecting
+        expr: |
+          sum by (tool, reason) (increase(yuzu_mcp_tool_args_too_large_total[15m])) > 20
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP tool arguments are being rejected for exceeding input bounds"
+          description: >-
+            yuzu_mcp_tool_args_too_large_total is climbing on
+            {{ $labels.tool }} (reason={{ $labels.reason }}). Either a client is
+            sending arguments past the tool's published inputSchema bounds -
+            check whether it read tools/list - or someone is probing the limits.
+            Denials are audited as mcp.<tool>|denied with detail
+            "input bound exceeded: <reason>"; correlate there for the principal.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon
@@ -1131,13 +1175,17 @@ groups:
   #       annotations:
   #         summary: "A Guardian journal replay worker has not completed a page pass in >5m"
   #         description: >-
-  #           The worst endpoint's time since its last successful replay page pass
-  #           exceeds 10x the 30 s cadence. The worker there is dead, hung, or throwing
-  #           on every pass (climbing maint_exceptions alongside means throwing NOW; a
-  #           flat value means hung, OR the loop died earlier - loop death increments
-  #           the counter exactly once and logs a `critical` line, so check the agent
-  #           log): journalled lifecycle records are not being replayed to the server
-  #           from that endpoint.
+  #           The worst endpoint's time since its last replay page pass that made
+  #           progress or verified a clean idle backlog exceeds 10x the 30 s cadence
+  #           (#2452). The worker there is dead/hung/throwing (climbing maint_exceptions
+  #           means throwing NOW; a flat value means hung, OR the loop died earlier -
+  #           loop death increments that counter once and logs a `critical` line, check
+  #           the agent log) - OR its passes are stalling short of progress:
+  #           token-starved, read-failing, boot-barrier-stalled, window-blocked
+  #           (headroom), or quarantining every candidate. Correlate with
+  #           page_read_failures / headroom_blocked_seconds / quarantined to tell which;
+  #           either way journalled lifecycle records are not being replayed from that
+  #           endpoint.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
   #     - alert: YuzuGuardianJournalPruneStale
   #       expr: |
@@ -1148,10 +1196,15 @@ groups:
   #       annotations:
   #         summary: "A Guardian journal retention prune has not completed in >20m"
   #         description: >-
-  #           The worst endpoint's time since its last successful retention prune
-  #           exceeds 10x the 120 s cadence. Retention is not running there: the
-  #           journal grows toward its write ceiling, where new audit batches start
-  #           being refused (write_capacity_rejected).
+  #           The worst endpoint's time since a prune pass that actually ran retention
+  #           (applied the delete or verified nothing eligible) exceeds 10x the 120 s
+  #           cadence (#2452). The worker is dead/hung/throwing, its prune scan is
+  #           failing every pass, its retention DELETE is failing every pass (disk-full
+  #           / perms - also visible on prune_failures), or a stop keeps aborting it.
+  #           Retention is not running: the journal grows toward its write ceiling,
+  #           where new audit batches start being refused (write_capacity_rejected). A
+  #           forward-clock-jump wipe is the one case that still reads fresh (the delete
+  #           did succeed) - the clock guard, not this gauge, owns that.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
   #     # ---- Loss / fault counters (rising edge; NOT sufficient - see REASON 2) -----
   #     - alert: YuzuGuardianJournalIntegrityGap

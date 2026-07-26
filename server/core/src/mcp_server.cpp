@@ -26,6 +26,7 @@
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
@@ -190,7 +191,12 @@ int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
 // Server-side length cap for free-text agentic params (question, scenario) that
 // are lowercased/echoed/searched. Bounds work + error-message echo (G-S11); the
 // matching input schemas also carry "maxLength": 2048.
+// SCOPE NOTE (#2437): this constant serves exactly two READ tools —
+// classify_operational_question and get_incident_playbook. It is NOT a
+// general handler-side byte cap, and in particular execute_instruction has
+// never used it; see kExecInstr* below for that tool's bounds.
 constexpr std::size_t kAgenticParamMaxLen = 2048;
+
 
 std::string json_quoted_string(std::string_view value) {
     std::string quoted;
@@ -586,19 +592,22 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
-     // contract (A5 materiality backfill). Enforcement is SPLIT since #2405:
-     // on the APPROVAL-GATED path (supervised tier, where requires_approval is
-     // true) the C8 gate validates arguments against this schema before an
-     // approval ticket is minted or consumed, so these caps ARE enforced there;
-     // on the operator/readonly path they remain client-advisory, per the same
-     // advisory-vs-enforced convention as the annotation hints. Full
-     // server-side enforcement on every path is tracked in #2437.
+     // contract (A5 materiality backfill), and since #2437 they are ENFORCED
+     // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
+     // kExecInstr* constants in this file before dispatch, so the operator
+     // tier (which executes with no approval, and was therefore the unbounded
+     // one) is now bounded too. Enforcement had been split since #2405:
+     // approval-gated calls were validated by the C8 gate against this schema
+     // before a ticket was minted or consumed, while operator/readonly calls
+     // got client-advisory bounds only.
+     // THE LITERALS BELOW AND kExecInstr* ARE ONE CONTRACT IN TWO PLACES:
+     // change a bound here and change its twin, or the gap reopens silently.
      R"j({"type":"object","properties":{)j"
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
-     R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":8192},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope). Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -2761,6 +2770,45 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string mint_detail_prefix =
                         audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
 
+                    // Observability must never fail a dispatch. Both C8
+                    // rejection paths below - the #2405 schema violation and
+                    // the #2437 bound violation - count through this ONE
+                    // guarded helper rather than incrementing inline, so the
+                    // guard cannot land on one path and not the other. (The
+                    // handler's own `too_large` has carried the same guard
+                    // since #2437; before this BOTH C8 sites were the
+                    // outliers.) MetricsRegistry::counter is a lock_guard plus
+                    // a map insert with no backend and no cardinality limit,
+                    // so in practice only bad_alloc escapes - the guard costs
+                    // nothing and removes the question.
+                    //
+                    // SCOPE, stated precisely because the first version of this
+                    // comment overclaimed: this closes the two rejection paths
+                    // in the C8 block. It is NOT a file-wide guarantee -
+                    // `yuzu_mcp_tool_security_misconfig_total` and
+                    // `yuzu_mcp_stream_rejects_total` still increment inline
+                    // elsewhere in this file. Both of those fail CLOSED, so
+                    // they are hardening rather than defects; lifting this
+                    // helper to cover them is #2437 follow-up work, not a
+                    // property to assume here.
+                    //
+                    // The label vector is built INSIDE the try on purpose. An
+                    // earlier signature took a `const yuzu::Labels&`, which
+                    // materialised the vector plus its strings at the CALL
+                    // site - outside the guard - making this helper strictly
+                    // weaker than the `too_large` sibling it was modelled on.
+                    auto count_denial = [metrics, &tool_name](const char* family,
+                                                              const char* reason) noexcept {
+                        if (metrics == nullptr) return;
+                        try {
+                            yuzu::Labels labels{{"tool", tool_name}};
+                            if (reason != nullptr)
+                                labels.emplace_back("reason", reason);
+                            metrics->counter(family, labels).increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    };
+
                     // ── #2405: input-schema validation BEFORE any ticket work ──
                     // A schema-invalid call must neither MINT a ticket (an
                     // admin's approval would be wasted on args the handler
@@ -2790,11 +2838,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             // caller-derived keys are wildcarded to '*').
                             const std::string cid =
                                 yuzu::server::detail::make_correlation_id();
-                            if (metrics != nullptr)
-                                metrics
-                                    ->counter("yuzu_mcp_tool_args_invalid_total",
-                                              {{"tool", tool_name}})
-                                    .increment();
+                            count_denial("yuzu_mcp_tool_args_invalid_total", nullptr);
                             mcp_audit("denied",
                                       "arguments do not match the tool input schema at '" +
                                           violation->path + "' correlation_id=" + cid);
@@ -2804,6 +2848,34 @@ McpServer::HandlerFn McpServer::build_handler(
                                              violation->path + "': " + violation->reason,
                                          "correct the arguments to match this tool's "
                                          "tools/list inputSchema and re-call; no approval "
+                                         "ticket was created or consumed",
+                                         -1, cid),
+                                "application/json");
+                            return;
+                        }
+                    }
+
+                    // #2437: the two bounds the CLOSED subset cannot express
+                    // (params key count, params key length) get checked HERE
+                    // too, not only in the handler. A handler-only check would
+                    // mint a ticket, spend a human's approval, CONSUME the
+                    // one-time ticket, and only then fail — the exact waste
+                    // this gate exists to prevent, and unavoidable for a client
+                    // since neither bound is published in the schema. Same
+                    // deny-without-consume shape as the schema violation above;
+                    // the handler keeps its own copy as defense in depth for
+                    // the ungated tiers.
+                    if (tool_name == "execute_instruction") {
+                        if (auto bv = check_exec_instruction_shape(args)) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            count_denial("yuzu_mcp_tool_args_too_large_total", bv->reason);
+                            mcp_audit("denied",
+                                      std::string("input bound exceeded: ") + bv->reason +
+                                          " correlation_id=" + cid);
+                            res.set_content(
+                                a4_error(kInvalidParams, bv->message,
+                                         "reduce the argument and re-call; no approval "
                                          "ticket was created or consumed",
                                          -1, cid),
                                 "application/json");
@@ -5192,12 +5264,137 @@ McpServer::HandlerFn McpServer::build_handler(
                                [](unsigned char c) { return std::tolower(c); });
                 std::transform(action.begin(), action.end(), action.begin(),
                                [](unsigned char c) { return std::tolower(c); });
-                if (plugin.empty() || action.empty()) {
+                // ── Server-side input bounds (#2437) ──────────────────────────
+                // These mirror this tool's SERVED inputSchema exactly. Until now
+                // the schema's maxLength/maxItems were enforced only on the
+                // approval-gated (supervised) path, where the C8 gate validates
+                // arguments before minting or consuming a ticket — on the
+                // operator tier, which executes without approval, they were pure
+                // advice to a cooperating client. That asymmetry is the hole:
+                // the tier that needs no human in the loop was the unbounded one.
+                //
+                // Bounds are BYTE counts, matching the schema compiler's
+                // documented "maxLength counts bytes" deviation, so schema and
+                // enforcement can be compared literally rather than approximately.
+                //
+                // Deliberately NOT narrowing the charset. `execute_bundle`'s
+                // is_ident() restricts plugin/action to [a-z0-9_], but dotted
+                // server actions are live shipped content (content/definitions/
+                // workflow_management.yaml: plugin "server", action
+                // "workflow.list"), so importing that rule here would reject
+                // working calls. Length/count only.
+                auto too_large = [&](const char* reason, std::string_view what) {
+                    // ONE correlation id across the audit row and the client
+                    // envelope, minted FIRST (#2423 review F4 gave a4_error
+                    // its cid_override parameter for exactly this). Without
+                    // it the envelope mints an id the audit row never sees
+                    // and a SIEM cannot join the CC7.2 evidence row to the
+                    // error the caller got - which docs/mcp-server.md
+                    // already advertises as this surface's contract.
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_tool_args_too_large_total",
+                                      {{"tool", tool_name}, {"reason", reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // observability must never fail the dispatch
+                        }
+                    }
+                    mcp_audit("denied", std::string("input bound exceeded: ") + reason +
+                                        " correlation_id=" + cid);
                     res.set_content(
-                        error_response(id, kInvalidParams, "plugin and action are required"),
+                        a4_error(kInvalidParams, what,
+                                 "reduce the argument to within this tool's tools/list "
+                                 "inputSchema bounds and re-call",
+                                 -1, cid),
                         "application/json");
-                    return;
+                };
+                {
+                    // The schema-inexpressible rules, from the SAME pure
+                    // function the C8 gate ran pre-mint. Defense in depth for
+                    // the ungated tiers (readonly/operator never reach C8), and
+                    // structurally the reason a new rule cannot land on one
+                    // path only.
+                    if (auto bv = check_exec_instruction_shape(args)) {
+                        too_large(bv->reason, bv->message);
+                        return;
+                    }
+                    // Every rejection leaves EVIDENCE. A bound whose whole
+                    // purpose is detecting abuse must not be the one silent
+                    // denial here: the sibling free-text caps audit
+                    // ("question_too_long"/"scenario_too_long") and the C8
+                    // schema gate audits AND counts, so this does both. The
+                    // -32602 rides HTTP 200, so without this the only trace
+                    // would be yuzu_http_requests_total{status="200"}.
+                    // `reason` is a closed set of server literals — it is a
+                    // metric label, so it must never carry caller-derived text.
+                    if (plugin.size() > kExecInstrIdentMaxLen ||
+                        action.size() > kExecInstrIdentMaxLen) {
+                        too_large("ident_len", std::format("plugin and action must each be at most {} bytes", kExecInstrIdentMaxLen));
+                        return;
+                    }
+                    if (args.contains("scope") && args["scope"].is_string() &&
+                        args["scope"].get_ref<const std::string&>().size() >
+                            kExecInstrScopeMaxLen) {
+                        too_large("scope_len", std::format("scope must be at most {} bytes", kExecInstrScopeMaxLen));
+                        return;
+                    }
+                    if (args.contains("params") && args["params"].is_object()) {
+                        const auto& p = args["params"];
+                        if (p.size() > kExecInstrParamCountMax) {
+                            too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
+                            return;
+                        }
+                        for (const auto& [k, v] : p.items()) {
+                            // Key length is NOT expressible in the served schema
+                            // (the subset has no propertyNames/maxProperties), so
+                            // this bound and the count above exist only here.
+                            // Borrowed from bundle_service.hpp so the two
+                            // execute surfaces agree on what a param may be.
+                            if (k.size() > kExecInstrParamKeyMaxLen) {
+                                too_large("param_key_len", std::format("a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
+                                return;
+                            }
+                            // Measure what the handler will actually store: a
+                            // non-string value is dumped to text below, and the
+                            // dump is what reaches the agent, so bounding the
+                            // raw JSON value would under-count.
+                            const std::size_t vlen =
+                                v.is_string() ? v.get_ref<const std::string&>().size()
+                                              : v.dump().size();
+                            if (vlen > kExecInstrParamValueMaxLen) {
+                                too_large("param_value_len", std::format("a params value exceeds {} bytes", kExecInstrParamValueMaxLen));
+                                return;
+                            }
+                        }
+                    }
+                    if (args.contains("agent_ids") && args["agent_ids"].is_array()) {
+                        const auto& a = args["agent_ids"];
+                        if (a.size() > kExecInstrAgentIdsMaxItems) {
+                            too_large("agent_ids_count", std::format("agent_ids must have at most {} entries", kExecInstrAgentIdsMaxItems));
+                            return;
+                        }
+                        for (const auto& v : a) {
+                            // The type IS guaranteed by check_exec_instruction_shape
+                            // above (and pre-mint in the C8 block), so this guard is
+                            // dead code today. It is kept deliberately: it costs
+                            // nothing, it stays correct under refactoring, and
+                            // without it a non-string reaching here would throw
+                            // type_error out of get_ref and become a 500 instead of
+                            // a clean -32602 the moment that 89-line-distant
+                            // invariant is disturbed. Removing it in this PR was a
+                            // false economy (#2492 review).
+                            if (v.is_string() &&
+                                v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
+                                too_large("agent_id_len", std::format("an agent_ids entry exceeds {} bytes", kExecInstrIdentMaxLen));
+                                return;
+                            }
+                        }
+                    }
                 }
+
 
                 // Extract params as string map
                 std::unordered_map<std::string, std::string> params;
@@ -5216,9 +5413,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
-                // Default scope to __all__ if neither scope nor agent_ids provided
-                if (scope.empty() && agent_ids.empty())
+                // Default scope to __all__ ONLY when the caller named no target at
+                // all. A targeting argument that was SUPPLIED but resolved to
+                // nothing must never widen to the whole fleet - that is the #2437
+                // defect, and `{"agent_ids": []}` from a device filter matching
+                // nothing is its likelier shape than a type-confused list.
+                //
+                // check_exec_instruction_shape already rejects those shapes ~90
+                // lines above, so this branch is UNREACHABLE today and is second
+                // line of defence, not the fix. It is here because the sink is the
+                // one place where a bypass or a reorder turns a specific-looking
+                // target list into the entire fleet, and a single point of failure
+                // is exactly what this series argues against. Falsifiable on its
+                // own terms: neuter the shape check and this still refuses.
+                const bool supplied_target = args.contains("agent_ids") || args.contains("scope");
+                if (scope.empty() && agent_ids.empty()) {
+                    if (supplied_target) {
+                        const bool by_ids = args.contains("agent_ids");
+                        too_large(by_ids ? "agent_ids_empty" : "scope_empty",
+                                  by_ids ? "agent_ids was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents"
+                                         : "scope was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents");
+                        return;
+                    }
                     scope = "__all__";
+                }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
                 // A request carrying _meta.progressToken opts into live progress

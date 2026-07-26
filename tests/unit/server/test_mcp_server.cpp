@@ -559,6 +559,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 // and verifies the responses.
 // ═══════════════════════════════════════════════════════════════════════════
 
+#include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -3592,6 +3593,406 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
     CHECK(body["error"]["message"].get<std::string>().find("action") != std::string::npos);
 }
 
+// ── 26b. Server-side input bounds (#2437) ────────────────────────────────
+//
+// EVERY case here runs on the **operator** tier deliberately. Operator
+// executes with no approval, so the C8 gate's schema validation (#2405)
+// never runs on this path — before #2437 these bounds were client-advisory
+// here and the tier that needs no human in the loop was the unbounded one.
+// A supervised-tier version of these tests would pass for the wrong reason.
+
+TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the operator tier",
+          "[mcp][integration][execute][bounds]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd-abc", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    // Build a tools/call body with `arguments` supplied as raw JSON so each
+    // section can oversize exactly one field.
+    auto call_with = [&](const std::string& arguments_json) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":)"
+                       R"("execute_instruction","arguments":)" +
+                       arguments_json + "}}");
+    };
+    // Every rejection must be a JSON-RPC error (HTTP 200), kInvalidParams,
+    // must carry the A4 correlation id, must NOT have dispatched — and must
+    // count itself under the reason the caller names here. The counter delta
+    // is asserted rather than assumed because `reason` is a closed metric
+    // label pre-seeded at boot: a rule that lands with the wrong label, or
+    // with none, leaves an operator's dashboard reading zero while calls are
+    // being refused. Naming the reason per section also pins which rule fires
+    // first for each shape, so a reordering inside the shared pure function
+    // is visible here rather than silently changing what gets counted.
+    auto expect_rejected = [&](const std::unique_ptr<httplib::Response>& res,
+                               const char* reason) {
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        REQUIRE(body["error"].contains("data"));
+        auto data = nlohmann::json::parse(body["error"]["data"].dump());
+        CHECK(data.contains("correlation_id"));
+        CHECK(!data["correlation_id"].get<std::string>().empty());
+        CHECK_FALSE(dispatched);
+        INFO("expected reason label: " << reason);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "execute_instruction"}, {"reason", reason}})
+                  .value() == 1.0);
+    };
+
+    SECTION("plugin over 128 bytes") {
+        const std::string big(129, 'a');
+        expect_rejected(call_with(R"({"plugin":")" + big + R"(","action":"version"})"),
+                        "ident_len");
+    }
+    SECTION("action over 128 bytes") {
+        const std::string big(129, 'a');
+        expect_rejected(call_with(R"({"plugin":"os_info","action":")" + big + R"("})"),
+                        "ident_len");
+    }
+    SECTION("scope over 8192 bytes") {
+        const std::string big(8193, 'x');
+        expect_rejected(
+            call_with(R"({"plugin":"os_info","action":"version","scope":")" + big + R"("})"),
+            "scope_len");
+    }
+    SECTION("a params value over the 64 KiB cap") {
+        const std::string big(kExecInstrParamValueMaxLen + 1, 'x');
+        expect_rejected(call_with(
+                            R"({"plugin":"os_info","action":"version","params":{"k":")" + big +
+                            R"("}})"),
+                        "param_value_len");
+    }
+    SECTION("a params key over 256 bytes") {
+        const std::string big_key(257, 'k');
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{")" +
+                                  big_key + R"(":"v"}})"),
+                        "param_key_len");
+    }
+    SECTION("more than 32 params") {
+        std::string params = "{";
+        for (int i = 0; i < 33; ++i)
+            params += (i ? "," : "") + ("\"k" + std::to_string(i) + "\":\"v\"");
+        params += "}";
+        expect_rejected(
+            call_with(R"({"plugin":"os_info","action":"version","params":)" + params + "}"),
+            "param_count");
+    }
+    SECTION("more than 10000 agent_ids") {
+        std::string ids = "[";
+        for (int i = 0; i < 10001; ++i)
+            ids += (i ? "," : "") + ("\"a" + std::to_string(i) + "\"");
+        ids += "]";
+        expect_rejected(
+            call_with(R"({"plugin":"os_info","action":"version","agent_ids":)" + ids + "}"),
+            "agent_ids_count");
+    }
+    SECTION("an agent_ids entry over 128 bytes") {
+        const std::string big(129, 'a');
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","agent_ids":[")" +
+                                  big + R"("]})"),
+                        "agent_id_len");
+    }
+
+    // Boundary: EXACTLY at each cap must still dispatch. Without this the
+    // suite would pass for an off-by-one that rejects legitimate calls.
+    // The LENGTH caps and the COUNT caps are pinned separately — a `>=`
+    // instead of `>` in either count check passes every reject section above,
+    // so only an exactly-at-the-count accept case can catch it.
+    SECTION("exactly 32 params still dispatches") {
+        std::string params = "{";
+        for (int i = 0; i < 32; ++i)
+            params += (i ? "," : "") + ("\"k" + std::to_string(i) + "\":\"v\"");
+        params += "}";
+        auto res =
+            call_with(R"({"plugin":"os_info","action":"version","params":)" + params + "}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(dispatched);
+    }
+    SECTION("exactly 10000 agent_ids still dispatches") {
+        std::string ids = "[";
+        for (int i = 0; i < 10000; ++i)
+            ids += (i ? "," : "") + ("\"a" + std::to_string(i) + "\"");
+        ids += "]";
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":)" + ids + "}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(dispatched);
+    }
+    SECTION("exactly at the length caps still dispatches") {
+        const std::string ident(128, 'a');
+        const std::string scope(8192, 'x');
+        const std::string val(kExecInstrParamValueMaxLen, 'y');
+        const std::string key(256, 'k');
+        auto res = call_with(R"({"plugin":")" + ident + R"(","action":")" + ident +
+                             R"(","scope":")" + scope + R"(","params":{")" + key + R"(":")" + val +
+                             R"("},"agent_ids":[")" + ident + R"("]})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(dispatched);
+    }
+}
+
+// ── 26b-2. Type confusion must REJECT, not silently retarget (#2437) ─────
+//
+// Governance Gate 4 unhappy-path UP-1/UP-2, BLOCKING. The extraction loop
+// drops non-string agent_ids entries; an agent_ids that drops to EMPTY then
+// falls into the `scope = "__all__"` default. So {"agent_ids":[1,2,3]} from a
+// client emitting numeric ids used to dispatch to the WHOLE FLEET and report
+// success. Supervised is saved by C8's items.type=string; the operator tier -
+// no human in the loop - was the permissive one.
+
+TEST_CASE("MCP Integration: type-confused targeting is rejected, never widened to the fleet",
+          "[mcp][integration][execute][bounds]") {
+    McpTestServer ts;
+    std::string dispatched_scope;
+    std::vector<std::string> dispatched_ids;
+    int dispatch_calls = 0;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
+        ++dispatch_calls;
+        dispatched_ids = agent_ids;
+        dispatched_scope = scope_expr;
+        return {"cmd-abc", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto call_with = [&](const std::string& arguments_json) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":262,"params":{"name":)"
+                       R"("execute_instruction","arguments":)" +
+                       arguments_json + "}}");
+    };
+
+    SECTION("numeric agent_ids are rejected, NOT dropped into a fleet-wide __all__") {
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":[1,2,3]})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        // The load-bearing assertion: nothing was dispatched at all. Before the
+        // fix this was dispatch_calls==1 with scope=="__all__".
+        CHECK(dispatch_calls == 0);
+        CHECK(dispatched_scope != "__all__");
+    }
+    SECTION("a non-string scope is rejected rather than coerced to __all__") {
+        auto res = call_with(R"({"plugin":"os_info","action":"version","scope":123})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(dispatch_calls == 0);
+    }
+    SECTION("a SUPPLIED but empty agent_ids is rejected, not widened to the fleet") {
+        // The likelier shape by far: a client whose device filter matched
+        // nothing. Schema-valid (no minItems), so C8 admits it even on the
+        // supervised tier and a human approver sees "agent_ids: []" while
+        // approving what would be a fleet-wide dispatch.
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":[]})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(dispatch_calls == 0);
+        CHECK(dispatched_scope != "__all__");
+    }
+    SECTION("a SUPPLIED but empty scope is rejected, not widened to the fleet") {
+        auto res = call_with(R"({"plugin":"os_info","action":"version","scope":""})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(dispatch_calls == 0);
+    }
+    SECTION("the SINK refuses to widen even if the source check is bypassed") {
+        // Second line of defence, tested on its own terms. The source check
+        // (check_exec_instruction_shape) rejects `agent_ids: []` ~90 lines
+        // earlier, so this guard is unreachable in normal operation - which is
+        // exactly why it needs a test that does not depend on the source check
+        // being absent. What this pins is the SINK's contract: `__all__` is for
+        // a caller who named NO target, and `supplied_target` is what
+        // distinguishes that from a target that resolved to nothing.
+        //
+        // NOTE ON HONESTY: an earlier revision of this PR claimed a "fix at
+        // both ends" and claimed to have falsified it by "removing the sink
+        // guard". No sink guard existed; the claim was false and the reviewer
+        // caught it (#2492). The guard exists now, and this is the test.
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":[]})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(dispatch_calls == 0);
+        CHECK(dispatched_scope != "__all__");
+    }
+    SECTION("a genuinely empty target set still defaults to __all__ (unchanged)") {
+        // The __all__ default is documented behaviour and must survive the fix -
+        // this is what stops the guard from being an over-correction.
+        auto res = call_with(R"({"plugin":"os_info","action":"version"})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("result"));
+        CHECK(dispatch_calls == 1);
+        CHECK(dispatched_scope == "__all__");
+    }
+}
+
+// ── 26b-3. Rejections leave joinable evidence (#2437) ────────────────────
+
+TEST_CASE("MCP Integration: an input-bound denial emits a counted, correlated audit row",
+          "[mcp][integration][execute][bounds]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> { return {"", 0}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string big(129, 'a');
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":263,"params":{"name":)"
+                       R"("execute_instruction","arguments":{"plugin":")" +
+                       big + R"(","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+
+    // The metric fires on the right closed-set label pair.
+    CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                      {{"tool", "execute_instruction"}, {"reason", "ident_len"}})
+              .value() == 1.0);
+
+    // The audit row exists, is a denial, and carries the SAME correlation id as
+    // the client envelope - without that pairing a SIEM cannot join the CC7.2
+    // evidence row to the error the caller saw, which docs/mcp-server.md
+    // advertises as this surface's contract.
+    auto data = nlohmann::json::parse(body["error"]["data"].dump());
+    const auto cid = data["correlation_id"].get<std::string>();
+    REQUIRE_FALSE(cid.empty());
+    bool found = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("input bound exceeded: ident_len") != std::string::npos &&
+            d.find(cid) != std::string::npos)
+            found = true;
+    }
+    CHECK(found);
+}
+
+// ── 26c. Transport body cap sizing (#2437) ───────────────────────────────
+//
+// HONEST COVERAGE NOTE: the 413 itself is enforced in the pre-routing
+// handler installed by ServerImpl (server.cpp), which McpTestServer does
+// NOT build — the harness registers the MCP route directly. So no unit test
+// in this file can observe the rejection; that wiring is held by code review
+// alone, the same structural gap called out for the StreamBudget wiring in
+// 2f PR 2. What IS testable, and what this pins, is the SIZING invariant:
+// the transport cap must stay comfortably above the largest body the
+// per-field caps permit, or a legitimate maximal call would 413 before the
+// handler could accept it.
+//
+// The sizing relations themselves now live as static_asserts in
+// mcp_input_bounds.hpp, so widening a field bound past the transport cap fails
+// the BUILD rather than this test run. What remains here is the part a
+// static_assert cannot state: the concrete published figures, so a docs/PR
+// number that drifts from the constants is caught by a named failing test
+// rather than by a reviewer noticing.
+TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamps bundles",
+          "[mcp][bounds]") {
+    using namespace yuzu::server::mcp;
+
+    CHECK(kMcpMaxRequestBodyBytes == 4 * 1024 * 1024);
+
+    // The figure docs/mcp-server.md publishes as "~3.27 MiB decoded, about 18%
+    // headroom". Pinned because that number is what the next person reads to
+    // decide whether ANOTHER widening is safe — it was stale for exactly one
+    // review round after the 8 KiB -> 64 KiB params change, overstating the
+    // remaining room by ~3.5x in the unsafe direction.
+    INFO("docs/mcp-server.md publishes '~3.27 MiB decoded, about 18% headroom' - "
+         "recompute both from this constant and update the doc before changing this CHECK");
+    CHECK(kExecInstrWorstCaseBody == 3'426'080);
+    const double headroom_pct =
+        100.0 * static_cast<double>(kMcpMaxRequestBodyBytes - kExecInstrWorstCaseBody) /
+        static_cast<double>(kMcpMaxRequestBodyBytes);
+    CHECK(headroom_pct == Catch::Approx(18.3).margin(0.5));
+
+    // The cap is DELIBERATELY below what execute_bundle's own validator
+    // accepts, and that clamp is the part most likely to be "fixed" by someone
+    // who reads only the assert above. One saturated step is ~2 MiB, so a
+    // 2-step bundle validate_bundle_steps would accept is refused at the
+    // transport. A stated product clamp, NOT a derivation error.
+    constexpr std::size_t kMaxBundleBody = kMaxBundleSteps * kOneSaturatedBundleStep;
+    CHECK(kMaxBundleBody > kMcpMaxRequestBodyBytes);
+
+    // server.cpp pre-seeds from kExecInstrBoundReasons, so THAT copy cannot
+    // drift. docs/user-manual/metrics.md is a third copy that can - pin the
+    // size so adding a reason without documenting it fails here rather than
+    // shipping an undocumented label.
+    INFO("adding a reason? update docs/user-manual/metrics.md and this count");
+    CHECK(kExecInstrBoundReasons.size() == 13);
+}
+
+// ── 26d. Schema <-> handler-constant cross-check (#2437) ─────────────────
+//
+// The comments say "one contract in two places". This is the check that makes
+// that true: it reads the SERVED execute_instruction schema back out and
+// asserts every bound literal equals the constant the handler enforces. Bump
+// one without the other and this fails, instead of the gap reopening silently.
+// Same discipline as validate_tool_security_registration boot-failing on table
+// disagreement — the project's established answer to this drift class.
+TEST_CASE("execute_instruction schema bounds equal the handler constants", "[mcp][bounds]") {
+    using namespace yuzu::server::mcp;
+
+    std::string schema_json;
+    for (const auto& row : input_schemas_for_test()) {
+        if (row.name == "execute_instruction") {
+            schema_json = row.schema_json;
+            break;
+        }
+    }
+    REQUIRE_FALSE(schema_json.empty());
+    auto schema = nlohmann::json::parse(schema_json);
+    auto& props = schema.at("properties");
+
+    CHECK(props.at("plugin").at("maxLength").get<std::size_t>() == kExecInstrIdentMaxLen);
+    CHECK(props.at("action").at("maxLength").get<std::size_t>() == kExecInstrIdentMaxLen);
+    CHECK(props.at("scope").at("maxLength").get<std::size_t>() == kExecInstrScopeMaxLen);
+    CHECK(props.at("params").at("additionalProperties").at("maxLength").get<std::size_t>() ==
+          kExecInstrParamValueMaxLen);
+    CHECK(props.at("agent_ids").at("maxItems").get<std::size_t>() == kExecInstrAgentIdsMaxItems);
+    // minItems IS expressible in the closed subset (execute_bundle uses it), so
+    // the empty-target rule is PUBLISHED rather than hidden: discoverable in
+    // tools/list, and enforced pre-mint by C8 for free on the gated path. The
+    // handler keeps its own check for the ungated tiers, which never reach C8.
+    CHECK(props.at("agent_ids").at("minItems").get<std::size_t>() == 1);
+    CHECK(props.at("agent_ids").at("items").at("maxLength").get<std::size_t>() ==
+          kExecInstrIdentMaxLen);
+
+    // The two bounds the closed subset cannot express have NO schema twin —
+    // asserted as absent so that if the catalogue ever gains maxProperties /
+    // propertyNames (#2444), this test fails and forces the twin to be added
+    // here rather than the schema quietly diverging.
+    CHECK_FALSE(schema.contains("maxProperties"));
+    CHECK_FALSE(props.at("params").contains("maxProperties"));
+    CHECK_FALSE(props.at("params").contains("propertyNames"));
+}
+
 // ── 27. Zero agents reached ──────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction zero agents reached",
@@ -5570,6 +5971,102 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
     sqlite3_close(raw);
 }
 
+// ── Gate 8 round 2: the schema-inexpressible rules must not burn a ticket ──
+//
+// The whole point of check_exec_instruction_shape running INSIDE the C8 block.
+// A rule the served schema cannot express (params count/key length, empty or
+// type-confused targeting) is invisible to C8's schema validation, so a
+// handler-only check would mint a ticket, spend a human's approval, CONSUME
+// it, and only then refuse. This session reintroduced that burn twice by
+// adding a check at the handler and forgetting the gate; this test is what
+// makes the third time fail loudly.
+TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticket",
+          "[mcp][integration][approval][bounds]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    int dispatch_calls = 0;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
+        ++dispatch_calls;
+        return {"cmd-abc", 1};
+    };
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    // supervised: execute_instruction IS approval-gated here, so a violation
+    // that slipped past C8 would cost a real ticket.
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto call_with = [&](const std::string& args_json) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":264,"params":{"name":)"
+                       R"("execute_instruction","arguments":)" + args_json + "}}");
+    };
+
+    SECTION("supplied-but-empty agent_ids is refused BEFORE a ticket is minted") {
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":[]})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("error"));
+        // -32602, NOT -32006 kApprovalRequired: no ticket was created at all.
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.pending_count() == 0);
+        CHECK(appr.query({}).empty());
+        CHECK(dispatch_calls == 0);
+    }
+    SECTION("too many params is refused BEFORE a ticket is minted") {
+        std::string params = "{";
+        for (int i = 0; i < 33; ++i)
+            params += (i ? "," : "") + ("\"k" + std::to_string(i) + "\":\"v\"");
+        params += "}";
+        auto res = call_with(R"({"plugin":"os_info","action":"version","params":)" + params + "}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.query({}).empty());
+    }
+    SECTION("a VALID supervised call still mints a ticket (guard is not over-broad)") {
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":["a1"]})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+        CHECK(appr.pending_count() == 1);
+    }
+    SECTION("empty plugin/action is refused BEFORE a ticket is minted") {
+        // Sol's find, and the FIFTH instance of the burn class: the schema
+        // marks plugin/action `required` (which C8 enforces) but the closed
+        // subset has no minLength, so "" passes every published check and the
+        // handler refused it only after the ticket had been consumed.
+        auto res = call_with(R"({"plugin":"","action":""})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        INFO(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.query({}).empty());
+        CHECK(dispatch_calls == 0);
+    }
+}
+
 // Governance qa-SHOULD-1: a ticket minted for one tool must not authorize a
 // DIFFERENT tool — the `definition_id = "mcp." + tool_name` binding is the
 // privilege-escalation guard. Mint for delete_tag, present the (approved) id to
@@ -6402,7 +6899,16 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
     {
         yuzu::server::ApprovalManager appr(raw);
         appr.create_tables();
+        // Declared BEFORE `ts` so the server tears down before the registry it
+        // borrows. Wired because this is the ONLY test that reaches the C8
+        // block: without it `metrics` is null there and `count_denial` runs
+        // just its early return, so the gate's two counter increments — the
+        // ones whose whole purpose is to make a pre-mint denial visible —
+        // would have no coverage at all. The operator-tier bounds test
+        // exercises the HANDLER's `too_large`, a different site.
+        yuzu::MetricsRegistry reg;
         McpTestServer ts;
+        ts.metrics_for_test = &reg;
         ts.approval_manager_for_test = &appr;
         ts.start("supervised");
 
@@ -6428,6 +6934,17 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
                  .c_str(),
              "'/token_id'");
         CHECK(appr.pending_count() == 0);
+        // The C8 gate's #2405 counter: the three schema denials above all went
+        // through `count_denial`. No `reason` label on this family.
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                          {{"tool", "create_engine_principal"}})
+                  .value() == 1.0);
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                          {{"tool", "mint_engine_credential"}})
+                  .value() == 1.0);
+        CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                          {{"tool", "confirm_engine_rotation"}})
+                  .value() == 1.0);
 
         // A REALISTIC (non-minimal) execute_instruction payload — scope +
         // agent_ids + string params — passes validation and mints (-32006).
@@ -6497,6 +7014,67 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         CHECK(over_agents["error"]["message"].get<std::string>().find("'/agent_ids'") !=
               std::string::npos);
         CHECK(appr.pending_count() == 1); // still only the one valid mint
+
+        // #2437: the two bounds the CLOSED subset CANNOT express — params key
+        // COUNT and params key LENGTH. Every denial above came from the schema
+        // compiler; these two come from check_exec_instruction_shape running in
+        // the C8 block, and they are the whole reason it is called there rather
+        // than in the handler alone. A client cannot avoid them by reading
+        // tools/list (neither bound is publishable in the subset), so a
+        // handler-only check would mint a ticket, spend a human's approval,
+        // consume the one-time ticket and only THEN fail. pending_count()
+        // unchanged is the assertion that matters; the message is secondary.
+        std::string many_params =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":328,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{)";
+        for (int i = 0; i < 33; ++i) { // cap is 32
+            if (i)
+                many_params += ',';
+            many_params += R"("k)" + std::to_string(i) + R"(":"v")";
+        }
+        many_params += "}}}}";
+        auto over_params = nlohmann::json::parse(ts.call(many_params)->body);
+        REQUIRE(over_params.contains("error"));
+        CHECK(over_params["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_params["error"]["message"].get<std::string>().find("at most 32 keys") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // NOT minted — the point of the C8 placement
+        // Counted at the GATE, under the same closed reason set the handler
+        // uses. A pre-mint denial invisible to metrics is how an operator ends
+        // up unable to see a client burning itself on a bound.
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "execute_instruction"}, {"reason", "param_count"}})
+                  .value() == 1.0);
+
+        const std::string long_key(yuzu::server::mcp::kExecInstrParamKeyMaxLen + 1, 'k');
+        auto over_key = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":329,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{")" +
+                  long_key + R"(":"v"}}}})")
+                ->body);
+        REQUIRE(over_key.contains("error"));
+        CHECK(over_key["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(over_key["error"]["message"].get<std::string>().find("exceeds 256 bytes") !=
+              std::string::npos);
+        CHECK(appr.pending_count() == 1); // still not minted
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "execute_instruction"}, {"reason", "param_key_len"}})
+                  .value() == 1.0);
+
+        // And the boundary ACCEPTS: exactly-at-cap key count mints normally.
+        // Without this an off-by-one (>= for >) would pass every rejection case
+        // above and quietly refuse legitimate maximal calls.
+        std::string at_cap =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":330,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{)";
+        for (int i = 0; i < 32; ++i) {
+            if (i)
+                at_cap += ',';
+            at_cap += R"("k)" + std::to_string(i) + R"(":"v")";
+        }
+        at_cap += "}}}}";
+        auto at_cap_res = nlohmann::json::parse(ts.call(at_cap)->body);
+        REQUIRE(at_cap_res.contains("error"));
+        CHECK(at_cap_res["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+        CHECK(appr.pending_count() == 2); // minted, so the bound is > not >=
     }
     sqlite3_close(raw);
 }

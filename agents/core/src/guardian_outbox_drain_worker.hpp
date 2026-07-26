@@ -197,6 +197,20 @@ struct GuardianMaintenanceResult {
     std::size_t skipped_already_sent{0};
     /// The sent-label scan failed and the pass fell back to re-offering everything.
     bool sent_scan_failed{false};
+    /// THE page-side gate signal (#2452 Gate 7): the pass placed records or positively verified a
+    /// clean idle backlog (JournalPageStats::progress_or_verified_idle). False on EVERY no-work
+    /// exit - deferred, sent-scan/candidate/value read failure, boot-prune barrier, headroom-
+    /// blocked, quarantine-only, null-kv, a stopping_ bail - so the drain worker's page success
+    /// stamp advances iff this is true (mirrors the prune side gating on prune_progress_or_verified).
+    bool progress_or_verified_idle{false};
+    /// A prune pass was requested and ran (mirrors page_attempted for the retention side).
+    bool prune_attempted{false};
+    /// THE prune-side gate signal (JournalPruneStats::progress_or_verified, #2452 Gate 8): retention
+    /// was applied or verified idle. False on every no-work prune exit - scan failure, delete
+    /// failure, and any stop before the delete - so the prune success stamp advances only on this
+    /// (the prune-side mirror of progress_or_verified_idle; closes UP-7 delete-fail + UP8-3
+    /// stop-abort that gating on read_ok alone left open).
+    bool prune_progress_or_verified{false};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {
@@ -294,24 +308,34 @@ public:
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
     }
 
-    /// steady_clock ms of the last PAGE maintenance pass that ran without throwing, seeded
-    /// non-zero at start() (flip item 6 / item 14). 0 means start() has not run - the reader
-    /// treats that as "no worker", not as an age. The cadence locals in loop() advance even
-    /// when a pass throws (deliberate min-GAP pacing); these advance ONLY on a non-throwing
-    /// pass, so a dead thread or a permanently-throwing pass reads as an ever-growing age on
-    /// the heartbeat. A deferred-no-token or read-failed pass still counts: it returned, so
-    /// the LOOP is alive - this is a liveness gauge, not a throughput gauge. KNOWN BLIND
-    /// SPOT (governance UP-4): read failures have their own counter
-    /// (page_read_failures), but a PERMANENTLY token-starved worker does not - deferred
-    /// passes stamp "fresh" here while zero replay happens, and deferred_no_token is
-    /// per-pass state with no cumulative counter or heartbeat tag. A starvation counter is
-    /// tracked as a follow-up; until it lands, do not cite this gauge as evidence replay is
-    /// making progress. Lock-free.
+    /// steady_clock ms of the last PAGE maintenance pass that made REPLAY PROGRESS or positively
+    /// established there was none, seeded non-zero at start() (flip item 6 / item 14). 0 means
+    /// start() has not run - the reader treats that as "no worker", not as an age. The cadence
+    /// locals in loop() advance even when a pass throws (deliberate min-GAP pacing); this stamp
+    /// advances only on a pass that did not throw, was not stop-aborted, AND either PLACED records
+    /// (records_paged > 0 - demonstrable progress, so a stray same-pass read failure does not make
+    /// it stale) or cleanly established there was nothing to page (not deferred_no_token, not
+    /// sent_scan_failed, and not read_failed - the candidate scan, a candidate value read, or the
+    /// boot-prune barrier's scan failing). So a dead thread, a permanently-throwing pass, a
+    /// permanently token-starved worker, or one whose reads permanently fail (INCLUDING a
+    /// journal-read failure from boot that keeps the boot-prune barrier from latching) all read as
+    /// an ever-growing age on the heartbeat. This CLOSES the former UP-4/UP-11 blind spot (#2452):
+    /// a deferred or read-failed pass used to stamp "fresh" here while zero replay happened, so the
+    /// gauge is now a replay-progress-or-verified-idle signal, not merely a loop-liveness one. Read
+    /// failures also keep their own counter (page_read_failures), except the boot-barrier case
+    /// which is counted on prune_failures. Lock-free.
     [[nodiscard]] std::uint64_t last_page_success_steady_ms() const noexcept {
         return last_page_success_steady_ms_.load(std::memory_order_relaxed);
     }
     /// PRUNE sibling of last_page_success_steady_ms() - separate because the two passes run
-    /// on different cadences (30 s page / 120 s prune) and stall independently.
+    /// on different cadences (30 s page / 120 s prune) and stall independently. Advances only on a
+    /// prune that genuinely RAN retention: it did not throw, a stop did not abort it, and it applied
+    /// the delete OR verified nothing was eligible (JournalPruneStats::progress_or_verified, the
+    /// prune-side mirror of the page stamp's positive flag). A prune whose scan fails, whose DELETE
+    /// fails, or that a stop aborts before the delete returns without throwing, so gating on "did
+    /// not throw" (or on scan-only read_ok) would read a stalled retention loop as fresh (#2452
+    /// Gate 8, closing UP-7 delete-fail + UP8-3 stop-abort). A forward-clock-jump wipe still advances
+    /// it (the delete DID succeed - the L5 clock-guard #2360/#2361 owns that, not this gauge).
     [[nodiscard]] std::uint64_t last_prune_success_steady_ms() const noexcept {
         return last_prune_success_steady_ms_.load(std::memory_order_relaxed);
     }

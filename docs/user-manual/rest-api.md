@@ -6259,7 +6259,9 @@ curl -N -H "Authorization: Bearer $TOKEN" \
 ```
 
 Every error body carries the A4 envelope (`correlation_id`, nullable `retry_after_ms`,
-`remediation`). Streams end with a final `stream-closed` frame naming the reason.
+`remediation`). Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+(a normal `message` on the stream, not a bespoke `event: stream-closed` frame) whose `params`
+name the reason in that same A4 shape.
 
 #### `DELETE /mcp/v1/`
 

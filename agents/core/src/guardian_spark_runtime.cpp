@@ -761,7 +761,20 @@ std::size_t GuardianSparkRuntime::lifecycle_headroom() const {
 std::unordered_set<std::string> GuardianSparkRuntime::lifecycle_event_ids() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     const auto present = lifecycle_log_.event_id_set(); // borrowed views, valid under the lock
-    return std::unordered_set<std::string>(present.begin(), present.end());
+    // Materialise element-by-element rather than via the iterator-range ctor (#2484).
+    // The range ctor routes through libstdc++'s `_Hashtable::_S_forward_key`, which on
+    // libstdc++ 13 forwards the source key type instead of converting it — so building an
+    // unordered_set<string> from string_view iterators is a hard compile error there
+    // (hashtable.h:890, "could not convert ... basic_string_view<char> ... to
+    // basic_string<char>"). GCC 14+ accepts it, which is why only the ubuntu-24.04 canary
+    // leg — the sole leg on the distro's system GCC 13 — caught it. CLAUDE.md declares
+    // GCC 13+ as a supported compiler, so this must build there. Same explicit-emplace
+    // idiom the sibling `want` set above already uses.
+    std::unordered_set<std::string> out;
+    out.reserve(present.size());
+    for (const std::string_view sv : present)
+        out.emplace(sv);
+    return out;
 }
 
 std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const OutboxEntry&)>& send) {

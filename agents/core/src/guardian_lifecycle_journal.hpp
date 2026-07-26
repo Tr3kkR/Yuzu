@@ -127,6 +127,31 @@ struct JournalPageStats {
     /// re-offering everything. Counted because that fallback is invisible otherwise: an agent
     /// whose scan fails every pass silently returns to the old redelivery floor (#2345 Gate 8).
     bool sent_scan_failed{false};
+    /// This pass could not read/establish replay state: the candidate scan failed, a considered
+    /// candidate's VALUE read failed, or the boot-prune barrier's own scan failed (the last
+    /// increments prune_failures_, not page_read_failures_, so it carries no counter signal of its
+    /// own). Distinct from deferred_no_token (no token) and sent_scan_failed (fell back but could
+    /// still page): a read_failed pass did NO verifiable replay work, so the drain worker's page
+    /// success stamp must not read it as fresh unless the pass also placed records (#2452).
+    bool read_failed{false};
+    /// THE authoritative "this pass is healthy replay evidence" signal the page success stamp
+    /// gates on (#2452 governance Gate 7). Defaults false and is set true at EXACTLY ONE place -
+    /// the successful tail of page_into_window - iff the pass either placed records
+    /// (records_paged > 0) OR considered every candidate it reached this pass and found nothing
+    /// that needed or could be paged, with nothing left blocked (headroom), quarantined,
+    /// read-failed, or sent-scan-degraded. "Considered this pass" is per-SLICE, not whole-backlog:
+    /// the consideration loop is capped at kJournalPageMaxBatchesPerPass, so on a large journal a
+    /// clean slice reads verified-idle while an unexamined tail could still be blocked/corrupt -
+    /// bounded and self-correcting, because the fair-rotation cursor reaches that tail within
+    /// ceil(N/cap) passes (whereupon headroom/quarantine flip it stale). Requiring whole-backlog
+    /// coverage would instead read a large fully-delivered journal permanently STALE, since no
+    /// single pass ever considers more than the cap. Every early return (null-kv, a stopping_ bail,
+    /// deferred_no_token, the boot-prune barrier, a candidate scan failure) leaves it false by
+    /// construction, so a NEW no-progress exit cannot advance the stamp by forgetting to opt out -
+    /// the failure mode the earlier per-cause negative enumeration kept hitting (headroom-blocked,
+    /// quarantine-only). This is the page-side mirror of the prune stamp's positive
+    /// JournalPruneStats::progress_or_verified.
+    bool progress_or_verified_idle{false};
 };
 
 /// A batch persist() durably wrote, for back-filling window-entry provenance (review M3): the
@@ -146,6 +171,15 @@ struct JournalPruneStats {
                                    ///< aside this pass. A corrupt VALUE is quarantined by
                                    ///< the REPLAY pass instead (#2299), not counted here.
     std::size_t sent_labels_gc{0}; ///< orphaned/evicted sent-labels removed this pass
+    /// THE prune-side gate signal (#2452 Gate 8), mirroring the page stamp's
+    /// progress_or_verified_idle. True iff retention was APPLIED (the delete succeeded) or VERIFIED
+    /// IDLE (nothing eligible to evict). Default false; set true only after the eviction block, so
+    /// a scan failure (read_ok false), a delete failure (returns early, prune_failures), and any
+    /// stop BEFORE the delete all leave it false - the drain worker's prune success stamp advances
+    /// only on this, closing the "reads fresh while retention did not run" holes (UP-7 delete-fail,
+    /// UP8-3 stop-abort) that gating on read_ok alone left open. read_ok is retained separately: it
+    /// still gates the boot-prune barrier (M5), which needs only "the scan succeeded".
+    bool progress_or_verified{false};
 };
 
 class YUZU_EXPORT GuardianLifecycleJournal {
