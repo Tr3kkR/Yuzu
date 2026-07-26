@@ -812,8 +812,18 @@ this path - the retention guard is correct without its index, only slower.
 Cost on a large existing `audit_events`: a one-time build at first boot after
 upgrade, measured at ~81 MB and ~1.8-3.3 s at 5M rows on NVMe. At 50M rows the
 build reads a ~16 GB table - tens of seconds on local NVMe, and potentially
-minutes on container overlayfs or network storage, so a large first
-post-upgrade boot may need a raised orchestrator `startupProbe` window. The
+minutes on container overlayfs or network storage.
+
+**This runs synchronously, before the server binds its listeners**, so nothing
+answers `/livez` or `/readyz` until it finishes. If your orchestrator's
+kill-before-ready budget is shorter than the build you get a CRASH LOOP rather
+than a slow boot: `CREATE INDEX` is one atomic statement, so every killed attempt
+rolls back and the next boot re-pays it in full, indefinitely. Budget at least
+**5 minutes** before the first liveness kill for an `audit_events` above ~20M
+rows on non-NVMe storage. The shipped
+`deploy/docker/docker-compose.reference.yml` sets `start_period: 30s`, which is
+fine for a fresh install and NOT enough for a large first post-upgrade boot -
+raise it before upgrading such a deployment. The
 elapsed time is logged when it exceeds a second, and subsequent boots are a
 no-op. If the build fails, retention still runs, but each pass then scans the
 table AND sorts the whole expired backlog for its `ORDER BY ... LIMIT` (measured
@@ -874,9 +884,12 @@ consequences on upgrade:
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
 
-Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
+Six new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
 declined-pass and failed-pass counters must be alerted on separately: both leave
 rows undeleted, so an audit table that never shrinks looks identical either way.
+One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
+state in which none of the other five can fire, because they all key on a counter
+rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 

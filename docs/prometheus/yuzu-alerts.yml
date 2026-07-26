@@ -461,7 +461,7 @@ groups:
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
             uptime history before concluding the clock is at fault. Nothing was deleted;
             retention resumes automatically, paced at the per-pass cap.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The counterpart signal. Both a declined pass and a broken pass leave rows
       # undeleted, so an audit table that never shrinks looks identical either
@@ -484,7 +484,7 @@ groups:
             in this state - it reflects only whether the database is OPEN, and a pass
             failing on a SQLite fault leaves it open. Surfacing retention health there
             is tracked in #2509.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The per-pass delete cap is what turns an allowed wipe into a paced drain,
       # but it introduces its own failure: if it binds on every pass, expiry is
@@ -511,7 +511,7 @@ groups:
             pass) is below this fleet's audit volume, so audit.db grows without bound;
             the cap is a compile-time constant today, so this needs an engineering
             escalation rather than a config change.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The docs tell operators to alert on this gauge; ship the rule so that
       # instruction is not a dead letter. A failed index build turns the pass's
@@ -533,7 +533,7 @@ groups:
             and that cost grows with the table. Check the server log for "could not create
             idx_audit_ttl_id" and for a migration failure. NOTE this gauge is evaluated
             once at startup, so it does not detect an index dropped while the server runs.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # THE ABSENCE ALERT. Every other rule in this group fires on a counter
       # RISING; none of them fires when the cleanup thread simply never runs
@@ -562,7 +562,7 @@ groups:
             "AuditStore: retention pass threw", confirm the store opened at boot
             (a failed migration closes it and start_cleanup() then early-returns), and
             check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
@@ -580,7 +580,7 @@ groups:
             Detection still works within this process, but will not survive a restart --
             a server that reboots with a wrong clock would then see no elapsed-time step.
             Usually a disk or permissions problem on the audit database.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded

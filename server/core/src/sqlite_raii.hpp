@@ -113,7 +113,10 @@ public:
     }
 
     /// Address for `sqlite3_exec(db, sql, nullptr, nullptr, msg.addr())`.
-    char** addr() noexcept { return &m_; }
+    char** addr() noexcept {
+        reset(); // reusing a live owner would otherwise leak the old message
+        return &m_;
+    }
 
     /// Never null. SQLite leaves the out-param untouched on success and does not
     /// set it on every failure path either, so callers get a usable string
@@ -163,13 +166,23 @@ public:
     /// Address for `sqlite3_open_v2(path, db.addr(), flags, nullptr)`. SQLite
     /// may allocate the handle even when the open FAILS, which is exactly why it
     /// wants an owner from the first call rather than after the error check.
-    sqlite3** addr() noexcept { return &db_; }
+    sqlite3** addr() noexcept {
+        close(); // re-opening through a live owner would otherwise leak it
+        return &db_;
+    }
     sqlite3* get() const noexcept { return db_; }
     explicit operator bool() const noexcept { return db_ != nullptr; }
 
+    /// close_v2, NOT close. `sqlite3_close` returns SQLITE_BUSY and does NOT
+    /// close when any statement is still outstanding -- so nulling the member
+    /// after it would leak the connection and its WAL/SHM files while this owner
+    /// reported success, which is precisely the leak this class exists to stop.
+    /// close_v2 marks the connection zombie and closes it when the last
+    /// statement finalizes. Reachable: a store method holding a raw
+    /// `sqlite3_stmt*` across an allocating loop can unwind past its finalize.
     void close() noexcept {
         if (db_) {
-            sqlite3_close(db_);
+            sqlite3_close_v2(db_);
             db_ = nullptr;
         }
     }

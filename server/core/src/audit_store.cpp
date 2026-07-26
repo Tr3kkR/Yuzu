@@ -467,6 +467,15 @@ std::expected<bool, std::string> exists_probe(sqlite3* db, const char* sql,
 } // namespace
 
 std::size_t AuditStore::cleanup_once(std::int64_t now) {
+    // Liveness, stamped for EVERY pass -- including the implausible-`now`
+    // refusal below, declines, and failures. The documented contract is "passes
+    // ATTEMPTED"; a reaper that runs and refuses is healthy, a reaper that never
+    // runs is the failure these two exist to expose, and no other counter moves
+    // in that state. Stamped BEFORE any return so no branch can make the
+    // liveness signal lie.
+    retention_passes_.fetch_add(1, std::memory_order_relaxed);
+    last_pass_unixtime_.store(now, std::memory_order_relaxed);
+
     // Sanitise the CALLER's clock, not only the stored reading. In production
     // `run_cleanup` passes `system_clock` seconds, but this method is public and
     // `now + window + kAuditTtlFutureSlackSec` below is signed-overflow UB for a
@@ -507,13 +516,6 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     std::size_t deleted = 0;
     std::int64_t emit_delta = 0, emit_window = 0;
     bool emit_full_wipe = false, emit_capped = false;
-
-    // Liveness, stamped for EVERY pass that gets this far -- declined, failed or
-    // successful. A reaper that runs and declines is healthy; a reaper that never
-    // runs is the failure these two exist to expose, and no other counter moves
-    // in that state.
-    retention_passes_.fetch_add(1, std::memory_order_relaxed);
-    last_pass_unixtime_.store(now, std::memory_order_relaxed);
 
     {
         std::unique_lock lock(mtx_);
@@ -852,15 +854,29 @@ void AuditStore::run_cleanup() {
         // formats log lines, so the surface is real (#2037 class).
         try {
             cleanup_once(now);
-        } catch (const std::exception& e) {
-            cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-            spdlog::error("AuditStore: retention pass threw ({}); abandoned, retried at the next "
-                          "interval",
-                          e.what());
         } catch (...) {
+            // The counter first, and unconditionally: it is the part that must
+            // survive. REPORTING the failure allocates (spdlog formats), so a
+            // bad_alloc in the handler would escape this thread function and
+            // terminate the server -- the exact condition the handler exists to
+            // prevent. The report is therefore nested and everything is
+            // swallowed: a pass that failed AND could not say so still leaves
+            // `cleanup_failed_` moving, which is what the alert keys on.
             cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-            spdlog::error("AuditStore: retention pass threw a non-std exception; abandoned, "
-                          "retried at the next interval");
+            try {
+                try {
+                    throw;
+                } catch (const std::exception& e) {
+                    spdlog::error("AuditStore: retention pass threw ({}); abandoned, retried at "
+                                  "the next interval",
+                                  e.what());
+                } catch (...) {
+                    spdlog::error("AuditStore: retention pass threw a non-std exception; "
+                                  "abandoned, retried at the next interval");
+                }
+            } catch (...) {
+                // Nothing escapes a thread function, not even a failure to report.
+            }
         }
     }
 }

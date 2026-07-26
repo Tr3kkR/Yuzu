@@ -400,6 +400,23 @@ guard's survivor horizon, which is derived from the current window -- so after a
 reduction (and a restart, per issue #483) the older long-TTL rows stop counting
 as survivors, and a single declined pass becomes more likely.
 
+**`/healthz` does not report retention health.** `stores.audit` reflects only
+whether the database is OPEN, so it reads healthy while retention is failing,
+not running, or running without its index. Alert on the metrics above rather
+than on the health probe for this (tracked in #2509).
+
+**A backward clock excursion is the one case the guard cannot help with.** Rows
+written while the clock was behind (a dead CMOS reporting 1970, before NTP
+corrects) are stamped with an already-past TTL, so once the clock is correct they
+are the OLDEST rows in the table and the first the paced delete takes -- at
+`info` level, indistinguishable from routine ageing-out. That is precisely the
+window an auditor asks about first, because it covers a host fault. If you know a
+server ran with a backward-skewed clock, export the affected range before the
+next cleanup interval; nothing in the guard will hold it for you. The mirror case
+is that rows written while the clock was AHEAD sit permanently beyond the datable
+horizon: never deleted, never reported, and retained past the stated window
+(tracked in #2510).
+
 **What this does and does not promise.** The cap is the half that always
 applies: it bounds the damage of any allowed wipe unconditionally. The two
 detectors are best-effort, and the outcome test has a known blind spot --- it is
@@ -409,9 +426,11 @@ case, which is why the elapsed-time reading is persisted across restarts. Taken
 together the guard converts an instantaneous wipe into a paced one plus an
 operator signal; it does not guarantee every clock anomaly is detected.
 
-Six metrics report on this. All but `rows_deleted_total` ship with an alert rule
-in `docs/prometheus/yuzu-alerts.yml`; that one is a rate to read alongside the
-others, not an alert on its own. Do not collapse the first two:
+Eight metrics report on this. All but `rows_deleted_total` and
+`retention_last_pass_unixtime` ship with an alert rule in
+`docs/prometheus/yuzu-alerts.yml`; those two are read alongside the others
+(is the backlog moving? when did the reaper last run?) rather than alerted on
+directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|

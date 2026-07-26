@@ -7,6 +7,7 @@
  */
 
 #include "audit_store.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -20,6 +21,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <limits>
 #include <vector>
 
 using namespace yuzu::server;
@@ -433,19 +435,21 @@ namespace {
 // follow-on "database is locked" flake. `sqlite3_open` allocates the handle even
 // when it fails, so the owner takes it from the first call.
 struct RawConn {
+    // The handle is owned from the FIRST call, not after the check: `sqlite3_open`
+    // allocates even when it fails, and the `REQUIRE` below throws, so a bare
+    // pointer member would leak on constructor unwind -- the same bug class this
+    // helper exists to fix, one level up.
+    SqliteDb owner;
     sqlite3* db{nullptr};
     explicit RawConn(const std::filesystem::path& path) {
-        const int rc = sqlite3_open(path.string().c_str(), &db);
+        const int rc = sqlite3_open(path.string().c_str(), owner.addr());
+        db = owner.get();
         REQUIRE(rc == SQLITE_OK);
         sqlite3_exec(db, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     }
-    // close_v2, not close: a statement left unfinalized by a throwing REQUIRE
-    // makes plain close() return SQLITE_BUSY and NOT close, which would defeat
-    // the point. close_v2 defers the close until the last statement finalizes.
-    ~RawConn() {
-        if (db)
-            sqlite3_close_v2(db);
-    }
+    // No destructor: `owner` closes (via close_v2, which is what makes an
+    // outstanding statement from a throwing REQUIRE safe).
+    ~RawConn() = default;
     RawConn(const RawConn&) = delete;
     RawConn& operator=(const RawConn&) = delete;
 };
@@ -453,23 +457,29 @@ struct RawConn {
 void seed_rows_with_ttl(const std::filesystem::path& path, std::int64_t ttl, int count) {
     RawConn c{path};
     REQUIRE(sqlite3_exec(c.db, "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_stmt* stmt = nullptr;
+    // Guard declared BEFORE the statement so the statement finalizes first --
+    // SQLite wants live statements gone before ROLLBACK. Without both owners a
+    // throwing REQUIRE below leaves an open transaction AND a live statement, and
+    // close_v2 then defers the connection close forever (zombie), so the second
+    // writable connection against the file under test never goes away.
+    SqliteTxn txn{c.db};
+    SqliteStmt stmt;
     REQUIRE(sqlite3_prepare_v2(c.db,
                                "INSERT INTO audit_events (timestamp, principal, principal_role, "
                                "action, result, ttl_expires_at) VALUES (?,?,?,?,?,?)",
-                               -1, &stmt, nullptr) == SQLITE_OK);
+                               -1, stmt.addr(), nullptr) == SQLITE_OK);
     for (int i = 0; i < count; ++i) {
-        sqlite3_reset(stmt);
-        sqlite3_bind_int64(stmt, 1, ttl);
-        sqlite3_bind_text(stmt, 2, "admin", -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 3, "admin", -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 4, "auth.login", -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 5, "success", -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 6, ttl);
-        REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_reset(stmt.get());
+        sqlite3_bind_int64(stmt.get(), 1, ttl);
+        sqlite3_bind_text(stmt.get(), 2, "admin", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 3, "admin", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 4, "auth.login", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt.get(), 5, "success", -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt.get(), 6, ttl);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
     }
-    sqlite3_finalize(stmt);
-    REQUIRE(sqlite3_exec(c.db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
+    stmt.reset(); // finalize before COMMIT
+    REQUIRE(txn.commit() == SQLITE_OK);
 }
 
 // Run arbitrary SQL through a second connection (used to remove a survivor row
@@ -973,14 +983,13 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     };
     auto stored_reading = [&]() -> std::int64_t {
         RawConn c{tmp.path};
-        sqlite3_stmt* st = nullptr;
+        SqliteStmt st;
         REQUIRE(sqlite3_prepare_v2(c.db,
                                    "SELECT value FROM audit_retention_meta WHERE key='last_pass_now'",
-                                   -1, &st, nullptr) == SQLITE_OK);
+                                   -1, st.addr(), nullptr) == SQLITE_OK);
         std::int64_t v = -1;
-        if (sqlite3_step(st) == SQLITE_ROW)
-            v = sqlite3_column_int64(st, 0);
-        sqlite3_finalize(st);
+        if (sqlite3_step(st.get()) == SQLITE_ROW)
+            v = sqlite3_column_int64(st.get(), 0);
         return v;
     };
 
@@ -1337,4 +1346,27 @@ TEST_CASE("AuditStore #2360: liveness counters move on declined and failed passe
     CHECK(f.store.cleanup_failed_count() == 1);
     CHECK(f.store.retention_passes_count() == 2);
     CHECK(f.store.last_pass_unixtime() == kNow + 1);
+}
+
+TEST_CASE("AuditStore #2360: an implausible caller clock is refused before any arithmetic",
+          "[audit_store][retention][clock-guard]") {
+    // `cleanup_once` is public, and `now + window + slack` is signed-overflow UB
+    // for a `now` near INT64_MAX. Without this case the guard is mutation-inert
+    // and UBSan never reaches the overflow. Run under UBSan.
+    GuardFixture f;
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1);
+
+    CHECK(f.store.cleanup_once(std::numeric_limits<std::int64_t>::max()) == 0);
+    CHECK(f.store.total_count() == 6);          // nothing deleted
+    CHECK(f.store.cleanup_failed_count() == 1); // counted, not silent
+    // Refusing is still a pass that RAN, so liveness must move -- the contract is
+    // "attempted", and a refusal that looked like a dead reaper would be worse.
+    CHECK(f.store.retention_passes_count() == 1);
+
+    // And a NEGATIVE now is admitted: that is the dead-CMOS-1969 case the whole
+    // guard exists for, and it cannot underflow anything.
+    CHECK(f.store.cleanup_once(-86'400) == 0);
+    CHECK(f.store.cleanup_failed_count() == 1); // unchanged -- not a refusal
+    CHECK(f.store.retention_passes_count() == 2);
 }
