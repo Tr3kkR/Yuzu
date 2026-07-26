@@ -19,6 +19,8 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include <nlohmann/json.hpp> // parse the JSON-RPC-wrapped close frame (2f PR 3b)
+
 #include <atomic>
 #include <chrono>
 #include <future> // the two-thread handshake test parks the pump on another thread
@@ -130,6 +132,31 @@ TEST_CASE("StreamBudget: the per-principal map is bounded by LIVE principals",
     // for 50 principals that have long since disconnected.
     CHECK(budget.active() == 0);
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "principal-7") == 0);
+}
+
+TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principal cap does not "
+          "ration the GET surface, and vice versa (2f PR 3b)",
+          "[mcp][stream][ch5][2f]") {
+    // The metric label for the new streamed-POST surface.
+    CHECK(std::string(detail::to_string(detail::SseSurface::kMcpPost)) == "mcp_post");
+
+    detail::StreamBudget budget{{.global_cap = 100}};
+    // Fill alice's streamed-POST allowance to the per-principal cap.
+    std::vector<detail::StreamBudget::Lease> posts;
+    for (std::size_t i = 0; i < detail::kPerPrincipalMcpPost; ++i) {
+        auto r = budget.try_acquire(detail::SseSurface::kMcpPost, "alice", detail::kPerPrincipalMcpPost);
+        REQUIRE(r.lease);
+        posts.push_back(std::move(r.lease));
+    }
+    // One more streamed POST for alice is rejected on the per-principal cap...
+    auto over = budget.try_acquire(detail::SseSurface::kMcpPost, "alice", detail::kPerPrincipalMcpPost);
+    CHECK_FALSE(over.lease);
+    CHECK(std::string(over.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
+    // ...but her GET streams are a separate (surface, principal) key, so a GET admits.
+    auto get = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", mcp::kMcpStreamsPerPrincipalDefault);
+    CHECK(get.lease);
+    CHECK(budget.active_for(detail::SseSurface::kMcpPost, "alice") == detail::kPerPrincipalMcpPost);
+    CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
 }
 
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
@@ -257,6 +284,49 @@ TEST_CASE("McpStreamState: a bogus future cursor takes the same path as an evict
     // cannot be used to probe how many events a session has emitted.
     CHECK(state.attach_and_replay(99, nullptr, "alice").status ==
           mcp::McpStreamState::AttachStatus::kGap);
+}
+
+TEST_CASE("McpStreamState: a nonzero cursor fronting a NON-contiguous surviving suffix is a GAP, "
+          "not a silent skip over frames evicted behind a pinned final (#2435)",
+          "[mcp][stream][ch2][2f]") {
+    // A shared session ring interleaves frames from concurrent streamed POSTs: an early
+    // request's final is PINNED (eviction-exempt, Decision 15(f)) while a later request keeps
+    // publishing progress and wraps the ring, evicting the UNPINNED frames between the pinned
+    // final and the newest. The surviving suffix then has a hole the replay loop would skip.
+    mcp::McpStreamState state{/*ring_cap=*/4};
+    for (int i = 1; i <= 4; ++i)
+        state.publish("message", "p" + std::to_string(i)); // ids 1..4
+    const auto final_id = state.publish_final("message", "final-A"); // id 5, pinned
+    REQUIRE(final_id == 5);
+    for (int i = 6; i <= 10; ++i)
+        state.publish("message", "p" + std::to_string(i)); // ids 6..10
+
+    // Ring is now [5(pinned), 8, 9, 10]: 1..4 and 6,7 were evicted; 5 survives because pinned.
+    REQUIRE(state.pinned_count() == 1);
+    REQUIRE(state.is_pinned(5));
+
+    // A resume from cursor 4 would replay 5 and then JUMP to 8 — a silent Last-Event-ID gap
+    // where 6,7 used to be. #2435: that is a kGap (client re-initializes and fetches the final
+    // by execution_id), not a skip. Checked before any mutation, so a fresh state each time.
+    CHECK(state.attach_and_replay(4, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kGap);
+    // Cursor 5 (client already acked the pinned final) still fronts the 6,7 hole -> kGap.
+    CHECK(state.attach_and_replay(5, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kGap);
+    // Cursor 7 fronts a CONTIGUOUS surviving suffix (8,9,10) -> serviceable.
+    CHECK(state.attach_and_replay(7, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kAttached);
+
+    // Cursor 0 is UNAFFECTED by the contiguity gate: a fresh client explicitly takes whatever
+    // the ring still holds (no resume contract), so the hole is tolerated and it replays the
+    // whole surviving window [5, 8, 9, 10].
+    auto fresh = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(fresh.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(fresh.sink->sse->mu);
+    std::vector<std::uint64_t> ids;
+    for (const auto& ev : fresh.sink->sse->queue)
+        ids.push_back(ev.id);
+    CHECK(ids == std::vector<std::uint64_t>{5, 8, 9, 10});
 }
 
 TEST_CASE("McpStreamState: a live sink receives published frames", "[mcp][stream]") {
@@ -429,6 +499,65 @@ TEST_CASE("McpStreamPump/CH-4: a revoked credential kills the stream within one 
     // The client is TOLD why — a revoked stream must not look like a clean EOF.
     CHECK(wire.contains(R"("reason":"credential_revoked")"));
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kCredentialRevoked);
+}
+
+TEST_CASE("McpStreamPump: the close frame is a JSON-RPC-wrapped notifications/yuzu.stream_closed "
+          "under the default `message` event type, off-ring and id-less (2f PR 3b, PENDING 2)",
+          "[mcp][stream][ch4][2f]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kRevoked; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer())); // revocation closes on the first tick
+
+    // A normal JSON-RPC message on the stream, NOT the old bespoke `event: stream-closed` (which
+    // a spec MCP client parsing JSON-RPC off the stream would never see).
+    CHECK(wire.contains("event: message"));
+    CHECK_FALSE(wire.contains("event: stream-closed"));
+    CHECK(wire.contains(R"("jsonrpc":"2.0")"));
+    CHECK(wire.contains(R"("method":"notifications/yuzu.stream_closed")"));
+    // The A4-shaped params carry the machine-parseable reason + remediation.
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
+    CHECK(wire.contains(R"("retry_after_ms":null)"));
+    CHECK(wire.contains(R"("remediation":)"));
+    // Off-ring + id-less: a close is a point-in-time terminal signal, never replayed, so it
+    // carries no SSE `id:` line an out-of-the-box client would persist as a resumable cursor.
+    // (This assertion is exact only because the ring is empty on this fresh attach AND kRevoked
+    // trips the very first pump gate, so the close frame is provably the ONLY bytes written — a
+    // ring frame WOULD carry an `id:` line.)
+    CHECK_FALSE(wire.contains("id: "));
+}
+
+TEST_CASE("make_stream_closed_frame: wraps the A4 body and merges caller extras (2f PR 3b)",
+          "[mcp][stream][2f]") {
+    // Bare: just the A4 body inside the JSON-RPC params.
+    const auto bare = mcp::make_stream_closed_frame(mcp::McpStreamClose::kCancelled, "cid-1");
+    auto j = nlohmann::json::parse(bare);
+    CHECK(j["jsonrpc"] == "2.0");
+    CHECK(j["method"] == "notifications/yuzu.stream_closed");
+    CHECK(j["params"]["reason"] == "cancelled");
+    CHECK(j["params"]["correlation_id"] == "cid-1");
+    CHECK(j["params"]["retry_after_ms"].is_null());
+    CHECK(j["params"].contains("remediation"));
+
+    // With extras: the raw fragment (leading comma) merges into params as further fields — the
+    // shape C6c/C7 use to carry execution_id + partial status on a cap/cancel close.
+    const auto extra = mcp::make_stream_closed_frame(mcp::McpStreamClose::kCapExpired, "cid-2",
+                                                     R"(,"execution_id":"exec-9","partial":true)");
+    auto je = nlohmann::json::parse(extra);
+    CHECK(je["params"]["reason"] == "cap_expired");
+    CHECK(je["params"]["execution_id"] == "exec-9");
+    CHECK(je["params"]["partial"] == true);
+
+    // kCompleted is POST-only and never reaches the GET wire, but its to_string / remediation /
+    // envelope must still be valid so the closed metric+audit label set is exhaustive.
+    CHECK(std::string(mcp::to_string(mcp::McpStreamClose::kCompleted)) == "completed");
+    auto jc = nlohmann::json::parse(mcp::make_stream_closed_frame(mcp::McpStreamClose::kCompleted,
+                                                                  "cid-3"));
+    CHECK(jc["params"]["reason"] == "completed");
+    CHECK(jc["params"].contains("remediation"));
 }
 
 TEST_CASE("McpStreamPump/CH-4: an auth-backend outage buys a bounded grace window, not a kill",
@@ -676,6 +805,58 @@ TEST_CASE("McpStreamPump/#2367: a cached answer clears a grace deadline armed du
     clock_now += std::chrono::milliseconds(1300);
     CHECK_FALSE(pump.pump_once(wire.writer()));
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("RevalidateGrace: the extracted grace state machine, exercised directly (2f PR 3b)",
+          "[mcp][stream][ch4][2f]") {
+    using RG = mcp::RevalidateGrace;
+    using R = mcp::StreamRevalidate;
+    // Deterministic: an injected clock and jitter_max=0. RevalidateGrace seeds
+    // last_authoritative_ok_ to now() at construction, so build it at t0 = epoch.
+    auto at = [](std::int64_t ms) {
+        return std::chrono::steady_clock::time_point{std::chrono::milliseconds(ms)};
+    };
+    std::chrono::steady_clock::time_point clock_now = at(0);
+    auto clock = [&clock_now] { return clock_now; };
+    RG::Config cfg;
+    cfg.grace = std::chrono::milliseconds(1000);
+
+    SECTION("kRevoked is an immediate kill, no grace") {
+        RG grace{cfg, clock};
+        CHECK(grace.on_verdict(R::kRevoked) == RG::Outcome::kCloseCredentialRevoked);
+    }
+
+    SECTION("kIndeterminate rides a bounded grace window, then closes auth_unavailable") {
+        RG grace{cfg, clock};                              // last_authoritative_ok_ = 0
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline armed @1000
+        clock_now = at(1001);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+
+    SECTION("an authoritative kValid clears an armed deadline and re-bases the window (#2367)") {
+        RG grace{cfg, clock};
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @1000
+        CHECK(grace.on_verdict(R::kValid) == RG::Outcome::kContinue);         // clears it, floor=500
+        clock_now = at(1001);                                                // past the OLD deadline
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // new deadline @1500
+        clock_now = at(1600);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+
+    SECTION("a kValidStale cache hit clears the deadline but only advances the floor one window") {
+        cfg.max_staleness = std::chrono::milliseconds(250);
+        RG grace{cfg, clock};
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @1000
+        clock_now = at(2000);
+        CHECK(grace.on_verdict(R::kValidStale) == RG::Outcome::kContinue);    // clears; floor=1750
+        // A fresh outage re-arms from the clamped floor (1750 + 1000 = 2750), not from t0.
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @2750
+        clock_now = at(2751);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
 }
 
 TEST_CASE("McpStreamPump: a terminated session ends the stream with its own reason",
