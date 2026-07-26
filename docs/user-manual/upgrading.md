@@ -719,6 +719,18 @@ elapsed time is logged when it exceeds a second. If it fails, retention still
 runs - each pass just scans instead of seeking, and the failure is logged as an
 error.
 
+**Container operators: check your healthcheck `start_period` before this
+upgrade if `audit_events` is large.** The build runs inside the `AuditStore`
+constructor, which completes well before the server binds its listener, so for
+its whole duration there is no `/healthz` responder. A healthcheck whose
+`start_period` is shorter than the build will kill the container mid-build - and
+because nothing was committed, the next boot starts the build again, so it
+restart-loops rather than converging. The shipped compose files use a 5-10 s
+`start_period`, which is sized for a fresh database; raise it past your expected
+build time (see the figures above) for the one upgrade boot. The stock
+365-day-retention server is unaffected until `audit_events` reaches the
+multi-million-row range.
+
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 
 **No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:

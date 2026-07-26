@@ -40,7 +40,7 @@ query-owner seam (ADR-0012 §3) when scoring lands.
 | `FleetTopologyStore` | `fleet_topology_store` | authoritative | durable topology; viz; join-adjacent. |
 | `ResponseStore` | `response_store` | durability-on-top? | high-write, TTL'd 90d; backfill **skippable** (ADR-0009). |
 | `ResultSetStore` | `result_set_store` | authoritative | scope-walking; inherently cross-store. |
-| `AuditStore` | `audit_store` | authoritative | SOC 2 retained 365d; backfill **mandatory**. |
+| `AuditStore` | `audit_store` | authoritative | SOC 2 retained 365d; backfill **mandatory**. Carries SQLite schema v3 (`audit_retention_meta`, one k/v row) plus the partial index `idx_audit_ttl_id`; both must come across. The retention clock guard (#2360) is migration-REQUIRED behaviour, not an optimisation - dropping it on the way over reinstates an unbounded clock-driven `DELETE` on the evidence chain. **Single-writer assumption, and this is the part that does not port:** `clock_anomaly_latched_` is a per-PROCESS member while the clock reading it pairs with is durable, so N servers each spend the guard independently; on PG the latch must become a per-store advisory lease (the ADR-0012 §3 `AppPerfRollup` pattern). Likewise `kMaxAuditDeletesPerPass` is calibrated as a drain rate for ONE hourly loop - N processes x 25k is a different number. |
 
 ## Wave 2 — authoritative config / reference (operator state that cannot be lost)
 
