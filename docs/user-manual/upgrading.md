@@ -768,14 +768,17 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the best-effort index build described
   under Schema Migrations above.
-- **Agents surface new `tar status` lines**: `storage_state` (always first),
+- **Agents surface new `tar status` lines**: `storage_state`,
   `retention_guard_declines_total`, `retention_guard_failures_total`, and
-  per-table detail. On the healthy path existing consumers filter on the
-  `config|` prefix and ignore unknown lines, so nothing breaks. **On the offline
-  path they do break**: when the TAR database has been closed after a wedged
-  rollback, `tar status` returns non-zero and emits only an `error|` line plus
-  `storage_state|offline` - no `record_count`, no `config|` lines at all. A
-  consumer keyed on the presence of `record_count` must handle that. See
+  per-table detail. On the healthy path `storage_state|ok` is the first line,
+  and existing consumers filter on the `config|` prefix and ignore unknown
+  lines, so nothing breaks. **On the offline path they do break**: when the TAR
+  database has been closed after a wedged rollback, `tar status` returns
+  non-zero and emits only an `error|` line followed by `storage_state|offline` -
+  no `record_count`, no `config|` lines at all. Note the order is REVERSED
+  there: `error|` comes first, because server and dashboard consumers key off
+  the output starting with `error|`. A consumer keyed on the presence of
+  `record_count` must handle that. See
   [tar.md](tar.md#the-retention-clock-guard). TAR persists its own clock reading
   in `tar_config` (`retention_guard_last_pass`) - no schema change.
 - **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,

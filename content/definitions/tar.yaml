@@ -16,12 +16,18 @@ metadata:
     and to monitor disk usage. Also reports both the configured
     network_capture_method and the network_capture_method_effective (the
     mechanism actually collecting — always polling today), so status never
-    misrepresents the active capture mechanism. The FIRST line is
-    storage_state (ok|offline); offline means a wedged rollback closed the TAR
+    misrepresents the active capture mechanism. On the healthy path the FIRST
+    line is storage_state|ok. Offline means a wedged rollback closed the TAR
     database, so collection and retention are both stopped until the agent
     restarts and every other field is withheld -- the reply is then just an
-    error| line plus storage_state|offline, and the action exits non-zero.
-    Historical data stays queryable via tar sql. Reports the retention clock
+    error| line followed by storage_state|offline, and the action exits
+    non-zero. The order is REVERSED on that path: error| comes FIRST, because
+    server and dashboard consumers key off the output starting with error|, so
+    do not assume storage_state is always the first line. Historical data
+    NORMALLY stays queryable via tar sql, but only when the read-only query
+    connection is itself available; the error| line states which case applies,
+    so do not infer tar sql access from storage_state|offline alone.
+    Reports the retention clock
     guard counters (#2361): retention_guard_declines_total and
     retention_guard_failures_total are always present, with per-table
     retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for
