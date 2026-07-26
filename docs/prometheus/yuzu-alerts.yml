@@ -470,8 +470,11 @@ groups:
             retention was reconfigured before investigating the clock.
             Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
-            uptime history before concluding the clock is at fault. Nothing was deleted;
-            retention resumes automatically, paced at the per-pass cap.
+            uptime history before concluding the clock is at fault. Nothing was deleted on this
+            pass. Retention NORMALLY resumes on the next one, paced at the per-pass cap, but do
+            not assume it did: confirm yuzu_server_audit_rows_deleted_total is actually moving.
+            A clock alternating either side of one reading holds the guard in its declining
+            state indefinitely, and a flat rows_deleted is the only thing that shows it.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The counterpart signal. Both a declined pass and a broken pass leave rows

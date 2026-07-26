@@ -379,8 +379,11 @@ all-expired table or a corrupt stored reading is a *condition* -- it persists
 until something changes, so it warns once and the backlog then drains at the
 capped rate. A clock jump is an *event*: the guard re-anchors its reading every
 pass, so a jump can only be detected if the clock moved since the last pass.
-Both directions count, and both use the SAME 7-day floor: a movement of at
-least that much, forward or backward, warns on every recurrence, so a clock
+Both directions count while retention is ENABLED, and both use the same 7-day
+floor: a movement of at least that much, forward or backward, warns on every
+recurrence. (With `audit_retention_days` set to 0 the forward detector is gated
+off and only backward movement is seen -- the directions are not symmetric in
+that configuration.) A qualifying movement so a clock
 stepping repeatedly produces one warning per step rather than one in total.
 Movement BELOW the floor is treated as a condition, not an event -- it warns
 once and then lets the backlog drain. That floor is load-bearing: because a

@@ -632,7 +632,14 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // regressing one second per pass -- two disagreeing time sources, a
         // hypervisor sync racing NTP -- reported forever and never drained once.
         // Sub-floor jitter is a CONDITION: say it once, then get on with the
-        // drain.
+        // drain. True for MONOTONE drift, which is the common shape. A clock
+        // ALTERNATING either side of one reading is not covered: `prev_unusable`
+        // flips every pass, so the fact set changes every pass and the drain
+        // still starves. That loop predates this floor and reproduces
+        // byte-identically on the previous rule, but it needs a store with no
+        // audit write inside a whole retention window, and it raises
+        // `clock_anomaly_skips_` on every halted pass, so it is loud rather than
+        // silent. Tracked, not fixed here.
         //
         // Symmetry also covers the case a backward-only test missed entirely:
         // recovery OUT of negative time (dead CMOS, then NTP) is a forward
