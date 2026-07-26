@@ -1931,6 +1931,86 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
     }
 }
 
+TEST_CASE("bridge park_after_dispatch_failure - parks, keeps the subscription, publishes the real final (C6b)",
+          "[mcp][bridge][2f]") {
+    // A post-dispatch failure means the work IS running, so the record must keep
+    // its listener and stay able to publish the real terminal for GET resume.
+    // abandon() would unsubscribe and discard a result the client can still
+    // legitimately collect - that is the whole distinction this transition exists
+    // to make.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-park"));
+    REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+
+    // The subscription survived: a terminal published AFTER the park still
+    // reaches the record and is projected as a pinned real final.
+    fx.bus.publish("exec-park", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+    for (const auto& f : ring_frames(*s.stream, "alice")) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["status"] == "completed");        // the REAL terminal
+            CHECK(j["result"]["execution_id"] == "exec-park");  // durable handle
+        }
+    }
+    CHECK(fx.audit_count("mcp.bridge.dispatch_failure") == 1);
+}
+
+TEST_CASE("bridge park_after_dispatch_failure - arbitration and the prebuilt fallback (C6b)",
+          "[mcp][bridge][2f]") {
+    SECTION("only kArming parks; a second call loses") {
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-1"));
+        REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+        CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));  // no longer kArming
+        CHECK(fx.audit_count("mcp.bridge.dispatch_failure") == 1);           // exactly once
+    }
+    SECTION("an armed record cannot be parked - arm won the arbitration") {
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+    }
+    SECTION("an unknown record is a no-op, never a throw") {
+        Fx fx;
+        auto s = fx.make_session();
+        CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(99)));
+    }
+    SECTION("a record parked BEFORE arm still has a non-empty fallback final") {
+        // subscribe() prebuilds it; without that, a parked-before-arm record whose
+        // real-final build fails would publish an EMPTY frame, because arm() -
+        // the only other place that fills fallback_final - never ran.
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-fb"));
+        REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+        // Fail the REAL final build so the projector publishes the prebuilt
+        // fallback. An un-prebuilt record publishes an empty frame here, which
+        // parses as no result at all - which is what the count below catches.
+        fx.bridge->inject_projection_build_fault_for_test(1);
+        fx.bus.publish("exec-fb", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+        auto frames = ring_frames(*s.stream, "alice");
+        REQUIRE(count_results(frames) == 1);
+        for (const auto& f : frames) {
+            auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+            if (j.is_object() && j.contains("result")) {
+                CHECK(j["result"]["execution_id"] == "exec-fb");
+                CHECK(j["result"]["status"] == "unknown");  // the prebuilt fallback shape
+            }
+        }
+    }
+}
+
 TEST_CASE("bridge reserve - the streamed charge and the record commit together (C6a)",
           "[mcp][bridge][2f]") {
     // The ledger bump and the map insert BOTH allocate, so either can throw with
@@ -2022,7 +2102,8 @@ TEST_CASE("bridge #2528 - a terminal lost to the degraded settle publishes the f
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly
 
-    fx.bridge->inject_projection_build_fault_for_test(1);
+    fx.bridge->inject_projection_build_fault_for_test(1);     // real final throws
+    fx.bridge->inject_projection_fallback_fault_for_test(1);  // ...and so does the fallback
     fx.bridge->inject_claim_lock_fault_for_test(1);
     fx.bus.publish("exec-pl", "execution-completed", kCompleted);
 

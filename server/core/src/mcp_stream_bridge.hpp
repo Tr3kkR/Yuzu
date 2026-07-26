@@ -11,18 +11,26 @@
 //
 // GET-only mode is LIVE (rung 3a.7 wires reserve/subscribe/arm(kGetOnly) into
 // execute_instruction in mcp_server.cpp + construction in server.cpp). The
-// STREAMED-POST surface is still dead: on_post_closed / request_cancel /
-// ArmMode::kStreaming and therefore the whole kRingOnly lifecycle (parked
-// finals, the pressure hatch) have no production caller until the 3b pump lands
-// - deliberately, the same zero-producer staging as publish_final (3a.4).
+// STREAMED-POST surface is still dead: on_post_closed / park_after_dispatch_
+// failure / request_cancel / ArmMode::kStreaming and therefore the whole
+// kRingOnly lifecycle (parked finals, the pressure hatch) have no production
+// caller until the 3b pump lands - deliberately, the same zero-producer staging
+// as publish_final (3a.4).
 //
 // ── Record lifecycle ────────────────────────────────────────────────────────
 //
 //   kArming ──arm(kStreaming)──────────▶ kStreaming ──on_post_closed()─▶ kRingOnly
-//      │  └──arm(kGetOnly | cancel-degrade)─▶ kArmedGetOnly                  │
-//      │                                        │ (terminal projected)       │
+//      │  ├──arm(kGetOnly | cancel-degrade)─▶ kArmedGetOnly                  ▲
+//      │  │                                     │ (terminal projected)       │
+//      │  └──park_after_dispatch_failure()──────┼───────────────────────────▶┤
+//      │                                        │                            │
 //      └──abandon()──▶ kAborted                 ▼                            ▼
 //                                             kDone ◀────── sweep() ─────────┘
+//
+//   The two edges out of kArming on a FAILURE differ by whether dispatch happened:
+//   abandon() is pre-dispatch (unsubscribe + discard; nothing is running), while
+//   park_after_dispatch_failure() is post-dispatch (subscription and mailbox
+//   RETAINED, because the execution is running and its terminal is still owed).
 //
 //   kArming        reserved, pre-dispatch; mailbox latches events, nothing projects.
 //   kStreaming     POST pump owns projection (3b). In 3a nothing arms this in
@@ -326,10 +334,29 @@ public:
     /// owns lease release / mark_cancelled / the byte-identical error path (G1).
     bool abandon(const std::string& session_id, const nlohmann::json& jsonrpc_id);
 
-    /// 3b pump-releaser seam, landed now because it is the only path into
-    /// kRingOnly: kStreaming → kRingOnly, assign parked order, wake the
+    /// 3b pump-releaser seam: kStreaming → kRingOnly, assign parked order, wake the
     /// projector (A1 - a latched terminal must not wait for the next bus event).
     bool on_post_closed(const std::string& session_id, const nlohmann::json& jsonrpc_id);
+
+    /// POST-DISPATCH failure unwind: kArming → kRingOnly, retaining the bus
+    /// subscription, the mailbox and any latched terminal. PARK, NOT abandon -
+    /// the work is already running, so the record must stay able to receive and
+    /// publish its real terminal for GET resume; abandon() would unsubscribe and
+    /// discard a result the client can still legitimately collect. The caller
+    /// owns the correlated error response (which MUST carry the execution_id) and
+    /// must NOT mark the execution cancelled - unlike the pre-dispatch paths, the
+    /// execution is genuinely still running.
+    ///
+    /// Needed because arm()'s flip is no-throw but its PRE-flip work is not (the
+    /// key build, the execution-id copy, the fallback build, and the by-value
+    /// result_base copy at the call boundary, which cannot be prebuilt because it
+    /// carries post-dispatch data). A throw there leaves a dispatched record stuck
+    /// in kArming with no transition of its own.
+    ///
+    /// Deliberately does NOT set torn_down: that flag means "permanently excluded
+    /// from reclaim", and a park is a transition, not a teardown.
+    bool park_after_dispatch_failure(const std::string& session_id,
+                                     const nlohmann::json& jsonrpc_id);
 
     /// Reap + enforce (server tick wiring is 3a.7; public for tests):
     ///   0. kDone records → unsubscribe/unpin-bookkeeping/erase.
@@ -401,12 +428,16 @@ public:
     /// recorded honestly - terminal_projected when the frame was already published,
     /// terminal_payload_lost when it was extracted and never published.
     void inject_claim_lock_fault_for_test(int times = 1);
-    /// The NEXT `times` project_record terminal builds fail BOTH ways (real final
-    /// and the prebuilt fallback copy) - the only path that leaves the terminal
-    /// extracted but unpublished, and therefore the only path whose recovery is
-    /// the guard's restore. Pairs with inject_claim_lock_fault_for_test to reach
-    /// the #2528 degraded settle's payload-lost arm.
+    /// The NEXT `times` project_record REAL-final builds throw. The prebuilt
+    /// fallback still publishes, so this covers the fallback-final path (and
+    /// proves the prebuilt string is non-empty for a record parked before arm).
     void inject_projection_build_fault_for_test(int times = 1);
+    /// The NEXT `times` FALLBACK copies throw as well. Armed together with the
+    /// build fault this is the double allocation failure - the only path that
+    /// leaves the terminal extracted but never published, and therefore the only
+    /// path whose recovery is the guard's restore. Pairs with
+    /// inject_claim_lock_fault_for_test to reach #2528's payload-lost arm.
+    void inject_projection_fallback_fault_for_test(int times = 1);
     /// The NEXT `times` teardown terminal-frame BUILDS throw, modelling an
     /// allocation failure before publish_terminal_ladder is ever reached. Proves the
     /// TerminalRung::kNotAttempted audit path: nothing published AND the stream was
@@ -549,7 +580,6 @@ private:
         bool torn_down = false;
         std::uint64_t pinned_event_id = 0;
         std::uint64_t parked_seq = 0;      ///< assigned on entry to kRingOnly
-        std::optional<std::string> final_frame;  ///< 3b pump seam: written LAST on the wire
 
         // C5: record-local, listener-writable observability. Flushed by the
         // projector / teardown through the noexcept obs guard - the listener
@@ -575,6 +605,13 @@ private:
     void project_record(const std::shared_ptr<BridgeRecord>& rec);
     /// Build the parked real final from the bus terminal payload + result_base (B5).
     static std::string build_real_final(const BridgeRecord& rec, const std::string& terminal_data);
+    /// The ONE derivation of the minimal success-shaped fallback final ("terminal
+    /// counts unavailable - fetch by execution_id"). Built by subscribe() so a
+    /// record that parks BEFORE arm still has one, and rebuilt identically by
+    /// arm(); every publisher of a fallback reads rec.fallback_final, so this
+    /// must stay the only place its bytes are composed.
+    static std::string build_fallback_final(const nlohmann::json& jsonrpc_id,
+                                            const std::string& execution_id);
     /// Which rung of the publish ladder actually committed. The committed id alone
     /// cannot answer this - a nonzero id from the retry looks identical to one from
     /// the primary frame - and teardown's audit must not claim the caller's frame
@@ -680,7 +717,8 @@ private:
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
     std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
     std::atomic<int> claim_lock_fault_{0};     ///< remaining ~ClaimGuard lock throws (test seam)
-    std::atomic<int> projection_build_fault_{0}; ///< remaining project_record double-build failures
+    std::atomic<int> projection_build_fault_{0};    ///< remaining real-final build throws
+    std::atomic<int> projection_fallback_fault_{0}; ///< remaining fallback-copy throws
     /// Remaining injected throws per teardown stage (test seam), indexed by
     /// TeardownStage.
     std::array<std::atomic<int>, kTeardownStageCount> teardown_step_fault_{};
