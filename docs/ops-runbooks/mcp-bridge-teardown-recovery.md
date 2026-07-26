@@ -22,9 +22,9 @@ until the process restarts.
 
 | reason | settled | retained until restart |
 |---|---|---|
-| `unsubscribe` | the terminal disposition **if there was one** - most teardowns (session death, pin-ack, arming reap, done reap) publish nothing at all, and even a memory-pressure teardown delivers nothing if its publish failed. The audit row says which, in one of three forms: "after the decided terminal was published", "the terminal publish POISONED the session" (session-wide - every later attach 410s), or "nothing was published". | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
-| `release_charge` | terminal and subscription; the record is still erased | one per-session streamed admission slot |
-| `erase` | terminal and subscription, and the charge **unless** `release_charge` also fired | the record and one global record slot, plus the admission slot if both fired |
+| `unsubscribe` | the terminal disposition **if there was one** - most teardowns (session death, pin-ack, arming reap, done reap) publish nothing at all, and even a memory-pressure teardown delivers nothing if its publish failed. Every failure row carries the terminal's fate as well as the mechanical failure, in one of these forms: "after the decided terminal was published", "the terminal publish POISONED the session" (session-wide - every later attach 410s), or "nothing was published". | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
+| `release_charge` | the terminal disposition (whatever the row names) and the subscription; the record is still erased | one per-session streamed admission slot |
+| `erase` | the terminal disposition (whatever the row names) and the subscription, and the charge **unless** `release_charge` also fired | the record and one global record slot, plus the admission slot if both fired |
 
 This table is a summary keyed on one reason at a time. The audit row is authoritative
 in every case: it names what was actually published, and when two reasons fire for the

@@ -444,7 +444,8 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
         audit_contained("mcp.bridge.cancel", exec_id,
                         outcome == ArmOutcome::kDegradedGetOnly
                             ? "consumed_by_arm: streamed intent degraded to get-only"
-                            : "consumed_by_arm: get-only request, nothing to detach");
+                            : "consumed_by_arm: get-only request, nothing to detach",
+                        {}, AuditResult::kSuccess);
     }
     return outcome;
 }
@@ -789,8 +790,11 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // reading "not held" while streamed_unpinned_[session] still counts it, so
         // that entry never reaches 0, never gets erased, and the session accumulates
         // forever. run_projector's per-record catch swallows it, so nothing retries.
-        // Fixing release_charge alone would have fixed the instance and left the
-        // sink; this is the second and last site.
+        // Fixing release_charge alone would have fixed the instance and left the sink.
+        // NOT the last site: arm()'s cancel-degrade path still clears the flag under
+        // rec->mu and takes bridge_mu_ afterwards. It is out of scope here (request
+        // thread, guarded by the caller) and tracked separately - this comment used to
+        // claim it was the last, which was simply wrong.
         std::lock_guard<std::mutex> lk(bridge_mu_);
         std::lock_guard<std::mutex> rlk(rec->mu);
         rec->terminal_projected = true;
@@ -1308,6 +1312,8 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // this rather than off which branch was INTENDED.
     const bool published = decision != TeardownFinal::kNone &&
                            (rung == TerminalRung::kPrimary || rung == TerminalRung::kFallback);
+    // Derived ONCE and passed to every bail site below. See disposition_phrase().
+    const char* const disposition = disposition_phrase(decision, rung);
 
     // ── Step 2: unsubscribe ────────────────────────────────────────────────────
     if (!contained([&] {
@@ -1338,22 +1344,10 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // disposition delivers nothing on kPoisoned / kPublishThrew / kNotAttempted -
         // so "the terminal was published first" is only true when the ladder actually
         // committed. Two bounded literals rather than one convenient claim.
-        // THREE outcomes, not two. A poisoned session is not "nothing happened": the
-        // poison is session-wide and every future attach 410s, so collapsing it into
-        // the generic no-delivery literal leaves the most consequential outcome
-        // unevidenced on this path.
         audit_contained(audit_action, exec_id,
-                        published ? "teardown incomplete: bus unsubscribe failed after the "
-                                    "decided terminal was published; the record is retained "
-                                    "for shutdown"
-                        : rung == TerminalRung::kPoisoned
-                            ? "teardown incomplete: bus unsubscribe failed and the terminal "
-                              "publish POISONED the session (every later attach 410s); the "
-                              "record is retained for shutdown - recover by execution_id"
-                            : "teardown incomplete: bus unsubscribe failed and nothing was "
-                              "published; the record is retained for shutdown - recover by "
-                              "execution_id",
-                        AuditResult::kFailure);
+                        "teardown incomplete: bus unsubscribe failed; the record, its streamed "
+                        "charge and its bus subscription are all retained for shutdown",
+                        disposition, AuditResult::kFailure);
         return;
     }
 
@@ -1395,6 +1389,11 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // fault class, so a compound failure previously produced a row asserting a
         // settled charge while the metric said otherwise - understating the blast
         // radius to whoever reads the row during an incident.
+        // Takes the disposition like every other bail site. This one used to branch on
+        // charge_released ALONE and say nothing about the terminal, so a teardown that
+        // poisoned the session and then failed to erase left the poisoning entirely
+        // unevidenced - the same defect as the other two sites, found only after both
+        // of those had been fixed individually.
         audit_contained(audit_action, exec_id,
                         charge_released
                             ? "teardown incomplete: record erase failed; the subscription and "
@@ -1403,7 +1402,7 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
                             : "teardown incomplete: record erase failed AND the streamed charge "
                               "was not released; the record and one per-session admission slot "
                               "are both retained for shutdown",
-                        AuditResult::kFailure);
+                        disposition, AuditResult::kFailure);
         return;
     }
     publish_records_gauge(active);
@@ -1483,32 +1482,20 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // ERASE it. Overwriting unconditionally meant a teardown that both poisoned
         // the session and leaked a slot reported only the slot, and the poisoning
         // went unevidenced entirely.
-        // `published`, NOT `delivered`. They differ exactly where it matters:
-        // `delivered` stays true for a kNone teardown, which publishes nothing at
-        // all, so keying off it would claim a delivery on the majority path.
-        //
-        // THREE literals, matching the unsubscribe-bail path above. A poisoned
-        // session is not "nothing was published": the poison is session-wide and
-        // every later attach 410s, so collapsing it into the generic no-delivery
-        // wording omits the most consequential half of a compound failure. The
-        // three-way split was applied to the unsubscribe path first and NOT mirrored
-        // here, which left this call site with the exact defect the comment above it
-        // describes.
-        audit_detail = published ? "teardown incomplete: streamed charge not released; the "
-                                   "record was erased and the terminal was published, but one "
-                                   "per-session admission slot is held until shutdown"
-                       : rung == TerminalRung::kPoisoned
-                           ? "teardown incomplete: streamed charge not released AND the "
-                             "terminal publish POISONED the session (every later attach 410s); "
-                             "the record was erased but one per-session admission slot is held "
-                             "until shutdown - recover any result by execution_id"
-                           : "teardown incomplete: streamed charge not released AND this "
-                             "teardown published nothing; the record was erased but one "
-                             "per-session admission slot is held until shutdown - if no final "
-                             "was pinned earlier, recover by execution_id";
+        // Stage text only - the terminal's fate comes from the shared disposition, so
+        // this site cannot drift from the other two.
+        audit_detail = "teardown incomplete: streamed charge not released; the record was "
+                       "erased but one per-session admission slot is held until shutdown";
         delivered = false;
     }
+    // A clean teardown keeps its existing decision-specific wording and passes NO
+    // disposition, so a normal kNone reap's row stays byte-identical to before this
+    // work started. A charge failure, though, makes this the FAILURE row for the
+    // teardown - so it carries the shared disposition exactly like the other bail
+    // sites, or it would be the fourth site to describe a mechanical failure while
+    // staying silent about the terminal.
     audit_contained(audit_action, exec_id, audit_detail,
+                    charge_released ? std::string_view{} : std::string_view{disposition},
                     delivered ? AuditResult::kSuccess : AuditResult::kFailure);
 }
 
@@ -1634,12 +1621,60 @@ void McpStreamBridge::flush_core_obs() noexcept {
     }
 }
 
+const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
+                                               TerminalRung rung) noexcept {
+    // ONE source for every teardown bail site. The recurring defect on this function
+    // was a bail site that described the mechanical failure and stayed silent about
+    // the terminal - most consequentially about a POISONED session, which is
+    // session-wide (every later attach 410s). Three separate rounds fixed one site
+    // and left another; deriving it once removes the opportunity.
+    if (decision == TeardownFinal::kNone) {
+        return "this teardown published nothing (any earlier final is unaffected)";
+    }
+    switch (rung) {
+        case TerminalRung::kPrimary:
+            return decision == TeardownFinal::kSynthesizeUnavailable
+                       ? "the terminal-unavailable frame was published"
+                       : "the fallback final was published";
+        case TerminalRung::kFallback:
+            return "the intended terminal failed and the prebuilt fallback final was "
+                   "published instead";
+        case TerminalRung::kPoisoned:
+            return "the terminal publish POISONED the session - every later attach 410s and "
+                   "the client must re-initialize; recover the result by execution_id";
+        case TerminalRung::kPublishThrew:
+            // Deliberately does NOT claim the stream escaped poisoning. publish_final
+            // is noexcept, so the only way the ladder throws is poison_terminal(),
+            // which sets its sticky flag under mu_ and THEN calls close_sink outside
+            // it - so a throw here means the session very likely IS poisoned, with the
+            // flag already set. The previous wording asserted the opposite. This arm
+            // is reachable but has no fault seam (nothing can make close_sink throw
+            // from a test), so it is stated conservatively rather than pinned.
+            return "the terminal was built but publishing threw; nothing was confirmed "
+                   "published and the stream's poison state is indeterminate (a throw at this "
+                   "point usually means it WAS poisoned) - recover the result by execution_id";
+        case TerminalRung::kNotAttempted:
+            break;
+    }
+    return "the terminal frame could not be built; nothing was published and the stream was "
+           "NOT poisoned - recover the result by execution_id";
+}
+
 void McpStreamBridge::audit_contained(const char* action, const std::string& execution_id,
-                                      std::string_view detail, AuditResult result) noexcept {
+                                      std::string_view stage, std::string_view disposition,
+                                      AuditResult result) noexcept {
     if (audit_) {
-        // Both owned strings the AuditFn signature needs (action from a const char*,
-        // detail from the view) are constructed HERE, inside the guard - #2487.
-        obs_guard([&] { audit_(action, execution_id, std::string(detail), result); });
+        // Every owned string the AuditFn signature needs - action from a const char*,
+        // and the joined detail from the two views - is constructed HERE, inside the
+        // guard, so the join cannot allocate on an uncontained path (#2487).
+        obs_guard([&] {
+            std::string detail(stage);
+            if (!detail.empty() && !disposition.empty()) {
+                detail += "; ";
+            }
+            detail.append(disposition);
+            audit_(action, execution_id, std::move(detail), result);
+        });
     }
 }
 

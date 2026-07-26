@@ -963,8 +963,8 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
                 // This is a session-death reap: its disposition is kNone, so NOTHING
                 // was published. The row must not claim otherwise - a generic
                 // "teardown incomplete" grep would pass over exactly that lie.
-                CHECK(row.detail.find("nothing was published") != std::string::npos);
-                CHECK(row.detail.find("terminal was published") == std::string::npos);
+                CHECK(row.detail.find("published nothing") != std::string::npos);
+                CHECK(row.detail.find("frame was published") == std::string::npos);
             }
         }
         CHECK(saw_incomplete);
@@ -1087,6 +1087,26 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         }
         return Fx::AuditRow{"<absent>", "<absent>", "<absent>"};
     };
+    // Two parked records with cap 1: "b" completes and pins first, so the older
+    // terminal-less "a" is the pressure victim (decision kSynthesizeUnavailable).
+    // Factored because three sections needed it verbatim; the neighbouring TEST_CASE
+    // has its own copy, which is what made a third one look normal.
+    auto park_pair = [](Fx& fx, Fx::Session& s, const char* tag) {
+        const std::string a = std::string("exec-") + tag + "-a";
+        const std::string b = std::string("exec-") + tag + "-b";
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("a"), a));
+        REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("b"), b));
+        REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+        fx.bus.publish(b, "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    };
     auto park_one = [](Fx& fx, Fx::Session& s) {
         REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-stage"));
@@ -1140,18 +1160,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         // must report both rather than implying the client got nothing.
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
-        REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-pub-a"));
-        REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
-                Bridge::ArmOutcome::kArmed);
-        REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
-        REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-pub-b"));
-        REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
-                Bridge::ArmOutcome::kArmed);
-        REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
-        fx.bus.publish("exec-pub-b", "execution-completed", kCompleted, /*is_terminal=*/true);
-        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+        park_pair(fx, s, "pub");
 
         // The synthesis publishes normally; only the charge release fails.
         fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
@@ -1159,7 +1168,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
         CHECK(row.result == "failure");
-        CHECK(row.detail.find("the terminal was published") != std::string::npos);
+        CHECK(row.detail.find("frame was published") != std::string::npos);
         CHECK(row.detail.find("admission slot is held") != std::string::npos);
         CHECK(row.detail.find("published nothing") == std::string::npos);
     }
@@ -1173,18 +1182,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
         auto s = fx.make_session();
         // Two parked records so the pressure hatch picks the older, terminal-less one.
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
-        REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-pois-a"));
-        REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
-                Bridge::ArmOutcome::kArmed);
-        REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
-        REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-pois-b"));
-        REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
-                Bridge::ArmOutcome::kArmed);
-        REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
-        fx.bus.publish("exec-pois-b", "execution-completed", kCompleted, /*is_terminal=*/true);
-        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+        park_pair(fx, s, "pois");
 
         // Both publish rungs fail -> poison; and the charge release fails too.
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
@@ -1194,6 +1192,41 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
         CHECK(row.result == "failure");
         CHECK(row.detail.find("charge not released") != std::string::npos);
+        CHECK(row.detail.find("POISONED") != std::string::npos);
+    }
+    SECTION("unsubscribe fails on a POISONED teardown: that site names it too") {
+        // The third bail site's poison arm. Every site now takes the same derived
+        // disposition, so this closes the combination matrix rather than leaving the
+        // sibling call site as the next place the class resurfaces.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        park_pair(fx, s, "up");
+        s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
+        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000);
+        REQUIRE_NOTHROW(fx.bridge->sweep());
+
+        const auto row = row_for(fx, "mcp.bridge.forced_expire");
+        CHECK(row.result == "failure");
+        CHECK(row.detail.find("bus unsubscribe failed") != std::string::npos);
+        CHECK(row.detail.find("POISONED") != std::string::npos);
+    }
+    SECTION("erase fails on a POISONED teardown: the row names the poisoning too") {
+        // The site that stayed poison-blind after the other two were fixed
+        // individually. An erase failure returns before the step-5 row, so its row is
+        // the ONLY row - if it omits the disposition, a session-wide poisoning is
+        // never evidenced anywhere. Every bail site now takes the shared disposition,
+        // so this pins the whole class rather than the instance.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        park_pair(fx, s, "ep");
+
+        s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
+        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE_NOTHROW(fx.bridge->sweep());
+
+        const auto row = row_for(fx, "mcp.bridge.forced_expire");
+        CHECK(row.result == "failure");
+        CHECK(row.detail.find("record erase failed") != std::string::npos);
         CHECK(row.detail.find("POISONED") != std::string::npos);
     }
     SECTION("release_charge AND erase both fail: the row names BOTH retained resources") {
@@ -1266,8 +1299,7 @@ TEST_CASE("bridge pressure - the decided terminal is published even if teardown 
             if (row.action == "mcp.bridge.forced_expire" &&
                 row.detail.find("bus unsubscribe failed") != std::string::npos) {
                 saw = true;
-                CHECK(row.detail.find("after the decided terminal was published") !=
-                      std::string::npos);
+                CHECK(row.detail.find("frame was published") != std::string::npos);
                 CHECK(row.result == "failure");
             }
         }

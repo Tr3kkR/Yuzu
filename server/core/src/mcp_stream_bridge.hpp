@@ -581,9 +581,19 @@ private:
     /// teardown path that caller is the bare maintenance thread, where an escaped
     /// bad_alloc is std::terminate (#2487). The view converts without allocating;
     /// the owned string the AuditFn sink needs is built INSIDE the guard.
+    /// `stage` describes what went wrong with the teardown mechanics; `disposition`
+    /// describes what happened to the terminal. They are SEPARATE parameters, not one
+    /// pre-joined string, because the disposition was omitted at one bail site three
+    /// separate times - each fix corrected the instance and the next site drifted.
+    /// Making it a parameter means a new bail site cannot forget it. The two are
+    /// joined INSIDE the guard, so the join's allocation stays contained (#2487).
     void audit_contained(const char* action, const std::string& execution_id,
-                         std::string_view detail,
+                         std::string_view stage, std::string_view disposition = {},
                          AuditResult result = AuditResult::kSuccess) noexcept;
+
+    /// The ONE derivation of "what happened to the terminal", shared by every
+    /// teardown bail site. Returns a static literal; never allocates.
+    static const char* disposition_phrase(TeardownFinal decision, TerminalRung rung) noexcept;
 
     ExecutionEventBus* bus_ = nullptr;
     McpSessionRegistry* sessions_ = nullptr;
