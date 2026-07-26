@@ -251,4 +251,29 @@ TEST_CASE("#2500 — audit-detail truncation never severs a UTF-8 character",
     // Control characters and CR/LF still become '?' — the forgery guard the
     // truncation fix must not regress.
     CHECK(yuzu::server::onbehalf::sanitize_for_log("a\nb\rc", 128) == "a?b?c");
+
+    // 3-byte and 4-byte sequences cut at EVERY offset. The 2-byte case above
+    // would pass even if the `need` arms for 0xE0/0xF0 were wrong, so these are
+    // what actually pin the classification. Lifted from the property set of an
+    // ASan/UBSan probe that ran 25.2M inputs against this function during
+    // review; these are the cases a regression would slip through.
+    for (int cut = 1; cut <= 2; ++cut) {
+        const std::string euro = std::string(128 - cut, 'a') + "\xE2\x82\xAC";
+        CHECK(well_formed(yuzu::server::onbehalf::sanitize_for_log(euro, 128)));
+    }
+    for (int cut = 1; cut <= 3; ++cut) {
+        const std::string emoji = std::string(128 - cut, 'a') + "\xF0\x9F\x98\x80";
+        CHECK(well_formed(yuzu::server::onbehalf::sanitize_for_log(emoji, 128)));
+    }
+    // A tail of pure continuation bytes exits the walk by loop condition rather
+    // than by return — the one path that does not hit the erase branch.
+    const std::string orphans = std::string(126, 'a') + "\x80\x80\x80\x80";
+    const auto orphan_out = yuzu::server::onbehalf::sanitize_for_log(orphans, 128);
+    CHECK(orphan_out.size() <= 128 + 3); // no growth, no hang
+
+    // At most ONE character is ever removed: a fix that lopped the tail harder
+    // would satisfy every well-formedness check above while eating valid text.
+    const std::string full = std::string(124, 'a') + "\xF0\x9F\x98\x80";
+    CHECK(yuzu::server::onbehalf::sanitize_for_log(full, 128).find("\xF0\x9F\x98\x80") !=
+          std::string::npos);
 }

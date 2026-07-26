@@ -209,6 +209,8 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/instructions/{id}/execute` | `agent_ids` `[]`, non-array | broadcast to all | `400` |
 | `POST /api/instructions/{id}/execute` | `scope` `""` or non-string | broadcast to all | `400` |
 | `POST /api/v1/result-sets/from-*` | `parent_id` empty, non-string, or `null` | searched/dispatched unscoped | `400` |
+| `POST /api/command` | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/command` | `plugin`/`action` outside `[A-Za-z0-9_.-]` or over 128 bytes | accepted | `400` |
 | `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
 | `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
 | `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |

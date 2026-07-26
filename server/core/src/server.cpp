@@ -7947,6 +7947,42 @@ private:
                 return;
             }
 
+            // plugin/action are IDENTIFIERS. Bounding them here is what actually
+            // closes the audit-detail forgery that a previous round only half
+            // fixed: `sanitize_for_log` normalises control bytes, but leaves
+            // space, `=`, `:` and `-` alone, so a caller could still plant
+            //     plugin = "noop reason=agent_ids_empty"
+            //     action = "noop \u2192 4000 agent(s)"
+            // and produce a durable denial row that mimics the SUCCESS format
+            // (`reason=<r> <plugin>:<action>` vs `plugin:action \u2192 N agent(s)`).
+            // Byte-shape safety is not field-structure safety. Validating the
+            // input is also what bounds the row size and keeps the column
+            // well-formed, which is three problems closed at one gate instead of
+            // three sanitisers at three sinks.
+            //
+            // Charset matches what shipped content actually uses - every
+            // `plugin`/`action` in content/definitions/*.yaml fits this, and
+            // dotted server actions (`workflow.list`) are live content, so `.`
+            // must stay legal. Length matches MCP's kExecInstrIdentMaxLen so the
+            // two execute surfaces agree on what an identifier is.
+            {
+                constexpr size_t kIdentMax = 128;
+                const auto bad_ident = [](const std::string& v) {
+                    if (v.size() > kIdentMax)
+                        return true;
+                    return std::any_of(v.begin(), v.end(), [](unsigned char c) {
+                        return !(std::isalnum(c) || c == '_' || c == '.' || c == '-');
+                    });
+                };
+                if (bad_ident(plugin) || bad_ident(action)) {
+                    res.status = 400;
+                    res.set_content(
+                        R"j({"error":{"code":400,"message":"plugin and action must be identifiers ([A-Za-z0-9_.-], max 128 bytes)"},"meta":{"api_version":"v1"}})j",
+                        "application/json");
+                    return;
+                }
+            }
+
             // All commands require Execution:Execute permission
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
@@ -8233,10 +8269,23 @@ private:
                 // place where a reorder turns a specific-looking target list into
                 // the entire fleet. Falsifiable on its own terms — neuter the shape
                 // check and `{"agent_ids": []}` is still refused here.
+                //
+                // (An earlier version of this comment said the pre-#2500 caller
+                // "got a 503"; the base code answered 400 "invalid scope". The
+                // docs and tests were corrected in an earlier fold and this
+                // comment was missed.)
                 if (named_target) {
+                    // Derive the label from which field was actually supplied,
+                    // as the MCP sink does. Hardcoding `agent_ids_empty` would
+                    // mislabel a `scope`-only violation if this arm ever became
+                    // reachable, and a wrong reason on a fleet-safety refusal is
+                    // worse than no reason.
+                    const auto sink_reason = body.contains("agent_ids")
+                                                 ? kTargetingShapeReasons[1]  // agent_ids_empty
+                                                 : kTargetingShapeReasons[4]; // scope_empty
                     metrics_
                         .counter("yuzu_server_dispatch_target_rejected_total",
-                                 {{"route", "command"}, {"reason", "agent_ids_empty"}})
+                                 {{"route", "command"}, {"reason", std::string(sink_reason)}})
                         .increment();
                     // Empty target_id, matching the source-side denial above: the
                     // same verb must not carry two different target shapes, and a
@@ -8244,7 +8293,7 @@ private:
                     // the audit trail as though one was.
                     const bool audit_ok =
                         audit_log(req, "command.dispatch", "denied", "command", "",
-                                  "reason=agent_ids_empty " +
+                                  "reason=" + std::string(sink_reason) + " " +
                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
                                       onbehalf::sanitize_for_log(action, 128));
                     if (!audit_ok)
@@ -12215,6 +12264,16 @@ private:
                 // refactor pointing this at command_dispatch_fn — whose `None`
                 // reaches nobody — becomes a visible decision rather than a
                 // silent conversion of every dashboard fleet-execute to a no-op.
+                //
+                // ONE ARM DID CHANGE, contrary to what an earlier version of
+                // this comment claimed: a literal `scope_expr == "__all__"` used
+                // to reach the Scope arm, fail `scope::parse`, and dispatch to
+                // NOBODY. It now broadcasts, matching every other sink. That is
+                // unreachable today because dashboard_routes.cpp strips the
+                // sentinel before calling, and it is the behaviour we want if it
+                // ever becomes reachable — but "no arm changed" was not true and
+                // is exactly the kind of preservation claim this PR keeps
+                // getting wrong (governance, consistency).
                 const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
                 if (arm == DispatchArm::Group) {
                     auto group_id = scope_expr.substr(6);

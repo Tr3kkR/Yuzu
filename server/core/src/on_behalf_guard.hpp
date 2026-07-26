@@ -93,6 +93,17 @@ template <typename Range>
 /// `/api/v1/audit` emit a response that is not valid UTF-8 JSON — `json_escape`
 /// passes bytes >= 0x20 through unvalidated — so a strict client cannot decode
 /// the whole page. One truncated device name would poison the audit list.
+///
+/// PRECONDITION, and the limit of what this gives you: it **preserves** UTF-8
+/// validity, it does not **establish** it. A caller passing already-invalid
+/// bytes gets invalid bytes back (minus control chars). On `/api/command` the
+/// inputs are valid by construction because they came through
+/// `nlohmann::json::parse`, which rejects ill-formed UTF-8 — that is the only
+/// reason the audit path is safe. Other callers pass httplib-percent-decoded
+/// `req.path` / `remote_addr` / `ctx->peer()`, which CAN carry raw high bytes;
+/// harmless while those only reach a log line, but a future caller routing one
+/// of them into a durable column reintroduces the undecodable-page bug under a
+/// name that reads as though it were covered.
 inline void drop_partial_utf8_tail(std::string& out) {
     const size_t n = out.size();
     for (size_t back = 1; back <= 4 && back <= n; ++back) {

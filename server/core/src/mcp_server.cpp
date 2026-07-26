@@ -26,6 +26,7 @@
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
@@ -5437,7 +5438,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                            "omit it entirely to target all agents");
                         return;
                     }
-                    scope = "__all__";
+                    scope = std::string(yuzu::server::kBroadcastScope);
                 }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────

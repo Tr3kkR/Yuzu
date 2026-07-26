@@ -83,8 +83,15 @@ struct BoundViolation {
 /// route-level reasons live in `kRouteRejectReasons` below, because forcing
 /// them into this array would force them into the MCP array too, and a reason
 /// MCP can never emit does not belong in MCP's closed set.
+inline constexpr std::string_view kReasonAgentIdsType{"agent_ids_type"};
+inline constexpr std::string_view kReasonAgentIdsEmpty{"agent_ids_empty"};
+inline constexpr std::string_view kReasonAgentIdType{"agent_id_type"};
+inline constexpr std::string_view kReasonScopeType{"scope_type"};
+inline constexpr std::string_view kReasonScopeEmpty{"scope_empty"};
+
 inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
-    "agent_ids_type", "agent_ids_empty", "agent_id_type", "scope_type", "scope_empty",
+    kReasonAgentIdsType, kReasonAgentIdsEmpty, kReasonAgentIdType,
+    kReasonScopeType,    kReasonScopeEmpty,
 };
 
 /// Reasons emitted by the ROUTES rather than by `check_targeting_shape`.
@@ -161,22 +168,22 @@ check_targeting_shape(const nlohmann::json& args) {
     if (args.contains("agent_ids")) {
         const auto& a = args["agent_ids"];
         if (!a.is_array())
-            return BoundViolation{"agent_ids_type", "agent_ids must be an array of strings"};
+            return BoundViolation{kReasonAgentIdsType.data(), "agent_ids must be an array of strings"};
         if (a.empty())
-            return BoundViolation{"agent_ids_empty",
+            return BoundViolation{kReasonAgentIdsEmpty.data(),
                                   "agent_ids was supplied but is empty; omit it to target "
                                   "all agents deliberately"};
         for (const auto& v : a) {
             if (!v.is_string())
-                return BoundViolation{"agent_id_type", "agent_ids entries must be strings"};
+                return BoundViolation{kReasonAgentIdType.data(), "agent_ids entries must be strings"};
         }
     }
     if (args.contains("scope")) {
         const auto& sc = args["scope"];
         if (!sc.is_string())
-            return BoundViolation{"scope_type", "scope must be a string"};
+            return BoundViolation{kReasonScopeType.data(), "scope must be a string"};
         if (sc.get_ref<const std::string&>().empty())
-            return BoundViolation{"scope_empty",
+            return BoundViolation{kReasonScopeEmpty.data(),
                                   "scope was supplied but is empty; omit it to target all "
                                   "agents deliberately"};
     }
