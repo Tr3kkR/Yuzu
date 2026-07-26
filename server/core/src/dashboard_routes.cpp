@@ -10,11 +10,13 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 
 #include "agent_registry.hpp" // provides detail::AgentRegistry
 #include "event_bus.hpp"
+#include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "response_store.hpp"
@@ -148,7 +150,28 @@ parse_instruction_params(const std::string& text) {
 // register_routes
 // ---------------------------------------------------------------------------
 
+// httplib::Server& overload — wraps the server in an HttplibRouteSink and
+// delegates, so production registration and the in-process test registration
+// run the exact same handler-construction code (#1786).
 void DashboardRoutes::register_routes(httplib::Server& svr,
+                                       AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                                       ResponseStore* response_store,
+                                       ManagementGroupStore* mgmt_group_store,
+                                       detail::AgentRegistry* registry, TagStore* tag_store,
+                                       detail::EventBus* event_bus,
+                                       AgentsJsonFn agents_json_fn,
+                                       DispatchFn dispatch_fn,
+                                       ResolveFn resolve_fn,
+                                       yuzu::MetricsRegistry* metrics,
+                                       InstructionStore* instruction_store) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    response_store, mgmt_group_store, registry, tag_store, event_bus,
+                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(resolve_fn),
+                    metrics, instruction_store);
+}
+
+void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                        ResponseStore* response_store,
                                        ManagementGroupStore* mgmt_group_store,
@@ -205,7 +228,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     }
 
     // -- GET /fragments/results -----------------------------------------------
-    svr.Get("/fragments/results",
+    sink.Get("/fragments/results",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Response", "Read")) return;
 
@@ -316,7 +339,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- GET /fragments/results/filter-bar ------------------------------------
-    svr.Get("/fragments/results/filter-bar",
+    sink.Get("/fragments/results/filter-bar",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Response", "Read")) return;
 
@@ -364,7 +387,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     //
     // Securable: Response:Read — sibling parity with /fragments/results
     // and the /api/v1/executions/{id}/visualization REST endpoint.
-    svr.Get(R"(/fragments/executions/([A-Za-z0-9._-]+)/visualization)",
+    sink.Get(R"(/fragments/executions/([A-Za-z0-9._-]+)/visualization)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Response", "Read")) return;
                 auto execution_id = req.matches[1].str();
@@ -419,7 +442,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- GET /fragments/create-group-form -------------------------------------
-    svr.Get("/fragments/create-group-form",
+    sink.Get("/fragments/create-group-form",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
 
@@ -437,7 +460,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- POST /api/dashboard/group-from-results -------------------------------
-    svr.Post("/api/dashboard/group-from-results",
+    sink.Post("/api/dashboard/group-from-results",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ManagementGroup", "Write")) return;
                  auto session = auth_fn_(req, res);
@@ -530,7 +553,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
              });
 
     // -- POST /api/dashboard/execute — HTMX-native instruction dispatch --------
-    svr.Post("/api/dashboard/execute",
+    sink.Post("/api/dashboard/execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
 
@@ -763,7 +786,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
              });
 
     // -- POST /api/dashboard/tar-execute (TAR warehouse SQL query) -------------
-    svr.Post("/api/dashboard/tar-execute",
+    sink.Post("/api/dashboard/tar-execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
 
@@ -863,7 +886,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
              });
 
     // -- GET /fragments/scope-list (enhanced with groups) ----------------------
-    svr.Get("/fragments/scope-list",
+    sink.Get("/fragments/scope-list",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
                 auto session = auth_fn_(req, res);
@@ -896,7 +919,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     // fleet on every page load — the dispatch is an explicit operator action,
     // surfaced in the audit trail.
 
-    svr.Get("/fragments/tar/retention-paused",
+    sink.Get("/fragments/tar/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Infrastructure", "Read")) {
                     if (metrics_) {
@@ -934,7 +957,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 }
             });
 
-    svr.Post("/fragments/tar/retention-paused/scan",
+    sink.Post("/fragments/tar/retention-paused/scan",
              [this](const httplib::Request& req, httplib::Response& res) {
                  // Dispatching a command to the fleet is an Execute action,
                  // not a Read. Sibling dispatch handlers (`run-instruction`,
@@ -1108,7 +1131,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     // out-of-scope device_ids are rejected with the same 404 body as
     // not-connected so non-operators cannot use this endpoint as an
     // existence-enumeration oracle.
-    svr.Post("/fragments/tar/retention-paused/reenable",
+    sink.Post("/fragments/tar/retention-paused/reenable",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) {
                      // Compliance F1: denied audit on RBAC rejection.
@@ -1269,7 +1292,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     // The agent refuses if the source is still enabled — that is the authoritative
     // TOCTOU guard. Dispatch is fire-and-forget, so rows_deleted is computed
     // agent-side (returned in the response record) and is NOT in this audit row.
-    svr.Post("/fragments/tar/retention-paused/purge",
+    sink.Post("/fragments/tar/retention-paused/purge",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Infrastructure", "Delete")) {
                      audit_fn_(req, "tar.source.purge", "denied", "command", "", "rbac_denied");
