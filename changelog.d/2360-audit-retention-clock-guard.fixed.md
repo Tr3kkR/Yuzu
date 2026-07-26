@@ -18,8 +18,9 @@
   `yuzu_server_audit_cleanup_failed_total` (errored or store closed),
   `yuzu_server_audit_retention_cap_reached_total` (the backlog is not draining),
   `yuzu_server_audit_rows_deleted_total`, `yuzu_server_audit_retention_index_ok`
-  and `yuzu_server_audit_retention_persist_failed_total` (the last is a gauge, the
-  rest counters). All but `rows_deleted_total` ship with a Prometheus alert rule. A
+  and `yuzu_server_audit_retention_persist_failed_total`. All are counters except
+  `retention_index_ok`, which is a gauge. All but `rows_deleted_total` ship with a
+  Prometheus alert rule. A
   partial index on `audit_events(ttl_expires_at, id)` keeps the pass index-driven;
   it is built best-effort outside the migration runner, so a failure to create it
   degrades retention to full scans instead of taking the audit trail offline.

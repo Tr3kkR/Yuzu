@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1442,4 +1443,127 @@ TEST_CASE("TAR #2361: a delete failure stops the pass instead of leaking autocom
     CHECK(row_count(*f.db, "process_hourly") == 6);
     CHECK(row_count(*f.db, "tcp_hourly") == 6); // its 5 expired rows survive too
     CHECK(failures_of(f.guard, "process_hourly") >= 1);
+}
+
+TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writer's work",
+          "[tar][retention][clock-guard]") {
+    // Kimi / Gate 8, and the defect that survived four rounds. Driving
+    // BEGIN/COMMIT through execute_sql releases the database mutex between
+    // statements, so a concurrent collector INSERT or set_config joined the
+    // retention transaction -- and once retention started rolling back on
+    // failure, the rollback discarded that write after its caller had been told
+    // it succeeded. Silent collateral data loss on the endpoint.
+    //
+    // execute_atomic_batch holds the mutex for the whole transaction, so an
+    // interleaved write can no longer be inside it.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> written{0};
+    std::thread writer([&] {
+        // A stand-in for a collector tick: an ordinary committed write on the
+        // same connection, racing the retention pass.
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (f.db->set_config("collector_heartbeat", std::to_string(written.load() + 1)))
+                written.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    run_retention(*f.db, kT0, f.guard);
+    stop.store(true, std::memory_order_relaxed);
+    writer.join();
+
+    REQUIRE(written.load() > 0); // the racing writer really did commit something
+    // Its last acknowledged write must still be there: the retention rollback
+    // reaches only retention's own statements.
+    CHECK(f.db->get_config("collector_heartbeat", "") == std::to_string(written.load()));
+    // And retention itself still failed closed.
+    CHECK(row_count(*f.db, "process_hourly") == 6);
+    CHECK(failures_of(f.guard, "process_hourly") >= 1);
+}
+
+TEST_CASE("TAR #2361: the latch is HELD through a capped drain, then released",
+          "[tar][retention][clock-guard]") {
+    // Gate 8 coverage gap: every prior over-cap test used a survivor, so
+    // `would_wipe` was false and the latch was trivially clear. This is the
+    // transition the latch rewrite actually governs -- an all-expired backlog
+    // larger than one pass can delete.
+    constexpr int64_t kSurplus = 3;
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
+                           static_cast<int>(yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus));
+
+    run_retention(*f.db, kT0, f.guard); // decline #1
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(latched_of(f.guard, "process_hourly"));
+
+    // Accepted, capped: a backlog remains, so the latch must STAY armed or the
+    // next pass would decline a second time for the same anomaly.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == kSurplus);
+    CHECK(latched_of(f.guard, "process_hourly"));
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+
+    // Final pass clears the backlog, so the latch releases in that same pass.
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 0);
+    CHECK_FALSE(latched_of(f.guard, "process_hourly"));
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+}
+
+TEST_CASE("TAR #2361: the latch does NOT survive an agent restart",
+          "[tar][retention][clock-guard]") {
+    // Gate 8 coverage gap. The clock reading is persisted; the latch deliberately
+    // is not, so a reboot re-declines. Nothing pinned that, so persisting the
+    // latch by mistake would have left the whole suite green.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 10);
+
+    run_retention(*f.db, kT0, f.guard);
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(latched_of(f.guard, "process_hourly"));
+
+    yuzu::tar::RetentionGuardState fresh; // agent restarts
+    run_retention(*f.db, kT0 + 1, fresh);
+    CHECK(row_count(*f.db, "process_hourly") == 10); // declines again, does not delete
+    CHECK(declines_of(fresh, "process_hourly") == 1);
+}
+
+TEST_CASE("TAR #2361: a failed delete re-arms the latch, matching the audit sibling",
+          "[tar][retention][clock-guard]") {
+    // Kimi / Gate 8 found the two stores had diverged here: audit re-arms on a
+    // delete failure, TAR left the latch at its read-phase value. A failed pass
+    // learned nothing about the clock, so carrying an armed latch forward lets
+    // the NEXT pass accept a still-live anomaly with no decline and no counter.
+    // The backlog must EXCEED the per-pass cap. Below it, the latch rule itself
+    // (`would_wipe && cap_will_bind`) already clears the latch on the accepting
+    // pass, so the re-arm would be redundant and the test would pass without it.
+    constexpr int64_t kSurplus = 3;
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
+                           static_cast<int>(yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus));
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, latch armed
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(latched_of(f.guard, "process_hourly"));
+
+    // Latched, so this pass ACCEPTS -- and the delete fails.
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") ==
+          yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus);
+    CHECK(failures_of(f.guard, "process_hourly") >= 1);
+    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // re-armed
+
+    // Same wipe condition, still unresolved: it must decline again rather than
+    // delete on a latch the failure had spent.
+    REQUIRE(f.db->execute_sql("DROP TRIGGER block_del"));
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") ==
+          yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
 }

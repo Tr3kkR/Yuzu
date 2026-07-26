@@ -507,7 +507,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     enum class Emit {
         None,
         ProbeFailed,
-        DeclineFirstPass,
+        DeclineWipe,
         DeclineStep,
         DeclineImplausible,
         Deleted,
@@ -668,9 +668,12 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             if ((would_wipe || big_step || prev_implausible) && !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 clock_anomaly_latched_ = true;
-                emit = prev_implausible  ? Emit::DeclineImplausible
-                       : !prev_pass_now  ? Emit::DeclineFirstPass
-                                         : Emit::DeclineStep;
+                // Name the trigger that actually fired. Reporting an elapsed
+                // delta for a would_wipe-only decline attributed a clock step or
+                // outage that did not happen, in the SOC 2-relevant log line.
+                emit = prev_implausible ? Emit::DeclineImplausible
+                       : big_step       ? Emit::DeclineStep
+                                        : Emit::DeclineWipe;
             } else {
                 deleted = delete_capped_locked(now, would_wipe, emit_err);
                 if (!emit_err.empty())
@@ -701,17 +704,19 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     case Emit::DeleteFailed:
         spdlog::warn("AuditStore: cleanup error: {}", emit_err);
         break;
-    case Emit::DeclineFirstPass:
-        spdlog::warn("AuditStore: the first retention pass after start would expire EVERY datable "
-                     "audit row; declining once so a clock anomaly cannot delete the audit trail "
-                     "wholesale");
+    case Emit::DeclineWipe:
+        spdlog::warn("AuditStore: this retention pass would expire EVERY datable audit row; "
+                     "declining once so a clock anomaly cannot delete the audit trail wholesale. "
+                     "(No unusual gap since the last pass -- either the clock moved while this "
+                     "server was running, or the store is genuinely all-expired.)");
         break;
     case Emit::DeclineStep:
-        spdlog::warn("AuditStore: this retention pass would expire {} ({}s since the last pass, "
-                     "threshold {}s -- a forward clock jump OR an outage that long); declining "
-                     "once so a clock anomaly cannot delete the audit trail wholesale",
-                     emit_full_wipe ? "EVERY datable audit row" : "an unexpectedly large slice",
-                     emit_delta, emit_window);
+        spdlog::warn("AuditStore: {}s elapsed since the last retention pass, over the {}s "
+                     "threshold -- a forward clock jump OR an outage that long. This pass would "
+                     "have expired {}; declining once so a clock anomaly cannot delete the audit "
+                     "trail wholesale",
+                     emit_delta, emit_window,
+                     emit_full_wipe ? "EVERY datable audit row" : "an unexpectedly large slice");
         break;
     case Emit::Deleted:
         if (emit_capped)

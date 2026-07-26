@@ -330,8 +330,9 @@ configuration is required.
 ## Retention and cleanup
 
 Audit events are retained for 365 days by default. A background thread runs
-every hour and deletes events whose `timestamp` falls outside the retention
-window. Deletion is permanent --- there is no soft-delete or archive step.
+every hour and deletes events whose `ttl_expires_at` has passed. That TTL is
+stamped once, when the row is written, as `insert time + retention window` -- it
+is not derived from the event's own `timestamp`, and nothing ever rewrites it. Deletion is permanent --- there is no soft-delete or archive step.
 
 To preserve audit data beyond the retention window, export events periodically
 using the REST API or forward them to an external system (see Planned Features
@@ -381,8 +382,9 @@ case, which is why the elapsed-time reading is persisted across restarts. Taken
 together the guard converts an instantaneous wipe into a paced one plus an
 operator signal; it does not guarantee every clock anomaly is detected.
 
-Six metrics report on this. Alert on all of them, and do not collapse the
-first two:
+Six metrics report on this. All but `rows_deleted_total` ship with an alert rule
+in `docs/prometheus/yuzu-alerts.yml`; that one is a rate to read alongside the
+others, not an alert on its own. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|

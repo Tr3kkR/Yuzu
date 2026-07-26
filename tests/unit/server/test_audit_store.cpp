@@ -956,9 +956,11 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     std::size_t pass = 0;
     std::uint64_t skips = 0, failures = 0;
     std::size_t remaining = before;
-    // INT64_MAX and a far-future value are "ahead of now" -> anomaly, decline.
-    // -1 is out of range -> no comparison point, but not itself an anomaly.
-    // The final pass runs with the row deleted entirely (a fresh-install shape).
+    // INT64_MAX, -1 and a far-future value are all implausible readings, so each
+    // declines. (-1 used to be a quiet reset; round 4 made it an anomaly, because
+    // no pass this code runs can write a negative reading.) The final pass runs
+    // with the row deleted entirely -- a fresh-install shape, which is NOT an
+    // anomaly.
     for (const char* value : std::array<const char*, 4>{"9223372036854775807", "-1",
                                                         "1799999999", nullptr}) {
         if (value)
@@ -1097,4 +1099,55 @@ TEST_CASE("AuditStore #2360: INT64_MIN in the stored reading is rejected before 
     REQUIRE(store.is_open());
     CHECK(store.cleanup_once(kNow) == 0); // declines; no subtraction is performed
     CHECK(store.clock_anomaly_skips_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360: the latch is HELD through a capped drain, then released",
+          "[audit_store][retention][clock-guard]") {
+    // Gate 8 coverage gap: every prior over-cap test used a survivor, so
+    // `would_wipe` was false and the latch was trivially clear. This is the
+    // transition the latch rewrite governs -- an all-expired backlog larger than
+    // one pass can delete.
+    constexpr std::size_t kSurplus = 4;
+    GuardFixture f;
+    f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
+
+    REQUIRE(f.store.cleanup_once(kNow) == 0); // decline #1
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // Accepted, capped: a backlog remains, so the latch must STAY armed --
+    // otherwise the next pass declines a second time for the same anomaly.
+    CHECK(f.store.cleanup_once(kNow + 1) == kMaxAuditDeletesPerPass);
+    CHECK(f.store.cap_reached_count() == 1);
+    CHECK(f.store.clock_anomaly_skips_count() == 1);
+
+    // Final pass clears it; the latch releases in that same pass.
+    CHECK(f.store.cleanup_once(kNow + 2) == kSurplus);
+    CHECK(f.store.total_count() == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 1);
+
+    // Proof the latch actually released: a fresh anomaly declines again.
+    f.seed(kNow - 100, 3);
+    CHECK(f.store.cleanup_once(kNow + 3) == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 2);
+}
+
+TEST_CASE("AuditStore #2360: the latch does NOT survive a restart",
+          "[audit_store][retention][clock-guard]") {
+    // Gate 8 coverage gap. The clock reading is persisted; the latch deliberately
+    // is not, so a restart re-declines. Nothing pinned that, so persisting the
+    // latch by mistake would have left the suite green.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-latchrestart-"}};
+    {
+        AuditStore first(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(first.is_open());
+        seed_rows_with_ttl(tmp.path, kNow - 100, 10);
+        REQUIRE(first.cleanup_once(kNow) == 0); // decline, latch armed
+        REQUIRE(first.clock_anomaly_skips_count() == 1);
+    }
+
+    AuditStore second(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(second.is_open());
+    CHECK(second.cleanup_once(kNow + 1) == 0); // declines again, does not delete
+    CHECK(second.total_count() == 10);
+    CHECK(second.clock_anomaly_skips_count() == 1);
 }

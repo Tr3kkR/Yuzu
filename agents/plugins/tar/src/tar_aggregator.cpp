@@ -388,46 +388,13 @@ std::optional<bool> exists_where(TarDatabase& db, std::string_view table,
     return v != 0;
 }
 
-// Issues ROLLBACK on scope exit unless commit() succeeded. `TarDatabase` does
-// not expose its raw `sqlite3*`, so `server/core/src/sqlite_raii.hpp`'s
-// SqliteTxn cannot be reused here; this is the same contract over the
-// `execute_sql` seam. Without it, a throw between BEGIN and COMMIT leaves the
-// shared connection wedged in an open write transaction -- every subsequent
-// collector INSERT then accumulates uncommitted until the next rollup 900s
-// later, and a crash in between loses all of it.
-class TarTxnGuard {
-public:
-    explicit TarTxnGuard(TarDatabase& db) : db_(db) {}
-    ~TarTxnGuard() noexcept {
-        if (committed_)
-            return;
-        // This destructor's whole purpose is to run during an exception unwind,
-        // and execute_sql is not noexcept (it locks a mutex and logs). A throw
-        // here would be std::terminate -- the guard turning the failure it exists
-        // to contain into a crash.
-        try {
-            db_.execute_sql("ROLLBACK");
-        } catch (...) {
-        }
-    }
-    TarTxnGuard(const TarTxnGuard&) = delete;
-    TarTxnGuard& operator=(const TarTxnGuard&) = delete;
-    bool commit() {
-        committed_ = db_.execute_sql("COMMIT");
-        return committed_;
-    }
-
-private:
-    TarDatabase& db_;
-    bool committed_{false};
-};
 
 // ONE aggregate line per pass, never one per table. A real clock anomaly trips
 // every time-based table at once and a broken database fails all of them, so
 // per-table warns would bury the signal ~20 lines deep on an endpoint nobody is
 // tailing. Per-table detail is at debug; the durable operator surface is the
 // `tar status` counters, since the agent has no /metrics endpoint.
-void warn_if_degraded(int declined, int unreadable, int total) {
+void warn_if_degraded(int declined, int unreadable, int total, bool persist_failed) {
     if (declined > 0)
         spdlog::warn("TAR retention: clock guard declined {} of {} time-based tables this pass. "
                      "More than the retention threshold elapsed since the last pass, or the whole "
@@ -439,6 +406,10 @@ void warn_if_degraded(int declined, int unreadable, int total) {
                      "were skipped and are NOT being retained (see retention_guard_failed in "
                      "`tar status`)",
                      unreadable, total);
+    if (persist_failed)
+        spdlog::warn("TAR retention: could not persist the clock reading; after a restart this "
+                     "agent will have no comparison point and the elapsed-time check will not "
+                     "fire (see retention_guard_failed|__clock_state__ in `tar status`)");
 }
 
 } // namespace
@@ -693,61 +664,41 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
 
 
     if (plans.empty()) {
-        warn_if_degraded(declined_tables, unreadable_tables, time_based_tables);
+        warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
         return; // a fully-declining pass writes nothing at all, not even a BEGIN
     }
 
-    // Per-statement outcome, sized BEFORE the transaction so recording a failure
-    // inside it cannot allocate (and so cannot throw between BEGIN and COMMIT).
-    std::vector<char> failed(plans.size(), 0);
-    bool txn_failed = false;
-
-    // M17: Wrap all retention deletes -- row-count and guarded time-based alike
-    // -- in a single transaction to amortize fsync cost. Every statement was
-    // built during the read phase, so this loop ALLOCATES nothing. It is not
-    // formally no-throw: execute_sql takes a mutex and logs, neither of which is
-    // declared noexcept. That is why TarTxnGuard's destructor is noexcept and
-    // swallows -- an exception here unwinds through it and rolls back, rather
-    // than terminating.
-    if (!db.execute_sql("BEGIN TRANSACTION")) {
-        txn_failed = true; // no transaction, so nothing to roll back
-    } else {
-        TarTxnGuard txn(db);
-        for (std::size_t i = 0; i < plans.size(); ++i) {
-            if (db.execute_sql(plans[i].sql))
-                continue;
-            // STOP at the first failure. Some SQLite errors (SQLITE_FULL,
-            // SQLITE_IOERR, a RAISE(ROLLBACK) trigger) abort the transaction
-            // automatically; continuing would then run the remaining deletes as
-            // AUTOCOMMITS, which the guard's ROLLBACK cannot undo -- deletions
-            // escaping the transaction that was supposed to contain them
-            // (#2361 Gate 8 / Sol). Everything queued is reported as failed,
-            // because the transaction is now going to be rolled back anyway.
-            for (std::size_t j = 0; j < plans.size(); ++j)
-                failed[j] = 1;
-            txn_failed = true;
-            break;
-        }
-        // A failed COMMIT rolls the whole transaction back, so EVERY queued
-        // delete is undone -- not just the ones that errored. Attributing the
-        // failure to all of them is what keeps the status surface honest: the
-        // alternative reported a healthy zero while time-based retention had
-        // stopped completely and the disk filled.
-        if (!txn.commit())
-            txn_failed = true;
-    }
+    // Hand the whole batch to the store so it runs under ONE held lock. The
+    // previous shape drove BEGIN/COMMIT through execute_sql, which releases the
+    // database mutex between statements -- so a concurrent collector INSERT or
+    // `set_config` joined the retention transaction, and the rollback this pass
+    // performs on failure then discarded that write after its caller had already
+    // been told it succeeded (#2361 Gate 8 / Kimi). Silent collateral data loss,
+    // widened by the deliberate rollback rather than caused by it.
+    std::vector<std::string> sql;
+    sql.reserve(plans.size());
+    for (const auto& p : plans)
+        sql.push_back(p.sql);
+    const auto batch = db.execute_atomic_batch(sql);
 
     {
         std::lock_guard lock(guard.mu);
-        for (std::size_t i = 0; i < plans.size(); ++i)
-            if (txn_failed || failed[i])
-                ++guard.delete_failures[plans[i].table];
+        for (std::size_t i = 0; i < plans.size(); ++i) {
+            if (!batch.failed[i])
+                continue;
+            ++guard.delete_failures[plans[i].table];
+            // Re-arm, exactly as the audit sibling does on its delete-failure
+            // path. Nothing was deleted, so the pass learned nothing about the
+            // clock; carrying a set latch forward would let the next pass accept
+            // a real anomaly with no decline and no counter.
+            guard.latched[plans[i].table] = false;
+        }
     }
-    if (txn_failed)
-        spdlog::warn("TAR retention: the delete transaction failed; {} queued table prunes were "
-                     "rolled back and nothing was retained this pass",
+    if (!batch.committed)
+        spdlog::warn("TAR retention: the delete transaction did not commit; {} queued table "
+                     "prunes were rolled back and nothing was retained this pass",
                      plans.size());
-    warn_if_degraded(declined_tables, unreadable_tables, time_based_tables);
+    warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
 }
 
 } // namespace yuzu::tar

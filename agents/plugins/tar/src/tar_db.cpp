@@ -1749,6 +1749,69 @@ bool TarDatabase::execute_sql(const std::string& sql) {
     return true;
 }
 
+TarDatabase::BatchResult
+TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
+    BatchResult out;
+    out.failed.assign(statements.size(), 0);
+    if (statements.empty())
+        return out;
+
+    std::lock_guard lock(mu_);
+    if (!db_) {
+        out.failed.assign(statements.size(), 1);
+        return out;
+    }
+
+    char* err = nullptr;
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &err) != SQLITE_OK) {
+        spdlog::error("TarDatabase::execute_atomic_batch BEGIN failed: {}",
+                      err ? err : "unknown error");
+        sqlite3_free(err);
+        out.failed.assign(statements.size(), 1);
+        return out; // no transaction was opened, so nothing to roll back
+    }
+    sqlite3_free(err);
+    out.began = true;
+
+    bool ok = true;
+    for (const auto& sql : statements) {
+        err = nullptr;
+        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK) {
+            sqlite3_free(err);
+            continue;
+        }
+        spdlog::error("TarDatabase::execute_atomic_batch statement failed: {}",
+                      err ? err : "unknown error");
+        sqlite3_free(err);
+        ok = false;
+        break; // see the header: continuing risks autocommits past an auto-rollback
+    }
+
+    if (ok) {
+        err = nullptr;
+        if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err) == SQLITE_OK) {
+            sqlite3_free(err);
+            out.committed = true;
+            return out;
+        }
+        spdlog::error("TarDatabase::execute_atomic_batch COMMIT failed: {}",
+                      err ? err : "unknown error");
+        sqlite3_free(err);
+    }
+
+    // Rolled back as a whole, so every statement is reported failed.
+    err = nullptr;
+    if (sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, &err) != SQLITE_OK) {
+        // SQLite may already have rolled back automatically; that is not an
+        // additional failure, it is the state we wanted.
+        spdlog::debug("TarDatabase::execute_atomic_batch ROLLBACK: {}",
+                      err ? err : "no transaction active");
+    }
+    sqlite3_free(err);
+    out.failed.assign(statements.size(), 1);
+    return out;
+}
+
 bool TarDatabase::execute_sql_range(const std::string& sql, int64_t from, int64_t to) {
     std::lock_guard lock(mu_);
     if (!db_)

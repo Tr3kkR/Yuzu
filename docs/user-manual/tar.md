@@ -294,8 +294,9 @@ ever writes (corruption or tampering); the source is fail-closed until it is
 re-`configure`d. See the tri-state description below.
 
 `retention_guard_declines_total` counts retention passes this agent declined
-because its clock moved, and `retention_guard_failures_total` counts passes where
-a table could not be read at all (see "The retention clock guard" below). Both
+because its clock moved, and `retention_guard_failures_total` counts tables that
+could not be retained at all -- whether the probes could not be read or the
+delete itself failed (see "The retention clock guard" below). Both
 are always emitted. **Read them together**: a zero declines total only means the
 clock is behaving if the failures total is also zero -- a table whose probes fail
 every pass has silently stopped being retained, and would otherwise report as
@@ -415,7 +416,10 @@ TAR is designed for minimal performance overhead:
 - **Performance sampling**: a handful of kernel-counter reads every 30s; one row written per sample. The `$Perf_Live` 7-day window holds ~20,000 rows (~1-2 MB) per endpoint at the default cadence.
 - **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day (plus the ~1-2 MB perf window)
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
-- **Automatic purge**: old events are removed hourly based on the retention setting
+- **Automatic purge**: old events are removed on the rollup tick (every 900 s).
+  Each tier's window comes from the schema registry's per-granularity default,
+  **not** from the `retention_days` configure key -- that key is stored and
+  reported by `status` but is not what the warehouse tiers prune against.
 
 ### The retention clock guard
 

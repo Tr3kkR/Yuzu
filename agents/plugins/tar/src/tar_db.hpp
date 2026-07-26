@@ -430,8 +430,45 @@ public:
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).
      * Returns true on success.
+     *
+     * NOTE this takes `mu_` PER CALL. A caller that issues `BEGIN` through this
+     * method does NOT own the transaction: another thread's write on this same
+     * connection lands between statements and joins it, so a later ROLLBACK
+     * discards that write too. Use `execute_atomic_batch` for anything
+     * transactional.
      */
     bool execute_sql(const std::string& sql);
+
+    /// Outcome of `execute_atomic_batch`.
+    struct BatchResult {
+        bool began{false};     ///< BEGIN IMMEDIATE succeeded
+        bool committed{false}; ///< COMMIT succeeded (false => rolled back)
+        /// Per-statement failure flags, sized to the input. On any failure every
+        /// entry is set, because the transaction is rolled back as a whole.
+        std::vector<char> failed;
+    };
+
+    /**
+     * Run `statements` as ONE transaction while holding `mu_` for the whole
+     * thing, so no other writer on this connection can join it.
+     *
+     * That isolation is the point (#2361 Gate 8 / Kimi). `execute_sql` releases
+     * `mu_` between statements, so a caller-driven BEGIN/COMMIT silently
+     * enrolled any concurrent collector INSERT or `set_config` write into the
+     * transaction -- and once retention started rolling back on failure, that
+     * rollback silently discarded those writes after their callers had already
+     * been told they succeeded. `purge_source` already holds `mu_` across
+     * `BEGIN IMMEDIATE`; this is the same pattern, exposed for reuse.
+     *
+     * Stops at the FIRST failed statement: several SQLite errors (SQLITE_FULL,
+     * SQLITE_IOERR, a RAISE(ROLLBACK) trigger) abort the transaction
+     * automatically, and continuing would run the rest as autocommits that the
+     * rollback cannot undo.
+     *
+     * Cost: collectors block for the batch's duration. Bounded by the caller's
+     * own per-statement caps, and the same trade `purge_source` already accepts.
+     */
+    BatchResult execute_atomic_batch(const std::vector<std::string>& statements);
 
     /**
      * Execute parameterized SQL with two int64 bind values.
