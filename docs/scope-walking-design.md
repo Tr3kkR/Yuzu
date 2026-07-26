@@ -167,7 +167,7 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | Method | Path | Body | Returns | Notes |
 |---|---|---|---|---|
 | `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[]}` | `{id, ttl_at, device_count}` | Direct create — operator passes pre-computed members. Used by dashboard for "I have a CSV" import. |
-| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, query, parent_id?}` | `{id, ttl_at, device_count}` | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. |
+| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, query, parent_id?}` | `{id, ttl_at, device_count}` | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
 | `POST` | `/api/v1/result-sets/from-tar-query` | `{name?, sql, parent_id?}` | `{id, ttl_at, device_count}` | Dispatches the SQL to TAR agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
 | `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `{id, ttl_at, device_count}` | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
 | `GET` | `/api/v1/result-sets` | — | `{result_sets: [...]}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |

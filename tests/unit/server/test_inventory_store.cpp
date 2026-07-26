@@ -159,6 +159,41 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
         CHECK(*c == 3);
     }
 
+    SECTION("upsert rejects a blank agent_id/plugin (GDPR orphan guard, IS5/UP-7)") {
+        store.upsert("", "installed_software", R"({"x":1})", 1000);
+        store.upsert("agent-blank-plugin", "  ", R"({"x":1})", 1000);
+        auto blank_id = store.get("", "installed_software");
+        REQUIRE(blank_id.has_value());
+        CHECK_FALSE(blank_id->has_value()); // never written
+        auto blank_plugin = store.get_agent_inventory("agent-blank-plugin");
+        REQUIRE(blank_plugin.has_value());
+        CHECK(blank_plugin->empty());
+    }
+
+    SECTION("upsert never lets an older report overwrite a newer row (stale guard, IS6/UP-8)") {
+        // agent-1/installed_software is already seeded at collected_at=1000.
+        store.upsert("agent-1", "installed_software", R"({"n":"older"})", 500); // older: rejected
+        auto after_older = store.get("agent-1", "installed_software");
+        REQUIRE(after_older.has_value());
+        REQUIRE(after_older->has_value());
+        CHECK((*after_older)->data_json == R"({"n":1})");
+        CHECK((*after_older)->collected_at == 1000);
+
+        store.upsert("agent-1", "installed_software", R"({"n":"same-instant"})",
+                     1000); // equal: still updates
+        auto after_equal = store.get("agent-1", "installed_software");
+        REQUIRE(after_equal.has_value());
+        REQUIRE(after_equal->has_value());
+        CHECK((*after_equal)->data_json == R"({"n":"same-instant"})");
+
+        store.upsert("agent-1", "installed_software", R"({"n":"newer"})", 2000); // newer: updates
+        auto after_newer = store.get("agent-1", "installed_software");
+        REQUIRE(after_newer.has_value());
+        REQUIRE(after_newer->has_value());
+        CHECK((*after_newer)->data_json == R"({"n":"newer"})");
+        CHECK((*after_newer)->collected_at == 2000);
+    }
+
     SECTION("delete_agent: empty-id guard, commit status, idempotent") {
         CHECK_FALSE(store.delete_agent(""));
         auto still_there = store.get_agent_inventory("agent-1");
@@ -260,4 +295,84 @@ TEST_CASE("InventoryStore migrate_from_sqlite fails closed on an unreadable lega
         f << "not a sqlite database";
     }
     CHECK_FALSE(store.migrate_from_sqlite(corrupt.path));
+}
+
+TEST_CASE("InventoryStore migrate_from_sqlite skips a bad row (invalid UTF-8) and a "
+          "blank-key row without bricking boot — good rows still land",
+          "[pg][inventory]") {
+    // IB2/UP-1: InventoryStore is FAIL-SOFT/self-healing (the agent re-pushes), so
+    // a single malformed legacy row must never abort the whole backfill/boot.
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    InventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_"};
+    InventoryRecord good;
+    good.agent_id = "legacy-good";
+    good.plugin = "installed_software";
+    good.data_json = R"({"ok":true})";
+    good.collected_at = 100;
+
+    // Invalid-UTF-8 bytes (a lone continuation byte + overlong sequence) — SQLite
+    // stores TEXT as raw bytes with no encoding validation, but Postgres's UTF8
+    // client/server encoding validation rejects this on INSERT — the per-row
+    // SAVEPOINT must recover from exactly this failure mode.
+    InventoryRecord bad;
+    bad.agent_id = "legacy-bad";
+    bad.plugin = "installed_software";
+    bad.data_json = std::string("\xFF\xFE\xFA\xFB");
+    bad.collected_at = 200;
+
+    InventoryRecord blank_id;
+    blank_id.agent_id = "";
+    blank_id.plugin = "installed_software";
+    blank_id.data_json = R"({"orphan":true})";
+    blank_id.collected_at = 300;
+
+    InventoryRecord blank_plugin;
+    blank_plugin.agent_id = "legacy-blank-plugin";
+    blank_plugin.plugin = "";
+    blank_plugin.data_json = R"({"orphan":true})";
+    blank_plugin.collected_at = 400;
+
+    InventoryRecord good2;
+    good2.agent_id = "legacy-good-2";
+    good2.plugin = "device_ci";
+    good2.data_json = R"({"ok":true})";
+    good2.collected_at = 500;
+
+    // Bad/blank rows interleaved with good ones so the SAVEPOINT recovery must
+    // actually resume the loop, not just tolerate a trailing failure.
+    seed_legacy_db(legacy.path, {good, bad, blank_id, blank_plugin, good2});
+
+    REQUIRE(store.migrate_from_sqlite(legacy.path)); // must NOT fail closed — no infra error
+
+    auto g1 = store.get("legacy-good", "installed_software");
+    REQUIRE(g1.has_value());
+    REQUIRE(g1->has_value());
+    CHECK((*g1)->data_json == R"({"ok":true})");
+
+    auto g2 = store.get("legacy-good-2", "device_ci");
+    REQUIRE(g2.has_value());
+    REQUIRE(g2->has_value());
+
+    auto bad_row = store.get("legacy-bad", "installed_software");
+    REQUIRE(bad_row.has_value()); // not a degrade
+    CHECK_FALSE(bad_row->has_value()); // skipped, never landed
+
+    auto blank_plugin_row = store.get_agent_inventory("legacy-blank-plugin");
+    REQUIRE(blank_plugin_row.has_value());
+    CHECK(blank_plugin_row->empty()); // skipped, never landed
+
+    auto c = store.count();
+    REQUIRE(c.has_value());
+    CHECK(*c == 2); // only the two good rows — bad + both blank-key rows skipped
+
+    // Idempotent: a second call is a cheap no-op (already stamped).
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    auto c2 = store.count();
+    REQUIRE(c2.has_value());
+    CHECK(*c2 == 2);
 }

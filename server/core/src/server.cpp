@@ -648,8 +648,21 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
-                          "(installed_software/device_ci). /readyz stays green under pure pool "
-                          "saturation, so this is the read-path degrade signal",
+                          "(installed_software/device_ci/generic — generic is the ADR-0037 "
+                          "InventoryStore). /readyz stays green under pure pool saturation, so "
+                          "this is the read-path degrade signal",
+                          "counter");
+        // Generic InventoryStore observability (ADR-0037 hardening round).
+        metrics_.describe("yuzu_inventory_ingest_dropped_total",
+                          "Generic InventoryStore upsert calls that did not persist, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error/invalid_key) — the "
+                          "agent's next report re-sends the same blob (fail-soft), but a "
+                          "sustained non-zero rate means writes are silently not landing",
+                          "counter");
+        metrics_.describe("yuzu_inventory_query_truncated_total",
+                          "Generic InventoryStore query() calls whose result count hit the "
+                          "effective row limit (caller limit or the kQueryRowCap ceiling) — more "
+                          "rows may exist past what was returned",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -2967,6 +2980,10 @@ public:
                                   inv_db.string());
                     startup_failed_ = true;
                 } else {
+                    // Set-once before serving (race-free): wires the shared
+                    // read-degrade counter + the new ingest-drop/query-truncation
+                    // counters (governance IS3).
+                    inventory_store_->set_metrics(&metrics_);
                     if (gateway_service_)
                         gateway_service_->set_inventory_store(inventory_store_.get());
                 }
@@ -4367,6 +4384,14 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // Generic InventoryStore (ADR-0037): same discipline as the typed PG
+        // stores below — null the borrowed pointer in both ingest services,
+        // then drop the store, BEFORE the pool (governance IS1: this was
+        // previously the one PG store missing this unwire-then-reset step).
+        agent_service_.set_inventory_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_inventory_store(nullptr);
+        inventory_store_.reset();
         // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
         // thread that leased it is already joined above).
         preflight_run_store_.reset();
@@ -6276,6 +6301,10 @@ private:
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
                 device_inventory_store_ && device_inventory_store_->is_open();
+            // Generic InventoryStore (ADR-0037) — was wired into /readyz but missing
+            // here (governance IS2: the file's own comments document this exact
+            // readyz-vs-healthz drift as a previously-shipped bug for other stores).
+            bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
@@ -6284,7 +6313,7 @@ private:
                                  guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                                  offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                                  app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
-                                 approval_ok;
+                                 inventory_ok && approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -6305,7 +6334,8 @@ private:
                   {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
-                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
+                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
+                  {"inventory_store", inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.

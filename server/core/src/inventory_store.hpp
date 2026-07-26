@@ -18,10 +18,11 @@
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement
-/// (`inventory_store.inventory_data`), and uses `RETURNING` for
-/// mutate-and-return — never `sqlite3_changes()` (#1033). No secrets
-/// (ADR-0010 does not apply — `data_json` is plugin-collected inventory,
-/// not credential material).
+/// (`inventory_store.inventory_data`). Mutators check the `PgResult` status
+/// directly rather than `sqlite3_changes()` (#1033); none needs `RETURNING`
+/// (no caller consumes an affected-row count). No secrets (ADR-0010 does not
+/// apply — `data_json` is plugin-collected inventory, not credential
+/// material).
 ///
 /// Failure posture (ADR-0012 §1), split by operation class:
 ///  - **Ingest (`upsert`)**: FAIL-SOFT. A transient lease/query failure logs
@@ -51,6 +52,10 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -107,6 +112,16 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_inventory_read_degrade_total{reason, source="generic"}`, shared
+    /// with the typed sibling stores) and the ingest-drop / query-truncation
+    /// counters below. Set ONCE during single-threaded startup, before the
+    /// gRPC/REST surfaces begin serving — the pointer is read without
+    /// synchronisation on the serving threads, so a later swap would race. A
+    /// null registry (the default, e.g. in unit tests) disables emission;
+    /// every emit site is null-guarded.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
     /// One-time, idempotent first-boot backfill from the legacy SQLite
     /// `inventory.db` (ADR-0009/0037). Call once at startup, before serving.
     ///
@@ -116,25 +131,48 @@ public:
     ///    after the first is a cheap single-row lookup.
     ///  - If `legacy_db_path` does not exist, stamps "nothing to backfill"
     ///    and returns true (a fresh install never had a legacy file).
-    ///  - Otherwise opens the legacy SQLite file READ-ONLY, copies every row
-    ///    of its `inventory_data` table into
-    ///    `inventory_store.inventory_data` via `INSERT ... ON CONFLICT
-    ///    (agent_id, plugin) DO NOTHING` (never clobbers a row a live agent
-    ///    has already re-reported since this boot sequence started), all
-    ///    inside one transaction, then stamps completion. The legacy file is
-    ///    never written to — it stays the rollback net for one release
-    ///    (ADR-0009) — and is not deleted by this call.
-    ///  - FAILS CLOSED: returns false on any legacy-open/read error or any
-    ///    Postgres write error. The caller MUST treat `false` as a fatal
-    ///    startup error (`startup_failed_ = true` in `server.cpp`) — per
-    ///    ADR-0009, the server refuses to start rather than serve
-    ///    half-migrated inventory data.
+    ///  - Otherwise opens the legacy SQLite file READ-ONLY (via RAII owners —
+    ///    no manual finalize/close), reads every row of its `inventory_data`
+    ///    table, and inserts each one into `inventory_store.inventory_data`
+    ///    via `INSERT ... ON CONFLICT (agent_id, plugin) DO NOTHING` (never
+    ///    clobbers a row a live agent has already re-reported since this boot
+    ///    sequence started), each under its own SAVEPOINT inside one overall
+    ///    transaction, then stamps completion. The legacy file is never
+    ///    written to — it stays the rollback net for one release (ADR-0009) —
+    ///    and is not deleted by this call.
+    ///  - A single BAD ROW (a legacy value that violates encoding/constraints —
+    ///    e.g. invalid UTF-8) does NOT abort the backfill: its SAVEPOINT is
+    ///    rolled back, the row is logged at warn + counted skipped, and the
+    ///    loop continues. A row with an empty/blank `agent_id` or `plugin` is
+    ///    skipped the same way (never backfilled as an un-erasable orphan —
+    ///    the decommission cascade's empty-id guard could never reach it).
+    ///    This store is FAIL-SOFT / self-healing (the agent re-pushes), so one
+    ///    malformed legacy blob must not permanently brick the server.
+    ///  - FAILS CLOSED only on a genuine INFRASTRUCTURE error — the initial
+    ///    connection/lease, the backfill transaction's own BEGIN/SAVEPOINT/
+    ///    COMMIT, or a `ROLLBACK TO SAVEPOINT` that itself fails (the signal
+    ///    that the connection, not just one row, is broken) — never on a
+    ///    single bad row. The caller MUST treat `false` as a fatal startup
+    ///    error (`startup_failed_ = true` in `server.cpp`) — per ADR-0009, the
+    ///    server refuses to start rather than serve against an unreachable
+    ///    database.
+    ///  - The `backfill_state.legacy_rows` stamp records the count of rows
+    ///    actually inserted (per-statement affected-row count via
+    ///    `PQcmdTuples`), not the size of the in-memory legacy row list —
+    ///    skipped/orphaned/conflicting rows are not counted as inserted.
     [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// Upsert inventory data for an agent+plugin pair. FAIL-SOFT ingest: a
     /// lease/query failure is logged and this returns without throwing — the
-    /// agent's next report re-sends the same blob. If data already exists for
-    /// (agent_id, plugin), it is replaced.
+    /// agent's next report re-sends the same blob (a drop bumps
+    /// `yuzu_inventory_ingest_dropped_total`). A blank (empty/whitespace-only)
+    /// `agent_id` or `plugin` is REJECTED (logged, no write) — never persisted
+    /// as an un-erasable orphan the decommission cascade's empty-id guard
+    /// could never reach (GDPR). If data already exists for (agent_id,
+    /// plugin), it is replaced ONLY when `collected_at` is not older than the
+    /// stored row's — a reordered/duplicate older report can never clobber
+    /// newer data (a same-instant re-report, `collected_at` equal, still
+    /// updates).
     void upsert(const std::string& agent_id, const std::string& plugin,
                 const std::string& data_json, int64_t collected_at = 0);
 
@@ -151,7 +189,11 @@ public:
 
     /// Query inventory across agents with filters. AUTHORITATIVE read:
     /// `std::nullopt` on a store/pool/query degrade, NEVER a silent empty. An
-    /// empty value = no rows matched.
+    /// empty value = no rows matched. When the result count hits the
+    /// effective limit (the caller's `q.limit`, clamped to `kQueryRowCap`),
+    /// more rows may exist past what is returned — this is logged and bumps
+    /// `yuzu_inventory_query_truncated_total` so an operator/caller can tell
+    /// "capped at N" from "exactly N" (full keyset pagination is a follow-up).
     [[nodiscard]] std::optional<std::vector<InventoryRecord>> query(const InventoryQuery& q) const;
 
     /// Get all inventory records for a specific agent. AUTHORITATIVE read:
@@ -172,6 +214,7 @@ public:
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server
