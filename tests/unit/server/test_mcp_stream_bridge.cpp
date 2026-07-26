@@ -1931,6 +1931,89 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
     }
 }
 
+TEST_CASE("bridge streamed-POST close is allocation-free and keyed (C6c)",
+          "[mcp][bridge][2f]") {
+    // The pump's releaser runs inside ~Response, so it must not build the record
+    // key itself - that is a bad_alloc site in a destructor. record_key() pays
+    // that cost up front and the releaser closes with the string it returned.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-k"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+    CHECK_FALSE(fx.bridge->record_key(s.id, json(99)).has_value());  // unknown record
+
+    SECTION("no final written - the record parks for GET resume") {
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        CHECK_FALSE(fx.bridge->on_post_closed_keyed(*key));  // exactly once
+    }
+    SECTION("final already on the wire - the record is DONE, not parked") {
+        REQUIRE(fx.bridge->on_final_written(*key));
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        // Parking here would hold a resume window open for an answer the client
+        // already has.
+        auto ph = fx.bridge->phase_for(s.id, json(1));
+        CHECK((!ph.has_value() || ph == Bridge::Phase::kDone));  // kDone, or already reaped
+    }
+    SECTION("on_final_written only accepts a live streamed record") {
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));  // -> kRingOnly
+        CHECK_FALSE(fx.bridge->on_final_written(*key));
+    }
+}
+
+TEST_CASE("bridge sweep backstop PARKS a stranded kStreaming record, never reaps it (C6c)",
+          "[mcp][bridge][2f]") {
+    // No sweep pass claims kStreaming, so a record whose releaser never ran is
+    // invisible to all of them - including session death - and leaks for the life
+    // of the process. The backstop must PARK it: a reap would unsubscribe, unpin
+    // and erase a result the client can still legitimately collect.
+    Fx fx{Bridge::Config{.global_record_cap = 256,
+                         .ring_only_pressure_cap = 64,
+                         .streaming_park_after = std::chrono::seconds(0)}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-strand"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    // The releaser never runs - exactly the stranding this backstop exists for.
+    fx.bridge->sweep();
+
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);  // PARKED
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 1.0);
+
+    // Parked, not torn down: the subscription survived, so the real terminal
+    // still reaches the ring for GET resume. A reap would have destroyed it.
+    fx.bus.publish("exec-strand", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+    for (const auto& f : ring_frames(*s.stream, "alice")) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["status"] == "completed");
+            CHECK(j["result"]["execution_id"] == "exec-strand");
+        }
+    }
+}
+
+TEST_CASE("bridge sweep backstop leaves a healthy kStreaming record alone (C6c)",
+          "[mcp][bridge][2f]") {
+    // The mirror of the test above: with a live session and the normal threshold
+    // the sweep must NOT park a stream out from under its own pump.
+    Fx fx;  // default streaming_park_after = 600s
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-live"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    fx.bridge->sweep();
+    CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 0.0);
+}
+
 TEST_CASE("bridge park_after_dispatch_failure - parks, keeps the subscription, publishes the real final (C6b)",
           "[mcp][bridge][2f]") {
     // A post-dispatch failure means the work IS running, so the record must keep
