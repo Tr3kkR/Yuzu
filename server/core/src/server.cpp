@@ -611,13 +611,13 @@ public:
         // #2500 REST targeting refusals. Deliberately NOT the MCP counter above:
         // these are different surfaces with different gates, and folding them into
         // one series would make `yuzu_mcp_*` count calls that never touched MCP.
-        // Both axes are closed — `route` is the two REST twins that dispatch on
-        // caller-supplied targeting, `reason` iterates the ONE array in
+        // Both axes are closed — `route` is the REST surfaces that dispatch or
+        // narrow on caller-supplied targeting, `reason` iterates the ONE array in
         // dispatch_target_shape.hpp — so this pre-seed is exhaustive and absent()
         // stays meaningful. A reason added at an emit site instead of in that array
         // is emitted-but-unseeded: it passes its own test while the dashboard reads
         // zero and the alert never fires.
-        for (const char* route : {"command", "instruction_execute"}) {
+        for (const char* route : {"command", "instruction_execute", "result_set_parent"}) {
             for (const auto reason : yuzu::server::kTargetingShapeReasons) {
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
@@ -7926,35 +7926,44 @@ private:
             // is rather than being subsumed the way `ident_empty` subsumed MCP's: it
             // currently runs BEFORE require_permission, and moving an auth-adjacent
             // check is not something to do silently inside a targeting fix.
-            bool named_target = false;
-            bool target_rejected = false;
-            try {
-                const auto body = nlohmann::json::parse(req.body);
-                if (auto bv = yuzu::server::check_targeting_shape(body)) {
-                    metrics_
-                        .counter("yuzu_server_dispatch_target_rejected_total",
-                                 {{"route", "command"}, {"reason", bv->reason}})
-                        .increment();
-                    (void)audit_log(req, "command.dispatch", "denied", "command", "",
-                                    std::string("reason=") + bv->reason);
-                    res.status = 400;
-                    res.set_content(
-                        nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
-                                        {"meta", {{"api_version", "v1"}}}})
-                            .dump(),
-                        "application/json");
-                    target_rejected = true;
-                } else {
-                    named_target = yuzu::server::targeting_supplied(body);
-                }
-            } catch (const std::exception&) {
-                // Unreachable: a body that does not parse yields an empty `plugin`,
-                // which the check above already refused. Left as "named no target"
-                // rather than swallowed silently, so a future reorder of that check
-                // degrades to today's broadcast semantics, not to an unguarded one.
-            }
-            if (target_rejected)
+            // Parsed with allow_exceptions=false rather than a try/catch that falls
+            // through. The earlier form set "named no target" in its catch and
+            // CONTINUED, arguing the catch was unreachable because a body that does
+            // not parse yields an empty `plugin`. That holds for parse errors — but
+            // not for std::bad_alloc: under memory pressure a body of
+            // {"agent_ids":[]} would have landed in the catch and proceeded to
+            // broadcast. A fail-OPEN catch inside the fix for a widening defect
+            // (governance, cpp-safety). A discarded value yields contains()==false
+            // on every query below, so an unparseable body is refused here rather
+            // than continuing with unknown targeting.
+            const auto body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            // `check_targeting_shape` requires an OBJECT: contains() is false for an
+            // array or scalar, so `["dev-1"]` would read as "named no target" and
+            // broadcast — the very shape this route is being fixed for. Three Gate-3
+            // reviewers found this independently; the precondition is enforced here
+            // and pinned by a route test, not left as a comment on the header.
+            if (!body.is_object()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
+                    "application/json");
                 return;
+            }
+            if (auto bv = yuzu::server::check_targeting_shape(body)) {
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", bv->reason}})
+                    .increment();
+                (void)audit_log(req, "command.dispatch", "denied", "command", "",
+                                std::string("reason=") + bv->reason);
+                res.status = 400;
+                res.set_content(nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
+                return;
+            }
+            const bool named_target = yuzu::server::targeting_supplied(body);
 
             // Per-action securable elevation + scope confinement for DESTRUCTIVE
             // generic-dispatch actions (governance HIGH #2). /api/command otherwise
@@ -8052,7 +8061,17 @@ private:
             auto scope_expr = extract_json_string(req.body, "scope");
 
             int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
+            // the MCP execute_instruction schema, docs/scope-walking-design.md), and
+            // it is handled here as "no scope expression" so the ordering matches the
+            // shared closure and the MCP one exactly: an explicit agent_ids list
+            // still wins. Before #2500 this route fed `__all__` to scope::parse,
+            // which fails, so the caller got a 503 having reached nobody — while the
+            // sibling instruction-execute route broadcast on the same string. One
+            // advertised scope kind must not mean two things across sibling REST
+            // routes (governance, security MEDIUM).
+            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+            if (arm == yuzu::server::DispatchArm::Group) {
                 // Group-based dispatch — resolve group members
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
@@ -8062,7 +8081,7 @@ private:
                             ++sent;
                     }
                 }
-            } else if (!scope_expr.empty()) {
+            } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
                 // This raw path is untracked (no execution row), so read the
@@ -8097,7 +8116,16 @@ private:
                         ++sent;
                     }
                 }
-            } else if (agent_ids.empty()) {
+            } else if (arm == yuzu::server::DispatchArm::Ids) {
+                for (const auto& aid : agent_ids) {
+                    if (registry_.send_to(aid, cmd)) {
+                        ++sent;
+                    }
+                }
+            } else if (arm == yuzu::server::DispatchArm::Broadcast) {
+                // Explicitly asked for the fleet by its published name.
+                sent = registry_.send_to_all(cmd);
+            } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
                 // widen to the whole fleet — `{"agent_ids": []}` from a device
@@ -8117,7 +8145,11 @@ private:
                         .counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", "command"}, {"reason", "agent_ids_empty"}})
                         .increment();
-                    (void)audit_log(req, "command.dispatch", "denied", "command", command_id,
+                    // Empty target_id, matching the source-side denial above: the
+                    // same verb must not carry two different target shapes, and a
+                    // command_id for a command that was never dispatched reads in
+                    // the audit trail as though one was.
+                    (void)audit_log(req, "command.dispatch", "denied", "command", "",
                                     "reason=agent_ids_empty");
                     res.status = 400;
                     res.set_content(
@@ -8126,12 +8158,6 @@ private:
                     return;
                 }
                 sent = registry_.send_to_all(cmd);
-            } else {
-                for (const auto& aid : agent_ids) {
-                    if (registry_.send_to(aid, cmd)) {
-                        ++sent;
-                    }
-                }
             }
 
             // Forward commands queued for gateway agents
@@ -10700,14 +10726,23 @@ private:
                 agent_service_.record_execution_id(command_id, execution_id);
             }
             int sent = 0;
-            // Broadcast is now something a caller ASKS FOR by name (#2500).
-            // `__all__` is not a new vocabulary: the MCP dispatch closure has
-            // always special-cased it, and this closure's own callers already
-            // describe their untargeted path as "__all__" in their comments —
-            // they simply passed empty and relied on the fall-through below.
-            if (scope_expr == "__all__") {
-                sent = registry_.send_to_all(cmd);
-            } else if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // Broadcast is something a caller ASKS FOR by name (#2500).
+            // `__all__` is not new vocabulary: the MCP closure below has always
+            // special-cased it, and this closure's own callers already
+            // described their untargeted path as "__all__" in their comments —
+            // they simply passed empty and relied on the fall-through.
+            //
+            // ORDERING IS LOAD-BEARING and mirrors the MCP closure exactly:
+            // `__all__` is treated as "no scope expression", NOT as a
+            // first-wins broadcast. An earlier revision of this commit put the
+            // broadcast branch at the TOP of the chain, which made
+            // {agent_ids:["a"], scope:"__all__"} reach the whole fleet here
+            // while the MCP closure reached exactly agent "a" — a widening
+            // introduced by the commit that exists to remove widenings, and a
+            // fourth dialect of a token that already had three. An explicit id
+            // list must always win over a broadcast request.
+            const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+            if (arm == DispatchArm::Group) {
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
                     auto members = mgmt_group_store_->get_members(group_id);
@@ -10715,7 +10750,7 @@ private:
                         if (registry_.send_to(m.agent_id, cmd))
                             ++sent;
                 }
-            } else if (!scope_expr.empty()) {
+            } else if (arm == DispatchArm::Scope) {
                 // from_result_set: is owner-scoped; recover the dispatching
                 // operator from the execution row (run_async / workflow /
                 // scheduled all create it with dispatched_by before dispatch).
@@ -10746,31 +10781,35 @@ private:
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                 }
-            } else if (agent_ids.empty()) {
-                // NO TARGET NAMED AT ALL — reach NOBODY, not everybody (#2500).
-                //
-                // This closure has eight callers. Six were safe only because six
-                // authors each remembered to guard their own inputs, and the two
-                // that did not were the pair #2500 was filed about. That is a
-                // single point of failure with an eight-way surface, and the
-                // failure mode is the worst one available: an unintended
-                // fleet-wide dispatch that reports success.
-                //
-                // Inverting the default makes the ninth caller's omission
-                // harmless. Every caller that legitimately broadcasts now says
-                // so with `scope_expr = "__all__"` above — a grep-able, explicit
-                // request rather than the residue of an empty vector.
-                //
-                // No behaviour changed when this landed: every existing caller
-                // either guards its inputs, passes a specific id, or was updated
-                // in the same commit to name `__all__`.
-                spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
-                             "no agents; pass scope \"__all__\" to broadcast deliberately",
-                             plugin, norm_action);
-            } else {
+            } else if (arm == DispatchArm::Ids) {
                 for (const auto& aid : agent_ids)
                     if (registry_.send_to(aid, cmd))
                         ++sent;
+            } else if (arm == DispatchArm::Broadcast) {
+                sent = registry_.send_to_all(cmd);
+            } else {
+                // NO TARGET NAMED AT ALL — reach NOBODY, not everybody (#2500).
+                //
+                // This closure has TEN callers (governance corrected an earlier
+                // count of eight: DexRoutes and TarTreeRoutes reach it through
+                // 5-param adapters). Eight were safe only because eight authors
+                // each remembered to guard their own inputs, and the two that
+                // did not were the pair #2500 was filed about. That is a single
+                // point of failure with a ten-way surface, and the failure mode
+                // is the worst one available: an unintended fleet-wide dispatch
+                // that reports success.
+                //
+                // Inverting the default makes the eleventh caller's omission
+                // harmless. Every caller that legitimately broadcasts names
+                // kBroadcastScope — a grep-able request, not the residue of an
+                // empty vector.
+                //
+                // No behaviour changed when this landed: every existing caller
+                // either guards its inputs, passes a specific id, or was updated
+                // in the same commit to name the sentinel.
+                spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
+                             "no agents; pass scope \"{}\" to broadcast deliberately",
+                             plugin, norm_action, kBroadcastScope);
             }
             forward_gateway_pending();
             if (sent > 0)

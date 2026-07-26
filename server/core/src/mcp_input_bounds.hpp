@@ -136,8 +136,12 @@ static_assert(2 * kOneSaturatedBundleStep > kMcpMaxRequestBodyBytes,
               "the clamp changed and the docs must change with it");
 
 /// One violated bound. Defined in `dispatch_target_shape.hpp` now that the
-/// targeting rules are shared with the REST twins (#2500); aliased here so
-/// every existing `mcp::BoundViolation` call site is unchanged.
+/// targeting rules are shared with the REST twins (#2500).
+///
+/// Kept as a compat shim, not because call sites need it: governance checked,
+/// and every consumer in `server/` and `tests/` spells it `auto`, so nothing
+/// outside these two headers names the type. An earlier version of this comment
+/// claimed the alias keeps existing call sites unchanged — it does, vacuously.
 using BoundViolation = yuzu::server::BoundViolation;
 
 /// Every reason `check_targeting_shape` can emit must ALSO be a member of

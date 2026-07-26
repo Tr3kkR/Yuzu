@@ -1,5 +1,7 @@
 #include "schedule_runner.hpp"
 
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
+
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "execution_tracker.hpp"
@@ -211,8 +213,9 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
     // create-route validation gap with its own product decision (should a
     // schedule have to name `__all__`?) and is tracked separately — see #2500's
     // sibling issue. When it is fixed, this mapping is what stops being needed.
-    const std::string dispatch_scope =
-        s.scope_expression.empty() ? std::string("__all__") : s.scope_expression;
+    const std::string dispatch_scope = s.scope_expression.empty()
+                                           ? std::string(yuzu::server::kBroadcastScope)
+                                           : s.scope_expression;
     try {
         std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
                                                     dispatch_scope,

@@ -1393,6 +1393,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        // `check_targeting_shape` requires an OBJECT: nlohmann's contains() is
+        // false for an array or scalar, so a body of `["dev-1","dev-2"]` would
+        // read as "named no target" and broadcast to the whole fleet — the exact
+        // class this route is being fixed for, arriving through the guard itself.
+        // Found independently by three Gate-3 reviewers.
+        if (!j.is_object()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
         // ── Targeting shape: supplied-but-names-nothing is an ERROR (#2500) ──
         // The same rule, from the same function, that MCP execute_instruction
         // enforces (#2492). Before this, `{"agent_ids": []}`, a non-array
@@ -1550,8 +1563,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // the deliberate case onto the sink's explicit `__all__` branch and
             // leaves an accidental empty — from any future code path that skips
             // the check — reaching nobody instead of everybody.
-            const std::string dispatch_scope =
-                (agent_ids.empty() && scope_expr.empty()) ? std::string("__all__") : scope_expr;
+            const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
+                                                   ? std::string(kBroadcastScope)
+                                                   : scope_expr;
             std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
                                                       dispatch_scope, params, execution_id);
         } catch (const std::exception& e) {

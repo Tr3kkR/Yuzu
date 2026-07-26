@@ -191,6 +191,48 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — a device target that was supplied but names nothing is now refused, not widened to the fleet (#2500)
+
+**What changed.** Three REST surfaces treated a targeting argument the caller *supplied* that
+resolved to no devices as identical to one they never sent — and "no target named" meant
+broadcast. `POST /api/command` with `{"plugin":"service","action":"restart","agent_ids":[1,2,3]}`
+restarted the service on **every connected agent** under plain `Execution:Execute`, with no
+approval step, and returned a success response. So did `{"agent_ids": []}`, which is what any
+device filter that matched nothing produces. Each of these is now `400`.
+
+**What breaks.** Requests that previously succeeded and now fail:
+
+| Endpoint | Shape | Was | Now |
+|---|---|---|---|
+| `POST /api/command` | `agent_ids` `[]`, non-array, or containing a non-string | broadcast to all | `400` |
+| `POST /api/command` | `scope` `""` or non-string | broadcast to all | `400` |
+| `POST /api/instructions/{id}/execute` | `agent_ids` `[]`, non-array | broadcast to all | `400` |
+| `POST /api/instructions/{id}/execute` | `scope` `""` or non-string | broadcast to all | `400` |
+| `POST /api/v1/result-sets/from-*` | `parent_id` empty, non-string, or `null` | searched/dispatched unscoped | `400` |
+| all of the above | body is not a JSON object | treated as "no target" → broadcast | `400` |
+
+The instructions-execute row is the one to read twice: `"scope": "" + empty agent_ids = broadcast`
+was **documented** behaviour in `rest-api.md`, so a client written against the published contract
+is affected. The `from-*` row covers `from-tar-query`, `from-instruction-result`, `re-eval` and
+`from-inventory-query`.
+
+**What still works, unchanged.** **Omitting both** `agent_ids` and `scope` broadcasts to the whole
+fleet, on every route. So does an explicit `"scope": "__all__"` — the ground scope kind already
+advertised by `/discover/scope-kinds` and by the MCP `execute_instruction` schema. If you have a
+client sending `"scope": ""` to mean "everything", change it to omit the field or to send
+`"__all__"`; both are supported and neither is deprecated.
+
+**Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
+sends `__all__` instead of an empty string.
+
+**How to find affected clients before they break.** Refusals are counted by
+`yuzu_server_dispatch_target_rejected_total{route,reason}` (all series pre-seeded at boot, so
+`absent()` stays meaningful) and audited as `command.dispatch|denied`,
+`instruction.execute|denied` or `result_set.create|denied` with `detail=reason=<reason>`. The
+`YuzuDispatchTargetRejected` alert fires on any non-zero rate — deliberately more sensitive than
+the MCP equivalent, because before this change these same calls reached the entire fleet and
+reported success.
+
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 
 Two operator-visible changes to held-open MCP/SSE streams authenticated by an

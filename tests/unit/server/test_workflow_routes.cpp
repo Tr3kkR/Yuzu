@@ -63,6 +63,12 @@ struct ExecHarness {
     // alive while ~ExecutionTracker runs (it doesn't close, only finalizes
     // statements), then SqliteHandleGuard closes the handle on destruction.
     SqliteHandleGuard tracker_guard;
+    /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
+    /// owns the route lambdas that capture `&metrics`, so this ordering is what
+    /// keeps the borrowed pointer valid for as long as a handler could run. An
+    /// earlier revision declared it after `sink` and asserted the wrong
+    /// invariant in a comment; structure, not prose (governance, cpp-safety).
+    yuzu::MetricsRegistry metrics;
     yuzu::server::test::TestRouteSink sink;
 
     /// Optional shared admission budget (ADR-0034). Default nullptr keeps every
@@ -111,9 +117,6 @@ struct ExecHarness {
     int dispatch_calls{0};
     std::vector<std::string> last_dispatch_agent_ids;
     std::string last_dispatch_scope;
-    /// Borrowed by the routes' lambdas, so it must outlive `routes` — hence
-    /// declared above it.
-    yuzu::MetricsRegistry metrics;
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -1508,6 +1511,72 @@ TEST_CASE("#2500 — an explicit non-empty target is unaffected",
     h.dispatch_sent_override = 1;
 
     auto res = h.sink.Post("/api/instructions/def-T7/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 1);
+    CHECK(h.last_dispatch_agent_ids[0] == "agent-1");
+}
+
+TEST_CASE("#2500 — a non-object body is refused, not read as an unnamed target",
+          "[workflow][executions][execute][targeting][security]") {
+    // `check_targeting_shape` asks the body whether it CONTAINS targeting keys,
+    // and nlohmann's contains() answers false for an array or a scalar. So
+    // before the route rejected non-objects, `["dev-1","dev-2"]` — a plausible
+    // shape from a client that forgot the envelope — looked identical to a body
+    // that named no target at all, and "named no target" means the whole fleet.
+    // The guard the fix installs would have widened through its own front door.
+    //
+    // Found independently by three Gate-3 reviewers; the precondition is
+    // enforced at the route and pinned here rather than left as a header
+    // comment, because a comment is not a check.
+    for (const char* body : {R"(["dev-1","dev-2"])", "5", "null", R"("dev-1")"}) {
+        ExecHarness h;
+        h.make_def("def-T8", "T8");
+        auto res = h.sink.Post("/api/instructions/def-T8/execute", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls == 0);
+    }
+}
+
+TEST_CASE("#2500 — an explicit scope of __all__ broadcasts by name",
+          "[workflow][executions][execute][targeting]") {
+    // The vocabulary this fix introduces at the dispatch sink, exercised from
+    // the outside. `__all__` is a PUBLISHED ground scope kind — advertised by
+    // /discover/scope-kinds and named in the MCP execute_instruction schema —
+    // so a caller may legitimately send it, and the dashboard's "All agents"
+    // option does exactly that. It must reach the sink intact rather than being
+    // refused as a scope that resolves to no devices.
+    ExecHarness h;
+    h.make_def("def-T9", "T9");
+    h.dispatch_cmd_override = "cmd-3";
+    h.dispatch_sent_override = 2;
+
+    auto res = h.sink.Post("/api/instructions/def-T9/execute", R"({"scope":"__all__"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_scope == "__all__");
+    CHECK(h.last_dispatch_agent_ids.empty());
+}
+
+TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
+          "[workflow][executions][execute][targeting][security]") {
+    // This pins that the ROUTE forwards both fields intact. The precedence
+    // DECISION itself lives in the dispatch sink, which this harness cannot
+    // reach (it stubs the dispatch closure) — that is covered by
+    // classify_dispatch_arm's own tests in test_dispatch_target_shape.cpp.
+    // Saying so explicitly rather than letting the case name imply it proves
+    // the sink: getting precedence wrong is how the first attempt at the sink
+    // inversion introduced a NEW widening.
+    ExecHarness h;
+    h.make_def("def-T10", "T10");
+    h.dispatch_cmd_override = "cmd-4";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/instructions/def-T10/execute",
+                           R"({"agent_ids":["agent-1"],"scope":"__all__"})");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.dispatch_calls == 1);

@@ -27,6 +27,8 @@
 
 using yuzu::server::check_targeting_shape;
 using yuzu::server::kTargetingShapeReasons;
+using yuzu::server::classify_dispatch_arm;
+using yuzu::server::DispatchArm;
 using yuzu::server::targeting_supplied;
 
 namespace {
@@ -116,4 +118,55 @@ TEST_CASE("#2500 — every emitted reason is a member of the closed label set",
     // to the array without an emit site would leave a permanently-zero series
     // that reads as "this can never happen".
     CHECK(kTargetingShapeReasons.size() == 5);
+}
+
+// ── classify_dispatch_arm — the branch selection with fleet-wide blast radius ──
+//
+// Extracted from the dispatch closures during governance for one reason: it was
+// the highest-consequence decision in the change and nothing tested it. The
+// closures live inside `Server::start()`, unreachable by any harness (#1786),
+// and the route tests assert against STUB dispatch closures — so reverting the
+// real sink's default would have broken no test at all.
+
+TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
+          "[targeting][dispatch][security]") {
+    // THE regression this exists for. The first version of the sink inversion
+    // put Broadcast first in the chain, so {agent_ids:["a"], scope:"__all__"}
+    // reached the ENTIRE FLEET on the shared closure while the MCP closure
+    // reached exactly agent "a" — a widening introduced by the change that
+    // exists to remove widenings, and a fourth dialect of a token that already
+    // had three. A contradictory request resolves to the SPECIFIC reading.
+    CHECK(classify_dispatch_arm(/*has_agent_ids=*/true, "__all__") == DispatchArm::Ids);
+    CHECK(classify_dispatch_arm(/*has_agent_ids=*/false, "__all__") == DispatchArm::Broadcast);
+}
+
+TEST_CASE("#2500 — nothing named selects None, which reaches nobody",
+          "[targeting][dispatch][security]") {
+    // The inversion itself: empty ids + empty scope used to fall into
+    // send_to_all on the shared closure. Eight of its ten callers were safe
+    // only because eight authors each remembered to guard their own inputs.
+    CHECK(classify_dispatch_arm(false, "") == DispatchArm::None);
+}
+
+TEST_CASE("#2500 — a real scope expression outranks both ids and broadcast",
+          "[targeting][dispatch]") {
+    // Pre-existing precedence, pinned so the #2500 reshuffle cannot have
+    // changed it silently: a scope expression has always won over agent_ids on
+    // these closures, and `group:` is dispatched by member lookup rather than
+    // through the scope engine.
+    CHECK(classify_dispatch_arm(true, "tag:prod") == DispatchArm::Scope);
+    CHECK(classify_dispatch_arm(false, "tag:prod") == DispatchArm::Scope);
+    CHECK(classify_dispatch_arm(true, "group:servers") == DispatchArm::Group);
+    CHECK(classify_dispatch_arm(false, "from_result_set:rs_1") == DispatchArm::Scope);
+
+    // `__all__` is deliberately NOT a scope expression here — it short-circuits
+    // per-device evaluation and never reaches the parser, which is what
+    // /discover/scope-kinds documents. Treating it as one is what made
+    // /api/command 503 on the string its sibling route broadcast on.
+    CHECK(classify_dispatch_arm(true, "group:servers") != DispatchArm::Broadcast);
+}
+
+TEST_CASE("#2500 — ids-only and the empty-string scope are unchanged",
+          "[targeting][dispatch]") {
+    CHECK(classify_dispatch_arm(true, "") == DispatchArm::Ids);
 }

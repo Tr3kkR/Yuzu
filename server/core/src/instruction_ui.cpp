@@ -483,7 +483,15 @@ function executeInstruction() {
 
   var body = {params: params};
   if (scope === '__all__') {
-    body.scope = '';
+    // Send the published ground scope kind, NOT an empty string. Empty used to
+    // mean "broadcast" only by falling through the dispatch sink's untargeted
+    // default; #2500 made a SUPPLIED-but-empty scope a 400, because a caller
+    // whose scope resolved to nothing and a caller who meant the whole fleet
+    // must not look identical on the wire. `__all__` is what
+    // /discover/scope-kinds and the MCP execute_instruction schema both
+    // advertise, so this is the dialog finally sending what its own <option>
+    // value has always said.
+    body.scope = '__all__';
   } else if (scope.startsWith('group:')) {
     body.scope = scope;
   } else {

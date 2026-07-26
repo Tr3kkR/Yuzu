@@ -26,13 +26,36 @@
 /// not, and a REST route including an `mcp_`-named header would be the first
 /// step toward the two surfaces drifting again.
 ///
-/// WHY A SHARED FUNCTION AND NOT A SHARED CONVENTION: the four dispatch
-/// closures in `server.cpp` each end in their own `else if (agent_ids.empty())
-/// send_to_all(cmd)`, and the callers that are safe are safe because their
-/// authors each remembered. That is the property this header exists to
-/// replace. A third copy of these rules is how #2500 happened after #2492
-/// fixed #2437.
+/// WHY A SHARED FUNCTION AND NOT A SHARED CONVENTION: `server.cpp` holds FOUR
+/// dispatch closures that each decide targeting independently — the shared
+/// `command_dispatch_fn`, the `/api/command` inline path, the DashboardRoutes
+/// 5-param closure, and the MCP closure. Every caller that is safe is safe
+/// because its author remembered. That is the property this header exists to
+/// replace, and a second copy of these rules is how #2500 happened on REST
+/// after #2492 fixed the identical defect on MCP.
+///
+/// SCOPE OF WHAT ACTUALLY CHANGED (#2500), stated because a comment claiming a
+/// pattern is gone when it is half-gone is the trap this header exists to
+/// close: only `command_dispatch_fn` had its default INVERTED to reach nobody
+/// on an unnamed target. The `/api/command` inline path guards at its own
+/// source and sink; the Dashboard and MCP closures still broadcast on empty
+/// and are guarded upstream instead. They are not equivalent, and a fifth
+/// closure must not be written by copying whichever one is nearest.
 namespace yuzu::server {
+
+/// The ONE spelling of "every enrolled agent" on the dispatch path.
+///
+/// Not an internal sentinel — a PUBLISHED ground scope kind: advertised by
+/// `/discover/scope-kinds` (`discover_routes.cpp`), named in the MCP
+/// `execute_instruction` inputSchema, and documented in
+/// `docs/scope-walking-design.md`. Callers may legitimately supply it.
+///
+/// It is a named constant because #2500 changed what a typo costs. Before,
+/// `"_all_"` failed to parse and fell into the broadcast default, so a
+/// misspelling reached EVERYBODY — loud, and obvious in seconds. Now it
+/// reaches NOBODY and still answers 200, which is silent. A literal repeated
+/// across five files is how that lands in production unnoticed.
+inline constexpr std::string_view kBroadcastScope{"__all__"};
 
 /// One violated bound. Neither field is ever caller-derived.
 struct BoundViolation {
@@ -83,6 +106,15 @@ inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
 /// non-array or non-string-`scope` cases at all, and would ship half the bug
 /// with green tests.
 ///
+/// PRECONDITION — `args` MUST be a JSON object, and the caller is responsible
+/// for enforcing that BEFORE calling. `nlohmann::contains()` returns false for
+/// an array, a scalar or null, so a non-object body looks exactly like one
+/// that named no target, and "named no target" means the whole fleet. Passing
+/// `["dev-1","dev-2"]` here would therefore broadcast. Both REST callers
+/// reject a non-object body with their existing invalid-body 400 before
+/// reaching this function, and `test_dispatch_target_shape.cpp` pins that
+/// behaviour on each route rather than trusting this paragraph.
+///
 /// Pure and total: no I/O. Returns the FIRST violation in a deterministic
 /// order so a denial is reproducible.
 [[nodiscard]] inline std::optional<BoundViolation>
@@ -110,6 +142,43 @@ check_targeting_shape(const nlohmann::json& args) {
                                   "agents deliberately"};
     }
     return std::nullopt;
+}
+
+/// Which arm of a dispatch closure a (agent_ids, scope_expr) pair selects.
+enum class DispatchArm {
+    Group,     ///< `group:<id>` — resolve members.
+    Scope,     ///< A scope DSL expression — resolve via the scope engine.
+    Ids,       ///< An explicit agent_ids list.
+    Broadcast, ///< `__all__` — every enrolled agent, asked for by name.
+    None,      ///< Nothing named. Reaches NOBODY on the shared closure (#2500).
+};
+
+/// The branch selection shared by the dispatch closures, extracted so the one
+/// decision with fleet-wide blast radius is unit-testable.
+///
+/// It was not testable before: the closures live inside `Server::start()`,
+/// which no harness can reach (#1786), and the route tests assert against STUB
+/// dispatch closures — so reverting the real sink's default broke nothing.
+/// Governance's words: "the highest-blast-radius line in the PR is unverified".
+///
+/// ORDER IS THE CONTRACT, and getting it wrong is not hypothetical: the first
+/// version of the #2500 sink inversion put Broadcast FIRST, which made
+/// `{agent_ids:["a"], scope:"__all__"}` reach the entire fleet on the shared
+/// closure while the MCP closure reached exactly agent "a". A widening
+/// introduced by the change that exists to remove widenings. An explicit id
+/// list therefore always wins over a broadcast REQUEST.
+[[nodiscard]] inline DispatchArm classify_dispatch_arm(bool has_agent_ids,
+                                                       std::string_view scope_expr) {
+    const bool real_scope = !scope_expr.empty() && scope_expr != kBroadcastScope;
+    if (real_scope && scope_expr.starts_with("group:"))
+        return DispatchArm::Group;
+    if (real_scope)
+        return DispatchArm::Scope;
+    if (has_agent_ids)
+        return DispatchArm::Ids;
+    if (scope_expr == kBroadcastScope)
+        return DispatchArm::Broadcast;
+    return DispatchArm::None;
 }
 
 /// Did the caller name a target at all?

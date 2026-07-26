@@ -207,6 +207,27 @@ groups:
             Denials are audited as mcp.<tool>|denied with detail
             "input bound exceeded: <reason>"; correlate there for the principal.
 
+      - alert: YuzuDispatchTargetRejected
+        expr: |
+          sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A REST caller named a device target that resolved to nothing"
+          description: >-
+            yuzu_server_dispatch_target_rejected_total is non-zero on
+            {{ $labels.route }} (reason={{ $labels.reason }}). A client supplied
+            agent_ids, scope or parent_id that names no device - it believes it is
+            targeting specific machines and is not. Before #2500 these calls
+            dispatched to the ENTIRE FLEET and returned success, so any non-zero
+            rate here is a near-miss worth reading, not just a validation
+            failure: the threshold is deliberately >0 rather than the MCP twin's
+            >20. Most often a client emitting numeric device ids, or a device
+            filter that matched nothing. Denials are audited as
+            command.dispatch|denied, instruction.execute|denied or
+            result_set.create|denied with detail "reason=<reason>"; correlate
+            there for the principal.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon

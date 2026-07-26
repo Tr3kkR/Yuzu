@@ -1,4 +1,6 @@
 #include "rest_api_v1.hpp"
+
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
@@ -5911,6 +5913,22 @@ void RestApiV1::register_routes(
             if (body.contains("parent_id") &&
                 (!body["parent_id"].is_string() ||
                  body["parent_id"].get_ref<const std::string&>().empty())) {
+                // Counted and audited on the SAME family as the other two
+                // instances. Governance: without this the third instance is
+                // "deliberately invisible to the alert the PR ships" — the
+                // dashboard would read zero while the same class of refusal
+                // fires, which is the exact absent()-alerting hole the closed
+                // label set exists to prevent.
+                const char* reason =
+                    body["parent_id"].is_string() ? "scope_empty" : "scope_type";
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_dispatch_target_rejected_total",
+                                  {{"route", "result_set_parent"}, {"reason", reason}})
+                        .increment();
+                if (audit_fn)
+                    audit_fn(req, "result_set.create", "denied", "result_set", "",
+                             std::string("reason=") + reason);
                 rs_err(res, 400,
                        "RESULT_SET_BAD_PARENT: parent_id was supplied but names no parent set; "
                        "omit it entirely to dispatch to all agents");
@@ -5967,7 +5985,7 @@ void RestApiV1::register_routes(
             // empty-means-everybody default, which that issue inverted. Pass the
             // sentinel the comment already claims, so the behaviour survives.
             const std::string dispatch_scope =
-                scope_expr.empty() ? std::string("__all__") : scope_expr;
+                scope_expr.empty() ? std::string(kBroadcastScope) : scope_expr;
             try {
                 std::tie(command_id, sent) =
                     command_dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id);
@@ -6146,6 +6164,36 @@ void RestApiV1::register_routes(
                       }
 
                       // Optional parent-scope narrowing.
+                      //
+                      // #2500, FOURTH instance — the one the original fix missed.
+                      // A supplied `parent_id` that is numeric, empty or null used
+                      // to fail the `is_string() && !empty()` test below and leave
+                      // `parent_members` unset, so the query evaluated over the
+                      // UNSCOPED inventory: a caller who believed it was narrowing
+                      // to one result set searched every device instead. This is a
+                      // synchronous producer, so the consequence is a read wider
+                      // than asked for rather than a command dispatch — narrower
+                      // than /api/command's blast radius, the same defect in shape.
+                      // Caught by governance after the first fix guarded only the
+                      // shared `run_async` closure.
+                      if (body.contains("parent_id") &&
+                          (!body["parent_id"].is_string() ||
+                           body["parent_id"].get_ref<const std::string&>().empty())) {
+                          const char* reason =
+                              body["parent_id"].is_string() ? "scope_empty" : "scope_type";
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_parent"}, {"reason", reason}})
+                                  .increment();
+                          if (audit_fn)
+                              audit_fn(req, "result_set.create", "denied", "result_set", "",
+                                       std::string("reason=") + reason);
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
+                                 "parent set; omit it entirely to search all devices");
+                          return;
+                      }
                       std::optional<std::unordered_set<std::string>> parent_members;
                       CreateRequest cr;
                       cr.owner_principal = session->username;
