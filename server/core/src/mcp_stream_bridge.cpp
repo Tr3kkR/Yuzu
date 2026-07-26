@@ -740,7 +740,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // and any later bus/arm activity bound the retry latency instead).
         return;
     }
-    const auto fid = publish_terminal_ladder(rec, std::move(frame));
+    const auto fid = publish_terminal_ladder(rec, std::move(frame)).id;
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later
     // bookkeeping failure may restore + republish.
     guard.terminal_settled = true;
@@ -799,11 +799,12 @@ std::string McpStreamBridge::build_real_final(const BridgeRecord& rec,
     return success_response(rec.jsonrpc_id, base.dump());
 }
 
-std::uint64_t McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                                       std::string frame) {
+McpStreamBridge::LadderResult
+McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
+                                         std::string frame) {
     auto fid = rec->stream->publish_final("message", frame);
     if (fid != 0) {
-        return fid;
+        return {fid, TerminalRung::kPrimary};
     }
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
@@ -812,7 +813,7 @@ std::uint64_t McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<Bri
     // string_view stays alive across the call).
     fid = rec->stream->publish_final("message", rec->fallback_final);
     if (fid != 0) {
-        return fid;
+        return {fid, TerminalRung::kFallback};
     }
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
@@ -821,7 +822,7 @@ std::uint64_t McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<Bri
     // durable execution_id fetch is the recovery path (Decision 15(f) wiring of
     // the mcp_stream caller obligation).
     rec->stream->poison_terminal();
-    return 0;
+    return {0, TerminalRung::kPoisoned};
 }
 
 // ── Sweep ──────────────────────────────────────────────────────────────────
@@ -1030,7 +1031,7 @@ void McpStreamBridge::sweep() {
                                 MailboxEntry tmp{ev->id, ev->data};
                                 oldest->terminal_slot = std::move(tmp);
                                 oldest->terminal_accepted = true;
-                            } catch (...) {
+                            } catch (...) {  // NOLINT(bugprone-empty-catch) - deliberate
                                 // Copy OOM: nothing secured. Defer, keep the
                                 // listener (a retry latches next sweep).
                             }
@@ -1191,6 +1192,10 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
                         "for shutdown");
         return;
     }
+    // #2506 F4: initialised BEFORE the switch on purpose - frame construction can
+    // throw before the ladder is ever reached, and kPoisoned ("nothing reached the
+    // ring") is the honest default for that case too.
+    TerminalRung rung = TerminalRung::kPoisoned;
     switch (decision) {
         case TeardownFinal::kSynthesizeUnavailable:
             // Pressure victim that genuinely NEVER saw a terminal (verified at
@@ -1210,7 +1215,7 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
                 std::string frame =
                     error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
                                    "streamed result forced-expired under memory pressure", data);
-                publish_terminal_ladder(rec, std::move(frame));  // 0 twice ⇒ poison (A6a)
+                rung = publish_terminal_ladder(rec, std::move(frame)).rung;  // 0 twice ⇒ poison
             } catch (...) {
                 // Build-side OOM: nothing published. The record is gone either way;
                 // the durable execution fetch remains, and the failure is counted.
@@ -1225,7 +1230,7 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
             // ("fetch by execution_id"), NEVER -32014. Contain the by-value copy of
             // fallback_final (may OOM).
             try {
-                publish_terminal_ladder(rec, rec->fallback_final);  // 0 twice ⇒ poison
+                rung = publish_terminal_ladder(rec, rec->fallback_final).rung;  // 0 twice ⇒ poison
             } catch (...) {
                 if (metrics_ != nullptr) {
                     obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
@@ -1260,11 +1265,29 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
     // kNone detail stays empty: teardown_claimed(kNone) is shared with pass-2
     // (session-death / pin-ack reaps) whose records need not hold a real final, so a
     // "real final pinned" string would be inaccurate there (sec-INFO1 declined).
-    const char* audit_detail = decision == TeardownFinal::kSynthesizeUnavailable
-                                   ? "terminal-unavailable synthesized (pressure)"
-                                   : decision == TeardownFinal::kFallbackFinal
-                                         ? "fallback final published (terminal payload lost)"
-                                         : "";
+    //
+    // #2506 F4: the detail names WHAT ACTUALLY REACHED THE RING, not what this
+    // branch intended to publish. The ladder can fall through to the record's
+    // prebuilt fallback, or poison the session and publish nothing at all; an audit
+    // row asserting "synthesized" or "published" in those cases is evidence of a
+    // delivery that never happened. The committed id alone cannot distinguish them -
+    // a nonzero id from the retry is indistinguishable from one from the primary
+    // frame - which is why the ladder reports its rung.
+    const char* audit_detail = "";
+    if (decision == TeardownFinal::kSynthesizeUnavailable) {
+        audit_detail = rung == TerminalRung::kPrimary
+                           ? "terminal-unavailable synthesized (pressure)"
+                           : rung == TerminalRung::kFallback
+                                 ? "terminal-unavailable synthesis failed; fallback final "
+                                   "published instead (pressure)"
+                                 : "terminal-unavailable synthesis failed; session poisoned, "
+                                   "nothing published (pressure)";
+    } else if (decision == TeardownFinal::kFallbackFinal) {
+        audit_detail = rung == TerminalRung::kPoisoned
+                           ? "fallback final failed; session poisoned, nothing published "
+                             "(terminal payload lost)"
+                           : "fallback final published (terminal payload lost)";
+    }
     audit_contained(audit_action, exec_id, audit_detail);
 }
 

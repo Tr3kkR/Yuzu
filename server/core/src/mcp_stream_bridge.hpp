@@ -54,12 +54,39 @@
 // Pressure escape hatch (cap `ring_only_pressure_cap`, E1 two-stage): sweep picks
 // the OLDEST parked record, sets pressure_requested (the projector claims no new
 // progress batch for it), and - only once no progress projection is in flight -
-// QUIESCES the subscription, revalidates under the record mutex, and claims kDone
-// ONLY for a terminal-unaccepted, projection-free record; that victim gets a
-// pinned kMcpTerminalUnavailable synthesis carrying the execution_id. A latched
-// or in-flight real terminal always defers the teardown; a REAL pinned final is
-// never destroyed and its pin survives the record (ack/session-death rules
+// hands a callback to ExecutionEventBus::unsubscribe_and_visit_terminal. That is
+// ONE atomic step under the channel mutex: ask the bus whether this execution ever
+// reached a terminal, decide, and remove the listener - and the listener is removed
+// ONLY if the callback commits a claim. There is no unsubscribe-then-re-check
+// window for a terminal to land in; closing that window IS #2409 (C5), so do not
+// re-split this into two steps.
+//
+// Record state DOMINATES the bus verdict: a record that already holds a real final
+// (accepted AND projected) is torn down with nothing published; one with a latched
+// but unprojected terminal, or a projection in flight, DEFERS - keeping its
+// listener. Only a record the bridge has never seen a terminal for lets the bus
+// verdict decide, and the outcome is one of three dispositions:
+//
+//   kNone                   nothing published (a real final is already pinned, or
+//                           this is a plain pin-ack / session-death reap).
+//   kFallbackFinal          the bus says a terminal EXISTED but its payload has
+//                           aged out of the replay buffer: publish the prebuilt
+//                           SUCCESS-shaped final ("fetch it by execution_id").
+//   kSynthesizeUnavailable  the bus says this execution never reached a terminal at
+//                           all: pin a kMcpTerminalUnavailable (-32014) carrying the
+//                           execution_id.
+//
+// -32014 is reachable ONLY from that last case. An aged-out terminal must NEVER
+// become -32014 - the whole point of #2409 is that the bridge stops asserting "no
+// result exists" when all it knows is "I no longer have the payload". A REAL pinned
+// final is never destroyed and its pin survives the record (ack/session-death rules
 // release it). Never evicts a newer record.
+//
+// Teardown ownership is THREE things - the records_ entry, the streamed charge, and
+// the bus subscription - and the claim is ONE-WAY (torn_down excludes the record
+// from every later sweep). So a teardown step that cannot complete leaves the
+// record WHOLE for shutdown() rather than erasing around a live listener, and says
+// so via yuzu_mcp_bridge_teardown_incomplete_total (#2487).
 //
 // Poison blast radius: poison_terminal() is session-wide - every future attach on
 // that session 410s. Reached only on a double publish-failure (allocation death);
@@ -424,11 +451,20 @@ private:
     void project_record(const std::shared_ptr<BridgeRecord>& rec);
     /// Build the parked real final from the bus terminal payload + result_base (B5).
     static std::string build_real_final(const BridgeRecord& rec, const std::string& terminal_data);
-    /// The publish_final → retry-fallback → poison ladder (A6). Returns the
-    /// committed id (0 ⇒ poisoned). `frame` is only viewed (passed as a
-    /// string_view to publish_final); the retry uses the record's fallback_final.
-    std::uint64_t publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                          std::string frame);
+    /// Which rung of the publish ladder actually committed. The committed id alone
+    /// cannot answer this - a nonzero id from the retry looks identical to one from
+    /// the primary frame - and teardown's audit must not claim the caller's frame
+    /// was delivered when the fallback was (#2506 F4).
+    enum class TerminalRung { kPrimary, kFallback, kPoisoned };
+    struct LadderResult {
+        std::uint64_t id = 0;  ///< committed event id; 0 ⇔ kPoisoned
+        TerminalRung rung = TerminalRung::kPoisoned;
+    };
+    /// The publish_final → retry-fallback → poison ladder (A6). `frame` is only
+    /// viewed (passed as a string_view to publish_final); the retry uses the
+    /// record's fallback_final.
+    LadderResult publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
+                                         std::string frame);
 
     /// Claimed-kDone teardown: unsubscribe, publish the decided terminal frame
     /// (kSynthesizeUnavailable = -32014 for a never-terminal victim; kFallbackFinal

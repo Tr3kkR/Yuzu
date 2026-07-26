@@ -1160,6 +1160,75 @@ TEST_CASE("bridge double terminal-publish failure - poison, counted, charge free
     }
 }
 
+TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actually committed "
+          "(#2506 F4)",
+          "[mcp][bridge][2f]") {
+    // The audit row is the evidence that a forced-expire delivered SOMETHING to the
+    // client. The publish ladder can fall through to the record's prebuilt fallback,
+    // or poison the session and publish nothing at all - so a row that always says
+    // "synthesized" evidences a delivery that did not happen. The committed event id
+    // cannot disambiguate this (a nonzero id from the retry is indistinguishable
+    // from one from the primary frame), which is why the ladder reports its rung.
+    auto detail_for = [](Fx& fx, const std::string& action) {
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        for (const auto& [a, d] : fx.audits) {
+            if (a == action) {
+                return d;
+            }
+        }
+        return std::string{"<absent>"};
+    };
+    // Two parked records so the pressure hatch has an oldest to pick; A never
+    // completes, so its disposition is kSynthesizeUnavailable (the -32014 arm).
+    auto build = [](Fx& fx, Fx::Session& s) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-f4-a"));
+        REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-f4-b"));
+        REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+        fx.bus.publish("exec-f4-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+        REQUIRE(fx.bridge->ring_only_count() == 2);
+    };
+
+    SECTION("primary commits: the row says synthesized") {
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        build(fx, s);
+        fx.bridge->sweep();
+        CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
+              "terminal-unavailable synthesized (pressure)");
+    }
+    SECTION("primary fails, the fallback commits: the row says so, and does not claim a "
+            "synthesis") {
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        build(fx, s);
+        // One pre-commit failure: the -32014 frame never lands; the ladder retries
+        // with the record's prebuilt SUCCESS-shaped fallback, which does.
+        s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 1);
+        fx.bridge->sweep();
+        CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
+              "terminal-unavailable synthesis failed; fallback final published instead "
+              "(pressure)");
+    }
+    SECTION("both rungs fail: the row says poisoned, nothing published") {
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        build(fx, s);
+        s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
+        fx.bridge->sweep();
+        CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
+              "terminal-unavailable synthesis failed; session poisoned, nothing published "
+              "(pressure)");
+    }
+}
+
 TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3/C5)",
           "[mcp][bridge][2f]") {
     Fx fx;
