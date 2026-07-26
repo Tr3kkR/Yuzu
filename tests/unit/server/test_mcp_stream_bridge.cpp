@@ -1112,6 +1112,11 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         const auto row = row_for(fx, "mcp.bridge.session_dead");
         CHECK(row.result == "failure");  // NOT "success" - a slot is still held
         CHECK(row.detail.find("streamed charge not released") != std::string::npos);
+        // A session-death reap publishes nothing, so the row must say so rather than
+        // reporting only the leaked slot: an unconditional charge message used to
+        // ERASE the publish disposition, which meant a teardown that both poisoned
+        // the session and leaked a slot evidenced only the slot.
+        CHECK(row.detail.find("nothing was published") != std::string::npos);
     }
     SECTION("erase fails: subscription and charge settled, record retained, and the "
             "row is NOT silently skipped") {

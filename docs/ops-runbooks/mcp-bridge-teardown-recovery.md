@@ -22,12 +22,13 @@ until the process restarts.
 
 | reason | settled | retained until restart |
 |---|---|---|
-| `unsubscribe` | the terminal disposition, which is published first | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
+| `unsubscribe` | the terminal disposition **if there was one** - most teardowns (session death, pin-ack, arming reap, done reap) publish nothing at all, and even a memory-pressure teardown delivers nothing if its publish failed. The audit row says which: it reads either "after the decided terminal was published" or "and nothing was published". | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
 | `release_charge` | terminal and subscription; the record is still erased | one per-session streamed admission slot |
 | `erase` | terminal and subscription, and the charge **unless** `release_charge` also fired | the record and one global record slot, plus the admission slot if both fired |
 
-When two reasons fire for the same teardown, the audit row names both retained
-resources - trust the row over this table's single-reason rows.
+This table is a summary keyed on one reason at a time. The audit row is authoritative
+in every case: it names what was actually published, and when two reasons fire for the
+same teardown it names both retained resources. Trust the row over the table.
 
 A retained record also pins that session's whole stream state, its replay ring and any
 pinned finals, past normal session garbage collection.

@@ -656,6 +656,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
             std::lock_guard<std::mutex> rlk(rec->mu);
             if (term.has_value() && !terminal_settled) {
                 rec->terminal_slot = std::move(term);
+            } else if (terminal_settled) {
+                // The terminal was committed to the wire but the bookkeeping below
+                // may not have run - it is the one thing between the commit and the
+                // flag that can throw (two mutex acquisitions). Without this, such a
+                // record has terminal_accepted set and terminal_projected clear, and
+                // the pressure visitor's "latched but unprojected -> defer" arm then
+                // defers it FOREVER; because a defer exits the pressure loop, one
+                // wedged victim stalls ring-only pressure relief bridge-wide. Setting
+                // it here is safe precisely because terminal_settled means the frame
+                // is already published - it cannot cause a republish.
+                rec->terminal_projected = true;
             }
             rec->projection_in_flight = false;
         }
@@ -1326,10 +1337,18 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // disposition delivers nothing on kPoisoned / kPublishThrew / kNotAttempted -
         // so "the terminal was published first" is only true when the ladder actually
         // committed. Two bounded literals rather than one convenient claim.
+        // THREE outcomes, not two. A poisoned session is not "nothing happened": the
+        // poison is session-wide and every future attach 410s, so collapsing it into
+        // the generic no-delivery literal leaves the most consequential outcome
+        // unevidenced on this path.
         audit_contained(audit_action, exec_id,
-                        published
-                            ? "teardown incomplete: bus unsubscribe failed after the decided "
-                              "terminal was published; the record is retained for shutdown"
+                        published ? "teardown incomplete: bus unsubscribe failed after the "
+                                    "decided terminal was published; the record is retained "
+                                    "for shutdown"
+                        : rung == TerminalRung::kPoisoned
+                            ? "teardown incomplete: bus unsubscribe failed and the terminal "
+                              "publish POISONED the session (every later attach 410s); the "
+                              "record is retained for shutdown - recover by execution_id"
                             : "teardown incomplete: bus unsubscribe failed and nothing was "
                               "published; the record is retained for shutdown - recover by "
                               "execution_id",
@@ -1458,10 +1477,23 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
             break;
     }
     if (!charge_released) {
-        // Priority over the publish disposition: a leaked admission slot outlives
-        // the request and is the operator-actionable half.
-        audit_detail = "teardown incomplete: streamed charge not released; the record was "
-                       "erased but one per-session admission slot is held until shutdown";
+        // A leaked admission slot outlives the request and is the operator-actionable
+        // half, so it takes priority over the publish disposition - but it must not
+        // ERASE it. Overwriting unconditionally meant a teardown that both poisoned
+        // the session and leaked a slot reported only the slot, and the poisoning
+        // went unevidenced entirely.
+        // `published`, NOT `delivered`. They differ exactly where it matters:
+        // `delivered` stays true for a kNone teardown, which publishes nothing at
+        // all, so keying off it would claim a delivery on the majority path. That
+        // conflation is the same one this round has now corrected three times.
+        audit_detail = published
+                           ? "teardown incomplete: streamed charge not released; the record "
+                             "was erased and the terminal was published, but one per-session "
+                             "admission slot is held until shutdown"
+                           : "teardown incomplete: streamed charge not released AND nothing "
+                             "was published; the record was erased but one per-session "
+                             "admission slot is held until shutdown - recover any result by "
+                             "execution_id";
         delivered = false;
     }
     audit_contained(audit_action, exec_id, audit_detail,

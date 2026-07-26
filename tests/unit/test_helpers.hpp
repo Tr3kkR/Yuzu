@@ -1205,7 +1205,9 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
 template <typename Sqlite3T> struct SqliteHandleOwner;
 template <typename T>
 inline constexpr bool kSqliteOwnerIsSealed = !std::is_copy_constructible_v<SqliteHandleOwner<T>> &&
-                                             !std::is_move_constructible_v<SqliteHandleOwner<T>>;
+                                             !std::is_move_constructible_v<SqliteHandleOwner<T>> &&
+                                             !std::is_copy_assignable_v<SqliteHandleOwner<T>> &&
+                                             !std::is_move_assignable_v<SqliteHandleOwner<T>>;
 template <typename Sqlite3T> struct SqliteHandleOwner {
     Sqlite3T* db{nullptr};
     SqliteHandleOwner() = default;
