@@ -316,11 +316,36 @@ private:
     // and written only under the exclusive mtx_ that cleanup_once() holds for
     // the whole pass, and no accessor exposes them.
     //
-    // The latch makes a decline fire ONCE per anomaly rather than every pass --
-    // a store whose datable rows are all genuinely expired would otherwise never
-    // age out anything at all. Deliberately NOT persisted: re-declining once
-    // after a restart is the safe direction.
-    bool clock_anomaly_latched_{false};
+    /// What the guard can conclude about a pass, in precedence order. A pure
+    /// function of that pass's inputs -- see `classify`.
+    enum class Anomaly { None, Wipe, Step, BadState };
+    /// Classify one pass. PURE: no member reads, no side effects, so it can be
+    /// reasoned about and tested one condition at a time. Precedence is
+    /// BadState > Step > Wipe: a reading we cannot trust makes the other two
+    /// unreliable, and an elapsed-time step explains a wipe better than the wipe
+    /// explains itself.
+    static Anomaly classify(bool has_expired, bool would_wipe, bool big_step,
+                            bool prev_unusable) noexcept {
+        if (prev_unusable)
+            return Anomaly::BadState;
+        if (!has_expired)
+            return Anomaly::None; // nothing to delete, so nothing to guard
+        if (big_step)
+            return Anomaly::Step;
+        return would_wipe ? Anomaly::Wipe : Anomaly::None;
+    }
+
+    // The anomaly currently being REPORTED, replacing what used to be a shared
+    // bool latch. One variable, one rule (in `cleanup_once`): report when the
+    // anomaly differs from this, stand down to None when there is none. That
+    // makes a repeat of the SAME condition silent -- so a legitimately
+    // all-expired store still ages out, costing one interval -- while a
+    // DIFFERENT condition arriving mid-anomaly is still reported, which a single
+    // bool could not express and silently swallowed.
+    //
+    // Deliberately NOT persisted: re-reporting once after a restart is the safe
+    // direction.
+    Anomaly last_reported_{Anomaly::None};
     // Wall-clock reading the previous pass saw. PERSISTED in
     // `audit_retention_meta` and reloaded at construction, because the
     // elapsed-time check is the only half of this guard that still works once a
@@ -384,10 +409,9 @@ private:
         std::string backlog_probe_err;
     };
     /// The accepted-delete half of a pass. Caller must hold `mtx_` exclusively.
-    /// `would_wipe` is the pre-delete outcome test. On failure returns the SQLite
+    /// On failure returns the SQLite
     /// message so the caller can log it AFTER releasing the lock.
-    std::expected<DeleteOutcome, std::string> delete_capped_locked(std::int64_t now,
-                                                                   bool would_wipe);
+    std::expected<DeleteOutcome, std::string> delete_capped_locked(std::int64_t now);
 #ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
 #else

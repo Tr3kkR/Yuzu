@@ -1730,3 +1730,57 @@ TEST_CASE("AuditStore #2360: a PERSISTENTLY implausible reading reports once, no
     CHECK(reopened.cleanup_once(kNow + 1) == 0);
     CHECK(reopened.clock_anomaly_skips_count() == 1); // a fresh store reports its own
 }
+
+TEST_CASE("AuditStore #2360: a DIFFERENT anomaly arriving while latched is still reported",
+          "[audit_store][retention][clock-guard]") {
+    // Written BEFORE the state-model rethink, and expected to FAIL against the
+    // single-bool latch.
+    //
+    // The latch exists so one PERSISTENT condition reports once instead of every
+    // pass. It should not suppress a DIFFERENT condition. With a single bool
+    // there is no way to tell "still the same anomaly" from "a new one", so a
+    // pass latched on a would-wipe silently swallows a subsequent clock step --
+    // the operator sees one warn for the first cause and nothing at all for the
+    // second, in a SOC 2 signal whose whole job is to say what happened.
+    GuardFixture f;
+
+    // 1. All rows expired, no survivor -> would-wipe. Declines and latches.
+    f.seed(kNow - 100, 5);
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // 2. A survivor appears, so would-wipe is gone -- but the clock now jumps
+    //    well past the 7-day threshold. A genuinely different anomaly.
+    f.seed(kNow + 40 * 86'400, 1); // survivor at the later reading
+    const std::int64_t jumped = kNow + 30 * 86'400;
+    CHECK(f.store.cleanup_once(jumped) == 0);          // the step declines too
+    CHECK(f.store.clock_anomaly_skips_count() == 2);   // and is REPORTED
+}
+
+TEST_CASE("AuditStore #2360: a quiet pass re-arms even when nothing was deleted",
+          "[audit_store][retention][clock-guard]") {
+    // Isolates the stand-down-when-quiet half of the rule from the
+    // stand-down-after-a-drain half. In most sequences the drain re-arms, so
+    // removing the quiet-pass re-arm is invisible; it only matters when the
+    // backlog goes away WITHOUT this store deleting it -- an operator pruning
+    // rows by hand, a restore, another process -- and the SAME anomaly kind then
+    // recurs. Without the re-arm the recurrence equals `last_reported_` and is
+    // silently swallowed.
+    GuardFixture f;
+    f.seed(kNow - 100, 5); // all expired, no survivor -> would-wipe
+
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // The backlog vanishes without this store touching it, so the accepting
+    // path -- and its stand-down -- never runs.
+    exec_raw(f.tmp.path, "DELETE FROM audit_events");
+    REQUIRE(f.store.cleanup_once(kNow + 1) == 0); // nothing expired: quiet pass
+    CHECK(f.store.clock_anomaly_skips_count() == 1);
+
+    // The same anomaly KIND recurs. It must be reported again.
+    f.seed(kNow - 100, 4);
+    CHECK(f.store.cleanup_once(kNow + 2) == 0);
+    CHECK(f.store.total_count() == 4); // declined, not deleted
+    CHECK(f.store.clock_anomaly_skips_count() == 2);
+}
