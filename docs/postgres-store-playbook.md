@@ -95,6 +95,17 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    migrations, so a template buys them nothing). Full contract: the `PgTestTemplate` doc
    comment in `tests/unit/test_helpers.hpp`.
 
+   High-volume store-behaviour files may instead keep one template clone and pool for the
+   file, then completely reset its rows with `TRUNCATE … RESTART IDENTITY CASCADE` before
+   each case. The fixture owns the pool in `std::optional<PgPool>` and passes a non-throwing
+   reset callback to `PostgresTestDb::keep_until_run_end()`; the Catch2 run-end listener
+   drains that pool before dropping the clone while libpq is still alive. Use this only when
+   the reset names every mutable table and no state escapes through a lease or background
+   thread. Tests that alter DDL or `public.schema_meta`, retain session/advisory-lock state,
+   or otherwise cannot be restored by `TRUNCATE` remain on their own per-test clone. Filtered
+   and randomized runs must pass, and the lifecycle regression in
+   `test_pg_template_cleanup.cpp` must continue to prove drain-before-drop ordering.
+
 8. **`meson.build`** — add the new `.cpp` to the server target (and the test). `libpq_dep` is
    already gated on `build_server`.
 
