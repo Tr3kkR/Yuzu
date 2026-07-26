@@ -606,8 +606,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope). Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -5264,12 +5264,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                [](unsigned char c) { return std::tolower(c); });
                 std::transform(action.begin(), action.end(), action.begin(),
                                [](unsigned char c) { return std::tolower(c); });
-                if (plugin.empty() || action.empty()) {
-                    res.set_content(
-                        error_response(id, kInvalidParams, "plugin and action are required"),
-                        "application/json");
-                    return;
-                }
                 // ── Server-side input bounds (#2437) ──────────────────────────
                 // These mirror this tool's SERVED inputSchema exactly. Until now
                 // the schema's maxLength/maxItems were enforced only on the
@@ -5383,11 +5377,15 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         for (const auto& v : a) {
-                            // is_string() guard is load-bearing: get_ref throws
-                            // a type_error on a non-string. (A non-string entry
-                            // is silently DROPPED by the extraction loop below,
-                            // which is a separate hazard - it lands with the
-                            // targeting-safety change, not here.)
+                            // The type IS guaranteed by check_exec_instruction_shape
+                            // above (and pre-mint in the C8 block), so this guard is
+                            // dead code today. It is kept deliberately: it costs
+                            // nothing, it stays correct under refactoring, and
+                            // without it a non-string reaching here would throw
+                            // type_error out of get_ref and become a 500 instead of
+                            // a clean -32602 the moment that 89-line-distant
+                            // invariant is disturbed. Removing it in this PR was a
+                            // false economy (#2492 review).
                             if (v.is_string() &&
                                 v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
                                 too_large("agent_id_len", std::format("an agent_ids entry exceeds {} bytes", kExecInstrIdentMaxLen));
@@ -5415,9 +5413,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
-                // Default scope to __all__ if neither scope nor agent_ids provided
-                if (scope.empty() && agent_ids.empty())
+                // Default scope to __all__ ONLY when the caller named no target at
+                // all. A targeting argument that was SUPPLIED but resolved to
+                // nothing must never widen to the whole fleet - that is the #2437
+                // defect, and `{"agent_ids": []}` from a device filter matching
+                // nothing is its likelier shape than a type-confused list.
+                //
+                // check_exec_instruction_shape already rejects those shapes ~90
+                // lines above, so this branch is UNREACHABLE today and is second
+                // line of defence, not the fix. It is here because the sink is the
+                // one place where a bypass or a reorder turns a specific-looking
+                // target list into the entire fleet, and a single point of failure
+                // is exactly what this series argues against. Falsifiable on its
+                // own terms: neuter the shape check and this still refuses.
+                const bool supplied_target = args.contains("agent_ids") || args.contains("scope");
+                if (scope.empty() && agent_ids.empty()) {
+                    if (supplied_target) {
+                        const bool by_ids = args.contains("agent_ids");
+                        too_large(by_ids ? "agent_ids_empty" : "scope_empty",
+                                  by_ids ? "agent_ids was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents"
+                                         : "scope was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents");
+                        return;
+                    }
                     scope = "__all__";
+                }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
                 // A request carrying _meta.progressToken opts into live progress

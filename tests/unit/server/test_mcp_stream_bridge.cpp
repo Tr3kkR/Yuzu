@@ -627,9 +627,15 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
         CHECK(s.stream->is_pinned(final_id));  // truth stays in the ring
     }
     SECTION("terminal racing the pressure sweep: the real result always wins") {
-        // Property form of the E1/D1 barrier: publish the terminal while sweeps
-        // hammer the victim. Whatever interleaving occurs, the invariant is ONE
-        // real final, ZERO -32014, and the record eventually reaped.
+        // The terminal is LATCHED before the sweeper starts (the listener runs
+        // synchronously inside publish under ch->mu), so ch->terminal is true from
+        // the first visit -> the sweep can never see kNeverTerminal and never
+        // synthesizes -32014. The race that remains (and that TSan exercises) is
+        // sweep vs the PROJECTOR settling that latched terminal: ONE real final,
+        // ZERO -32014, reaped. NOTE: publishing the terminal AFTER spawning the
+        // sweeper is a genuine sweeper-beats-publish startup race whose -32014 (over
+        // a not-yet-published terminal) is a SOUND linearization, not a bug - so it
+        // must not be asserted against; publish-then-race keeps the invariant exact.
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
         auto s = fx.make_session();
         REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
@@ -640,6 +646,7 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
             fx.bus.publish("exec-r", "execution-progress", kProgress13);
         }
         REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        fx.bus.publish("exec-r", "execution-completed", kCompleted, /*is_terminal=*/true);
         // Bounded sweeper: a regression that never reaps must FAIL FAST (a wall-
         // clock deadline), not hang CI forever (governance quality).
         auto sweeper = std::async(std::launch::async, [&] {
@@ -653,12 +660,206 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
             }
             return true;
         });
-        fx.bus.publish("exec-r", "execution-completed", kCompleted, /*is_terminal=*/true);
         REQUIRE(sweeper.get());  // reaped within the deadline
         auto frames = ring_frames(*s.stream, "alice");
         CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
         CHECK(count_results(frames) == 1);
     }
+}
+
+TEST_CASE("bridge pressure #2409 - a terminal-flagged progress is never lost to -32014",
+          "[mcp][bridge][2f][2409]") {
+    // The regression that closes #2409. refresh_counts publishes a terminal-flagged
+    // execution-progress BEFORE execution-completed (two publishes, ch->mu released
+    // between). The bridge listener latches ONLY execution-completed, so
+    // terminal_accepted stays FALSE while the BUS channel is terminal with a
+    // buffered, usable payload. The pre-C5 pressure sweep (unsubscribe, then a
+    // terminal_accepted re-check blind to the bus) synthesized -32014 over that real
+    // terminal. The first_terminal_id marker + the atomic visit must instead secure
+    // the buffered terminal and publish the REAL final.
+    //
+    // Under the pre-C5 code this asserts 0 results / 1 error - i.e. it FAILS,
+    // exactly the property a regression test must have.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2409"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    // The terminal-flagged progress: bus terminal=true, listener does NOT latch it.
+    fx.bus.publish(
+        "exec-2409", "execution-progress",
+        R"({"status":"succeeded","agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
+        /*is_terminal=*/true);
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // NEVER -32014
+    CHECK(count_results(frames) == 1);                                   // a REAL final instead
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["status"] == "succeeded");  // built from the marked payload
+        }
+    }
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);
+}
+
+TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, never -32014 (#2409 qa-B1)",
+          "[mcp][bridge][2f][2409]") {
+    // End-to-end bridge coverage of the aged-out-terminal disposition: the marker
+    // ages out of the bus buffer, the visit computes kTerminalKnownLost, and the
+    // bridge publishes the success-shaped fallback ("fetch by execution_id"), NEVER
+    // -32014 - releasing the streamed charge and auditing the disposition.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-kl"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    // Terminal-flagged execution-progress: the bus is terminal, but the listener
+    // latches ONLY execution-completed, so terminal_accepted stays false. Flood past
+    // kBufferCap so the marker (id 1) ages out with NO execution-completed ever
+    // published -> the visit computes kTerminalKnownLost.
+    fx.bus.publish("exec-kl", "execution-progress",
+                   R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
+                   /*is_terminal=*/true);
+    for (int i = 0; i < static_cast<int>(yuzu::server::ExecutionEventBus::kBufferCap) + 5; ++i) {
+        fx.bus.publish("exec-kl", "execution-progress", kProgress13);
+    }
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return !fx.bridge->phase_for(s.id, json(1)).has_value();  // record 1 reaped
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // NEVER -32014
+    REQUIRE(count_results(frames) == 1);                                 // the success-shaped fallback
+    std::uint64_t fallback_id = 0;
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["execution_id"] == "exec-kl");  // durable handle present
+            CHECK(j["result"]["status"] == "unknown");        // fallback shape, not a real status
+            fallback_id = f.id;
+        }
+    }
+    CHECK(s.stream->is_pinned(fallback_id));  // pinned -> resume-replayable
+    {  // the audit names the disposition (not an empty/synthesized detail)
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool ok = false;
+        for (const auto& [a, d] : fx.audits) {
+            if (a == "mcp.bridge.forced_expire" && d == "fallback final published (terminal payload lost)") {
+                ok = true;
+            }
+        }
+        CHECK(ok);
+    }
+    // Charge released: teardown_claimed already released the streamed charge
+    // synchronously when it reaped record 1 (streamed_unpinned_ back to 0); the pinned
+    // fallback still holds one slot, which the resume cursor below consumes. With BOTH
+    // freed, all 4 fresh streamed reserves admit. Had the charge leaked, streamed_
+    // unpinned_ would still be 1 and the 4th reserve would be rejected pin_slots - so
+    // the 4th admitting is the load-bearing release_charge regression guard.
+    auto att = s.stream->attach_and_replay(fallback_id, nullptr, "alice");
+    REQUIRE(att.status == mcp::McpStreamState::AttachStatus::kAttached);
+    s.stream->detach(att.sink);
+    CHECK(s.stream->pinned_count() == 0);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);  // 4th slot: only free if charge released
+}
+
+TEST_CASE("bridge pressure - a visitor copy-OOM defers and keeps the listener (#2409 safety-S1)",
+          "[mcp][bridge][2f][2409]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-oom"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    // Terminal-flagged progress -> the visit's verdict is kTerminalBuffered (marker in
+    // buffer; terminal_accepted still false because the listener ignores progress).
+    fx.bus.publish("exec-oom", "execution-progress",
+                   R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
+                   /*is_terminal=*/true);
+    REQUIRE(fx.bus.subscriber_count("exec-oom") == 1);
+    // PERSISTENT copy-OOM: every visitor terminal-payload copy throws. This is the
+    // self-validating part - while the fault fires the copy never latches, so the
+    // record can NEVER settle no matter how many sweeps run. (If the injection were a
+    // silent no-op, the very first sweep would latch + settle + reap, and the
+    // still-alive assertion below would fail RED.)
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/100);
+    for (int i = 0; i < 15; ++i) {
+        fx.bridge->sweep();
+        REQUIRE(fx.bridge->record_count() == 1);                   // never reaped under the fault
+        REQUIRE(fx.bus.subscriber_count("exec-oom") == 1);         // listener NOT erased (defer, no claim)
+    }
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 0);    // never settled a final
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 0);
+    // Heal the fault: now the copy succeeds, the terminal latches, and the record
+    // settles the REAL final and reaps.
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/0);
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
+    CHECK(count_results(frames) == 1);  // the real final, after the fault healed
+}
+
+TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
+          "[mcp][bridge][2f][2409]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2s"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // never-terminal claimable victim
+    // Two threads hammer sweep() on the same oldest kRingOnly victim. The torn_down
+    // CAS under Channel::mu must make exactly one win: one teardown, one audit, one
+    // synthesized -32014 (the FA-1 exactly-once property under real contention).
+    auto racer = [&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (fx.bridge->record_count() != 0 && std::chrono::steady_clock::now() < until) {
+            fx.bridge->sweep();
+            std::this_thread::yield();
+        }
+    };
+    auto a = std::async(std::launch::async, racer);
+    auto b = std::async(std::launch::async, racer);
+    a.get();
+    b.get();
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);  // exactly once, not twice
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 1);
+}
+
+TEST_CASE("bridge pressure - a sweep claim racing shutdown reaps once, no double teardown (#2409 qa-B2, TSan)",
+          "[mcp][bridge][2f][2409]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-sd"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // claimable never-terminal victim
+    // The claim commits inside f (under Channel::mu, NO bridge_mu_), so shutdown() can
+    // start before the claimed branch re-checks shutdown_started_. If shutdown won,
+    // its all-phase walk cleans up; if the sweep won, teardown ran. Either way: no
+    // crash, no double teardown, the record is gone.
+    auto sweeper = std::async(std::launch::async, [&] {
+        for (int i = 0; i < 300; ++i) {
+            fx.bridge->sweep();
+        }
+    });
+    fx.bridge->shutdown();
+    sweeper.get();
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") <= 1);  // 0 (shutdown) or 1 (sweep), never 2
 }
 
 TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched",
@@ -1056,6 +1257,11 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cr"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly, charged
+    // Latch the terminal BEFORE the sweeper starts (else a sweeper-beats-publish
+    // startup race legitimately synthesizes a SOUND -32014 over a not-yet-published
+    // terminal - not a bug, but it would break the "one real final" assertion). With
+    // it latched first, the race that remains is sweep vs the projector settling it.
+    fx.bus.publish("exec-cr", "execution-completed", kCompleted, /*is_terminal=*/true);
 
     auto sweeper = std::async(std::launch::async, [&] {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1064,7 +1270,6 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
             std::this_thread::yield();
         }
     });
-    fx.bus.publish("exec-cr", "execution-completed", kCompleted, /*is_terminal=*/true);
     sweeper.get();
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_results(frames) == 1);        // exactly one real final
