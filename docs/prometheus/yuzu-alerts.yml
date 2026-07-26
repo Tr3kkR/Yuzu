@@ -458,7 +458,11 @@ groups:
             threshold, not scaled to audit_retention_days); or the stored clock reading was
             not usable (ahead of the clock, negative, present but not an integer, or
             unreadable). This is NOT
-            exclusively a clock signal: REDUCING audit_retention_days narrows the survivor
+            exclusively a clock signal, and it is NOT one-warning-per-incident: a repeat of
+            the same CONDITION (all-expired table, corrupt stored reading) is reported once,
+            while a repeated clock STEP is reported every time in either direction, since
+            each jump is a distinct event. A flapping clock source therefore produces one
+            warning per step. Also note REDUCING audit_retention_days narrows the survivor
             horizon by design, so the first pass after that change can decline, and a
             genuinely all-expired table declines once on its first pass. Check whether
             retention was reconfigured before investigating the clock.

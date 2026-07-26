@@ -621,6 +621,15 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // reasoned about: the clock moved backward, or the state was corrupted.
         // Quietly accepting one is how the step check gets disabled while every
         // counter reports healthy, which is why it declines either way.
+        // The BACKWARD half of the unusable-reading test is an EVENT, not a
+        // condition, and has to be identified before the sanitiser resets the
+        // value below. `*prev > now` can only hold if the clock moved backward
+        // SINCE the previous pass, because line above re-anchors the reading to
+        // `now` every time -- structurally identical to `big_step`, just the
+        // other direction. The other two carriers are not events: the load-time
+        // flag is one-shot, and `*prev < 0` persists for as long as the clock is
+        // negative.
+        const bool backward_step = raw_prev && *raw_prev > now;
         std::optional<std::int64_t> prev_pass_now = raw_prev;
         // A row that existed but was not an integer is corrupted durable state,
         // which is an anomaly in its own right -- distinct from no row at all.
@@ -694,7 +703,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // silently) but the load-time flag is deliberately NOT consumed --
             // this pass did not act on it.
             cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-            last_reported_ = Anomaly::None;
+            last_reported_ = audit_retention::Anomaly::None;
             emit = Emit::ProbeFailed;
             emit_err = !has_expired ? has_expired.error() : has_datable_survivor.error();
         } else {
@@ -711,7 +720,10 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit_window = kAuditMinBigStepSec;
             emit_full_wipe = would_wipe;
 
-            const Anomaly a = classify(*has_expired, would_wipe, big_step, prev_unusable);
+            // `cleanup_once` is the ONLY caller of `classify`; the rule lives in its
+            // own header so it can be pinned exhaustively (all 16 inputs) without a
+            // database, not because anything else consumes it.
+            const audit_retention::Anomaly a = audit_retention::classify(*has_expired, would_wipe, big_step, prev_unusable);
             // Consumed HERE, unconditionally, at exactly one site: this pass has
             // folded it into the verdict. The durable row was re-anchored above,
             // so from now on the VALUE carries the truth. Three conditional
@@ -736,29 +748,38 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // one while silently deleting for the other. It cannot spam --
             // after any pass the stored reading is `now`, so the next pass sees
             // an interval-sized delta unless the clock moved again.
-            const bool is_event = (a == Anomaly::Step);
-            if (a != Anomaly::None && (is_event || a != last_reported_)) {
+            // EVENTS are not deduplicated; CONDITIONS are. Both directions of
+            // clock movement are events: a forward jump surfaces as `Step`, a
+            // backward one as `BadState` via `backward_step`. Suppressing either
+            // by equality reports one jump and silently deletes for the next.
+            const bool is_event = (a == audit_retention::Anomaly::Step) ||
+                                  (a == audit_retention::Anomaly::BadState && backward_step);
+            if (a != audit_retention::Anomaly::None && (is_event || a != last_reported_)) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+                // For `Step` this assignment is provably unobservable -- Step is
+                // exempt from the equality test, and every other value differs
+                // from it -- but it is kept so the member always names the last
+                // thing reported. Do not infer a suppression contract from it.
                 last_reported_ = a;
                 switch (a) {
-                case Anomaly::BadState:
+                case audit_retention::Anomaly::BadState:
                     // Same condition, two audiences: with a backlog pending the
                     // operator needs to know deletion was held back; without
                     // one, that nothing was at risk.
                     emit = *has_expired ? Emit::DeclineImplausible : Emit::CorruptStateReported;
                     break;
-                case Anomaly::Step:
+                case audit_retention::Anomaly::Step:
                     emit = Emit::DeclineStep;
                     break;
-                case Anomaly::Wipe:
+                case audit_retention::Anomaly::Wipe:
                     emit = prev_pass_now ? Emit::DeclineWipe : Emit::DeclineFirstPass;
                     break;
-                case Anomaly::None:
+                case audit_retention::Anomaly::None:
                     break; // unreachable: guarded above
                 }
             } else {
-                if (a == Anomaly::None)
-                    last_reported_ = Anomaly::None; // stood down; re-armed
+                if (a == audit_retention::Anomaly::None)
+                    last_reported_ = audit_retention::Anomaly::None; // stood down; re-armed
                 // Either nothing is wrong, or we are working off an anomaly we
                 // have already reported. Both delete -- paced by the cap, which
                 // is what actually bounds the damage.
@@ -785,7 +806,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                         // unreadable backlog probe reports `true` conservatively,
                         // which keeps the report standing -- the safe direction.
                         if (!outcome->backlog_remains)
-                            last_reported_ = Anomaly::None;
+                            last_reported_ = audit_retention::Anomaly::None;
                     }
                 }
             }
@@ -795,7 +816,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
 
     if (!emit_backlog_probe_err.empty())
         spdlog::warn("AuditStore: the post-delete backlog probe failed ({}); this pass assumed a "
-                     "backlog remains, so the cap counter and the clock-anomaly latch are both "
+                     "backlog remains, so the cap counter and the reported-anomaly state are both "
                      "acting on an assumption rather than a reading",
                      emit_backlog_probe_err);
     if (emit_persist_failed)
@@ -877,7 +898,7 @@ AuditStore::delete_capped_locked(std::int64_t now) {
     SqliteStmt del;
     if (sqlite3_prepare_v2(db_.get(), kDeleteSql, -1, del.addr(), nullptr) != SQLITE_OK) {
         cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-        last_reported_ = Anomaly::None; // re-arm, as on the probe path
+        last_reported_ = audit_retention::Anomaly::None; // re-arm, as on the probe path
         return std::unexpected(sqlite3_errmsg(db_.get()));
     }
     sqlite3_bind_int64(del.get(), 1, now);
@@ -894,7 +915,7 @@ AuditStore::delete_capped_locked(std::int64_t now) {
         cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
         // Read BEFORE the SqliteStmt destructor finalizes the statement.
         std::string err = sqlite3_errmsg(db_.get());
-        last_reported_ = Anomaly::None;
+        last_reported_ = audit_retention::Anomaly::None;
         // The rows RETURNING already yielded are NOT deleted: SQLite unwinds a
         // failed statement from its statement journal, so they are back.
         return std::unexpected(std::move(err));
@@ -919,7 +940,7 @@ AuditStore::delete_capped_locked(std::int64_t now) {
                                        "SELECT EXISTS(SELECT 1 FROM audit_events "
                                        "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
                                        binds);
-        // Unreadable: assume a backlog remains. That keeps the latch armed and
+        // Unreadable: assume a backlog remains. That keeps the anomaly reported and
         // the counter moving, the conservative direction for both -- but SAY SO.
         // Without this the failure is the only one in the pass that moves no
         // counter and writes no line, and `cap_reached_` would then be
@@ -939,7 +960,7 @@ AuditStore::delete_capped_locked(std::int64_t now) {
 
     // NO anomaly bookkeeping here. This function deletes; deciding what is being
     // reported belongs to the one rule in cleanup_once, which re-evaluates the
-    // condition each pass from the probes. Assigning the latch from a
+    // condition each pass from the probes. Deriving the reported state from a
     // post-delete fact here is what produced the pre-delete/post-delete
     // ordering defects.
     return DeleteOutcome{deleted, backlog_remains, std::move(probe_err)};

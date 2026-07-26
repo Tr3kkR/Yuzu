@@ -2,15 +2,19 @@
   was a blind `DELETE FROM audit_events WHERE ttl_expires_at < now`, so a single
   forward clock step (restored VM snapshot, NTP correction after a dead CMOS
   battery, a hand-set date) could empty the SOC 2 evidence table in one statement
-  with no counter and no actionable log line. A pass now declines once, latched,
-  when it would expire every datable row, when the gap since the previous pass
+  with no counter and no actionable log line. A pass now declines and warns when it
+  would expire every datable row, when the gap since the previous pass
   exceeds a fixed 7 days (an absolute threshold, deliberately NOT scaled to
   `--audit-retention-days`: at the 365-day default that would put it a year out,
   where it could never fire), or when the stored reading is ahead of the current
   clock. That reading is persisted and sanitised, so the check still fires on a
   server that BOOTED with an already-wrong clock, and an out-of-range poisoned
   value (negative, or ahead of the clock) is reported as an anomaly rather than
-  quietly accepted. Every accepted pass is capped at 25,000 rows oldest-first. Rows
+  quietly accepted. Reporting distinguishes conditions from events: a repeat of the
+  same CONDITION (an all-expired table, a corrupt stored reading) is not re-warned,
+  so a legitimately all-expired store still ages out at the capped rate, while a
+  clock MOVEMENT warns every time it recurs, in either direction, because each jump
+  is a separate incident. Every accepted pass is capped at 25,000 rows oldest-first. Rows
   whose TTL sits implausibly far in the future are excluded from the decision, so
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe

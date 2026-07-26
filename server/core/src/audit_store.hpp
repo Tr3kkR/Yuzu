@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audit_retention_rules.hpp"
 #include "sqlite_raii.hpp"
 
 #include <sqlite3.h>
@@ -260,33 +261,6 @@ public:
         return persist_failed_.load(std::memory_order_relaxed);
     }
 
-    /// What the guard can conclude about a pass, in precedence order. A pure
-    /// function of that pass's inputs -- see `classify`.
-    ///
-    /// PUBLIC deliberately, alongside `cleanup_once`: `classify` holds the
-    /// whole precedence contract and is a pure function of four bools, so it
-    /// can be pinned by a table with no database, no clock and no fixture.
-    /// Exposing a function that reads no state is strictly less invasive than
-    /// the `cleanup_once` seam below, and the alternative -- reaching it only
-    /// through seeded multi-pass integration tests -- is how the precedence
-    /// went unpinned long enough for two mutations to survive.
-    enum class Anomaly { None, Wipe, Step, BadState };
-    /// Classify one pass. PURE: no member reads, no side effects, so it can be
-    /// reasoned about and tested one condition at a time. Precedence is
-    /// BadState > Step > Wipe: a reading we cannot trust makes the other two
-    /// unreliable, and an elapsed-time step explains a wipe better than the wipe
-    /// explains itself.
-    static Anomaly classify(bool has_expired, bool would_wipe, bool big_step,
-                            bool prev_unusable) noexcept {
-        if (prev_unusable)
-            return Anomaly::BadState;
-        if (!has_expired)
-            return Anomaly::None; // nothing to delete, so nothing to guard
-        if (big_step)
-            return Anomaly::Step;
-        return would_wipe ? Anomaly::Wipe : Anomaly::None;
-    }
-
     /// Run exactly ONE retention pass against `now` (epoch seconds) and return
     /// the number of rows deleted. Returns 0 when the pass declined (clock
     /// guard), when nothing was expired, or when the pass failed.
@@ -343,17 +317,29 @@ private:
     // and written only under the exclusive mtx_ that cleanup_once() holds for
     // the whole pass, and no accessor exposes them.
     //
-    // The anomaly currently being REPORTED, replacing what used to be a shared
-    // bool latch. One variable, one rule (in `cleanup_once`): report when the
-    // anomaly differs from this, stand down to None when there is none. That
-    // makes a repeat of the SAME condition silent -- so a legitimately
-    // all-expired store still ages out, costing one interval -- while a
-    // DIFFERENT condition arriving mid-anomaly is still reported, which a single
-    // bool could not express and silently swallowed.
+    // The anomaly last REPORTED, replacing what used to be a shared bool latch
+    // (which is what older comments and test names in this feature call "the
+    // latch"). One variable, one rule, in `cleanup_once`: report when the
+    // anomaly is an EVENT, or when it differs from this; stand down to None when
+    // there is none.
+    //
+    // The events-vs-conditions split is the whole rule. A CONDITION persists on
+    // its own -- an all-expired table, a corrupt stored reading -- so re-warning
+    // every pass is noise, and suppressing the repeat lets a legitimately
+    // all-expired store age out at the capped rate for the cost of one interval.
+    // An EVENT is a clock MOVEMENT, and it can only be observed at all because
+    // the reading is re-anchored every pass: a second jump is a second incident,
+    // never a continuation of the first, so it must report every time. Both
+    // directions count -- `Step` covers a forward jump, and `BadState` carries a
+    // backward one via `*prev > now`, which is why `cleanup_once` tests that
+    // carrier and not just the enum.
+    //
+    // A DIFFERENT condition arriving mid-anomaly is still reported by the
+    // inequality half. A single bool could express none of this.
     //
     // Deliberately NOT persisted: re-reporting once after a restart is the safe
     // direction.
-    Anomaly last_reported_{Anomaly::None};
+    audit_retention::Anomaly last_reported_{audit_retention::Anomaly::None};
     // Wall-clock reading the previous pass saw. PERSISTED in
     // `audit_retention_meta` and reloaded at construction, because the
     // elapsed-time check is the only half of this guard that still works once a
@@ -371,13 +357,13 @@ private:
     // Set at construction when durable state EXISTED but could not be used --
     // either not an integer, or unreadable (corruption, busy, I/O error).
     // Absent is NOT carried: that is the ordinary fresh-install shape.
-    // Cleared at exactly three sites, all of which REPORT it first: the decline
-    // branch, the nothing-expired branch (which reports it via
-    // Emit::CorruptStateReported), and the accepting path that goes on to
-    // delete. It is NOT cleared on a pass that reaches no verdict -- an
-    // unreadable probe, or a closed store -- because those say nothing about
-    // the state. Clearing without reporting would swallow the corruption signal
-    // entirely, which is the failure mode this flag exists to prevent.
+    // Cleared at exactly ONE site, unconditionally, once the probes have read:
+    // that pass has folded it into the verdict, and the durable row was
+    // re-anchored above, so from then on the VALUE carries the truth. It is NOT
+    // reached on a pass that gets no verdict (unreadable probe, closed store),
+    // which is deliberate -- those say nothing about the state. An earlier
+    // version cleared it at three conditional sites and produced both a
+    // cleared-too-early and a cleared-too-late defect.
     bool loaded_meta_unusable_{false};
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
@@ -403,7 +389,7 @@ private:
     std::expected<std::int64_t, MetaReadError> load_meta(const char* key) const;
     bool store_meta(const char* key, std::int64_t value);
     /// What one accepted delete did. `backlog_remains` is the POST-delete fact
-    /// the latch, the cap counter and the operator log line are ALL derived
+    /// the reported-anomaly state, the cap counter and the operator log line are ALL derived
     /// from, so they cannot disagree.
     struct DeleteOutcome {
         std::size_t deleted{0};

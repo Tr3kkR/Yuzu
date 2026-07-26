@@ -7,6 +7,7 @@
  */
 
 #include "audit_store.hpp"
+#include "audit_retention_rules.hpp"
 #include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
@@ -1848,7 +1849,7 @@ TEST_CASE("AuditStore #2360: classify pins the anomaly precedence with no databa
     // no clock. This would have killed the precedence mutations (M27/M28) in
     // microseconds; the integration tests that caught them each need a seeded
     // database and several passes.
-    using A = AuditStore::Anomaly;
+    using A = yuzu::server::audit_retention::Anomaly;
     struct Case {
         bool has_expired, would_wipe, big_step, prev_unusable;
         A expected;
@@ -1870,7 +1871,76 @@ TEST_CASE("AuditStore #2360: classify pins the anomaly precedence with no databa
     };
     for (const auto& c : cases) {
         INFO(c.why);
-        CHECK(AuditStore::classify(c.has_expired, c.would_wipe, c.big_step, c.prev_unusable) ==
+        CHECK(audit_retention::classify(c.has_expired, c.would_wipe, c.big_step, c.prev_unusable) ==
               c.expected);
     }
+}
+
+TEST_CASE("AuditStore #2360: a SECOND backward jump is a second event, not a continuing condition",
+          "[audit_store][retention][clock-guard]") {
+    // Written before the fix, expected to FAIL. The sibling of the forward-step
+    // case, found independently by two reviewers.
+    //
+    // `BadState` has THREE carriers with different natures, and treating them as
+    // one is what leaves this hole:
+    //   - the load-time flag  -- one-shot
+    //   - `*prev < 0`         -- a CONDITION, persists while the clock is negative
+    //   - `*prev > now`       -- an EVENT: the reading is re-anchored every pass,
+    //                            so it can only be true if the clock moved BACKWARD
+    //                            since the previous pass
+    // The third is structurally identical to `big_step`, just the other
+    // direction, but `is_event = (a == Step)` excludes it -- so a second
+    // independent backward jump is equality-suppressed and DELETES silently.
+    //
+    // The direction is safe (an earlier cutoff deletes strictly fewer rows), so
+    // this is lost signal rather than data loss -- but it is a delete on a pass
+    // whose own classifier just said the clock state was unusable.
+    GuardFixture f;
+    f.seed(kNow - 100, 9);
+    f.seed(kNow + kWindow, 1);
+    REQUIRE(f.store.cleanup_once(kNow) == 9); // healthy: establishes a reading
+
+    // First backward jump: the stored reading is now AHEAD of `now`.
+    const std::int64_t b1 = kNow - 10 * 86'400;
+    seed_rows_with_ttl(f.tmp.path, b1 - 100, 9);
+    seed_rows_with_ttl(f.tmp.path, b1 + kWindow, 1);
+    REQUIRE(f.store.cleanup_once(b1) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // A SECOND, independent backward jump on the very next pass.
+    const std::int64_t b2 = b1 - 10 * 86'400;
+    seed_rows_with_ttl(f.tmp.path, b2 - 100, 9);
+    seed_rows_with_ttl(f.tmp.path, b2 + kWindow, 1);
+    CHECK(f.store.cleanup_once(b2) == 0);            // must decline again
+    CHECK(f.store.clock_anomaly_skips_count() == 2); // and be reported
+}
+
+TEST_CASE("AuditStore #2360: one CONDITION replacing another is reported",
+          "[audit_store][retention][clock-guard]") {
+    // Pins the inequality half of the rule, which nothing else does any more.
+    // The `DIFFERENT anomaly` test transitions Wipe -> Step, and since `Step` is
+    // now unconditionally reported it stays green even if difference-sensitivity
+    // is destroyed entirely (replace `a != last_reported_` with
+    // `last_reported_ == None`). This transitions between two CONDITIONS, where
+    // only the inequality can carry the report.
+    GuardFixture f;
+
+    // 1. Everything expired, no survivor -> Wipe. Reported.
+    f.seed(kNow - 100, 6);
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // 2. Corrupt the durable reading and reopen, so the NEXT pass classifies as
+    //    BadState -- a different condition, with a backlog still pending so the
+    //    would-wipe is still true underneath it.
+    exec_raw(f.tmp.path, "UPDATE audit_retention_meta SET value = 'not-a-number' "
+                         "WHERE key = 'last_pass_now'");
+    AuditStore reopened(f.tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(reopened.is_open());
+
+    LogCapture log;
+    CHECK(reopened.cleanup_once(kNow + 1) == 0);
+    CHECK(reopened.clock_anomaly_skips_count() == 1); // fresh store, its own count
+    CHECK(log.says("not usable"));                    // BadState, not Wipe
+    CHECK_FALSE(log.says("EVERY datable audit row"));
 }

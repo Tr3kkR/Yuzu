@@ -363,7 +363,7 @@ refuses to act on that:
   put the threshold at a full year on the 365-day default, where it could never
   fire. Elapsed time still cannot tell a clock jump from an outage, so a server
   that was genuinely down for more than a week declines one cleanup pass ---
-  deliberately cheap, and the warning names both causes. A repeat of the SAME condition is not re-reported, so an audit table that is
+  deliberately cheap, and the warning names both causes. A repeat of the same CONDITION is not re-reported, so an audit table that is
   *legitimately* all-expired still ages out
   --- it just costs one cleanup interval first.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
@@ -373,6 +373,21 @@ refuses to act on that:
   window plus two days, i.e. written while the clock was already skewed forward
   --- are excluded from the "would this expire everything?" question. Without
   that, one such row would disarm the guard permanently.
+
+**Conditions are reported once; clock movements are reported every time.** An
+all-expired table or a corrupt stored reading is a *condition* -- it persists
+until something changes, so it warns once and the backlog then drains at the
+capped rate. A clock jump is an *event*: the guard re-anchors its reading every
+pass, so a jump can only be detected if the clock moved since the last pass.
+Both directions count -- a forward jump and a backward one each warn on every
+recurrence. A clock stepping repeatedly therefore produces one warning per step,
+not one in total.
+
+**For a report-once anomaly, your log pipeline is the durable record, not the
+metric.** The alert rules fire on `increase()` over a rolling window, so once a
+one-time warning ages out of that window and the process restarts, the counter
+no longer shows it happened. Ship the `AuditStore:` warnings to whatever durable
+log store feeds your evidence chain.
 
 **Capacity.** The drain is a fixed 25,000 rows per hourly pass -- about 600,000
 rows/day, or a sustained ceiling of roughly **6.9 audit events/second**. Above
