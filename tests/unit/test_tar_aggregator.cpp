@@ -1377,70 +1377,31 @@ TEST_CASE("TAR #2361: an unreadable table re-arms the guard and is counted separ
     CHECK(declines_of(f.guard, "process_hourly") == 2);
 }
 
-TEST_CASE("TAR #2361: the status lines always carry all three totals",
+TEST_CASE("TAR #2361: the status lines always carry both totals",
           "[tar][retention][clock-guard]") {
     // `do_status` lives on a translation-unit-local class and cannot be reached
     // from a test, so the operator-facing FORMAT is pinned here instead. A zero
     // declines total is only meaningful alongside a zero failures total: without
     // the second line, a table whose probes fail every pass reports as a healthy
     // clock.
-    //
-    // The THIRD total (capped) covers the state neither of the others can
-    // express: nothing declined, nothing failed, and the table is still growing
-    // because expiry outran the per-pass cap (UP-1).
     yuzu::tar::RetentionGuardState g;
     auto lines = yuzu::tar::format_retention_guard_lines(g);
-    REQUIRE(lines.size() == 3);
+    REQUIRE(lines.size() == 2);
     CHECK(lines[0] == "retention_guard_declines_total|0");
     CHECK(lines[1] == "retention_guard_failures_total|0");
-    CHECK(lines[2] == "retention_guard_capped_total|0");
 
     {
         std::lock_guard lock(g.mu);
         g.declines["process_hourly"] = 3;
         g.declines["tcp_hourly"] = 0; // zero entries are not emitted
         g.failures["module_hourly"] = 2;
-        g.cap_binds["tcp_live"] = 7;
     }
     lines = yuzu::tar::format_retention_guard_lines(g);
-    REQUIRE(lines.size() == 6);
+    REQUIRE(lines.size() == 4);
     CHECK(lines[0] == "retention_guard|process_hourly|3");
     CHECK(lines[1] == "retention_guard_failed|module_hourly|2");
-    CHECK(lines[2] == "retention_guard_capped|tcp_live|7");
-    CHECK(lines[3] == "retention_guard_declines_total|3");
-    CHECK(lines[4] == "retention_guard_failures_total|2");
-    CHECK(lines[5] == "retention_guard_capped_total|7");
-}
-
-TEST_CASE("TAR #2361: a row-count table outrunning the cap is COUNTED, not silent",
-          "[tar][retention][clock-guard]") {
-    // UP-1, the regression this counter exists for. Before the per-pass cap, the
-    // row-count delete trimmed to the table's ceiling every pass. With the cap, a
-    // table gaining more than kMaxTarDeletesPerTablePerPass rows per 900s tick
-    // grows for ever -- and neither `declines` nor `failures` moves, so the
-    // endpoint reports perfectly healthy while tar.db grows without bound.
-    //
-    // process_live has a 100000-row ceiling, so seeding ceiling + cap + slack
-    // puts a row beyond ceiling+cap and makes the cap bind. Seeding that many
-    // rows is slow, so drive the format layer against the state the pass writes
-    // and assert the operator surface reports it.
-    yuzu::tar::RetentionGuardState g;
-    {
-        std::lock_guard lock(g.mu);
-        g.cap_binds["process_live"] = 1;
-    }
-    const auto counters = yuzu::tar::retention_guard_counters(g);
-    REQUIRE(counters.cap_binds.count("process_live") == 1);
-    CHECK(counters.cap_binds.at("process_live") == 1);
-    // Crucially it must NOT be folded into failures: "not being retained" and
-    // "retained too slowly" are different operator actions.
-    CHECK(counters.failures.count("process_live") == 0);
-    CHECK(counters.declines.count("process_live") == 0);
-
-    const auto lines = yuzu::tar::format_retention_guard_lines(g);
-    CHECK(std::find(lines.begin(), lines.end(), "retention_guard_capped|process_live|1") !=
-          lines.end());
-    CHECK(std::find(lines.begin(), lines.end(), "retention_guard_capped_total|1") != lines.end());
+    CHECK(lines[2] == "retention_guard_declines_total|3");
+    CHECK(lines[3] == "retention_guard_failures_total|2");
 }
 
 TEST_CASE("TAR #2361: every registered granularity declares the ts column its suffix maps to",
@@ -2008,37 +1969,6 @@ TEST_CASE("TAR #2361: a row INSIDE the future-slack band still counts as a survi
 
     CHECK(row_count(*f.db, "process_hourly") == 1); // survivor recognised -> deleted normally
     CHECK(declines_of(f.guard, "process_hourly") == 0);
-}
-
-TEST_CASE("TAR #2361: a rolled-back pass does NOT claim the cap bound",
-          "[tar][retention][clock-guard]") {
-    // Sol adversarial review. The cap counter used to increment at PROBE time,
-    // so a pass whose batch then rolled back still reported a capped deletion
-    // that never happened -- telemetry describing an event that did not occur,
-    // on the one surface whose job is to be believed.
-    //
-    // The existing cap test injects guard state directly and cannot see this;
-    // it takes a real pass whose delete fails.
-    TarGuardFixture f;
-    // Enough expired rows that the cap genuinely would bind, plus a survivor so
-    // the table is ACCEPTED rather than declined.
-    for (int i = 0; i < 12; ++i)
-        seed_process_hourly_at(*f.db, kT0 - (10 + i) * kHourlyCutoffSec, 500);
-    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
-    // RAISE(ROLLBACK) aborts the transaction, so the whole batch rolls back and
-    // nothing is deleted anywhere.
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
-                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
-
-    run_retention(*f.db, kT0, f.guard);
-
-    const auto counters = yuzu::tar::retention_guard_counters(f.guard);
-    const auto it = counters.cap_binds.find("process_hourly");
-    const int64_t claimed = it == counters.cap_binds.end() ? 0 : it->second;
-    CHECK(claimed == 0); // nothing committed, so nothing may be claimed
-    // The failure IS reported -- silence would be the other way to be wrong.
-    CHECK(failures_of(f.guard, "process_hourly") >= 1);
-    CHECK(row_count(*f.db, "process_hourly") == 6001); // nothing deleted
 }
 
 TEST_CASE("TAR #2361: the FIRST pass with no stored anchor declines instead of deleting",

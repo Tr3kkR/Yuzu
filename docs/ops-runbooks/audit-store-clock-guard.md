@@ -104,35 +104,12 @@ The durable clock reading is not being written. The elapsed-time detector is the
 only half of the guard that survives a restart, so while this persists a restart
 loses its comparison point. Check disk and permissions on `audit.db`.
 
-## YuzuAuditRetentionNotRunning - no pass has run
-
-`audit.db` is growing and NOTHING else will tell you: every other rule here fires
-on activity, so a server whose retention never runs looks exactly like an idle
-one. This rule fires on the ABSENCE of increase in
-`yuzu_server_audit_retention_passes_total`, which counts passes ATTEMPTED
-(whatever the outcome), and on the series being absent entirely.
-
-Most likely causes, in order:
-
-1. **The server is restarting more often than the cleanup interval.** The loop
-   sleeps a full interval (60 minutes by default) BEFORE its first pass, so a
-   server that never stays up an hour never completes one. Check uptime and the
-   restart history first - this needs no fault to reach.
-2. **The series is absent**: the server is down, the scrape target is wrong, or
-   the store was never constructed. Check `up` for the job.
-3. **The cleanup thread died.** Look for a crash or an exception around the
-   store in the log.
-
-The alert is deliberately suppressed for the first 3 hours of a server's uptime,
-because the sleep-first loop makes early zeros expected.
-
 ## Verifying recovery
 
 ```
 yuzu_server_audit_clock_anomaly_skips_total   # stops increasing
 yuzu_server_audit_rows_deleted_total          # resumes increasing
 yuzu_server_audit_retention_cap_reached_total # flat once the backlog drains
-yuzu_server_audit_retention_passes_total      # increasing at the cleanup cadence
 ```
 
 Read the skips and failed counters **together**. Both leave rows undeleted, so a

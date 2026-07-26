@@ -509,12 +509,6 @@ std::optional<bool> exists_probe(sqlite3* db, const char* sql,
 } // namespace
 
 std::size_t AuditStore::cleanup_once(std::int64_t now) {
-    // Liveness FIRST, before any early return. This counter answers "did
-    // retention run at all", so it must move even on the paths that do nothing
-    // and even on the closed-store path -- an increment conditional on success
-    // would leave the one state it exists to detect indistinguishable from a
-    // healthy idle server (#2360 Gate 4, unhappy-path UP-2).
-    passes_total_.fetch_add(1, std::memory_order_relaxed);
     // What this pass wants logged, filled in under the lock and emitted after it
     // is released: spdlog formatting is neither cheap nor bounded, and every
     // audit log() blocks on this same exclusive lock.

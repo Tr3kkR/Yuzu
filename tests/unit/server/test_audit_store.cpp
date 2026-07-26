@@ -1334,34 +1334,6 @@ TEST_CASE("AuditStore #2360: a failed persist of the clock reading is counted",
     f.store.cleanup_once(kNow + 1);
     CHECK(f.store.persist_failed_count() > 0);
 }
-
-TEST_CASE("AuditStore #2360: the liveness counter moves even when the pass does nothing",
-          "[audit_store][retention][clock-guard]") {
-    // UP-2. This counter exists to answer "did retention run AT ALL", so its
-    // defining property is that it advances on the paths where nothing happened.
-    // If it only counted useful work, the one state it is for -- retention never
-    // running, audit.db growing, every other counter at zero, /healthz ok --
-    // would still be invisible.
-    GuardFixture f;
-    REQUIRE(f.store.passes_total() == 0);
-
-    // Nothing expired at all: the quietest possible pass.
-    f.store.cleanup_once(kNow);
-    CHECK(f.store.passes_total() == 1);
-    CHECK(f.store.rows_deleted_count() == 0);
-    CHECK(f.store.clock_anomaly_skips_count() == 0);
-
-    // A declining pass: also nothing deleted, still a pass.
-    f.seed(kNow - 100, 5); // every datable row expired -> would_wipe
-    f.store.cleanup_once(kNow);
-    CHECK(f.store.passes_total() == 2);
-    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
-
-    // And an accepting one.
-    f.store.cleanup_once(kNow);
-    CHECK(f.store.passes_total() == 3);
-}
-
 TEST_CASE("AuditStore #2360: the FIRST pass with no stored anchor declines instead of deleting",
           "[audit_store][retention][clock-guard]") {
     // Sol adversarial review, BLOCKING. The bootstrap hole the persisted-reading

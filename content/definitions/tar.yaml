@@ -28,17 +28,12 @@ metadata:
     connection is itself available; the error| line states which case applies,
     so do not infer tar sql access from storage_state|offline alone.
     Reports the retention clock
-    guard counters (#2361): retention_guard_declines_total,
-    retention_guard_failures_total and retention_guard_capped_total are always
-    present, with per-table retention_guard|<table>|<n>,
-    retention_guard_failed|<table>|<n> and retention_guard_capped|<table>|<n>
-    lines for any table with a non-zero count. The capped total counts passes
-    where the per-pass delete cap BOUND and left a backlog: neither a decline nor
-    a failure, so it is the only signal that expiry is outrunning the drain and
-    the table is growing. Read all THREE totals together - a zero
+    guard counters (#2361): retention_guard_declines_total and
+    retention_guard_failures_total are always present, with per-table
+    retention_guard|<table>|<n> and retention_guard_failed|<table>|<n> lines for
+    any table with a non-zero count. Read the two totals TOGETHER - a zero
     declines total only means the endpoint's clock is behaving if the failures
-    total is also zero, and neither says anything about whether the table is
-    outgrowing the cap. Scrape this across the fleet to find hosts whose clocks
+    total is also zero. Scrape this across the fleet to find hosts whose clocks
     need attention; the agent has no /metrics endpoint.
   tags: [tar, timeline, monitoring, diagnostics]
 

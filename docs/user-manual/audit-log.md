@@ -393,11 +393,9 @@ case, which is why the elapsed-time reading is persisted across restarts. Taken
 together the guard converts an instantaneous wipe into a paced one plus an
 operator signal; it does not guarantee every clock anomaly is detected.
 
-Seven metrics report on this. All but `rows_deleted_total` ship with an alert
+Six metrics report on this. All but `rows_deleted_total` ship with an alert
 rule in `docs/prometheus/yuzu-alerts.yml`; that one is a rate to read alongside
-the others, not an alert on its own. Do not collapse the first two, and note
-that `retention_passes_total` is alerted on its ABSENCE of increase rather than
-on a value:
+the others, not an alert on its own. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
@@ -407,7 +405,6 @@ on a value:
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. **Evaluated once at startup**, so it will not detect an index dropped while the server is running. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
-| `yuzu_server_audit_retention_passes_total` | Passes ATTEMPTED, whatever the outcome. Liveness: every other metric here moves only when something happened, so a server whose retention never runs at all is invisible to all of them and reads exactly like an idle one. Reachable with no fault - the cleanup loop sleeps a full interval before its first pass, so a server restarting more often than that never completes one. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is

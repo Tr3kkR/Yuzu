@@ -1036,13 +1036,6 @@ public:
                           "Failures to persist the audit retention clock reading, which degrades "
                           "clock-anomaly detection across a restart",
                           "counter");
-        metrics_.describe("yuzu_server_audit_retention_passes_total",
-                          "Audit retention passes attempted, whatever the outcome. LIVENESS: "
-                          "alert on the ABSENCE of increase, not on a value. Every other "
-                          "retention metric moves only when something happened, so a server "
-                          "whose retention never runs at all is invisible to all of them and "
-                          "reads exactly like an idle one",
-                          "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
         // Increments in the token-create handlers (api_token, device_token)
         // when `secure_random::fill_random` returns prng_failure (entropy
@@ -3880,8 +3873,6 @@ public:
                         .set(audit_store_->retention_index_ok() ? 1.0 : 0.0);
                     metrics_.gauge("yuzu_server_audit_retention_persist_failed_total")
                         .set(static_cast<double>(audit_store_->persist_failed_count()));
-                    metrics_.gauge("yuzu_server_audit_retention_passes_total")
-                        .set(static_cast<double>(audit_store_->passes_total()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore
