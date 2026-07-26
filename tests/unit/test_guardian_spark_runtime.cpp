@@ -1580,6 +1580,12 @@ TEST_CASE("#2364 episode: a stop-truncated pass with FULL coverage still does no
     CHECK_FALSE(s3.headroom_blocked);
     CHECK(classify_calls == 4); // truncated mid-loop, after the coverage-completing 3rd
     CHECK(rig.journal->headroom_blocked_since_for_test() == since); // NOT cleared
+    // #2452 Gate 7: a stop-truncated pass placed nothing and did not verify a clean idle backlog,
+    // so it is not "verified idle". This pins the `stop_truncated` tail term - the one governance
+    // Gate 8 found unpinned: with records_paged==0 and every other term false, deleting
+    // `!stop_truncated` from the tail conjunction would flip this to true.
+    CHECK(s3.records_paged == 0);
+    CHECK_FALSE(s3.progress_or_verified_idle);
 }
 
 TEST_CASE("#2364 episode: restart after clear - a fresh episode stamps and clears cleanly",

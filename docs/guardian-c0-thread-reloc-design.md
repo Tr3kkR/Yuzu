@@ -726,11 +726,36 @@ bounds, UP-6 to the jitter) and are listed anyway so the set stays in one place.
   read healthy while replay was genuinely stalled. PRE-EXISTING from L1b, not introduced by L2 -
   but L2 is the rung that makes replay real, and this is the gauge an on-call engineer will trust
   first once it is. Both compliance and SRE called this the one deferred item that should be a
-  flip PREREQUISITE rather than ordinary backlog. **FIX:** the page stamp now advances only on a
-  pass that did not throw, was not stop-aborted, was not `deferred_no_token`, did not
-  `sent_scan_failed`, and raised no `page_read_failures`; the prune stamp gained the sibling
-  `read_ok` gate (a `stopping_` return no longer advances either). The named flip prerequisite is
-  cleared.
+  flip PREREQUISITE rather than ordinary backlog. **FIX (governance Gate 7):** an initial per-cause
+  negative enumeration kept missing no-work exits (the review round found boot-barrier, then
+  headroom-blocked, quarantine-only, and a worker-vs-journal stop-flag divergence), so the page
+  stamp now gates on a single POSITIVE signal - `JournalPageStats::progress_or_verified_idle`, set
+  true only at page_into_window's successful tail iff the pass placed records OR ran a full scan of
+  a clean, unblocked, uncorrupted, readable idle backlog. Every early return (null-kv, a `stopping_`
+  bail, deferred, sent-scan/candidate/value read failure, boot-barrier, headroom-blocked,
+  quarantine-only) leaves it false by construction, so a future no-work exit cannot advance it by
+  forgetting to opt out. Mirrors the prune stamp's positive `progress_or_verified` gate; both also carry
+  `!stop_requested()`. **PAGE-side cleared, and PRUNE-side now also cleared** for the same-class
+  no-work exits: the prune stamp gained the symmetric positive `JournalPruneStats::progress_or_verified`,
+  true iff retention was APPLIED (`evicted > 0`) OR verified genuinely idle. It reads a growing age on a
+  scan failure, a **DELETE failure (UP-7)**, a **stop BEFORE the delete (UP8-3)** (all return early,
+  before the set point), a **`skip_age` clock-decline of rows that were expired (UPR-2)** - `skip_age &&
+  expired > 0`, so retention was deferred and the journal is not idle, though a big_step on a genuinely
+  idle journal stays fresh - and a **quarantine-rename FAILURE (UPR-1)** that left a corrupt row stuck,
+  mirroring the page-side guard (the last two found by the focused re-review). A stop during the trailing
+  label-GC correctly keeps it true (retention already ran), and a quarantine SUCCESS reads fresh (progress).
+  ONE prune residual is TRACKED, not closed here: a forward-clock-jump wipe still advances the stamp - the
+  delete genuinely succeeded, so it is not a stamp-gating problem but the L5 clock-guards' (#2360/#2361) job to
+  PREVENT the wipe. Also pre-flip (SRE observability): ship draft alert rules for
+  `_headroom_blocked_seconds` / `_quarantined` / `_prune_failures` so the newly-stale gauges have
+  actual alerts. One thing to remember when they land: the page stamp is verified PER-SLICE (cap 128),
+  so a fully-unhealthy tail on a large journal surfaces only after ceil(N/128) page cadences - worst
+  case ~8 x 30 s = 240 s at N=1000, thin under a 300 s (10x) `_page_stale_seconds_max` threshold: size
+  the page-stale alert `for:`/threshold with that rotation lag in mind, or alert on
+  `_headroom_blocked_seconds` (which is NOT slice-capped) for the congestion case. (The prune
+  quarantine-rename-FAILURE case the K3 review flagged as by-contract-fresh is now CLOSED - the focused
+  re-review's UPR-1 gate makes it read stale via `quarantine_stall_this_pass`, mirroring the page side;
+  a quarantine SUCCESS still reads fresh, which is correct.)
 - UP-5 — a pre-planted `quarantine:` twin makes the page-side rename Conflict every pass;
   bounded by the per-pass candidate cap, but can stall the drain behind ~128 KvStore round
   trips. Tampered-DB only. The same shape applies to the size-quarantine branch, where the row

@@ -197,17 +197,20 @@ struct GuardianMaintenanceResult {
     std::size_t skipped_already_sent{0};
     /// The sent-label scan failed and the pass fell back to re-offering everything.
     bool sent_scan_failed{false};
-    /// The page pass could not read/establish replay state (JournalPageStats::read_failed):
-    /// candidate scan, a candidate value read, or the boot-prune barrier's scan failed. Unlike
-    /// deferred_no_token/sent_scan_failed it carries no per-pass counter of its own for the
-    /// boot-barrier case, which is why it is surfaced here (#2452).
-    bool page_read_failed{false};
+    /// THE page-side gate signal (#2452 Gate 7): the pass placed records or positively verified a
+    /// clean idle backlog (JournalPageStats::progress_or_verified_idle). False on EVERY no-work
+    /// exit - deferred, sent-scan/candidate/value read failure, boot-prune barrier, headroom-
+    /// blocked, quarantine-only, null-kv, a stopping_ bail - so the drain worker's page success
+    /// stamp advances iff this is true (mirrors the prune side gating on prune_progress_or_verified).
+    bool progress_or_verified_idle{false};
     /// A prune pass was requested and ran (mirrors page_attempted for the retention side).
     bool prune_attempted{false};
-    /// The prune pass's initial journal scan succeeded (JournalPruneStats::read_ok). A prune
-    /// whose scan fails returns without throwing, so `ok` alone cannot tell a healthy retention
-    /// pass from a permanently-unreadable one - the success stamp gates on this (#2452).
-    bool prune_read_ok{false};
+    /// THE prune-side gate signal (JournalPruneStats::progress_or_verified, #2452 Gate 8): retention
+    /// was applied or verified idle. False on every no-work prune exit - scan failure, delete
+    /// failure, and any stop before the delete - so the prune success stamp advances only on this
+    /// (the prune-side mirror of progress_or_verified_idle; closes UP-7 delete-fail + UP8-3
+    /// stop-abort that gating on read_ok alone left open).
+    bool prune_progress_or_verified{false};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {
@@ -325,11 +328,14 @@ public:
         return last_page_success_steady_ms_.load(std::memory_order_relaxed);
     }
     /// PRUNE sibling of last_page_success_steady_ms() - separate because the two passes run
-    /// on different cadences (30 s page / 120 s prune) and stall independently. Advances only on
-    /// a prune whose scan read cleanly (JournalPruneStats::read_ok) and that a stop did not abort;
-    /// a permanently-unreadable prune returns without throwing, so gating on "did not throw" alone
-    /// would read a stalled retention loop as fresh (#2452). A scan-clean pass whose DELETE failed
-    /// still advances (that is prune_failures / #2364 territory, a distinct operator situation).
+    /// on different cadences (30 s page / 120 s prune) and stall independently. Advances only on a
+    /// prune that genuinely RAN retention: it did not throw, a stop did not abort it, and it applied
+    /// the delete OR verified nothing was eligible (JournalPruneStats::progress_or_verified, the
+    /// prune-side mirror of the page stamp's positive flag). A prune whose scan fails, whose DELETE
+    /// fails, or that a stop aborts before the delete returns without throwing, so gating on "did
+    /// not throw" (or on scan-only read_ok) would read a stalled retention loop as fresh (#2452
+    /// Gate 8, closing UP-7 delete-fail + UP8-3 stop-abort). A forward-clock-jump wipe still advances
+    /// it (the delete DID succeed - the L5 clock-guard #2360/#2361 owns that, not this gauge).
     [[nodiscard]] std::uint64_t last_prune_success_steady_ms() const noexcept {
         return last_prune_success_steady_ms_.load(std::memory_order_relaxed);
     }

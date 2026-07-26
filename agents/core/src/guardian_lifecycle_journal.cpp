@@ -346,6 +346,13 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     }
     stats.read_ok = true;
 
+    // #2452 Gate 8 (focused re-review UPR-1): a malformed key whose quarantine RENAME fails below
+    // leaves a corrupt row STUCK in lc: (re-failing every pass, consuming ceiling budget). Like the
+    // page side's any_quarantine_this_pass, that is not a clean, verified-idle retention pass, so it
+    // must NOT read the prune stamp fresh - fed into progress_or_verified at the tail. Mirrors the
+    // page-side guard the first prune cut missed.
+    bool quarantine_stall_this_pass = false;
+
     // Rebase to what the scan actually observed on disk (all lc: rows, well-keyed or not); the
     // quarantine + eviction below then fetch_sub exactly what they REMOVE, so the gauge lands
     // at the true post-prune size without ever taking an absolute snapshot.
@@ -448,6 +455,7 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                                          std::memory_order_relaxed);
             } else {
                 quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
+                quarantine_stall_this_pass = true; // #2452 Gate 8: stuck corrupt row -> not verified idle
             }
             continue;
         }
@@ -795,6 +803,23 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
         }
     }
 
+    // #2452 Gate 8 - retention ran or was verified idle. This is reached past the eviction block, so
+    // a delete FAILURE (returned early above, UP-7), a scan failure (read_ok false), and any stop
+    // BEFORE the delete (UP8-3) never get here - all leave the flag false. But reaching here is NOT
+    // sufficient on its own (focused re-review): the flag is true iff the pass either APPLIED a
+    // delete (evicted > 0 - genuine retention progress) OR the empty evict set genuinely reflects an
+    // idle journal - which it does NOT when the pass DECLINED age eviction of rows that WERE expired
+    // (`skip_age && expired > 0`, UPR-2: a would_wipe all-expired reading, or a big_step suspend/
+    // resume that aged rows out - retention deferred, journal not idle), and NOT when a malformed
+    // key's quarantine rename failed and left a corrupt row stuck (quarantine_stall_this_pass, UPR-1,
+    // mirroring the page-side guard). `skip_age && expired > 0` is deliberate over plain `!skip_age`:
+    // a big_step on a genuinely-idle journal (expired == 0) declined nothing, so it stays
+    // verified-idle rather than false-staling. A stop during the trailing label-GC below still leaves
+    // this true (retention already ran). A forward-clock-jump WIPE evicts (evicted > 0), so it still
+    // reads fresh - the L5 clock-guard (#2360/#2361) owns preventing that wipe, tracked separately.
+    stats.progress_or_verified =
+        stats.evicted > 0 || (!(skip_age && expired > 0) && !quarantine_stall_this_pass);
+
     // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC. The
     // size gauges are NOT stored here any more - the rebase above plus the quarantine/eviction
     // fetch_subs already left them at the true on-disk size via RMW only, so a concurrent
@@ -998,6 +1023,14 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // footer. A failed read leaves that candidate's headroom disposition UNKNOWN, and unknown
     // is not evidence of "not blocked".
     bool value_read_failed = false;
+    // Pass-level "this pass hit a CORRUPT candidate" (#2452 Gate 7 / UP-2), set whether the
+    // quarantine rename succeeds OR fails. A quarantine is a SUCCESSFUL read of a corrupt batch, so
+    // it is not a read failure, but it is not replay progress either: a pass that only quarantines
+    // (or fails to quarantine a stuck corrupt batch) placed nothing and did not verify a clean idle
+    // backlog, so it must NOT read the page stamp fresh. Feeds progress_or_verified_idle at the
+    // tail; on a mass-corruption endpoint that is what makes the age gauge grow instead of lying
+    // healthy while zero records reach the server.
+    bool any_quarantine_this_pass = false;
     // A throw here would unwind the whole pass BEFORE page_cursor_ advances past this
     // candidate, so the next pass restarts on the same row and throws again - a permanent
     // rotation wedge that starves every batch behind it (Gate 4 unhappy-path UP-2). The
@@ -1059,6 +1092,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 }
             }
             if (!replayable) {
+                // A corrupt candidate this pass - whether the quarantine rename below SUCCEEDS or
+                // FAILS (a pre-planted quarantine: twin conflicts, or a write error), the pass
+                // placed nothing here and did not verify a clean idle backlog, so it must not read
+                // the page stamp fresh (#2452 Gate 7). Set BEFORE the rename so a rename failure -
+                // itself a no-work stall on a stuck corrupt batch - cannot slip past the flag.
+                any_quarantine_this_pass = true;
                 if (kv_->rename_key(kJournalNamespace, c.key, journal_quarantine_key(c.key)) ==
                     KvRename::Renamed) {
                     quarantined_.fetch_add(1, std::memory_order_relaxed);
@@ -1454,6 +1493,22 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
 
     pages_.fetch_add(1, std::memory_order_relaxed);
     records_paged_.fetch_add(stats.records_paged, std::memory_order_relaxed);
+    // #2452 Gate 7 - the ONLY site that sets progress_or_verified_idle true. Reached only when the
+    // pass finished its consideration loop (no early return, no stopping_ truncation) - which is
+    // per-SLICE (capped at kJournalPageMaxBatchesPerPass), not whole-backlog; see the hpp docstring
+    // for why per-slice is correct. Healthy iff it PLACED records, or it verified a clean idle slice:
+    // nothing left blocked on
+    // headroom, nothing quarantined, no candidate value read failed, and the sent-label scan did
+    // NOT fall back (sent_scan_failed - a degraded read means the pass could not fully verify what
+    // was already delivered, so it is not "verified" idle; parity with the pre-Gate-7 gate).
+    // `stop_truncated` guards a mid-loop shutdown; a stopping_ bail before this point never reaches
+    // here and leaves the flag false. This positive signal is what closes the negative
+    // enumeration's structural gap - a future no-progress exit added above returns early and stays
+    // not-fresh by construction.
+    stats.progress_or_verified_idle =
+        stats.records_paged > 0 ||
+        (!stop_truncated && !stats.headroom_blocked && !stats.read_failed &&
+         !stats.sent_scan_failed && !any_quarantine_this_pass);
     return stats;
 }
 

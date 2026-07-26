@@ -712,6 +712,123 @@ TEST_CASE("eviction classification: sent, no-evidence, and unclassified all non-
           j.batches_pruned());
 }
 
+// ── prune progress_or_verified: the prune stamp's positive gate signal (#2452 Gate 8) ──
+// The prune-side mirror of page's progress_or_verified_idle. True iff retention was APPLIED (the
+// delete succeeded) or VERIFIED IDLE (nothing eligible). The drain worker's prune success stamp
+// advances only on this, so a scan failure, a DELETE failure (UP-7), or a stop before the delete
+// reads a growing age instead of lying "retention healthy".
+
+TEST_CASE("prune flag: a clean pass with nothing to evict is verified (progress_or_verified true)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/100, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // 3 batches, well under the 100 cap -> nothing eligible
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.evicted == 0);
+    CHECK(stats.progress_or_verified); // scanned clean, verified nothing to evict
+}
+
+TEST_CASE("prune flag: a pass that evicts is progress (progress_or_verified true)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // over the 0 cap -> all evicted
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.evicted == 3);
+    CHECK(stats.progress_or_verified);
+}
+
+TEST_CASE("prune flag: a DELETE-failing pass is NOT verified (progress_or_verified false, UP-7)",
+          "[guardian][journal][prune]") {
+    // Scan is clean (read_ok true) but the retention delete fails, so retention did NOT run - the
+    // stamp must read a growing age, not fresh. This is the case that distinguishes the positive
+    // flag from the old read_ok gate (which advanced here); mutation-reddens if the flag is set
+    // before the delete rather than after.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // over-cap -> would evict
+    j.inject_delete_failures_for_test(1); // the retention delete fails
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);                    // scan succeeded
+    CHECK(stats.evicted == 0);               // delete failed, nothing removed
+    CHECK(j.prune_failures() >= 1);          // counted
+    CHECK_FALSE(stats.progress_or_verified); // retention did not run
+}
+
+TEST_CASE("prune flag: a scan-failing pass is NOT verified (progress_or_verified false)",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    persist_n_unmarked(j, t, 1);
+    j.inject_read_failures_for_test(1); // the initial scan fails
+    const auto stats = j.prune(0);
+    CHECK_FALSE(stats.read_ok);
+    CHECK_FALSE(stats.progress_or_verified);
+}
+
+TEST_CASE("prune flag: a quarantine-rename-FAILING pass is NOT verified (progress_or_verified false, UPR-1)",
+          "[guardian][journal][prune]") {
+    // A malformed key whose quarantine rename FAILS leaves a corrupt row stuck in lc: (re-failing
+    // every pass, eating ceiling). Like the page side's any_quarantine_this_pass guard, that is not
+    // a clean verified-idle pass - it must read stale. Focused re-review UPR-1 (the page-side guard
+    // the first prune cut missed). Pre-plant the quarantine twin so the rename conflicts.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/100, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    const std::string bad = "lc:corrupt:000000000000"; // malformed key -> quarantined on sight
+    REQUIRE(t.kv->set(kJournalNamespace, bad, "not valid json"));
+    REQUIRE(t.kv->set(kJournalNamespace, journal_quarantine_key(bad), "pre-existing twin"));
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.evicted == 0);               // nothing age/count/byte-eligible
+    CHECK(j.quarantine_failures() >= 1);     // the rename really failed
+    CHECK_FALSE(stats.progress_or_verified); // stuck corrupt row -> not verified idle
+}
+
+TEST_CASE("prune flag: a quarantine-only SUCCESS pass is verified (progress_or_verified true)",
+          "[guardian][journal][prune]") {
+    // The by-contract true case (distinct from the FAILURE above): a successful quarantine removed
+    // the corrupt row and retention found nothing else to evict -> verified idle. Pins that the
+    // UPR-1 guard fires ONLY on a quarantine FAILURE, not on every quarantine.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/100, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    REQUIRE(t.kv->set(kJournalNamespace, "lc:corrupt:000000000000", "not valid json"));
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);
+    CHECK(stats.quarantined >= 1);      // the malformed key was quarantined successfully
+    CHECK(stats.evicted == 0);
+    CHECK(stats.progress_or_verified);  // quarantine succeeded + nothing to evict -> verified
+}
+
+TEST_CASE("prune flag: a stop in the mid-scan loop (pre-delete) is NOT verified (progress_or_verified false)",
+          "[guardian][journal][prune]") {
+    // A stop landing AFTER read_ok is set but BEFORE the delete (via the post-scan seam) reaches an
+    // early return that never sets the flag. Directly pins a pre-delete stop -> false - the UP8-3
+    // class the "bracketed by delete-fail + scan-fail" claim only argued structurally (focused
+    // re-review QA: the mid-scan-loop stop at read_ok=true/evicted=0 was previously untested).
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    j.set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0, /*max_bytes=*/kNoCap,
+                                    /*max_quarantine=*/100);
+    persist_n_unmarked(j, t, 3); // over-cap: would evict, but the stop truncates before the delete
+    j.set_post_scan_hook_for_test([&] { j.request_stop(); });
+    const auto stats = j.prune(0);
+    CHECK(stats.read_ok);      // the scan succeeded before the stop
+    CHECK(stats.evicted == 0); // truncated before the delete
+    CHECK_FALSE(stats.progress_or_verified);
+}
+
 // ── Fault-injection + capacity hardening (governance Gate 7) ──────────────────
 
 TEST_CASE("journal prune: an injected read failure is fail-safe (counted, read_ok false, retried)",
@@ -1113,9 +1230,13 @@ TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock ju
     CHECK(declined.evicted == 0);
     CHECK(j.clock_jump_skips() == 1); // counted, and the trail survives the first pass
     CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+    // #2452 Gate 8 UPR-2: the pass declined age eviction of rows that WERE expired, so retention was
+    // deferred and the journal is NOT idle - the prune stamp must read a growing age, not fresh.
+    CHECK_FALSE(declined.progress_or_verified);
 
     const auto accepted = j.prune(now + 6000); // ...and the next pass proceeds
     CHECK(accepted.evicted == 2);
+    CHECK(accepted.progress_or_verified); // retention actually ran -> verified
 }
 
 TEST_CASE("journal prune: an IMPLAUSIBLY LARGE value cannot evict the rest of the journal",
