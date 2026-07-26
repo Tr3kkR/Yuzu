@@ -76,7 +76,7 @@ condition:
 So:
 
 - **Not near the cap:** do nothing now. Record the occurrence, file a bug with the
-  `reason` label and surrounding logs (`MCP bridge teardown incomplete [stage=...]`), and
+  `reason` label and surrounding logs (`MCP bridge teardown incomplete [reason=...]`), and
   fold the restart into the next planned maintenance window.
 - **Near or at the cap, and `teardown_incomplete` is non-zero:** schedule a restart.
   Check host memory headroom first. Prefer a rolling restart if more than one replica is
@@ -89,8 +89,9 @@ So:
 
 Every incomplete teardown emits, in order of reliability:
 
-1. An operator log line: `MCP bridge teardown incomplete [stage=<stage>
-   execution_id=<id>]: resource retained until shutdown`.
+1. An operator log line: `MCP bridge teardown incomplete [reason=<reason>
+   execution_id=<id>]: resource retained until shutdown`. The field is `reason`,
+   matching the metric label, so the same value greps both.
 2. The metric above.
 3. An audit row on the relevant `mcp.bridge.*` verb with `result=failure` and a `detail`
    naming what was retained.

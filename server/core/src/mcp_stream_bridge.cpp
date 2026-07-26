@@ -660,6 +660,14 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
             // a lock failure here is std::terminate on the projector thread, and
             // guaranteed so if the destructor runs during unwinding. release_charge and
             // project_record were restructured for exactly this seam; this was not.
+            //
+            // NOTE the containment is not the whole fix: projection_in_flight is
+            // cleared INSIDE this try, so a lock failure leaves it set and the record
+            // is deferred by every consumer forever - and because a defer exits the
+            // pressure loop, one wedged victim stalls ring-only pressure relief
+            // bridge-wide. Fixing that needs projection_in_flight to become atomic
+            // with a stated protocol (a finally-style clear would race the readers),
+            // which is a design change: tracked as #2528, deliberately not done here.
             try {
                 std::lock_guard<std::mutex> rlk(rec->mu);
                 if (term.has_value() && !terminal_settled) {
@@ -804,7 +812,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // rec->mu and takes bridge_mu_ afterwards. Its caller's guard stops the
         // exception ESCAPING but does nothing about the desync - a throw there strands
         // streamed_unpinned_[session] identically, so the sink is the same one. Out of
-        // scope here (request thread, different failure posture) and NOT YET FILED.
+        // scope here (request thread, different failure posture); tracked as #2529.
         std::lock_guard<std::mutex> lk(bridge_mu_);
         std::lock_guard<std::mutex> rlk(rec->mu);
         rec->terminal_projected = true;
@@ -1353,11 +1361,12 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // replay buffer for the process lifetime.
         count_teardown_incomplete(TeardownStage::kUnsubscribe);
         log_incomplete(stage_name(TeardownStage::kUnsubscribe));
-        // The detail must not assert a delivery that did not happen. Four of the five
-        // call sites pass kNone and publish nothing at all, and even a publishing
-        // disposition delivers nothing on kPoisoned / kPublishThrew / kNotAttempted -
-        // so "the terminal was published first" is only true when the ladder actually
-        // committed. Two bounded literals rather than one convenient claim.
+        // The detail must not assert a delivery that did not happen. There are three
+        // teardown_claimed call sites; the pin-ack / session-death / arming-reap one
+        // passes kNone literally and publishes nothing, and the two pressure sites
+        // pass a decision that still delivers nothing on kPoisoned / kPublishThrew /
+        // kNotAttempted - so "the terminal was published" is only true when the ladder
+        // actually committed. The disposition below is derived, not assumed.
         audit_contained(audit_action, exec_id,
                         "teardown incomplete: bus unsubscribe failed; the record, its streamed "
                         "charge and its bus subscription are all retained for shutdown",
