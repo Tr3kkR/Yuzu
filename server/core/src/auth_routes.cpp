@@ -1274,6 +1274,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     } else if (!rec) {
                         spdlog::warn("record_failed_login failed for '{}': error={}", username,
                                      static_cast<int>(rec.error()));
+                        if (is_store_unavailable(rec.error())) {
+                            // ★ Hermes p2 MEDIUM: the lockout counter could not
+                            // be persisted (PG outage) — refuse fail-closed with
+                            // a 503 rather than return the already-built 401,
+                            // which would be an UNcounted attempt and let a
+                            // password-spray brute-force unlimited tries while
+                            // the store is degraded.
+                            res.status = 503;
+                            res.set_content(
+                                R"({"error":{"code":503,"message":"authentication store is temporarily unavailable"},"meta":{"api_version":"v1"}})",
+                                "application/json");
+                        }
                     }
                 }
             }
@@ -1318,17 +1330,47 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (login_lk.owns_lock())
             login_lk.unlock();
 
-        // Decide whether this user must complete a TOTP challenge before
-        // we mint a real session. The AuthDB lookup is fail-open relative
-        // to MFA: if AuthDB is not configured (legacy config-file-only
-        // deployments) or the row read fails, we treat the user as
-        // not-enrolled. Enforcement modes (`admin-only`, `required`)
-        // tighten this in a follow-up PR.
+        // Decide whether this user must complete a TOTP challenge before we
+        // mint a real session. ★ SECURITY (architect BLOCK, Postgres
+        // migration): `mfa_status` is now TRI-STATE — a store/decrypt
+        // failure (`SecretUnavailable`/`QueryFailed`) MUST NEVER collapse to
+        // "not enrolled". Doing so would let a PG/KEK outage silently strip
+        // an enrolled privileged account of its second factor and fall
+        // through to the password-only session mint below. Only a genuine
+        // `Ok{enrolled=false}` may skip MFA; every error arm fails CLOSED
+        // (503, no session minted) here — if AuthDB itself is not
+        // configured at all (db == nullptr; legacy/degraded deployments),
+        // that is unchanged fail-open-to-not-enrolled, matching every other
+        // "AuthDB unavailable" site in this file (there is no store to be
+        // wrong about).
         bool mfa_enrolled = false;
         if (auto* db = auth_mgr_.auth_db_ptr()) {
             auto status = db->mfa_status(username);
-            if (status && status->enrolled) {
-                mfa_enrolled = true;
+            if (status) {
+                mfa_enrolled = status->enrolled;
+            } else {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"authentication store is temporarily )"
+                    R"(unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
+                        .increment();
+                }
+                audit_log_for_principal(
+                    req, "mfa.status.unavailable", "error", username,
+                    auth::role_to_string(*role_opt), "User", username,
+                    status.error() == AuthDBError::SecretUnavailable
+                        ? "mfa_status: secret unavailable (fail-closed, no session minted)"
+                        : "mfa_status: query failed (fail-closed, no session minted)");
+                emit_event("mfa.status.unavailable", req,
+                           {{"source_ip", req.remote_addr}, {"username", username}}, {},
+                           Severity::kCritical);
+                spdlog::error("mfa_status failed for '{}' (error={}) — refusing login "
+                              "(fail-closed, architect BLOCK)",
+                              username, static_cast<int>(status.error()));
+                return;
             }
         }
 
@@ -1435,13 +1477,31 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             auto init = db->mfa_init_enrollment(username, "Yuzu");
             if (!init) {
-                res.status = 500;
+                // ★ SECURITY (architect BLOCK): a decrypt/store failure while
+                // (re-)revealing a provisional secret is 503, fail-closed —
+                // never a generic 500 that could be confused with a
+                // harmless one-off. No session is minted either way.
+                const bool store_unavailable = is_store_unavailable(init.error());
+                res.status = store_unavailable ? 503 : 500;
                 res.set_content(
-                    R"({"error":{"code":500,"message":"Could not initiate MFA enrollment"},"meta":{"api_version":"v1"}})",
+                    store_unavailable
+                        ? R"({"error":{"code":503,"message":"authentication store is temporarily )"
+                          R"(unavailable"},"meta":{"api_version":"v1"}})"
+                        : R"({"error":{"code":500,"message":"Could not initiate MFA enrollment"},)"
+                          R"("meta":{"api_version":"v1"}})",
                     "application/json");
+                if (store_unavailable) {
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
+                            .increment();
+                    }
+                }
                 audit_log_for_principal(req, "mfa.enroll.required", "error", username,
                                         auth::role_to_string(*role_opt), "User", username,
-                                        "mfa_init_enrollment failed");
+                                        store_unavailable
+                                            ? "mfa_init_enrollment: secret/store unavailable "
+                                              "(fail-closed)"
+                                            : "mfa_init_enrollment failed");
                 return;
             }
             auto pending_token =
@@ -1646,6 +1706,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         bool matched = false;
         bool used_recovery = false;
+        bool store_unavailable = false;
         // Strict shape gate (Gate 4 consistency N2 + unhappy UP-14/UP-20):
         //   - TOTP: exactly 6 ASCII digits
         //   - Recovery: any other shape goes through normalisation +
@@ -1664,15 +1725,50 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         if (is_totp) {
             auto r = db->mfa_verify_login_code(entry.username, code);
-            if (r && *r) {
-                matched = true;
+            if (r) {
+                matched = *r;
+            } else if (is_store_unavailable(r.error())) {
+                // ★ SECURITY (architect BLOCK): a decrypt/store failure must
+                // NEVER be treated as "wrong code" — that would silently
+                // burn one of the user's limited attempts against a
+                // transient outage, and (more importantly) is exactly the
+                // class of error `AuthDBError::SecretUnavailable` exists to
+                // distinguish from a genuine mismatch. `matched` stays
+                // false either way (no session is minted), but this takes
+                // a dedicated fail-closed 503 path below rather than the
+                // uniform 401 "wrong code" body.
+                store_unavailable = true;
             }
         } else {
             auto r = db->mfa_consume_recovery_code(entry.username, code);
             if (r && *r) {
                 matched = true;
                 used_recovery = true;
+            } else if (!r && is_store_unavailable(r.error())) {
+                store_unavailable = true; // outage → 503, never a burned attempt
             }
+        }
+
+        if (store_unavailable) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"authentication store is temporarily )"
+                R"(unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_verify"}})
+                    .increment();
+            }
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "mfa_verify_login_code: secret/store unavailable "
+                                    "(fail-closed, no session minted)");
+            emit_event("mfa.login.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", entry.username},
+                        {"reason", "store_unavailable"}},
+                       {}, Severity::kCritical);
+            return;
         }
 
         if (!matched) {
@@ -1842,12 +1938,42 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         std::vector<std::string> recovery_codes;
         bool verified = false;
+        bool store_unavailable = false;
         if (is_totp) {
             auto r = db->mfa_verify_enrollment(entry.username, code);
             if (r) {
                 recovery_codes = std::move(*r);
                 verified = true;
+            } else if (is_store_unavailable(r.error())) {
+                // ★ SECURITY (architect BLOCK): a decrypt/store failure must
+                // NEVER be treated as "wrong code" here either — same
+                // reasoning as /login/mfa. No session is minted regardless;
+                // this only routes to a distinct fail-closed 503 below
+                // instead of burning an attempt on a transient outage.
+                store_unavailable = true;
             }
+        }
+
+        if (store_unavailable) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"authentication store is temporarily )"
+                R"(unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
+                    .increment();
+            }
+            audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "mfa_verify_enrollment: secret/store unavailable "
+                                    "(fail-closed, no session minted)");
+            emit_event("mfa.enroll.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", entry.username},
+                        {"reason", "store_unavailable"}},
+                       {}, Severity::kCritical);
+            return;
         }
 
         if (!verified) {
@@ -2045,16 +2171,49 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         bool matched = false;
         bool used_recovery = false;
+        bool store_unavailable = false;
         if (is_totp) {
             auto r = db->mfa_verify_login_code(session->username, code);
-            if (r && *r)
-                matched = true;
+            if (r) {
+                matched = *r;
+            } else if (is_store_unavailable(r.error())) {
+                // ★ SECURITY (architect BLOCK): never collapse a decrypt/
+                // store failure into "wrong code" — no session mutation
+                // happens either way, but the caller (and audit trail)
+                // deserves a distinct fail-closed signal.
+                store_unavailable = true;
+            }
         } else {
             auto r = db->mfa_consume_recovery_code(session->username, code);
             if (r && *r) {
                 matched = true;
                 used_recovery = true;
+            } else if (!r && is_store_unavailable(r.error())) {
+                store_unavailable = true; // outage → 503, never a burned attempt
             }
+        }
+
+        if (store_unavailable) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"authentication store is temporarily )"
+                R"(unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+                    .increment();
+            }
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    "mfa_verify_login_code: secret/store unavailable "
+                                    "(fail-closed)");
+            emit_event("mfa.step_up.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", session->username},
+                        {"reason", "store_unavailable"}},
+                       {}, Severity::kCritical);
+            return;
         }
 
         if (!matched) {
@@ -2786,7 +2945,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                    const std::string& tt, const std::string& ti, const std::string& d) {
                 return audit_log(r, a, rs, tt, ti, d);
             },
-            label, cfg_.mfa_enforcement);
+            label, cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
     };
     // Default step-up window for the elevation surfaces; floored to 300 s when the
     // global gate is disabled so the privilege boundary keeps a fresh-proof check.
@@ -3090,8 +3249,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // Local session: mandatory local TOTP enrollment (unchanged). An
             // eligible operator with no TOTP enrolled is refused here
             // (require_mfa_step_up would otherwise pass them through under the
-            // default optional mode).
-            if (auto st = db->mfa_status(session->username); !st || !st->enrolled) {
+            // default optional mode). ★ SECURITY (architect BLOCK): a
+            // store/decrypt failure (SecretUnavailable/QueryFailed) is
+            // ALREADY a deny here (elevation is refused either way, never
+            // granted on error) — but it must be a distinct fail-closed 503,
+            // not conflated with the genuine "not enrolled, go enroll" 403,
+            // so an operator/SIEM can tell "MFA store is down" from
+            // "this account has no MFA".
+            auto st = db->mfa_status(session->username);
+            if (!st && is_store_unavailable(st.error())) {
+                audit_log_for_principal(req, "role.elevation.denied", "error", session->username,
+                                        auth::role_to_string(session->role), "User", session->username,
+                                        "mfa_status: secret/store unavailable (fail-closed)");
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "authentication store is temporarily "
+                                                           "unavailable",
+                                                      cid),
+                                "application/json");
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_secret_unavailable_total", {{"route", "elevate"}})
+                        .increment();
+                }
+                return;
+            }
+            if (!st || !st->enrolled) {
                 audit_log_for_principal(req, "role.elevation.denied", "denied", session->username,
                                         auth::role_to_string(session->role), "User", session->username,
                                         "no MFA enrolled (a second factor is required to elevate)");

@@ -22,16 +22,18 @@
 #include <chrono>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using yuzu::server::AgentLicenseRow;
-using yuzu::server::SoftwareLicensingParse;
-using yuzu::server::SoftwareLicensingStore;
 using yuzu::server::ingest_software_licensing_report;
 using yuzu::server::parse_software_licensing_blob;
 using yuzu::server::software_licensing_raw_hash;
+using yuzu::server::SoftwareLicensingParse;
+using yuzu::server::SoftwareLicensingStore;
 using yuzu::server::pg::PgPool;
 namespace pg = yuzu::server::pg;
 namespace agentpb = yuzu::agent::v1;
@@ -80,7 +82,9 @@ std::string sample_lic() {
 
 // The pinned fixture blob: one lic record + the D-10 cfg record. MUST stay
 // byte-stable — kPinnedRawHash pins its digest.
-std::string sample_blob() { return sample_lic() + rec({"cfg", "user_ref", "hash"}); }
+std::string sample_blob() {
+    return sample_lic() + rec({"cfg", "user_ref", "hash"});
+}
 
 agentpb::InventoryReport full_report(const std::string& claimed_hash, const std::string& blob) {
     agentpb::InventoryReport rpt;
@@ -94,6 +98,62 @@ agentpb::InventoryReport hash_only_report(const std::string& claimed_hash) {
     (*rpt.mutable_content_hashes())[kSource] = claimed_hash;
     return rpt;
 }
+
+// ── Shared pre-migrated fixture (behaviour-preserving DB-provisioning swap) ──
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between the store-backed [pg] ingest tests instead of a fresh CREATE DATABASE
+// + new pool per test (see test_software_inventory_store.cpp for the rationale).
+// SEPARATE template key from test_software_licensing_store.cpp: same schema, but
+// cross-file shared-key replay-verification mismatches environmentally on local
+// PG16 (see test_software_catalog_rollup.cpp) — a distinct key sidesteps it.
+// Behaviour-preserving: identical ingest calls + CHECKs; only the DB
+// provisioning/isolation changes. At testRunEnded the pool is drained before
+// the clone is dropped, leaving static destruction inert. The [parse]/[hash]
+// tests need no DB and the degraded-store test uses a deliberately-broken DSN —
+// none are converted.
+yuzu::test::PgTestTemplate sleing_tpl{"sleingest", [](const std::string& dsn) {
+                                          PgPool pool{{.conninfo = dsn, .size = 1}};
+                                          SoftwareLicensingStore store{pool};
+                                          if (!store.is_open())
+                                              throw std::runtime_error(
+                                                  "sleingest template: store failed to migrate");
+                                      }};
+
+struct SleingShared {
+    yuzu::test::PostgresTestDb db{sleing_tpl};
+    std::optional<PgPool> pool;
+    SleingShared() {
+        REQUIRE(db.available());
+        pool.emplace(PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+SleingShared& sleing_shared() {
+    static SleingShared s;
+    return s;
+}
+
+// TRUNCATE both data tables between tests; public.schema_meta is untouched, so
+// the per-test store ctor finds the clone migrated and skips migration.
+void sleing_reset() {
+    auto lease = sleing_shared().pool->acquire();
+    REQUIRE(lease);
+    auto trunc = pg::exec_params(lease.get(),
+                                 "TRUNCATE software_licensing_store.agent_license_state, "
+                                 "software_licensing_store.agent_licenses RESTART IDENTITY CASCADE",
+                                 std::vector<std::string>{});
+    REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+}
+
+#define SLEING_SHARED(store, pool)                                                                 \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                              \
+    sleing_reset();                                                                                \
+    [[maybe_unused]] PgPool& pool = *sleing_shared().pool;                                         \
+    SoftwareLicensingStore store{pool};                                                            \
+    REQUIRE(store.is_open())
 
 } // namespace
 
@@ -161,10 +221,10 @@ TEST_CASE("parse: unknown record kinds are skipped without error (forward-compat
           "[sle_ingest][parse]") {
     // ent| (PR2), probe_status| (live-only — never legitimately in a blob, but
     // the seam must still skip it gracefully), and arbitrary future kinds.
-    std::string blob = rec({"ent", "P", "V", "feat", "10", "3", "subscription", "0", "flexlm",
-                            "srv:27000"}) +
-                       sample_lic() + rec({"probe_status", "wmi_slp", "ok", "12"}) +
-                       rec({"totally_new_kind", "x", "y"});
+    std::string blob =
+        rec({"ent", "P", "V", "feat", "10", "3", "subscription", "0", "flexlm", "srv:27000"}) +
+        sample_lic() + rec({"probe_status", "wmi_slp", "ok", "12"}) +
+        rec({"totally_new_kind", "x", "y"});
     SoftwareLicensingParse p = parse_software_licensing_blob(blob);
     REQUIRE(p.rows.size() == 1);
     CHECK(p.rows[0].product == "Office 365 ProPlus");
@@ -189,8 +249,7 @@ TEST_CASE("parse: cfg|user_ref mode extraction + whitelist (D-10)", "[sle_ingest
         CHECK(p.effective_user_ref_mode.empty());
     }
     SECTION("unknown cfg subkeys are skipped like unknown record kinds") {
-        SoftwareLicensingParse p =
-            parse_software_licensing_blob(rec({"cfg", "future_knob", "on"}));
+        SoftwareLicensingParse p = parse_software_licensing_blob(rec({"cfg", "future_knob", "on"}));
         CHECK(p.effective_user_ref_mode.empty());
     }
     SECTION("one cfg record per blob — the first wins") {
@@ -204,9 +263,9 @@ TEST_CASE("parse: cfg|user_ref mode extraction + whitelist (D-10)", "[sle_ingest
 
 TEST_CASE("parse: §3.2 enum whitelist at projection (C-7) — unrecognised → unknown",
           "[sle_ingest][parse]") {
-    SoftwareLicensingParse p = parse_software_licensing_blob(
-        rec({"lic", "P", "V", "1.0", "warez", "KMS", "cracked", "0", "magic8ball", "certain", "",
-             "", "root", ""}));
+    SoftwareLicensingParse p =
+        parse_software_licensing_blob(rec({"lic", "P", "V", "1.0", "warez", "KMS", "cracked", "0",
+                                           "magic8ball", "certain", "", "", "root", ""}));
     REQUIRE(p.rows.size() == 1);
     CHECK(p.rows[0].license_type == "unknown");
     CHECK(p.rows[0].state == "unknown");
@@ -234,13 +293,15 @@ TEST_CASE("parse: fields are UTF-8-scrubbed, §3.3-stripped and clamped (scrub-b
           "[sle_ingest][parse]") {
     SECTION("invalid UTF-8 byte → U+FFFD; §3.3 byte set stripped") {
         std::string product = "Pro|du\r\nct S\xFFN"; // pipe/CR/LF stripped, 0xFF scrubbed
-        SoftwareLicensingParse p =
-            parse_software_licensing_blob(rec({"lic", product, "V\x01" "endor"}));
+        SoftwareLicensingParse p = parse_software_licensing_blob(rec({"lic", product,
+                                                                      "V\x01"
+                                                                      "endor"}));
         REQUIRE(p.rows.size() == 1);
         CHECK(p.rows[0].product == "Product S\xEF\xBF\xBDN");
         // Other C0 control bytes are NOT in the §3.3 strip set (framing +
         // newline + NUL only) — they pass through as valid UTF-8.
-        CHECK(p.rows[0].vendor == "V\x01" "endor");
+        CHECK(p.rows[0].vendor == "V\x01"
+                                  "endor");
     }
     SECTION("over-long field clamps to ≤1024 B on a codepoint boundary") {
         // 1023 ASCII bytes + a 3-byte U+20AC would split at 1024 — the clamp
@@ -285,11 +346,7 @@ TEST_CASE("raw hash: pinned independent SHA-256 of the received bytes", "[sle_in
 
 TEST_CASE("ingest: full payload stores rows + the RAW-byte hash, never the claim",
           "[pg][sle_ingest]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
+    SLEING_SHARED(store, pool);
 
     // The agent's claim is a LIE — storage must carry sha256(raw bytes).
     const std::string claimed = "claimed-hash-the-server-must-not-trust";
@@ -343,19 +400,15 @@ TEST_CASE("ingest: full payload stores rows + the RAW-byte hash, never the claim
 
 TEST_CASE("ingest: interleaved unknown record kinds store fine; the hash covers the raw bytes",
           "[pg][sle_ingest]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
+    SLEING_SHARED(store, pool);
 
     // A mixed-version blob: the lic record bracketed by kinds this server
     // doesn't know. Rows project identically to the plain blob, but the hash
     // is over the RAW bytes — unknown kinds are IN it, which is exactly what
     // keeps a mixed-version fleet loop-free (ADR-0024 Decision 3).
-    const std::string mixed = rec({"ent", "P", "V", "feat", "10", "3", "subscription", "0",
-                                   "flexlm", "srv:27000"}) +
-                              sample_lic() + rec({"future_kind", "x"});
+    const std::string mixed =
+        rec({"ent", "P", "V", "feat", "10", "3", "subscription", "0", "flexlm", "srv:27000"}) +
+        sample_lic() + rec({"future_kind", "x"});
     agentpb::InventoryAck ack;
     ingest_software_licensing_report(store, "agent-b", full_report("claim", mixed), ack, nullptr);
     CHECK(ack.need_full_size() == 0);
@@ -368,25 +421,20 @@ TEST_CASE("ingest: interleaved unknown record kinds store fine; the hash covers 
     auto stored = store.stored_hash("agent-b");
     REQUIRE(stored.has_value());
     REQUIRE(stored->has_value());
-    CHECK(**stored == software_licensing_raw_hash(mixed)); // covers the raw bytes…
+    CHECK(**stored == software_licensing_raw_hash(mixed));        // covers the raw bytes…
     CHECK(**stored != software_licensing_raw_hash(sample_lic())); // …not the parsed subset
 
     // Next cycle the mixed-version agent claims its own (raw) hash → touched,
     // no permanent full-resend loop.
     agentpb::InventoryAck ack2;
-    ingest_software_licensing_report(store, "agent-b",
-                                     hash_only_report(software_licensing_raw_hash(mixed)), ack2,
-                                     nullptr);
+    ingest_software_licensing_report(
+        store, "agent-b", hash_only_report(software_licensing_raw_hash(mixed)), ack2, nullptr);
     CHECK(ack2.need_full_size() == 0);
 }
 
 TEST_CASE("ingest: an empty blob is a VALID full replace-to-empty (ADR-0024 D3)",
           "[pg][sle_ingest]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
+    SLEING_SHARED(store, pool);
 
     agentpb::InventoryAck ack;
     ingest_software_licensing_report(store, "agent-c", full_report("x", sample_blob()), ack,
@@ -411,11 +459,7 @@ TEST_CASE("ingest: an empty blob is a VALID full replace-to-empty (ADR-0024 D3)"
 
 TEST_CASE("ingest: R5 caps — over-blob and over-records drop + nack, nothing stored",
           "[pg][sle_ingest][caps]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
+    SLEING_SHARED(store, pool);
 
     SECTION("blob over 1 MiB") {
         agentpb::InventoryAck ack;
@@ -432,8 +476,7 @@ TEST_CASE("ingest: R5 caps — over-blob and over-records drop + nack, nothing s
         for (int i = 0; i < 10001; ++i)
             blob += rec({"lic", "P" + std::to_string(i)});
         agentpb::InventoryAck ack;
-        ingest_software_licensing_report(store, "agent-many", full_report("h", blob), ack,
-                                         nullptr);
+        ingest_software_licensing_report(store, "agent-many", full_report("h", blob), ack, nullptr);
         REQUIRE(ack.need_full_size() == 1);
         CHECK(ack.need_full(0) == kSource);
         auto stored = store.stored_hash("agent-many");
@@ -443,16 +486,12 @@ TEST_CASE("ingest: R5 caps — over-blob and over-records drop + nack, nothing s
 }
 
 TEST_CASE("ingest: hash-only cold cache nacks; absent source is a no-op", "[pg][sle_ingest]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareLicensingStore store{pool};
-    REQUIRE(store.is_open());
+    SLEING_SHARED(store, pool);
 
     SECTION("hash-only with no stored state → need_full (cold cache)") {
         agentpb::InventoryAck ack;
-        ingest_software_licensing_report(store, "agent-cold", hash_only_report(kPinnedRawHash),
-                                         ack, nullptr);
+        ingest_software_licensing_report(store, "agent-cold", hash_only_report(kPinnedRawHash), ack,
+                                         nullptr);
         REQUIRE(ack.need_full_size() == 1);
         CHECK(ack.need_full(0) == kSource);
     }

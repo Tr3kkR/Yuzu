@@ -116,9 +116,16 @@ persistent auth database** — i.e. one started with `--data-dir`.
 > the server falls back to in-memory auth and lockout (and session persistence)
 > is silently **off**. The server logs a loud startup `WARN` in that state.
 > Set `--data-dir` to make the control active.
+>
+> **Superseded by the AuthDB→Postgres migration (see below).** Lockout state
+> now lives in **Postgres** (`users.failed_login_count` / `locked_until`), not
+> `auth.db`. It is active whenever `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
+> set — which the server now **requires to boot at all** (no SQLite fallback) —
+> and `--data-dir` no longer gates it. Read the `--data-dir` requirement above
+> as historical, for pre-migration builds only.
 
 No further config change is required to opt in — a deployment that already runs
-with `--data-dir` gains the behavior the instant you start the new build.
+with `--postgres-dsn` gains the behavior the instant you start the new build.
 
 What changes on upgrade:
 
@@ -155,7 +162,12 @@ nothing happened.
 - **Single-admin deployments:** there is no self-service unlock for the *only*
   admin (the unlock endpoint requires a second privileged principal), so either
   wait out the window or use the offline recovery procedure in
-  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery.
+  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. **Note:**
+  since the AuthDB → Postgres migration (see "⚠️ Breaking: local accounts + MFA
+  enrolments reset" below), that runbook's SQL-surgery steps are SQLite-era and
+  do not apply — for a PG-backed deployment there is no offline SQL fallback
+  for the sole-admin case today; wait out the window.
+
 ## Behaviour change: operator/API tags now beat agent self-report (#1411)
 
 An agent's self-reported tags (`scopable_tags`, synced on every Register) can no
@@ -348,8 +360,11 @@ second factor for an external identity, so **before enabling
 claim containing a recognized MFA method** (Entra: `mfa`; others:
 `otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
 unable to reach high-risk endpoints — recoverable by restarting in
-`optional` (see `docs/ops-runbooks/auth-db-recovery.md`). Under `optional`,
-no IdP `amr` configuration is required (SSO sessions pass the gate).
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md`; note that runbook's
+file-based SQL steps are SQLite-era and superseded post-AuthDB→Postgres
+migration — the restart-with-`optional` procedure itself is unaffected).
+Under `optional`, no IdP `amr` configuration is required (SSO sessions pass
+the gate).
 
 **Single-admin deployments:** do not first-boot a fresh single-admin
 deployment straight into `required`. Enroll the admin under `optional` first,
@@ -360,7 +375,9 @@ the token expires, restart with `optional`, log in, enroll, then re-enable.
 **Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
 admin can't enroll): restart the server with `--mfa-enforcement=optional`
 (this re-seeds the in-memory config), log in, resolve enrollment, then
-re-enable. See `docs/ops-runbooks/auth-db-recovery.md`.
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md` (SQLite-era; the
+restart procedure above works unchanged post-AuthDB→Postgres migration, but
+that runbook's SQL-surgery steps do not apply to a Postgres-backed AuthDB).
 
 ## Hardened auth mode (`--auth-mode=sso-only`) — opt-in (SOC 2 CC6.3/CC6.6)
 
@@ -384,14 +401,22 @@ closed (non-zero exit, refuses to serve)** otherwise:
 
 **Breaking the glass (IdP outage).** The break-glass account is dormant until
 armed out-of-band on the server host: `yuzu-server --break-glass-arm
---break-glass-user <name> --config … --data-dir …` arms it for
+--break-glass-user <name> --config … --data-dir … --postgres-dsn …` arms it for
 `--break-glass-window-secs` (default 24 h, auto-expiring). It still requires the
-account's MFA at login. Full runbook: `docs/ops-runbooks/auth-db-recovery.md`
-§ Break-glass arm.
+account's MFA at login. Since the AuthDB→Postgres migration this one-shot opens
+the **Postgres** auth store, so `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
+**required** — point it at the same database the server uses; without it the
+command fails closed with "requires the Postgres auth store" and does nothing.
+`--data-dir` is still needed for the audit record. Full runbook:
+`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (its SQL-surgery
+sections elsewhere are SQLite-era and superseded — see its banner).
 
-**Migration.** AuthDB migration **v4** adds a nullable `break_glass_armed_until`
-column to `users` — automatic, additive, data-safe. **Rollback** below 0.x after
-v4 has run is data-safe (the column is simply ignored).
+**Migration.** `break_glass_armed_until` is a nullable column on `auth.users`.
+It arrived as SQLite `auth.db` migration v4, but the AuthDB→Postgres cutover
+folded every historical migration into the born-on-PG schema, which starts at
+**v1** — there is no v4 to apply and no rollback-past-v4 question. See the
+AuthDB→Postgres section above for the (fresh-start, no-backfill) upgrade
+contract that replaces it.
 
 ## ⚠️ Breaking: server generates default TLS certificates on first boot (v0.13.0)
 
@@ -423,6 +448,71 @@ What to expect / do:
 - **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
   — losing the CA key forces a full fleet re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Breaking: local accounts + MFA enrolments reset (AuthDB/ScimStore → Postgres, ADR-0006)
+
+`AuthDB` (local user accounts, MFA enrolments, enrollment tokens) and
+`ScimStore` (SCIM-provisioned users/groups) move from the SQLite `auth.db`
+file to the server's PostgreSQL substrate in this release (ADR-0006 Wave 3),
+schemas `auth` and `scim_store`. Like the earlier `ApiTokenStore` cutover,
+this is a **fresh-start cutover with no data migration**: on first boot
+against a Postgres database whose `auth.users` table is empty, the server
+seeds exactly the config-file admin and **never reads the old `auth.db`**.
+Sessions are (and always were) in-memory-only, so they are unaffected beyond
+the usual "log in again after a restart."
+
+**Who this affects:** every local-password operator, everyone with TOTP MFA
+enrolled, and every SCIM-provisioned user/group. This is **not** limited to
+password auth — SSO/OIDC/SAML session establishment itself is unaffected
+(the IdP still asserts identity), but any RBAC role/group mapping recorded
+only in the old `auth.db` local-account tables is gone until re-established.
+
+**What happens on first PG boot:**
+
+- Prior local accounts, roles, and MFA enrolments that existed only in the
+  pre-cutover `auth.db` are gone. The server re-seeds a single admin account
+  from `yuzu-server.cfg` (the same config-as-seed-only behavior as the
+  original v0.12.0 AuthDB bring-up).
+- SCIM-provisioned users/groups are **not** lost long-term: `ScimStore`
+  self-heals on the IdP's next scheduled sync cycle, which re-provisions
+  everything from the IdP as the source of truth. There is a gap between
+  first PG boot and that next sync during which SCIM-provisioned users
+  cannot log in.
+- Anyone with TOTP MFA enrolled must **re-enrol** — the encrypted
+  `mfa_totp_secret` blob and enrolment state do not carry over.
+- The server logs a loud boot warning: **`AUTH DATA RESET ON POSTGRES
+  CUTOVER`**. If you do not see this line on first boot against the new
+  Postgres database, the cutover did not happen as expected — investigate
+  before assuming accounts are intact.
+
+**Remediate:**
+
+1. Plan the upgrade in a maintenance window and notify every local-password
+   operator, MFA-enrolled user, and SCIM administrator in advance — expect a
+   batch of failed logins immediately after cutover, not a surprise incident.
+2. After upgrade, log in as the re-seeded admin using the credentials in
+   `yuzu-server.cfg`.
+3. Re-create any other local operator accounts that are not SCIM-provisioned
+   (Settings → Users), and have every user re-enrol MFA
+   (Settings → Multi-Factor Authentication).
+4. For SCIM-provisioned users, either wait for the next scheduled IdP sync or
+   trigger one manually if your SCIM setup supports it; do not manually
+   re-create SCIM-managed users (they will be re-provisioned).
+5. Confirm the `AUTH DATA RESET ON POSTGRES CUTOVER` line appeared in the
+   server log at the boot where the cutover ran.
+
+**Not affected:** the `PgTestTemplate` config, engine principals (a separate
+store), and API/MCP bearer tokens (already migrated to Postgres in an
+earlier release, see "⚠️ Breaking: API and MCP bearer tokens are invalidated
+on upgrade" above — this AuthDB/ScimStore cutover is independent of that one
+and does not re-invalidate already-reissued tokens).
+
+See `docs/auth-architecture.md` § "AuthDB — persistent authentication store"
+for the full design rationale, and
+[`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md)
+for lockout/break-glass recovery — note that runbook predates this cutover
+and its file-based SQL steps do not apply to the Postgres-backed store; see
+its banner.
 
 ## Upgrade Order
 

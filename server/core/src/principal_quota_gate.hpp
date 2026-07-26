@@ -17,6 +17,7 @@
 /// — those stay in server.cpp because they are wiring, not the security
 /// decision.
 
+#include "mcp_transport.hpp" // accept_wants_sse — the streamed-POST /mcp/v1/ carve (2f PR 3b)
 #include "principal_quota.hpp"
 #include "principal_quota_denial.hpp"
 
@@ -87,7 +88,25 @@ namespace yuzu::server::detail {
 /// principal's stream holds its concurrency reservation for the stream's whole life
 /// rather than releasing it early at post-routing (the UP-1 hazard this guard exists to
 /// prevent). Any FUTURE streaming route added to `is_streaming_path` MUST do the same.
+///
+/// POST /mcp/v1/ streams CONDITIONALLY (2f PR 3b, SSE-on-POST) — unlike the four GET routes
+/// above, which stream unconditionally. A POST /mcp/v1/ becomes a held-open SSE response only
+/// when the client opts in with an SSE-capable `Accept` AND (checked later, in the handler) the
+/// request carries a `_meta.progressToken`; otherwise it is an ordinary one-shot JSON tool call.
+/// The pre-routing chokepoint runs before the body is parsed, so the only streaming signal it
+/// can see is the `Accept` header — hence the `accept_wants_sse` gate here. This is an over-
+/// approximation on purpose: a POST that advertises SSE but omits the progressToken degrades to
+/// plain JSON, and its slot then correctly releases at post-routing — a plain-POST release is
+/// CORRECT, not a listed-but-not-adopting bug, because that request never streamed. The streamed
+/// arm adopts the slot at its `set_chunked_content_provider` site in the `execute_instruction`
+/// handler (2f PR 3b), exactly like the GET tail. (R7.) NOTE: `is_streaming_path` has no
+/// production consumer today — server.cpp releases the slot unconditionally at post-routing and
+/// streaming routes move it out first via `adopt_quota_slot_into_stream`; this registry is the
+/// discoverability contract + the surface the quota chokepoint tests walk.
 [[nodiscard]] inline bool is_streaming_path(const httplib::Request& req) {
+    // Streamed POST /mcp/v1/ (2f PR 3b): a POST is a streaming path only when it opts into SSE.
+    if (req.method == "POST")
+        return req.path == "/mcp/v1/" && mcp::transport::accept_wants_sse(req.get_header_value("Accept"));
     if (req.method != "GET")
         return false;
     if (req.path == "/events")                       // dashboard event-bus SSE

@@ -7,6 +7,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
 #include <chrono>
 #include <string_view>
@@ -16,7 +17,7 @@ namespace yuzu::server {
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db, int window_secs,
                          const StepUpAuditFn& audit_fn, const std::string& action_label,
-                         std::string_view mfa_enforcement) {
+                         std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics) {
     // Escape hatch — operator disabled the gate. Treated as fresh.
     if (window_secs <= 0) {
         return true;
@@ -118,6 +119,16 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
         if (!status) {
             // Fail closed. Emit a distinct audit verb so SRE can grep for
             // store-error events vs legitimate stale-session denials.
+            //
+            // ★ SECURITY (architect BLOCK, Postgres migration): this branch
+            // already fails closed for EVERY `mfa_status` error (never falls
+            // to the `!status->enrolled` pass-through below) — the tri-state
+            // `SecretUnavailable`/`QueryFailed` outcomes are folded into the
+            // same deny. The only refinement is the wire status: a
+            // store/decrypt outage is 503 (retryable, distinct from "please
+            // step up"), never the 401 challenge that implies a fresh proof
+            // would fix it.
+            const bool store_unavailable = is_store_unavailable(status.error());
             if (audit_fn) {
                 try {
                     (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint",
@@ -132,6 +143,22 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
             }
             spdlog::error("require_mfa_step_up: mfa_status({}) failed — failing closed",
                           session.username);
+            if (store_unavailable) {
+                nlohmann::json envelope_503 = {
+                    {"error",
+                     {{"code", 503},
+                      {"message", "authentication store is temporarily unavailable"},
+                      {"correlation_id", detail::make_correlation_id()},
+                      {"remediation", "retry shortly or contact an administrator"}}},
+                    {"meta", {{"api_version", "v1"}, {"mfa_step_up_required", true}}}};
+                res.status = 503;
+                res.set_content(envelope_503.dump(), "application/json");
+                if (metrics) {
+                    metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+                        .increment();
+                }
+                return false;
+            }
             nlohmann::json envelope_fail = {
                 {"error",
                  {{"code", 401},

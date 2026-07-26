@@ -41,10 +41,16 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime
 
 CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
-# A positional Catch2 tag-filter spec as used by sharded meson entries (#2092):
-# '[pg]', '~[pg]', '[a][b]', '~[a][b]'. Name specs / comma lists are not used
-# in tests/meson.build (its comment holds that line), so they are not matched.
-CATCH2_TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
+# A positional Catch2 tag-filter spec as used by sharded meson entries (#2092).
+# Grammar: one or more comma-OR'd AND-groups, each group a run of ~?[tag].
+# Examples: '[pg]', '~[pg]', '[a][b]', '~[a][b]', '[pg]~[routes]~[store]'
+# (a single AND-group with mid-spec negations), and '[pg][routes],[pg][store]'
+# (a comma-OR of AND-groups — the auth->PG [pg] rebalance split, #2394). Bare
+# case-name specs still never match (no leading '['), so a case name is never
+# mistaken for a strippable spec — the invariant _cmd_without_test_specs and
+# the isolated retry rely on (a recognised spec is always stripped, so it can
+# never OR with the retried case name).
+CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
 
 
@@ -597,6 +603,13 @@ def _selftest():
     check(_cmd_without_test_specs(["~[pg]", "[pg]"]) == ["~[pg]"],
           "argv[0] untouched even when spec-shaped")
     check(_cmd_without_test_specs(["x", "~[a][b]"]) == ["x"], "strips tilde compound spec")
+    check(_cmd_without_test_specs(["x", "[pg]~[routes]~[store]~[token]"]) == ["x"],
+          "strips mid-spec-negation shard filter (#2394)")
+    check(_cmd_without_test_specs(["x", "[pg][routes],[pg][store],[pg][token]"]) == ["x"],
+          "strips comma-OR shard filter (#2394)")
+    check(_cmd_without_test_specs(["x", "a normal, prose case name"])
+          == ["x", "a normal, prose case name"],
+          "prose case name with a comma is NOT a spec (kept)")
     check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
     check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
 
@@ -632,11 +645,15 @@ def _selftest():
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
         _shard_specs.append(tuple(_args))
-    # Positive pin so hollow extraction can never pass again: the two shard
-    # filters must come back verbatim. A third shard or a rebalance updates
-    # this line consciously.
-    check(("~[pg]",) in _shard_specs and ("[pg]",) in _shard_specs,
-          "meson.build: both shard tag filters extracted verbatim")
+    # Positive pin so hollow extraction can never pass again: the shard filters
+    # must come back verbatim. A shard add or rebalance updates this line
+    # consciously. #2394 split the single '[pg]' entry into two balanced halves
+    # (the auth->PG cutover ~doubled the [pg] population); the non-PG '~[pg]'
+    # entry is unchanged.
+    check(("~[pg]",) in _shard_specs
+          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]",) in _shard_specs,
+          "meson.build: all three shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
