@@ -13,4 +13,8 @@
   overrides), so no step — including the pre-existing unconditional PostgreSQL
   service restart — can interrupt another agent's job on the shared box. The
   runner manifest/self-test now pins every private binary path, service
-  `ImagePath`, running state, and authenticated health probe.
+  `ImagePath`, running state, and authenticated health probe. New
+  `deploy/windows/Test-ProvisionLogic.ps1` regression-tests the provisioning
+  script's decision logic (gate, `-D` handling, `ImagePath` rewrite) without
+  elevation or machine state — provisioning cannot run in CI, so its guard rails
+  had no executable check until now.

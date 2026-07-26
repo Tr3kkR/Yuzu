@@ -13,6 +13,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 |---|---|
 | `Provision-Windows-Runner.ps1` | Installs the pinned toolchain, sets machine env (incl. the gateway + shared-cache contracts), emits `toolchain-manifest.json`. |
 | `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
+| `Test-ProvisionLogic.ps1` | Regression tests for the provisioning script's decision logic (maintenance gate, `-D` handling, `ImagePath` rewrite). Safe anywhere — no elevation, no machine state. Run after editing `Provision-Windows-Runner.ps1`. |
 | `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache and selects that runner's persistent telemetry DB. |
 
 ## Standing up a new box
@@ -35,6 +36,13 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    re-asserts the gate on entry and again immediately before each service
    restart. `-AllowActiveRunners` overrides the gate and will kill in-flight
    jobs; it exists for a box you know is yours.
+
+   If you **edited** the provisioning script, run its regression tests first —
+   they need no elevation and touch no machine state, so run them anywhere,
+   including on a box that is busy:
+   ```powershell
+   pwsh -File deploy\windows\Test-ProvisionLogic.ps1
+   ```
 
 2. **Self-test** (must pass before registering):
    ```powershell
