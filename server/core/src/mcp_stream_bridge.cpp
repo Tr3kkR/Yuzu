@@ -1013,7 +1013,8 @@ void McpStreamBridge::sweep() {
                         // final would silently degrade to status:"unknown".
                         if (ev != nullptr) {
                             try {
-                                if (visit_copy_fault_.exchange(false, std::memory_order_acq_rel)) {
+                                if (visit_copy_fault_.load(std::memory_order_relaxed) > 0 &&
+                                    visit_copy_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
                                     throw std::bad_alloc{};  // inject_visit_copy_fault_for_test
                                 }
                                 // Construct fully OUTSIDE the slot, then commit with
@@ -1354,8 +1355,8 @@ void McpStreamBridge::inject_subscribe_fault_for_test() {
     subscribe_fault_.store(true, std::memory_order_release);
 }
 
-void McpStreamBridge::inject_visit_copy_fault_for_test() {
-    visit_copy_fault_.store(true, std::memory_order_release);
+void McpStreamBridge::inject_visit_copy_fault_for_test(int times) {
+    visit_copy_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }

@@ -627,9 +627,15 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
         CHECK(s.stream->is_pinned(final_id));  // truth stays in the ring
     }
     SECTION("terminal racing the pressure sweep: the real result always wins") {
-        // Property form of the E1/D1 barrier: publish the terminal while sweeps
-        // hammer the victim. Whatever interleaving occurs, the invariant is ONE
-        // real final, ZERO -32014, and the record eventually reaped.
+        // The terminal is LATCHED before the sweeper starts (the listener runs
+        // synchronously inside publish under ch->mu), so ch->terminal is true from
+        // the first visit -> the sweep can never see kNeverTerminal and never
+        // synthesizes -32014. The race that remains (and that TSan exercises) is
+        // sweep vs the PROJECTOR settling that latched terminal: ONE real final,
+        // ZERO -32014, reaped. NOTE: publishing the terminal AFTER spawning the
+        // sweeper is a genuine sweeper-beats-publish startup race whose -32014 (over
+        // a not-yet-published terminal) is a SOUND linearization, not a bug - so it
+        // must not be asserted against; publish-then-race keeps the invariant exact.
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
         auto s = fx.make_session();
         REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
@@ -640,6 +646,7 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
             fx.bus.publish("exec-r", "execution-progress", kProgress13);
         }
         REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        fx.bus.publish("exec-r", "execution-completed", kCompleted, /*is_terminal=*/true);
         // Bounded sweeper: a regression that never reaps must FAIL FAST (a wall-
         // clock deadline), not hang CI forever (governance quality).
         auto sweeper = std::async(std::launch::async, [&] {
@@ -653,7 +660,6 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
             }
             return true;
         });
-        fx.bus.publish("exec-r", "execution-completed", kCompleted, /*is_terminal=*/true);
         REQUIRE(sweeper.get());  // reaped within the deadline
         auto frames = ring_frames(*s.stream, "alice");
         CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
@@ -751,9 +757,12 @@ TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, ne
         }
         CHECK(ok);
     }
-    // Charge released: consume the fallback pin (resume cursor), then all 4 fresh
-    // streamed slots admit. Had the charge leaked, streamed_unpinned_ would stay at 1
-    // and the 4th reserve would be rejected pin_slots.
+    // Charge released: teardown_claimed already released the streamed charge
+    // synchronously when it reaped record 1 (streamed_unpinned_ back to 0); the pinned
+    // fallback still holds one slot, which the resume cursor below consumes. With BOTH
+    // freed, all 4 fresh streamed reserves admit. Had the charge leaked, streamed_
+    // unpinned_ would still be 1 and the 4th reserve would be rejected pin_slots - so
+    // the 4th admitting is the load-bearing release_charge regression guard.
     auto att = s.stream->attach_and_replay(fallback_id, nullptr, "alice");
     REQUIRE(att.status == mcp::McpStreamState::AttachStatus::kAttached);
     s.stream->detach(att.sink);
@@ -778,23 +787,29 @@ TEST_CASE("bridge pressure - a visitor copy-OOM defers and keeps the listener (#
                    R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
                    /*is_terminal=*/true);
     REQUIRE(fx.bus.subscriber_count("exec-oom") == 1);
-    // One-shot OOM at the visitor's terminal-payload copy, then a single sweep.
-    fx.bridge->inject_visit_copy_fault_for_test();
-    fx.bridge->sweep();
-    // The copy threw -> f deferred + claimed nothing: record survives, listener kept,
-    // nothing synthesized (the erase-only-on-claim + defer-on-copy-throw invariant).
-    CHECK(fx.bridge->phase_for(s.id, json(1)).has_value());  // not reaped
-    CHECK(fx.bus.subscriber_count("exec-oom") == 1);         // listener NOT erased
+    // PERSISTENT copy-OOM: every visitor terminal-payload copy throws. This is the
+    // self-validating part - while the fault fires the copy never latches, so the
+    // record can NEVER settle no matter how many sweeps run. (If the injection were a
+    // silent no-op, the very first sweep would latch + settle + reap, and the
+    // still-alive assertion below would fail RED.)
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/100);
+    for (int i = 0; i < 15; ++i) {
+        fx.bridge->sweep();
+        REQUIRE(fx.bridge->record_count() == 1);                   // never reaped under the fault
+        REQUIRE(fx.bus.subscriber_count("exec-oom") == 1);         // listener NOT erased (defer, no claim)
+    }
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 0);    // never settled a final
     CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 0);
-    // The fault is one-shot: a later sweep latches the still-buffered terminal and
-    // settles the REAL final.
+    // Heal the fault: now the copy succeeds, the terminal latches, and the record
+    // settles the REAL final and reaps.
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/0);
     REQUIRE(poll_until([&] {
         fx.bridge->sweep();
         return fx.bridge->record_count() == 0;
     }));
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
-    CHECK(count_results(frames) == 1);  // the real final, recovered after the fault healed
+    CHECK(count_results(frames) == 1);  // the real final, after the fault healed
 }
 
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
@@ -1242,6 +1257,11 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cr"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly, charged
+    // Latch the terminal BEFORE the sweeper starts (else a sweeper-beats-publish
+    // startup race legitimately synthesizes a SOUND -32014 over a not-yet-published
+    // terminal - not a bug, but it would break the "one real final" assertion). With
+    // it latched first, the race that remains is sweep vs the projector settling it.
+    fx.bus.publish("exec-cr", "execution-completed", kCompleted, /*is_terminal=*/true);
 
     auto sweeper = std::async(std::launch::async, [&] {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1250,7 +1270,6 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
             std::this_thread::yield();
         }
     });
-    fx.bus.publish("exec-cr", "execution-completed", kCompleted, /*is_terminal=*/true);
     sweeper.get();
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_results(frames) == 1);        // exactly one real final

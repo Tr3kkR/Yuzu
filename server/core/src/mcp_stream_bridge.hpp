@@ -293,10 +293,13 @@ public:
     /// reserve/subscribe guards degrade to the plain path (governance quality).
     void inject_reserve_fault_for_test();
     void inject_subscribe_fault_for_test();
-    /// One-shot: the NEXT pressure-visitor terminal-payload copy (kTerminalBuffered
-    /// latch) throws std::bad_alloc, modelling a copy OOM. Proves the visit defers +
-    /// keeps the listener + leaves terminal_accepted false (#2409 safety-S1).
-    void inject_visit_copy_fault_for_test();
+    /// The NEXT `times` pressure-visitor terminal-payload copies (kTerminalBuffered
+    /// latch) throw std::bad_alloc, modelling a copy OOM. A persistent fault (times
+    /// large) makes the record NEVER settle (the copy never latches), which is what
+    /// distinguishes "the fault path fired" from a silent no-op; healing (times=0)
+    /// then lets it settle. Proves defer + keep-listener + terminal_accepted-false
+    /// (#2409 safety-S1).
+    void inject_visit_copy_fault_for_test(int times = 1);
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -460,7 +463,7 @@ private:
     std::atomic<bool> arm_fault_{false};       ///< one-shot arm() throw seam
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
-    std::atomic<bool> visit_copy_fault_{false};///< one-shot pressure-visit copy throw seam
+    std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
 
     std::chrono::steady_clock::time_point now() const {
