@@ -234,6 +234,30 @@ groups:
             after 15 minutes would contradict the contract it exists to report.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpBridgeProjectionDegraded
+        expr: |
+          yuzu_mcp_bridge_projection_degraded_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge projection released its claim without the record lock"
+          description: >-
+            A projection guard could not retake the record lock, so it released
+            the projection claim WITHOUT running the settle bookkeeping (#2528).
+            Releasing the claim is the correct trade - leaving it set would wedge
+            that record out of every consumer and, because a defer exits the
+            pressure loop, stall ring-only pressure relief bridge-wide - but the
+            settle is lossy: a terminal payload that was mid-retry cannot be put
+            back, so that request is answered by the success-shaped fallback final
+            ("fetch by execution_id") instead of its real result. Client results
+            stay durably fetchable by execution_id. This needs a genuinely broken
+            platform mutex, so ANY nonzero value is a signal about the host, not a
+            rate to tune - the same mutex fault reaches
+            yuzu_mcp_bridge_teardown_incomplete_total, so check that too.
+            DELIBERATELY a raw counter test, not increase() over a window: the
+            lost payload is permanent, so an alert that cleared after 15 minutes
+            would contradict what it reports.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpMaintenanceTickFailing
         expr: |
           sum by (tick) (increase(yuzu_mcp_maintenance_tick_failures_total[15m])) > 0

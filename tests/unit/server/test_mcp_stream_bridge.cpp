@@ -1930,3 +1930,103 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
         CHECK((*terminal_progress)["agents_failure"] == 1);
     }
 }
+
+// ── #2528: ~ClaimGuard must release the claim even when it cannot take mu ──────
+//
+// The claim used to be cleared INSIDE the try whose first act was the record-lock
+// acquisition, so a lock failure left it set forever. All four consumers then skip
+// the record, and because a defer exits the pressure loop, one wedged victim
+// stalls ring-only pressure relief bridge-wide.
+//
+// Coverage note (deliberate, not an omission): the degraded path's third arm -
+// storing terminal_projected when the frame was ALREADY published - needs the
+// kRingOnly settle block (bridge_mu_ + mu) to fail as well as the guard's own
+// lock, and no seam models that second failure. It is one relaxed store that can
+// only help, so it stays as documented-uncovered defence-in-depth rather than
+// getting a test that proves something weaker than it claims.
+
+TEST_CASE("bridge #2528 - a ClaimGuard lock failure still releases the claim",
+          "[mcp][bridge][2f][2528]") {
+    // Progress-only batch: nothing was owed to the settle, so releasing the claim
+    // is a COMPLETE recovery. The load-bearing assertion is the SECOND batch - it
+    // can only project if the claim was released, and under the pre-fix code it
+    // never appeared.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cg"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+
+    fx.bridge->inject_claim_lock_fault_for_test(1);
+    fx.bus.publish("exec-cg", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 1;
+    }));
+    // The claim was taken for that batch and its guard hit the injected lock
+    // failure, so the degraded release is the only thing that can free it.
+    REQUIRE(poll_until(
+        [&] { return fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0; }));
+
+    fx.bus.publish("exec-cg", "execution-progress", prog(2, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 2;
+    }));
+    // Healed: the second batch's guard took mu normally, so nothing further degraded.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0);
+}
+
+TEST_CASE("bridge #2528 - a terminal lost to the degraded settle publishes the fallback, never -32014",
+          "[mcp][bridge][2f][2528]") {
+    // The one path that leaves a terminal extracted-but-unpublished is the double
+    // build failure, whose documented recovery is "restore and let the next wake
+    // retry". If the guard cannot retake mu, that restore is impossible and the
+    // payload is gone for good - terminal_slot is empty and sticky
+    // terminal_accepted stops any listener refill, so NO retry exists and a
+    // consumer that merely defers would defer forever.
+    //
+    // The honest disposition is therefore the same as kTerminalKnownLost: a
+    // terminal demonstrably happened, so publish the success-shaped fallback -
+    // never -32014 (which would deny a terminal that did occur) and never a silent
+    // kNone (which would answer the client nothing at all).
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-pl"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly
+
+    fx.bridge->inject_projection_build_fault_for_test(1);
+    fx.bridge->inject_claim_lock_fault_for_test(1);
+    fx.bus.publish("exec-pl", "execution-completed", kCompleted);
+
+    // Sweep converges: before the projector runs, the visitor sees a latched but
+    // unprojected terminal and defers (it must NOT steal it); once the degraded
+    // settle marks the payload lost, the next sweep claims and publishes.
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return !fx.bridge->phase_for(s.id, json(1)).has_value();
+    }));
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0);
+
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // NEVER -32014
+    REQUIRE(count_results(frames) == 1);                                 // exactly one final
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["execution_id"] == "exec-pl");  // durable handle present
+            CHECK(j["result"]["status"] == "unknown");        // fallback shape
+        }
+    }
+    {  // audited as a published fallback, not as a silent expiry
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool ok = false;
+        for (const auto& row : fx.audits) {
+            if (row.action == "mcp.bridge.forced_expire" &&
+                row.detail == "the fallback final was published") {
+                ok = true;
+            }
+        }
+        CHECK(ok);
+    }
+}
