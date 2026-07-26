@@ -1544,8 +1544,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string command_id;
         int sent = 0;
         try {
-            std::tie(command_id, sent) =
-                cmd_dispatch(def->plugin, def->action, agent_ids, scope_expr, params, execution_id);
+            // #2500: NAME the broadcast rather than expressing it as "both
+            // fields happen to be empty". The shape check above guarantees that
+            // arriving here empty means the caller OMITTED both, so this maps
+            // the deliberate case onto the sink's explicit `__all__` branch and
+            // leaves an accidental empty — from any future code path that skips
+            // the check — reaching nobody instead of everybody.
+            const std::string dispatch_scope =
+                (agent_ids.empty() && scope_expr.empty()) ? std::string("__all__") : scope_expr;
+            std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
+                                                      dispatch_scope, params, execution_id);
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created

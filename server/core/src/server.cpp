@@ -10700,7 +10700,14 @@ private:
                 agent_service_.record_execution_id(command_id, execution_id);
             }
             int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // Broadcast is now something a caller ASKS FOR by name (#2500).
+            // `__all__` is not a new vocabulary: the MCP dispatch closure has
+            // always special-cased it, and this closure's own callers already
+            // describe their untargeted path as "__all__" in their comments —
+            // they simply passed empty and relied on the fall-through below.
+            if (scope_expr == "__all__") {
+                sent = registry_.send_to_all(cmd);
+            } else if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
                     auto members = mgmt_group_store_->get_members(group_id);
@@ -10740,7 +10747,26 @@ private:
                             ++sent;
                 }
             } else if (agent_ids.empty()) {
-                sent = registry_.send_to_all(cmd);
+                // NO TARGET NAMED AT ALL — reach NOBODY, not everybody (#2500).
+                //
+                // This closure has eight callers. Six were safe only because six
+                // authors each remembered to guard their own inputs, and the two
+                // that did not were the pair #2500 was filed about. That is a
+                // single point of failure with an eight-way surface, and the
+                // failure mode is the worst one available: an unintended
+                // fleet-wide dispatch that reports success.
+                //
+                // Inverting the default makes the ninth caller's omission
+                // harmless. Every caller that legitimately broadcasts now says
+                // so with `scope_expr = "__all__"` above — a grep-able, explicit
+                // request rather than the residue of an empty vector.
+                //
+                // No behaviour changed when this landed: every existing caller
+                // either guards its inputs, passes a specific id, or was updated
+                // in the same commit to name `__all__`.
+                spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
+                             "no agents; pass scope \"__all__\" to broadcast deliberately",
+                             plugin, norm_action);
             } else {
                 for (const auto& aid : agent_ids)
                     if (registry_.send_to(aid, cmd))

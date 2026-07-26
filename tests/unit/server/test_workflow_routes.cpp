@@ -1492,7 +1492,12 @@ TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broad
     CHECK(res->status == 200);
     CHECK(h.dispatch_calls == 1);
     CHECK(h.last_dispatch_agent_ids.empty());
-    CHECK(h.last_dispatch_scope.empty());
+    // The broadcast is NAMED, not inferred from two empty fields. The shared
+    // sink now reaches nobody on empty+empty, so this assertion is the whole
+    // difference between "deliberately the entire fleet" and "reached no one" —
+    // relaxing it back to `.empty()` would silently turn every untargeted
+    // execute into a no-op that still answers 200.
+    CHECK(h.last_dispatch_scope == "__all__");
 }
 
 TEST_CASE("#2500 — an explicit non-empty target is unaffected",

@@ -173,11 +173,16 @@ TEST_CASE("from-tar-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(data["source_kind"] == "tar_query");
     REQUIRE_FALSE(data["source_execution_id"].get<std::string>().empty());
 
-    // Dispatch happened with tar/sql, empty scope (=> broadcast), sql param.
+    // Dispatch happened with tar/sql, an EXPLICIT `__all__` scope, sql param.
+    // This case's name always said `__all__`; the assertion used to be
+    // `scope_expr.empty()`, because empty was the proxy for broadcast at the
+    // dispatch sink. #2500 inverted that default — empty now reaches nobody —
+    // so the producer names the broadcast and the assertion finally matches
+    // the name it has had all along.
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].plugin == "tar");
     REQUIRE(h.calls[0].action == "sql");
-    REQUIRE(h.calls[0].scope_expr.empty());
+    REQUIRE(h.calls[0].scope_expr == "__all__");
     REQUIRE(h.calls[0].params.at("sql") == "SELECT pid FROM process_live");
     // execution_id was minted BEFORE dispatch (create-before-dispatch).
     REQUIRE(h.calls[0].execution_id == data["source_execution_id"].get<std::string>());

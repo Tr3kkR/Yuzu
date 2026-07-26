@@ -5936,9 +5936,17 @@ void RestApiV1::register_routes(
 
             std::string command_id;
             int sent = 0;
+            // #2500: this producer has no agent_ids by construction, and an
+            // absent `parent_id` has always meant "broadcast to all connected
+            // agents (__all__)" — as the comment above already says. It said so
+            // while passing an EMPTY scope and relying on the dispatch sink's
+            // empty-means-everybody default, which that issue inverted. Pass the
+            // sentinel the comment already claims, so the behaviour survives.
+            const std::string dispatch_scope =
+                scope_expr.empty() ? std::string("__all__") : scope_expr;
             try {
                 std::tie(command_id, sent) =
-                    command_dispatch_fn(plugin, action, {}, scope_expr, params, exec_id);
+                    command_dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 execution_tracker->mark_cancelled(exec_id, owner);
