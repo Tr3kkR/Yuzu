@@ -11,6 +11,15 @@
   read had caught in round 1. This file exists so the guard rails that came out
   of that round have an executable check.
 
+  Scope, honestly: this covers the maintenance gate, the -D data-dir handling,
+  the ImagePath rewrite, and a set of structural invariants over the script's
+  own AST. It does NOT execute provisioning — nothing here proves a real
+  robocopy, service repoint or cluster restart works. Round 3 of the PR #2359
+  review found two live blockers while an earlier version of this suite reported
+  all-green, because one assertion compared the first gate call against the
+  first restart and so passed trivially; treat green here as "the specific
+  regressions below are absent", never as "provisioning is correct".
+
   It is SAFE TO RUN ANYWHERE: no elevation, no machine state. Function bodies
   are extracted from the real script via the AST (never copied, so they cannot
   drift), Get-CimInstance is mocked, the registry work uses a throwaway HKCU key
@@ -256,9 +265,51 @@ Check 'the top-level gate is NOT nested inside a scriptblock (Step would swallow
   }
   $true
 }
-Check 'the top-level gate precedes EVERY Restart-Service (incl. the pre-existing one)' {
-  $gateCalls.Count -and $restarts.Count -and
-  ($gateCalls[0].Extent.StartLineNumber -lt $restarts[0].Extent.StartLineNumber)
+# Round-3 finding, correctly made: the previous version of this compared the
+# FIRST gate call against the FIRST restart. The top-level gate is always
+# textually first, so it passed trivially — green while two blockers were live
+# in the code it had just "tested". Pair EVERY restart with its own nearby gate
+# instead, and require any deliberate exception to be marked in the source.
+Check 'EVERY Restart-Service is immediately preceded by a gate or a DRAIN-EXEMPT marker' {
+  if(-not $restarts.Count){ return $false }
+  $srcLines   = $text -split "`r?`n"
+  $gateLines  = @($gateCalls | ForEach-Object { $_.Extent.StartLineNumber })
+  $ungated    = @()
+  foreach($r in $restarts){
+    $line    = $r.Extent.StartLineNumber
+    # Look back a short window: the gate must be adjacent to the restart it
+    # protects, not merely somewhere earlier in the file.
+    $window  = [Math]::Max(1, $line - 12)
+    $covered = @($gateLines | Where-Object { $_ -ge $window -and $_ -lt $line }).Count -gt 0
+    if(-not $covered){
+      $exempt = $false
+      for($i = $window; $i -lt $line; $i++){
+        if($srcLines[$i-1] -match 'DRAIN-EXEMPT'){ $exempt = $true; break }
+      }
+      if(-not $exempt){ $ungated += $line }
+    }
+  }
+  if($ungated.Count){ Write-Host "        ungated Restart-Service at line(s): $($ungated -join ', ')" -ForegroundColor DarkYellow }
+  $ungated.Count -eq 0
+}
+# The other half of the round-3 blocker: detection is worthless if the handler
+# swallows it. Step() catches and continues by design, so it must special-case
+# the drain tag and abort the PROCESS.
+Check 'Step() aborts the process on a drain-tagged failure instead of continuing' {
+  $stepFn = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Step' }, $true)
+  if(-not $stepFn){ return $false }
+  $body = $stepFn[0].Extent.Text
+  ($body -match 'kDrainTag') -and ($body -match '\bexit\s+\d')
+}
+Check 'the drain check fails CLOSED when it cannot observe the box' {
+  $probe = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Get-ActiveRunnerProcess' }, $true)
+  if(-not $probe){ return $false }
+  # A Get-CimInstance failure must be re-tagged as an abort, not allowed to fall
+  # through to a caller's log-and-continue path.
+  ($probe[0].Extent.Text -match 'catch') -and ($probe[0].Extent.Text -match 'kDrainTag')
 }
 Check 'the per-agent catch re-throws drain failures instead of continuing the loop' {
   $text -match '\$_\.Exception\.Message\.StartsWith\(\$kDrainTag\)\s*\)\s*\{\s*throw\s*\}'
@@ -321,6 +372,29 @@ function Get-CimInstance { param($ClassName,$Filter,$EA)
         Write-Host (($out -split "`n" | Select-Object -First 12) -join "`n")
         $script:fail++
       }
+    }
+
+    # Round-3 blocker, end to end: a drain detected MID-SCRIPT (inside a Step)
+    # must abort the process. Step() catches and continues by design, so a
+    # tagged throw that it merely logs would let the remaining steps — Defender
+    # exclusions, vcpkg pinning, the machine PATH/env rewrite — run under a live
+    # CI job. Suite 4 asserts the shape; this proves the behaviour.
+    $midHarness = Join-Path $work 'gate-harness-mid.ps1'
+    ($prologue + @"
+`nStep 'simulated mid-script drain detection' { throw "`$script:kDrainTag simulated runner became active" }
+Write-Host 'REACHED-AFTER-STEP'
+Stop-Transcript | Out-Null
+exit 0
+"@) | Set-Content -LiteralPath $midHarness -Encoding UTF8
+    $env:YUZU_GATETEST_PROCS = ''
+    $midOut  = & pwsh -NoProfile -File $midHarness 2>&1 | Out-String
+    $midCode = $LASTEXITCODE
+    if(($midCode -eq 2) -and ($midOut -notmatch 'REACHED-AFTER-STEP')){
+      Write-Host "  PASS  mid-script drain inside a Step aborts the process (exit=$midCode, later steps did NOT run)" -ForegroundColor Green
+      $script:pass++
+    } else {
+      Write-Host "  FAIL  mid-script drain inside a Step aborts the process (exit=$midCode want=2, reachedAfterStep=$($midOut -match 'REACHED-AFTER-STEP') want=False)" -ForegroundColor Red
+      $script:fail++
     }
 
     Case 'drained box proceeds to step 1'             ''                                         @()                      0 $true

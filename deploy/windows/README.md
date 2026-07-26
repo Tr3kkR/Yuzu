@@ -32,10 +32,22 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    this: it exits (code 2) before *any* step if a `Runner.Listener.exe` or
    `Runner.Worker.exe` is live. It gates on the **listener**, not just the
    worker — an idle listener can accept a job mid-run, so "no job right now" is
-   not a safe state. The long-running per-agent PostgreSQL-binary step
-   re-asserts the gate on entry and again immediately before each service
-   restart. `-AllowActiveRunners` overrides the gate and will kill in-flight
-   jobs; it exists for a box you know is yours.
+   not a safe state.
+
+   That start-of-run check can be minutes stale by the time a service restart
+   happens, so it is **re-asserted immediately before every `Restart-Service`**
+   — the main PostgreSQL step's included — and on entry to the long per-agent
+   binary step. The single exception is the rollback restart, marked
+   `DRAIN-EXEMPT` in the source: it only runs when a repoint has already failed,
+   so refusing it would strand a non-serving cluster, which is worse than the
+   restart; it warns instead. A detection **mid-script aborts the process**
+   (exit 2), because `Step()` otherwise catches and continues — a failed step
+   would leave the later Defender, vcpkg and machine PATH/env steps running
+   under a live job.
+
+   `-AllowActiveRunners` **skips the check only** — it stops no runner and kills
+   no job, so a live job may simply be interrupted. It exists for a box you know
+   is yours.
 
    If you **edited** the provisioning script, run its regression tests first —
    they need no elevation and touch no machine state, so run them anywhere,

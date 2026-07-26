@@ -53,8 +53,9 @@ param(
 
   # Escape hatch for the maintenance gate below. Provisioning restarts shared
   # services and rewrites machine env under whatever is running; the gate
-  # refuses to start while any runner process is live. Pass this ONLY when you
-  # accept killing in-flight CI jobs on this box.
+  # refuses to start while any runner process is live. This switch only SKIPS
+  # the check — it stops no runner and kills no job. Pass it only when you
+  # accept that a live CI job on this box may be interrupted.
   [switch]$AllowActiveRunners
 )
 $ErrorActionPreference = 'Continue'
@@ -64,6 +65,10 @@ New-Item -ItemType Directory -Force 'C:\ProvisionLogs' | Out-Null
 Start-Transcript -Path "C:\ProvisionLogs\provision-$(Get-Date -Format yyyyMMdd-HHmmss).log" | Out-Null
 
 $script:failedSteps = @()
+# Tag on every drain failure so a per-item catch can tell "this one item went
+# wrong, carry on" from "the box is no longer safe to mutate, stop now".
+# Defined above Step() because Step()'s catch is the handler that acts on it.
+$script:kDrainTag = '[RUNNERS-ACTIVE]'
 function Step([string]$name,[scriptblock]$body){
   # Every Step still runs regardless of an earlier one's failure (unchanged
   # semantics) - only the PROCESS exit code changes. Before this, a failed
@@ -76,6 +81,19 @@ function Step([string]$name,[scriptblock]$body){
   Write-Host "`n===== $name =====" -ForegroundColor Cyan
   try   { & $body; Write-Host "[OK]  $name" -ForegroundColor Green }
   catch {
+    # ONE exception class is not a step failure but a stop-the-world: a runner
+    # became active (or the drain check stopped being able to see), so the box
+    # is no longer safe to mutate. Catch-and-continue here would carry on into
+    # the remaining steps — Defender exclusions, vcpkg pinning, and the machine
+    # PATH/env rewrite — under a live CI job. The top-level gate lives outside
+    # Step() for exactly this reason; a mid-script detection has to abort the
+    # PROCESS the same way, not just fail its own step.
+    if($_.Exception.Message.StartsWith($script:kDrainTag)){
+      Write-Host "[ABORT] $name :: $($_.Exception.Message)" -ForegroundColor Red
+      Write-Host "Provisioning stopped: no further steps run." -ForegroundColor Red
+      Stop-Transcript | Out-Null
+      exit 2
+    }
     Write-Host "[FAIL] $name :: $($_.Exception.Message)" -ForegroundColor Red
     $script:failedSteps += $name
   }
@@ -115,14 +133,24 @@ function Get-ActiveRunnerProcess {
   # not a lock: a listener that is idle at the instant we look can accept a job
   # a second later, while we are still copying trees and restarting clusters.
   # Gating on the LISTENER closes that window — no listener, no job can start.
-  @(Get-CimInstance Win32_Process `
-      -Filter "Name = 'Runner.Listener.exe' OR Name = 'Runner.Worker.exe'" -EA Stop)
+  # WMI/DCOM/permissions can make this throw for reasons unrelated to runners.
+  # "I cannot see whether the box is busy" must fail CLOSED — re-tag it so it
+  # aborts like a positive detection instead of falling into a caller's
+  # log-and-continue path. A gate that fails open when it cannot observe is not
+  # a gate.
+  try {
+    @(Get-CimInstance Win32_Process `
+        -Filter "Name = 'Runner.Listener.exe' OR Name = 'Runner.Worker.exe'" -EA Stop)
+  } catch {
+    throw ("$script:kDrainTag cannot determine whether runners are active " +
+           "(drain check itself failed: $($_.Exception.Message)) — refusing to proceed")
+  }
 }
-# Tag on every drain failure so a per-item catch can tell "this one item went
-# wrong, carry on" from "the box is no longer safe to mutate, stop now".
-$script:kDrainTag = '[RUNNERS-ACTIVE]'
 function Assert-RunnersDrained([string]$context){
-  if($AllowActiveRunners){ return }
+  if($AllowActiveRunners){
+    Write-Warning "-AllowActiveRunners: skipping the drain check ($context). Nothing is stopped — any live CI job on this box may be interrupted."
+    return
+  }
   $active = Get-ActiveRunnerProcess
   if($active.Count -eq 0){ return }
   $detail = ($active | Sort-Object Name,ProcessId |
@@ -296,6 +324,11 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   } finally {
     Remove-Item Env:\PGPASSWORD -EA SilentlyContinue
   }
+  # Agent 0's cluster is shared with whatever else is on this box. The
+  # script-start gate can be arbitrarily stale by now — every winget toolchain
+  # install runs between it and here, real minutes on a cold box — so re-assert
+  # immediately before dropping this service's live connections.
+  Assert-RunnersDrained "refusing to restart $svc"
   Restart-Service $svc -Force
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
@@ -567,6 +600,16 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
           $forwardError = $_.Exception.Message
           try {
             Set-ItemProperty $regPath -Name ImagePath -Value $curImage -Type $imageKind -EA Stop
+            # DRAIN-EXEMPT: recovery, deliberately not gated. Reaching here means
+            # the forward repoint already failed, so this service is ALREADY not
+            # serving — refusing to restart would strand it broken, which is
+            # strictly worse for any job that just started than the restart is.
+            # Reachable only if a runner appeared inside the narrow window
+            # between the check at the forward restart and this catch, so warn
+            # loudly and recover anyway.
+            if(-not $AllowActiveRunners -and (Get-ActiveRunnerProcess).Count -gt 0){
+              Write-Warning "agent ${n}: a runner became active during recovery; restoring $svc anyway — leaving a non-serving cluster behind would be worse"
+            }
             Restart-Service $svc -Force -EA Stop
             Assert-PgServing (Split-Path $curExe -Parent) $port "agent $n rollback service"
           } catch {
@@ -697,7 +740,10 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     throw "Defender exclusion for the private postgres.exe tree is ineffective: $pgbinRoot"
   }
   $pgExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(postgres.exe skipped - pgbin not found)' }
-  $procExcl = @($pgExcl) + $testExes
+  # Include the private per-agent copies: they are the binaries that actually
+  # serve every [pg] connection, so omitting them understates what is protected.
+  $privateExcl = @(for($n=0; $n -lt $RunnerCount; $n++){ Join-Path $CacheRoot "pgbin\agent-$n\bin\postgres.exe" })
+  $procExcl = @($pgExcl) + $privateExcl + $testExes
   "Defender exclusions added: process=" + ($procExcl -join ', ') + "; paths=" + ($paths -join ', ')
 }
 
