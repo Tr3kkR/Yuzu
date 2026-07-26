@@ -1181,7 +1181,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the `auth.db` write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -1217,7 +1217,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 
@@ -6423,6 +6423,8 @@ username=admin&password=secretpass
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `qr_svg` field on the enrollment variant is a server-rendered inline SVG QR code encoding `otpauth_uri` — inject it into the DOM **without** HTML-escaping (it is pure shape geometry, no user content). If `qr_svg` is the empty string, QR encoding failed; fall back to displaying `secret_base32` / `otpauth_uri` for manual entry. The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
 
+**Errors:** a `503` from this endpoint can also mean the enrolled user's MFA secret could not be read (PG/KEK unavailable, tamper, or a rotated/unresolvable key) rather than the pending-challenge-map load-shed above — this fails closed rather than silently falling back to "not enrolled." See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
+
 #### `POST /login/mfa`
 
 Complete a pending MFA login. Called after receiving HTTP 202 from `POST /login`.
@@ -6443,8 +6445,11 @@ The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII 
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
 | `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
+| `503` | The user's MFA secret could not be read/decrypted (PG outage mid-read, tamper, an unresolvable/rotated KEK, or a corrupt blob) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
 An enrollment-pending token issued by the `mfa_enrollment_required` branch is **rejected** here (use `POST /login/mfa/enroll`); a login-challenge token is likewise rejected at the enroll endpoint.
+
+**Errors:** the `503` above is a deliberate fail-closed outcome, never collapsed into the `401` "code rejected" case (which would burn one of the user's limited verification attempts against a transient outage). See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 #### `POST /login/mfa/enroll`
 
@@ -6492,6 +6497,8 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up — the body points to `/auth/oidc/start`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+
+**Errors:** the `503` above includes the case where the session owner's MFA secret specifically could not be read/decrypted (PG/KEK unavailable, tamper, or a rotated/unresolvable key) — `require_mfa_step_up` fails closed on this rather than treating it as "not enrolled." See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 **Audit verbs:** `mfa.step_up.passed` on success (`detail=method=totp` or `method=recovery`); `mfa.step_up.failed` on each rejection with the rejection reason in `detail`.
 

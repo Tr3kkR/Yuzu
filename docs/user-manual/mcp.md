@@ -574,6 +574,20 @@ confirming no ticket was created or consumed. Two strictness notes: `integer`
 parameters must be JSON integers (an integral float like `1.0` is rejected),
 and `maxLength` limits are byte counts.
 
+Targeting arguments are **type-checked and never coerced**, and an empty target
+set is an error rather than a widening:
+
+- a non-string entry in `agent_ids`, or a non-string `scope`, is rejected;
+- a **supplied but empty** `agent_ids` (now `minItems: 1` in the published
+  schema) or an empty `scope` string is rejected.
+
+Omitting both is still the documented way to target every agent. The reason
+for the strictness: entries the server could not use were previously dropped,
+and a target set that emptied out fell through to the "nothing specified"
+default — which means the whole fleet. So a client whose device filter matched
+nothing, or which emitted numeric ids, could dispatch fleet-wide and be told it
+succeeded. You now get `-32602` instead.
+
 **Examples of key parameters:**
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,

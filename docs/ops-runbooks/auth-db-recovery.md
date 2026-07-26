@@ -1,7 +1,24 @@
 # Auth DB Recovery Runbook
 
+> ⚠️ **SQLite-era — SUPERSEDED by the Postgres auth substrate (ADR-0006).**
+> The AuthDB (and `ScimStore`) moved off the on-disk SQLite `auth.db` to the
+> server's PostgreSQL substrate (schema `auth`; see `docs/auth-architecture.md`
+> and `docs/user-manual/upgrading.md` § "⚠️ Breaking: local accounts + MFA
+> enrolments reset"). **Every file-based recovery step below — `sqlite3
+> .backup`, moving `auth.db`/`auth.db-wal`/`auth.db-shm` aside, direct
+> `UPDATE`/`DELETE` SQL against `auth.db`, the Windows Defender exclusion for
+> those files — DOES NOT APPLY to a Postgres-backed AuthDB and will not work.**
+> For a PG-backed deployment, auth data lives in Postgres schema `auth`;
+> lockout/break-glass are cleared via the admin API
+> (`POST /api/v1/users/{username}/unlock`) or the `--break-glass-arm` /
+> `--mfa-reset` CLI flags — **not** file surgery. A dedicated Postgres-native
+> recovery runbook is tracked as a follow-up; until it ships, treat this
+> document as historical/reference only, and do not follow its SQL-surgery
+> steps against a Postgres-backed server.
+
 Operator runbook for recovering a Yuzu server when its on-disk authentication
 database (`auth.db`) cannot be opened or fails the integrity check at startup.
+**Applies to the legacy SQLite-backed AuthDB only — see the banner above.**
 Symptoms covered, recovery procedure, prevention via routine backup, and the
 Windows-specific Defender exclusion.
 

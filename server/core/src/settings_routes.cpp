@@ -1571,7 +1571,23 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
 
     auto status_res = auth_db->mfa_status(username);
     if (!status_res) {
-        return html + "<span style=\"color:#484f58\">User not found for MFA status.</span>";
+        // Read-only display path — no session/MFA-skip decision is made
+        // here either way, but ★ (architect BLOCK follow-through) the
+        // message must not misreport a store/decrypt failure
+        // (SecretUnavailable/QueryFailed) as "user not found" — that would
+        // mislead an operator into thinking the account is gone rather than
+        // that MFA state is temporarily unreadable (retry, don't panic).
+        const bool store_unavailable = is_store_unavailable(status_res.error());
+        if (store_unavailable && metrics_registry_) {
+            metrics_registry_
+                ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
+                .increment();
+        }
+        return html +
+               (store_unavailable
+                    ? "<span style=\"color:#484f58\">MFA status is temporarily unavailable "
+                      "(authentication store error) — retry shortly.</span>"
+                    : "<span style=\"color:#484f58\">User not found for MFA status.</span>");
     }
     const auto& status = *status_res;
 
@@ -5335,6 +5351,17 @@ void SettingsRoutes::register_routes(
             const char* msg = "Enrollment failed";
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
                 msg = "MFA is already enabled — disable it first to re-enroll";
+            } else if (is_store_unavailable(init.error())) {
+                // ★ SECURITY (architect BLOCK follow-through): distinguish a
+                // store/decrypt failure from a generic enrollment error —
+                // never mislead the operator into retrying a fundamentally
+                // broken step; no MFA state changes either way.
+                msg = "Authentication store is temporarily unavailable — retry shortly";
+                if (metrics_registry_) {
+                    metrics_registry_
+                        ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
+                        .increment();
+                }
             }
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
             res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {}, msg),
@@ -5377,10 +5404,28 @@ void SettingsRoutes::register_routes(
                       // routes the renderer to the retry shape; leaving
                       // `new_otpauth_uri` empty suppresses the
                       // one-time secret reveal (Gate 4 happy-path B3).
+                      //
+                      // ★ SECURITY (architect BLOCK follow-through): a
+                      // store/decrypt failure is NOT "code rejected" — never
+                      // conflate the two (no enrollment completes / no
+                      // recovery codes are issued either way, but the
+                      // operator-facing message and audit detail must be
+                      // honest about which happened).
+                      const bool store_unavailable = is_store_unavailable(codes_res.error());
+                      if (store_unavailable && metrics_registry_) {
+                          metrics_registry_
+                              ->counter("yuzu_auth_secret_unavailable_total",
+                                       {{"route", "mfa_enroll"}})
+                              .increment();
+                      }
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
-                                "code rejected");
-                      const char* msg = "Code rejected. Try the next code shown by your "
-                                        "authenticator (codes refresh every 30 seconds).";
+                                store_unavailable ? "secret/store unavailable (fail-closed)"
+                                                  : "code rejected");
+                      const char* msg =
+                          store_unavailable
+                              ? "Authentication store is temporarily unavailable — retry shortly."
+                              : "Code rejected. Try the next code shown by your authenticator "
+                                "(codes refresh every 30 seconds).";
                       res.set_content(render_mfa_fragment(session->username, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");

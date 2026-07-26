@@ -26,6 +26,7 @@
  * `test_kv_store.cpp`.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -45,11 +46,14 @@
 #include <chrono>
 #include <expected>
 #include <format>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <libpq-fe.h>
 
@@ -346,6 +350,143 @@ inline void sweep_stale_test_databases(const std::string& admin_dsn) {
     }
 }
 
+/// ── Shared per-file test databases (shared-DB + TRUNCATE fixtures) ────────
+///
+/// The shared-DB fixture pattern — one migrated clone + one persistent pool
+/// per test FILE, TRUNCATE between tests instead of a fresh database per test
+/// — exists to cut the per-test CREATE DATABASE + pool spin-up (each opens
+/// several backends, and on Windows Postgres is EXEC_BACKEND: a fresh
+/// postgres.exe per connection, the dominant [pg]-shard cost). The clone must
+/// be dropped at testRunEnded, while libpq's TLS stack is still alive, and
+/// NEVER in the function-local static's destructor: that static-dtor DROP
+/// races OpenSSL's atexit cleanup on filtered runs and leaks — the exact
+/// hazard PgTestTemplate::drop_all_built documents. A shared fixture calls
+/// PostgresTestDb::keep_until_run_end(), which hands its clone and a pool-drain
+/// callback here; the test_pg_template_cleanup listener calls
+/// cleanup_all_shared(), which drains every pool and drops every shared clone
+/// before PgTestTemplate::drop_all_built() removes the templates.
+class SharedPgDbRegistry {
+public:
+    using Drain = std::function<void()>;
+
+    static void add(std::string admin_dsn, std::string db_name, Drain drain) {
+        Reg& r = reg();
+        const std::lock_guard<std::mutex> lock(r.mu);
+        r.dbs.push_back({std::move(admin_dsn), std::move(db_name), std::move(drain)});
+    }
+
+    /// Drain every shared fixture's persistent pool, then drop every clone,
+    /// while libpq/OpenSSL are still alive. Taking the entries first keeps
+    /// callbacks and network cleanup outside the registry mutex.
+    static void cleanup_all_shared() {
+        std::vector<Entry> entries;
+        Reg& r = reg();
+        {
+            const std::lock_guard<std::mutex> lock(r.mu);
+            entries.swap(r.dbs);
+        }
+        cleanup_entries(entries);
+    }
+
+    /// Scoped counterpart used by the mechanism regression test. It follows
+    /// the exact drain-then-drop entry path without invalidating shared
+    /// fixtures from other files when Catch2 randomises test order.
+    static void cleanup_shared(const std::string& db_name) {
+        std::vector<Entry> entries;
+        Reg& r = reg();
+        {
+            const std::lock_guard<std::mutex> lock(r.mu);
+            const auto it = std::find_if(r.dbs.begin(), r.dbs.end(),
+                                         [&](const Entry& e) { return e.db_name == db_name; });
+            if (it == r.dbs.end())
+                return;
+            entries.push_back(std::move(*it));
+            r.dbs.erase(it);
+        }
+        cleanup_entries(entries);
+    }
+
+private:
+    struct Entry {
+        std::string admin_dsn;
+        std::string db_name;
+        Drain drain;
+    };
+    struct Reg {
+        std::mutex mu;
+        std::vector<Entry> dbs;
+    };
+    static Reg& reg() {
+        static Reg r;
+        return r;
+    }
+
+    static bool drain_entry(Entry& e) noexcept {
+        if (!e.drain)
+            return true;
+        std::fprintf(stderr, "SharedPgDbRegistry: draining pool for %s\n", e.db_name.c_str());
+        try {
+            e.drain();
+            e.drain = {};
+            std::fprintf(stderr, "SharedPgDbRegistry: drained pool for %s\n", e.db_name.c_str());
+            return true;
+        } catch (...) {
+            e.drain = {};
+            std::fprintf(stderr,
+                         "SharedPgDbRegistry: pool drain for %s threw; continuing with forced "
+                         "clone cleanup\n",
+                         e.db_name.c_str());
+            return false;
+        }
+    }
+
+    static bool drop_entry(const Entry& e) noexcept {
+        try {
+            yuzu::server::pg::PgConn conn{PQconnectdb(e.admin_dsn.c_str())};
+            if (PQstatus(conn.get()) != CONNECTION_OK) {
+                std::fprintf(stderr,
+                             "SharedPgDbRegistry: teardown admin connect failed for %s — leaked "
+                             "a yuzu_test_* database (next sweep reclaims it)\n",
+                             e.db_name.c_str());
+                return false;
+            }
+            const std::string drop = "DROP DATABASE IF EXISTS \"" + e.db_name + "\" WITH (FORCE)";
+            yuzu::server::pg::PgResult res{PQexec(conn.get(), drop.c_str())};
+            if (!res.ok()) {
+                std::fprintf(stderr, "SharedPgDbRegistry: drop of %s failed: %s\n",
+                             e.db_name.c_str(), PQerrorMessage(conn.get()));
+                return false;
+            }
+            return true;
+        } catch (...) {
+            std::fprintf(stderr,
+                         "SharedPgDbRegistry: teardown of %s threw — leaked a yuzu_test_* "
+                         "database (next sweep reclaims it)\n",
+                         e.db_name.c_str());
+            return false;
+        }
+    }
+
+    static void cleanup_entries(std::vector<Entry>& entries) noexcept {
+        if (entries.empty())
+            return;
+        std::size_t drain_failures = 0;
+        for (auto& e : entries) {
+            if (!drain_entry(e))
+                ++drain_failures;
+        }
+        std::size_t dropped = 0;
+        for (const auto& e : entries) {
+            if (drop_entry(e))
+                ++dropped;
+        }
+        std::fprintf(stderr,
+                     "SharedPgDbRegistry: cleanup complete; dropped %zu/%zu shared test "
+                     "database(s), drain failures=%zu\n",
+                     dropped, entries.size(), drain_failures);
+    }
+};
+
 class PgTestTemplate;
 
 /// RAII fixture for an ephemeral, uniquely-named Postgres database.
@@ -370,6 +511,11 @@ public:
     explicit PostgresTestDb(PgTestTemplate& tpl);
 
     ~PostgresTestDb() {
+        // Teardown handed to SharedPgDbRegistry (dropped at testRunEnded, while
+        // OpenSSL is still up) — do nothing here, and in particular do not
+        // PQconnectdb from a static destructor where OpenSSL may be gone.
+        if (detached_)
+            return;
         if (db_name_.empty() || admin_dsn_.empty())
             return;
         yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn_.c_str())};
@@ -400,6 +546,20 @@ public:
     /// Conninfo (keyword/value form) for the ephemeral database.
     [[nodiscard]] const std::string& dsn() const noexcept { return dsn_; }
     [[nodiscard]] const std::string& db_name() const noexcept { return db_name_; }
+
+    /// Hand this database and its persistent-pool drain callback to
+    /// SharedPgDbRegistry. At testRunEnded the pool is destroyed first and the
+    /// database is then dropped, while libpq/OpenSSL are still alive. The
+    /// registry retains the callback until cleanup: captures must outlive that
+    /// point, and the callback must synchronously destroy the pool without
+    /// throwing, retaining a lease, or re-entering this registry. No-op when
+    /// the database never came up.
+    void keep_until_run_end(SharedPgDbRegistry::Drain drain) {
+        if (!available_ || db_name_.empty() || admin_dsn_.empty())
+            return;
+        SharedPgDbRegistry::add(admin_dsn_, db_name_, std::move(drain));
+        detached_ = true;
+    }
 
 private:
     /// Shared constructor body. `tpl_name` == nullptr -> empty database
@@ -546,6 +706,7 @@ private:
     std::string dsn_;
     std::string error_;
     bool available_{false};
+    bool detached_{false}; ///< true → SharedPgDbRegistry owns teardown (keep_until_run_end)
 
     friend class PgTestTemplate; // rewrite_dbname for the template's own DSN
 };
@@ -702,8 +863,7 @@ public:
                                 total)
                         .c_str(),
                     stderr);
-            } catch (...) {
-            }
+            } catch (...) {}
         }
     }
 
@@ -724,8 +884,8 @@ public:
 
 private:
     struct Entry {
-        std::string db_name; ///< empty only when CREATE DATABASE itself failed
-        std::string error;   ///< nonempty = build failed (db_name may still be set)
+        std::string db_name;   ///< empty only when CREATE DATABASE itself failed
+        std::string error;     ///< nonempty = build failed (db_name may still be set)
         std::string admin_dsn; ///< for the cleanup drop
         /// Structural fingerprint of the built template (schemas, columns,
         /// indexes, constraints).
@@ -815,13 +975,15 @@ private:
         {
             yuzu::server::pg::PgConn conn{PQconnectdb(admin_dsn.c_str())};
             if (PQstatus(conn.get()) != CONNECTION_OK) {
-                e.error = std::string("template admin connect failed: ") + PQerrorMessage(conn.get());
+                e.error =
+                    std::string("template admin connect failed: ") + PQerrorMessage(conn.get());
                 return e;
             }
             const std::string create = "CREATE DATABASE \"" + db_name + "\"";
             yuzu::server::pg::PgResult res{PQexec(conn.get(), create.c_str())};
             if (!res.ok()) {
-                e.error = std::string("template CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
+                e.error =
+                    std::string("template CREATE DATABASE failed: ") + PQerrorMessage(conn.get());
                 return e;
             }
         }
@@ -857,12 +1019,22 @@ private:
     }
 
     /// Structural fingerprint of a database: md5 over the sorted set of
-    /// non-system schemas, (schema, table, column, type) tuples, index
-    /// definitions, and table constraints. Deliberately structure-only —
+    /// non-system schemas, (schema, table, column, type, nullability) tuples,
+    /// index definitions, and table constraints. Deliberately structure-only —
     /// a setup may reset DATA after migrating (e.g. the secrets template
     /// clears kek_meta) and still be equivalent. NOT covered: triggers and
     /// functions (no store migration creates them today; extend here if
     /// one ever does).
+    ///
+    /// NOT-NULL constraints are excluded from the constraint arm and carried
+    /// by the column arm's is_nullable instead: before PG 18 a NOT NULL is
+    /// surfaced as an auto-named CHECK constraint whose name embeds the
+    /// table/attribute OIDs ("39836_39837_1_not_null"), so two databases with
+    /// IDENTICAL schemas fingerprint differently and every shared-key replay
+    /// verification fails spuriously on PG < 18 (CI is on 18 and never saw
+    /// it; a local PG 16 cluster fails every cross-file shared key). Moving
+    /// nullability to is_nullable keeps the divergence detectable while making
+    /// the fingerprint OID-independent on every supported server version.
     static std::expected<std::string, std::string> structure_fingerprint(const std::string& dsn) {
         yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
         if (PQstatus(conn.get()) != CONNECTION_OK)
@@ -874,6 +1046,7 @@ private:
             "   WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'"
             "  UNION ALL"
             "  SELECT table_schema || '.' || table_name || '.' || column_name || ':' || data_type"
+            "         || ':null=' || is_nullable"
             "    FROM information_schema.columns"
             "   WHERE table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'"
             "  UNION ALL"
@@ -885,6 +1058,9 @@ private:
             "         || ':' || constraint_type"
             "    FROM information_schema.table_constraints"
             "   WHERE table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'"
+            // OID-named (PG < 18) and column-named (PG >= 18) NOT NULL checks:
+            // nullability rides on the column arm's is_nullable instead.
+            "     AND NOT (constraint_type = 'CHECK' AND constraint_name LIKE '%\\_not\\_null')"
             ") s";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), kQuery)};
         if (PQresultStatus(res.get()) != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)

@@ -346,6 +346,13 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     }
     stats.read_ok = true;
 
+    // #2452 Gate 8 (focused re-review UPR-1): a malformed key whose quarantine RENAME fails below
+    // leaves a corrupt row STUCK in lc: (re-failing every pass, consuming ceiling budget). Like the
+    // page side's any_quarantine_this_pass, that is not a clean, verified-idle retention pass, so it
+    // must NOT read the prune stamp fresh - fed into progress_or_verified at the tail. Mirrors the
+    // page-side guard the first prune cut missed.
+    bool quarantine_stall_this_pass = false;
+
     // Rebase to what the scan actually observed on disk (all lc: rows, well-keyed or not); the
     // quarantine + eviction below then fetch_sub exactly what they REMOVE, so the gauge lands
     // at the true post-prune size without ever taking an absolute snapshot.
@@ -448,6 +455,7 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                                          std::memory_order_relaxed);
             } else {
                 quarantine_failures_.fetch_add(1, std::memory_order_relaxed);
+                quarantine_stall_this_pass = true; // #2452 Gate 8: stuck corrupt row -> not verified idle
             }
             continue;
         }
@@ -699,17 +707,6 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                 }
                 bool point_read_failed = false;
                 for (const auto& key : evict) {
-                    // The per-key stop gate is kept on BOTH the in-memory and the fallback path
-                    // (not only the fallback, as an earlier shape had it): the count/byte
-                    // eviction path is uncapped by design, so an abnormally large evict set must
-                    // still let a stop truncate promptly (the surrounding code maintains that
-                    // posture throughout). The remainder is COUNTED, never silently dropped.
-                    if (stopping_.load(std::memory_order_acquire)) {
-                        evicted_unclassified_.fetch_add(evict.size() - classified,
-                                                        std::memory_order_relaxed);
-                        classified = evict.size();
-                        break;
-                    }
                     // Best-effort classification: a live entry may age out before its batch key
                     // exists, so absence of a sent-label != "never sent".
                     //
@@ -724,6 +721,19 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                     // diagnosing a spike should read it alongside `quarantined` rather than alone.
                     const std::string label = journal_sent_key_from_batch_key(key);
                     if (sent_keys) {
+                        // Scan-OK path (#2470): classification here is a pure in-memory set
+                        // lookup - no I/O, no unbounded per-key cost - so a mid-loop shutdown does
+                        // NOT truncate on this path. The remainder is fully determinable from the
+                        // already-materialized `sent_keys` at negligible cost, so every key is
+                        // classified to its TRUE disposition rather than lumping the tail into
+                        // evicted_unclassified_ (which the fleet HELP calls "PERMANENTLY UNKNOWN",
+                        // and which would leave evicted_without_send_evidence_ - the audit-gap
+                        // floor an auditor reads - looser than the data supports). The earlier
+                        // shape kept a per-key stop gate here too (Sol's L3 D1); the empirical
+                        // panel reverted it (#2470): shutdown-promptness on an abnormally large
+                        // evict set does not justify mislabeling determinable gaps, because these
+                        // lookups are cheap. The per-key stop gate lives on the FALLBACK path
+                        // ONLY, where each key is a KvStore round trip.
                         if (sent_keys->count(label))
                             evicted_sent_unacked_.fetch_add(1, std::memory_order_relaxed);
                         else
@@ -733,14 +743,24 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
                             prune_classify_hook_(classified);
                         continue;
                     }
-                    // The scan failed. Fall back to a per-key read bounded by the evict set -
-                    // but a FALLIBLE one. exists() answers false for both "absent" and "the
-                    // read failed", and the read here fails for exactly the reason the scan just
-                    // did, so it would report a whole evict set as "no send evidence" - the
-                    // reading an operator is meant to treat as audit loss. A point error is
-                    // counted as a read failure AND classified as UNCLASSIFIED: an unknown
-                    // disposition is not evidence of absence, and it still belongs to a bucket
-                    // so the invariant holds.
+                    // The scan failed, so each remaining key now costs a KvStore round trip (I/O,
+                    // uncapped by the count/byte eviction path). ONLY here must a mid-loop shutdown
+                    // truncate promptly - and the remainder is genuinely undeterminable, because
+                    // the scan that would classify it already failed, so it is COUNTED as
+                    // unclassified, never silently dropped.
+                    if (stopping_.load(std::memory_order_acquire)) {
+                        evicted_unclassified_.fetch_add(evict.size() - classified,
+                                                        std::memory_order_relaxed);
+                        classified = evict.size();
+                        break;
+                    }
+                    // Fall back to a per-key read bounded by the evict set - but a FALLIBLE one.
+                    // exists() answers false for both "absent" and "the read failed", and the
+                    // read here fails for exactly the reason the scan just did, so it would report
+                    // a whole evict set as "no send evidence" - the reading an operator is meant to
+                    // treat as audit loss. A point error is counted as a read failure AND
+                    // classified as UNCLASSIFIED: an unknown disposition is not evidence of
+                    // absence, and it still belongs to a bucket so the invariant holds.
                     std::expected<std::optional<std::string>, KvStoreError> one;
                     if (inject_fail_prune_sent_reads_.load(std::memory_order_relaxed) > 0) { // test-only
                         inject_fail_prune_sent_reads_.fetch_sub(1, std::memory_order_relaxed);
@@ -782,6 +802,23 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
             throw;
         }
     }
+
+    // #2452 Gate 8 - retention ran or was verified idle. This is reached past the eviction block, so
+    // a delete FAILURE (returned early above, UP-7), a scan failure (read_ok false), and any stop
+    // BEFORE the delete (UP8-3) never get here - all leave the flag false. But reaching here is NOT
+    // sufficient on its own (focused re-review): the flag is true iff the pass either APPLIED a
+    // delete (evicted > 0 - genuine retention progress) OR the empty evict set genuinely reflects an
+    // idle journal - which it does NOT when the pass DECLINED age eviction of rows that WERE expired
+    // (`skip_age && expired > 0`, UPR-2: a would_wipe all-expired reading, or a big_step suspend/
+    // resume that aged rows out - retention deferred, journal not idle), and NOT when a malformed
+    // key's quarantine rename failed and left a corrupt row stuck (quarantine_stall_this_pass, UPR-1,
+    // mirroring the page-side guard). `skip_age && expired > 0` is deliberate over plain `!skip_age`:
+    // a big_step on a genuinely-idle journal (expired == 0) declined nothing, so it stays
+    // verified-idle rather than false-staling. A stop during the trailing label-GC below still leaves
+    // this true (retention already ran). A forward-clock-jump WIPE evicts (evicted > 0), so it still
+    // reads fresh - the L5 clock-guard (#2360/#2361) owns preventing that wipe, tracked separately.
+    stats.progress_or_verified =
+        stats.evicted > 0 || (!(skip_age && expired > 0) && !quarantine_stall_this_pass);
 
     // Surviving batch keys (parseable, not evicted): the reference set for sent-label GC. The
     // size gauges are NOT stored here any more - the rebase above plus the quarantine/eviction
@@ -883,7 +920,15 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // cutover resilience work (#2300); it does not gate this inert path.
     if (!boot_pruned_) {
         // Call prune_locked_ directly: we already hold paging_mutex_ (prune() would re-lock it).
-        if (!prune_locked_(now_ms).read_ok)
+        if (!prune_locked_(now_ms).read_ok) {
+            // The barrier's own prune scan failed (counted on prune_failures_, NOT
+            // page_read_failures_): this pass paged nothing and established nothing, so it must
+            // NOT read as replay progress. Flag it so the drain worker's page success stamp does
+            // not advance (#2452 - the same "clean return, no work" class as the candidate-scan
+            // failures below, reached through the boot barrier before boot_pruned_ latches; in a
+            // read-failure-from-boot regime the barrier never latches and every page pass takes
+            // this exit).
+            stats.read_failed = true;
             return stats; // #2303 C4: the barrier means "prune BEFORE any candidate can page".
                           // Latching only on read_ok (M5) is necessary but not sufficient - on a
                           // failed scan we must also PAGE NOTHING this pass, or we hand the
@@ -891,6 +936,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                           // the barrier on exactly the passes it exists for. Bounded and
                           // self-correcting: the tick's periodic prune and the next token-bearing
                           // pass retry, and expired rows are skipped below regardless.
+        }
         boot_pruned_ = true;
     }
 
@@ -903,6 +949,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     if (inject_fail_page_reads_.load(std::memory_order_relaxed) > 0) { // test-only read fault
         inject_fail_page_reads_.fetch_sub(1, std::memory_order_relaxed);
         page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+        stats.read_failed = true;
         return stats; // same observable as a real scan failure below
     }
     // KEYS ONLY (#2299 perf-P-1). Selection - expiry, ordering, sent-label skip, rotation - is
@@ -924,6 +971,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
         // scan failures - a page-side read that fails every pass stops ALL replay while prune
         // keeps succeeding, so the two are different operator situations (#2345 Gate 6 SRE).
         page_read_failures_.fetch_add(1, std::memory_order_relaxed);
+        stats.read_failed = true;
         return stats;
     }
 
@@ -975,6 +1023,14 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // footer. A failed read leaves that candidate's headroom disposition UNKNOWN, and unknown
     // is not evidence of "not blocked".
     bool value_read_failed = false;
+    // Pass-level "this pass hit a CORRUPT candidate" (#2452 Gate 7 / UP-2), set whether the
+    // quarantine rename succeeds OR fails. A quarantine is a SUCCESSFUL read of a corrupt batch, so
+    // it is not a read failure, but it is not replay progress either: a pass that only quarantines
+    // (or fails to quarantine a stuck corrupt batch) placed nothing and did not verify a clean idle
+    // backlog, so it must NOT read the page stamp fresh. Feeds progress_or_verified_idle at the
+    // tail; on a mass-corruption endpoint that is what makes the age gauge grow instead of lying
+    // healthy while zero records reach the server.
+    bool any_quarantine_this_pass = false;
     // A throw here would unwind the whole pass BEFORE page_cursor_ advances past this
     // candidate, so the next pass restarts on the same row and throws again - a permanent
     // rotation wedge that starves every batch behind it (Gate 4 unhappy-path UP-2). The
@@ -1004,6 +1060,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 c.unusable = true;
                 c.read_failed = true;
                 value_read_failed = true;
+                stats.read_failed = true; // pass could not establish this candidate (#2452)
                 page_read_failures_.fetch_add(1, std::memory_order_relaxed);
                 return nullptr;
             }
@@ -1035,6 +1092,12 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
                 }
             }
             if (!replayable) {
+                // A corrupt candidate this pass - whether the quarantine rename below SUCCEEDS or
+                // FAILS (a pre-planted quarantine: twin conflicts, or a write error), the pass
+                // placed nothing here and did not verify a clean idle backlog, so it must not read
+                // the page stamp fresh (#2452 Gate 7). Set BEFORE the rename so a rename failure -
+                // itself a no-work stall on a stuck corrupt batch - cannot slip past the flag.
+                any_quarantine_this_pass = true;
                 if (kv_->rename_key(kJournalNamespace, c.key, journal_quarantine_key(c.key)) ==
                     KvRename::Renamed) {
                     quarantined_.fetch_add(1, std::memory_order_relaxed);
@@ -1058,6 +1121,7 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
             c.unusable = true;
             c.read_failed = true; // unknown, NOT provably block-free
             value_read_failed = true;
+            stats.read_failed = true; // pass could not establish this candidate (#2452)
             page_read_failures_.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
         }
@@ -1429,6 +1493,22 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
 
     pages_.fetch_add(1, std::memory_order_relaxed);
     records_paged_.fetch_add(stats.records_paged, std::memory_order_relaxed);
+    // #2452 Gate 7 - the ONLY site that sets progress_or_verified_idle true. Reached only when the
+    // pass finished its consideration loop (no early return, no stopping_ truncation) - which is
+    // per-SLICE (capped at kJournalPageMaxBatchesPerPass), not whole-backlog; see the hpp docstring
+    // for why per-slice is correct. Healthy iff it PLACED records, or it verified a clean idle slice:
+    // nothing left blocked on
+    // headroom, nothing quarantined, no candidate value read failed, and the sent-label scan did
+    // NOT fall back (sent_scan_failed - a degraded read means the pass could not fully verify what
+    // was already delivered, so it is not "verified" idle; parity with the pre-Gate-7 gate).
+    // `stop_truncated` guards a mid-loop shutdown; a stopping_ bail before this point never reaches
+    // here and leaves the flag false. This positive signal is what closes the negative
+    // enumeration's structural gap - a future no-progress exit added above returns early and stays
+    // not-fresh by construction.
+    stats.progress_or_verified_idle =
+        stats.records_paged > 0 ||
+        (!stop_truncated && !stats.headroom_blocked && !stats.read_failed &&
+         !stats.sent_scan_failed && !any_quarantine_this_pass);
     return stats;
 }
 
