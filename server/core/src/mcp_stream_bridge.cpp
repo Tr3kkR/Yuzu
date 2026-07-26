@@ -969,8 +969,16 @@ void McpStreamBridge::sweep() {
         TeardownFinal decision = TeardownFinal::kNone;
         ExecutionEventBus::VisitStatus status = ExecutionEventBus::VisitStatus::kAbsentChannel;
         if (bus_ != nullptr) {
+            // NOT noexcept ON PURPOSE: the ONE uncontained throw here is the
+            // record-lock acquisition below (before any mutation). Letting it
+            // propagate lets unsubscribe_and_visit_terminal's try/catch convert it
+            // to kInternalError (fail-closed), which a noexcept lambda would instead
+            // turn into std::terminate before that catch can see it. Everything
+            // after the lock is noexcept stores + an internally-contained payload
+            // copy, so a propagated throw means "record untouched" == "f did not
+            // run" - the kInternalError invariant holds.
             auto f = [&](ExecutionEventBus::TerminalVisit verdict,
-                         const ExecutionEvent* ev) noexcept -> bool {
+                         const ExecutionEvent* ev) -> bool {
                 std::lock_guard<std::mutex> rlk(oldest->mu);
                 const Phase ph = oldest->phase.load(std::memory_order_acquire);
                 if (oldest->torn_down || ph != Phase::kRingOnly) {
@@ -1029,9 +1037,24 @@ void McpStreamBridge::sweep() {
                                                           oldest->sub_id, f);
         }
         if (claimed_by_me) {
-            // f won the claim (FA-1: the captured flag, NOT record-state inference -
-            // a concurrent sweep's winner leaves the record kDone-in-map until its
-            // teardown erases it). teardown_claimed re-validates identity itself.
+            // f won the claim under Channel::mu (FA-1: the captured flag, NOT
+            // record-state inference - a concurrent sweep's winner leaves the record
+            // kDone-in-map until its teardown erases it). Re-acquire the shutdown
+            // gate the pre-visit block released: the claim commits WITHOUT bridge_mu_
+            // (inside f, under Channel::mu), so shutdown() can have started meanwhile.
+            // If it has, DO NOT publish/audit against a torn-down record - shutdown()'s
+            // own walk covers every record (all phases), releasing the charge and
+            // unsubscribing, so the claimed record is still cleaned up.
+            {
+                std::lock_guard<std::mutex> lk(bridge_mu_);
+                if (shutdown_started_) {
+                    return;
+                }
+                auto it = records_.find(oldest->key);
+                if (it == records_.end() || it->second != oldest) {
+                    continue;  // shutdown/another sweep already removed it
+                }
+            }
             teardown_claimed(oldest, decision, "mcp.bridge.forced_expire");
             continue;  // recount
         }

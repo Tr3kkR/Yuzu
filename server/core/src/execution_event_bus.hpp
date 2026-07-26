@@ -162,13 +162,16 @@ public:
     /// the listener, so an unclaimed terminal-bearing channel can never go
     /// listener-less and be GC'd out from under the record.
     ///
-    /// `f` contract (caller-enforced, NOT checkable here): genuinely `noexcept`;
-    /// takes only ITS record mutex; MUST NOT call any ExecutionEventBus method (it
-    /// runs UNDER Channel::mu; a bus call taking `map_mu_` would invert the
-    /// `map_mu_ -> Channel::mu` order publish/GC rely on). It returns `true` iff it
-    /// claimed. CF-3: `f` is invoked strictly AFTER every throwing step below, and
-    /// the post-`f` erase is noexcept, so a `kInternalError` return always means
-    /// "`f` did not run", never "ran then threw".
+    /// `f` contract (caller-enforced, NOT checkable here): takes only ITS record
+    /// mutex; MUST NOT call any ExecutionEventBus method (it runs UNDER Channel::mu;
+    /// a bus call taking `map_mu_` would invert the `map_mu_ -> Channel::mu` order
+    /// publish/GC rely on). It returns `true` iff it claimed. `f` need NOT be
+    /// `noexcept` - the call is inside this method's try/catch, so a throw becomes
+    /// `kInternalError` (fail-closed); a `noexcept` `f` would instead terminate on a
+    /// record-lock failure before that catch is reached. `f` MUST make its only
+    /// uncontained throw-site its initial record-lock acquisition (before any
+    /// mutation) and contain any payload copy internally, so `kInternalError` still
+    /// means "record untouched" == "`f` did not run", never "ran then threw".
     ///
     /// The verdict scan keys on `first_terminal_id` (the FIRST terminal-flagged
     /// event - which in the `refresh_counts` split is a terminal-flagged
@@ -177,9 +180,10 @@ public:
     /// any buffered `execution-completed` before concluding `kTerminalKnownLost`.
     /// `ev` points into the channel buffer and is valid only for the `f` call.
     ///
-    /// Returns `kAbsentChannel` (no channel -> no barrier) or `kInternalError` (a
-    /// lock/alloc threw) WITHOUT running `f`; `kStaleSub` (channel present, sub_id
-    /// already gone) still runs `f` - a stale sub means a prior visit ran and `f`'s
+    /// Returns `kAbsentChannel` (no channel -> no barrier) WITHOUT running `f`, or
+    /// `kInternalError` (a lock/alloc threw - in the wrapped body OR propagated out
+    /// of `f` per the contract above); `kStaleSub` (channel present, sub_id already
+    /// gone) still runs `f` - a stale sub means a prior visit ran and `f`'s
     /// record-state-first checks make the re-run idempotent.
     template <class F>
     VisitStatus unsubscribe_and_visit_terminal(const std::string& execution_id,
