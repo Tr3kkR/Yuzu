@@ -65,10 +65,6 @@ New-Item -ItemType Directory -Force 'C:\ProvisionLogs' | Out-Null
 Start-Transcript -Path "C:\ProvisionLogs\provision-$(Get-Date -Format yyyyMMdd-HHmmss).log" | Out-Null
 
 $script:failedSteps = @()
-# Tag on every drain failure so a per-item catch can tell "this one item went
-# wrong, carry on" from "the box is no longer safe to mutate, stop now".
-# Defined above Step() because Step()'s catch is the handler that acts on it.
-$script:kDrainTag = '[RUNNERS-ACTIVE]'
 function Step([string]$name,[scriptblock]$body){
   # Every Step still runs regardless of an earlier one's failure (unchanged
   # semantics) - only the PROCESS exit code changes. Before this, a failed
@@ -78,22 +74,15 @@ function Step([string]$name,[scriptblock]$body){
   # PR #2167. $script: is required: Step is a function, so a bare
   # $failedSteps assignment in the catch below would be local to that one
   # call and never accumulate across Step() invocations.
+  # NOTE for anyone adding a stop-the-world condition here: do NOT signal it by
+  # throwing something this catch is expected to recognise. That design (a
+  # string-tagged exception) shipped and produced two blockers — one handler
+  # swallowed the tag, another stripped it by re-wrapping. Abort the PROCESS
+  # from where you detect it (see Assert-RunnersDrained); `exit` is not
+  # catchable here, so it cannot be swallowed by this or any other handler.
   Write-Host "`n===== $name =====" -ForegroundColor Cyan
   try   { & $body; Write-Host "[OK]  $name" -ForegroundColor Green }
   catch {
-    # ONE exception class is not a step failure but a stop-the-world: a runner
-    # became active (or the drain check stopped being able to see), so the box
-    # is no longer safe to mutate. Catch-and-continue here would carry on into
-    # the remaining steps — Defender exclusions, vcpkg pinning, and the machine
-    # PATH/env rewrite — under a live CI job. The top-level gate lives outside
-    # Step() for exactly this reason; a mid-script detection has to abort the
-    # PROCESS the same way, not just fail its own step.
-    if($_.Exception.Message.StartsWith($script:kDrainTag)){
-      Write-Host "[ABORT] $name :: $($_.Exception.Message)" -ForegroundColor Red
-      Write-Host "Provisioning stopped: no further steps run." -ForegroundColor Red
-      Stop-Transcript | Out-Null
-      exit 2
-    }
     Write-Host "[FAIL] $name :: $($_.Exception.Message)" -ForegroundColor Red
     $script:failedSteps += $name
   }
@@ -128,54 +117,101 @@ function Find-RealEscript {
   return $null
 }
 function Get-ActiveRunnerProcess {
-  # Runner.Listener.exe polls GitHub for work and spawns one Runner.Worker.exe
-  # per accepted job. Gating on the WORKER alone is a point-in-time snapshot,
-  # not a lock: a listener that is idle at the instant we look can accept a job
-  # a second later, while we are still copying trees and restarting clusters.
-  # Gating on the LISTENER closes that window — no listener, no job can start.
-  # WMI/DCOM/permissions can make this throw for reasons unrelated to runners.
-  # "I cannot see whether the box is busy" must fail CLOSED — re-tag it so it
-  # aborts like a positive detection instead of falling into a caller's
-  # log-and-continue path. A gate that fails open when it cannot observe is not
-  # a gate.
-  try {
-    @(Get-CimInstance Win32_Process `
-        -Filter "Name = 'Runner.Listener.exe' OR Name = 'Runner.Worker.exe'" -EA Stop)
-  } catch {
-    throw ("$script:kDrainTag cannot determine whether runners are active " +
-           "(drain check itself failed: $($_.Exception.Message)) — refusing to proceed")
-  }
+  # OBSERVATION ONLY — no policy. Runner.Listener.exe polls GitHub for work and
+  # spawns one Runner.Worker.exe per accepted job. Looking for the WORKER alone
+  # is a point-in-time snapshot, not a lock: a listener that is idle at the
+  # instant we look can accept a job a second later, while we are still copying
+  # trees and restarting clusters. Including the LISTENER closes that window —
+  # no listener, no job can start.
+  # Throws if WMI/DCOM/permissions make the box unobservable. Callers decide
+  # what that means; Assert-RunnersDrained treats it as fatal.
+  @(Get-CimInstance Win32_Process `
+      -Filter "Name = 'Runner.Listener.exe' OR Name = 'Runner.Worker.exe'" -EA Stop)
 }
 function Assert-RunnersDrained([string]$context){
+  # THE gate. It EXITS the process rather than throwing, deliberately: `exit` is
+  # not catchable by any enclosing try/catch (not Step()'s, not the per-agent
+  # loop's, not the rollback recovery's), so a detection here cannot be
+  # swallowed, re-wrapped, or downgraded by a handler between us and the top of
+  # the script. The previous design threw a string-tagged exception that every
+  # intervening catch had to recognise and re-throw; two of them didn't, and
+  # both were shipped blockers. Do not convert this back to a throw.
   if($AllowActiveRunners){
     Write-Warning "-AllowActiveRunners: skipping the drain check ($context). Nothing is stopped — any live CI job on this box may be interrupted."
     return
   }
-  $active = Get-ActiveRunnerProcess
-  if($active.Count -eq 0){ return }
-  $detail = ($active | Sort-Object Name,ProcessId |
-             ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', '
-  throw ("$kDrainTag $context while GitHub Actions runners are live on this box: $detail — " +
-         "stop all $RunnerCount Start-PinnedRunner tasks/consoles, wait for in-flight " +
-         "jobs to finish, then re-run. -AllowActiveRunners skips this check " +
-         "without stopping anything — those jobs may then be interrupted.")
+  $reason = $null
+  try {
+    $active = Get-ActiveRunnerProcess
+    if($active.Count -gt 0){
+      $detail = ($active | Sort-Object Name,ProcessId |
+                 ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', '
+      $reason = "$context while GitHub Actions runners are live on this box: $detail"
+    }
+  } catch {
+    # Fail CLOSED: "I cannot tell whether this box is busy" is not permission to
+    # mutate it. A gate that proceeds when it cannot observe is not a gate.
+    $reason = "$context — the drain check itself failed ($($_.Exception.Message)), so this box cannot be shown to be idle"
+  }
+  if($null -eq $reason){ return }
+  Write-Host "`n[ABORT] $reason" -ForegroundColor Red
+  Write-Host ("Stop all $RunnerCount Start-PinnedRunner tasks/consoles, wait for in-flight jobs " +
+              "to finish, then re-run. -AllowActiveRunners skips this check without stopping " +
+              "anything — those jobs may then be interrupted.") -ForegroundColor Red
+  Write-Host "Provisioning stopped: no further steps run." -ForegroundColor Red
+  Stop-Transcript -EA SilentlyContinue | Out-Null
+  exit 2
+}
+
+function Test-PgServingNow([string]$bin,[int]$port){
+  # Single-shot liveness probe — deliberately NOT Assert-PgServing's 90s wait
+  # loop. Answers one question: is a postmaster serving this port RIGHT NOW?
+  # Used on the rollback path to tell "the cluster is down, restarting it can
+  # only help" from "the cluster is still up and a restart would drop live
+  # connections".
+  $ready = Join-Path $bin 'pg_isready.exe'
+  if(-not (Test-Path $ready)){ return $false }
+  & $ready -q -h 127.0.0.1 -p $port 2>$null
+  return ($LASTEXITCODE -eq 0)
+}
+function Assert-PgServing([string]$bin,[int]$port,[string]$context){
+  # Script-scoped so EVERY cluster restart can prove it came back — the main
+  # PostgreSQL step's as well as the per-agent ones, which is why this is not
+  # nested inside a single Step.
+  $ready = Join-Path $bin 'pg_isready.exe'
+  $psql  = Join-Path $bin 'psql.exe'
+  if(-not (Test-Path $ready)){ throw "$context missing $ready" }
+  if(-not (Test-Path $psql)){ throw "$context missing $psql" }
+  $deadline=(Get-Date).AddSeconds(90)
+  do {
+    & $ready -q -h 127.0.0.1 -p $port 2>$null
+    if($LASTEXITCODE -eq 0){ break }
+    Start-Sleep 2
+  } while((Get-Date) -lt $deadline)
+  if($LASTEXITCODE -ne 0){ throw "$context cluster on :$port not ready in 90s" }
+  $oldPassword = $env:PGPASSWORD
+  $env:PGPASSWORD='postgres'
+  try {
+    $probe = (& $psql -U postgres -h 127.0.0.1 -p $port -tAc 'SELECT 1' 2>$null | Out-String).Trim()
+    if($LASTEXITCODE -ne 0 -or $probe -ne '1'){
+      throw "$context SELECT 1 failed on :$port"
+    }
+  } finally {
+    if($null -eq $oldPassword){ Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
+    else { $env:PGPASSWORD = $oldPassword }
+  }
 }
 
 # ---- Maintenance gate: must precede EVERY Step ------------------------------
 # Wee Tam's four runner agents share ONE OS identity on ONE box (CLAUDE.md
 # standing invariant), so a service restart or machine-env rewrite here is a
 # cross-JOB mutation, not a local one. Several steps below force-restart a
-# shared PostgreSQL service — the pinned-version step and the per-agent-cluster
-# step do so unconditionally, and have always done so — and toolchain installs
-# swap binaries under a running build. Enforce the drain ONCE, HERE, outside
-# Step(): Step() catches and continues, so a gate expressed as a Step would
-# leave every unguarded mutation below to run anyway.
-try { Assert-RunnersDrained 'refusing to provision' }
-catch {
-  Write-Host "`n$($_.Exception.Message)" -ForegroundColor Red
-  Stop-Transcript | Out-Null
-  exit 2
-}
+# shared PostgreSQL service and toolchain installs swap binaries under a running
+# build, so check before any of them. This is the FIRST of several checks, not
+# the only one: it can be minutes stale by the time a service actually restarts,
+# so every Restart-Service re-asserts. It is a check, not a lock — an operator
+# who starts a runner mid-run is not prevented, only detected at the next check.
+Assert-RunnersDrained 'refusing to provision'
 
 Step 'winget sanity' { "winget " + (winget --version) }
 
@@ -335,10 +371,12 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
   # The wait loop used to fall through silently on timeout, reporting the
   # cluster "ready" while the service was stopped. Match the per-agent step's
-  # posture: a restart that does not come back is a step failure.
+  # posture exactly: Running is necessary but not sufficient, so prove it
+  # actually serves before calling this step OK.
   if((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running'){
     throw "$svc did not return to Running within 90s of the restart"
   }
+  Assert-PgServing $pgbin $PostgresPort "main PostgreSQL cluster"
   "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
 }
 
@@ -485,41 +523,6 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
     }
     [pscustomobject]@{ Exe=$exe; DataDir=$data }
   }
-  function Test-PgServingNow([string]$bin,[int]$port){
-    # Single-shot liveness probe — deliberately NOT Assert-PgServing's 90s wait
-    # loop. Answers one question on the recovery path: is a postmaster serving
-    # this port RIGHT NOW? Used to tell "the cluster is down, restarting it can
-    # only help" from "the cluster is still up and a restart would drop live
-    # connections".
-    $ready = Join-Path $bin 'pg_isready.exe'
-    if(-not (Test-Path $ready)){ return $false }
-    & $ready -q -h 127.0.0.1 -p $port 2>$null
-    return ($LASTEXITCODE -eq 0)
-  }
-  function Assert-PgServing([string]$bin,[int]$port,[string]$context){
-    $ready = Join-Path $bin 'pg_isready.exe'
-    $psql  = Join-Path $bin 'psql.exe'
-    if(-not (Test-Path $ready)){ throw "$context missing $ready" }
-    if(-not (Test-Path $psql)){ throw "$context missing $psql" }
-    $deadline=(Get-Date).AddSeconds(90)
-    do {
-      & $ready -q -h 127.0.0.1 -p $port 2>$null
-      if($LASTEXITCODE -eq 0){ break }
-      Start-Sleep 2
-    } while((Get-Date) -lt $deadline)
-    if($LASTEXITCODE -ne 0){ throw "$context cluster on :$port not ready in 90s" }
-    $oldPassword = $env:PGPASSWORD
-    $env:PGPASSWORD='postgres'
-    try {
-      $probe = (& $psql -U postgres -h 127.0.0.1 -p $port -tAc 'SELECT 1' 2>$null | Out-String).Trim()
-      if($LASTEXITCODE -ne 0 -or $probe -ne '1'){
-        throw "$context SELECT 1 failed on :$port"
-      }
-    } finally {
-      if($null -eq $oldPassword){ Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
-      else { $env:PGPASSWORD = $oldPassword }
-    }
-  }
 
   # The script-wide gate at the top already proved the box was drained. This
   # step is the longest-running mutation in the script (four whole-tree
@@ -634,24 +637,25 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
             if($stillServing){
               Write-Host "agent ${n}: $svc still serving the ORIGINAL binary (the restart failed before stopping it) — ImagePath restored, no restart needed"
             } else {
-              # DRAIN-EXEMPT: recovery on a cluster PROVEN not to be serving
-              # (either the new binary came up unhealthy, or the restart killed
-              # the old one and nothing is answering). Refusing here would strand
-              # it broken, which is worse for any job than the restart. Narrow by
-              # construction — the liveness probe above is what earns the
-              # exemption, not an assumption about how we got here.
-              if(-not $AllowActiveRunners -and (Get-ActiveRunnerProcess).Count -gt 0){
-                Write-Warning "agent ${n}: a runner became active during recovery; restarting $svc anyway — it is not serving, and leaving it that way would be worse"
+              # Observation for the LOG ONLY — deliberately not Assert-
+              # RunnersDrained, and deliberately swallowing its failure. This is
+              # the one place a drain observation must not stop anything: the
+              # restart below happens either way, so the answer only decides how
+              # loudly we narrate it. Not being able to observe therefore changes
+              # nothing here, unlike everywhere else in this script.
+              $activeDuringRecovery = try { (Get-ActiveRunnerProcess).Count } catch { -1 }
+              if(-not $AllowActiveRunners -and $activeDuringRecovery -ne 0){
+                Write-Warning "agent ${n}: runners may be active during recovery (found: $activeDuringRecovery, -1 = could not determine); restarting $svc anyway — it is not serving, and leaving it that way would be worse"
               }
+              # DRAIN-EXEMPT: recovery on a cluster PROVEN not to be serving —
+              # the new binary came up unhealthy, or the restart killed the old
+              # one and nothing is answering. Refusing would strand it broken,
+              # worse for any job than the restart. The liveness probe above is
+              # what earns this, not an assumption about how we got here.
               Restart-Service $svc -Force -EA Stop
               Assert-PgServing $originalBin $port "agent $n rollback service"
             }
           } catch {
-            # The drain probe is called inside THIS try (above). If it failed
-            # closed, that tag must survive: re-wrapping it below would strip the
-            # prefix and demote "I cannot tell if this box is safe" to a routine
-            # per-agent failure at the outer catch.
-            if($_.Exception.Message.StartsWith($kDrainTag)){ throw }
             $rollbackError = $_.Exception.Message
             throw "repoint of $svc failed ($forwardError); rollback to '$curExe' ALSO FAILED verification ($rollbackError)"
           }
@@ -659,11 +663,10 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
         }
       }
     } catch {
-      # A runner coming up mid-loop is not agent $n's fault and is not something
-      # the next agent can survive either — every remaining restart would hit the
-      # same live box. Abort the step instead of mislabelling it as N copy
-      # failures and marching on through the restarts.
-      if($_.Exception.Message.StartsWith($kDrainTag)){ throw }
+      # Per-agent failures are isolated: log, record, carry on to the next agent.
+      # A drain detection never reaches here — Assert-RunnersDrained exits the
+      # process — so there is no stop-the-world case for this handler to
+      # recognise, and nothing here can downgrade one.
       Write-Warning "agent ${n} binary-copy FAILED: $($_.Exception.Message) — continuing to the next agent; re-run this script to retry (idempotent)"
       $failedAgents += $n
     }

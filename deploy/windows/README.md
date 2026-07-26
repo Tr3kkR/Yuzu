@@ -38,12 +38,19 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    happens, so it is **re-asserted immediately before every `Restart-Service`**
    — the main PostgreSQL step's included — and on entry to the long per-agent
    binary step. The single exception is the rollback restart, marked
-   `DRAIN-EXEMPT` in the source: it only runs when a repoint has already failed,
-   so refusing it would strand a non-serving cluster, which is worse than the
-   restart; it warns instead. A detection **mid-script aborts the process**
-   (exit 2), because `Step()` otherwise catches and continues — a failed step
-   would leave the later Defender, vcpkg and machine PATH/env steps running
-   under a live job.
+   `DRAIN-EXEMPT` in the source: it runs only after a liveness probe proves that
+   cluster is *not* serving, where refusing would strand it broken — worse than
+   the restart. It warns instead.
+
+   Wherever it fires, the gate **exits the process directly** (code 2) rather
+   than raising an error for something else to handle. That is deliberate:
+   `Step()` catches and continues by design, so anything catchable can be — and
+   twice was — swallowed or re-wrapped before reaching the top, letting the
+   later Defender, vcpkg and machine PATH/env steps run under a live job. `exit`
+   cannot be intercepted by any handler.
+
+   It is a **check, not a lock**: an operator who starts a runner mid-run is
+   detected at the next check, not prevented.
 
    `-AllowActiveRunners` **skips the check only** — it stops no runner and kills
    no job, so a live job may simply be interrupted. It exists for a box you know

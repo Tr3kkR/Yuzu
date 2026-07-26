@@ -13,11 +13,12 @@
   skips the check; it stops nothing itself). Because the toolchain installs can
   put minutes between that snapshot and the first service restart, the gate is
   re-asserted immediately before every `Restart-Service` — including the
-  pre-existing PostgreSQL one — except the rollback path, which is marked
-  `DRAIN-EXEMPT` because refusing to restore an already-broken cluster is worse
-  than the restart. A detection mid-script aborts the process rather than
-  failing one step, so the later machine PATH/env rewrite cannot run under a
-  live job. The
+  pre-existing PostgreSQL one — except the rollback path, marked `DRAIN-EXEMPT`
+  and taken only after a liveness probe proves that cluster is not serving,
+  where refusing would strand it broken. Wherever it fires the gate exits the
+  process directly rather than raising a catchable error, so no handler between
+  it and the top of the script can swallow or re-wrap it and let the later
+  machine PATH/env rewrite run under a live job. It is a check, not a lock. The
   runner manifest/self-test now pins every private binary path, service
   `ImagePath`, running state, and authenticated health probe. New
   `deploy/windows/Test-ProvisionLogic.ps1` regression-tests the provisioning

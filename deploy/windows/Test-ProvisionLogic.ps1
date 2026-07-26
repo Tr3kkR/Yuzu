@@ -55,13 +55,11 @@ if($errs.Count){
 
 # Pull the real definitions into this session. Anything renamed or deleted in
 # the script fails here rather than silently testing a stale copy.
-$tagAssign = $ast.FindAll({ param($n)
-  $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-  $n.Left.Extent.Text -eq '$script:kDrainTag' }, $true)
-if(-not $tagAssign){ throw '$script:kDrainTag assignment not found in the script under test' }
-Invoke-Expression $tagAssign[0].Extent.Text
-
-foreach($name in @('Get-ActiveRunnerProcess','Assert-RunnersDrained','Get-PgServiceImageParts')){
+# NOTE: Assert-RunnersDrained is deliberately NOT imported. It exits the process
+# on detection (that is the point — see suite 4), so calling it in-process would
+# kill this harness. Its behaviour is tested end-to-end in suite 5, against a
+# real child pwsh, which is a stronger test than an in-process stub anyway.
+foreach($name in @('Get-ActiveRunnerProcess','Get-PgServiceImageParts')){
   $fn = $ast.FindAll({ param($n)
     $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
   if(-not $fn){ throw "function $name not found in the script under test" }
@@ -84,61 +82,54 @@ Write-Host "Testing: $ScriptPath" -ForegroundColor DarkGray
 # The round-2 blocker: gating on Runner.Worker.exe alone is a snapshot, because
 # an idle Runner.Listener.exe accepts a job seconds later while the binary step
 # is still copying trees. Gating on the LISTENER is what closes the window.
-Write-Host "`nMaintenance gate (Assert-RunnersDrained)" -ForegroundColor Cyan
+Write-Host "`nRunner observation (Get-ActiveRunnerProcess)" -ForegroundColor Cyan
 $script:mockProcs  = @()
 $script:lastFilter = ''
+$script:cimShouldThrow = $false
 function Get-CimInstance { param($ClassName,$Filter,$EA)
   $script:lastFilter = $Filter
+  if($script:cimShouldThrow){ throw 'simulated WMI/DCOM failure' }
   $script:mockProcs | Where-Object { $Filter -like "*'$($_.Name)'*" }
 }
 $RunnerCount = 4
 $AllowActiveRunners = $false
 
-Check 'drained box passes' { $script:mockProcs = @(); Assert-RunnersDrained 'x'; $true }
-
-Check 'active WORKER blocks' {
-  $script:mockProcs = @([pscustomobject]@{ Name='Runner.Worker.exe'; ProcessId=4242 })
-  try { Assert-RunnersDrained 'refusing'; $false } catch { $_.Exception.Message -match 'Runner\.Worker\.exe\(4242\)' }
-}
-
-Check 'idle LISTENER blocks (the round-2 TOCTOU fix)' {
-  $script:mockProcs = @([pscustomobject]@{ Name='Runner.Listener.exe'; ProcessId=1111 })
-  try { Assert-RunnersDrained 'refusing'; $false } catch { $_.Exception.Message -match 'Runner\.Listener\.exe\(1111\)' }
-}
-
-Check 'filter asks for BOTH process names' {
-  $script:mockProcs = @(); Assert-RunnersDrained 'x'
+Check 'queries for BOTH process names (worker alone would be a snapshot)' {
+  $script:mockProcs = @(); Get-ActiveRunnerProcess | Out-Null
   ($script:lastFilter -match 'Runner\.Listener\.exe') -and ($script:lastFilter -match 'Runner\.Worker\.exe')
 }
 
-Check 'every live PID reported, sorted' {
+Check 'drained box observes nothing' {
+  $script:mockProcs = @(); (Get-ActiveRunnerProcess).Count -eq 0
+}
+
+Check 'an active WORKER is observed' {
+  $script:mockProcs = @([pscustomobject]@{ Name='Runner.Worker.exe'; ProcessId=4242 })
+  @(Get-ActiveRunnerProcess)[0].ProcessId -eq 4242
+}
+
+Check 'an idle LISTENER is observed (the round-2 TOCTOU fix)' {
+  $script:mockProcs = @([pscustomobject]@{ Name='Runner.Listener.exe'; ProcessId=1111 })
+  @(Get-ActiveRunnerProcess)[0].ProcessId -eq 1111
+}
+
+Check 'every live process is observed, not just the first' {
   $script:mockProcs = @(
     [pscustomobject]@{ Name='Runner.Worker.exe';   ProcessId=9 },
     [pscustomobject]@{ Name='Runner.Listener.exe'; ProcessId=7 },
     [pscustomobject]@{ Name='Runner.Listener.exe'; ProcessId=3 })
-  try { Assert-RunnersDrained 'x'; $false }
-  catch { $_.Exception.Message -match 'Runner\.Listener\.exe\(3\), Runner\.Listener\.exe\(7\), Runner\.Worker\.exe\(9\)' }
+  (Get-ActiveRunnerProcess).Count -eq 3
 }
 
-# The per-agent loop catches and continues on an ordinary failure, but a runner
-# coming up mid-loop is not that agent's fault and the next agent cannot survive
-# it either — the tag is how the catch tells the two apart.
-Check 'drain failures carry the abort tag' {
-  $script:mockProcs = @([pscustomobject]@{ Name='Runner.Listener.exe'; ProcessId=5 })
-  try { Assert-RunnersDrained 'x'; $false }
-  catch { $_.Exception.Message.StartsWith($kDrainTag) -and $kDrainTag -eq '[RUNNERS-ACTIVE]' }
+# The probe reports observation failure rather than hiding it; the GATE is what
+# turns that into a refusal (suite 5). Keeping the policy out of the probe is
+# what lets the rollback path use the same function without being aborted by it.
+Check 'an unobservable box surfaces as a throw, not an empty result' {
+  $script:cimShouldThrow = $true
+  try { Get-ActiveRunnerProcess | Out-Null; $false }
+  catch { $_.Exception.Message -match 'simulated WMI/DCOM failure' }
+  finally { $script:cimShouldThrow = $false }
 }
-
-Check 'an ordinary per-agent failure does NOT carry the tag' {
-  -not ('robocopy C:\pgsql -> D:\ci\pgbin\agent-1 failed (exit 16)').StartsWith($kDrainTag)
-}
-
-Check '-AllowActiveRunners overrides' {
-  $script:mockProcs = @([pscustomobject]@{ Name='Runner.Worker.exe'; ProcessId=1 })
-  $AllowActiveRunners = $true
-  try { Assert-RunnersDrained 'x'; $true } finally { $AllowActiveRunners = $false }
-}
-$AllowActiveRunners = $false
 
 # --- 2. robocopy /XD exclusion canonicalisation ------------------------------
 # /XD matches the directory by PATH STRING. $srcData comes from parsing a
@@ -296,31 +287,25 @@ Check 'EVERY Restart-Service is immediately preceded by a gate or a DRAIN-EXEMPT
   if($ungated.Count){ Write-Host "        ungated Restart-Service at line(s): $($ungated -join ', ')" -ForegroundColor DarkYellow }
   $ungated.Count -eq 0
 }
-# The other half of the round-3 blocker: detection is worthless if the handler
-# swallows it. Step() catches and continues by design, so it must special-case
-# the drain tag and abort the PROCESS.
-Check 'Step() aborts the process on a drain-tagged failure instead of continuing' {
-  $stepFn = $ast.FindAll({ param($n)
-    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Step' }, $true)
-  if(-not $stepFn){ return $false }
-  $body = $stepFn[0].Extent.Text
-  ($body -match 'kDrainTag') -and ($body -match '\bexit\s+\d')
+# THE load-bearing invariant, and the reason rounds 3 and 4 cannot recur. The
+# gate signals "stop" with `exit`, which no try/catch can intercept, instead of
+# a string-tagged exception that every intervening handler had to recognise and
+# re-throw. Two handlers didn't, and both were shipped blockers: Step() swallowed
+# it (round 3), and the rollback recovery catch re-wrapped it and stripped the
+# tag (round 4). If this assertion ever fails, that entire class is back.
+Check 'the gate stops the process with exit, never with a throw a handler could eat' {
+  $gate = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Assert-RunnersDrained' }, $true)
+  if(-not $gate){ return $false }
+  $body = $gate[0].Extent.Text
+  ($body -match '\bexit\s+\d') -and ($body -notmatch '(?m)^\s*throw\b')
 }
-# Round-4 blocker 2: the drain probe is also called inside the rollback recovery
-# try. If that throws, the recovery catch must NOT re-wrap it — doing so strips
-# the tag and demotes "cannot tell if the box is safe" to a routine per-agent
-# failure at the outer catch, and the script continues.
-Check 'EVERY catch enclosing a drain-probe call re-throws the tag before re-wrapping' {
-  # Two known re-throw sites: the per-agent outer catch and the rollback
-  # recovery catch. Both must be present, and the recovery one must come before
-  # the string that re-wraps into "ALSO FAILED verification".
-  $rethrows = @([regex]::Matches($text, '\$_\.Exception\.Message\.StartsWith\(\$kDrainTag\)\)\s*\{\s*throw\s*\}'))
-  if($rethrows.Count -lt 2){ return $false }
-  $wrapIdx = $text.IndexOf('ALSO FAILED verification')
-  if($wrapIdx -lt 0){ return $false }
-  # At least one re-throw must guard the re-wrap (appear before it in the same
-  # catch block — approximated as within the 800 chars preceding it).
-  @($rethrows | Where-Object { $_.Index -lt $wrapIdx -and $_.Index -gt ($wrapIdx - 800) }).Count -gt 0
+# Corollary: no handler should be pattern-matching on a drain signal any more,
+# because there is no signal to match — the process is already gone. A revival
+# of the tag protocol anywhere is a regression to the round-3/4 design.
+Check 'no handler pattern-matches a drain signal (the tag protocol stays dead)' {
+  ($text -notmatch 'kDrainTag') -and ($text -notmatch 'RUNNERS-ACTIVE')
 }
 # Round-4 blocker 1: the DRAIN-EXEMPT restart must be earned by a liveness probe,
 # not by an assumption that a failed forward path implies a dead cluster.
@@ -331,17 +316,12 @@ Check 'the DRAIN-EXEMPT restart is conditional on a proven-not-serving cluster' 
   ($text -match '\$stillServing\s*=\s*\(-not \$restartCompleted\)\s*-and\s*\(Test-PgServingNow') -and
   ($text -match '\$restartCompleted\s*=\s*\$true')
 }
-Check 'the drain check fails CLOSED when it cannot observe the box' {
-  $probe = $ast.FindAll({ param($n)
-    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -eq 'Get-ActiveRunnerProcess' }, $true)
-  if(-not $probe){ return $false }
-  # A Get-CimInstance failure must be re-tagged as an abort, not allowed to fall
-  # through to a caller's log-and-continue path.
-  ($probe[0].Extent.Text -match 'catch') -and ($probe[0].Extent.Text -match 'kDrainTag')
-}
-Check 'the per-agent catch re-throws drain failures instead of continuing the loop' {
-  $text -match '\$_\.Exception\.Message\.StartsWith\(\$kDrainTag\)\s*\)\s*\{\s*throw\s*\}'
+# Every cluster restart proves it came back — the main PostgreSQL step's as well
+# as the per-agent ones. That is why Assert-PgServing is script-scoped rather
+# than nested in one Step (round-4 should-fix).
+Check 'the main PostgreSQL restart verifies the cluster actually serves' {
+  ($text -match '(?m)^function Assert-PgServing') -and
+  ($text -match 'Assert-PgServing \$pgbin \$PostgresPort')
 }
 Check 'the -D data dir is canonicalised before robocopy /XD' {
   $text -match '\$srcData\s*=\s*\[IO\.Path\]::GetFullPath\(\$srcData\)\.TrimEnd'
@@ -372,6 +352,7 @@ if(-not $SkipEndToEnd){
 
     $mock = @'
 function Get-CimInstance { param($ClassName,$Filter,$EA)
+  if($env:YUZU_GATETEST_THROW){ throw 'simulated WMI/DCOM failure' }
   if($env:YUZU_GATETEST_PROCS){
     $env:YUZU_GATETEST_PROCS.Split(';') | ForEach-Object {
       $p=$_.Split(','); [pscustomobject]@{ Name=$p[0]; ProcessId=[int]$p[1] }
@@ -387,12 +368,16 @@ function Get-CimInstance { param($ClassName,$Filter,$EA)
     ($prologue + "`nWrite-Host 'REACHED-STEP-1'`nStop-Transcript | Out-Null`nexit 0`n") |
       Set-Content -LiteralPath $harness -Encoding UTF8
 
-    function Case([string]$what,[string]$procs,[string[]]$extraArgs,[int]$wantExit,[bool]$wantReached){
+    function Case([string]$what,[string]$procs,[string[]]$extraArgs,[int]$wantExit,[bool]$wantReached,[switch]$CimThrows){
       $env:YUZU_GATETEST_PROCS = $procs
+      if($CimThrows){ $env:YUZU_GATETEST_THROW = '1' }
       try {
         $out  = & pwsh -NoProfile -File $harness @extraArgs 2>&1 | Out-String
         $code = $LASTEXITCODE
-      } finally { Remove-Item Env:\YUZU_GATETEST_PROCS -EA SilentlyContinue }
+      } finally {
+        Remove-Item Env:\YUZU_GATETEST_PROCS -EA SilentlyContinue
+        Remove-Item Env:\YUZU_GATETEST_THROW -EA SilentlyContinue
+      }
       $reached = [bool]($out -match 'REACHED-STEP-1')
       if(($code -eq $wantExit) -and ($reached -eq $wantReached)){
         Write-Host "  PASS  $what (exit=$code, reachedStep1=$reached)" -ForegroundColor Green; $script:pass++
@@ -403,34 +388,46 @@ function Get-CimInstance { param($ClassName,$Filter,$EA)
       }
     }
 
-    # Round-3 blocker, end to end: a drain detected MID-SCRIPT (inside a Step)
-    # must abort the process. Step() catches and continues by design, so a
-    # tagged throw that it merely logs would let the remaining steps — Defender
-    # exclusions, vcpkg pinning, the machine PATH/env rewrite — run under a live
-    # CI job. Suite 4 asserts the shape; this proves the behaviour.
+    # THE round-3 regression test, now against the real gate rather than a
+    # simulated tagged throw: call Assert-RunnersDrained from INSIDE a Step,
+    # where Step()'s catch would previously have swallowed it, and prove the
+    # process dies before any later step. This is the case that shipped broken.
     $midHarness = Join-Path $work 'gate-harness-mid.ps1'
     ($prologue + @"
-`nStep 'simulated mid-script drain detection' { throw "`$script:kDrainTag simulated runner became active" }
+`nStep 'mid-script drain detection' { Assert-RunnersDrained 'mid-script check' }
 Write-Host 'REACHED-AFTER-STEP'
 Stop-Transcript | Out-Null
 exit 0
 "@) | Set-Content -LiteralPath $midHarness -Encoding UTF8
-    $env:YUZU_GATETEST_PROCS = ''
-    $midOut  = & pwsh -NoProfile -File $midHarness 2>&1 | Out-String
-    $midCode = $LASTEXITCODE
-    if(($midCode -eq 2) -and ($midOut -notmatch 'REACHED-AFTER-STEP')){
-      Write-Host "  PASS  mid-script drain inside a Step aborts the process (exit=$midCode, later steps did NOT run)" -ForegroundColor Green
-      $script:pass++
-    } else {
-      Write-Host "  FAIL  mid-script drain inside a Step aborts the process (exit=$midCode want=2, reachedAfterStep=$($midOut -match 'REACHED-AFTER-STEP') want=False)" -ForegroundColor Red
-      $script:fail++
+    function MidCase([string]$what,[string]$procs,[bool]$cimThrows,[int]$wantExit,[bool]$wantReached){
+      $env:YUZU_GATETEST_PROCS = $procs
+      if($cimThrows){ $env:YUZU_GATETEST_THROW = '1' }
+      try {
+        $out  = & pwsh -NoProfile -File $midHarness 2>&1 | Out-String
+        $code = $LASTEXITCODE
+      } finally {
+        Remove-Item Env:\YUZU_GATETEST_PROCS -EA SilentlyContinue
+        Remove-Item Env:\YUZU_GATETEST_THROW -EA SilentlyContinue
+      }
+      $reached = [bool]($out -match 'REACHED-AFTER-STEP')
+      if(($code -eq $wantExit) -and ($reached -eq $wantReached)){
+        Write-Host "  PASS  $what (exit=$code, laterStepsRan=$reached)" -ForegroundColor Green; $script:pass++
+      } else {
+        Write-Host "  FAIL  $what (exit=$code want=$wantExit, laterStepsRan=$reached want=$wantReached)" -ForegroundColor Red
+        Write-Host (($out -split "`n" | Select-Object -First 12) -join "`n")
+        $script:fail++
+      }
     }
+    MidCase 'gate INSIDE a Step kills the process; Step() cannot swallow it' 'Runner.Worker.exe,77' $false 2 $false
+    MidCase 'gate inside a Step, box drained -> later steps run normally'    ''                     $false 0 $true
+    MidCase 'gate inside a Step, box UNOBSERVABLE -> fails closed, exit 2'   ''                     $true  2 $false
 
     Case 'drained box proceeds to step 1'             ''                                         @()                      0 $true
     Case 'live WORKER   -> exit 2, step 1 never runs' 'Runner.Worker.exe,4242'                   @()                      2 $false
     Case 'idle LISTENER -> exit 2, step 1 never runs' 'Runner.Listener.exe,1111'                 @()                      2 $false
     Case 'both live     -> exit 2, step 1 never runs' 'Runner.Listener.exe,1;Runner.Worker.exe,2' @()                     2 $false
     Case '-AllowActiveRunners proceeds anyway'        'Runner.Worker.exe,4242'                   @('-AllowActiveRunners') 0 $true
+    Case 'unobservable box -> fails closed at the top gate' '' @() 2 $false -CimThrows
   } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -EA SilentlyContinue
   }
