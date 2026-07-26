@@ -192,6 +192,21 @@ groups:
             capped this way.
 
 
+      - alert: YuzuMcpInputBoundsRejecting
+        expr: |
+          sum by (tool, reason) (increase(yuzu_mcp_tool_args_too_large_total[15m])) > 20
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP tool arguments are being rejected for exceeding input bounds"
+          description: >-
+            yuzu_mcp_tool_args_too_large_total is climbing on
+            {{ $labels.tool }} (reason={{ $labels.reason }}). Either a client is
+            sending arguments past the tool's published inputSchema bounds -
+            check whether it read tools/list - or someone is probing the limits.
+            Denials are audited as mcp.<tool>|denied with detail
+            "input bound exceeded: <reason>"; correlate there for the principal.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon
