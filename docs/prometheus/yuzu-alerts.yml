@@ -515,7 +515,9 @@ groups:
 
       # The docs tell operators to alert on this gauge; ship the rule so that
       # instruction is not a dead letter. A failed index build turns the pass's
-      # bounded ~315ms hourly lock hold into an unbounded one that grows with the
+      # bounded sub-second hourly lock hold (measured ~285-315 ms for a full capped
+      # pass, varying with backlog composition and hardware) into an unbounded one
+      # that grows with the
       # table -- and every audit write waits on that lock. Also reads 0 for a
       # store closed by a failed migration, which is the same "retention is not
       # working" conclusion.
@@ -549,6 +551,7 @@ groups:
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
+          and on(instance) yuzu_server_uptime_seconds > 10800
         for: 15m
         labels:
           severity: warning
@@ -557,8 +560,13 @@ groups:
           description: >-
             No audit retention pass has been attempted in 3 hours, so audit.db is not
             being drained and rows are being retained past the configured window. Note the
-            other retention alerts CANNOT fire in this state - they all key on a counter
-            rising, and nothing is running to raise one. Check the server log for
+            other five retention COUNTERS cannot move in this state - they all key on a
+            counter rising, and nothing is running to raise one. (The
+            yuzu_server_audit_retention_index_ok gauge is the exception: it is evaluated at
+            startup and its alert fires independently of whether the reaper runs.) The
+            uptime guard on this rule exists because run_cleanup sleeps BEFORE its first
+            pass, so a freshly started server legitimately has no pass for one interval.
+            Check the server log for
             "AuditStore: retention pass threw", confirm the store opened at boot
             (a failed migration closes it and start_cleanup() then early-returns), and
             check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.

@@ -445,31 +445,34 @@ struct RawConn {
     // pointer member would leak on constructor unwind -- the same bug class this
     // helper exists to fix, one level up.
     SqliteDb owner;
-    sqlite3* db{nullptr};
     explicit RawConn(const std::filesystem::path& path) {
         const int rc = sqlite3_open(path.string().c_str(), owner.addr());
-        db = owner.get();
         REQUIRE(rc == SQLITE_OK);
-        sqlite3_exec(db, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+        sqlite3_exec(owner.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     }
-    // No destructor: `owner` closes (via close_v2, which is what makes an
-    // outstanding statement from a throwing REQUIRE safe).
-    ~RawConn() = default;
+    // A METHOD, not a cached member. A stored `sqlite3*` alias would be the one
+    // live instance of the `addr()` footgun in the tree: any later `owner.addr()`
+    // finalizes/closes what the alias points at, and the recycled handle can land
+    // at the SAME address, so a stale alias silently refers to a different object
+    // rather than crashing.
+    [[nodiscard]] sqlite3* db() const { return owner.get(); }
+    // No user-declared destructor: `owner` closes, via close_v2, which is what
+    // makes an outstanding statement from a throwing REQUIRE safe.
     RawConn(const RawConn&) = delete;
     RawConn& operator=(const RawConn&) = delete;
 };
 
 void seed_rows_with_ttl(const std::filesystem::path& path, std::int64_t ttl, int count) {
     RawConn c{path};
-    REQUIRE(sqlite3_exec(c.db, "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(c.db(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
     // Guard declared BEFORE the statement so the statement finalizes first --
     // SQLite wants live statements gone before ROLLBACK. Without both owners a
     // throwing REQUIRE below leaves an open transaction AND a live statement, and
     // close_v2 then defers the connection close forever (zombie), so the second
     // writable connection against the file under test never goes away.
-    SqliteTxn txn{c.db};
+    SqliteTxn txn{c.db()};
     SqliteStmt stmt;
-    REQUIRE(sqlite3_prepare_v2(c.db,
+    REQUIRE(sqlite3_prepare_v2(c.db(),
                                "INSERT INTO audit_events (timestamp, principal, principal_role, "
                                "action, result, ttl_expires_at) VALUES (?,?,?,?,?,?)",
                                -1, stmt.addr(), nullptr) == SQLITE_OK);
@@ -491,7 +494,7 @@ void seed_rows_with_ttl(const std::filesystem::path& path, std::int64_t ttl, int
 // or to break the table for the fail-closed test).
 void exec_raw(const std::filesystem::path& path, const char* sql) {
     RawConn c{path};
-    REQUIRE(sqlite3_exec(c.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(c.db(), sql, nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 // Retention window used by every guard test below: 1 day. `cleanup_interval_min
@@ -1030,7 +1033,7 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     auto stored_reading = [&]() -> std::int64_t {
         RawConn c{tmp.path};
         SqliteStmt st;
-        REQUIRE(sqlite3_prepare_v2(c.db,
+        REQUIRE(sqlite3_prepare_v2(c.db(),
                                    "SELECT value FROM audit_retention_meta WHERE key='last_pass_now'",
                                    -1, st.addr(), nullptr) == SQLITE_OK);
         std::int64_t v = -1;

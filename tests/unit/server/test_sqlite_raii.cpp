@@ -130,6 +130,40 @@ TEST_CASE("SqliteDb: reopening through a live owner does not leak the old connec
     CHECK_FALSE(wal_sidecar_present(second.path));
 }
 
+TEST_CASE("SqliteStmt: re-preparing through one owner finalizes the first statement",
+          "[sqlite_raii][stmt]") {
+    // The contract `SqliteStmt::addr()` shares with the other two owners, and the
+    // only behaviour the last commit changed. It needs its own test for a reason
+    // that is easy to get wrong: LSan does NOT catch this leak. SQLite keeps
+    // unfinalized statements reachable from the connection, so a leaked statement
+    // is not "lost" memory -- it is a live object pinning the connection, which
+    // with `close_v2` means the connection zombies until process exit.
+    //
+    // `sqlite3_next_stmt` walks the connection's live statement list, so it is a
+    // direct, deterministic observable for exactly this. Removing the `reset()`
+    // from `addr()` leaves the first statement on that list and reddens the final
+    // assertion.
+    yuzu::test::TempDbFile tmp{std::string_view{"sqliteraii-stmt-"}};
+    SqliteDb db;
+    open_wal(db, tmp.path);
+
+    SqliteStmt stmt;
+    REQUIRE(sqlite3_prepare_v2(db.get(), "SELECT x FROM t", -1, stmt.addr(), nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_next_stmt(db.get(), nullptr) != nullptr); // one live statement
+
+    // Re-prepare through the SAME owner.
+    REQUIRE(sqlite3_prepare_v2(db.get(), "SELECT count(*) FROM t", -1, stmt.addr(), nullptr) ==
+            SQLITE_OK);
+
+    // Exactly ONE live statement, not two: the first was finalized by addr().
+    sqlite3_stmt* first = sqlite3_next_stmt(db.get(), nullptr);
+    REQUIRE(first != nullptr);
+    CHECK(sqlite3_next_stmt(db.get(), first) == nullptr);
+
+    stmt.reset();
+    CHECK(sqlite3_next_stmt(db.get(), nullptr) == nullptr); // owner released it
+}
+
 TEST_CASE("SqliteDb: move transfers ownership exactly once", "[sqlite_raii][db]") {
     yuzu::test::TempDbFile tmp{std::string_view{"sqliteraii-move-"}};
     {

@@ -1021,8 +1021,11 @@ public:
                           "reading was ahead of the current clock",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
-                          "Audit retention passes that failed on a SQLite error or ran against a "
-                          "closed store",
+                          "Audit retention passes that did not fully do their job: an unreadable "
+                          "probe, a failed delete, a refused implausible clock, a closed store, or "
+                          "an exception caught at the thread boundary. Note one site fires AFTER a "
+                          "successful delete (the post-delete backlog probe), so this means "
+                          "'retention is not fully healthy', not 'nothing was deleted'",
                           "counter");
         // The cap that makes an allowed wipe pace out introduces its own failure
         // mode: if it binds on EVERY pass for a sustained period, expiry is
@@ -1047,7 +1050,8 @@ public:
         // two are what an operator alerts on the ABSENCE of.
         metrics_.describe("yuzu_server_audit_retention_passes_total",
                           "Audit retention passes attempted, including declined and failed ones. "
-                          "Flat means the cleanup thread is not running",
+                          "Flat means the cleanup thread is not running - the one condition the "
+                          "other retention counters cannot report",
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
                           "Wall-clock reading of the most recent audit retention pass, 0 if none "

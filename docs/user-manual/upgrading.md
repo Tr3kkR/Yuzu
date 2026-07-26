@@ -827,7 +827,8 @@ raise it before upgrading such a deployment. The
 elapsed time is logged when it exceeds a second, and subsequent boots are a
 no-op. If the build fails, retention still runs, but each pass then scans the
 table AND sorts the whole expired backlog for its `ORDER BY ... LIMIT` (measured
-2.0 s vs 285 ms at a 4.5M backlog) - still far better than the unguarded code it
+2.0 s versus ~285-315 ms for the same capped pass WITH the index; the range
+reflects different benchmark runs, not two different operations) - still far better than the unguarded code it
 replaced, but the failure is logged as an error and
 `yuzu_server_audit_retention_index_ok` reads 0.
 

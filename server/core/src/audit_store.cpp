@@ -7,11 +7,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <random>
 #include <shared_mutex>
 #include <expected>
 #include <limits>
 #include <span>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -203,8 +205,8 @@ bool AuditStore::log(const AuditEvent& event) {
             principal_class)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_.get(), sql, -1, stmt.addr(), nullptr) != SQLITE_OK) {
         emit_failed_.fetch_add(1, std::memory_order_relaxed);
         spdlog::error("AuditStore: sqlite3_prepare_v2 failed: {}", sqlite3_errmsg(db_.get()));
         return false;
@@ -216,22 +218,21 @@ bool AuditStore::log(const AuditEvent& event) {
     auto ts = event.timestamp > 0 ? event.timestamp : now;
     auto ttl = retention_days_ > 0 ? now + retention_days_ * 86400LL : 0;
 
-    sqlite3_bind_int64(stmt, 1, ts);
-    sqlite3_bind_text(stmt, 2, event.principal.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, event.principal_role.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, event.action.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, event.target_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, event.target_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, event.detail.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 8, event.source_ip.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 9, event.user_agent.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 10, event.session_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 11, event.result.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 12, ttl);
-    sqlite3_bind_text(stmt, 13, event.principal_class.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 1, ts);
+    sqlite3_bind_text(stmt.get(), 2, event.principal.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, event.principal_role.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, event.action.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, event.target_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 6, event.target_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 7, event.detail.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 8, event.source_ip.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 9, event.user_agent.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 10, event.session_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 11, event.result.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 12, ttl);
+    sqlite3_bind_text(stmt.get(), 13, event.principal_class.c_str(), -1, SQLITE_TRANSIENT);
 
-    int step_rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    int step_rc = sqlite3_step(stmt.get());
 
     // SOC 2 CC7.2: a privileged-mutation handler that emits an audit event
     // and silently fails to persist it produces a forensically-empty row.
@@ -349,8 +350,8 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         offset_idx = bind_idx++;
     }
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_.get(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_.get(), sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK) {
         // UP-5: a prepare failure (corruption, locked-past-timeout, schema drift)
         // otherwise returns an empty vector indistinguishable from "no rows" — a
         // false "no audit activity" for an evidence query. Make it observable; a
@@ -362,10 +363,10 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
     }
 
     for (const auto& [idx, val] : text_binds) {
-        sqlite3_bind_text(stmt, idx, val.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), idx, val.c_str(), -1, SQLITE_TRANSIENT);
     }
     for (const auto& [idx, val] : int_binds) {
-        sqlite3_bind_int64(stmt, idx, val);
+        sqlite3_bind_int64(stmt.get(), idx, val);
     }
     // Under random_sample, over-fetch a bounded candidate pool (capped, indexed)
     // and sample from it in C++ — bounding both CPU and lock-hold. When the window
@@ -374,17 +375,17 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
     // unbounded window would reintroduce the M-1 full-scan).
     const int64_t fetch_limit =
         q.random_sample ? std::max(static_cast<int64_t>(q.limit), kRandomSampleScanCap) : q.limit;
-    sqlite3_bind_int64(stmt, limit_idx, fetch_limit);
+    sqlite3_bind_int64(stmt.get(), limit_idx, fetch_limit);
     if (offset_idx > 0) {
-        sqlite3_bind_int64(stmt, offset_idx, q.offset);
+        sqlite3_bind_int64(stmt.get(), offset_idx, q.offset);
     }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         AuditEvent e;
-        e.id = sqlite3_column_int64(stmt, 0);
-        e.timestamp = sqlite3_column_int64(stmt, 1);
+        e.id = sqlite3_column_int64(stmt.get(), 0);
+        e.timestamp = sqlite3_column_int64(stmt.get(), 1);
         auto col_text = [&](int c) -> std::string {
-            auto t = sqlite3_column_text(stmt, c);
+            auto t = sqlite3_column_text(stmt.get(), c);
             return t ? reinterpret_cast<const char*>(t) : std::string{};
         };
         e.principal = col_text(2);
@@ -400,7 +401,6 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         e.principal_class = col_text(12);
         results.push_back(std::move(e));
     }
-    sqlite3_finalize(stmt);
 
     // random_sample: shuffle the bounded candidate pool and truncate to limit, so
     // the returned rows are a random draw rather than the newest-N (Hermes M-1 —
@@ -424,14 +424,13 @@ std::size_t AuditStore::total_count() const {
     std::shared_lock lock(mtx_);
     if (!db_)
         return 0;
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_.get(), "SELECT COUNT(*) FROM audit_events", -1, &stmt, nullptr) !=
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_.get(), "SELECT COUNT(*) FROM audit_events", -1, stmt.addr(), nullptr) !=
         SQLITE_OK)
         return 0;
     std::size_t count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        count = static_cast<std::size_t>(sqlite3_column_int64(stmt, 0));
-    sqlite3_finalize(stmt);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW)
+        count = static_cast<std::size_t>(sqlite3_column_int64(stmt.get(), 0));
     return count;
 }
 
@@ -477,7 +476,6 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     // in that state. Stamped BEFORE any return so no branch can make the
     // liveness signal lie.
     retention_passes_.fetch_add(1, std::memory_order_relaxed);
-    last_pass_unixtime_.store(now, std::memory_order_relaxed);
 
     // Sanitise the CALLER's clock, not only the stored reading. In production
     // `run_cleanup` passes `system_clock` seconds, but this method is public and
@@ -499,6 +497,14 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                      now);
         return 0;
     }
+
+    // Stamped only for a reading the guard is willing to reason about. Stamping
+    // the refused value would poison the gauge permanently on a machine whose
+    // clock jumped far forward -- and the "last pass is stale" diagnostic the
+    // absence alert points operators at would then never fire again. The
+    // ATTEMPT is already counted above; this is the reading, and a reading we
+    // just declared unusable is not one.
+    last_pass_unixtime_.store(now, std::memory_order_relaxed);
 
     // What this pass wants logged, filled in under the lock and emitted after it
     // is released: spdlog formatting is neither cheap nor bounded, and every
@@ -833,7 +839,7 @@ AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe) {
 }
 
 void AuditStore::start_cleanup() {
-    if (!db_.get() || cleanup_interval_min_ <= 0)
+    if (!db_ || cleanup_interval_min_ <= 0)
         return;
 #ifdef __cpp_lib_jthread
     cleanup_thread_ = std::jthread([this](std::stop_token stop) { run_cleanup(stop); });

@@ -200,12 +200,15 @@ public:
         return clock_anomaly_skips_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that FAILED, for any of six reasons:
-    /// an unreadable pre-delete probe; a failed delete prepare; a failed delete
-    /// step; an unreadable POST-delete backlog probe; a pass refused because the
-    /// caller's clock was implausible; a pass against a closed store; or an
-    /// exception escaping the pass (caught at the thread boundary). The common
-    /// thread is "this pass did not do its job", not any particular SQLite call.
+    /// Cumulative count of retention passes that did NOT do their job. Seven
+    /// sites: an unreadable pre-delete probe; a failed delete prepare; a failed
+    /// delete step; an unreadable POST-delete backlog probe; a pass refused
+    /// because the caller's clock was implausible; a pass against a closed
+    /// store; and an exception escaping the pass, caught at the thread
+    /// boundary. NOT all of them mean the delete failed -- the post-delete
+    /// backlog probe fires AFTER a successful delete, so the pass drained rows
+    /// and is merely degraded. Read it as "retention is not fully healthy",
+    /// never as "nothing was deleted".
     /// Scraped SEPARATELY from
     /// `clock_anomaly_skips_count()` on purpose: both leave rows undeleted, but
     /// one means "the guard is protecting the table" and the other means "the
@@ -241,14 +244,15 @@ public:
     /// Cumulative retention passes ATTEMPTED, and the wall-clock reading of the
     /// most recent one (0 if none has run in this process).
     ///
-    /// These exist because every other counter here is silence-means-healthy: a
-    /// cleanup thread that never starts, dies, or is stopped leaves all of them
-    /// flat at 0 forever, which is indistinguishable from a quiet, healthy
-    /// store. `audit.db` then grows without bound and rows are retained past
+    /// These exist because every other COUNTER here is silence-means-healthy: a
+    /// cleanup thread that never starts, dies, or is stopped leaves all six flat
+    /// at 0 forever, which is indistinguishable from a quiet, healthy store.
+    /// (`retention_index_ok` is the exception -- a startup-evaluated gauge whose
+    /// alert fires whether or not the reaper runs.) `audit.db` then grows without bound and rows are retained past
     /// the stated window with no signal at all. An operator alerts on ABSENCE
     /// here (`passes_total` not increasing, or `last_pass_unixtime` going
     /// stale), which is the only way to detect a reaper that is not running.
-    uint64_t retention_passes_count() const noexcept {
+    std::uint64_t retention_passes_count() const noexcept {
         return retention_passes_.load(std::memory_order_relaxed);
     }
     std::int64_t last_pass_unixtime() const noexcept {
