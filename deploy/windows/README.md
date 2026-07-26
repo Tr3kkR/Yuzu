@@ -23,11 +23,18 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    pwsh -File deploy\windows\Provision-Windows-Runner.ps1
    ```
    Re-runnable; pins live in the `param()` block (bump deliberately). Open a new
-   shell afterwards so machine PATH/env take effect. On an existing shared box,
-   first disable/drain all four runners and wait for their active jobs to finish:
-   the per-agent PostgreSQL-binary step refuses to copy or restart services while
-   any `Runner.Worker.exe` is running, so provisioning cannot interrupt another
-   agent's `[pg]` suite.
+   shell afterwards so machine PATH/env take effect.
+
+   **On an existing shared box, stop all four runners first.** Provisioning
+   restarts shared PostgreSQL services and rewrites machine PATH/env under
+   whatever is running. A maintenance gate at the top of the script enforces
+   this: it exits (code 2) before *any* step if a `Runner.Listener.exe` or
+   `Runner.Worker.exe` is live. It gates on the **listener**, not just the
+   worker — an idle listener can accept a job mid-run, so "no job right now" is
+   not a safe state. The long-running per-agent PostgreSQL-binary step
+   re-asserts the gate on entry and again immediately before each service
+   restart. `-AllowActiveRunners` overrides the gate and will kill in-flight
+   jobs; it exists for a box you know is yours.
 
 2. **Self-test** (must pass before registering):
    ```powershell
@@ -89,12 +96,16 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   `pg_isready` plus authenticated `SELECT 1`) and per-agent catch-and-continue.
   A failed repoint restores the exact original `ImagePath`, restarts from the
   original bin directory, and verifies the same two health checks; a failed
-  rollback is reported distinctly instead of claiming recovery. Agent 0's live
-  data exclusion comes from the service's actual `-D` argument, not an assumed
-  install-root layout. `D:\ci\pgbin` and each copy's `postgres.exe` join the
-  Defender exclusions below. The manifest self-test verifies all four private
-  binary sets, registered service executables, `Running` states, and live
-  authenticated probes, so drift fails before a build starts.
+  rollback is reported distinctly instead of claiming recovery. Both registry
+  writes preserve the value's original kind, so a rollback restores the exact
+  original bytes. Agent 0's live data exclusion comes from the service's actual
+  `-D` argument (canonicalised before it is handed to `robocopy /XD`, which
+  matches by path string), not an assumed install-root layout. `D:\ci\pgbin` and
+  each copy's `postgres.exe` join the Defender exclusions below — and, unlike
+  before, those two are verified fail-closed rather than added best-effort. The
+  manifest self-test verifies all four private binary sets, registered service
+  executables, `Running` states, and live authenticated probes, so drift fails
+  before a build starts.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg
@@ -155,7 +166,8 @@ verified by `Assert-Toolchain.ps1`:
       "pg_ctl": "D:\\ci\\pgbin\\agent-0\\bin\\pg_ctl.exe",
       "postgres": "D:\\ci\\pgbin\\agent-0\\bin\\postgres.exe",
       "psql": "D:\\ci\\pgbin\\agent-0\\bin\\psql.exe",
-      "pg_isready": "D:\\ci\\pgbin\\agent-0\\bin\\pg_isready.exe" }
+      "pg_isready": "D:\\ci\\pgbin\\agent-0\\bin\\pg_isready.exe" },
+    "..."
   ],
   "tools": [ { "name": "vcpkg", "path": "C:\\vcpkg\\vcpkg.exe", "version": "...", "required": true }, ... ]
 }
