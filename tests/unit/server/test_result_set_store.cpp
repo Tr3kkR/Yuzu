@@ -18,7 +18,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <sqlite3.h>
 
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -59,6 +61,61 @@ void exec_sql(const std::string& dsn, const std::string& sql) {
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
     PgResult r{PQexec(conn.get(), sql.c_str())};
     REQUIRE(r.ok());
+}
+
+// Build a legacy SQLite `result_sets.db` at `path` with the pre-migration
+// schema `migrate_from_sqlite` reads (S3a) — one ground row + one child row
+// (parent_id exercises the created_at/id ORDER BY, B3a) + member rows for
+// each. Raw sqlite3 C API: this test targets the legacy reader, not the
+// live store (which never opens SQLite at all post-migration).
+void write_legacy_sqlite_db(const std::filesystem::path& path, const std::string& parent_id,
+                            const std::string& child_id) {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE result_sets ("
+        "  id TEXT PRIMARY KEY, name TEXT, owner_principal TEXT NOT NULL,"
+        "  created_at INTEGER NOT NULL, ttl_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,"
+        "  pinned INTEGER NOT NULL DEFAULT 0, parent_id TEXT,"
+        "  source_kind TEXT NOT NULL, source_payload TEXT NOT NULL,"
+        "  status TEXT NOT NULL DEFAULT 'materialized',"
+        "  source_execution_id TEXT NOT NULL DEFAULT '', matcher TEXT NOT NULL DEFAULT '',"
+        "  device_count INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE result_set_members (result_set_id TEXT NOT NULL, device_id TEXT NOT NULL,"
+        "  PRIMARY KEY (result_set_id, device_id));";
+    REQUIRE(sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto insert_set = [&](const std::string& id, const std::optional<std::string>& parent,
+                          int64_t created_at, int device_count) {
+        std::string sql = "INSERT INTO result_sets (id, name, owner_principal, created_at, "
+                          "ttl_at, last_used_at, pinned, parent_id, source_kind, "
+                          "source_payload, status, source_execution_id, matcher, "
+                          "device_count) VALUES ('" +
+                          id + "', 'legacy-" + id + "', 'alice', " + std::to_string(created_at) +
+                          ", " + std::to_string(created_at + 3600) + ", " +
+                          std::to_string(created_at) + ", 0, " +
+                          (parent ? "'" + *parent + "'" : "NULL") +
+                          ", 'manual_curate', '{}', 'materialized', '', '', " +
+                          std::to_string(device_count) + ");";
+        REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    // Parent created first (earlier created_at) — B3a ordering exercised on
+    // read even though this helper controls insertion order directly; the
+    // migrate_from_sqlite SELECT re-derives the order regardless of how the
+    // legacy rows happen to be stored on disk.
+    insert_set(parent_id, std::nullopt, 1000, 2);
+    insert_set(child_id, parent_id, 2000, 1);
+
+    auto insert_member = [&](const std::string& rsid, const std::string& dev) {
+        std::string sql = "INSERT INTO result_set_members (result_set_id, device_id) VALUES ('" +
+                          rsid + "', '" + dev + "');";
+        REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    insert_member(parent_id, "dev-a");
+    insert_member(parent_id, "dev-b");
+    insert_member(child_id, "dev-a");
+
+    sqlite3_close(db);
 }
 
 // Unwrap helpers for the four type-distinguishable-error reads (ADR-0036 /
@@ -214,6 +271,35 @@ TEST_CASE("ResultSetStore: async create -> materialize", "[pg][result_set][async
     CHECK(got->device_count == 2);
     CHECK(store.list_pending().empty());
     CHECK(contains_ok(store, rs->id, "dev-1"));
+}
+
+// UP-6 (2026-07-26 hardening round, S2): materialize() must dedup + drop
+// empty-string device_ids exactly like insert_row_impl — pre-fix,
+// device_count reflected the raw request size (over-reporting on
+// duplicates) rather than the rows actually stored.
+TEST_CASE("ResultSetStore: materialize dedups members and drops empty ids",
+          "[pg][result_set][async][dedup]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "dedup-check");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-dedup");
+    REQUIRE(rs.has_value());
+
+    auto m = store.materialize(rs->id, {"a", "a", ""});
+    REQUIRE(m.has_value());
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->device_count == 1); // NOT 3 — deduped "a" and dropped ""
+    std::string cursor;
+    auto members = store.members(rs->id, "", 100, cursor);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "a");
 }
 
 TEST_CASE("ResultSetStore: touch extends TTL", "[pg][result_set][ttl]") {
@@ -459,5 +545,95 @@ TEST_CASE("ResultSetStore::migrate_from_sqlite backfill contract", "[pg][result_
         // Even though the (still-missing) path never changes, the marker row
         // short-circuits before any filesystem check on the second call.
         CHECK(store.migrate_from_sqlite(missing));
+    }
+}
+
+// S3a (2026-07-26 hardening round): a populated legacy file must have its
+// rows AND members copied into Postgres, and a second migrate_from_sqlite
+// call — even against the SAME still-present legacy file — must be a no-op
+// (marker idempotency, not "re-read the file every boot").
+TEST_CASE("ResultSetStore::migrate_from_sqlite copies a populated legacy file exactly once",
+          "[pg][result_set][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    const std::string parent_id = "rs_legacyparent";
+    const std::string child_id = "rs_legacychild";
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_rs_populated") / "result_sets.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_sqlite_db(legacy_path, parent_id, child_id);
+
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+
+    // Rows copied, including the self-FK parent/child edge (proves the
+    // ORDER BY created_at, id ASC read — B3a — landed the parent before the
+    // child so the FK insert never violated).
+    auto parent = get_ok(store, parent_id);
+    REQUIRE(parent.has_value());
+    CHECK(parent->owner_principal == "alice");
+    CHECK(parent->device_count == 2);
+    CHECK_FALSE(parent->parent_id.has_value());
+
+    auto child = get_ok(store, child_id);
+    REQUIRE(child.has_value());
+    REQUIRE(child->parent_id.has_value());
+    CHECK(*child->parent_id == parent_id);
+
+    // Members copied.
+    CHECK(contains_ok(store, parent_id, "dev-a"));
+    CHECK(contains_ok(store, parent_id, "dev-b"));
+    CHECK(contains_ok(store, child_id, "dev-a"));
+
+    // Second call against the SAME populated file is a no-op (marker
+    // idempotency) — re-running must not error (e.g. on a duplicate-key
+    // conflict) and must not change the already-copied data.
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+    auto parent_again = get_ok(store, parent_id);
+    REQUIRE(parent_again.has_value());
+    CHECK(parent_again->device_count == 2); // unchanged, not doubled
+}
+
+// S3b (2026-07-26 hardening round): with the backing table dropped, the
+// four type-distinguishable reads must each report DbError distinctly from
+// "not found"/"not a member" — REQUIRE_FALSE(has_value()) +
+// .error() == DbError, not a truthy-but-empty result.
+TEST_CASE("ResultSetStore: get/contains/resolve_alias report DbError on a genuine "
+          "store failure",
+          "[pg][result_set][dberror]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto rs = store.create_materialized(req("alice", "will-degrade"), {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    exec_sql(db.dsn(), "DROP TABLE result_set_store.result_set_members CASCADE");
+    exec_sql(db.dsn(), "DROP TABLE result_set_store.result_sets CASCADE");
+
+    SECTION("get reports DbError, not an empty optional") {
+        auto r = store.get(rs->id);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::DbError);
+    }
+    SECTION("contains reports DbError, not false") {
+        auto r = store.contains(rs->id, "dev-a");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::DbError);
+    }
+    SECTION("resolve_alias reports DbError, not nullopt") {
+        auto r = store.resolve_alias("alice", "will-degrade");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::DbError);
+    }
+    SECTION("member_set_owned reports DbError, not an empty set") {
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::DbError);
     }
 }

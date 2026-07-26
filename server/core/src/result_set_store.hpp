@@ -208,6 +208,13 @@ public:
     /// production caller — `AgentRegistry`'s membership check uses
     /// `member_set_owned` instead; widened for API consistency and the
     /// authorization-primitive contract this store advertises.)
+    ///
+    /// CAUTION: `!contains(...)` tests the ERROR state (`std::expected`'s
+    /// `operator!`/`operator bool`), NOT "device is not a member" — a bare
+    /// `!contains(...)` silently treats a DB error the same as "not a
+    /// member" and a successful `false` the same as "degraded", both wrong.
+    /// Check `.has_value()` first, then dereference (`**result` or
+    /// `result.value()`) for the actual boolean membership answer.
     std::expected<bool, ResultSetError> contains(const std::string& id,
                                                  const std::string& device_id);
     /// All members of `id` iff owned by `owner`; empty set otherwise (absent id

@@ -107,10 +107,15 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
         CHECK(matched->empty());
     }
 
-    SECTION("empty principal (untracked raw-dispatch path) resolves nothing") {
+    SECTION("empty principal (untracked raw-dispatch path) ABORTS, never silently "
+            "no-matches (B2, 2026-07-26 hardening round)") {
+        // Pre-B2 this resolved to an empty (but present) match — which under a
+        // NOT combinator elsewhere would invert to "matches every agent" purely
+        // from a missing principal, no DB error required. A real rs_store is
+        // wired here but there is no principal to owner-resolve against, so
+        // evaluate_scope must abort (nullopt), not degrade to "0 matched".
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
-        REQUIRE(matched.has_value());
-        CHECK(matched->empty());
+        REQUIRE_FALSE(matched.has_value());
     }
 
     SECTION("an unknown result-set id resolves to nothing — fail-closed, not match-all (UP-14)") {
@@ -288,5 +293,65 @@ TEST_CASE("evaluate_scope: a degraded result-set store ABORTS — never expands 
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
         REQUIRE_FALSE(matched.has_value());
+    }
+}
+
+// ── B2 fail-closed regression (2026-07-26 hardening round): an EMPTY ────────
+// ── principal must ABORT, never silently expand a NOT-inverted scope to ────
+// ── the whole fleet — no DB error required, purely structural.           ────
+//
+// The concrete vulnerability: `evaluate_scope`'s preload guard used to be
+// `if (rs_store && !principal.empty())` — with a real rs_store wired but an
+// empty principal (e.g. the tracked/MCP dispatch paths recovering `principal`
+// from an execution row's `dispatched_by`, which can miss/be empty), the
+// preload loop never ran at all. A `from_result_set:<id>` atom then resolved
+// "" (no match) for every agent, and `NOT` inverted that to "matches every
+// agent" — a fleet-wide command dispatch reachable with a perfectly healthy
+// database, purely from a missing principal.
+TEST_CASE("evaluate_scope: an empty principal ABORTS — never expands a NOT-inverted "
+          "scope to the whole fleet (B2, no DB degrade needed)",
+          "[pg][scope][result_set][authz][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(info("agent-win"));
+    registry.register_agent(info("agent-lin"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+
+    SECTION("NOT from_result_set:<id> with empty principal aborts rather than matching "
+            "every agent") {
+        auto expr = yuzu::scope::parse("NOT from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        // rs_store IS wired (real store, healthy DB) — only `principal` is
+        // empty. Pre-B2 this would have silently matched BOTH agents.
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("the plain (non-NOT) form also aborts, never a false empty match") {
+        auto expr = yuzu::scope::parse("from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("a scope WITHOUT a from_result_set: atom is completely unaffected by an "
+            "empty principal (narrowness check)") {
+        auto expr = yuzu::scope::parse(R"(ostype == "windows")");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE(matched.has_value()); // no from_result_set: atom -> never aborts
     }
 }

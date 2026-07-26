@@ -35,7 +35,17 @@ The reference user journey is the **Chrome IR walkthrough** in §10.
 
 ## 3. Data model
 
-### 3.1 Server schema (`result_set_store.cpp`, new SQLite database `result_sets.db`)
+### 3.1 Server schema (`result_set_store.cpp`, PostgreSQL schema `result_set_store`)
+
+**2026-07-25 update (ADR-0036):** this store originally shipped as SQLite
+(`result_sets.db`, as the SQL below still illustrates) and has since migrated
+to PostgreSQL — schema `result_set_store`, tables `result_sets` +
+`result_set_members`, unchanged in shape (`INTEGER`→`BIGINT`, the `pinned`
+0/1 flag→`BOOLEAN`; see ADR-0036 for the exact type mapping). The legacy
+SQLite file is retained read-only for one release as a rollback breadcrumb
+(ADR-0009) and backfilled into Postgres on first boot. The SQL below is
+retained as the original design illustration; treat ADR-0036 as authoritative
+for the live schema.
 
 ```sql
 CREATE TABLE result_sets (
@@ -179,7 +189,7 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `{new_id, device_count_delta}` | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). |
 | `DELETE` | `/api/v1/result-sets/{id}` | — | `204` | Pinned sets must be unpinned first. |
 
-Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`.
+Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
 
 ## 7. YAML DSL surface
 

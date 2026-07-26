@@ -91,6 +91,40 @@ a single global `shared_mutex` serializing every writer.
   longer for a lease, but still bound the wait"). Construction and the one-time backfill use
   unbounded `acquire()`/`with_txn` per ADR-0012 §2(a) (boot is serial).
 
+### 2026-07-26 hardening round (post-review)
+
+A consolidated governance review of this migration surfaced four further findings, all
+addressed in this same ADR/PR:
+
+- **B1 — RAII for the backfill's SQLite handles (cpp-safety).** `migrate_from_sqlite`'s legacy
+  connection and its two prepared statements now use RAII owners (a local `SqliteConnGuard` +
+  the existing `SqliteStmt`, `sqlite_raii.hpp`) instead of manual `sqlite3_close`/
+  `sqlite3_finalize` — an exception thrown mid read-loop (e.g. `std::bad_alloc` building a
+  `ResultSet`/string) can no longer leak the connection or a statement.
+- **B2 — the fail-open closure extends to the empty-principal case.** The DB-degrade fix above
+  guarded `member_set_owned` returning an error; it did NOT guard the case where `rs_store` is
+  wired but `principal` is empty (the preload's own `if (rs_store && !principal.empty())` guard
+  skipped the preload entirely) — reachable on the tracked and MCP dispatch paths whenever the
+  execution row's `dispatched_by` lookup misses, and structurally on the dashboard dispatch
+  closure (no principal seam at all). `AgentRegistry::evaluate_scope` now aborts
+  (`std::nullopt`) whenever the expression references a `from_result_set:` atom AND `principal`
+  is empty — the identical fail-open shape as the DB-degrade case, but reachable with a
+  perfectly healthy database. NARROW by construction: a scope with no `from_result_set:` atom
+  is unaffected regardless of principal.
+- **B3 — backfill boot-failure diagnosability (UP-1).** The legacy `SELECT ... FROM result_sets`
+  now carries `ORDER BY created_at ASC, id ASC` so parent rows are always inserted before their
+  children (the self-referencing `parent_id` FK is not deferrable). A row that still violates a
+  Postgres constraint now aborts with a message naming the SPECIFIC offending row id/columns and
+  a remediation hint (inspect/fix that row in the retained read-only legacy file, then restart —
+  the marker was not stamped, so the next boot retries), not an opaque "backfill failed".
+- **B4 — audit + metric on every abort path.** A new `scope.evaluation_aborted` audit event
+  (`server.cpp`, sibling to the existing `instruction.scope_resolution_failed` per-ref forensic
+  row) and a `yuzu_scope_eval_degraded_total{reason}` Prometheus counter
+  (`reason` ∈ `db_degraded` | `principal_unresolved`) fire on every dispatch-path abort — the
+  raw/tracked/MCP command-dispatch closures and the dashboard dispatch closure. Without this, an
+  operator whose command was silently reduced to 0 targets by an abort had no distinguishable
+  signal from a genuine "0 agents matched" (UP-12).
+
 ### Backfill (ADR-0009)
 
 `migrate_from_sqlite(legacy_db_path)` is called once at server startup, immediately after
@@ -100,19 +134,21 @@ dedicated `sqlite_backfill` marker row — **not** inferred from `result_sets` b
 row-count-based idempotency check would re-run the backfill (re-inserting stale/expired legacy
 rows) on every boot after the fleet's live result sets happen to have all expired. When no legacy
 file is present (fresh install), the method stamps the marker and returns `true` without further
-work. When present, it reads `result_sets` + `result_set_members` from the legacy SQLite file
-read-only, and inserts every row into Postgres inside **one** transaction (`ON CONFLICT DO
-NOTHING` on both tables, so a legacy row that already exists in Postgres — e.g. a retried boot
-after a prior partial failure this method's own transactionality should otherwise prevent — is
-inert) plus the marker insert, all-or-nothing. Any error — legacy file open/read failure, insert
-failure — fails the whole method closed (returns `false`); `server.cpp` treats that identically
-to `!is_open()`: a fatal startup error (`startup_failed_ = true`). This is the only fidelity this
-store's TTL semantics require: because live result sets skew toward being short-lived (default
-TTL 1 hour), the realistic backfill population at any given upgrade is small, so the
-implementation favors simplicity (per-row `INSERT` statements inside the one transaction) over
-the batched-`unnest` idiom used by higher-volume stores (`DeploymentRunStore`,
-`AccessReviewStore`) — a legitimate choice for a store whose backfill population is bounded by
-its own TTL policy, revisit if a future fleet is observed pinning large sets at scale.
+work. When present, it reads `result_sets` (ordered `created_at, id ASC` — B3 above) +
+`result_set_members` from the legacy SQLite file read-only via RAII handles (B1 above), and
+inserts every row into Postgres inside **one** transaction (`ON CONFLICT DO NOTHING` on both
+tables, so a legacy row that already exists in Postgres — e.g. a retried boot after a prior
+partial failure this method's own transactionality should otherwise prevent — is inert) plus the
+marker insert, all-or-nothing. Any error — legacy file open/read failure, insert failure — fails
+the whole method closed (returns `false`) with a message naming the specific offending row and a
+remediation hint (B3 above); `server.cpp` treats that identically to `!is_open()`: a fatal
+startup error (`startup_failed_ = true`). This is the only fidelity this store's TTL semantics
+require: because live result sets skew toward being short-lived (default TTL 1 hour), the
+realistic backfill population at any given upgrade is small, so the implementation favors
+simplicity (per-row `INSERT` statements inside the one transaction) over the batched-`unnest`
+idiom used by higher-volume stores (`DeploymentRunStore`, `AccessReviewStore`) — a legitimate
+choice for a store whose backfill population is bounded by its own TTL policy, revisit if a
+future fleet is observed pinning large sets at scale.
 
 Per ADR-0009, the legacy `result_sets.db` file is retained read-only for exactly one release (not
 deleted by this migration) as the rollback breadcrumb, and this method never writes to it.
@@ -186,8 +222,14 @@ library instead of leaning on a Postgres-side cast this store has no other reaso
   `rs_get_owned` chokepoint helper), and `policy_evaluator.cpp` was updated to unwrap and fail
   closed on the error case. `list_by_owner`/`members`/`lineage`/etc. keep their pre-migration
   plain-container signatures (see Posture).
-- **Operator-facing:** none. The backfill is transparent; existing result sets survive an upgrade
-  (subject to their own TTL, unchanged).
+- **Operator-facing:** the backfill itself is transparent (existing result sets survive an
+  upgrade, subject to their own TTL, unchanged), but the fail-closed hardening round
+  (2026-07-26) introduces one visible behavior change: a command dispatch whose scope
+  references a `from_result_set:<id>` set now returns **503** (`RESULT_SET_STORE_UNAVAILABLE`,
+  `docs/scope-walking-design.md` §6) instead of silently proceeding when the database
+  degrades mid-request or the dispatching principal could not be resolved — previously
+  indistinguishable from a normal "0 agents matched" response. This is the intended,
+  narrowly-scoped trade-off (see Posture); it is not a regression to explain away.
 
 ## Follow-ups and accepted risks
 

@@ -1134,33 +1134,54 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     // cannot target another operator's set by id (review finding B1). Aliases
     // are not resolved here; callers that accept aliases pre-resolve them.
     std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
-    if (rs_store && !principal.empty()) {
+    if (rs_store) {
         std::vector<std::string> refs;
         collect_result_set_ids(expr, refs);
-        const std::string owner(principal);
-        for (const auto& rsid : refs) {
-            if (rs_members.contains(rsid))
-                continue;
-            auto mem = rs_store->member_set_owned(rsid, owner);
-            if (!mem) {
-                // ADR-0036 fail-closed contract: a Postgres error mid-preload
-                // ABORTS the whole evaluation — never proceed with a partial
-                // membership map. Under a NOT combinator, an atom missing from
-                // rs_members would resolve "" (no match) and INVERT to "matches
-                // every agent" — the concrete fleet-wide fail-open this guards
-                // against (a degraded/transient DB blip must never silently
-                // expand a scope to the entire fleet).
-                spdlog::error("AgentRegistry::evaluate_scope: member_set_owned degraded for "
-                              "result-set '{}' (owner={}) — aborting scope evaluation",
-                              rsid, owner);
-                return std::nullopt;
+        if (!refs.empty() && principal.empty()) {
+            // B2 fail-closed (2026-07-26 hardening round): a real rs_store is
+            // wired but there is no principal to owner-resolve against — e.g.
+            // the tracked/MCP dispatch paths recover `principal` from an
+            // execution row's `dispatched_by` and that lookup missed/was
+            // empty, or a dispatch closure never threads a principal at all.
+            // This is the SAME fail-open shape as a degraded preload: an
+            // unresolvable from_result_set: atom would otherwise resolve ""
+            // (no match) for every agent, and under a NOT combinator that
+            // INVERTS to "matches every agent" — a fleet-wide command
+            // dispatch reachable without any DB error at all, purely from a
+            // missing principal. Abort rather than silently no-match. NARROW
+            // by construction: a scope with no from_result_set: atom takes
+            // the `refs.empty()` branch and is completely unaffected.
+            spdlog::error("AgentRegistry::evaluate_scope: scope references from_result_set: but "
+                          "no principal was supplied to owner-resolve against — aborting scope "
+                          "evaluation");
+            return std::nullopt;
+        }
+        if (!principal.empty()) {
+            const std::string owner(principal);
+            for (const auto& rsid : refs) {
+                if (rs_members.contains(rsid))
+                    continue;
+                auto mem = rs_store->member_set_owned(rsid, owner);
+                if (!mem) {
+                    // ADR-0036 fail-closed contract: a Postgres error mid-preload
+                    // ABORTS the whole evaluation — never proceed with a partial
+                    // membership map. Under a NOT combinator, an atom missing from
+                    // rs_members would resolve "" (no match) and INVERT to "matches
+                    // every agent" — the concrete fleet-wide fail-open this guards
+                    // against (a degraded/transient DB blip must never silently
+                    // expand a scope to the entire fleet).
+                    spdlog::error("AgentRegistry::evaluate_scope: member_set_owned degraded for "
+                                  "result-set '{}' (owner={}) — aborting scope evaluation",
+                                  rsid, owner);
+                    return std::nullopt;
+                }
+                // Touch only sets we actually own (non-empty owned membership): keeps
+                // a set actively used as scope from being GC'd mid-investigation
+                // (review finding I), and never extends another operator's set TTL.
+                if (!mem->empty())
+                    rs_store->touch(rsid);
+                rs_members.emplace(rsid, std::move(*mem));
             }
-            // Touch only sets we actually own (non-empty owned membership): keeps
-            // a set actively used as scope from being GC'd mid-investigation
-            // (review finding I), and never extends another operator's set TTL.
-            if (!mem->empty())
-                rs_store->touch(rsid);
-            rs_members.emplace(rsid, std::move(*mem));
         }
     }
 

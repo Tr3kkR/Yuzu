@@ -268,24 +268,31 @@ public:
     // to per-device membership, scoped to `principal`: a referenced set that
     // `principal` does not own resolves to an empty membership and never matches
     // (no cross-operator targeting — review finding B1). Pass the dispatching
-    // operator as `principal` on every command path; leave it empty (and/or
-    // rs_store null) only where from_result_set is intentionally unsupported
-    // (e.g. server-authored policy scopes) — with rs_store null or principal
-    // empty, the preload below never runs and this call cannot degrade.
-    // Aliases must be pre-resolved to canonical ids by the caller. Stale
-    // members (offline / decommissioned agents not in the live registry) drop
-    // silently.
+    // operator as `principal` on every command path; leave BOTH `rs_store` null
+    // AND `principal` empty only where from_result_set is intentionally
+    // unsupported at this call site (e.g. server-authored policy scopes) — that
+    // combination can never degrade (see below). Aliases must be pre-resolved
+    // to canonical ids by the caller. Stale members (offline / decommissioned
+    // agents not in the live registry) drop silently.
     //
-    // Returns std::nullopt (ADR-0036 fail-closed contract) when the
-    // from_result_set: membership preload hits a Postgres error mid-scan —
-    // NEVER a partial/degraded membership map. This is load-bearing: under a
-    // NOT combinator, an atom that resolved to "no match" because of a missing
-    // preload entry would silently INVERT to "matches every agent" — the
-    // concrete fleet-wide fail-open a degraded preload must never produce.
-    // Every caller that dispatches/enforces/targets on this result MUST treat
-    // nullopt as "abort — do not proceed", never as "0 matches". A caller that
-    // passes rs_store == nullptr or principal.empty() can never observe
-    // nullopt (the preload is skipped entirely) and may use value_or({}).
+    // Returns std::nullopt (ADR-0036 + 2026-07-26 B2 fail-closed contract) in
+    // TWO cases, both load-bearing:
+    //   1. The from_result_set: membership preload hits a Postgres error
+    //      mid-scan — NEVER a partial/degraded membership map.
+    //   2. `rs_store` is non-null, the expression references a
+    //      from_result_set: atom, but `principal` is empty — e.g. a
+    //      dispatch path that recovers the principal from an execution row's
+    //      `dispatched_by` and that lookup missed, or a dispatch closure that
+    //      never threads a principal at all. A real store exists but there is
+    //      no owner to resolve against, so the atom cannot be answered.
+    // Both are the same fail-open shape: under a NOT combinator, an atom that
+    // resolves "no match" (missing preload entry / unresolvable-for-lack-of-
+    // principal) silently INVERTS to "matches every agent" — a fleet-wide
+    // command dispatch, not a theoretical hardening gap. Every caller that
+    // dispatches/enforces/targets on this result MUST treat nullopt as "abort
+    // — do not proceed", never as "0 matches". NARROW: a scope with NO
+    // from_result_set: atom, or a call with `rs_store == nullptr`, is
+    // completely unaffected — value_or({}) is safe there.
     std::optional<std::vector<std::string>>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                    const CustomPropertiesStore* props_store = nullptr,

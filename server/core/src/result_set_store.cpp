@@ -5,6 +5,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <limits>
 #include <random>
 #include <string_view>
@@ -238,6 +240,48 @@ int count_pinned_on(PGconn* conn, const std::string& owner) {
     return to_int(PQgetvalue(res.get(), 0, 0));
 }
 
+// RAII owner for the legacy SQLite connection migrate_from_sqlite opens
+// read-only. sqlite3_close runs on scope exit — including exception unwind
+// (e.g. a std::bad_alloc thrown mid read-loop building a ResultSet/string) —
+// so no early-return/error path can leak the handle (gov cpp-safety). Local
+// to this file: the only sqlite3* connection this store ever opens (the
+// runtime store lives entirely on pg::PgPool). Pairs with the existing
+// per-statement `SqliteStmt` owner (sqlite_raii.hpp) for the prepare/step
+// loops below.
+class SqliteConnGuard {
+public:
+    SqliteConnGuard() = default;
+    ~SqliteConnGuard() { reset(); }
+
+    SqliteConnGuard(const SqliteConnGuard&) = delete;
+    SqliteConnGuard& operator=(const SqliteConnGuard&) = delete;
+    SqliteConnGuard(SqliteConnGuard&& o) noexcept : db_(o.db_) { o.db_ = nullptr; }
+    SqliteConnGuard& operator=(SqliteConnGuard&& o) noexcept {
+        if (this != &o) {
+            reset();
+            db_ = o.db_;
+            o.db_ = nullptr;
+        }
+        return *this;
+    }
+
+    /// Address for `sqlite3_open_v2(path, guard.addr(), flags, nullptr)`.
+    sqlite3** addr() noexcept { return &db_; }
+    sqlite3* get() const noexcept { return db_; }
+    explicit operator bool() const noexcept { return db_ != nullptr; }
+
+    /// Close early. Idempotent.
+    void reset() noexcept {
+        if (db_) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+        }
+    }
+
+private:
+    sqlite3* db_{nullptr};
+};
+
 } // namespace
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -313,73 +357,81 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
 
     // Read the legacy SQLite file READ-ONLY. It is retained by the caller
     // (never deleted here) for the ADR-0009 one-release rollback window.
-    sqlite3* legacy = nullptr;
-    if (sqlite3_open_v2(legacy_db_path.string().c_str(), &legacy, SQLITE_OPEN_READONLY, nullptr) !=
-        SQLITE_OK) {
+    // RAII (gov cpp-safety): SqliteConnGuard/SqliteStmt close/finalize on
+    // every path — including an exception thrown mid read-loop (e.g. a
+    // std::bad_alloc building a ResultSet/string) — so no early return here
+    // can leak the connection or a prepared statement.
+    SqliteConnGuard legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
         spdlog::error("ResultSetStore::migrate_from_sqlite: failed to open legacy {}: {}",
-                      legacy_db_path.string(), legacy ? sqlite3_errmsg(legacy) : "open failed");
-        if (legacy)
-            sqlite3_close(legacy);
+                      legacy_db_path.string(),
+                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
         return false;
     }
 
     std::vector<ResultSet> legacy_sets;
     {
-        sqlite3_stmt* s = nullptr;
+        SqliteStmt s;
+        // ORDER BY created_at, id ASC (B3a): the self-referencing parent_id FK
+        // is NOT DEFERRABLE, so a child row's INSERT must never precede its
+        // parent's in the write transaction below. `id` embeds an epoch-ms
+        // prefix (generate_id()) — a finer-grained, still-lexically-ordered
+        // tiebreak for two rows created within the same created_at second.
         const char* sql =
             "SELECT id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, "
             "parent_id, source_kind, source_payload, status, source_execution_id, matcher, "
-            "device_count FROM result_sets;";
-        if (sqlite3_prepare_v2(legacy, sql, -1, &s, nullptr) != SQLITE_OK) {
+            "device_count FROM result_sets ORDER BY created_at ASC, id ASC;";
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
             spdlog::error(
                 "ResultSetStore::migrate_from_sqlite: legacy result_sets query failed: {}",
-                sqlite3_errmsg(legacy));
-            sqlite3_close(legacy);
+                sqlite3_errmsg(legacy.get()));
             return false;
         }
-        while (sqlite3_step(s) == SQLITE_ROW) {
+        while (sqlite3_step(s.get()) == SQLITE_ROW) {
             ResultSet r;
-            r.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-            r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-            r.owner_principal = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-            r.created_at = sqlite3_column_int64(s, 3);
-            r.ttl_at = sqlite3_column_int64(s, 4);
-            r.last_used_at = sqlite3_column_int64(s, 5);
-            r.pinned = sqlite3_column_int64(s, 6) != 0;
-            if (sqlite3_column_type(s, 7) != SQLITE_NULL)
-                r.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 7)));
-            r.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 8)));
-            r.source_payload = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 9)));
+            r.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
+            r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
+            r.owner_principal =
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
+            r.created_at = sqlite3_column_int64(s.get(), 3);
+            r.ttl_at = sqlite3_column_int64(s.get(), 4);
+            r.last_used_at = sqlite3_column_int64(s.get(), 5);
+            r.pinned = sqlite3_column_int64(s.get(), 6) != 0;
+            if (sqlite3_column_type(s.get(), 7) != SQLITE_NULL)
+                r.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 7)));
+            r.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 8)));
+            r.source_payload =
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 9)));
             r.status = result_set_status_from(
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 10))));
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 10))));
             r.source_execution_id =
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 11)));
-            r.matcher = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 12)));
-            r.device_count = sqlite3_column_int64(s, 13);
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 11)));
+            r.matcher = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 12)));
+            r.device_count = sqlite3_column_int64(s.get(), 13);
             legacy_sets.push_back(std::move(r));
         }
-        sqlite3_finalize(s);
+        // s finalizes here (end of scope), before the next SqliteStmt opens.
     }
 
     std::vector<std::pair<std::string, std::string>> legacy_members; // (result_set_id, device_id)
     {
-        sqlite3_stmt* s = nullptr;
+        SqliteStmt s;
         const char* sql = "SELECT result_set_id, device_id FROM result_set_members;";
-        if (sqlite3_prepare_v2(legacy, sql, -1, &s, nullptr) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
             spdlog::error(
                 "ResultSetStore::migrate_from_sqlite: legacy result_set_members query failed: {}",
-                sqlite3_errmsg(legacy));
-            sqlite3_close(legacy);
+                sqlite3_errmsg(legacy.get()));
             return false;
         }
-        while (sqlite3_step(s) == SQLITE_ROW) {
+        while (sqlite3_step(s.get()) == SQLITE_ROW) {
             legacy_members.emplace_back(
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))),
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1))));
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0))),
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1))));
         }
-        sqlite3_finalize(s);
     }
-    sqlite3_close(legacy);
+    // `legacy` closes here (end of function scope) via SqliteConnGuard's
+    // destructor — no explicit sqlite3_close() call needed on any path below.
 
     spdlog::info("ResultSetStore::migrate_from_sqlite: backfilling {} result set(s), {} member "
                  "row(s) from {}",
@@ -388,7 +440,12 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
     // ONE transaction: fail closed on any error, nothing partially committed
     // (ADR-0009 "fails closed on any error"). Unbounded with_txn (not
     // with_txn_for): startup is serial, same discipline as the ctor's
-    // unbounded acquire() (ADR-0012 §2(a)).
+    // unbounded acquire() (ADR-0012 §2(a)). `failure_detail` (B3b) names the
+    // SPECIFIC offending row so the abort log is actionable, not opaque —
+    // the operator can inspect/fix that exact row in the retained read-only
+    // legacy file before restarting (the marker is never stamped on failure,
+    // so the next boot retries the whole backfill).
+    std::string failure_detail;
     bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         for (const auto& r : legacy_sets) {
             pg::PgResult res = pg::exec_params(
@@ -407,6 +464,8 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                     std::string(to_string(r.status)), r.source_execution_id, r.matcher,
                     std::to_string(r.device_count)});
             if (res.status() != PGRES_COMMAND_OK) {
+                failure_detail = std::format("legacy result_sets row id='{}' (owner='{}'): {}",
+                                             r.id, r.owner_principal, PQerrorMessage(conn));
                 spdlog::error("ResultSetStore::migrate_from_sqlite: insert of {} failed: {}", r.id,
                               PQerrorMessage(conn));
                 return false;
@@ -419,6 +478,10 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 "VALUES ($1,$2) ON CONFLICT DO NOTHING",
                 std::vector<std::string>{rs_id, dev_id});
             if (res.status() != PGRES_COMMAND_OK) {
+                failure_detail =
+                    std::format("legacy result_set_members row (result_set_id='{}', "
+                                "device_id='{}'): {}",
+                                rs_id, dev_id, PQerrorMessage(conn));
                 spdlog::error(
                     "ResultSetStore::migrate_from_sqlite: member insert ({}, {}) failed: {}",
                     rs_id, dev_id, PQerrorMessage(conn));
@@ -431,6 +494,7 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             "$1::bigint) ON CONFLICT (id) DO NOTHING",
             std::vector<std::string>{std::to_string(now_epoch())});
         if (marker.status() != PGRES_COMMAND_OK) {
+            failure_detail = std::format("backfill marker stamp: {}", PQerrorMessage(conn));
             spdlog::error("ResultSetStore::migrate_from_sqlite: failed to stamp backfill marker: {}",
                           PQerrorMessage(conn));
             return false;
@@ -438,8 +502,14 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         return true;
     });
     if (!ok) {
-        spdlog::error("ResultSetStore::migrate_from_sqlite: backfill transaction failed — "
-                      "result-set data NOT migrated");
+        spdlog::error(
+            "ResultSetStore::migrate_from_sqlite: backfill transaction failed and was rolled "
+            "back — result-set data NOT migrated. Offending: {}. Remediation: inspect/fix the "
+            "referenced row in the retained read-only legacy file ({}) — e.g. `sqlite3 {} "
+            "\"SELECT * FROM result_sets WHERE id='<id>'\"` — then restart the server; the "
+            "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
+            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
+            legacy_db_path.string(), legacy_db_path.string());
         return false;
     }
     spdlog::info("ResultSetStore::migrate_from_sqlite: backfill complete");
@@ -1040,11 +1110,26 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
     const std::string& id, const std::vector<std::string>& members) {
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
-    const std::vector<std::string_view> member_views = as_views(members);
+
+    // Dedup + drop empties (UP-6): matches insert_row_impl's contract exactly
+    // — device_count must reflect the rows actually stored (ON CONFLICT DO
+    // NOTHING silently drops duplicates), not the raw request size. Before
+    // this fix materialize() skipped this step, so a caller passing
+    // `["a","a"]` over-reported device_count=2 for one stored row.
+    std::vector<std::string> uniq;
+    uniq.reserve(members.size());
+    {
+        std::unordered_set<std::string> seen;
+        seen.reserve(members.size() * 2);
+        for (const auto& dev : members)
+            if (!dev.empty() && seen.insert(dev).second)
+                uniq.push_back(dev);
+    }
+    const std::vector<std::string_view> member_views = as_views(uniq);
     bool not_found = false;
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        if (!members.empty()) {
+        if (!uniq.empty()) {
             pg::PgResult r = pg::exec_params(
                 conn,
                 "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
@@ -1060,7 +1145,7 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
             conn,
             "UPDATE result_set_store.result_sets SET status = 'materialized', "
             "device_count = $1::bigint WHERE id = $2 AND status = 'pending' RETURNING id",
-            std::vector<std::string>{std::to_string(static_cast<int64_t>(members.size())), id});
+            std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())), id});
         if (upd.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::materialize: update failed: {}", PQerrorMessage(conn));
             return false;

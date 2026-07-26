@@ -5568,6 +5568,41 @@ private:
                           command_id, ref);
     }
 
+    // 2026-07-26 hardening round B4: distinct audit + metric for a WHOLE
+    // scope evaluation ABORTING (as opposed to audit_scope_resolution_failed's
+    // per-ref "not found/not owned" forensic row above). Fires when
+    // AgentRegistry::evaluate_scope() returns std::nullopt on a from_result_set:
+    // scope — either the membership preload hit a Postgres error
+    // (reason="db_degraded", ADR-0036) or a from_result_set: atom had no
+    // principal to owner-resolve against (reason="principal_unresolved", B2).
+    // Without this, a dispatch silently reduced to 0 targets by an ABORT is
+    // indistinguishable in telemetry/audit from a genuine "0 agents matched"
+    // (UP-12) — an operator investigating "why did my command reach nobody"
+    // would find nothing. The Prometheus counter makes the failure alertable
+    // rather than buried in audit.db alone (sre SHOULD).
+    void audit_scope_evaluation_aborted(const std::string& principal,
+                                        const std::string& principal_role,
+                                        const std::string& command_id, const std::string& reason) {
+        metrics_.counter("yuzu_scope_eval_degraded_total", {{"reason", reason}}).increment();
+        spdlog::warn("scope evaluation aborted: command={} principal={} reason={} — dispatch "
+                     "reduced to 0 targets (fail-closed, ADR-0036/B2)",
+                     command_id, principal.empty() ? "unknown" : principal, reason);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "scope.evaluation_aborted";
+        ev.target_type = "result_set";
+        ev.target_id = "";
+        ev.detail = "SCOPE_EVALUATION_ABORTED command=" + command_id + " reason=" + reason;
+        ev.result = "failure";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: scope.evaluation_aborted (command={} reason={})",
+                          command_id, reason);
+    }
+
     // Apply stored runtime config overrides on startup
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
@@ -7646,6 +7681,8 @@ private:
                 if (!resolved_scope) {
                     spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
                                   to_string(resolved_scope.error()));
+                    audit_scope_evaluation_aborted(principal, principal_role, command_id,
+                                                   "db_degraded");
                 } else {
                     // Forensic row when a referenced set is absent/expired/unowned
                     // (design §7 rule 3); does not abort dispatch.
@@ -7655,6 +7692,8 @@ private:
                         spdlog::error("scope dispatch: scope_refs_failing_owner_check degraded "
                                       "({})",
                                       to_string(failing_refs.error()));
+                        audit_scope_evaluation_aborted(principal, principal_role, command_id,
+                                                       "db_degraded");
                     } else {
                         for (const auto& ref : *failing_refs)
                             audit_scope_resolution_failed(principal, principal_role, command_id,
@@ -7679,6 +7718,13 @@ private:
                         } else {
                             spdlog::error("scope dispatch: evaluate_scope degraded (result-set "
                                           "membership preload failed)");
+                            // B2: evaluate_scope's own guard order means a nullopt with an
+                            // empty principal is ALWAYS the principal_unresolved case (it
+                            // aborts before ever touching the store); a non-empty principal
+                            // means the abort came from a genuine member_set_owned DB error.
+                            audit_scope_evaluation_aborted(
+                                principal, principal_role, command_id,
+                                principal.empty() ? "principal_unresolved" : "db_degraded");
                         }
                     }
                 }
@@ -10313,6 +10359,8 @@ private:
                 if (!resolved_scope) {
                     spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
                                   to_string(resolved_scope.error()));
+                    audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
+                                                   "db_degraded");
                 } else {
                     // Role is not available on the tracked path (principal recovered
                     // from the execution row, no live session); principal + command
@@ -10323,6 +10371,8 @@ private:
                         spdlog::error("scope dispatch: scope_refs_failing_owner_check degraded "
                                       "({})",
                                       to_string(failing_refs.error()));
+                        audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
+                                                       "db_degraded");
                     } else {
                         for (const auto& ref : *failing_refs)
                             audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
@@ -10337,6 +10387,12 @@ private:
                             } else {
                                 spdlog::error("scope dispatch: evaluate_scope degraded (result-set "
                                               "membership preload failed)");
+                                // B2: see the raw-dispatch site's identical comment — an
+                                // empty principal here means evaluate_scope aborted on the
+                                // principal_unresolved guard, never a DB error.
+                                audit_scope_evaluation_aborted(
+                                    principal, /*role=*/"", command_id,
+                                    principal.empty() ? "principal_unresolved" : "db_degraded");
                             }
                         }
                     }
@@ -11639,14 +11695,20 @@ private:
                 } else if (!scope_expr.empty()) {
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
-                        // No principal passed here — the from_result_set: preload
-                        // never runs (evaluate_scope's own empty-principal guard),
-                        // so this call cannot degrade (nullopt); value_or({}) is a
-                        // no-op fallback, not a fail-open (ADR-0036).
-                        auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                                custom_properties_store_.get(),
-                                                                result_set_store_.get())
-                                          .value_or(std::vector<std::string>{});
+                        // B2 (2026-07-26): this closure has NO principal seam at all —
+                        // a from_result_set: scope here can NEVER be owner-resolved, so
+                        // evaluate_scope's principal_unresolved guard fires and returns
+                        // nullopt. value_or({}) correctly collapses that to "0 targets"
+                        // (never a fail-open — see evaluate_scope's header contract), but
+                        // the abort must still be audited/counted (B4) so it isn't
+                        // silently indistinguishable from a genuine "0 matched".
+                        auto matched_opt = registry_.evaluate_scope(
+                            *parsed, tag_store_.get(), custom_properties_store_.get(),
+                            result_set_store_.get());
+                        if (!matched_opt)
+                            audit_scope_evaluation_aborted(/*principal=*/"", /*role=*/"",
+                                                           command_id, "principal_unresolved");
+                        auto matched = matched_opt.value_or(std::vector<std::string>{});
                         for (const auto& aid : matched) {
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
@@ -12348,6 +12410,8 @@ private:
                             spdlog::error("MCP scope dispatch: resolve_scope_aliases degraded "
                                           "({})",
                                           to_string(resolved_scope.error()));
+                            audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
+                                                           "db_degraded");
                         } else {
                             // Role unavailable on the MCP path (principal recovered
                             // from the MCP-created execution row); principal + command
@@ -12358,6 +12422,8 @@ private:
                                 spdlog::error("MCP scope dispatch: "
                                               "scope_refs_failing_owner_check degraded ({})",
                                               to_string(failing_refs.error()));
+                                audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
+                                                               "db_degraded");
                             } else {
                                 for (const auto& ref : *failing_refs)
                                     audit_scope_resolution_failed(principal, /*role=*/"",
@@ -12375,6 +12441,11 @@ private:
                                         spdlog::error("MCP scope dispatch: evaluate_scope "
                                                       "degraded (result-set membership preload "
                                                       "failed)");
+                                        // B2: see the raw-dispatch site's identical comment.
+                                        audit_scope_evaluation_aborted(
+                                            principal, /*role=*/"", command_id,
+                                            principal.empty() ? "principal_unresolved"
+                                                              : "db_degraded");
                                     }
                                 }
                             }
