@@ -159,7 +159,12 @@ inline constexpr std::array<std::string_view, 5> kRouteRejectReasons{
 /// only (`test_workflow_routes.cpp`, "a non-object body is refused"). It is
 /// NOT pinned on `/api/command`, which no test can reach — that route is
 /// registered inline on a raw httplib::Server inside `Server::start()` rather
-/// than through HttpRouteSink (#1786). An earlier version of this paragraph
+/// than through HttpRouteSink (#2557). Earlier revisions of this comment cited
+/// #1786 for it, which is a different gap entirely — the TAR retention-paused
+/// dashboard fragments in `dashboard_routes.cpp`, closed by #2534 without
+/// touching `/api/command`. That citation was inherited from a review summary
+/// and repeated without reading the issue.
+/// An earlier version of this paragraph
 /// claimed both routes were pinned; they are not, and a false verification
 /// claim in the header that is the source of truth for this invariant is worse
 /// than the gap it was papering over.
@@ -227,7 +232,8 @@ enum class DispatchArm {
 /// decision with fleet-wide blast radius is unit-testable.
 ///
 /// It was not testable before: the closures live inside `Server::start()`,
-/// which no harness can reach (#1786), and the route tests assert against STUB
+/// which no harness can reach (#2557 — NOT #1786, which covers the TAR
+/// dashboard fragments and was closed by #2534), and the route tests assert against STUB
 /// dispatch closures — so reverting the real sink's default broke nothing.
 /// Governance's words: "the highest-blast-radius line in the PR is unverified".
 ///
