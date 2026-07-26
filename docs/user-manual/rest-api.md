@@ -942,6 +942,8 @@ Explicit maker-checker confirmation that a rotation's successor secret has been 
 
 `token_id` (required) is the successor's token id **returned by the `rotate` response above** — it pins this confirm to that exact rotation. A stale or mismatched id (for example a blind retry of an old confirm after a *second* rotation has started) is rejected with `409` and **no state change**, so a replayed confirm can never resolve a later rotation early. The success audit row records the confirmed id (`token_id=<id>`).
 
+Replaying a confirm **after its own success** (a network-dropped `200`, a double-submit) is a terminal `409` conflict, not a retryable `503`: once the rotation has resolved the successor is the sole active credential, and the confirm returns an explicit `already confirmed` / `already resolved` answer with no state change. Treat it as done and stop retrying (rotate again only if you genuinely need a fresh rotation). See the error table below for the full state matrix.
+
 **Response:**
 
 ```json
@@ -960,9 +962,13 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | `token_id` missing from the body, empty, not a string, or the body is malformed/non-object JSON | `400` — `token_id required` |
 | The supplied `token_id` is not the pending rotation's successor (stale id from an earlier rotation, or the predecessor's id passed by mistake) | `409` — `token_id does not match the pending rotation successor; pass the token_id returned by rotate`. No state change. |
 | Confirm attempted by a **different** operator than the one who initiated the rotation | `409` — `rotation in progress by a different operator` |
-| The in-memory grace-cache entry needed to resolve the initiating operator is gone (process restart, or the rotation already resolved) | `409` — `rotation confirmation unavailable — retry via rotate or fall back to revoke` |
-| No in-flight rotation exists for this principal (zero, one, or an unrecognized pair of active credentials) | `503` — **not** `400`. Same ambiguity-avoidance rationale as `credentials/rotate` above: the internal read can't distinguish "genuinely nothing in flight" from a silently-failed read, so this is classified retryable rather than a definitive client error. |
-| A non-engine-kind active credential is present for this principal (defensive check) | `503` |
+| The in-memory grace-cache entry needed to resolve the initiating operator is gone while the pair is still present (process restart mid-overlap) | `409` — `rotation confirmation unavailable — retry via rotate or fall back to revoke` |
+| **Replay after the rotation already resolved** — the successor is now the principal's sole active credential and the supplied `token_id` matches it | `409`, terminal, **do not retry**: `rotation already confirmed - the supplied token_id is the sole active credential; nothing to confirm` (an explicit confirm resolved it) or `no rotation in flight - the supplied token_id is already the sole active credential; nothing to confirm` (never rotated, or resolved by the auto-revoke sweep or a manual revoke) |
+| One credential is active with its rotation state clear, but the supplied `token_id` is a **different** id (the pinned rotation has moved on) | `409`, terminal — `no rotation in flight for the supplied token_id - the rotation was resolved (confirmed, revoked, or cut over); rotate again if a new rotation is needed` |
+| One credential is active but still carries **unresolved rotation metadata** (a best-effort pair-resolve failed, or its partner expired before cleanup while the sweep was down) | `409` — `one active credential with unresolved rotation metadata - inspect the credential state and do not rotate; revoke only if it is confirmed stale`. Rotating from here would strand a malformed pair; **inspect before revoking** — in the sweep-outage case this sole credential is the good survivor. |
+| **More than two** active credentials for this principal (one minted outside the rotation path) | `400` — `more than two active credentials for this principal - resolve manually before confirming` |
+| No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
+| A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
 | Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed | `403` |
@@ -1175,7 +1181,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the `auth.db` write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `403` — caller lacks `UserManagement:Write` or failed MFA step-up; `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -1211,7 +1217,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — no `auth.db` (`--data-dir` unset).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated; `403` — not admin, MFA step-up refused, or self-grant; `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` on a 403).
 
@@ -6253,7 +6259,9 @@ curl -N -H "Authorization: Bearer $TOKEN" \
 ```
 
 Every error body carries the A4 envelope (`correlation_id`, nullable `retry_after_ms`,
-`remediation`). Streams end with a final `stream-closed` frame naming the reason.
+`remediation`). Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+(a normal `message` on the stream, not a bespoke `event: stream-closed` frame) whose `params`
+name the reason in that same A4 shape.
 
 #### `DELETE /mcp/v1/`
 
@@ -6415,6 +6423,8 @@ username=admin&password=secretpass
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `qr_svg` field on the enrollment variant is a server-rendered inline SVG QR code encoding `otpauth_uri` — inject it into the DOM **without** HTML-escaping (it is pure shape geometry, no user content). If `qr_svg` is the empty string, QR encoding failed; fall back to displaying `secret_base32` / `otpauth_uri` for manual entry. The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
 
+**Errors:** a `503` from this endpoint can also mean the enrolled user's MFA secret could not be read (PG/KEK unavailable, tamper, or a rotated/unresolvable key) rather than the pending-challenge-map load-shed above — this fails closed rather than silently falling back to "not enrolled." See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
+
 #### `POST /login/mfa`
 
 Complete a pending MFA login. Called after receiving HTTP 202 from `POST /login`.
@@ -6435,8 +6445,11 @@ The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII 
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
 | `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
+| `503` | The user's MFA secret could not be read/decrypted (PG outage mid-read, tamper, an unresolvable/rotated KEK, or a corrupt blob) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
 An enrollment-pending token issued by the `mfa_enrollment_required` branch is **rejected** here (use `POST /login/mfa/enroll`); a login-challenge token is likewise rejected at the enroll endpoint.
+
+**Errors:** the `503` above is a deliberate fail-closed outcome, never collapsed into the `401` "code rejected" case (which would burn one of the user's limited verification attempts against a transient outage). See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 #### `POST /login/mfa/enroll`
 
@@ -6484,6 +6497,8 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up — the body points to `/auth/oidc/start`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+
+**Errors:** the `503` above includes the case where the session owner's MFA secret specifically could not be read/decrypted (PG/KEK unavailable, tamper, or a rotated/unresolvable key) — `require_mfa_step_up` fails closed on this rather than treating it as "not enrolled." See `docs/auth-architecture.md` § "MFA fails closed on secret-read failure."
 
 **Audit verbs:** `mfa.step_up.passed` on success (`detail=method=totp` or `method=recovery`); `mfa.step_up.failed` on each rejection with the rejection reason in `detail`.
 

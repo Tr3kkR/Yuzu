@@ -5,7 +5,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
+#include <random>
+#include <stdexcept>
 
 namespace yuzu::agent {
 
@@ -23,7 +26,34 @@ std::int64_t journal_now_ms() {
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
+
+/// steady_clock in ms for the item-6 success stamps. Clamped >= 1: 0 is the "start() never
+/// ran" sentinel, and steady_clock's epoch is unspecified (commonly boot), so an honest
+/// reading CAN be 0 early in a machine's life - the clamp costs 1 ms of accuracy once ever.
+std::uint64_t success_stamp_now_ms() {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    return ms > 0 ? static_cast<std::uint64_t>(ms) : 1;
+}
+
+/// steady_clock in ms for the item-12 forced-page jitter deadline. Unclamped, unlike the
+/// stamps above: 0 here means "no deferral pending", and it is written only as
+/// now + a positive offset, so it can never collide with that sentinel.
+std::int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 } // namespace
+
+std::chrono::milliseconds guardian_jitter_offset(std::mt19937& rng,
+                                                 std::chrono::milliseconds upper) {
+    if (upper.count() <= 0)
+        return std::chrono::milliseconds{0};
+    std::uniform_int_distribution<std::int64_t> dist(0, upper.count() - 1);
+    return std::chrono::milliseconds{dist(rng)};
+}
 
 YUZU_EXPORT void set_guardian_joined_thread(bool on) noexcept { tl_guardian_joined_thread = on; }
 YUZU_EXPORT bool on_guardian_joined_thread() noexcept { return tl_guardian_joined_thread; }
@@ -32,7 +62,8 @@ GuardianOutboxDrainWorker::GuardianOutboxDrainWorker(GuardianSparkRuntime& rt, S
                                                      std::uint64_t periodic_bound_ms,
                                                      GuardianMaintenanceConfig maintenance)
     : rt_(rt), send_(std::move(send)), periodic_bound_ms_(periodic_bound_ms),
-      maint_(maintenance), sig_(std::make_shared<Signal>()) {}
+      maint_(maintenance), sig_(std::make_shared<Signal>()),
+      jitter_rng_(std::random_device{}()) {}
 
 GuardianOutboxDrainWorker::~GuardianOutboxDrainWorker() { stop(); }
 
@@ -42,6 +73,23 @@ void GuardianOutboxDrainWorker::start() {
         if (started_ || sig_->stopping.load(std::memory_order_acquire))
             return;
         started_ = true;
+        // Jitter the BOOT forced page here rather than in the loop: set before the thread
+        // exists, it is already in force for the loop's very first wait, and a caller can
+        // observe the deferral without racing the thread's first cycle (item 12). The boot
+        // force bypasses the cadence entirely, so phasing the timers alone would not spread
+        // a fleet that restarted together.
+        if (maint_.jitter)
+            force_page_not_before_ms_ =
+                steady_now_ms() + guardian_jitter_offset(jitter_rng_, maint_.page_interval).count();
+    }
+    // Seed the item-6 staleness stamps NOW, not on the first pass: a thread that starts and
+    // then dies (or never completes a pass) reads as an ever-growing age from its very first
+    // heartbeat, which is what makes worker death visible at all (flip item 14 - sparse
+    // counters at zero are indistinguishable from healthy idle).
+    {
+        const auto now = success_stamp_now_ms();
+        last_page_success_steady_ms_.store(now, std::memory_order_relaxed);
+        last_prune_success_steady_ms_.store(now, std::memory_order_relaxed);
     }
     // Captures the shared Signal (NOT `this`), so a copy that outlives this
     // worker (installed on the runtime, cleared in stop() but a copy already
@@ -115,6 +163,21 @@ void GuardianOutboxDrainWorker::notify() {
         // wake the worker, and the page cadence could still defer the replay by up to
         // kDefaultPageInterval - exactly the promptness the kick exists to provide.
         force_page_.store(true, std::memory_order_release);
+        // ...but a fleet reconnects TOGETHER - a gateway bounce, a restored snapshot - and
+        // every one of those kicks is a full journal scan plus a token burst landing in the
+        // same second. Spread them (item 12). The loop derives its WAIT DEADLINE from this
+        // value, so the deferral is a real scheduled wake: merely polling it at the 5 s
+        // backstop would re-synchronise every agent onto the backstop tick and buy nothing.
+        // FIRST kick wins: only draw a deadline when none is pending. Re-drawing on every
+        // kick would let a flapping link postpone the replay indefinitely - each kick lands a
+        // fresh U[0,5s) offset, so the forced pass (the one that re-offers sent-labelled
+        // batches whose in-flight send may have been lost) keeps being pushed back by exactly
+        // the event it exists to respond to. One draw is all the fleet spread needs; making
+        // the deferral monotone costs nothing and removes the starvation shape.
+        if (maint_.jitter && force_page_not_before_ms_ == 0) {
+            const auto offset = guardian_jitter_offset(jitter_rng_, kGuardianForcedPageJitterMax);
+            force_page_not_before_ms_ = steady_now_ms() + offset.count();
+        }
         ++sig_->gen;
     }
     sig_->cv.notify_all();
@@ -139,8 +202,13 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
     if (!maint_.journal)
         return result;
     // NOTE: no engine mtx_ anywhere on this path, by construction - see the class doc.
-    if (ops.prune)
-        maint_.journal->prune(journal_now_ms());
+    if (ops.prune) {
+        result.prune_attempted = true;
+        // Capture the positive progress_or_verified signal: a prune whose scan OR delete fails, or
+        // that a stop aborts before the delete, returns without throwing, so the success stamp
+        // cannot use "did not throw" (nor scan-only read_ok) as its liveness signal (#2452 Gate 8).
+        result.prune_progress_or_verified = maint_.journal->prune(journal_now_ms()).progress_or_verified;
+    }
     if (ops.page) {
         result.page_attempted = true;
         const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms(), ops.replay_sent);
@@ -150,6 +218,7 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         result.deferred_no_token = stats.deferred_no_token;
         result.skipped_already_sent = stats.skipped_already_sent;
         result.sent_scan_failed = stats.sent_scan_failed;
+        result.progress_or_verified_idle = stats.progress_or_verified_idle;
     }
     return result;
 }
@@ -164,6 +233,16 @@ void GuardianOutboxDrainWorker::loop() {
     // cannot race the worker no matter which thread a test calls it from.
     auto last_prune = std::chrono::steady_clock::now();
     auto last_page = std::chrono::steady_clock::now();
+    // PHASE JITTER (item 12). Backdating each timer by a uniform offset inside its own
+    // interval lands the first cadence pass anywhere in that interval instead of exactly one
+    // interval after boot; the steady cadence afterwards is unchanged. This matters much less
+    // than the forced-page jitter below - agents boot at their own times - but it is free, and
+    // it covers the case where they do not (a fleet-wide rollout or a mass restart).
+    if (maint_.jitter) {
+        std::lock_guard<std::mutex> lk{sig_->mu}; // the RNG lives under this lock
+        last_prune -= guardian_jitter_offset(jitter_rng_, maint_.prune_interval);
+        last_page -= guardian_jitter_offset(jitter_rng_, maint_.page_interval);
+    }
     std::uint64_t seen = 0;
     // The FIRST cycle runs WITHOUT waiting: force_page_ is seeded true for the boot journal
     // replay, and making that replay sit behind a full periodic bound - or, worse, behind
@@ -215,7 +294,23 @@ void GuardianOutboxDrainWorker::loop() {
     while (true) {
         if (!skip_wait) {
             std::unique_lock<std::mutex> lk{sig_->mu};
-            sig_->cv.wait_for(lk, std::chrono::milliseconds(periodic_bound_ms_), [this, seen] {
+            // Wait no longer than the earlier of the periodic backstop and a pending forced
+            // page's release time. Without the second term a deferred force is only noticed at
+            // the next backstop wake, which for any deferral shorter than the backstop means
+            // every agent acts at the same backstop tick - the jitter would defer the work
+            // without spreading it, which is the whole point (Sol review).
+            auto wait_ms = std::chrono::milliseconds(periodic_bound_ms_);
+            if (force_page_not_before_ms_ != 0 && force_page_.load(std::memory_order_acquire)) {
+                const auto remaining =
+                    std::chrono::milliseconds{force_page_not_before_ms_ - steady_now_ms()};
+                if (remaining < wait_ms)
+                    // (std::max), not std::max: MSVC's max() macro would clobber it in a
+                    // windows.h TU - the same convention the journal and runtime headers
+                    // already document for (std::min). std:: qualification does not help;
+                    // the preprocessor expands on the identifier plus '('.
+                    wait_ms = (std::max)(remaining, std::chrono::milliseconds{0});
+            }
+            sig_->cv.wait_for(lk, wait_ms, [this, seen] {
                 return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
             });
             if (sig_->stopping.load(std::memory_order_acquire))
@@ -241,7 +336,20 @@ void GuardianOutboxDrainWorker::loop() {
         // and proceeds straight to the drain, which is what keeps live-event latency at
         // the pre-C0 level.
         const auto now = std::chrono::steady_clock::now();
-        const bool forced_page = force_page_.exchange(false, std::memory_order_acq_rel);
+        // Consume a pending force only once its jitter deadline has passed. A DEFERRAL, never
+        // a drop: the flag stays set, the wait above is bounded by the deadline, and the next
+        // cycle runs it. (With jitter off the deadline is 0 and this is the plain exchange it
+        // always was.)
+        bool forced_page = false;
+        {
+            std::lock_guard<std::mutex> lk{sig_->mu};
+            const bool deferred =
+                force_page_not_before_ms_ != 0 && steady_now_ms() < force_page_not_before_ms_;
+            if (!deferred) {
+                forced_page = force_page_.exchange(false, std::memory_order_acq_rel);
+                force_page_not_before_ms_ = 0;
+            }
+        }
         const bool page_due = forced_page || now - last_page >= maint_.page_interval;
         const bool prune_due = now - last_prune >= maint_.prune_interval;
 
@@ -268,12 +376,26 @@ void GuardianOutboxDrainWorker::loop() {
         };
 
         if (prune_due && !stop_requested()) {
-            firewalled([this] { maintenance_once({.prune = true}); });
+            GuardianMaintenanceResult prune_result;
+            const bool ok = firewalled([&] { prune_result = maintenance_once({.prune = true}); });
             // Stamped AFTER the attempt, so the cadence is a minimum GAP rather than
             // start-to-start. Start-to-start means a pass that runs longer than its own
             // interval is due again the instant it finishes, which under KvStore contention
             // degenerates back into continuous scanning (#2298 Sol review).
             last_prune = std::chrono::steady_clock::now();
+            // The SUCCESS stamp moves only when retention genuinely RAN: the pass did not throw
+            // (ok), a stop did not abort it, and it either applied the delete or verified nothing
+            // was eligible (prune_progress_or_verified, the prune-side mirror of the page stamp's
+            // positive flag). A prune whose scan fails, whose DELETE fails, or that a stop aborts
+            // before the delete returns WITHOUT throwing, so gating on `ok` (or on scan-only
+            // read_ok, as the first cut did) would read a stalled retention loop as fresh - the
+            // same blindness #2452 closes on the page side (Gate 8 UP-7 / UP8-3). The cadence stamp
+            // above deliberately advances regardless (min-GAP pacing). A forward-clock-jump wipe
+            // that deletes the whole journal still advances here (the delete DID succeed) - that is
+            // the L5 clock-guard's job (#2360/#2361), not this gauge's.
+            if (ok && !stop_requested() && prune_result.prune_progress_or_verified)
+                last_prune_success_steady_ms_.store(success_stamp_now_ms(),
+                                                    std::memory_order_relaxed);
         }
 
         GuardianMaintenanceResult page_result;
@@ -281,18 +403,52 @@ void GuardianOutboxDrainWorker::loop() {
             const bool ok = firewalled(
                 [&] { page_result = maintenance_once({.replay_sent = forced_page, .page = true}); });
             last_page = std::chrono::steady_clock::now();
+            // The page success stamp is the age gauge an on-call engineer trusts FIRST once the
+            // journal is live, so it must read fresh ONLY when this pass made real replay progress
+            // OR positively verified a clean idle backlog (#2452). page_into_window computes that
+            // as a SINGLE positive signal - progress_or_verified_idle - since only it has full
+            // visibility of every exit; the gate here just consumes it. An earlier per-cause
+            // NEGATIVE enumeration (advance unless deferred/sent-scan/read-failed) kept missing
+            // no-progress exits - boot-barrier, then headroom-blocked and quarantine-only found in
+            // review - because each new exit had to remember to opt out. The positive flag is false
+            // by construction on every early return, so those, plus a stop-aborted or throwing
+            // pass, all read as a growing age; a healthy pass (records placed, or a clean scan that
+            // found nothing to do) reads fresh. Mirrors the prune stamp's prune_progress_or_verified.
+            if (ok && !stop_requested() && page_result.progress_or_verified_idle)
+                last_page_success_steady_ms_.store(success_stamp_now_ms(),
+                                                   std::memory_order_relaxed);
             // A FORCED page that never ran must not be lost: re-arm so the next cycle
             // retries it rather than waiting out a full cadence interval.
             // ...and one that ran but did NO work because the paging rate-limiter had no
             // token is equally lost: the pass returns clean, so `ok` alone would drop the
             // kick and replay would wait out a full cadence interval after a reconnect.
-            if (forced_page && (!ok || page_result.deferred_no_token))
+            if (forced_page && (!ok || page_result.deferred_no_token)) {
+                // Under sig_->mu, and clearing the deadline with it: the flag and its
+                // deadline are one piece of state and must be mutated as a pair. Set
+                // outside the lock, a notify() landing in between would see a zero
+                // deadline, draw a fresh one, and defer by up to 5 s a re-arm that exists
+                // precisely because the forced page was LOST - the opposite of the intent.
+                std::lock_guard<std::mutex> lk{sig_->mu};
                 force_page_.store(true, std::memory_order_release);
+                force_page_not_before_ms_ = 0;
+            }
         }
 
         if (stop_requested())
             break;
         const auto drained = firewalled_drain();
+
+        // TEST-ONLY item-13 seam: model a throw from the loop's OWN tail (the refill re-arm's
+        // rt_.lifecycle_headroom() - std::mutex::lock can throw - and the cadence arithmetic),
+        // which sits outside every inner firewall. It fires unconditionally when armed, whereas
+        // the real lifecycle_headroom() runs only inside the refill condition below; the point
+        // is only to reach the thread lambda's TOP-LEVEL catch, so do not "tighten" this into
+        // the refill condition. Inert in production (default false; one relaxed load per cycle).
+        // Placed after the top-of-cycle stop gate, so it cannot fire on a cycle where a stop was
+        // already observed; a stop landing mid-drain is only seen next cycle, but the throw kills
+        // this one-shot worker so no next cycle runs regardless.
+        if (inject_loop_tail_throw_.exchange(false, std::memory_order_relaxed))
+            throw std::runtime_error{"injected loop-tail throw (item 13 seam)"};
 
         // Reconnect refill: while disconnected the send window is normally FULL, so the
         // kick's page finds no headroom and places nothing. The drain that follows empties
@@ -323,7 +479,16 @@ void GuardianOutboxDrainWorker::loop() {
         if (page_result.headroom_blocked && page_result.min_blocked_headroom > 0 && drained > 0 &&
             cycle_end - last_refill_page >= kGuardianMinRefillInterval &&
             rt_.lifecycle_headroom() >= page_result.min_blocked_headroom) {
-            force_page_.store(true, std::memory_order_release);
+            // Deliberately NOT jittered, and any inherited deadline is cleared: this re-arm is
+            // backlog RECOVERY on one agent that just made room for a batch it knows is
+            // waiting, already floored by kGuardianMinRefillInterval and gated on real
+            // headroom. Deferring it would fight the recovery loop rather than spread a fleet.
+            // Flag and deadline are set together under sig_->mu - they are one piece of state.
+            {
+                std::lock_guard<std::mutex> lk{sig_->mu};
+                force_page_.store(true, std::memory_order_release);
+                force_page_not_before_ms_ = 0;
+            }
             skip_wait = true; // act on it NOW, not after the backstop
             last_refill_page = cycle_end;
         }

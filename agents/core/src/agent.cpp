@@ -589,6 +589,13 @@ public:
         // dispatches once the Subscribe stream is open. Construction is
         // safe even when KV failed to open (it degrades to in-memory only).
         guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
+        // Spread this endpoint's journal maintenance and its forced (boot / reconnect) replay
+        // pages over their intervals - the ONLY place jitter is turned on, so every test keeps
+        // a deterministic cadence. Must precede wire_spark_engine(), which builds the worker.
+        // What it protects against is a CORRELATED fleet event - a gateway bounce, a mass
+        // restart, a restored snapshot - handing thousands of agents the same full journal
+        // scan and token burst in the same second (C0 flip-checklist item 12).
+        guardian_->set_maintenance_jitter(true);
         // start_local() (the pre-network cached-rule re-arm) is DEFERRED until after
         // the SparkEngine is constructed, started, and wired below (ADR-0021 rung
         // 7.7a): wire_spark_engine() must run before start_local() (the header
@@ -2012,6 +2019,13 @@ public:
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
                                 emit_guardian_journal_heartbeat_tags(tags, guardian_->journal_stats());
+                                // Journal AGE gauges (flip item 6 + #2364): the staleness pair
+                                // ships every heartbeat INCLUDING zero while the drain worker is
+                                // live (zero is a real "fresh" reading), the blocked age ships
+                                // sparsely. Dormancy is journal_age_stats() returning nullopt
+                                // (prefer_spark off / worker not started), not a zero - so an
+                                // inert journal still adds no tags here.
+                                emit_guardian_journal_age_tags(tags, guardian_->journal_age_stats());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted and each suppressed repeat is counted, so the
                                 // suppression is observable (not silent). Sparse: non-zero only.

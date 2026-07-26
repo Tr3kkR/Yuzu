@@ -191,6 +191,95 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
+
+Two operator-visible changes to held-open MCP/SSE streams authenticated by an
+**engine** principal. Nothing changes for human or API-token streams.
+
+**Liveness re-checks are cached for 15 seconds.** Every held-open stream
+re-validates its credential on each ~3 s heartbeat tick. For engine principals
+that check previously read PostgreSQL every tick, which under a connection-pool
+brownout was self-amplifying and could starve ordinary request traffic — not
+just streaming. It is now served from a short cache, and a store that cannot be
+reached is rate-limited rather than re-asked on every tick.
+
+Fresh authorization is unaffected: creating a session and on-behalf-of target
+checks still read through on every call, so revoking an engine principal stops
+new sessions immediately. On the server handling the revoke, live streams are
+still cut on the next tick — the cache is invalidated as part of that write.
+Across replicas, a revoke reaches another replica's stream within the 15 s TTL
+plus a tick. If your compliance posture quotes a revocation-latency figure for
+engine principals, that is the number.
+
+**A stream may now end sooner during a PostgreSQL outage.** The 60 s
+indeterminate grace window is now measured from the stream's last
+*authoritative* credential confirmation rather than from the moment the outage
+was noticed. Previously a stream could ride cached answers and then collect a
+full fresh 60 s window on top of them; total survival past a real confirmation
+is now bounded by the window itself. In practice a stream can close with
+`auth_unavailable` up to ~15 s earlier than before. Clients reconnect and
+resume via `Last-Event-ID` as they already do, and durable results remain
+fetchable by `execution_id`.
+
+**New observability.** Four metrics
+(`yuzu_server_engine_revalidate_cache_hits_total`, `..._misses_total`,
+`..._cache_size`, `..._backoff_suppressed_total` — see
+[metrics.md](metrics.md)). The last is the brownout signal: it moves only while
+the store is unreachable. The server also emits a startup warning when
+effective SSE stream capacity exceeds 16x `--postgres-pool-size`; if you see
+it, watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use` before
+raising either.
+
+No configuration changes are required and no flags were added.
+
+### vNEXT — MCP supervised-tier calls now enforce the published input schema pre-approval (#2405)
+
+Approval-gated MCP `tools/call` arguments are now validated against the tool's
+published `inputSchema` BEFORE an approval ticket is minted or consumed. Most
+callers only fail earlier (junk args that would have failed after admin
+approval now answer `-32602` immediately, with no ticket created or burned).
+
+**Previously-succeeding shapes that now break — supervised-tier
+`execute_instruction` / `execute_bundle`, plus any approval-gated tool taking
+an `integer` parameter:**
+
+- `execute_instruction` / `execute_bundle` with a `params` object containing a
+  non-string value (number/bool/array/object) — previously silently
+  stringified by the handler after approval. Stringify client-side.
+- `execute_bundle` with `steps: []` or more than 32 steps (the schema's
+  `minItems`/`maxItems`, matching the handler's own 1–32 bound).
+- `execute_instruction` with more than 10 000 `agent_ids`, or any single
+  `agent_ids` element longer than 128 bytes.
+- `execute_instruction` with `plugin`/`action` longer than 128 bytes, or
+  `scope` / a `params` value longer than 8192 bytes. (`execute_bundle`'s
+  per-step `plugin`/`action`/`params` carry no length bound and so are
+  unaffected by *these* bounds — the non-string rule above still applies to
+  them.)
+- Any approval-gated tool given an **integral float** where the schema declares
+  `integer` — e.g. `mint_engine_credential {"ttl_days": 90.0}` or
+  `rotate_engine_credential {"overlap_days": 7.0}`. These previously
+  "succeeded" in the worst way: the server ignored the value and silently
+  applied the parameter's default. Send a JSON integer (`90`, not `90.0`) —
+  note that Python's `json.dumps` emits `90.0` for a float-typed value.
+
+The bound-based rejections above were already the published schema contract
+(added in track 2f) but were client-advisory until this change; they are now
+enforced on the approval-gated path. **Operator and readonly callers of these
+two tools are unchanged** — schema validation runs where `requires_approval` is
+true, which for `Execution:Execute` is the supervised tier only, so those
+bounds stay advisory on the other tiers (full every-path enforcement is tracked
+in #2437). Note the gate keys on the *operation*, not the tier: `delete_tag` is
+approval-gated on **operator** as well, so its arguments are validated there
+too — it simply carries no length or count bound today, so nothing breaks. Any approval ticket already minted-and-approved for one of the shapes
+above becomes unrecallable fail-closed (it is never consumed) and expires on
+the normal 7-day approval TTL; re-submit the corrected call for a fresh ticket.
+
+Also note: a recall whose arguments fail schema validation now answers `-32602`
+before the ticket is even looked up — clients that pattern-matched `-32003` for
+every recall failure should treat `-32602` as "fix the arguments, ticket
+untouched". Full detail: `docs/mcp-server.md` "Pre-approval input-schema
+validation".
+
 ### vNEXT — MCP tool annotations are now truthful; write tools carry `destructiveHint:true` for the first time
 
 Track 2g PR 2. Every MCP tool now advertises the four standard annotation hints
@@ -210,6 +299,30 @@ reconnect after this deploy to pick up the corrected hints. Not a breaking chang
 a required `token_id` argument that pins the confirm to the exact pending
 rotation, so its `idempotentHint` is corrected back to `true` — and the new
 required argument IS a breaking change for that one unreleased tool/route.)*
+
+### vNEXT — `confirm_engine_rotation` replay-after-resolution is now a terminal error (#2404)
+
+Direct sequel to the `#2384` entry above. A `confirm` (REST
+`POST /api/v1/engine-principals/{id}/credentials/confirm` or MCP
+`confirm_engine_rotation`) replayed **after the rotation already resolved** — a
+network-dropped `200`, a double-submit, or a client racing the auto-revoke
+sweep — now returns a **terminal** `409` / MCP `kInvalidParams` (`rotation
+already confirmed` / `no rotation in flight ... already the sole active
+credential`), instead of the previous retryable `503`. A confirm that finds
+**more than two** active credentials likewise now returns a terminal `400`
+(was `503`). Only a genuinely-empty read and an unrecognized two-credential
+pair stay `503`.
+
+**Not a breaking change** by this file's convention — no previously-succeeding
+call is rejected; the first, real confirm still returns `200` identically. But
+**worth a glance for any integration that pattern-matches `503 => retry`**: such
+a client will now loop forever against a permanently-`503` call under the old
+behavior, which is exactly the livelock this fixes — after the upgrade it gets a
+terminal `409`/`400` and should stop and (if it genuinely needs a new
+credential) call `rotate`, not replay `confirm`. Agentic MCP clients honouring
+`idempotentHint:true` get the correct terminal answer automatically. Full
+detail: `docs/user-manual/rest-api.md` (confirm error table) and
+`docs/user-manual/engine-principals.md`.
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
@@ -1053,6 +1166,8 @@ The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays
 
 **Connection-pool sizing.** The server opens up to `--postgres-pool-size` / `YUZU_POSTGRES_POOL_SIZE` connections (default **16**). Each heartbeat persists last-seen with one short-lived lease (≈33/s at 1 000 agents on a 30 s heartbeat — well within 16), and `/viz/fleet` draws one. Raise the size for large fleets (rule of thumb: +1 per ~1 000 agents beyond 5 000, plus headroom per additional Postgres-backed store as they migrate) or for a slow managed-PG link. Tune against the `yuzu_pg_pool_{in_use,open,size}` gauges, the `yuzu_pg_acquire_wait_seconds` histogram (the leading saturation signal), and the `yuzu_pg_{connect_failed,acquire_timeout,unhealthy_discard}_total` counters (`unhealthy_discard` counts pooled connections dropped on a failed health probe); the bundled alert rules (`YuzuPgPoolSaturated`, `YuzuPgAcquireWaitHigh`, `YuzuPgConnectFailing` in `docs/prometheus/yuzu-alerts.yml`) fire before `/readyz` is affected. The heartbeat upsert is best-effort with a 250 ms acquire deadline, so a saturated pool degrades the stale-host display, never the live fleet.
 
+Held-open SSE streams also lease this pool: each re-validates its credential every ~3 s tick. Those reads are cached (60 s for API tokens, 15 s for the engine-principal liveness check), so steady-state cost is proportional to *distinct credentials* rather than to stream count — but the refreshes still land here alongside ordinary traffic, and a stream capacity far above the pool size is the shape that turns a brief pool blip into a correlated stall. The server warns at startup when effective SSE stream capacity exceeds 16x `--postgres-pool-size`. Treat that as a prompt to watch `yuzu_pg_acquire_wait_seconds` and `yuzu_pg_pool_in_use`, not as an instruction to enlarge the pool reflexively — adding connections against an already-struggling database makes matters worse, and lowering the stream capacity is often the better lever.
+
 **`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
 
 ### Provisioning a native (non-container) install
@@ -1137,7 +1252,7 @@ Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): eac
 
 **Rotation** mints `secrets-kek-v<N+1>` and re-wraps only the small wrapped-DEK header of each stored blob — payloads are untouched, so rotation is cheap, incremental, and interruptible (a crash resumes by re-running the re-wrap; already-rotated rows are detected by the blob header; a crash *before* the new version's fingerprint registers leaves an orphan key file that the next rotation attempt safely adopts). Rotation is complete when no stored blob references the old version (`oldest_kek_version_in_use`); only then may the old version be **retired** — the server refuses to retire a version that is active or still referenced, and records retirement in `kek_meta` as destruction evidence. Do not delete an old KEK file by hand while any backup you intend to honour still contains blobs wrapped under it — a restored backup needs the KEK versions its rows reference. The operator-facing rotation procedure (CLI/REST surface + DR drill cadence) lands with the first secret-bearing store migration and is tracked in #1341.
 
-Decrypt failures are counted per store and failure class as `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes: `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`) once the codec is wired into a serving store. A sustained non-zero `kek_unresolvable` rate after a deployment or restore is the primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper signal and warrants investigation, not retry.
+Decrypt failures are counted per store and failure class as `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes: `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`). **This is live as of the auth store's Postgres migration** — the auth store (`auth.users.mfa_totp_secret`, TOTP secrets) is the first secret-bearing store to ship, so `store="auth"` is the only label value today. The same wiring emits the `kek.generated`/`kek.rotated`/`kek.retired`/`secret.decrypt_failure` audit verbs. A sustained non-zero `kek_unresolvable` rate after a deployment or restore is the primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper signal and warrants investigation, not retry. Ready-made alert rules for both are in `docs/prometheus/yuzu-alerts.yml` (group `yuzu-secrets`).
 
 **Break-glass (KEK permanently lost).** KEK loss is painful, never a total lockout: admin sign-in survives by design (MFA recovery codes are verify-only hashes and need no KEK — sign in with a recovery code and re-enroll TOTP), and every gated secret class is re-enrollable/re-issuable (webhook secrets re-issued, offload credentials re-issued, OIDC client secret re-pasted). The explicit voided-secrets boot flag described in ADR-0010 ships with the first secret-bearing store migration.
 

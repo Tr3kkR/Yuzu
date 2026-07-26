@@ -8,6 +8,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -32,25 +34,101 @@ JournalRecord good_record() {
 
 // ── Key helpers ──────────────────────────────────────────────────────────────
 
-TEST_CASE("journal key helpers: batch/sent 12-digit seq + prefixes", "[guardian][journal][format]") {
-    CHECK(journal_batch_key("deadbeef", 0) == "lc:deadbeef:000000000000");
-    CHECK(journal_batch_key("deadbeef", 42) == "lc:deadbeef:000000000042");
-    CHECK(journal_sent_key("deadbeef", 42) == "sent:deadbeef:000000000042");
+TEST_CASE("journal key helpers: 13-digit ts + 12-digit seq + prefixes",
+          "[guardian][journal][format]") {
+    CHECK(journal_batch_key(0, "deadbeef", 0) == "lc:0000000000000:deadbeef:000000000000");
+    CHECK(journal_batch_key(42, "deadbeef", 42) == "lc:0000000000042:deadbeef:000000000042");
+    CHECK(journal_batch_key(1'700'000'000'000LL, "deadbeef", 1) ==
+          "lc:1700000000000:deadbeef:000000000001");
 
     // The three prefixes are disjoint - a scan of one never matches another.
-    const auto bk = journal_batch_key("nonce", 3);
+    const auto bk = journal_batch_key(1'700'000'000'000LL, "nonce", 3);
     CHECK(bk.starts_with(kBatchKeyPrefix));
     CHECK_FALSE(bk.starts_with(kSentKeyPrefix));
     CHECK_FALSE(bk.starts_with(kQuarantineKeyPrefix));
 }
 
-TEST_CASE("journal quarantine key wraps the batch key", "[guardian][journal][format]") {
-    const auto bk = journal_batch_key("nonce", 9);
+TEST_CASE("journal batch keys sort lexically in (ts_ms, key) order",
+          "[guardian][journal][format]") {
+    // THE property the whole O(work) scan rests on: SQLite's ORDER BY key must equal the
+    // (ts_ms, key) ordering the maintenance passes want, so candidates can be selected and
+    // ordered from keys alone. Fixed-width ts first is what makes byte order == time order.
+    struct Row {
+        std::int64_t ts;
+        std::string key;
+    };
+    std::vector<Row> rows{
+        {1'700'000'000'000LL, journal_batch_key(1'700'000'000'000LL, "bbbb", 7)},
+        {999LL, journal_batch_key(999LL, "zzzz", 0)},
+        {1'700'000'000'000LL, journal_batch_key(1'700'000'000'000LL, "aaaa", 9)},
+        {1'699'999'999'999LL, journal_batch_key(1'699'999'999'999LL, "cccc", 1)},
+    };
+
+    auto by_key = rows;
+    std::sort(by_key.begin(), by_key.end(), [](const Row& a, const Row& b) { return a.key < b.key; });
+    auto by_ts = rows;
+    std::sort(by_ts.begin(), by_ts.end(), [](const Row& a, const Row& b) {
+        return a.ts != b.ts ? a.ts < b.ts : a.key < b.key;
+    });
+
+    REQUIRE(by_key.size() == by_ts.size());
+    for (std::size_t i = 0; i < by_key.size(); ++i)
+        CHECK(by_key[i].key == by_ts[i].key);
+    // And a tie on ts really does fall through to the nonce/seq suffix.
+    CHECK(by_key[2].key < by_key[3].key);
+}
+
+TEST_CASE("journal batch key clamps an out-of-range timestamp rather than changing width",
+          "[guardian][journal][format]") {
+    // A '-' sign or a 14th digit would break the fixed-width ordering the key exists for.
+    // Both are clock anomalies, so they pin to the ends of the representable range.
+    const auto negative = journal_batch_key(-1, "nonce", 0);
+    CHECK(negative == "lc:0000000000000:nonce:000000000000");
+    CHECK(negative.find('-') == std::string::npos);
+
+    const auto huge = journal_batch_key(kJournalKeyMaxTsMs + 1, "nonce", 0);
+    CHECK(huge == "lc:9999999999999:nonce:000000000000");
+    CHECK(huge.size() == negative.size()); // width is the invariant, not the value
+}
+
+TEST_CASE("parse_journal_batch_key_ts is strict: only a well-formed key yields a ts",
+          "[guardian][journal][format]") {
+    const auto ok = journal_batch_key(1'700'000'000'123LL, "0123456789abcdef", 5);
+    auto ts = parse_journal_batch_key_ts(ok);
+    REQUIRE(ts.has_value());
+    CHECK(*ts == 1'700'000'000'123LL);
+    CHECK(parse_journal_batch_key_ts(journal_batch_key(0, "n", 0)).value_or(-1) == 0);
+
+    // Everything below is corruption, not legacy: the journal is dormant until the
+    // prefer_spark flip, so no key in the pre-ts format can exist on disk.
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:deadbeef:000000000042").has_value()); // old format
+    CHECK_FALSE(parse_journal_batch_key_ts("").has_value());
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:").has_value());
+    CHECK_FALSE(parse_journal_batch_key_ts("sent:1700000000000:n:000000000000").has_value());
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:170000000000:n:000000000000").has_value()); // 12
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:17000000000000:n:000000000000").has_value()); // 14
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:17000000000x0:n:000000000000").has_value());
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:1700000000000:n:00000000000").has_value()); // 11
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:1700000000000:n:0000000000x0").has_value());
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:1700000000000::000000000000").has_value()); // nonce
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:1700000000000:a:b:000000000000").has_value());
+    CHECK_FALSE(parse_journal_batch_key_ts("lc:1700000000000:n:000000000000x").has_value());
+}
+
+TEST_CASE("journal quarantine and sent keys wrap the ts-bearing batch key",
+          "[guardian][journal][format]") {
+    const auto bk = journal_batch_key(1'700'000'000'000LL, "nonce", 9);
     const auto qk = journal_quarantine_key(bk);
-    CHECK(qk == "quarantine:lc:nonce:000000000009");
+    CHECK(qk == "quarantine:lc:1700000000000:nonce:000000000009");
     CHECK(qk.starts_with(kQuarantineKeyPrefix));
     // A scan of the batch prefix must NOT see a quarantined key.
     CHECK_FALSE(qk.starts_with(kBatchKeyPrefix));
+
+    // The sent-label derivation is suffix-agnostic, so it carries the ts through and the
+    // round-trip still lands on the original batch key.
+    const auto sk = journal_sent_key_from_batch_key(bk);
+    CHECK(sk == "sent:1700000000000:nonce:000000000009");
+    CHECK(journal_batch_key_from_sent_key(sk) == bk);
 }
 
 // ── validate_record ──────────────────────────────────────────────────────────

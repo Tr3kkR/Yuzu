@@ -551,13 +551,18 @@ Whichever PR flips `prefer_spark` MUST also:
    sweeps are NOT included - they have their own `yuzu.guardian_sweep_exceptions`, as does
    outbox delivery via `yuzu.guardian_drain_exceptions`) and shifts again in effect at the
    flip. All three carry dormancy framing that must be shed at the same time.
-3. **Close or explicitly risk-accept the shutdown-classification undercount** (Gate 6
-   compliance, CC7.2): when a stop lands mid-classification, the remaining evicted keys are
-   counted in neither `evicted_sent_unacked` nor `evicted_no_send_evidence`, so the counter an
-   auditor reads as "audit gap" reports a SMALLER gap than actually occurred. Under-counting a
-   loss indicator is worse than under-counting a success one. Dormancy caps the severity
-   today; it does not once C0 is live. This needs to be an explicit checklist item on #2298,
-   not prose in a design doc.
+3. ~~**Close or explicitly risk-accept the shutdown-classification undercount**~~ - **DONE**
+   (built, NOT risk-accepted; L3 commit 5a85fcc5) (Gate 6 compliance, CC7.2): when a stop lands
+   mid-classification, the remaining evicted keys were counted in neither `evicted_sent_unacked`
+   nor `evicted_no_send_evidence`, so the counter an auditor reads as "audit gap" reported a
+   SMALLER gap than actually occurred. Under-counting a loss indicator is worse than
+   under-counting a success one. Dormancy capped the severity while dormant; it would not once
+   C0 is live. FIX: the classifier now lands every evicted key in exactly one of three buckets -
+   the new `evicted_unclassified` catches the mid-pass-shutdown remainder, an unreadable-label
+   fallback read, and a mid-classification throw - so `batches_pruned == evicted_sent_unacked +
+   evicted_no_send_evidence + evicted_unclassified` holds every pass, making
+   `evicted_no_send_evidence` a trustworthy floor. The explicit #2298 checklist entry this asked
+   for is added at PR time.
 4. ~~**Land the `yuzu_fleet_guardian_*` server rollup**~~ - **DONE**, merged into this branch as
    PR #2334 (`server/core/src/guardian_journal_fleet_tags.hpp`, the writer/reader bind test, 18
    Guardian journal rules in `docs/prometheus/yuzu-alerts.yml`). Gate 6 sre had this as the item
@@ -575,10 +580,18 @@ Whichever PR flips `prefer_spark` MUST also:
    struct field + `journal_stats()` + emit + fleet row + metrics.md; landed pre-flip and inert).
    The same PR also delivered the ledger's **UP-4** (`send_exceptions` /
    `lifecycle_backpressure_drops` reached no heartbeat tag) as two more journal-family counters.
-6. **Add a "seconds since last successful page/prune pass" gauge** (Gate 6 sre). It is the only
+6. ~~**Add a "seconds since last successful page/prune pass" gauge** (Gate 6 sre). It is the only
    viable liveness signal for the two wall-clock hazards AND for a release-build deadlock,
    where the `mtx_` guard compiles out and a wedged worker is indistinguishable from an idle
-   healthy one.
+   healthy one.~~ - **DONE** on branch `feat/guardian-journal-age-observability`:
+   `yuzu.guardian_journal_page_stale_seconds` + `..._prune_stale_seconds`, success stamps seeded
+   at worker `start()` and re-stamped only by a non-throwing pass (TIGHTENED by #2452 - see
+   UP-11 below - to re-stamp only on a pass that made replay/retention progress or verified
+   there was none, not merely one that did not throw), emitted every heartbeat
+   INCLUDING 0 while live and absent while dormant (dormancy = `journal_age_stats()` nullopt,
+   never a fabricated zero), fleet rollup as a NEW **MAX** family
+   (`yuzu_fleet_guardian_journal_*_seconds_max` - the first non-SUM rollup; a fleet sum of ages
+   is meaningless). This also closes item 14 (see its note).
 7. **Run chaos scenario CH-5** (live-event latency under KvStore contention, UAT rig). It is
    the only scenario that measures the thing C0 was built to fix, so it is the flip's genuine
    go/no-go rather than a formality. Run it at the journal's HARD ceiling (2000 batches /
@@ -594,22 +607,75 @@ Whichever PR flips `prefer_spark` MUST also:
    persists before signalling the workers as well as after them; the post-join flush stays,
    because `persist()` erases the durably-written prefix so a record can never land under two
    keys. They were right that offering the two as equals was the error.
-9. **Resolve or explicitly risk-accept the size-biased replay loss (#2364)**, and land its
-   telemetry first: the age of the oldest currently headroom-blocked batch, alongside item 4's
-   fleet rollup. Four mechanisms for this were built and reverted in this PR; the lesson
-   recorded there is that the channel needs measuring before it is engineered.
-10. **Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
+9. **Resolve or explicitly risk-accept the size-biased replay loss (#2364)** - the resolve/
+   risk-accept half remains OPEN (decided 2026-07-23: risk-accept at the flip, with pre-agreed
+   quantitative thresholds written before CH-5). ~~and land its telemetry first: the age of the
+   oldest currently headroom-blocked batch, alongside item 4's fleet rollup.~~ - **telemetry
+   DONE** on branch `feat/guardian-journal-age-observability`:
+   `yuzu.guardian_journal_headroom_blocked_seconds`, an EPISODE age maintained at pass
+   granularity in `GuardianLifecycleJournal` (set-if-unset on any observed block; cleared only
+   after accumulated block-free coverage of the full candidate set - clear-on-clean-PASS was
+   rejected in review because a pass is a 128-candidate slice and the sawtooth would zero the
+   gauge in exactly the starvation regime; sparse, dormant-absent, fleet rollup MAX). NOTE for
+   CH-5: this gauge has never fired outside unit tests - the CH-5 record must include a
+   forced-blocking sanity step, or a 0 reading is ambiguous (no-block vs gauge-broken). Four
+   mechanisms for the loss itself were built and reverted in this PR; the lesson recorded there
+   is that the channel needs measuring before it is engineered.
+10. ~~**Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
     ~668 ms per pass at the byte ceiling, 97% of it in `parse_journal_batch`, with `rows` (raw)
     and `cands` (parsed) both live for a measured +162 MiB RSS on the endpoint every 30 s.
     Building candidates as `(key, ts_ms)` and parsing only the ones actually considered takes
-    the pass to ~110 ms and +66 MiB. The 128 cap currently bounds 0.5% of the work.
-11. **Bound the heartbeat's retry-persist** (Gate 3 performance). It is circuit-broken on
+    the pass to ~110 ms and +66 MiB. The 128 cap currently bounds 0.5% of the work.~~
+    - **DONE** via #2299 perf-P-1, and further than the item asked: the batch key carries the
+    timestamp (`lc:<ts13>:<nonce>:<seq12>`), so `ORDER BY key` IS `(ts_ms, key)` and both
+    passes select, order and expire candidates from KEYS ALONE. Prune parses no values at
+    all; page reads a value only for a candidate it actually CONSIDERS - it needs the parsed
+    batch to size the request, so that is the ones it places, the ones it finds blocked, and
+    the remaining slice scanned for the smallest blocked requirement when the window is full -
+    memoized, bounded by the 128 cap. Three consequences are documented at the code: a corrupt
+    VALUE is now discovered and quarantined by the replay pass rather than by prune (a
+    malformed KEY is still prune's, on sight); a corrupt-value batch the rotation never
+    reaches before it ages out is therefore counted `evicted_without_send_evidence` rather
+    than `quarantined`, so on a mass-corruption endpoint that audit-loss counter no longer
+    separates "never delivered" from "never deliverable" and should be read alongside
+    `quarantined`; and a candidate whose value READ FAILS is not counted as block-free
+    coverage, so the item-9 episode cannot clear on a pass that had one. The key
+    change is migration-free ONLY while the journal is dormant, which is why it landed
+    pre-flip.
+11. ~~**Bound the heartbeat's retry-persist** (Gate 3 performance). It is circuit-broken on
     FAILURE but unbounded on slow SUCCESS: 4096 staged records is 16 autocommit inserts under
     `mtx_`, ~9.9 ms healthy but able to approach the 5 s busy timeout each under KvStore
     contention. A per-tick batch cap or wall deadline is what makes "cheap retry-persist on the
-    heartbeat" structurally true rather than true-in-practice.
-12. **Jitter the maintenance phase per agent** (Gate 3 performance). NOTE: this item used to
+    heartbeat" structurally true rather than true-in-practice.~~
+    - **DONE**: `persist()` takes TWO per-call bounds - a BATCH cap
+    (`kJournalPersistMaxBatchesPerTick`, 4) and a RECORD cap
+    (`kJournalPersistMaxRecordsPerTick`, 1024) - and stops at whichever it reaches first. Both
+    are passed only by the heartbeat tick, the one cadence caller. Two bounds rather than one
+    because a batch cap alone is a latency budget masquerading as a throughput budget: four
+    batches is ~1024 records when records are small, but as few as ~48 when large fields make
+    the byte cap split them, and since the heartbeat is the only steady-state drain the low end
+    would shed records through `journal_stage_dropped` - a NEW loss channel created by a
+    latency fix (governance Gate 3 performance). The record cap floors the drain rate
+    independently of record size. The cap check sits at the
+    very end of the Inserted case, after the sequence, gauges, written count and provenance
+    have all advanced, so a capped return is indistinguishable from the existing
+    circuit-broken one and the remainder simply stays staged for the next tick. Boot,
+    apply_rules and both shutdown flushes pass `kJournalPersistUnbounded`; NEITHER bound is
+    defaulted, so a future cadence caller cannot inherit unbounded behaviour by omission
+    (governance Gate 3 architect). Caps rather than a wall
+    deadline: the repo has an earned rule against wall-clock bounds in tests (#2372), and the
+    cap must count KvStore round trips, which the byte limit can multiply well past the
+    16 batches a records-per-tick sizing would predict.
+12. ~~**Jitter the maintenance phase per agent** (Gate 3 performance).~~ **DONE** - phase
+    offsets on `last_page`/`last_prune`, plus a jittered release deadline on the BOOT and
+    RECONNECT forced pages, enabled explicitly by the production wiring in `agent.cpp` (never
+    inferred from other config: several tests drive a live worker with no timing override,
+    and the production-boot-order regression depends on the worker running immediately). The
+    deadline bounds the worker's condition-variable wait, so a deferred force is a real
+    scheduled wake - polling it at the 5 s backstop would have re-synchronised every agent
+    onto the backstop tick and spread nothing. A deferral never drops a kick, and the
+    backlog-recovery refill re-arm is deliberately exempt. Original note retained: NOTE: this item used to
     size the fleet from a SUSTAINED redelivery floor of 0.1 batch/s/agent - ~256k events/s and
     ~615 Mbit/s at 10k agents. That floor no longer exists: replay consults the durable
     sent-label and does not re-offer delivered batches on an ordinary pass (#2345 round 8), so
@@ -618,17 +684,100 @@ Whichever PR flips `prefer_spark` MUST also:
     full token burst in the same cycle, which is exactly what jitter is for. Phase-jitter
     `last_page`/`last_prune` by U[0,interval) and jitter the BOOT page too, since a forced pass
     bypasses the cadence. Do not treat the old sustained number as a live gate.
-13. **Test the loop-death firewall** (Gate 3 QE). Nothing can currently make `loop()`'s own
-    tail throw, so the top-level catch and its counter are unexercised; this needs a seam.
+13. ~~**Test the loop-death firewall**~~ - **DONE** (L3 commit e4d98560) (Gate 3 QE). Nothing
+    could make `loop()`'s own tail throw, so the top-level catch and its counter were
+    unexercised; a one-shot test seam (`inject_loop_tail_throw_for_test`) now injects a throw
+    there, and a test asserts the escape is caught, `journal_maint_exceptions_` increments
+    exactly once, the success stamps freeze (item-6 liveness), and `stop()` still joins cleanly.
+    Mutation-verified: removing the catch aborts the process; removing its increment times out
+    the spin.
     ~~and the pre-join persist~~ - **the pre-join persist half is DONE (round 7)**: a test parks
     the drain worker inside a blocked send, calls `stop()` on another thread, and asserts the
     pending record reaches disk *while the join is still outstanding*. Asserting after `stop()`
     returns cannot distinguish the two orderings, because the post-join flush persists the same
     record either way - which is why deleting the call used to leave the suite green.
-14. **Give the drain worker a liveness signal that does not rely on a counter incrementing.**
-   Round 5 folded in an increment on the loop's top-level catch, so an *exception-killed* worker
-   is now visible - but the tags are emitted sparsely (a zero is omitted), so a worker that dies
-   before doing any work still reads identically to a healthy idle one. Item 6's staleness gauge
-   is the real fix; this note records that the counter is a partial mitigation, not a closure.
+14. ~~**Give the drain worker a liveness signal that does not rely on a counter incrementing.**~~
+   - **DONE, closed by item 6** (as this note always said it would be): the staleness stamps are
+   seeded at worker `start()` and advanced only by a completed non-throwing pass, so a worker
+   that starts and then dies - or hangs without throwing - reads as an ever-growing age from its
+   first heartbeat, and the emit-including-0 posture means "fresh" is a real reading rather than
+   an absence. (Historical note kept: round 5's loop-catch increment made an *exception-killed*
+   worker visible; it was a partial mitigation, not a closure.)
 
 Tracked on #2298, which is the cutover gate list.
+
+### 15. Deferred findings from the #2299 O(work) governance run — resolve or risk-accept before the flip
+
+The L2 run closed one BLOCKING regression and a
+long list of SHOULDs, but deliberately deferred the items below. They are recorded HERE, not
+only in a governance transcript, because a deferred finding with no forward pointer is a
+finding that gets re-discovered at flip time instead of resolved (Gate 6
+enterprise-readiness). Each needs an outcome - fixed, or explicitly risk-accepted and
+attributed - before `prefer_spark` flips. File them against #2298.
+
+Recorded here, in the FIRST PR of the three-PR #2299 stack, rather than the last: most of
+these are findings against this PR's own code, and if the rest of the stack stalled they would
+otherwise be undocumented on `dev`. A few belong to the later PRs (UP-9/UP-10 to the persist
+bounds, UP-6 to the jitter) and are listed anyway so the set stays in one place.
+
+- ~~**UP-11 — the page SUCCESS stamp advances on passes that did NO work.**~~ **RESOLVED by
+  #2452.** A no-token return, a `stopping_` return, or a pass whose every value read failed all
+  refreshed `last_page_success_steady_ms_`, so `yuzu.guardian_journal_page_stale_seconds` could
+  read healthy while replay was genuinely stalled. PRE-EXISTING from L1b, not introduced by L2 -
+  but L2 is the rung that makes replay real, and this is the gauge an on-call engineer will trust
+  first once it is. Both compliance and SRE called this the one deferred item that should be a
+  flip PREREQUISITE rather than ordinary backlog. **FIX (governance Gate 7):** an initial per-cause
+  negative enumeration kept missing no-work exits (the review round found boot-barrier, then
+  headroom-blocked, quarantine-only, and a worker-vs-journal stop-flag divergence), so the page
+  stamp now gates on a single POSITIVE signal - `JournalPageStats::progress_or_verified_idle`, set
+  true only at page_into_window's successful tail iff the pass placed records OR ran a full scan of
+  a clean, unblocked, uncorrupted, readable idle backlog. Every early return (null-kv, a `stopping_`
+  bail, deferred, sent-scan/candidate/value read failure, boot-barrier, headroom-blocked,
+  quarantine-only) leaves it false by construction, so a future no-work exit cannot advance it by
+  forgetting to opt out. Mirrors the prune stamp's positive `progress_or_verified` gate; both also carry
+  `!stop_requested()`. **PAGE-side cleared, and PRUNE-side now also cleared** for the same-class
+  no-work exits: the prune stamp gained the symmetric positive `JournalPruneStats::progress_or_verified`,
+  true iff retention was APPLIED (`evicted > 0`) OR verified genuinely idle. It reads a growing age on a
+  scan failure, a **DELETE failure (UP-7)**, a **stop BEFORE the delete (UP8-3)** (all return early,
+  before the set point), a **`skip_age` clock-decline of rows that were expired (UPR-2)** - `skip_age &&
+  expired > 0`, so retention was deferred and the journal is not idle, though a big_step on a genuinely
+  idle journal stays fresh - and a **quarantine-rename FAILURE (UPR-1)** that left a corrupt row stuck,
+  mirroring the page-side guard (the last two found by the focused re-review). A stop during the trailing
+  label-GC correctly keeps it true (retention already ran), and a quarantine SUCCESS reads fresh (progress).
+  ONE prune residual is TRACKED, not closed here: a forward-clock-jump wipe still advances the stamp - the
+  delete genuinely succeeded, so it is not a stamp-gating problem but the L5 clock-guards' (#2360/#2361) job to
+  PREVENT the wipe. Also pre-flip (SRE observability): ship draft alert rules for
+  `_headroom_blocked_seconds` / `_quarantined` / `_prune_failures` so the newly-stale gauges have
+  actual alerts. One thing to remember when they land: the page stamp is verified PER-SLICE (cap 128),
+  so a fully-unhealthy tail on a large journal surfaces only after ceil(N/128) page cadences - worst
+  case ~8 x 30 s = 240 s at N=1000, thin under a 300 s (10x) `_page_stale_seconds_max` threshold: size
+  the page-stale alert `for:`/threshold with that rotation lag in mind, or alert on
+  `_headroom_blocked_seconds` (which is NOT slice-capped) for the congestion case. (The prune
+  quarantine-rename-FAILURE case the K3 review flagged as by-contract-fresh is now CLOSED - the focused
+  re-review's UPR-1 gate makes it read stale via `quarantine_stall_this_pass`, mirroring the page side;
+  a quarantine SUCCESS still reads fresh, which is correct.)
+- UP-5 — a pre-planted `quarantine:` twin makes the page-side rename Conflict every pass;
+  bounded by the per-pass candidate cap, but can stall the drain behind ~128 KvStore round
+  trips. Tampered-DB only. The same shape applies to the size-quarantine branch, where the row
+  additionally keeps counting toward the byte ceiling and can permanently block writes.
+- UP-6 — the boot forced page is deferred by up to one page interval, so a crash-looping
+  process may never perform its boot replay. Records stay durable; the next healthy boot
+  replays them.
+- UP-9 / UP-10 — the persist bounds are a deliberate trade: a slower post-outage drain, and a
+  tick that can still hold `mtx_` for roughly four busy timeouts (bounded, where it was
+  previously unbounded).
+- UP-12 — the `sent:` label namespace has no ceiling of its own and its GC is skipped on every
+  early return, so stale labels can accumulate invisibly to the byte gauge.
+- UP-15 — `stopping_` is a one-way latch with no reset. Harmless today (one `run()` per
+  process) but a trap for any future in-process restart: maintenance would stay off while
+  persist kept writing to the ceiling.
+- UP-16 — the min-blocked inner scan memoizes up to a full slice of parsed batches purely to
+  compute a size, in the memory-pressure regime.
+- UP-3 / UP-4 / UP-17 — a bit flip inside the key timestamp is now decisive for retention
+  ordering; nothing cross-checks key-ts against the value's own `ts_ms`; two agent processes
+  sharing one `kv_store.db` would each replay the other's batches.
+- Test-coverage gaps: the page-side quarantine rename `Conflict` branch, and the persist
+  cap x circuit-breaker interaction. (The KvStore fallible-read branches are now covered for
+  a CLOSED handle and for a real `prepare` failure, both mutation-verified. The remaining
+  hole is a mid-SCAN failure - `rc != SQLITE_DONE` after rows have been returned - which
+  needs a VFS shim; it is shared with the pre-existing `list_entries` and predates #2299.)

@@ -1344,6 +1344,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // records lost" on a fleet whose journal is not even running.
     for (const auto& m : kGuardianJournalMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // The journal AGE family (item 6 + #2364) clears on the same rule. Doubly so, in
+    // fact: its staleness gauges are emitted every heartbeat INCLUDING 0 by a LIVE
+    // worker, so a stale retained series here would misreport a fleet whose workers
+    // all went dark as "fresh forever".
+    for (const auto& m : kGuardianJournalAgeMetrics)
+        metrics.clear_gauge_family(m.gauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1435,8 +1441,17 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // would suppress it and misreport a reporting fleet as absent.
     std::array<double, kNGuardianJournalMetrics> gj_sum{};
     std::array<bool, kNGuardianJournalMetrics> gj_reported{};
+    // The AGE family accumulates as MAX, never SUM - the first non-SUM fleet rollup in
+    // this function, so stated plainly: a fleet SUM of ages is meaningless (two agents
+    // 30 s stale would read as one agent 60 s stale), and the fleet question these
+    // answer is "how bad is the WORST endpoint". The op lives here in the consumer
+    // because the row struct deliberately has no op field (see the table's comment in
+    // guardian_journal_fleet_tags.hpp). `reported` gates publish exactly like the SUM
+    // family: MAX over an empty set is absence, never a fabricated 0.
+    std::array<double, kNGuardianJournalAgeMetrics> gja_max{};
+    std::array<bool, kNGuardianJournalAgeMetrics> gja_reported{};
     // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
-    // unconditionally, including at 0, unlike the 29 - they are server-owned counts
+    // unconditionally, including at 0, unlike the 30 - they are server-owned counts
     // that always have a true value, so 0 is a measurement, not a fabricated zero.
     // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
     // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
@@ -1447,7 +1462,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
-    // temporary key per lookup - 29 per agent per sweep. Built once (same pattern,
+    // temporary key per lookup - 30 per agent per sweep. Built once (same pattern,
     // and the same governance finding, as spark_mech_metric_keys above). It IS
     // registered for static destruction (non-trivial destructor), which is safe only
     // because health_recompute_thread_ - the sole production reader - is joined in
@@ -1456,6 +1471,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         std::array<std::string, kNGuardianJournalMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
             keys[i] = kGuardianJournalMetrics[i].tag;
+        return keys;
+    }();
+    // Same static-destruction-safety rationale as gj_keys directly above.
+    static const std::array<std::string, kNGuardianJournalAgeMetrics> gja_keys = [] {
+        std::array<std::string, kNGuardianJournalAgeMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianJournalAgeMetrics; ++i)
+            keys[i] = kGuardianJournalAgeMetrics[i].tag;
         return keys;
     }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
@@ -1708,6 +1730,26 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (journal_reported_any)
             ++gj_reporting;
+        // AGE family (item 6 + #2364): MAX accumulate. Same parse (an age in seconds
+        // sits far below the 1e9 plausibility ceiling for ~31 years of staleness; a
+        // forged value beyond it is rejected, not clamped - one rogue agent must not
+        // own the fleet MAX forever). Rejections fold into gj_tag_rejected - it counts
+        // "journal tags present but unparseable", which these are. DELIBERATELY not
+        // fed into journal_reported_any/gj_reporting: that meta-gauge's documented
+        // meaning is the COUNTER family's coverage, and quietly widening it would
+        // change a reviewed HELP string's truth. Absence composes with MAX exactly as
+        // with SUM: an absent tag is skipped and simply does not contend.
+        for (std::size_t i = 0; i < kNGuardianJournalAgeMetrics; ++i) {
+            const auto raw = get_view(gja_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_journal_count(raw)) {
+                gja_max[i] = std::max(gja_max[i], *v);
+                gja_reported[i] = true;
+            } else {
+                ++gj_tag_rejected;
+            }
+        }
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -1826,12 +1868,19 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
-    // healthy, quiescent or inert fleet that is ALL 29, which is the correct reading:
+    // healthy, quiescent or inert fleet that is ALL 30, which is the correct reading:
     // the journal has nothing to report, and "nothing to report" must not be
     // presentable as "checked and clean".
     for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
         if (gj_reported[i])
             metrics.gauge(kGuardianJournalMetrics[i].gauge).set(gj_sum[i]);
+    // AGE family: the fleet MAX (worst endpoint), same absent-when-unreported rule.
+    // Post-flip a live fleet publishes the two staleness gauges every sweep (their
+    // writer emits them including 0); pre-flip all three stay absent - dormancy is the
+    // writer's nullopt, and nothing here may fabricate a value for it.
+    for (std::size_t i = 0; i < kNGuardianJournalAgeMetrics; ++i)
+        if (gja_reported[i])
+            metrics.gauge(kGuardianJournalAgeMetrics[i].gauge).set(gja_max[i]);
     // The two meta-signals publish ALWAYS, including 0 - that is the point of them.
     // Not cleared above either: a family that is always written never goes stale.
     metrics.gauge(kGuardianJournalReportingGauge).set(static_cast<double>(gj_reporting));

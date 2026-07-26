@@ -12,6 +12,7 @@
 
 #include "api_token_store.hpp"
 #include "engine_principal_store.hpp"
+#include "engine_store_error_class.hpp" // #2404: assert the terminal-vs-transient class
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -1220,7 +1221,229 @@ TEST_CASE("ApiTokenStore: confirm_rotation rejects an operator who did not initi
     CHECK(real_confirm.has_value());
 }
 
-TEST_CASE("ApiTokenStore: confirm_rotation with no in-flight rotation is rejected",
+TEST_CASE("ApiTokenStore: confirm_rotation sole-credential states are terminal, but a "
+          "genuinely empty read stays retryable (#2404)",
+          "[pg][token][rotation][confirm]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-sole";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    const std::string sole_id = store.list_active_for_principal(principal).at(0).token_id;
+
+    // One never-rotated credential, pin MATCHES it: resolved without a confirm
+    // (confirmed_at == 0). Terminal conflict, NOT the old retryable error —
+    // this is the positive-read guarantee (#2404). Pre-#2384 wording proof: a
+    // client must be told "nothing to confirm", not told to retry.
+    auto resolved = store.confirm_rotation(principal, sole_id, "admin");
+    REQUIRE_FALSE(resolved.has_value());
+    CHECK(resolved.error().find("already the sole active credential") != std::string::npos);
+    CHECK(classify_engine_store_error(resolved.error()) == E::Conflict);
+
+    // One credential, pin does NOT match it: the pinned rotation moved on.
+    auto other = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef", "admin");
+    REQUIRE_FALSE(other.has_value());
+    CHECK(other.error().find("the rotation was resolved") != std::string::npos);
+    CHECK(classify_engine_store_error(other.error()) == E::Conflict);
+
+    // Now revoke the sole credential so the read is genuinely EMPTY. That case
+    // is ambiguous with a swallowed SELECT failure, so it MUST stay the
+    // retryable "no in-flight rotation to confirm" (Transient), never a
+    // terminal 409 (regression guard for the positive-read boundary).
+    REQUIRE(store.revoke_token(sole_id).value());
+    REQUIRE(store.list_active_for_principal(principal).empty());
+    auto none = store.confirm_rotation(principal, sole_id, "admin");
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error().find("no in-flight rotation to confirm") != std::string::npos);
+    CHECK(classify_engine_store_error(none.error()) == E::Transient);
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation replay after success is a terminal already-confirmed "
+          "conflict, not a retryable 503 (#2404)",
+          "[pg][token][rotation][confirm]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-replay";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // First confirm succeeds (the real cutover).
+    REQUIRE(store.confirm_rotation(principal, successor_id, "admin").has_value());
+
+    // The network-dropped-200 replay: SAME args. The successor is now the sole
+    // active credential with confirmed_at set, so this is terminal, not 503.
+    auto replay = store.confirm_rotation(principal, successor_id, "admin");
+    REQUIRE_FALSE(replay.has_value());
+    CHECK(replay.error().find("rotation already confirmed") != std::string::npos);
+    CHECK(replay.error().find("sole active credential") != std::string::npos);
+    CHECK(classify_engine_store_error(replay.error()) == E::Conflict);
+    // No side effect: still exactly one active credential.
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation after the sweep cuts over is a terminal "
+          "already-resolved conflict (#2404)",
+          "[pg][token][rotation][confirm][sweep]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-swept";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // The overlap sweep auto-revokes the predecessor and clears the successor
+    // (which was never confirmed: confirmed_at stays 0).
+    store.sweep_expired_rotations(now + kDay + 1);
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == successor_id);
+    CHECK(active[0].confirmed_at == 0); // resolved by sweep, not by a confirm
+
+    // A confirm racing the sweep now finds the successor resolved. Terminal,
+    // and worded "no rotation in flight" (not "already confirmed") because the
+    // cutover was the sweep, not an explicit confirm. Assert the contiguous
+    // fragment unique to kSoleResolved ("already the sole active credential"):
+    // it disambiguates from kSoleConfirmed ("is the sole...") and kSoleOtherToken
+    // (no "sole active credential") in a single check, so a partial message
+    // drift on one branch can't false-pass (qe review, #2404).
+    auto swept_confirm = store.confirm_rotation(principal, successor_id, "admin");
+    REQUIRE_FALSE(swept_confirm.has_value());
+    CHECK(swept_confirm.error().find("no rotation in flight") != std::string::npos);
+    CHECK(swept_confirm.error().find("already the sole active credential") != std::string::npos);
+    CHECK(classify_engine_store_error(swept_confirm.error()) == E::Conflict);
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation with more than two active credentials is a terminal "
+          "client error, not a retryable 503 (#2404)",
+          "[pg][token][rotation][confirm]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-overfull";
+    auto now = test_now_epoch();
+    // The store's create_token has no ≤2 ceiling (only the mint route does), so
+    // three direct mints reproduce the "credential minted outside rotation"
+    // shape (same setup as the rotate over-ceiling test).
+    REQUIRE(store.create_token("a", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("b", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("c", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 3);
+
+    auto over = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef", "admin");
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error().find("more than two active credentials") != std::string::npos);
+    CHECK(classify_engine_store_error(over.error()) == E::ClientValidation);
+    CHECK(store.list_active_for_principal(principal).size() == 3); // never arbitrated
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation on a sole credential with stale rotation linkage is "
+          "terminal and does NOT advise rotate (#2404 F1)",
+          "[pg][token][rotation][confirm]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotation-confirm-stale-linkage";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string predecessor_id, successor_id;
+    for (const auto& t : store.list_active_for_principal(principal)) {
+        if (t.supersedes_token_id.empty())
+            predecessor_id = t.token_id;
+        else
+            successor_id = t.token_id;
+    }
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Manufacture the F1 defect state: revoke the predecessor by DIRECT SQL,
+    // bypassing revoke_token's resolve_rotation_pair_after_revoke, so the
+    // surviving successor keeps its (now stale) rotation_group + supersedes.
+    // This is the durable state a best-effort pair-resolve failure leaves.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql =
+            "UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = '" +
+            predecessor_id + "';";
+        PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.ok());
+    }
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == successor_id);
+    CHECK_FALSE(active[0].rotation_group.empty()); // stale linkage survived
+
+    auto stale = store.confirm_rotation(principal, successor_id, "admin");
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error().find("unresolved rotation metadata") != std::string::npos);
+    CHECK(classify_engine_store_error(stale.error()) == E::Conflict);
+    // MUST NOT tell the operator to rotate from this state (rotating would
+    // strand a malformed pair). It says "do not rotate", never "rotate again".
+    CHECK(stale.error().find("do not rotate") != std::string::npos);
+    CHECK(stale.error().find("rotate again") == std::string::npos);
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation never misattributes a historical confirmed_at across "
+          "a later rotation (#2404 F2)",
           "[pg][token][rotation][confirm]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1229,15 +1452,50 @@ TEST_CASE("ApiTokenStore: confirm_rotation with no in-flight rotation is rejecte
     store.set_engine_referent_check(
         [](const std::string&) { return EngineLookupStatus::Active; });
 
-    const std::string principal = "engine:rotation-confirm-none";
+    const std::string principal = "engine:rotation-confirm-historical";
     auto now = test_now_epoch();
     REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
                 .has_value());
 
-    // Only one active credential — nothing to confirm. (Any non-empty
-    // token_id: the no-pair rejection fires before the #2384 id match.)
-    auto confirmed = store.confirm_rotation(principal, "deadbeefdeadbeefdeadbeef", "admin");
-    REQUIRE_FALSE(confirmed.has_value());
+    // R1: rotate + confirm. S1 becomes the sole active credential, confirmed.
+    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
+                .has_value());
+    std::string s1_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            s1_id = t.token_id;
+    REQUIRE_FALSE(s1_id.empty());
+    REQUIRE(store.confirm_rotation(principal, s1_id, "admin").has_value());
+    REQUIRE(store.get_token(s1_id).value()->confirmed_at > 0); // S1 carries R1's marker
+
+    // R2: rotate again (S1 is now the predecessor, KEEPING its confirmed_at),
+    // then revoke R2's successor so the pair resolves back to S1 alone.
+    REQUIRE(store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin")
+                .has_value());
+    std::string s2_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            s2_id = t.token_id;
+    REQUIRE_FALSE(s2_id.empty());
+    REQUIRE(store.revoke_token(s2_id).value()); // resolves the pair -> S1 sole, clear
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == s1_id);
+
+    // Pin = S1 (the confirmed survivor): "already confirmed" is TRUE and
+    // correct — the rotation in which S1 was successor (R1) WAS confirmed.
+    auto pin_s1 = store.confirm_rotation(principal, s1_id, "admin");
+    REQUIRE_FALSE(pin_s1.has_value());
+    CHECK(pin_s1.error().find("rotation already confirmed") != std::string::npos);
+
+    // Pin = S2 (R2's successor, which was resolved by REVOKE, not confirm):
+    // the message must NOT claim "already confirmed" — it says "the rotation
+    // was resolved", the cause-agnostic wording for a non-matching pin. This
+    // is the F2 guard: historical confirmed_at never attributes R2's cause.
+    auto pin_s2 = store.confirm_rotation(principal, s2_id, "admin");
+    REQUIRE_FALSE(pin_s2.has_value());
+    CHECK(pin_s2.error().find("the rotation was resolved") != std::string::npos);
+    CHECK(pin_s2.error().find("already confirmed") == std::string::npos);
 }
 
 TEST_CASE("ApiTokenStore: confirm_rotation rejects a token_id that is not the pending "

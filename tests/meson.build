@@ -233,7 +233,12 @@ agent_test_exe = executable(
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
   # thread_pool.hpp directly in the test TU, so it needs fmt symbols linked here.
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep],
+  # sqlite3_dep: test_kv_store.cpp opens a SECOND raw connection to the same file to
+  # provoke a genuine SQLite failure (dropping the table so prepare fails), which is the
+  # only way to exercise KvStore's fallible-read branches end to end rather than through
+  # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
+  # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
@@ -388,6 +393,7 @@ if build_server
       'unit/server/test_mfa_store.cpp',
       'unit/server/test_auth_lockout.cpp',
       'unit/server/test_auth_break_glass.cpp',
+      'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
@@ -410,6 +416,7 @@ if build_server
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
@@ -439,10 +446,15 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
+      # #2367: test-only definition of EngineLivenessTestAccess::revalidate,
+      # kept OFF the production link line so the private cached path has no
+      # public trampoline in server_core.
+      'unit/server/engine_liveness_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
       'unit/server/test_engine_store_error_class.cpp',
+      'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
       'unit/server/test_rest_access_review.cpp',
@@ -500,6 +512,7 @@ if build_server
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
       'unit/server/test_mcp_stream.cpp',
+      'unit/server/test_mcp_stream_bridge.cpp',
       'unit/server/test_sse_saturation.cpp',
       'unit/server/test_mcp_transport.cpp',
       'unit/server/test_process_health.cpp',
@@ -565,7 +578,7 @@ if build_server
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
       'unit/server/test_scim_store.cpp',
-      'unit/server/test_scim_group_store.cpp',
+      'unit/server/test_scim_store_pg.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
     ),
@@ -630,15 +643,32 @@ if build_server
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
-  # promised): two test() entries over the SAME binary, partitioned by Catch2
+  # promised): test() entries over the SAME binary, partitioned by Catch2
   # tag filter. '~[pg]' is everything not Postgres-backed; '[pg]' is the
-  # Postgres-substrate cases (~72 cases across 28 files). The complement is
-  # exact: every Postgres-touching test carries [pg] and no [pg] test is
-  # hidden ([.]), so the shards partition the visible case set with nothing
-  # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
-  # meson runs the entries in parallel, so suite wall time is max(shards),
-  # and each shard gets its own budget. Both budgets are sized for the *contended*
-  # Wee Tam box, not per-op cost: ~[pg] = 600s (quiet Windows ~231s), [pg] = 900s.
+  # Postgres-substrate cases. The complement is exact: every Postgres-touching
+  # test carries [pg] and no [pg] test is hidden ([.]), so the shards partition
+  # the visible case set with nothing lost or run twice (guard: --list-tests
+  # counts, N_all == N_nonpg + N_pg).
+  #
+  # RE-SHARDED 2026-07-16 (auth.db -> Postgres migration, ADR-0006): that cutover
+  # moved the entire auth/scim/mfa/route surface onto Postgres, ~doubling [pg]
+  # from ~330 to ~660 cases. Two failure modes surfaced and are fixed here:
+  #   (1) ~180 newly-Postgres route/store tests had been left UNTAGGED, so they
+  #       ran in the ~[pg] shard — a partition violation (they only skip-not-run
+  #       there when a DSN is absent; with a DSN, e.g. every CI leg, they RUN and
+  #       inflate ~[pg]). Empirical fix: every case that skips a no-DSN run via
+  #       the PG helper now carries [pg] (verified: ~[pg] no-DSN POSTGRES-skips == 0).
+  #   (2) the single ~660-case [pg] entry blew the 900s budget on the slow
+  #       GHA-hosted macos-15 runner. [pg] is now SPLIT into two balanced shards
+  #       by a count-based discriminator (per-case CREATE DATABASE ... TEMPLATE
+  #       clone cost is near-uniform, so case-count tracks wall time):
+  #         shard A = [pg] AND (routes|store|token)   ~321 cases
+  #         shard B = [pg] AND NOT (routes|store|token) ~338 cases
+  #       Exact-partition guard: N([pg]) == N(A) + N(B). meson runs all three
+  #       entries in parallel, so suite wall time is max(shard).
+  # Budgets are sized for the *contended* Wee Tam box, not per-op cost:
+  # ~[pg] = 600s (quiet Windows ~231s); each [pg] half = 600s (each is ~half the
+  # old 900s full-[pg] load, so 600s is generous even under Wee Tam c4 contention).
   #
   # HISTORY / do-not-regress: [pg] was raised 600->900 on 2026-07-14 when the
   # fsync-bound CREATE DATABASE ... TEMPLATE + DROP DATABASE WITH (FORCE) (~20x
@@ -656,18 +686,23 @@ if build_server
   # caps concurrent heavy Windows test phases per box), NOT a bigger budget —
   # raising a number just moves the cliff. A real hang is still bounded by the
   # job-level timeouts (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2
-  # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in both shards —
+  # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in all shards —
   # idempotent, harmless without a DSN. Constraints the shards must keep:
   #   - only tag-filter specs may appear in args (flake-retry.py strips
   #     positional tag specs before an isolated case retry — Catch2 ORs
-  #     positional specs);
-  #   - neither entry name may be a substring of the other (flake-retry maps
-  #     meson-junit names by longest substring match).
+  #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
+  #     inside a single arg; multiple positional args would AND, not OR);
+  #   - no entry name may be a substring of another (flake-retry maps
+  #     meson-junit names by longest substring match) — 'shard A'/'shard B'
+  #     and 'server unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
   test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
-  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
+  test('server pg unit tests shard A', server_test_exe,
+       args: ['[pg][routes],[pg][store],[pg][token]'], suite: 'server', timeout: 600)
+  test('server pg unit tests shard B', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

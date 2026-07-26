@@ -71,21 +71,25 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <thread>
 
 namespace yuzu::agent {
 
 class GuardianLifecycleJournal;
 
-/// Journal REPLAY-PAGE cadence. Load-bearing (#2298 governance f-1/A1): a paging pass is
-/// a full `list_entries` + parse + `validate_record` sweep of the journal, and
-/// JournalPagingBucket charges a token only when a batch pages NET-NEW work. So when the
-/// send window already holds every candidate - the normal state while the link is down and
-/// the backlog is retained - the bucket never throttles and every wake rescans the whole
-/// journal. Since the drain worker wakes on EVERY outbox enqueue, "page on every wake" is
-/// unbounded scan cost driven by the event rate. 30 s restores exactly the pre-C0 rate (one
+/// Journal REPLAY-PAGE cadence. Load-bearing (#2298 governance f-1/A1): a paging pass scans
+/// the whole batch-key namespace, and JournalPagingBucket charges a token only when a batch
+/// pages NET-NEW work. So when the send window already holds every candidate - the normal
+/// state while the link is down and the backlog is retained - the bucket never throttles and
+/// every wake rescans. Since the drain worker wakes on EVERY outbox enqueue, "page on every
+/// wake" is scan cost driven by the event rate. 30 s restores exactly the pre-C0 rate (one
 /// page per heartbeat tick); the reconnect kick still forces an immediate page, so replay
 /// promptness is unaffected.
+///
+/// The per-pass cost is much lower since #2299 - the scan reads keys and value lengths, and
+/// values are read only for the candidates actually considered - but the cadence still bounds
+/// the SCAN, which no amount of lazy parsing removes.
 inline constexpr std::chrono::milliseconds kGuardianJournalPageInterval{30'000};
 
 /// Retention-prune cadence. TIME-based for the same reason, and additionally because the
@@ -106,6 +110,17 @@ inline constexpr std::size_t kGuardianDrainBudget = 512;
 /// condition-variable wait is no bound at all, because that wait returns immediately whenever
 /// an enqueue already moved the generation (#2345 Gate 4 UP-1).
 inline constexpr std::chrono::milliseconds kGuardianMinRefillInterval{1'000};
+
+/// How far a RECONNECT-forced page may be deferred when jitter is on (item 12). Small on
+/// purpose: the kick exists for promptness, and replay volume is bucket-paced anyway, so a
+/// few seconds of fleet spread costs nothing an operator would notice while turning a
+/// simultaneous fleet-wide journal scan into a smear.
+inline constexpr std::chrono::milliseconds kGuardianForcedPageJitterMax{5'000};
+
+/// A uniform offset in [0, upper). Free function so the distribution itself is unit-testable
+/// without a running worker. `upper <= 0` yields 0 (a zero interval means "no cadence").
+[[nodiscard]] YUZU_EXPORT std::chrono::milliseconds
+guardian_jitter_offset(std::mt19937& rng, std::chrono::milliseconds upper);
 
 /// Wall-clock companion to kGuardianDrainBudget. 512 entries bounds the COUNT but not the
 /// TIME: at a pathological seconds-per-send it is still minutes, and the worker may be
@@ -133,6 +148,18 @@ struct GuardianMaintenanceConfig {
     /// slow-but-succeeding send makes an N-entry pass arbitrarily long while
     /// GuardianEngine::stop() waits on our join (#2298 Sol review).
     std::chrono::milliseconds drain_max_wall{kGuardianDrainMaxWall};
+    /// Spread this agent's maintenance phase over its interval (C0 flip-checklist item 12).
+    /// Every agent boots its worker at its own start, so nothing correlates the CADENCE
+    /// across a fleet - but the FORCED passes do correlate: a gateway bounce or a restored
+    /// snapshot hands every agent a boot/reconnect page in the same second, each a full
+    /// journal scan and a token burst. Jitter is aimed at that burst.
+    ///
+    /// Default OFF and enabled explicitly by production wiring. Inferring it from whatever
+    /// else a caller configured would be worse than useless in tests: several drive a live
+    /// worker without overriding any timing, including the production-boot-order regression
+    /// that depends on the worker running IMMEDIATELY - a hollow pass is the failure mode
+    /// there, not a red one.
+    bool jitter{false};
 };
 
 /// Which maintenance passes to run this cycle. The CALLER owns cadence - the worker loop
@@ -170,6 +197,20 @@ struct GuardianMaintenanceResult {
     std::size_t skipped_already_sent{0};
     /// The sent-label scan failed and the pass fell back to re-offering everything.
     bool sent_scan_failed{false};
+    /// THE page-side gate signal (#2452 Gate 7): the pass placed records or positively verified a
+    /// clean idle backlog (JournalPageStats::progress_or_verified_idle). False on EVERY no-work
+    /// exit - deferred, sent-scan/candidate/value read failure, boot-prune barrier, headroom-
+    /// blocked, quarantine-only, null-kv, a stopping_ bail - so the drain worker's page success
+    /// stamp advances iff this is true (mirrors the prune side gating on prune_progress_or_verified).
+    bool progress_or_verified_idle{false};
+    /// A prune pass was requested and ran (mirrors page_attempted for the retention side).
+    bool prune_attempted{false};
+    /// THE prune-side gate signal (JournalPruneStats::progress_or_verified, #2452 Gate 8): retention
+    /// was applied or verified idle. False on every no-work prune exit - scan failure, delete
+    /// failure, and any stop before the delete - so the prune success stamp advances only on this
+    /// (the prune-side mirror of progress_or_verified_idle; closes UP-7 delete-fail + UP8-3
+    /// stop-abort that gating on read_ok alone left open).
+    bool prune_progress_or_verified{false};
 };
 
 class YUZU_EXPORT GuardianOutboxDrainWorker {
@@ -213,6 +254,36 @@ public:
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
 
+    /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
+    /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by
+    /// that mutex, and a doc comment is not a synchronization primitive - a later caller
+    /// would otherwise race the loop's own draws and trip TSan rather than fail visibly.
+    void seed_jitter_rng_for_test(std::uint32_t seed) {
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        jitter_rng_.seed(seed);
+    }
+
+    /// TEST-ONLY: the steady-clock ms before which a pending forced page will not be
+    /// consumed (0 = none). Reading it is how a test observes a DEFERRED force without
+    /// asserting a wall-clock upper bound.
+    [[nodiscard]] std::int64_t force_page_not_before_ms_for_test() {
+        std::lock_guard<std::mutex> lk{sig_->mu};
+        return force_page_not_before_ms_;
+    }
+
+    /// TEST-ONLY: arm a ONE-SHOT throw in loop()'s own tail - the un-firewalled arithmetic and
+    /// the refill re-arm's rt_.lifecycle_headroom() call (std::mutex::lock can throw
+    /// std::system_error), which sit OUTSIDE every inner firewall. Nothing in production can
+    /// make that tail throw, so the thread lambda's top-level catch and its
+    /// journal_maint_exceptions_ increment are otherwise unexercised (flip item 13). The seam
+    /// fires exactly once and kills this one-shot worker, so it is a boolean, not a countdown -
+    /// a second cycle can never consume a second throw. Relaxed atomic, written before start()
+    /// (thread creation is the happens-before edge), read only on the worker thread; no lock,
+    /// no mtx_ contact. No production caller.
+    void inject_loop_tail_throw_for_test() noexcept {
+        inject_loop_tail_throw_.store(true, std::memory_order_relaxed);
+    }
+
     /// Deterministic test seam (also the worker thread's own loop body): run the
     /// maintenance passes named by `ops` synchronously on the caller's thread. Holds no
     /// timer state of its own, so unlike a cadence-owning variant it is safe to call
@@ -235,6 +306,38 @@ public:
     /// different operator responses, so they are deliberately not one number. Lock-free.
     [[nodiscard]] std::uint64_t journal_maint_exception_count() const noexcept {
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
+    }
+
+    /// steady_clock ms of the last PAGE maintenance pass that made REPLAY PROGRESS or positively
+    /// established there was none, seeded non-zero at start() (flip item 6 / item 14). 0 means
+    /// start() has not run - the reader treats that as "no worker", not as an age. The cadence
+    /// locals in loop() advance even when a pass throws (deliberate min-GAP pacing); this stamp
+    /// advances only on a pass that did not throw, was not stop-aborted, AND either PLACED records
+    /// (records_paged > 0 - demonstrable progress, so a stray same-pass read failure does not make
+    /// it stale) or cleanly established there was nothing to page (not deferred_no_token, not
+    /// sent_scan_failed, and not read_failed - the candidate scan, a candidate value read, or the
+    /// boot-prune barrier's scan failing). So a dead thread, a permanently-throwing pass, a
+    /// permanently token-starved worker, or one whose reads permanently fail (INCLUDING a
+    /// journal-read failure from boot that keeps the boot-prune barrier from latching) all read as
+    /// an ever-growing age on the heartbeat. This CLOSES the former UP-4/UP-11 blind spot (#2452):
+    /// a deferred or read-failed pass used to stamp "fresh" here while zero replay happened, so the
+    /// gauge is now a replay-progress-or-verified-idle signal, not merely a loop-liveness one. Read
+    /// failures also keep their own counter (page_read_failures), except the boot-barrier case
+    /// which is counted on prune_failures. Lock-free.
+    [[nodiscard]] std::uint64_t last_page_success_steady_ms() const noexcept {
+        return last_page_success_steady_ms_.load(std::memory_order_relaxed);
+    }
+    /// PRUNE sibling of last_page_success_steady_ms() - separate because the two passes run
+    /// on different cadences (30 s page / 120 s prune) and stall independently. Advances only on a
+    /// prune that genuinely RAN retention: it did not throw, a stop did not abort it, and it applied
+    /// the delete OR verified nothing was eligible (JournalPruneStats::progress_or_verified, the
+    /// prune-side mirror of the page stamp's positive flag). A prune whose scan fails, whose DELETE
+    /// fails, or that a stop aborts before the delete returns without throwing, so gating on "did
+    /// not throw" (or on scan-only read_ok) would read a stalled retention loop as fresh (#2452
+    /// Gate 8, closing UP-7 delete-fail + UP8-3 stop-abort). A forward-clock-jump wipe still advances
+    /// it (the delete DID succeed - the L5 clock-guard #2360/#2361 owns that, not this gauge).
+    [[nodiscard]] std::uint64_t last_prune_success_steady_ms() const noexcept {
+        return last_prune_success_steady_ms_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -271,10 +374,26 @@ private:
     std::thread thread_;
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
+    /// Success stamps for the staleness gauges (item 6). Seeded at start() (clamped >= 1 so
+    /// 0 stays the unambiguous "never started" sentinel even right after boot, where
+    /// steady_clock's epoch-relative reading can itself be ~0), stored at the loop's
+    /// maintenance call sites only when the firewalled pass did not throw.
+    std::atomic<std::uint64_t> last_page_success_steady_ms_{0};
+    std::atomic<std::uint64_t> last_prune_success_steady_ms_{0};
     /// Set by notify(), cleared by the loop: force ONE page irrespective of cadence.
     /// Seeded TRUE so the first cycle replays the journal at boot without waiting out
     /// kDefaultPageInterval.
     std::atomic<bool> force_page_{true};
+    /// TEST-ONLY one-shot: make loop()'s tail throw once (item 13). Consumed by exchange, so it
+    /// arms a single throw. Default false = inert in production (one relaxed load per cycle).
+    std::atomic<bool> inject_loop_tail_throw_{false};
+    /// Earliest steady-clock ms at which a pending forced page may be consumed (item 12).
+    /// 0 = no deferral. Written under sig_->mu (by notify() and the loop) so the loop can
+    /// derive its wait deadline from it without a second synchronisation point.
+    std::int64_t force_page_not_before_ms_{0};
+    /// Per-agent jitter source. Touched only under sig_->mu, or on the worker thread before
+    /// start() publishes it.
+    std::mt19937 jitter_rng_;
 };
 
 

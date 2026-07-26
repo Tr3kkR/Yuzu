@@ -203,6 +203,33 @@ successor PR that restructures `gc_terminal_channels` or adds a new path
 that erases from `channels_` while holding a channel mutex must preserve
 this ordering. Lock hierarchy is `map_mu_` → `ch->mu`, never reversed.
 
+### Terminal-visit primitive (#2409)
+
+`ExecutionEventBus::unsubscribe_and_visit_terminal(execution_id, sub_id, f)`
+runs a caller-supplied claim callback `f` under a **single hold of one
+channel's mutex**, then erases the listener **iff `f` claimed**. It is the
+MCP progress bridge's fix for a race where the sweep could unsubscribe a
+parked streamed record and then synthesize a spurious `-32014`
+terminal-unavailable frame over an execution that had actually completed —
+because a terminal published into the unsubscribe→re-check window was never
+latched. Two invariants a successor PR must not break:
+
+- **The verdict keys on `Channel::first_terminal_id`, not an event-type
+  scan.** `refresh_counts` publishes a terminal-flagged `execution-progress`
+  *before* `execution-completed` (two publishes, `ch->mu` released between),
+  so the *first* terminal-flagged event is a progress event; a scan for
+  `event_type == "execution-completed"` misclassifies. A marker that has
+  aged out of the ring is `kTerminalKnownLost` → the caller's safe
+  success-shaped fallback ("fetch by execution_id"); it deliberately does
+  **not** recover a later buffered `execution-completed`, which could be a
+  spurious `mark_cancelled` terminal (#2409 UP-1).
+- **`f` runs under `ch->mu` and must never call back into the bus** (a bus
+  call taking `map_mu_` would invert the `map_mu_` → `ch->mu` order above)
+  and must be erase-only-on-claim: every *defer* keeps the listener, so a
+  deferred terminal channel is never listener-less and never GC-eligible
+  out from under the record. The full contract lives on the method in
+  `execution_event_bus.hpp`.
+
 ### Client-side bootstrap is data-attribute-driven
 
 The list-row markup carries `data-execution-id` and
@@ -240,14 +267,24 @@ agentic route wraps every event in
 subscribed to one channel can still discriminate events without out-of-
 band context.
 
-**Two consumers, one bus, one set of publisher invariants** — the
+**Three consumers, one bus, one set of publisher invariants** - the
 publisher list above (`update_agent_status` / `refresh_counts` /
 `mark_cancelled` → `agent-transition` / `execution-progress` /
-`execution-completed`) is the single taxonomy both routes emit. A new
-event type must be added on the bus side first; both routes pick it up
-transparently. **Do not add a route-specific event type to either
-sibling** — that would split the taxonomy and break the A3 invariant
-that a single deterministic step name appears on every channel.
+`execution-completed`) is the single taxonomy every consumer reads. The
+three live consumers are (1) the dashboard SSE route
+(`execution.live_subscribe`), (2) the agentic route
+(`api.v1.events.subscribe`, `GET /api/v1/events`), and (3) the **MCP
+progress bridge** (track 2f PR 3a, `McpStreamBridge`), a *consumer-side
+projection only*: it maps the same bus events onto an MCP session's `GET`
+stream as `notifications/progress` + a final JSON-RPC response, adds **no
+bus event type** and renames no step. The bridge subscribes via
+`ExecutionEventBus::subscribe_and_replay` (atomic install-then-replay,
+closing the `replay_since`+`subscribe` race the two older siblings still
+carry - tracked for migration in #2410). A new event type must be added
+on the bus side first; every consumer picks it up transparently. **Do not
+add a consumer-specific event type** - that would split the taxonomy and
+break the A3 invariant that a single deterministic step name appears on
+every channel.
 
 The agentic route's audit verb is `api.v1.events.subscribe` (separate
 from `execution.live_subscribe` so SIEM filters can distinguish browser
