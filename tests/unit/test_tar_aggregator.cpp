@@ -21,6 +21,7 @@
 #include <format>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -865,6 +866,21 @@ void seed_process_hourly_at(TarDatabase& db, int64_t ts, int count) {
     REQUIRE(db.execute_sql("COMMIT"));
 }
 
+// Insert `count` process_monthly rows all stamped at exactly `ts`. The monthly
+// tier is the one whose retention window (~365d) exceeds kTarMinBigStepSec, so
+// it is the only tier that can tell an ABSOLUTE step threshold apart from the
+// max(window, constant) shape an earlier round used.
+void seed_process_monthly_at(TarDatabase& db, int64_t ts, int count) {
+    REQUIRE(db.execute_sql("BEGIN TRANSACTION"));
+    for (int i = 0; i < count; ++i) {
+        REQUIRE(db.execute_sql(std::format("INSERT INTO process_monthly "
+                                           "(month_ts,name,user,start_count,stop_count) "
+                                           "VALUES ({}, 'svc.exe', 'SYSTEM', 1, 1)",
+                                           ts)));
+    }
+    REQUIRE(db.execute_sql("COMMIT"));
+}
+
 struct TarGuardFixture {
     yuzu::test::TempDbFile tmp{std::string_view{"tar-2361-"}};
     std::optional<TarDatabase> db;
@@ -1000,6 +1016,45 @@ TEST_CASE("TAR #2361: a sub-window forward jump is caught by the step check",
 
     CHECK(row_count(*f.db, "process_hourly") == 7); // nothing deleted
     CHECK(declines_of(f.guard, "process_hourly") == 1);
+}
+
+TEST_CASE("TAR #2361: a month-long jump fires on the MONTHLY tier",
+          "[tar][retention][clock-guard]") {
+    // The mutation-pinning sibling of the audit store's DEFAULT-retention test.
+    //
+    // The threshold used to be max(tier window, kTarMinBigStepSec). On the monthly
+    // tier that window is ~365 days, which put the threshold a YEAR out, so the
+    // step check could never fire there -- and the outcome test is separately
+    // defeated by any row written after the jump, which do_rollup reliably
+    // produces. Both detectors were inert on the tier holding the LONGEST
+    // forensic history, which is the one an investigator reaches for.
+    //
+    // Every other step test in this file uses process_hourly (window 86400s),
+    // where the 30-day constant dominated under BOTH shapes -- which is exactly
+    // why none of them caught it, and why this one must use the monthly tier.
+    constexpr int64_t kMonthlyWindow = 31536000; // process/monthly, tar_schema_registry.cpp
+    static_assert(kMonthlyWindow > yuzu::tar::kTarMinBigStepSec,
+                  "the monthly window must exceed the constant, or this test cannot tell an "
+                  "absolute threshold apart from max(window, constant) and stops pinning it");
+    TarGuardFixture f;
+
+    // Pass 1: an expired backlog plus an in-window survivor, so would_wipe is
+    // false and the pass deletes normally, anchoring the stored clock reading.
+    seed_process_monthly_at(*f.db, kT0 - kMonthlyWindow - 100, 5);
+    seed_process_monthly_at(*f.db, kT0 - 3600, 1); // survivor for pass 1
+    run_retention(*f.db, kT0, f.guard);
+    REQUIRE(row_count(*f.db, "process_monthly") == 1);
+    REQUIRE(declines_of(f.guard, "process_monthly") == 0);
+
+    // 45 days on: comfortably past the 30-day constant, nowhere near the 365-day
+    // window. Under max(window, constant) this jump is invisible on this tier.
+    const int64_t jumped = kT0 + 45 * 86400;
+    seed_process_monthly_at(*f.db, kT0 - kMonthlyWindow - 50, 5);
+    seed_process_monthly_at(*f.db, jumped - 3600, 1); // survivor, so only the STEP can fire
+    run_retention(*f.db, jumped, f.guard);
+
+    CHECK(row_count(*f.db, "process_monthly") == 7); // nothing deleted
+    CHECK(declines_of(f.guard, "process_monthly") == 1);
 }
 
 TEST_CASE("TAR #2361: an ordinary over-cap backlog does NOT arm the latch",
@@ -1480,6 +1535,7 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
 
     std::atomic<bool> stop{false};
     std::mutex ack_mu;
+    std::condition_variable ack_cv;
     std::vector<int> acknowledged;
     std::thread writer([&] {
         int n = 0;
@@ -1488,6 +1544,7 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
             if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
                 std::lock_guard lk(ack_mu);
                 acknowledged.push_back(mine);
+                ack_cv.notify_one();
             }
         }
     });
@@ -1502,6 +1559,24 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
                 t.join();
         }
     } joiner{stop, writer};
+
+    // Wait for the writer to land at least one COMMITTED write BEFORE racing it.
+    // The contract under test is "no acknowledged write is discarded", which needs
+    // an acknowledged write to exist; without this the test relied on the writer
+    // thread being scheduled during run_retention, which on a loaded box it often
+    // is not (measured: 5/10 failures under CPU contention, 0/40 idle). Both CI
+    // pools run four runner agents on ONE box, so contention is the normal
+    // condition there, not the exceptional one. The writer keeps running through
+    // run_retention below, so the race this test exists for is unchanged -- only
+    // the precondition is now waited for instead of assumed.
+    //
+    // Declared after `joiner` so a timeout here still stops and joins the writer
+    // rather than terminating on a joinable thread.
+    {
+        std::unique_lock lk(ack_mu);
+        REQUIRE(ack_cv.wait_for(lk, std::chrono::seconds(30),
+                                [&] { return !acknowledged.empty(); }));
+    }
 
     run_retention(*f.db, kT0, f.guard);
     stop.store(true, std::memory_order_relaxed);
