@@ -17,8 +17,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+
 using yuzu::server::audit_retention::Anomaly;
 using yuzu::server::audit_retention::classify;
+using yuzu::server::audit_retention::moved_at_least;
 
 TEST_CASE("audit classify: the whole truth table", "[audit_store][audit_rules]") {
     struct Row {
@@ -50,7 +53,7 @@ TEST_CASE("audit classify: the whole truth table", "[audit_store][audit_rules]")
         // server whose clock legitimately moved.
         {false, false, false, false, Anomaly::None, "quiet pass"},
         {false, false, true, false, Anomaly::None, "step but nothing to delete"},
-        {false, true, false, false, Anomaly::None, "would-wipe cannot arise with nothing expired"},
+        {false, true, false, false, Anomaly::None, "would-wipe with nothing expired: real when retention is off"},
         {false, true, true, false, Anomaly::None, "neither matters with nothing expired"},
 
         // Rows expired: step outranks wipe.
@@ -65,17 +68,64 @@ TEST_CASE("audit classify: the whole truth table", "[audit_store][audit_rules]")
     for (const Row& r : kRows) {
         INFO(r.why << " (has_expired=" << r.has_expired << " would_wipe=" << r.would_wipe
                    << " big_step=" << r.big_step << " prev_unusable=" << r.prev_unusable << ")");
-        CHECK(classify(r.has_expired, r.would_wipe, r.big_step, r.prev_unusable) == r.want);
+        CHECK(classify({.has_expired = r.has_expired,
+                        .would_wipe = r.would_wipe,
+                        .big_step = r.big_step,
+                        .prev_unusable = r.prev_unusable}) == r.want);
     }
+}
+
+TEST_CASE("audit moved_at_least: magnitude in either direction, overflow-free",
+          "[audit_store][audit_rules]") {
+    constexpr std::int64_t kFloor = 7 * 86'400;
+
+    SECTION("symmetric: the same movement counts whichever way it went") {
+        CHECK(moved_at_least(1'000'000, 1'000'000 + kFloor, kFloor));
+        CHECK(moved_at_least(1'000'000 + kFloor, 1'000'000, kFloor));
+        CHECK_FALSE(moved_at_least(1'000'000, 1'000'000 + kFloor - 1, kFloor));
+        CHECK_FALSE(moved_at_least(1'000'000 + kFloor - 1, 1'000'000, kFloor));
+    }
+
+    SECTION("a one-second regression is NOT an event") {
+        // The BLOCKING regression this floor exists to prevent: an event forces
+        // the non-deleting branch, so treating sub-floor jitter as an event
+        // halts retention permanently.
+        CHECK_FALSE(moved_at_least(1'000'000, 999'999, kFloor));
+    }
+
+    SECTION("recovery out of negative time is an event and does not overflow") {
+        // Dead CMOS reads 1969, NTP corrects to the present. The SIGNED
+        // difference of these two overflows; the magnitude must not.
+        CHECK(moved_at_least(-2'000'000'000, 1'700'000'000, kFloor));
+
+        // These are the ones that matter. INT64_MIN/2 to INT64_MAX/2 does NOT
+        // overflow, so an earlier version of this section passed against a
+        // signed-subtraction implementation and proved nothing. The stored
+        // reading is attacker- or corruption-controlled and is only sanitised
+        // AFTER this helper runs, so a genuinely extreme pair is reachable.
+        CHECK(moved_at_least(INT64_MIN, INT64_MAX, kFloor));
+        CHECK(moved_at_least(INT64_MAX, INT64_MIN, kFloor));
+        CHECK(moved_at_least(INT64_MIN, 0, kFloor));
+        CHECK(moved_at_least(INT64_MIN, INT64_MAX / 4, kFloor)); // the real bound on `now`
+    }
+
+    SECTION("no movement is not an event") {
+        CHECK_FALSE(moved_at_least(1'000'000, 1'000'000, kFloor));
+        CHECK_FALSE(moved_at_least(-5, -5, kFloor));
+    }
+
+    static_assert(moved_at_least(-2'000'000'000, 1'700'000'000, 7 * 86'400));
+    static_assert(!moved_at_least(1'000'000, 999'999, 7 * 86'400));
 }
 
 TEST_CASE("audit classify: usable at compile time", "[audit_store][audit_rules]") {
     // `constexpr` is part of the contract, not decoration: it is what lets the
     // table above be `static constexpr` and what proves the function reads no
     // state. A future edit that reaches for a clock or a member breaks this.
-    static_assert(classify(true, true, true, false) == Anomaly::Step);
-    static_assert(classify(true, true, false, false) == Anomaly::Wipe);
-    static_assert(classify(false, true, true, false) == Anomaly::None);
-    static_assert(classify(false, false, false, true) == Anomaly::BadState);
+    static_assert(classify({.has_expired = true, .would_wipe = true, .big_step = true}) ==
+                  Anomaly::Step);
+    static_assert(classify({.has_expired = true, .would_wipe = true}) == Anomaly::Wipe);
+    static_assert(classify({.would_wipe = true, .big_step = true}) == Anomaly::None);
+    static_assert(classify({.prev_unusable = true}) == Anomaly::BadState);
     SUCCEED("compile-time evaluation asserted above");
 }

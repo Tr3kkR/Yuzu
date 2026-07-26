@@ -13,8 +13,10 @@
   quietly accepted. Reporting distinguishes conditions from events: a repeat of the
   same CONDITION (an all-expired table, a corrupt stored reading) is not re-warned,
   so a legitimately all-expired store still ages out at the capped rate, while a
-  clock MOVEMENT warns every time it recurs, in either direction, because each jump
-  is a separate incident. Every accepted pass is capped at 25,000 rows oldest-first. Rows
+  clock MOVEMENT of at least 7 days warns every time it recurs, in either direction,
+  because each jump is a separate incident. Smaller drift is treated as a condition
+  and warns once, so a clock wobbling between two disagreeing time sources cannot
+  halt retention by keeping the guard permanently in its declining state. Every accepted pass is capped at 25,000 rows oldest-first. Rows
   whose TTL sits implausibly far in the future are excluded from the decision, so
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe

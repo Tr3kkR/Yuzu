@@ -339,7 +339,7 @@ private:
     //
     // Deliberately NOT persisted: re-reporting once after a restart is the safe
     // direction.
-    audit_retention::Anomaly last_reported_{audit_retention::Anomaly::None};
+    std::optional<audit_retention::Facts> last_reported_;
     // Wall-clock reading the previous pass saw. PERSISTED in
     // `audit_retention_meta` and reloaded at construction, because the
     // elapsed-time check is the only half of this guard that still works once a

@@ -460,9 +460,11 @@ groups:
             unreadable). This is NOT
             exclusively a clock signal, and it is NOT one-warning-per-incident: a repeat of
             the same CONDITION (all-expired table, corrupt stored reading) is reported once,
-            while a repeated clock STEP is reported every time in either direction, since
-            each jump is a distinct event. A flapping clock source therefore produces one
-            warning per step. Also note REDUCING audit_retention_days narrows the survivor
+            while a repeated clock MOVEMENT of at least 7 days is reported every time, in
+            either direction, since each jump is a distinct event. A flapping clock source
+            therefore produces one warning per step. Movement UNDER 7 days is a condition,
+            reported once -- deliberately, because a warning suppresses that pass's delete,
+            so treating small drift as an event would halt retention permanently. Also note REDUCING audit_retention_days narrows the survivor
             horizon by design, so the first pass after that change can decline, and a
             genuinely all-expired table declines once on its first pass. Check whether
             retention was reconfigured before investigating the clock.

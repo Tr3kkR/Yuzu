@@ -379,9 +379,14 @@ all-expired table or a corrupt stored reading is a *condition* -- it persists
 until something changes, so it warns once and the backlog then drains at the
 capped rate. A clock jump is an *event*: the guard re-anchors its reading every
 pass, so a jump can only be detected if the clock moved since the last pass.
-Both directions count -- a forward jump and a backward one each warn on every
-recurrence. A clock stepping repeatedly therefore produces one warning per step,
-not one in total.
+Both directions count, and both use the SAME 7-day floor: a movement of at
+least that much, forward or backward, warns on every recurrence, so a clock
+stepping repeatedly produces one warning per step rather than one in total.
+Movement BELOW the floor is treated as a condition, not an event -- it warns
+once and then lets the backlog drain. That floor is load-bearing: because a
+warning suppresses deletion for that pass, treating a one-second drift as an
+event would stop retention permanently on any server whose clock wobbles
+between two disagreeing time sources.
 
 **For a report-once anomaly, your log pipeline is the durable record, not the
 metric.** The alert rules fire on `increase()` over a rolling window, so once a
@@ -463,7 +468,7 @@ directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete, counted once per reported anomaly. Repeats of the same *condition* are not re-counted; clock *movements* over the 7-day floor are, in either direction. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. |
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

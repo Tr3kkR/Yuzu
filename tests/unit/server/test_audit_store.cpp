@@ -1702,7 +1702,7 @@ TEST_CASE("AuditStore #2360: an out-of-range durable VALUE is reported even with
 TEST_CASE("AuditStore #2360: a PERSISTENTLY implausible reading reports once, not every pass",
           "[audit_store][retention][clock-guard]") {
     // The unbounded-emission case. A retention-disabled store on a pre-epoch
-    // clock re-anchors a NEGATIVE reading every pass, so `prev_implausible` is
+    // clock re-anchors a NEGATIVE reading every pass, so `prev_unusable` is
     // true forever and the nothing-expired branch is the only one ever taken.
     // An earlier version cleared the latch unconditionally at the top of that
     // branch, which made its own `!last_reported_` guard dead code: the
@@ -1733,9 +1733,25 @@ TEST_CASE("AuditStore #2360: a PERSISTENTLY implausible reading reports once, no
     CHECK(store.retention_passes_count() == 6); // the reaper did run every time
     CHECK(store.cleanup_failed_count() == 0);
 
-    // The clock recovers: the latch must RELEASE so a future anomaly can decline.
-    CHECK(store.cleanup_once(kNow) == 0);       // plausible now; nothing expired
-    CHECK(store.clock_anomaly_skips_count() == 1);
+    // The clock RECOVERS, and that recovery is itself an EVENT: the reading
+    // moves ~54 years in one pass. It must be reported.
+    //
+    // This assertion used to demand silence here, which encoded the defect. The
+    // same shape with expired rows present is the dead-CMOS-then-NTP sequence
+    // that deleted an entire audit trail in one pass with no warning and no
+    // counter: `prev` is still negative, so the pass classifies `BadState`
+    // exactly as the previous six did, matches, and is suppressed. A guard whose
+    // whole job is to notice the clock moving cannot stay quiet through the
+    // largest movement it will ever see.
+    CHECK(store.cleanup_once(kNow) == 0); // plausible now; nothing expired
+    CHECK(store.clock_anomaly_skips_count() == 2);
+
+    // But it must not SPAM. The reading is re-anchored every pass, so once the
+    // clock is sane the next pass sees an interval-sized delta, is not an event,
+    // and stands down. Without that, reporting a movement would starve the drain
+    // forever -- which is exactly how the no-magnitude-floor version failed.
+    CHECK(store.cleanup_once(kNow + 1) == 0);
+    CHECK(store.clock_anomaly_skips_count() == 2);
     log.clear();
     exec_raw(tmp.path, "UPDATE audit_retention_meta SET value = -1 WHERE key = 'last_pass_now'");
     AuditStore reopened(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
@@ -1871,8 +1887,10 @@ TEST_CASE("AuditStore #2360: classify pins the anomaly precedence with no databa
     };
     for (const auto& c : cases) {
         INFO(c.why);
-        CHECK(audit_retention::classify(c.has_expired, c.would_wipe, c.big_step, c.prev_unusable) ==
-              c.expected);
+        CHECK(audit_retention::classify({.has_expired = c.has_expired,
+                                         .would_wipe = c.would_wipe,
+                                         .big_step = c.big_step,
+                                         .prev_unusable = c.prev_unusable}) == c.expected);
     }
 }
 
@@ -1943,4 +1961,150 @@ TEST_CASE("AuditStore #2360: one CONDITION replacing another is reported",
     CHECK(reopened.clock_anomaly_skips_count() == 1); // fresh store, its own count
     CHECK(log.says("not usable"));                    // BadState, not Wipe
     CHECK_FALSE(log.says("EVERY datable audit row"));
+}
+
+// ---------------------------------------------------------------------------
+// Scoped-governance round: two BLOCKING defects in the events/conditions rule.
+// Both written BEFORE the fix and confirmed RED against 4e346794.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuditStore #2360: an arriving would-wipe is not swallowed by a standing bad state",
+          "[audit_store][retention][clock-guard]") {
+    // BLOCKING, found by cpp-safety and proven with a 5/5 deterministic probe.
+    //
+    // `classify` collapses FOUR independent facts onto ONE enum, so the
+    // `a != last_reported_` half cannot see a NEW condition arriving underneath
+    // an already-reported one. The dead-CMOS-then-NTP sequence -- the guard's own
+    // motivating case -- walks straight through it:
+    //
+    //   pass 1  clock in 1969, nothing expired            -> None
+    //   pass 2  still 1969, prev < 0                      -> BadState, REPORTED
+    //   ...rows are written while the clock is wrong...
+    //   pass 3  NTP corrects. would_wipe is now TRUE, but prev is still
+    //           negative, so classify returns BadState AGAIN, which EQUALS
+    //           last_reported_ -> suppressed -> the pass DELETES.
+    //
+    // For any store under the 25,000-row cap that is the entire SOC 2 trail, in
+    // one statement, with no warning and no counter. Exactly what #2360 exists
+    // to prevent.
+    GuardFixture f;
+
+    REQUIRE(f.store.cleanup_once(-100) == 0); // 1969, quiet
+    REQUIRE(f.store.cleanup_once(-50) == 0);  // prev < 0 -> BadState reported
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // Rows written under the wrong clock. Every one is expired once the clock is
+    // corrected, and there is no survivor -> would_wipe.
+    f.seed(86'350, 5);
+
+    const std::int64_t corrected = 1'700'000'000;
+    CHECK(f.store.cleanup_once(corrected) == 0);     // must NOT delete
+    CHECK(f.store.rows_deleted_count() == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 2); // the wipe must be REPORTED
+}
+
+TEST_CASE("AuditStore #2360: a sub-threshold backward drift must not halt retention forever",
+          "[audit_store][retention][clock-guard]") {
+    // BLOCKING, found by unhappy-path. A REGRESSION introduced by 0407082b.
+    //
+    // `backward_step` fires on ONE SECOND, while its forward twin `big_step`
+    // requires SEVEN DAYS. `is_event` is OR'd into the REPORT branch, and the
+    // report branch is the NON-DELETING branch. So a clock that regresses a
+    // second per pass -- two disagreeing time sources, a hypervisor sync racing
+    // NTP -- reports every pass forever and NEVER drains. `audit.db` then grows
+    // without bound while every counter looks busy: skips climbing, passes
+    // climbing, rows_deleted flat. CapReached cannot fire (nothing is deleted);
+    // Stalled cannot fire (passes are running).
+    //
+    // Before 0407082b this reported once and drained.
+    GuardFixture f;
+
+    // Establish a previous reading FIRST. Without this the opening pass has no
+    // `prev`, so it cannot see a backward step and simply drains the backlog --
+    // which is how the first version of this test passed against the defect it
+    // was written to expose.
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+
+    f.seed(kNow - 100, 5);      // expired backlog
+    f.seed(kNow + kWindow, 1);  // a survivor, so this is NOT a would-wipe
+
+    std::int64_t t = kNow;
+    for (int i = 0; i < 20; ++i) {
+        t -= 1; // one second backwards, every pass
+        f.store.cleanup_once(t);
+    }
+
+    // Sub-threshold jitter is a CONDITION, not twenty separate incidents: report
+    // it, then get on with draining.
+    CHECK(f.store.rows_deleted_count() > 0);
+}
+
+TEST_CASE("AuditStore #2360: a condition recurring after a step is reported again",
+          "[audit_store][retention][clock-guard]") {
+    // Closes the coverage hole cpp-safety found by mutation: changing
+    // `last_reported_ = a` to `if (a != Anomaly::Step) last_reported_ = a;`
+    // SURVIVED the entire committed suite. The write is not decoration -- it
+    // re-arms the equality test, so a condition recurring after a step is
+    // reported rather than swallowed.
+    //
+    // It also refutes the comment that called the Step assignment "provably
+    // unobservable". It cannot cause SUPPRESSION, which is what that proof
+    // actually showed; it can and does cause a report that would otherwise not
+    // happen.
+    GuardFixture f;
+
+    f.seed(kNow - 100, 5); // all expired, no survivor -> Wipe
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    const std::int64_t jumped = kNow + 30 * 86'400;
+    f.seed(jumped + kWindow, 1); // survivor clears would_wipe; the clock steps
+    REQUIRE(f.store.cleanup_once(jumped) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 2); // Step reported
+
+    // The survivor expires, so would_wipe returns. Wipe != Step, so it must be
+    // reported -- and must not delete.
+    const std::int64_t later = jumped + 2 * kWindow;
+    CHECK(f.store.cleanup_once(later) == 0);
+    CHECK(f.store.rows_deleted_count() == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 3);
+}
+
+TEST_CASE("AuditStore #2360: a wipe arriving under a standing bad state is reported even with no "
+          "material clock movement",
+          "[audit_store][retention][clock-guard]") {
+    // Proves the deduplication key must be the FACT SET, not the classified
+    // enum. Without this case, reverting to `classify(prev_facts) != a` passes
+    // the entire suite -- the enum-collapse defect is otherwise masked by the
+    // event path, because the sequence that first exposed it (dead CMOS, then
+    // NTP) is a movement large enough to report on its own.
+    //
+    // Strip the movement away and the collapse is naked. `BadState` is the only
+    // anomaly that can persist across two passes while the OTHER facts change:
+    // `Wipe` and `None` fully determine all four facts, and `Step` is always an
+    // event. So the shape is a clock stuck just below the epoch, stepping
+    // forward by less than the 7-day threshold -- a broken RTC near 1970, not a
+    // contrivance -- while rows become expired underneath it.
+    //
+    //   pass 1  now = -2   prev absent          -> None
+    //   pass 2  now = -1   prev < 0             -> BadState, reported
+    //   ...rows with a small positive TTL are written...
+    //   pass 3  now = 100  prev < 0, moved 101s -> BadState AGAIN
+    //
+    // Pass 3 is not an event (101s is far under the floor) and classifies
+    // identically to pass 2, so an enum comparison matches and DELETES. The fact
+    // set does not match -- `has_expired` and `would_wipe` both flipped -- so it
+    // is reported and nothing is deleted.
+    GuardFixture f;
+
+    REQUIRE(f.store.cleanup_once(-2) == 0); // quiet: no previous reading yet
+    REQUIRE(f.store.cleanup_once(-1) == 0); // prev < 0 -> BadState, reported
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // Rows that are expired under a small POSITIVE clock, with no survivor.
+    f.seed(50, 5);
+
+    CHECK(f.store.cleanup_once(100) == 0); // must decline, not delete
+    CHECK(f.store.rows_deleted_count() == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 2);
 }
