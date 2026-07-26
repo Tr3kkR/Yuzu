@@ -157,7 +157,8 @@ function Assert-RunnersDrained([string]$context){
              ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', '
   throw ("$kDrainTag $context while GitHub Actions runners are live on this box: $detail — " +
          "stop all $RunnerCount Start-PinnedRunner tasks/consoles, wait for in-flight " +
-         "jobs to finish, then re-run. -AllowActiveRunners overrides (kills them).")
+         "jobs to finish, then re-run. -AllowActiveRunners skips this check " +
+         "without stopping anything — those jobs may then be interrupted.")
 }
 
 # ---- Maintenance gate: must precede EVERY Step ------------------------------
