@@ -63,6 +63,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [Internal CA](#internal-ca)
+  - [KEK Rotation](#kek-rotation)
   - [Engine Principals](#engine-principals)
   - [RBAC](#rbac)
   - [Tags](#tags)
@@ -1468,6 +1469,85 @@ persistence failed), `503` (CA unavailable). A rejected import is audited
 > `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
 > the internal CA for that surface entirely — unchanged behaviour, supported and
 > independent of subordinate mode.
+
+---
+
+### KEK Rotation
+
+Rotate the secrets key-encryption-key (KEK) that wraps every envelope-encrypted
+secret column (ADR-0010). See `docs/user-manual/server-admin.md` "Key
+management (secrets KEK)" for the full runbook (half-committed recovery, DR
+drill, retirement preconditions). Each route has an MCP twin sharing the same
+failure classification and remediation wording: `rotate_kek`, `rewrap_secrets`,
+`get_kek_status`.
+
+#### `POST /api/v1/secrets/kek/rotate`
+
+Mint a new KEK version (`secrets-kek-v<N+1>`) and re-wrap every registered
+secret row's wrapped-DEK header under it (payloads untouched). **Permission:**
+`Security:Write`. No request body (empty or `{}`).
+
+```json
+{ "new_version": 2, "rotation_complete": true, "meta": { "api_version": "v1" } }
+```
+
+`rotation_complete` is the honest completion signal (ADR-0010 §3) — the
+response deliberately omits a rewrapped-row count; call `/rewrap` for one.
+Errors: `400`/`413` (non-empty/oversized body), `403` (missing
+`Security:Write`), `409` (another KEK operation holds the cluster-wide
+advisory lock — retry once it completes), `429` (rotation cooldown, below),
+`503` (codec/Postgres unavailable).
+
+> **`500` half-committed — do NOT retry this route.** If rotation registers
+> the new version but fails to finish re-wrapping every row, this returns
+> `500` with a remediation telling you to call `POST
+> /api/v1/secrets/kek/rewrap` to resume. Retrying `/rotate` instead would mint
+> a second, spurious version on top of the half-rotated state.
+
+> **`429` rotation cooldown.** Rotation *attempts* are rate-limited (5 minutes
+> between attempts, per server). A failed attempt consumes the budget too —
+> deliberately, because a failed rotation is exactly when you must not
+> immediately rotate again: automation that retries `/rotate` on a `500` would
+> otherwise mint a fresh version on every retry, and a KEK version can never be
+> retired (#2525). **`/rewrap` is NOT rate-limited** and is the correct way to
+> finish a half-committed rotation. The cooldown is a rate limiter, not a
+> correctness guarantee: it is per-process, so servers sharing one database each
+> have their own, and a restart clears it. Cluster-wide correctness comes from
+> the advisory lock, which returns `409`, not this.
+
+#### `POST /api/v1/secrets/kek/rewrap`
+
+Idempotent resume: re-wrap every row still on a non-active KEK version under
+the current active one. Safe to call repeatedly, including when there is
+nothing left to do. **Permission:** `Security:Write`. No request body.
+
+```json
+{ "rows_rewrapped": 3, "meta": { "api_version": "v1" } }
+```
+
+`rows_rewrapped: 0` is a normal outcome, not an error. Errors: `400`/`413`,
+`403` (missing `Security:Write`), `409` (advisory lock held), `503`.
+
+#### `GET /api/v1/secrets/kek/status`
+
+Current KEK rotation status. **Permission:** `Security:Read`.
+
+```json
+{ "active_version": 2, "oldest_in_use": 2, "rotation_complete": true, "meta": { "api_version": "v1" } }
+```
+
+`oldest_in_use` is `null` when no secret rows exist at all (trivially
+complete). Read-only, not audited. Errors: `403` (missing `Security:Read`),
+`409` (advisory lock held), `503`.
+
+> **No retire endpoint — by design.** Yuzu does not expose a way to destroy an
+> old KEK version, even though the codec's internal `retire_kek` exists and is
+> tested. `SecretCodec::encrypt()` snapshots the active version and releases
+> its lock before the caller persists the blob, so a retirement could pass its
+> "zero references" check and delete a key an in-flight write is about to use
+> — a permanent, unrecoverable loss (#2525). Old KEK files are expected to
+> accumulate; they are required to restore older backups and must not be
+> deleted by hand.
 
 ---
 
