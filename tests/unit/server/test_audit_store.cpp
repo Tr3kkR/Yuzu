@@ -821,7 +821,7 @@ TEST_CASE("AuditStore #2360: cleanup passes race-free against concurrent writers
     // the exclusive mtx_ covers the WHOLE pass, including the guard latch and
     // the last-pass reading. Those two are plain non-atomic members precisely
     // because of that lock, so this is the TSan target for it: take the lock out
-    // of cleanup_once and TSan reports on clock_anomaly_latched_ /
+    // of cleanup_once and TSan reports on last_reported_ /
     // last_pass_now_. (Concurrent cleanup callers are why the second claim needs
     // its own coverage -- writers alone cannot exercise the latch, since only a
     // cleanup pass ever touches it.)
@@ -1679,10 +1679,17 @@ TEST_CASE("AuditStore #2360: an out-of-range durable VALUE is reported even with
     CHECK(reopened.clock_anomaly_skips_count() == 1); // reported, not dropped
     CHECK(log.says("re-anchored"));
 
-    // Latched: this carrier is NOT one-shot, so a second pass must stay quiet.
+    // Quiet on the second pass -- but assert the MECHANISM, not just the
+    // outcome. This previously passed because the durable row had been
+    // re-anchored to a good value, so there was no anomaly left to report at
+    // all; deleting the suppression rule entirely left it green. Re-poison the
+    // row so the condition is genuinely still live, and THEN require silence.
+    exec_raw(f.tmp.path, "UPDATE audit_retention_meta SET value = 9000000000 "
+                         "WHERE key = 'last_pass_now'");
     log.clear();
     CHECK(reopened.cleanup_once(kNow + 120) == 0);
-    CHECK(reopened.clock_anomaly_skips_count() == 1);
+    CHECK(reopened.clock_anomaly_skips_count() == 1); // same condition, not re-reported
+    CHECK_FALSE(log.says("re-anchored"));
 }
 
 
@@ -1692,7 +1699,7 @@ TEST_CASE("AuditStore #2360: a PERSISTENTLY implausible reading reports once, no
     // clock re-anchors a NEGATIVE reading every pass, so `prev_implausible` is
     // true forever and the nothing-expired branch is the only one ever taken.
     // An earlier version cleared the latch unconditionally at the top of that
-    // branch, which made its own `!clock_anomaly_latched_` guard dead code: the
+    // branch, which made its own `!last_reported_` guard dead code: the
     // counter moved and a warn was emitted on EVERY pass, indefinitely, and the
     // clock-anomaly alert would have latched on permanently.
     //
@@ -1783,4 +1790,41 @@ TEST_CASE("AuditStore #2360: a quiet pass re-arms even when nothing was deleted"
     CHECK(f.store.cleanup_once(kNow + 2) == 0);
     CHECK(f.store.total_count() == 4); // declined, not deleted
     CHECK(f.store.clock_anomaly_skips_count() == 2);
+}
+
+TEST_CASE("AuditStore #2360: a SECOND clock step is a second event, not a continuing condition",
+          "[audit_store][retention][clock-guard]") {
+    // Written before the fix, expected to FAIL.
+    //
+    // `Wipe` and `BadState` are CONDITIONS: they persist until something changes,
+    // so suppressing a repeat is right. `Step` is an EVENT -- it is recomputed
+    // each pass against a reading that was just re-anchored, so a step can only
+    // fire when a genuinely NEW jump happened since the previous pass. Two
+    // consecutive steps mean two real jumps, and suppressing the second by
+    // equality with the first reports one and silently deletes for the other.
+    //
+    // Step cannot spam by construction: after any pass the stored reading is
+    // `now`, so the next pass sees an interval-sized delta unless the clock
+    // moved again.
+    // A survivor must be inside the datable horizon (`now + window + slack`) for
+    // the pass that reads it, or it is excluded as forward-skewed and `Wipe`
+    // fires instead of `Step` -- so each pass gets its own.
+    GuardFixture f;
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1);
+    REQUIRE(f.store.cleanup_once(kNow) == 5); // healthy baseline, establishes a reading
+
+    // First jump, well past the 7-day threshold.
+    const std::int64_t j1 = kNow + 30 * 86'400;
+    seed_rows_with_ttl(f.tmp.path, j1 - 100, 20);
+    seed_rows_with_ttl(f.tmp.path, j1 + kWindow, 1);
+    REQUIRE(f.store.cleanup_once(j1) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // A SECOND, independent jump on the very next pass. A distinct event.
+    const std::int64_t j2 = j1 + 30 * 86'400;
+    seed_rows_with_ttl(f.tmp.path, j2 - 100, 20);
+    seed_rows_with_ttl(f.tmp.path, j2 + kWindow, 1);
+    CHECK(f.store.cleanup_once(j2) == 0);              // must decline again
+    CHECK(f.store.clock_anomaly_skips_count() == 2);   // and be reported
 }

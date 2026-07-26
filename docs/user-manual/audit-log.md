@@ -363,8 +363,8 @@ refuses to act on that:
   put the threshold at a full year on the 365-day default, where it could never
   fire. Elapsed time still cannot tell a clock jump from an outage, so a server
   that was genuinely down for more than a week declines one cleanup pass ---
-  deliberately cheap, and the warning names both causes. The decline is
-  latched, so an audit table that is *legitimately* all-expired still ages out
+  deliberately cheap, and the warning names both causes. A repeat of the SAME condition is not re-reported, so an audit table that is
+  *legitimately* all-expired still ages out
   --- it just costs one cleanup interval first.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
   default), oldest first. A wipe the guard chose to allow therefore ages out at

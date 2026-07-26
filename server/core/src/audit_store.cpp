@@ -725,7 +725,19 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // one-shot flag plus per-branch clearing -- and it fixes what that
             // could not express, namely a DIFFERENT anomaly arriving while
             // latched, which the single bool silently swallowed.
-            if (a != Anomaly::None && a != last_reported_) {
+            // EVENTS are not deduplicated; CONDITIONS are. `Wipe` and `BadState`
+            // persist until something changes, so a repeat is the same anomaly
+            // still being worked off and suppressing it is what stops a
+            // legitimately all-expired store from declining forever. `Step` is
+            // different in kind: it is recomputed each pass against a reading
+            // this pass just re-anchored, so it can only fire when a genuinely
+            // NEW jump happened since the previous pass. Two consecutive steps
+            // are two real jumps, and equality-suppressing the second reports
+            // one while silently deleting for the other. It cannot spam --
+            // after any pass the stored reading is `now`, so the next pass sees
+            // an interval-sized delta unless the clock moved again.
+            const bool is_event = (a == Anomaly::Step);
+            if (a != Anomaly::None && (is_event || a != last_reported_)) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 last_reported_ = a;
                 switch (a) {
@@ -893,13 +905,12 @@ AuditStore::delete_capped_locked(std::int64_t now) {
     // Did this pass actually leave a backlog? One bounded EXISTS, and ONLY when
     // the cap bound the pass, so the healthy path pays nothing.
     //
-    // Guessing this from `deleted >= cap` is wrong twice over. A drain that
-    // removed exactly a cap's worth and emptied the backlog would still count as
-    // capped, while every doc says that counter proves a backlog remains. And
-    // the latch below would then be assigned from the PRE-delete `would_wipe`,
-    // so a pass that drained the whole backlog would stay latched -- meaning a
-    // real anomaly arriving before the next pass deletes with no decline, no
-    // warn and no counter. The latch must come from a POST-delete fact.
+    // Guessing this from `deleted >= cap` is wrong: a drain that removed exactly
+    // a cap's worth and emptied the backlog would still count as capped, while
+    // every doc says that counter proves a backlog remains. The caller ALSO
+    // needs the real answer -- it is what stands the reported anomaly down once
+    // the backlog it produced is gone -- so it must be an observation, not an
+    // inference from the row count.
     bool backlog_remains = false;
     std::string probe_err;
     if (deleted >= kMaxAuditDeletesPerPass) {
