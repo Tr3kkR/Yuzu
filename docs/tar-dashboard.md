@@ -322,7 +322,16 @@ Per `docs/observability-conventions.md`:
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
 | `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
 | `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
+| `yuzu_tar_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
+| `yuzu_tar_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |
 | `yuzu_tar_process_tree_render_seconds` | histogram | `node_count_bucket` | **planned — not yet emitted** (SRE follow-up) |
+
+> **Do not sum `yuzu_tar_source_purge_total` across surfaces yet.** The dashboard
+> fragment and the REST twin write the same series with different `result` tokens:
+> the fragment distinguishes `scope_violation` from `denied`, while REST folds
+> per-device scope denial, missing wiring, and audit failure all into `denied` and
+> otherwise only ever writes `requested`. `success` and `agent_not_connected` are
+> comparable; nothing else is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
 
