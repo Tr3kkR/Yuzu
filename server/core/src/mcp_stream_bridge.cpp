@@ -1327,9 +1327,10 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // Bail with the record still in records_, still charged: internally
         // consistent, reclaimed by shutdown(), and never an orphan listener.
         // torn_down is deliberately NOT cleared - re-entering the exactly-once
-        // teardown protocol is a design change, deliberately deferred rather than
-        // smuggled into a containment fix. NOT YET FILED as an issue; do not read
-        // "deferred" as "tracked".
+        // teardown protocol is a design change, deferred rather than smuggled into a
+        // containment fix. Tracked as #2513 (retriable teardown), which also records
+        // the real blast radius: a retained subscription pins the bus channel and its
+        // replay buffer for the process lifetime.
         count_teardown_incomplete(TeardownStage::kUnsubscribe);
         log_incomplete(stage_name(TeardownStage::kUnsubscribe));
         // The detail must not assert a delivery that did not happen. Four of the five

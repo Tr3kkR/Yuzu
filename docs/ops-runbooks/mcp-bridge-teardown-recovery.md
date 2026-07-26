@@ -99,6 +99,15 @@ The log line exists because the metric and the audit row both route through guar
 swallow failures; under severe pressure both can be lost, so the log is the floor. If
 you have the metric but no log line, or vice versa, that itself is worth reporting.
 
+## Known gaps
+
+Tracked follow-ups an on-call engineer may hit:
+
+- **#2513** - a failed teardown is never retried; retention lasts until restart.
+- **#2514** - the maintenance thread has other unguarded blocks, so severe pressure can still abort the process from a different call site.
+- **#2515** - `shutdown()` is the sole reclaimer and its walk aborts on the first failure, silently.
+- **#2518** - a wedged audit database can stall this thread every tick.
+
 ## Related
 
 - `docs/user-manual/metrics.md` - full metric reference
