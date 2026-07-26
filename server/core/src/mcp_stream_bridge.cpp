@@ -1603,7 +1603,7 @@ const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
                    "the client must re-initialize; recover the result by execution_id";
         case TerminalRung::kPublishThrew:
             // Deliberately does NOT claim the stream escaped poisoning. publish_final
-            // is noexcept, so the only way the ladder throws is poison_terminal(),
+            // is noexcept, so the only way the ladder throws is poison_terminal() (#2531),
             // which sets its sticky flag under mu_ and THEN calls close_sink outside
             // it - so a throw here means the session very likely IS poisoned, with the
             // flag already set. The previous wording asserted the opposite. This arm
@@ -1611,7 +1611,8 @@ const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
             // from a test), so it is stated conservatively rather than pinned.
             return "the terminal was built but publishing threw; nothing was confirmed "
                    "published and the session's poison state is indeterminate (a throw at this "
-                   "point usually means it WAS poisoned) - recover the result by execution_id";
+                   "point almost certainly means it WAS poisoned - see #2531; the wording stays "
+                   "conservative only because nothing can pin it) - recover by execution_id";
         case TerminalRung::kNotAttempted:
             break;
     }

@@ -1068,9 +1068,11 @@ SSE-on-`POST` rung. It is documented here for forward compatibility.
 
 **A related case**: if the failure happens while the server is publishing rather than
 building the frame, the session may additionally be left *poisoned* - every later attach
-returns 410 and the client must re-initialize rather than resume. The server records the
-poison state honestly in its own audit trail when it can determine it, but there is no
-frame telling the client, so the same timeout-plus-`execution_id` recovery applies.
+returns 410 and the client must re-initialize rather than resume. A currently-connected
+stream may not even receive a close frame in that case, so it will sit heart-beating
+until your own timeout fires. The server records the poison state in its own audit trail,
+but nothing tells the client, so the same timeout-plus-`execution_id` recovery applies -
+and a 410 on a subsequent attach means re-initialize, not retry.
 
 ### -32004: MCP tier does not allow this operation
 
