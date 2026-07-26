@@ -653,6 +653,9 @@ bool McpStreamBridge::on_post_closed_keyed(const std::string& key) {
             return false;
         }
         rec->parked_seq = parked_seq;
+        // The wire is gone; holding its sink would pin a dead connection's state
+        // for as long as the record parks.
+        rec->post_sink.reset();
     }
     // A1: a terminal latched while the pump was dying must not wait for the next
     // bus event or sweep - hand the record to the projector now.
@@ -678,6 +681,118 @@ bool McpStreamBridge::on_final_written(const std::string& key) {
     }
     rec->final_written = true;
     return true;
+}
+
+std::optional<std::string> McpStreamBridge::bind_post_sink(
+    const std::string& session_id, const nlohmann::json& jsonrpc_id,
+    std::shared_ptr<sse_bus::SseSinkState> sink) {
+    if (!sink) {
+        return std::nullopt;
+    }
+    auto key = make_key(session_id, jsonrpc_id);  // allocates HERE, before any state changes
+    std::shared_ptr<BridgeRecord> rec;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (shutdown_started_) {
+            return std::nullopt;
+        }
+        rec = find_locked(key);
+        if (!rec) {
+            return std::nullopt;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
+            return std::nullopt;  // only a live streamed record has a POST wire
+        }
+        rec->post_sink = std::move(sink);
+        // BIND-TIME HANDSHAKE: evaluate the pending-work predicate inside the SAME
+        // hold that stores the sink. Work can latch between arm() and this call -
+        // a terminal, most consequentially - and the projector only forwards wakes
+        // to a sink it can already see, so anything latched before the bind would
+        // otherwise cost the pump a full tick.
+        if (has_pending_work_locked(*rec)) {
+            poke_post_sink(rec->post_sink);
+        }
+    }
+    return key;
+}
+
+McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& key,
+                                                            bool cap_expired) {
+    PostBatch out;
+    std::shared_ptr<BridgeRecord> rec;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (shutdown_started_) {
+            return out;  // shutdown owns teardown; the pump sees an empty tick
+        }
+        rec = find_locked(key);
+        if (!rec) {
+            return out;
+        }
+    }
+    // ONE projection implementation - see the header note. project_record accepts
+    // kStreaming only when handed a batch, and fills it with the frames it just
+    // committed to the ring.
+    project_record(rec, &out, cap_expired);
+    flush_record_obs(*rec);
+    // PARK-VS-CLAIM FENCE. A close can flip kStreaming -> kRingOnly while this
+    // pump holds the projection claim. That transition wakes the projector once,
+    // but the projector finds the claim set and returns; by the time the claim
+    // clears (project_record's guard, just above) nothing wakes it again, and a
+    // parked record holding a latched terminal stalls until the next sweep tick.
+    // Re-waking here closes that window. A spurious wake costs one projector pass
+    // over a record with no work; a missed one costs a stalled result.
+    if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
+        wake(*core_);
+    }
+    return out;
+}
+
+bool McpStreamBridge::has_pending_work_locked(const BridgeRecord& rec) {
+    // The SAME predicate project_record uses to decide there is a batch worth
+    // claiming. Factored so the bind handshake and the projector's wake-forwarding
+    // cannot disagree with the consumer about what "pending" means.
+    const bool progress = rec.mb_count > 0 && !rec.pressure_requested;
+    const bool terminal = rec.terminal_accepted &&
+                          !rec.terminal_projected.load(std::memory_order_acquire) &&
+                          rec.terminal_slot.has_value();
+    return progress || terminal;
+}
+
+void McpStreamBridge::poke_post_sink(
+    const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept {
+    if (!sink) {
+        return;
+    }
+    try {
+        // Taking the sink mutex before notifying is what makes this a HANDOFF
+        // rather than a lost wakeup. The pump evaluates its predicate under this
+        // mutex, so a bare notify could land in the window between that
+        // evaluation and the wait, and the pump would then sleep through work
+        // that was already there. Nothing is mutated under it - the predicate
+        // reads bridge state - so the acquisition IS the synchronisation. Same
+        // discipline as close_sink storing `closed` under this mutex.
+        //
+        // NOT INDEPENDENTLY COVERED, and deliberately so: removing this
+        // acquisition leaves the suite green, because the poke reaches here only
+        // after the bus listener, the projector wake and a thread switch, by
+        // which time any waiting pump is already inside wait_for. Forcing the
+        // window would need a test hook inside this function, which would prove
+        // the hook rather than the discipline. Verified by mutation and recorded
+        // as uncovered rather than given a test that passes for the wrong reason.
+        //
+        // Callers hold the record mutex, which the declared hierarchy places
+        // ABOVE this one (BridgeRecord::mu -> McpStreamState::mu_ ->
+        // SseSinkState::mu), so this nesting is the sanctioned direction; the
+        // pump holds the sink mutex only to evaluate a predicate, never across
+        // a write.
+        { std::lock_guard<std::mutex> slk(sink->mu); }
+        sink->cv.notify_one();
+    } catch (...) {  // NOLINT(bugprone-empty-catch) - the pump's tick timeout is the backstop
+    }
 }
 
 // ── Projector ──────────────────────────────────────────────────────────────
@@ -732,7 +847,8 @@ void McpStreamBridge::run_projector() {
     }
 }
 
-void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
+void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, PostBatch* out,
+                                     bool cap_expired) {
     Phase ph;
     std::array<MailboxEntry, kBridgeMailboxCap> batch{};
     std::size_t batch_n = 0;
@@ -740,11 +856,25 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
         ph = rec->phase.load(std::memory_order_acquire);
-        if (ph != Phase::kArmedGetOnly && ph != Phase::kRingOnly) {
-            return;  // kArming latches; kStreaming is pump-owned (3b); kDone/kAborted dead
+        // kStreaming is PUMP-owned: only take_post_batch (which passes `out`) may
+        // project it. The projector still visits such records, but its whole job
+        // there is to FORWARD THE WAKE - a streamed record's frames are ring-only
+        // (deliver_live=false), so the publish path never notifies the POST sink
+        // and the pump would otherwise sleep out its tick on work already latched.
+        if (ph == Phase::kStreaming && out == nullptr) {
+            if (has_pending_work_locked(*rec)) {
+                poke_post_sink(rec->post_sink);
+            }
+            return;
+        }
+        if (ph != Phase::kArmedGetOnly && ph != Phase::kRingOnly && ph != Phase::kStreaming) {
+            return;  // kArming latches; kDone/kAborted dead
         }
         if (rec->projection_in_flight.load(std::memory_order_acquire)) {
-            return;  // single projector today, but the claim also fences sweep (B2)
+            if (out != nullptr) {
+                out->deferred = true;  // the pump retries next tick; nothing is owed
+            }
+            return;  // the claim fences sweep and the other projector (B2)
         }
         // E1: while a pressure sweep is waiting on this record, no NEW progress
         // batch may start - only an already-latched terminal settles.
@@ -753,6 +883,13 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
                                    !rec->terminal_projected.load(std::memory_order_acquire) &&
                                    rec->terminal_slot.has_value();
         if (!want_progress && !want_terminal) {
+            // CAP ARBITRATION, decided INSIDE the record lock alongside the
+            // terminal check rather than by the pump beforehand: a terminal that
+            // latched in the same instant wins, and ordinary progress is never
+            // ring-committed merely to probe for one.
+            if (out != nullptr && cap_expired) {
+                out->cap_settled = true;
+            }
             return;
         }
         // The claim - everything below is noexcept. Relaxed: this critical
@@ -923,6 +1060,19 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
             if (id != 0) {
                 rec->last_progress_sent = responded;
                 rec->progress_sent_any = true;
+                if (out != nullptr) {
+                    // Only COMMITTED frames reach the live POST wire. A frame the
+                    // ring rejected pre-commit has no replayable counterpart, so
+                    // sending it live would leave a resuming client with a gap it
+                    // can never fill - and the watermark above deliberately did
+                    // not advance for it either.
+                    try {
+                        out->progress.push_back(frame);
+                    } catch (...) {  // NOLINT(bugprone-empty-catch)
+                        // The ring copy is durable; losing the live copy costs
+                        // this client a frame it can still fetch by resume.
+                    }
+                }
             }
         }
     }
@@ -969,6 +1119,14 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // persistent OOM cannot hot-loop the projector (B4/A6c: sweep cadence
         // and any later bus/arm activity bound the retry latency instead).
         return;
+    }
+    if (out != nullptr) {
+        // Copied BEFORE the ladder consumes it, and before anything is published:
+        // if this allocation fails, the guard restores the terminal, the claim
+        // clears and the pump retries - nothing has been committed or delivered
+        // twice. Doing it after the publish would risk a ring commit the pump
+        // never learns about.
+        out->final_frame = frame;
     }
     const auto fid = publish_terminal_ladder(rec, std::move(frame)).id;
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later

@@ -177,7 +177,13 @@ namespace yuzu {
 class MetricsRegistry;
 }
 
+namespace yuzu::server::detail {
+struct SseSinkState;
+}
+
 namespace yuzu::server::mcp {
+
+namespace sse_bus = ::yuzu::server::detail;
 
 class McpStreamState;
 class McpSessionRegistry;
@@ -344,6 +350,39 @@ public:
     /// 3b pump-releaser seam: kStreaming → kRingOnly, assign parked order, wake the
     /// projector (A1 - a latched terminal must not wait for the next bus event).
     bool on_post_closed(const std::string& session_id, const nlohmann::json& jsonrpc_id);
+
+    /// What one pump tick may write to the live streamed-POST wire. The frames
+    /// have ALREADY been committed to the session ring (for GET resume) by the
+    /// time this returns - the ring is the durable copy, this is the live one.
+    struct PostBatch {
+        std::vector<std::string> progress;       ///< write in order, oldest first
+        std::optional<std::string> final_frame;  ///< write LAST, then EOF
+        /// Another claimant held the projection claim; nothing was taken and
+        /// nothing is owed. The pump retries on its next tick.
+        bool deferred = false;
+        /// The response cap elapsed with no terminal to deliver. The pump closes
+        /// with kCapExpired; the execution continues server-side.
+        bool cap_settled = false;
+    };
+
+    /// Bind the streamed-POST wake channel to a kStreaming record, returning its
+    /// key. The pump waits on `sink`'s condition variable, and the projector
+    /// pokes it whenever work lands - the publish path CANNOT do that job,
+    /// because a streamed record's frames are ring-only (deliver_live=false), so
+    /// no live-sink notify ever fires for them.
+    ///
+    /// Includes the bind-time handshake: the pending-work predicate is evaluated
+    /// inside the SAME record-lock hold that stores the sink, so a terminal that
+    /// latched between arm() and bind cannot be missed by a pump about to wait.
+    std::optional<std::string> bind_post_sink(const std::string& session_id,
+                                              const nlohmann::json& jsonrpc_id,
+                                              std::shared_ptr<sse_bus::SseSinkState> sink);
+
+    /// One pump tick's worth of work for a kStreaming record. `cap_expired` is
+    /// decided by the pump but arbitrated HERE, inside the projection claim, so
+    /// a terminal that landed in the same instant still wins over the cap - and
+    /// so ordinary progress is never ring-committed merely to probe for one.
+    PostBatch take_post_batch(const std::string& key, bool cap_expired);
 
     /// The record key for a live streamed request, resolved ONCE while the
     /// caller can still fail safely. The streamed-POST handler captures this in
@@ -612,6 +651,12 @@ private:
         bool torn_down = false;
         std::uint64_t pinned_event_id = 0;
         std::uint64_t parked_seq = 0;      ///< assigned on entry to kRingOnly
+        /// The live streamed-POST wake channel, bound while phase == kStreaming.
+        /// Held PURELY to wake the pump: the pump pulls its frames through
+        /// take_post_batch and writes them itself, so nothing ever enqueues onto
+        /// this sink's queue. Cleared when the record leaves kStreaming so a
+        /// parked record holds no reference to a dead connection.
+        std::shared_ptr<sse_bus::SseSinkState> post_sink;
         /// The pump wrote the final JSON-RPC response to the POST wire. A record
         /// that closes with this set is DONE (the client has its answer); one that
         /// closes without it parks for GET resume.
@@ -638,7 +683,26 @@ private:
     std::shared_ptr<BridgeRecord> find_locked(const std::string& key) const;  // holds bridge_mu_
 
     void run_projector();
-    void project_record(const std::shared_ptr<BridgeRecord>& rec);
+    /// ONE projection implementation for all three armed phases. `out` is null
+    /// for the projector thread (kArmedGetOnly / kRingOnly, and wake-forwarding
+    /// for kStreaming); non-null only for take_post_batch, which additionally
+    /// accepts kStreaming and collects the frames it just committed to the ring
+    /// so the pump can write the same bytes to the live POST wire.
+    ///
+    /// Deliberately NOT a second function: the claim, the settle-or-restore
+    /// guard, the progress watermark, the terminal ladder and the charge release
+    /// all live here, and a parallel copy for the POST path would drift from
+    /// this one exactly the way release_charge and project_record once did.
+    void project_record(const std::shared_ptr<BridgeRecord>& rec, PostBatch* out = nullptr,
+                        bool cap_expired = false);
+    /// The one definition of "this record has a batch worth claiming", shared by
+    /// project_record, the bind-time handshake and the projector's wake
+    /// forwarding, so they cannot disagree. Caller holds `rec.mu`.
+    static bool has_pending_work_locked(const BridgeRecord& rec);
+    /// Wake a bound streamed-POST pump. Callers hold the record mutex; the sink
+    /// mutex sits below it in the hierarchy. Contained - a missed poke costs one
+    /// pump tick, never correctness.
+    static void poke_post_sink(const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept;
     /// Build the parked real final from the bus terminal payload + result_base (B5).
     static std::string build_real_final(const BridgeRecord& rec, const std::string& terminal_data);
     /// The ONE derivation of the minimal success-shaped fallback final ("terminal
