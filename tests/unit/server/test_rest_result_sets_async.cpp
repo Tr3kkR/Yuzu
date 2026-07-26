@@ -252,6 +252,56 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[result_set][async
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
+          "[result_set][async][tar][targeting][security]") {
+    // parent_id IS the targeting argument on this route: present and non-empty
+    // scopes the dispatch to that set's members via `from_result_set:`, absent
+    // broadcasts to every connected agent. The guard used to be
+    // `contains && is_string && !empty`, so a SUPPLIED parent_id that was
+    // numeric or empty fell through to the untargeted arm — a caller who
+    // believed it was narrowing to one result set dispatched to the whole
+    // fleet instead. Same shape as the agent_ids defect on the two routes
+    // #2500 names; found while auditing this call site for that fix.
+    //
+    // `h.calls.empty()` is the assertion that matters: a 400 that still
+    // dispatched would leave the widening intact behind a better status code.
+    SECTION("numeric parent_id") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
+               status);
+        REQUIRE(status == 400);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("empty-string parent_id") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":""})",
+               status);
+        REQUIRE(status == 400);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("explicit null parent_id") {
+        // Rejected rather than read as "absent". A client that serialises an
+        // unset field as null and one whose parent lookup returned nothing are
+        // indistinguishable here, and only one of them wants the entire fleet.
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":null})",
+               status);
+        REQUIRE(status == 400);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("omitting parent_id still broadcasts — the over-broadness guard") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+        REQUIRE(status == 202);
+        REQUIRE(h.calls.size() == 1);
+        REQUIRE(h.calls[0].scope_expr == "__all__");
+    }
+}
+
 TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",
           "[result_set][async][tar]") {
     AsyncHarness h;

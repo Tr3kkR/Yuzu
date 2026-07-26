@@ -5892,6 +5892,30 @@ void RestApiV1::register_routes(
             // Resolve the parent scope. parent_id present → dispatch is scoped
             // to that set's CURRENT members via the `from_result_set:` scope
             // kind; absent → broadcast to all connected agents (__all__).
+            //
+            // #2500, third instance: `parent_id` IS the targeting argument on
+            // this route, and the guard below used to be
+            // `contains && is_string && !empty`, so `{"parent_id": 123}` and
+            // `{"parent_id": ""}` fell straight through to the untargeted arm —
+            // a caller who believed it was narrowing to one result set instead
+            // dispatched to every connected agent. Identical in shape to the
+            // `agent_ids` defect on the two routes this issue names, and found
+            // while auditing this call site for that fix.
+            //
+            // Same rule, stated the same way: OMIT the key to broadcast
+            // deliberately. A SUPPLIED parent_id must name a parent — including
+            // an explicit `null`, which is rejected rather than read as
+            // "absent", because a client that serialises an unset field as null
+            // and one whose parent lookup returned nothing are indistinguishable
+            // here, and only one of them wants the whole fleet.
+            if (body.contains("parent_id") &&
+                (!body["parent_id"].is_string() ||
+                 body["parent_id"].get_ref<const std::string&>().empty())) {
+                rs_err(res, 400,
+                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names no parent set; "
+                       "omit it entirely to dispatch to all agents");
+                return;
+            }
             std::optional<std::string> parent_id;
             std::string scope_expr;
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
