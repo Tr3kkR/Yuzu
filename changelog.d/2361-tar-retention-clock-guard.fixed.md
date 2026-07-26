@@ -12,12 +12,16 @@
   table per pass, oldest first. The floor leaves a deliberate dead band: a forward
   error between a table's own window and 30 days trips neither detector, and the cap
   alone bounds it. Rows stamped implausibly far in the future are excluded so one
-  forward-skewed row cannot disarm the guard. Row-count retention is deliberately
-  untouched (it trims to a fixed ceiling with no clock involved) and still shares the
-  single retention transaction, which now stops at the first failed statement and
-  rolls back (best-effort -- a rollback that itself fails is logged, not retried)
-  rather than leaving the shared connection wedged or letting later deletes escape
-  as autocommits after SQLite has already aborted the transaction. The existing paused/errored source gate
+  forward-skewed row cannot disarm the guard. Row-count retention keeps its
+  clock-free ceiling semantics, but is now capped per pass too -- the whole batch runs
+  under one held database mutex, so an uncapped prune over a large backlog would stall
+  every collector on the endpoint; a big excess now drains over a few ticks instead.
+  The retention transaction stops at the first failed statement and rolls back rather
+  than letting later deletes escape as autocommits after SQLite has already aborted it.
+  If the rollback itself fails with the transaction still open, the TAR database is
+  CLOSED: every subsequent write would be reported durable and then lost, so all of
+  them fail closed instead, and `tar status` reports `storage_state|offline` until the
+  agent restarts. The existing paused/errored source gate
   still runs first, so a source paused for forensics neither deletes nor reports an
   anomaly. Because the agent has no `/metrics` endpoint, the counters are surfaced
   through the `tar status` action as `retention_guard_declines_total` and

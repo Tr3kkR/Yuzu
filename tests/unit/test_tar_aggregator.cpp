@@ -1052,8 +1052,9 @@ TEST_CASE("TAR #2361: row-count retention still trims, unguarded, under a bad cl
           "[tar][retention][clock-guard]") {
     // Row-count retention trims only the excess over a fixed ceiling and is
     // computed with no clock at all, so no clock reading can make it delete more
-    // than it always would. It is therefore deliberately NOT guarded, NOT capped,
-    // and NOT declined. `netqual_boot` has a 400-row ceiling, small enough to
+    // than it always would. It is therefore deliberately NOT clock-guarded and
+    // NOT declined. It IS capped -- not for the clock, but because the whole
+    // batch runs under one held database mutex (see the dedicated cap test). `netqual_boot` has a 400-row ceiling, small enough to
     // exercise the trim directly: seeding 410 ancient rows must still leave
     // exactly 400 and must not touch the decline counters.
     constexpr int kBootCeiling = 400;
@@ -1667,4 +1668,39 @@ TEST_CASE("TAR #2361: row-count retention is capped too, so the batch lock stays
     // And it converges: the next pass takes the remainder down to the ceiling.
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(row_count(*f.db, "netqual_boot") == kCeiling);
+}
+
+TEST_CASE("TAR #2361: a closed store skips the pass instead of reporting clock trouble",
+          "[tar][retention][clock-guard]") {
+    // Gate 8 (Kimi). With the store closed every read returns its DEFAULT, so an
+    // unguarded pass walks the whole registry, queues plans against a null
+    // connection, fails all of them, and warns that a restart will cost the clock
+    // comparison point -- when a restart is exactly what recovers a closed store.
+    // The pass must say the true thing once and stop.
+    //
+    // A moved-from TarDatabase has `db_ == nullptr`, which is the same state the
+    // wedge path produces via sqlite3_close_v2. The close itself needs a rollback
+    // that fails with the transaction still open -- a disk-level fault, not
+    // inducible here -- so this covers the downstream behaviour, not the close.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 10);
+
+    yuzu::tar::RetentionGuardState armed;
+    run_retention(*f.db, kT0, armed);
+    REQUIRE(declines_of(armed, "process_hourly") == 1); // normal behaviour first
+    REQUIRE(row_count(*f.db, "process_hourly") == 10);
+
+    TarDatabase live = std::move(*f.db); // *f.db is now the closed store
+    REQUIRE_FALSE(f.db->is_open());
+    REQUIRE(live.is_open());
+
+    yuzu::tar::RetentionGuardState fresh;
+    run_retention(*f.db, kT0 + 1, fresh);
+
+    // No clock findings accrued against a store that could not be read at all,
+    // and no per-table failure rows for plans that were never attempted.
+    CHECK(retention_guard_counters(fresh).declines.empty());
+    CHECK(retention_guard_counters(fresh).failures.empty());
+    // The data is untouched (it lives on the moved-to connection).
+    CHECK(row_count(live, "process_hourly") == 10);
 }

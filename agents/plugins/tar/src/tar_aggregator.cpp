@@ -180,16 +180,26 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
             if (!db.set_state(std::string{key}, ""))
                 return false; // baseline NOT cleared → do not disable
         }
-        // KNOWN GAP, deliberately not fixed here: this write's result is
-        // discarded, so a failed persist reports a successful pause while
-        // collection and retention keep running on data the operator believes is
-        // frozen. Pre-existing, and out of scope for the retention clock guard --
-        // the obvious fix (return false on a failed write) is NOT correct on its
-        // own, because the baseline has already been cleared above, so it would
-        // leave the source ENABLED with a WIPED baseline and produce exactly the
-        // ghost-event burst #538's clear-first ordering exists to prevent. A real
-        // fix needs the flag and the baseline to move together. Tracked in #2490;
-        // do not "fix" it with a bare early return.
+        // KNOWN GAP, deliberately not fixed here (tracked in #2490). This write's
+        // result is discarded, so a failed persist reports a successful pause
+        // while collection and retention keep running on data the operator
+        // believes is frozen -- and because the caller sees success it ALSO fires
+        // the edge-gated nstat drain, discarding live TCP lifecycle events on a
+        // source that is still enabled.
+        //
+        // Be precise about why a bare `return false` here is not the fix, because
+        // an earlier version of this comment got it backwards. The baseline has
+        // already been cleared above, so the source is left ENABLED with a WIPED
+        // baseline and the next tick emits a ghost `started` for every process --
+        // but that happens with the CURRENT code too, so it is not a reason to
+        // prefer the current code. The early return is in fact strictly better on
+        // the false-success and nstat-drain counts. What it gets wrong is the
+        // report: do_configure's failure text says "could not clear collection
+        // baseline", which would then describe the wrong failure.
+        //
+        // A real fix moves the flag and the baseline together (one transaction --
+        // execute_atomic_batch now exists) and gives the flag-write failure its
+        // own operator message. Out of scope for the retention clock guard.
         db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
         return true;
@@ -461,6 +471,17 @@ std::vector<std::string> format_retention_guard_lines(const RetentionGuardState&
 }
 
 void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guard) {
+    // A closed store makes every read below return its DEFAULT, so the pass would
+    // walk the whole registry, queue plans against a null connection, fail every
+    // one, and warn that a restart will cost the clock comparison point -- when a
+    // restart is precisely what recovers a closed store. Say the true thing once
+    // and stop (#2361 Gate 8).
+    if (!db.is_open()) {
+        spdlog::warn("TAR retention: skipped, the TAR database is closed. Storage is offline on "
+                     "this endpoint until the agent restarts (see `tar status`).");
+        return;
+    }
+
     // #2361 read/decide phase, deliberately BEFORE the transaction. Every
     // statement executed inside the transaction below is a string built HERE, so
     // nothing that can throw (std::format, map/vector growth) runs between BEGIN
@@ -722,10 +743,20 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                 it->second = false;
         }
     }
-    if (!batch.committed)
-        spdlog::warn("TAR retention: the delete transaction did not commit; {} queued table "
-                     "prunes were rolled back and nothing was retained this pass",
-                     plans.size());
+    if (!batch.committed) {
+        // `began` distinguishes the two shapes: a BEGIN that never opened means
+        // nothing was rolled back because no transaction existed. Reporting a
+        // rollback either way is the kind of small untruth this branch has spent
+        // three rounds removing.
+        if (batch.began)
+            spdlog::warn("TAR retention: the delete transaction did not commit; {} queued table "
+                         "prunes were rolled back and nothing was retained this pass",
+                         plans.size());
+        else
+            spdlog::warn("TAR retention: could not open a transaction; {} queued table prunes "
+                         "were not attempted and nothing was retained this pass",
+                         plans.size());
+    }
     warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
 }
 

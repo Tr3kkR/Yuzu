@@ -18,7 +18,6 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
-#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -353,6 +352,13 @@ public:
     /**
      * Set a config value.
      */
+    /// False once the store has failed closed -- either it never opened, or a
+    /// wedged transaction forced `execute_atomic_batch` to close it. Callers that
+    /// REPORT state (rather than just read it) must consult this: with the
+    /// connection gone every getter returns its default, so an unguarded status
+    /// surface describes a dead store as a healthy empty one (#2361 Gate 8).
+    [[nodiscard]] bool is_open() const noexcept { return db_ != nullptr; }
+
     /// Returns false if the write did not persist. Retention's clock guard
     /// depends on this: a silently-dropped write leaves the guard with no
     /// comparison point on the next pass, forever, with nothing to report

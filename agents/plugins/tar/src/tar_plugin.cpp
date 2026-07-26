@@ -1870,6 +1870,20 @@ private:
     // ── status action ─────────────────────────────────────────────────────────
 
     int do_status(yuzu::CommandContext& ctx) {
+        // ALWAYS emitted, and first. With a closed store every getter below
+        // returns its default -- record_count 0, live_rows 0, and each source
+        // reporting its DEFAULT enabled state -- which reads as a healthy, empty
+        // database rather than a dead one. This action is the only operator- and
+        // agentic-readable surface the agent has (no /metrics), so that
+        // false-healthy report would be the whole signal (#2361 Gate 8).
+        const bool storage_ok = db_->is_open();
+        ctx.write_output(std::format("storage_state|{}", storage_ok ? "ok" : "offline"));
+        if (!storage_ok) {
+            ctx.write_output("error|TAR storage is offline on this endpoint; the database was "
+                             "closed after a transaction could not be rolled back. Collection and "
+                             "retention are both stopped. Restart the agent to recover.");
+            return 1;
+        }
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));

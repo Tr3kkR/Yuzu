@@ -1431,16 +1431,18 @@ std::string retention_sql(const std::string& real_table_name, int64_t now_epoch)
             "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
             real_table_name, real_table_name, gran.retention_default);
     } else {
-        // DEAD IN PRODUCTION as of #2361. `run_retention` no longer calls this
-        // for a kTimeBased granularity: an unbounded time-based delete is the
-        // wipe the clock guard exists to prevent, so the guarded, capped
-        // statement is built at the caller in `tar_aggregator.cpp`. Only the
-        // kRowCount branch above is still reached.
+        // NEITHER BRANCH'S SQL RUNS IN PRODUCTION as of #2361. `run_retention`
+        // builds both the time-based and the row-count DELETE at the caller so it
+        // can bound them -- the time-based one because an unbounded age delete is
+        // the wipe the clock guard exists to prevent, the row-count one because
+        // the whole batch runs under one held database mutex. This function is
+        // now called ONLY as an `.empty()` probe for "is this a retention-bearing
+        // table?", plus the text these tests pin.
         //
         // Kept, and kept byte-identical, because `test_tar_warehouse.cpp` and
-        // `test_tar_perf.cpp` pin this exact SQL text. That means a future author
-        // who "fixes" the cutoff formula HERE gets a green suite and no
-        // behaviour change whatsoever -- change `run_retention` instead.
+        // `test_tar_perf.cpp` pin this exact SQL text. So a future author who
+        // "fixes" either formula HERE gets a green suite and no behaviour change
+        // whatsoever -- change `run_retention` instead.
         int64_t cutoff = now_epoch - gran.retention_default;
         auto ts_col = ts_column_for_suffix(gran.suffix);
         return std::format(

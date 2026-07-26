@@ -215,6 +215,7 @@ POST /api/v1/instructions/execute
 The `status` action returns database health information:
 
 ```
+storage_state|ok
 record_count|15234
 oldest_timestamp|1710950000
 newest_timestamp|1711050423
@@ -481,8 +482,16 @@ history. A non-zero failures total means retention has stopped for that table
 for a reason that is not the clock: either its probes could not be read, or its
 delete failed. The pass stops at the first failed delete and rolls the
 transaction back, so every table queued in that pass is reported -- including
-row-count tables, which are otherwise outside the guard. (The rollback is
-best-effort: one that itself fails is logged, not retried.)
+row-count tables, which are otherwise outside the guard.
+
+If that rollback ITSELF fails and the database is left inside the transaction,
+the agent **closes the TAR database**. Every later write on a connection stuck in
+an uncommittable transaction would be reported durable and then lost at restart,
+so it fails all of them closed instead. `tar status` then reports
+`storage_state|offline` and nothing else; collection and retention are both
+stopped on that endpoint until the agent restarts. This needs a disk-level fault
+to reach, but read `storage_state` before trusting any other line in that
+output.
 
 **Known dead band.** Because the threshold is floored at 30 days, a forward
 clock error *between* a table's own window and 30 days trips neither detector:

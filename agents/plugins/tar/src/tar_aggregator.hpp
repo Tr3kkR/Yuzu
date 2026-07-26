@@ -181,8 +181,8 @@ format_retention_guard_lines(const RetentionGuardState& guard);
  * Enforces row-count limits on live tables and time-based retention on
  * aggregated tables.
  *
- * Row-count retention is unguarded and unchanged: it only ever trims the excess
- * over a fixed ceiling, so no clock reading can make it delete more than it was
+ * Row-count retention is unguarded but no longer unbounded: it still only trims
+ * the excess over a fixed ceiling, so no clock reading can make it delete more than it was
  * always going to. Time-based retention is clock-guarded (#2361): a pass that
  * would delete every datable row of a table, or that follows a wall-clock jump
  * larger than that table's whole retention window, declines once and is counted
