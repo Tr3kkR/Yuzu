@@ -359,6 +359,15 @@ public:
     /// surface describes a dead store as a healthy empty one (#2361 Gate 8).
     [[nodiscard]] bool is_open() const noexcept { return db_ != nullptr; }
 
+    /// True while the read-only query connection (`tar sql`) is usable.
+    /// DELIBERATELY independent of is_open(): the wedged-transaction close takes
+    /// down the WRITE connection only, so historical data stays readable through
+    /// this one. A status surface that PROMISES that read path must consult this
+    /// rather than assume it -- the connection is optional at open time (a
+    /// failure there is warned and tolerated, tar_db.cpp), and promising a read
+    /// path that is not there is worse than admitting the store is dark.
+    [[nodiscard]] bool query_engine_available() const noexcept { return query_db_ != nullptr; }
+
     /// Returns false if the write did not persist. Retention's clock guard
     /// depends on this: a silently-dropped write leaves the guard with no
     /// comparison point on the next pass, forever, with nothing to report

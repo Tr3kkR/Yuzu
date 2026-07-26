@@ -37,7 +37,11 @@
   stay readable through the separate read-only connection (`tar sql`), and `tar status`
   replies with a single `error|...` line followed by `storage_state|offline` -- no
   `record_count`, no `config|` lines. Anything keyed off `record_count` in a `tar status`
-  reply sees an absent field rather than a zero. There is no automatic recovery today.
+  reply sees an absent field rather than a zero. That error line only promises the
+  `tar sql` read path when the read-only connection actually opened; on an endpoint
+  where it did not, it says so rather than sending the operator to a dead end. The
+  dashboard's capture-sources frame now surfaces the line verbatim instead of a generic
+  "the device failed the status query". There is no automatic recovery today.
   The alternative was reporting every subsequent write durable and losing it at restart,
   which is silent forensic-data loss behind a healthy-looking surface.
 

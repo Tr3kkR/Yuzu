@@ -498,10 +498,18 @@ an uncommittable transaction would be reported durable and then lost at restart,
 so it fails all of them closed instead. `tar status` then returns non-zero and
 emits an `error|` line followed by `storage_state|offline`, and nothing else --
 every `config|` line is withheld. Collection and retention are both stopped on
-that endpoint until the agent restarts. **Historical data stays readable**: the
-close affects only the read-write connection, so `tar sql` can still query what
-was already collected. This needs a disk-level fault to reach, but read
-`storage_state` before trusting any other line in that output.
+that endpoint until the agent restarts. **Historical data normally stays
+readable**: the close affects only the read-write connection, so `tar sql` can
+still query what was already collected. The error line says which of those two
+cases you are in -- the read-only connection is itself optional at open time, and
+on the rare endpoint where it never opened, `tar sql` cannot read the history
+either, so the line says that instead of promising a read path that is not there.
+This needs a disk-level fault to reach, but read `storage_state` before trusting
+any other line in that output.
+
+In the dashboard, the capture-sources frame surfaces that error line verbatim
+rather than a generic failure, so the reason and the recovery advice reach the
+operator on the frame they opened to ask why the device's data is missing.
 
 **Known dead band.** Because the threshold is a fixed 30 days, a forward clock
 error smaller than that trips neither detector on a table whose own window is
