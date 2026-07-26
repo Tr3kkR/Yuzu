@@ -101,6 +101,15 @@ Every held-open SSE stream re-validates its credential on each ~3 s pump tick. F
 
 This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
 
+## MCP transport metrics
+
+Request-body rejections at the `/mcp/` ingress (#2437). The label set is
+CLOSED and pre-seeded at boot, so `absent()` alerting stays meaningful.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_mcp_body_too_large_total{reason}` | counter | `/mcp/v1/` requests rejected at the transport before the body was read (#2437). `reason=over_cap` is a declared `Content-Length` above 4 MiB (`413`); `reason=unmeasurable` is a body this server will not admit because it cannot size it in advance — any `Transfer-Encoding`, any non-`identity` `Content-Encoding` (httplib decompresses before its size check), or a POST/PUT/PATCH with no `Content-Length` (`411`). Pre-auth, so there is no principal and no audit row: the throttled `[#2437]` warn in the journal carries the sanitized method/path/source address. |
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a
