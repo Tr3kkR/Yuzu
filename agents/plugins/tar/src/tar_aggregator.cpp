@@ -180,13 +180,17 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
             if (!db.set_state(std::string{key}, ""))
                 return false; // baseline NOT cleared → do not disable
         }
-        // The flag write is the whole transition: if it does not persist, the
-        // source stays ENABLED while the operator is told it is paused, and both
-        // collection and retention keep running on data they believe is frozen.
-        // That is the same failure the baseline-clear check above exists to
-        // prevent, one line down (found reviewing #2361; pre-existing).
-        if (!db.set_config(enabled_key, std::string{new_value}))
-            return false;
+        // KNOWN GAP, deliberately not fixed here: this write's result is
+        // discarded, so a failed persist reports a successful pause while
+        // collection and retention keep running on data the operator believes is
+        // frozen. Pre-existing, and out of scope for the retention clock guard --
+        // the obvious fix (return false on a failed write) is NOT correct on its
+        // own, because the baseline has already been cleared above, so it would
+        // leave the source ENABLED with a WIPED baseline and produce exactly the
+        // ghost-event burst #538's clear-first ordering exists to prevent. A real
+        // fix needs the flag and the baseline to move together. Tracked
+        // separately; do not "fix" it with a bare early return.
+        db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
         return true;
     }
