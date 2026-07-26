@@ -1190,3 +1190,78 @@ TEST_CASE("AuditStore #2360: a month-long jump fires on a DEFAULT-retention serv
     // deleted on the declining pass.
     CHECK(store.total_count() == 7);
 }
+
+TEST_CASE("AuditStore #2360: a row INSIDE the future-slack band still counts as a survivor",
+          "[audit_store][retention][clock-guard]") {
+    // Mutation gap found by governance Gate 3 (quality-engineer). Every existing
+    // slack test places its poison row far OUTSIDE `window + slack`, so deleting
+    // the `+ kAuditTtlFutureSlackSec` term from the datable horizon left the
+    // whole suite green -- the row was excluded either way. The term only earns
+    // its keep at the boundary, so pin it there.
+    //
+    // A row half a slack-width past the window is a legitimate survivor: it can
+    // still expire one day. Treating it as forward-skewed would DISCARD the one
+    // survivor keeping `would_wipe` false, so the pass would decline and, on the
+    // pass after that, delete -- the guard mis-firing in the direction that
+    // costs evidence.
+    GuardFixture f;
+    f.seed(kNow - 100, 5); // expired
+    f.seed(kNow + kWindow + kAuditTtlFutureSlackSec / 2, 1);
+
+    // Survivor recognised => not a wipe => the pass deletes immediately.
+    CHECK(f.store.cleanup_once(kNow) == 5);
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+    CHECK(f.store.total_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360: the retention index gauge reports the real state",
+          "[audit_store][retention][clock-guard]") {
+    // `yuzu_server_audit_retention_index_ok` is scraped, and the index it
+    // reports on is the difference between a bounded pass and one that
+    // full-scans audit_events under the lock every audit write needs. Nothing
+    // asserted it: deleting the `retention_index_ok_.store(true)` in
+    // ensure_retention_index() left every test green while the gauge
+    // permanently under-reported (governance Gate 3, quality-engineer).
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-index-gauge-"}};
+    {
+        AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(store.is_open());
+        CHECK(store.retention_index_ok());
+        CHECK(store.persist_failed_count() == 0);
+    }
+    // The index is a real object in the schema, not just a flag.
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(tmp.path.string().c_str(), &raw) == SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(raw,
+                               "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND "
+                               "name='idx_audit_ttl_id'",
+                               -1, &stmt, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+    CHECK(sqlite3_column_int(stmt, 0) == 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(raw);
+}
+
+TEST_CASE("AuditStore #2360: a failed persist of the clock reading is counted",
+          "[audit_store][retention][clock-guard]") {
+    // The audit twin of `TAR #2361: a failed persist of the clock reading is
+    // reported`. The persisted reading is the ONLY half of the guard that
+    // survives a restart, so a write that silently never lands leaves the step
+    // check with no comparison point forever. It gets a counter rather than a
+    // log line alone; nothing asserted the counter moved.
+    GuardFixture f;
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1); // survivor, so the pass is accepted
+    REQUIRE(f.store.cleanup_once(kNow) == 5);
+    REQUIRE(f.store.persist_failed_count() == 0);
+
+    // Block writes to the meta table only; the pass itself must still run.
+    // store_meta is an upsert and the pass above already inserted the key, so
+    // the write under test is the UPDATE branch this trigger blocks.
+    exec_raw(f.tmp.path, "CREATE TRIGGER block_meta BEFORE UPDATE ON audit_retention_meta "
+                         "BEGIN SELECT RAISE(ABORT, 'blocked'); END;");
+    f.seed(kNow - 50, 5);
+    f.store.cleanup_once(kNow + 1);
+    CHECK(f.store.persist_failed_count() > 0);
+}
