@@ -9,7 +9,9 @@
 **Control:** SOC 2 **CC6.2** (logical access — periodic review and, where
 appropriate, revocation of access). Closes the `/auth-and-authz` gap
 "Periodic access reviews with manager/security attestation" (previously
-listed **MISSING**; Priority-2 item 12).
+listed **MISSING**; Priority-2 item **13** — item 12 at the time this record
+was written, renumbered on 2026-07-25 when a duplicate `10` in that section
+was corrected).
 
 ## What shipped
 
