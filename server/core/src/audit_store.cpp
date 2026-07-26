@@ -13,6 +13,7 @@
 #include <expected>
 #include <limits>
 #include <span>
+#include <string_view>
 #include <utility>
 
 namespace yuzu::server {
@@ -102,7 +103,12 @@ void AuditStore::create_tables() {
         return;
     }
     ensure_retention_index();
-    last_pass_now_ = load_meta(kLastPassNowKey);
+    if (auto r = load_meta(kLastPassNowKey)) {
+        last_pass_now_ = *r;
+    } else {
+        last_pass_now_.reset();
+        loaded_meta_malformed_ = (r.error() == MetaReadError::Malformed);
+    }
 }
 
 void AuditStore::ensure_retention_index() {
@@ -148,6 +154,32 @@ void AuditStore::ensure_retention_index() {
                       err.c_str());
         return;
     }
+    // `CREATE INDEX IF NOT EXISTS` succeeds as a NO-OP when an index of that name
+    // already exists with different columns or a different predicate -- so
+    // SQLITE_OK alone does not mean the pass is index-driven. Verify the stored
+    // definition before publishing a healthy gauge, or the one signal that says
+    // "the lock hold is no longer bounded" reports healthy while every pass
+    // full-scans.
+    {
+        SqliteStmt chk;
+        bool matches = false;
+        if (sqlite3_prepare_v2(db_.get(),
+                               "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", -1,
+                               chk.addr(), nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(chk.get(), 1, "idx_audit_ttl_id", -1, SQLITE_STATIC);
+            if (sqlite3_step(chk.get()) == SQLITE_ROW) {
+                const auto* def = reinterpret_cast<const char*>(sqlite3_column_text(chk.get(), 0));
+                const std::string_view sv{def ? def : ""};
+                matches = sv.find("ttl_expires_at") != std::string_view::npos &&
+                          sv.find("WHERE") != std::string_view::npos;
+            }
+        }
+        if (!matches) {
+            spdlog::error("AuditStore: idx_audit_ttl_id exists but does not match the expected "
+                          "definition; retention will run WITHOUT a usable index");
+            return;
+        }
+    }
     retention_index_ok_.store(true, std::memory_order_relaxed);
     if (ms >= 1000)
         spdlog::info("AuditStore: built idx_audit_ttl_id in {} ms (one-time, first boot after "
@@ -155,22 +187,35 @@ void AuditStore::ensure_retention_index() {
                      ms);
 }
 
-std::optional<std::int64_t> AuditStore::load_meta(const char* key) const {
+std::expected<std::int64_t, AuditStore::MetaReadError>
+AuditStore::load_meta(const char* key) const {
     if (!db_)
-        return std::nullopt;
+        return std::unexpected(MetaReadError::Unreadable);
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_.get(), "SELECT value FROM audit_retention_meta WHERE key = ?", -1,
                            stmt.addr(), nullptr) != SQLITE_OK)
-        return std::nullopt;
+        return std::unexpected(MetaReadError::Unreadable);
     sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW)
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        // Check the STORED TYPE, do not just coerce. The table is not `STRICT`,
+        // so `value INTEGER NOT NULL` is an affinity preference, not a
+        // constraint: SQLite accepts a TEXT value into it, and
+        // `sqlite3_column_int64` then silently coerces `'not-a-number'` to 0.
+        // Zero is a legitimate reading (a dead CMOS at the Unix epoch is the
+        // motivating case), so without this check a corrupted or hand-edited row
+        // is indistinguishable from a real one, and the "unparseable durable
+        // state is an anomaly" property this guard claims would not exist.
+        // Verified against the shipped SQLite before this check was written.
+        if (sqlite3_column_type(stmt.get(), 0) != SQLITE_INTEGER)
+            return std::unexpected(MetaReadError::Malformed); // present, but not a number
         return sqlite3_column_int64(stmt.get(), 0);
-    // Absent row and read error are both "no comparison point". Returning an
-    // optional rather than 0 matters because 0 is a LEGITIMATE reading: a dead
-    // CMOS reporting the Unix epoch is the motivating case for this whole guard,
-    // and collapsing it into the sentinel would suppress the check on the very
-    // pass after NTP corrects.
-    return std::nullopt;
+    }
+    // Absent is NOT the same as malformed -- see MetaReadError. Returning a
+    // typed error rather than 0 matters because 0 is a LEGITIMATE reading: a
+    // dead CMOS reporting the Unix epoch is the motivating case for this whole
+    // guard, and collapsing it into a sentinel would suppress the check on the
+    // very pass after NTP corrects.
+    return std::unexpected(MetaReadError::Absent);
 }
 
 bool AuditStore::store_meta(const char* key, std::int64_t value) {
@@ -436,7 +481,7 @@ std::size_t AuditStore::total_count() const {
 
 namespace {
 
-// Run a one-row EXISTS probe. Returns nullopt on any prepare/bind/step error so
+// Run a one-row EXISTS probe. Returns the REASON on any prepare/bind/step error so
 // the caller can fail closed rather than read a default.
 //
 // `binds` is a span, not a pointer+count: the arity is then deduced from the
@@ -573,12 +618,20 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // ordinary expired backlog, so this prevents UB as well as the silent
         // disable.
         //
-        // BOTH out-of-range directions are anomalies, not quiet resets. Neither
-        // can arise from a pass this code ran, so each means the state was
-        // corrupted or tampered with -- and quietly accepting one is exactly how
-        // the step check gets disabled while every counter reports healthy.
+        // BOTH out-of-range directions are anomalies, not quiet resets. They are
+        // NOT proof of tampering and must not be described as such: this very
+        // code persists a NEGATIVE reading when it runs on a dead-CMOS machine
+        // (the upper-bound-only guard admits `now < 0` deliberately), and an
+        // ordinary backward NTP correction leaves a perfectly legitimate earlier
+        // reading ahead of `now`. What they prove is that the reading cannot be
+        // reasoned about: the clock moved backward, or the state was corrupted.
+        // Quietly accepting one is how the step check gets disabled while every
+        // counter reports healthy, which is why it declines either way.
         std::optional<std::int64_t> prev_pass_now = raw_prev;
-        bool prev_implausible = false;
+        // A row that existed but was not an integer is corrupted durable state,
+        // which is an anomaly in its own right -- distinct from no row at all.
+        bool prev_implausible = loaded_meta_malformed_;
+        loaded_meta_malformed_ = false; // consumed; the re-anchor above self-heals it
         if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now)) {
             prev_implausible = true;
             prev_pass_now.reset();

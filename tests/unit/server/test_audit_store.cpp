@@ -1013,7 +1013,9 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     // durable guard state in sequence.
     //
     // Run this under UBSan: the pre-fix code computed `now - prev` on whatever
-    // the row held, so INT64_MAX is signed-overflow UB, not merely a wrong answer.
+    // the row held. INT64_MIN is the signed-overflow case; INT64_MAX is the
+    // silent-DISABLE case (`now - INT64_MAX` stays in range for a normal epoch,
+    // it just goes hugely negative and suppresses the step check forever).
     constexpr std::size_t kSurplus = 7;
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-ch1-"}};
     {
@@ -1051,8 +1053,10 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     std::uint64_t skips = 0, failures = 0;
     std::size_t remaining = before;
     // INT64_MAX, -1 and a far-future value are all implausible readings, so each
-    // declines. (-1 used to be a quiet reset; round 4 made it an anomaly, because
-    // no pass this code runs can write a negative reading.) The final pass runs
+    // declines. (-1 used to be a quiet reset; it is now an anomaly. Note this is
+    // NOT because the value is impossible for this code to have written -- a
+    // dead-CMOS machine persists a negative reading legitimately -- but because
+    // the guard cannot reason about it either way.) The final pass runs
     // with the row deleted entirely -- a fresh-install shape, which is NOT an
     // anomaly.
     for (const char* value : std::array<const char*, 4>{"9223372036854775807", "-1",
@@ -1515,4 +1519,62 @@ TEST_CASE("AuditStore #2360: a capped pass only claims a remainder when one exis
     REQUIRE(f.store.cleanup_once(kNow + 1) == kMaxAuditDeletesPerPass);
     CHECK(log.says("per-pass cap reached"));
     CHECK(f.store.cap_reached_count() == 1);
+}
+
+TEST_CASE("AuditStore #2360: a non-integer stored reading is rejected, not coerced",
+          "[audit_store][retention][clock-guard]") {
+    // `audit_retention_meta` is not a STRICT table, so `value INTEGER NOT NULL` is
+    // an affinity PREFERENCE: SQLite accepts a TEXT value into it, and
+    // `sqlite3_column_int64` then coerces `'not-a-number'` to 0 -- which is a
+    // LEGITIMATE reading (a dead CMOS at the Unix epoch). Without an explicit
+    // type check the "unparseable durable state is an anomaly" property the guard
+    // advertises simply does not exist, and corrupted state is indistinguishable
+    // from a real reading.
+    GuardFixture f;
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1); // survivor, so nothing declines on would_wipe
+    REQUIRE(f.store.cleanup_once(kNow) == 5); // establishes a real reading
+
+    exec_raw(f.tmp.path, "UPDATE audit_retention_meta SET value = 'not-a-number' "
+                         "WHERE key = 'last_pass_now'");
+    // The row really is TEXT, i.e. the fixture reproduces the hazard rather than
+    // being silently normalised by SQLite on the way in.
+    {
+        RawConn c{f.tmp.path};
+        SqliteStmt st;
+        REQUIRE(sqlite3_prepare_v2(c.db(),
+                                   "SELECT typeof(value) FROM audit_retention_meta "
+                                   "WHERE key='last_pass_now'",
+                                   -1, st.addr(), nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_step(st.get()) == SQLITE_ROW);
+        CHECK(std::string{reinterpret_cast<const char*>(sqlite3_column_text(st.get(), 0))} ==
+              "text");
+    }
+
+    f.seed(kNow - 50, 5);
+    AuditStore reopened(f.tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(reopened.is_open());
+
+    // ATTRIBUTION is the discriminator, not the decline. Coercing the TEXT to 0
+    // ALSO produces a decline -- `now - 0` is decades, so the elapsed-time check
+    // fires -- which is why asserting only "declined once" passes against the
+    // broken implementation. The pass must say the STATE was bad, not that the
+    // CLOCK stepped.
+    LogCapture log;
+    CHECK(reopened.cleanup_once(kNow + 120) == 0);
+    CHECK(reopened.clock_anomaly_skips_count() == 1);
+    CHECK(log.says("not a plausible past reading"));
+    CHECK_FALSE(log.says("elapsed since the last retention pass"));
+    // And it self-heals: the pass re-anchored a real integer over the bad value.
+    {
+        RawConn c{f.tmp.path};
+        SqliteStmt st;
+        REQUIRE(sqlite3_prepare_v2(c.db(),
+                                   "SELECT typeof(value) FROM audit_retention_meta "
+                                   "WHERE key='last_pass_now'",
+                                   -1, st.addr(), nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_step(st.get()) == SQLITE_ROW);
+        CHECK(std::string{reinterpret_cast<const char*>(sqlite3_column_text(st.get(), 0))} ==
+              "integer");
+    }
 }

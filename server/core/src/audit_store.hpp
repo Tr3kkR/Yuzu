@@ -242,7 +242,13 @@ public:
     }
 
     /// Cumulative retention passes ATTEMPTED, and the wall-clock reading of the
-    /// most recent one (0 if none has run in this process).
+    /// most recent pass WHOSE CLOCK WAS USABLE (0 if none has run in this
+    /// process). The two differ deliberately: a pass refused for an implausible
+    /// caller clock counts as attempted but does not stamp the reading, since
+    /// publishing a value the guard just declared unusable would corrupt the
+    /// staleness signal this gauge exists to provide. A stale gauge with a
+    /// RISING pass counter therefore means "alive but refusing an unusable
+    /// clock" -- a different fault from "stopped".
     ///
     /// These exist because every other COUNTER here is silence-means-healthy: a
     /// cleanup thread that never starts, dies, or is stopped leaves all six flat
@@ -301,8 +307,11 @@ private:
     // anything other than SQLITE_DONE.
     std::atomic<uint64_t> emit_failed_{0};
     // Retention-guard counters (#2360). Atomic because the /metrics scrape
-    // thread reads them without taking mtx_; all are only ever incremented from
-    // inside cleanup_once()'s exclusive lock.
+    // thread reads them without taking mtx_. MOST are incremented inside
+    // cleanup_once()'s exclusive lock -- but NOT all: `cleanup_failed_` also
+    // increments before the lock (the implausible-clock refusal) and outside it
+    // entirely (the thread-boundary catch), and the two liveness values are
+    // stamped before the lock is taken.
     std::atomic<uint64_t> clock_anomaly_skips_{0};
     std::atomic<uint64_t> cleanup_failed_{0};
     std::atomic<uint64_t> rows_deleted_{0};
@@ -343,6 +352,11 @@ private:
     // and collapsing the two suppresses the check on the pass right after NTP
     // corrects.
     std::optional<std::int64_t> last_pass_now_;
+    // Set at construction when the durable row EXISTED but was not an integer.
+    // Consumed and cleared by the first pass, which declines on it and
+    // re-anchors a good value -- so corrupted state self-heals but is never
+    // silently accepted.
+    bool loaded_meta_malformed_{false};
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
@@ -355,10 +369,16 @@ private:
     /// Build `idx_audit_ttl_id` best-effort, OUTSIDE the migration runner. See
     /// the definition for why it must not be a Migration entry.
     void ensure_retention_index();
-    /// Read/write one row of `audit_retention_meta`. `load_meta` returns
-    /// nullopt for both "absent" and "unreadable" -- see `last_pass_now_` for
-    /// why that is not folded into a 0.
-    std::optional<std::int64_t> load_meta(const char* key) const;
+    /// Why a durable reading could not be used. ABSENT and MALFORMED must stay
+    /// DISTINGUISHABLE: absent is the ordinary fresh-install shape and says
+    /// nothing about the clock, whereas a row that exists but is not an integer
+    /// is corrupted or hand-edited durable state and is an ANOMALY. Folding them
+    /// together is what made the advertised "unparseable is an anomaly" property
+    /// not actually exist.
+    enum class MetaReadError { Absent, Malformed, Unreadable };
+    /// Read one row of `audit_retention_meta`. Never returns a coerced value --
+    /// see the definition for why `sqlite3_column_int64` alone is unsafe here.
+    std::expected<std::int64_t, MetaReadError> load_meta(const char* key) const;
     bool store_meta(const char* key, std::int64_t value);
     /// What one accepted delete did. `backlog_remains` is the POST-delete fact
     /// the latch, the cap counter and the operator log line are ALL derived

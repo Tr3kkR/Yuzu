@@ -350,8 +350,10 @@ refuses to act on that:
   and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
   applies when the gap since the previous pass exceeds **a fixed 7 days**, or
   when the stored reading is not a plausible past reading --
-  *ahead* of the current clock, or negative. Neither can be produced by any pass
-  this code ran, so both signal tampering or corruption. That reading is
+  *ahead* of the current clock, or negative. Neither can be reasoned about, so the pass
+  declines either way. They are NOT proof of tampering: this code itself
+  persists a negative reading on a dead-CMOS machine, and an ordinary backward
+  NTP correction leaves a legitimate earlier reading ahead of `now`. That reading is
   persisted, so the check still fires on the first pass after a restart --- including
   a server that *booted* with an already-wrong clock. The 7 days is
   **absolute, not derived from `audit_retention_days`**: how far the clock moved
@@ -378,14 +380,18 @@ figure against your own audit-event rate before deploying at scale. The cap is a
 compile-time constant today, so exceeding it needs an engineering change rather
 than configuration.
 
-In practice the **file-size** ceiling binds first: sustaining 6.9 events/second
-for a 365-day retention window means roughly 219M rows, on the order of 44 GB of
-row data plus a comparable index footprint, in a single SQLite file. A deployment
+The **file-size** ceiling is likely to bind first, though this is an estimate
+rather than a measurement: sustaining 6.9 events/second
+for a 365-day retention window means roughly 219M rows. At an assumed ~200 bytes/row that is on the order of
+44 GB plus a comparable index footprint in a single SQLite file -- but row size
+varies with `principal`, `action`, `detail`, `target` and `user_agent`, so treat
+the byte figure as an order of magnitude, not a threshold. A deployment
 approaching the drain-rate ceiling has a storage problem before it has a
-retention-pacing problem. Audit rows are emitted per operator REQUEST, not per
-device, so a large fleet reaches high rates through agentic per-device sweeps --
-bursts, which the 600,000 rows/day drain absorbs -- rather than through steady
-state.
+retention-pacing problem. Audit rows are emitted per REQUEST rather than per device, but not only for
+operator requests: agent enrolment, fleet-topology pushes and rejections, and
+background schedule execution all write rows too, so fleet size does influence
+the rate. Measure your own `yuzu_server_audit_events_total` rate rather than
+assuming an operator-only workload.
 
 **The cap also bounds peak WAL.** The old unguarded delete cleared its whole
 backlog in one uncheckpointable transaction: measured at 152 MB of WAL for a
@@ -407,14 +413,16 @@ whether the database is OPEN, so it reads healthy while retention is failing,
 not running, or running without its index. Alert on the metrics above rather
 than on the health probe for this (tracked in #2509).
 
-**A backward clock excursion is the one case the guard cannot help with.** Rows
+**A backward clock excursion is the case the guard helps with least.** Rows
 written while the clock was behind (a dead CMOS reporting 1970, before NTP
 corrects) are stamped with an already-past TTL, so once the clock is correct they
 are the OLDEST rows in the table and the first the paced delete takes -- at
 `info` level, indistinguishable from routine ageing-out. That is precisely the
-window an auditor asks about first, because it covers a host fault. If you know a
-server ran with a backward-skewed clock, export the affected range before the
-next cleanup interval; nothing in the guard will hold it for you. The mirror case
+window an auditor asks about first, because it covers a host fault. The guard is not inert here -- the unconditional cap still paces the deletion,
+and if a pass was persisted while the clock was behind, the corrected-clock pass
+can decline once -- but neither will hold the rows for you. If you know a server
+ran with a backward-skewed clock, export the affected range before the next
+cleanup interval. The mirror case
 is that rows written while the clock was AHEAD sit permanently beyond the datable
 horizon: never deleted, never reported, and retained past the stated window
 (tracked in #2510).
@@ -436,7 +444,7 @@ directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not a plausible past reading (*ahead* of the clock, or negative -- the tamper/corruption signal). The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not a plausible past reading (*ahead* of the clock, or negative). Not proof of tampering -- a backward NTP correction produces the first, and a dead-CMOS boot produces the second. The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

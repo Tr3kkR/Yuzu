@@ -889,8 +889,9 @@ Six new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
 declined-pass and failed-pass counters must be alerted on separately: both leave
 rows undeleted, so an audit table that never shrinks looks identical either way.
 One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
-state in which none of the other five can fire, because they all key on a counter
-rising.
+state in which none of the other counter-driven rules can fire, because they all
+key on a counter rising. (`YuzuAuditRetentionIndexMissing` reads a
+startup-evaluated gauge and is the exception.)
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 

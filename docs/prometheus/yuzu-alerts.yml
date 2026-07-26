@@ -451,12 +451,16 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Audit retention declined a pass - clock moved, or the server was down"
+          summary: "Audit retention declined a pass - clock, outage, or a retention change"
           description: >-
             An audit retention pass declined. Triggers: it would have expired every datable
             row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
-            threshold, not scaled to audit_retention_days); or the stored clock reading
-            was AHEAD of the current clock.
+            threshold, not scaled to audit_retention_days); or the stored clock reading was
+            not a plausible past reading (ahead of the clock, OR negative). This is NOT
+            exclusively a clock signal: REDUCING audit_retention_days narrows the survivor
+            horizon by design, so the first pass after that change can decline, and a
+            genuinely all-expired table declines once on its first pass. Check whether
+            retention was reconfigured before investigating the clock.
             Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
             uptime history before concluding the clock is at fault. Nothing was deleted;
@@ -476,9 +480,14 @@ groups:
         annotations:
           summary: "Audit retention passes are failing on a database error"
           description: >-
-            yuzu_server_audit_cleanup_failed_total is rising: the audit retention pass
-            itself is erroring, so audit.db grows without bound. This is NOT the clock
-            guard (that is yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
+            yuzu_server_audit_cleanup_failed_total is rising: a retention pass did not
+            fully do its job. Seven sites feed it - an unreadable probe, a failed delete
+            prepare or step, a refused implausible caller clock, a closed store, an
+            exception caught at the thread boundary, and an unreadable POST-delete backlog
+            probe. That last one fires AFTER a successful delete, so a rising counter does
+            NOT prove nothing was deleted; read it as "retention is not fully healthy".
+            This is NOT the clock guard (that is
+            yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
             free disk and the server log for "AuditStore: retention probe failed" /
             "AuditStore: cleanup error". NOTE /healthz stores.audit will report healthy
             in this state - it reflects only whether the database is OPEN, and a pass
@@ -504,8 +513,11 @@ groups:
         annotations:
           summary: "Audit retention is not keeping up with expiry"
           description: >-
-            Every audit retention pass in the last 6 hours hit the per-pass delete cap,
-            so a backlog is carried forward each hour and audit.db is growing. Check
+            Every audit retention pass in the last 6 hours hit the per-pass delete cap, so
+            a backlog is carried forward each hour and audit.db is growing. Note the
+            counter is incremented on an OBSERVED backlog or, when the post-delete probe
+            could not be read, a conservatively ASSUMED one - a "retention probe failed"
+            warning in the log means the remainder was assumed, not measured. Check
             yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
             all. Sustained firing means the fixed drain rate (25,000 rows per cleanup
             pass) is below this fleet's audit volume, so audit.db grows without bound;
@@ -537,8 +549,10 @@ groups:
             once at startup, so it does not detect an index dropped while the server runs.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
-      # THE ABSENCE ALERT. Every other rule in this group fires on a counter
-      # RISING; none of them fires when the cleanup thread simply never runs
+      # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
+      # a counter RISING, so none of those fires when the cleanup thread never
+      # runs. (`YuzuAuditRetentionIndexMissing` is the exception: it reads a
+      # startup-evaluated gauge and fires either way.) None of them detects
       # (never started because the store was closed at boot, died, or was
       # stopped and not restarted). In that state all six other series sit flat
       # at 0 -- indistinguishable from a quiet, healthy store -- while audit.db

@@ -152,7 +152,7 @@ private:
     char* m_{nullptr};
 };
 
-/// RAII owner for the connection itself. `sqlite3_close` runs on scope exit,
+/// RAII owner for the connection itself. `sqlite3_close_v2` runs on scope exit,
 /// which is what makes a store's CONSTRUCTOR exception-safe: a throw after the
 /// handle is open but before the constructor completes means `~Store` never
 /// runs, so a raw `sqlite3*` member leaks the connection and its WAL/SHM files.
@@ -196,8 +196,10 @@ public:
     /// after it would leak the connection and its WAL/SHM files while this owner
     /// reported success, which is precisely the leak this class exists to stop.
     /// close_v2 marks the connection zombie and closes it when the last
-    /// statement finalizes. Reachable: a store method holding a raw
-    /// `sqlite3_stmt*` across an allocating loop can unwind past its finalize.
+    /// statement finalizes. `audit_store` no longer has any raw statement owner,
+    /// but any future one -- or any other store adopting `SqliteDb` -- would
+    /// reintroduce the exposure, which is why the owner does not rely on callers
+    /// getting it right.
     void close() noexcept {
         if (db_) {
             sqlite3_close_v2(db_);
