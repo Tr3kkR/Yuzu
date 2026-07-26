@@ -18,7 +18,12 @@
  *   - the CSRF same-site gate — cross-origin AND header-less POSTs are 403'd
  *     BEFORE dispatch (these fragments are stricter than the shared
  *     `origin_is_same_site` helper, which permits header-less non-browser
- *     clients; programmatic callers use the REST twin instead),
+ *     clients). For PURGE that strictness is free: a programmatic caller has
+ *     the REST twin POST /api/v1/tar/retention-paused/purge. REENABLE HAS NO
+ *     REST OR MCP TWIN, so pinning its header-less 403 also pins it as
+ *     unreachable by any non-browser principal — a pre-existing gap in a
+ *     grandfathered fragment, recorded here so the test is not mistaken for
+ *     an endorsement of it,
  *   - the {process,tcp,service,user} source allowlist and the
  *     required-field check → 400, no dispatch,
  *   - the per-device RBAC visibility gate → 404 collapsed with the offline
@@ -79,8 +84,11 @@ void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::strin
     g.membership_type = "static";
     auto gid = mg.create_group(g);
     REQUIRE(gid.has_value());
+    // Assert the membership writes land. A silently-failed add would leave
+    // get_visible_agents empty, and the 404/scope_violation cases would then
+    // pass for entirely the wrong reason.
     for (const auto& a : agents)
-        mg.add_member(*gid, a);
+        REQUIRE(mg.add_member(*gid, a).has_value());
     GroupRoleAssignment ra;
     ra.group_id = *gid;
     ra.principal_type = "user";
@@ -92,11 +100,17 @@ void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::strin
 struct FragmentHarness {
     // `yuzu_test_` prefix so the path lands inside the Wee Tam Defender
     // exclusion wildcard `yuzu_*` (CLAUDE.md → Test conventions).
-    yuzu::test::TempDbFile mg_db{std::string_view{"yuzu_test_tar_frag_mg_"}};
+    //
+    // MEMBER ORDER IS LOAD-BEARING: `sink` is declared LAST so it is destroyed
+    // FIRST, while the `DashboardRoutes` whose `this` its handlers captured is
+    // still alive. The reverse order (which most existing sink fixtures use)
+    // leaves live handlers holding a destroyed owner. `mg`/`metrics` precede
+    // `routes` because `routes` borrows both.
+    yuzu::test::TempDbFile mg_db{"yuzu_test_tar_frag_mg_"};
     ManagementGroupStore mg{mg_db.path};
     yuzu::MetricsRegistry metrics;
-    yuzu::server::test::TestRouteSink sink;
     DashboardRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
 
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
@@ -108,6 +122,9 @@ struct FragmentHarness {
     /// @param with_dispatch false → register with an empty DispatchFn so the
     ///        "dispatch unavailable" 503 branch is reachable.
     explicit FragmentHarness(bool with_dispatch = true) {
+        // A failed open would make get_visible_agents return empty and quietly
+        // turn every scope assertion into a pass-for-the-wrong-reason.
+        REQUIRE(mg.is_open());
         grant_visibility(mg, {"dev-A", "dev-B"});
 
         auto auth_fn = [this](const httplib::Request&,
@@ -152,6 +169,12 @@ struct FragmentHarness {
                                    return std::pair<std::string, std::string>{};
                                },
                                &metrics, /*instruction_store=*/nullptr);
+        // Exactly one registration pass. Two overloads of register_routes now
+        // exist; calling both (or either twice) would register every route
+        // twice — first-match-wins would then serve handlers bound to the
+        // FIRST call's dependencies while the members hold the second call's.
+        // Nothing else would fail, so pin the count.
+        REQUIRE(sink.route_count() == 12);
     }
 
     static std::unordered_map<std::string, std::string> same_site_headers() {
@@ -299,9 +322,27 @@ TEST_CASE("fragment reenable: missing fields and forged sources are rejected 400
     FragmentHarness h;
     CHECK(h.post(kReenablePath, "source=process")->status == 400);
     CHECK(h.post(kReenablePath, "device_id=dev-A")->status == 400);
+    CHECK(h.post(kReenablePath, "device_id=dev-A&source=")->status == 400); // empty source
     CHECK(h.post(kReenablePath, "device_id=dev-A&source=evil")->status == 400);
+    CHECK(h.post(kReenablePath, "device_id=dev-A&source=software")->status == 400);
     CHECK(h.calls.empty());
-    CHECK(h.metric("yuzu_tar_source_reenable_total", "invalid_input") == 3.0);
+    CHECK(h.metric("yuzu_tar_source_reenable_total", "invalid_input") == 5.0);
+}
+
+TEST_CASE("fragment reenable: every allowlisted source dispatches",
+          "[server][tar][reenable][fragment]") {
+    // The negative cases above cannot tell "rejected because forged" from
+    // "rejected because the allowlist rejects everything" — this is the
+    // positive half that makes removing a source from the allowlist fail.
+    FragmentHarness h;
+    for (const char* src : {"process", "tcp", "service", "user"})
+        CHECK(h.post(kReenablePath, std::string{"device_id=dev-A&source="} + src)->status == 200);
+    REQUIRE(h.calls.size() == 4);
+    for (std::size_t i = 0; i < h.calls.size(); ++i) {
+        CHECK(h.calls[i].action == "configure");
+        CHECK(h.calls[i].params.size() == 1); // per-source independence (#539)
+    }
+    CHECK(h.metric("yuzu_tar_source_reenable_total", "success") == 4.0);
 }
 
 TEST_CASE("fragment purge: every allowlisted source dispatches", "[server][tar][purge][fragment]") {
@@ -450,6 +491,38 @@ TEST_CASE("fragment purge: query-string params are honoured like form-body param
     REQUIRE(h.calls.size() == 1);
     CHECK(h.calls[0].agent_ids[0] == "dev-A");
     CHECK(h.calls[0].params.at("source") == "process");
+}
+
+TEST_CASE("fragment purge: a query param wins over a body param of the same name",
+          "[server][tar][purge][fragment]") {
+    // httplib parses the query string into req.params BEFORE the body, and
+    // get_param_value returns the first match — so a query value shadows a body
+    // value. Pinned because it is a request-smuggling shape: a proxy inspecting
+    // only the body would see `user` while the server dispatches `process`.
+    // This asserts the CURRENT, httplib-faithful precedence; if the handler ever
+    // needs body-wins semantics that is a deliberate change, not a silent one.
+    FragmentHarness h;
+    auto res = h.post(std::string{kPurgePath} + "?source=process", "device_id=dev-A&source=user");
+    CHECK(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].params.at("source") == "process");
+}
+
+TEST_CASE("fragment purge: a non-form content-type falls back to raw-body parsing",
+          "[server][tar][purge][fragment]") {
+    // With a non-urlencoded Content-Type the sink leaves req.params empty, as
+    // httplib does, so the handler takes its extract_form_value(req.body, ...)
+    // fallback. That fallback carries the unanchored-key defect filed as #2527
+    // (`xsource=` matches the needle `source=`), so the SAME bytes that dispatch
+    // source=tcp through the params branch are rejected 400 here. Pinning both
+    // directions keeps #2527's blast radius visible: it fails CLOSED on this
+    // route, and this test is what will flip when #2527 is fixed.
+    FragmentHarness h;
+    auto res = h.sink.dispatch("POST", kPurgePath, "xsource=evil&device_id=dev-A&source=tcp",
+                               "text/plain", FragmentHarness::same_site_headers());
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 400);
+    CHECK(h.calls.empty());
 }
 
 TEST_CASE("fragment purge: form fields are read the way httplib would parse them",
