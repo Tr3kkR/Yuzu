@@ -1502,6 +1502,47 @@ TEST_CASE("TAR #2361: a delete failure stops the pass instead of leaking autocom
     CHECK(failures_of(f.guard, "process_hourly") >= 1);
 }
 
+TEST_CASE("TAR #2361: a NON-aborting statement error fails one table, not the whole pass",
+          "[tar][retention][clock-guard]") {
+    // The other side of the test above, and the one that was missing.
+    //
+    // RAISE(ABORT) backs out the current STATEMENT and leaves the transaction
+    // intact; RAISE(ROLLBACK) kills the transaction. The batch used to `break`
+    // on both, so a single permanently-broken table -- a missing column after a
+    // partial DDL, one corrupt index -- rolled back every pass forever and
+    // tar.db grew without bound on the endpoint behind one warn line. Before the
+    // batch existed each statement ran independently and the COMMIT kept the
+    // successes, so that was a silent regression (governance Gate 3, cpp-expert).
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
+    auto seed_tcp = [&](int64_t ts, int n) {
+        for (int h = 0; h < n; ++h) {
+            REQUIRE(f.db->execute_sql(
+                std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
+                            "process_name,connect_count,disconnect_count) "
+                            "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
+                            ts)));
+        }
+    };
+    seed_tcp(kT0 - 10 * kHourlyCutoffSec, 5); // expired -> must still be deleted
+    seed_tcp(kT0 - 3600, 1);                  // survivor -> accepted, queued
+    // ABORT, deliberately, NOT ROLLBACK: the transaction survives this one.
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ABORT, 'one bad table'); END;"));
+
+    run_retention(*f.db, kT0, f.guard);
+
+    // The broken table keeps everything and is counted...
+    CHECK(row_count(*f.db, "process_hourly") == 6);
+    CHECK(failures_of(f.guard, "process_hourly") >= 1);
+    // ...while the healthy table's expired rows are still collected. Under the
+    // unconditional break this was 6, i.e. retention had stopped fleet-wide on
+    // this endpoint because of one table.
+    CHECK(row_count(*f.db, "tcp_hourly") == 1);
+    CHECK(failures_of(f.guard, "tcp_hourly") == 0);
+}
+
 TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writer's work",
           "[tar][retention][clock-guard]") {
     // Kimi / Gate 8, and the defect that survived four rounds: driving
