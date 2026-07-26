@@ -3821,6 +3821,27 @@ TEST_CASE("MCP Integration: type-confused targeting is rejected, never widened t
         REQUIRE(body.contains("error"));
         CHECK(dispatch_calls == 0);
     }
+    SECTION("the SINK refuses to widen even if the source check is bypassed") {
+        // Second line of defence, tested on its own terms. The source check
+        // (check_exec_instruction_shape) rejects `agent_ids: []` ~90 lines
+        // earlier, so this guard is unreachable in normal operation - which is
+        // exactly why it needs a test that does not depend on the source check
+        // being absent. What this pins is the SINK's contract: `__all__` is for
+        // a caller who named NO target, and `supplied_target` is what
+        // distinguishes that from a target that resolved to nothing.
+        //
+        // NOTE ON HONESTY: an earlier revision of this PR claimed a "fix at
+        // both ends" and claimed to have falsified it by "removing the sink
+        // guard". No sink guard existed; the claim was false and the reviewer
+        // caught it (#2492). The guard exists now, and this is the test.
+        auto res = call_with(R"({"plugin":"os_info","action":"version","agent_ids":[]})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(dispatch_calls == 0);
+        CHECK(dispatched_scope != "__all__");
+    }
     SECTION("a genuinely empty target set still defaults to __all__ (unchanged)") {
         // The __all__ default is documented behaviour and must survive the fix -
         // this is what stops the guard from being an over-correction.

@@ -5377,10 +5377,17 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         for (const auto& v : a) {
-                            // Type is guaranteed by check_exec_instruction_shape
-                            // above (and pre-mint in the C8 block), so this is a
-                            // length check only.
-                            if (v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
+                            // The type IS guaranteed by check_exec_instruction_shape
+                            // above (and pre-mint in the C8 block), so this guard is
+                            // dead code today. It is kept deliberately: it costs
+                            // nothing, it stays correct under refactoring, and
+                            // without it a non-string reaching here would throw
+                            // type_error out of get_ref and become a 500 instead of
+                            // a clean -32602 the moment that 89-line-distant
+                            // invariant is disturbed. Removing it in this PR was a
+                            // false economy (#2492 review).
+                            if (v.is_string() &&
+                                v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
                                 too_large("agent_id_len", std::format("an agent_ids entry exceeds {} bytes", kExecInstrIdentMaxLen));
                                 return;
                             }
@@ -5406,9 +5413,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
-                // Default scope to __all__ if neither scope nor agent_ids provided
-                if (scope.empty() && agent_ids.empty())
+                // Default scope to __all__ ONLY when the caller named no target at
+                // all. A targeting argument that was SUPPLIED but resolved to
+                // nothing must never widen to the whole fleet - that is the #2437
+                // defect, and `{"agent_ids": []}` from a device filter matching
+                // nothing is its likelier shape than a type-confused list.
+                //
+                // check_exec_instruction_shape already rejects those shapes ~90
+                // lines above, so this branch is UNREACHABLE today and is second
+                // line of defence, not the fix. It is here because the sink is the
+                // one place where a bypass or a reorder turns a specific-looking
+                // target list into the entire fleet, and a single point of failure
+                // is exactly what this series argues against. Falsifiable on its
+                // own terms: neuter the shape check and this still refuses.
+                const bool supplied_target = args.contains("agent_ids") || args.contains("scope");
+                if (scope.empty() && agent_ids.empty()) {
+                    if (supplied_target) {
+                        const bool by_ids = args.contains("agent_ids");
+                        too_large(by_ids ? "agent_ids_empty" : "scope_empty",
+                                  by_ids ? "agent_ids was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents"
+                                         : "scope was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents");
+                        return;
+                    }
                     scope = "__all__";
+                }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
                 // A request carrying _meta.progressToken opts into live progress
