@@ -5274,7 +5274,7 @@ Send a command to one or more connected agents.
   "plugin": "hardware",
   "action": "cpu-info",
   "agent_ids": ["agent-01", "agent-02"],
-  "parameters": {},
+  "params": {},
   "stagger": 30,
   "delay": 5
 }

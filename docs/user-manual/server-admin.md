@@ -232,10 +232,14 @@ advertised by `/discover/scope-kinds` and by the MCP `execute_instruction` schem
 client sending `"scope": ""` to mean "everything", change it to omit the field or to send
 `"__all__"`; both are supported and neither is deprecated.
 
-**Stored data changes shape.** An execution row for a fleet-wide dispatch now records
-`scope_expression = "__all__"` where it previously recorded `""`. Any saved query, report or
-dashboard filter that selects historical broadcasts by `scope_expression = ''` will not match
-new rows.
+**Stored data — narrower than it first looks.** Only requests that **explicitly** send
+`"scope": "__all__"` record `scope_expression = "__all__"` on the execution row, and those already
+did so before this change. Broadcasting by **omitting both fields** is unchanged and still records
+`""` — the execution row is written from the raw request value, before the omitted-means-`__all__`
+mapping is applied for dispatch, and the mapped value is never written back. The one practical
+change is that the dashboard's "All agents" button now sends `__all__` explicitly, so rows created
+that way look different from before. A saved query selecting historical broadcasts by
+`scope_expression = ''` still matches everything except dashboard-initiated ones.
 
 **Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
 sends `__all__` instead of an empty string.
@@ -247,7 +251,8 @@ shape that produced it: `command.dispatch|success` stores `plugin:action -> N ag
 `scope` the caller actually sent. So a historical broadcast that was deliberate and one that was
 an accidentally-widened three-device request are indistinguishable in existing rows. The closest
 available pre-upgrade signal is reviewing automation you believe targets a subset for dispatches
-whose agent count is suspiciously close to your full fleet size.
+whose agent count is suspiciously close to your full fleet size. (The stored detail uses a literal
+`\u2192` arrow, not `->`, so match on the agent count rather than the separator.)
 
 After upgrading, refusals are counted by
 `yuzu_server_dispatch_target_rejected_total{route,reason}` (all series pre-seeded at boot, so
@@ -255,9 +260,9 @@ After upgrading, refusals are counted by
 (`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
 (`detail=reason=<reason>`) or `result_set.create|denied`
 (`detail=reason=<reason> source_kind=<kind>`). The
-`YuzuDispatchTargetRejected` alert fires on any non-zero rate — deliberately more sensitive than
-the MCP equivalent, because before this change these same calls reached the entire fleet and
-reported success.
+`YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
+on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
+audit rows, not the alert, to find individual offenders.
 
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 

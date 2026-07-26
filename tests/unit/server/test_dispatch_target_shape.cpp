@@ -18,6 +18,7 @@
  */
 
 #include "dispatch_target_shape.hpp"
+#include "on_behalf_guard.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -203,4 +204,51 @@ TEST_CASE("#2500 — the route-level reason set matches what the routes actually
         CHECK(std::find(kTargetingShapeReasons.begin(), kTargetingShapeReasons.end(), r) ==
               kTargetingShapeReasons.end());
     }
+}
+
+TEST_CASE("#2500 — audit-detail truncation never severs a UTF-8 character",
+          "[targeting][dispatch][security]") {
+    // The round-3 fix routed caller-supplied `plugin`/`action` through
+    // `sanitize_for_log` to stop audit-detail forgery — and in doing so
+    // introduced a new way to corrupt the same field. The cap counts BYTES, so
+    // a cut landing mid-character used to leave a lone lead byte in the audit
+    // row. `/api/v1/audit` serialises detail through `json_escape`, which passes
+    // bytes >= 0x20 through unvalidated, so ONE truncated device name made the
+    // whole audit page undecodable to a strict UTF-8 client.
+    //
+    // Repro from the review: 127 ASCII bytes then 'é' (0xC3 0xA9) at a cap of
+    // 128 — the 0xC3 fits, the 0xA9 does not.
+    const std::string bad = std::string(127, 'a') + "\xC3\xA9";
+    const auto cut = yuzu::server::onbehalf::sanitize_for_log(bad, 128);
+    CHECK(cut.find('\xC3') == std::string::npos); // the lone lead byte is gone
+
+    // A COMPLETE character that fits must survive — a fix that just lopped the
+    // tail off would pass the assertion above and quietly mangle valid text.
+    const std::string good = std::string(126, 'a') + "\xC3\xA9";
+    const auto kept = yuzu::server::onbehalf::sanitize_for_log(good, 128);
+    CHECK(kept.find("\xC3\xA9") != std::string::npos);
+
+    // Every byte of the result is part of a well-formed sequence.
+    const auto well_formed = [](const std::string& v) {
+        for (size_t i = 0; i < v.size();) {
+            const auto c = static_cast<unsigned char>(v[i]);
+            size_t need = 1;
+            if ((c & 0x80) == 0) need = 1;
+            else if ((c & 0xE0) == 0xC0) need = 2;
+            else if ((c & 0xF0) == 0xE0) need = 3;
+            else if ((c & 0xF8) == 0xF0) need = 4;
+            else return false; // stray continuation byte
+            if (i + need > v.size()) return false;
+            for (size_t k = 1; k < need; ++k)
+                if ((static_cast<unsigned char>(v[i + k]) & 0xC0) != 0x80) return false;
+            i += need;
+        }
+        return true;
+    };
+    CHECK(well_formed(cut));
+    CHECK(well_formed(kept));
+
+    // Control characters and CR/LF still become '?' — the forgery guard the
+    // truncation fix must not regress.
+    CHECK(yuzu::server::onbehalf::sanitize_for_log("a\nb\rc", 128) == "a?b?c");
 }

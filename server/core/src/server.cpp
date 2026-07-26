@@ -641,17 +641,20 @@ public:
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
-                             {{"route", route}, {"reason", "body_type"}});
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonBodyType)}});
         }
-        for (const char* reason : {"parent_id_type", "parent_id_empty"})
+        for (const auto reason : {yuzu::server::kReasonParentIdType,
+                                  yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
-                             {{"route", "result_set_parent"}, {"reason", reason}});
+                             {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
         // The shared dispatch closure's last-line-of-defence arm. Its own route
         // label because it is not a REST surface — background runners reach it
         // too — and a non-zero value here means a CALLER forgot to name a
         // target, which is a code defect rather than a client one.
         metrics_.counter("yuzu_server_dispatch_target_rejected_total",
-                         {{"route", "dispatch_closure"}, {"reason", "closure_no_target"}});
+                         {{"route", "dispatch_closure"},
+                          {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -7928,6 +7931,12 @@ private:
             // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
             auto plugin = extract_json_string(req.body, "plugin");
             auto action = extract_json_string(req.body, "action");
+            // SILENT-DROP helper, kept deliberately: it returns {} for omitted,
+            // empty, non-array and parse-failure alike. That erasure is #2500's
+            // defect, and this call is safe ONLY because `check_targeting_shape`
+            // runs below on the separately-parsed `body` and refuses every shape
+            // whose erasure would matter. Moving this below that check, or
+            // removing it, requires re-reading that ordering first.
             auto agent_ids = extract_json_string_array(req.body, "agent_ids");
 
             if (plugin.empty() || action.empty()) {
@@ -7979,7 +7988,7 @@ private:
                 // reading rather than by watching a dashboard.
                 metrics_
                     .counter("yuzu_server_dispatch_target_rejected_total",
-                             {{"route", "command"}, {"reason", "body_type"}})
+                             {{"route", "command"}, {"reason", std::string(kReasonBodyType)}})
                     .increment();
                 // Capture the audit return and surface partial-success, per the
                 // AuditFn contract (SOC 2 CC6.6, PR #883) and the
@@ -7987,7 +7996,7 @@ private:
                 // request WAS invalid, and answering 503 because we could not
                 // record that would trade a correct refusal for an outage.
                 const bool audit_ok = audit_log(req, "command.dispatch", "denied", "command", "",
-                                                "reason=body_type");
+                                                std::string("reason=") + std::string(kReasonBodyType));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = 400;
@@ -8033,11 +8042,15 @@ private:
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = 400;
-                res.set_content(nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
-                                                {"audit_emitted", audit_ok},
-                                                {"meta", {{"api_version", "v1"}}}})
-                                    .dump(),
-                                "application/json");
+                // Same gate as the body_type denial above: with no audit store
+                // configured, audit_log() returns true without writing, so an
+                // unconditional `true` here would assert a row landed on a
+                // deployment that keeps none. Absent = no claim.
+                nlohmann::json err{{"error", {{"code", 400}, {"message", bv->message}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
                 return;
             }
             const bool named_target = yuzu::server::targeting_supplied(body);
@@ -8237,16 +8250,15 @@ private:
                     if (!audit_ok)
                         res.set_header("Sec-Audit-Failed", "true");
                     res.status = 400;
-                    res.set_content(
-                        nlohmann::json(
-                            {{"error",
-                              {{"code", 400},
-                               {"message", "a targeting argument was supplied but resolved to no "
-                                           "target; omit it entirely to target all agents"}}},
-                             {"audit_emitted", audit_ok},
-                             {"meta", {{"api_version", "v1"}}}})
-                            .dump(),
-                        "application/json");
+                    nlohmann::json err{
+                        {"error",
+                         {{"code", 400},
+                          {"message", "a targeting argument was supplied but resolved to no "
+                                      "target; omit it entirely to target all agents"}}},
+                        {"meta", {{"api_version", "v1"}}}};
+                    if (audit_store_)
+                        err["audit_emitted"] = audit_ok;
+                    res.set_content(err.dump(), "application/json");
                     return;
                 }
                 sent = registry_.send_to_all(cmd);
@@ -10910,7 +10922,7 @@ private:
                 // evidence than none. The counter is the durable signal.
                 metrics_
                     .counter("yuzu_server_dispatch_target_rejected_total",
-                             {{"route", "dispatch_closure"}, {"reason", "closure_no_target"}})
+                             {{"route", "dispatch_closure"}, {"reason", std::string(kReasonClosureNoTarget)}})
                     .increment();
                 spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
                              "no agents; pass scope \"{}\" to broadcast deliberately",
@@ -12229,7 +12241,10 @@ private:
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                     }
-                } else {
+                } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
+                    // Explicit for the same reason as the MCP sink: a future
+                    // DispatchArm must not become a fleet broadcast by falling
+                    // through an `else`.
                     sent = registry_.send_to_all(cmd);
                 }
 
@@ -12923,12 +12938,17 @@ private:
                         for (const auto& aid : agent_ids)
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
-                    } else {
+                    } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
                         // Broadcast, or None — which mcp_server.cpp has already
                         // normalised to kBroadcastScope, so it cannot arrive
                         // here meaning "unnamed". MCP keeps broadcast-on-empty
                         // deliberately: its guard is upstream at the C8 gate and
                         // in the handler, not at this sink.
+                        //
+                        // Named explicitly rather than left as a bare `else`: a
+                        // fifth DispatchArm added later would otherwise fall
+                        // into fleet-wide broadcast at this sink and the
+                        // dashboard's, silently, at two of four sites.
                         sent = registry_.send_to_all(cmd);
                     }
 

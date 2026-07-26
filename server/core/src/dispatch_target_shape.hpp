@@ -96,11 +96,23 @@ inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
 /// the caller had never sent. A tether added to prevent drift had produced a
 /// lie. These labels are honest about which field was wrong, and are excluded
 /// from the MCP set because MCP has neither a request body nor a `parent_id`.
+/// Named so the EMIT SITES reference these entries rather than re-typing the
+/// literal. An earlier version was an array plus hand-typed literals at every
+/// route, with a test that hand-copied the same strings a third time — a
+/// snapshot pretending to be a binding, in the test written to fix a snapshot
+/// pretending to be a binding. Renaming one of these now breaks the build at
+/// every site that emits it, which is the property the array was supposed to
+/// have all along.
+inline constexpr std::string_view kReasonBodyType{"body_type"};
+inline constexpr std::string_view kReasonParentIdType{"parent_id_type"};
+inline constexpr std::string_view kReasonParentIdEmpty{"parent_id_empty"};
+inline constexpr std::string_view kReasonClosureNoTarget{"closure_no_target"};
+
 inline constexpr std::array<std::string_view, 4> kRouteRejectReasons{
-    "body_type",         ///< the request body was not a JSON object
-    "parent_id_type",    ///< parent_id was supplied and is not a string
-    "parent_id_empty",   ///< parent_id was supplied and is an empty string
-    "closure_no_target", ///< a dispatch closure was called naming no target
+    kReasonBodyType,        ///< the request body was not a JSON object
+    kReasonParentIdType,    ///< parent_id was supplied and is not a string
+    kReasonParentIdEmpty,   ///< parent_id was supplied and is an empty string
+    kReasonClosureNoTarget, ///< a dispatch closure was called naming no target
 };
 
 /// Reject a targeting argument that was SUPPLIED but names nothing.

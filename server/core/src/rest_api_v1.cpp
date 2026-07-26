@@ -5919,17 +5919,17 @@ void RestApiV1::register_routes(
                 // dashboard would read zero while the same class of refusal
                 // fires, which is the exact absent()-alerting hole the closed
                 // label set exists to prevent.
-                const char* reason =
-                    body["parent_id"].is_string() ? "parent_id_empty" : "parent_id_type";
+                const std::string_view reason =
+                    body["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
                 if (metrics_registry)
                     metrics_registry
                         ->counter("yuzu_server_dispatch_target_rejected_total",
-                                  {{"route", "result_set_parent"}, {"reason", reason}})
+                                  {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
                         .increment();
                 bool audit_ok = true;
                 if (audit_fn)
                     audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
-                                        std::string("reason=") + reason +
+                                        std::string("reason=") + std::string(reason) +
                                             " source_kind=" + std::string(src_kind));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
@@ -6183,18 +6183,18 @@ void RestApiV1::register_routes(
                       if (body.contains("parent_id") &&
                           (!body["parent_id"].is_string() ||
                            body["parent_id"].get_ref<const std::string&>().empty())) {
-                          const char* reason =
-                              body["parent_id"].is_string() ? "parent_id_empty" : "parent_id_type";
+                          const std::string_view reason =
+                              body["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
                           if (metrics_registry)
                               metrics_registry
                                   ->counter("yuzu_server_dispatch_target_rejected_total",
-                                            {{"route", "result_set_parent"}, {"reason", reason}})
+                                            {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
                                   .increment();
                           bool audit_ok = true;
                           if (audit_fn)
                               audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
                                                   "",
-                                                  std::string("reason=") + reason +
+                                                  std::string("reason=") + std::string(reason) +
                                                       " source_kind=inventory_query");
                           if (!audit_ok)
                               res.set_header("Sec-Audit-Failed", "true");

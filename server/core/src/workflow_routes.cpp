@@ -1248,10 +1248,31 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             try {
                 auto j = nlohmann::json::parse(agent_ids_json);
                 if (j.is_array()) {
+                    // Build into a scratch vector and commit only on FULL
+                    // success. `get<std::string>()` throws on the first
+                    // non-string, and the bare catch below swallows it — so
+                    // pushing directly into `target_ids` left a PARTIALLY
+                    // filled list on `["a","b",3,"d"]` and this step then
+                    // dispatched to the truncated prefix, reporting
+                    // `agents_reached: 2` as success. That is #2500's defect
+                    // pointing the other way: a target the caller named,
+                    // silently NARROWED rather than widened. Both directions
+                    // are the same lie — the set that ran is not the set that
+                    // was asked for (governance, Gate 5 CH-1).
+                    std::vector<std::string> parsed_ids;
+                    parsed_ids.reserve(j.size());
                     for (const auto& a : j)
-                        target_ids.push_back(a.get<std::string>());
+                        parsed_ids.push_back(a.get<std::string>());
+                    target_ids = std::move(parsed_ids);
                 }
-            } catch (...) {}
+            } catch (...) {
+                // target_ids stays EMPTY on any malformed stored targeting.
+                // Empty reaches nobody at the shared sink (#2500), so a corrupt
+                // or legacy `agent_ids_json` fails this step loudly instead of
+                // dispatching to whatever happened to parse — or, before the
+                // inversion, to the entire fleet.
+                target_ids.clear();
+            }
 
             // Parse parameters from JSON object
             std::unordered_map<std::string, std::string> params;
@@ -1402,12 +1423,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (metrics) {
                 metrics
                     ->counter("yuzu_server_dispatch_target_rejected_total",
-                              {{"route", "instruction_execute"}, {"reason", "body_type"}})
+                              {{"route", "instruction_execute"}, {"reason", std::string(kReasonBodyType)}})
                     .increment();
             }
             if (audit_fn) {
                 audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
-                         "reason=body_type");
+                         std::string("reason=") + std::string(kReasonBodyType));
             }
             res.status = 400;
             res.set_content(

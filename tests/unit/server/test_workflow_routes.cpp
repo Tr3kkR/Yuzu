@@ -1537,6 +1537,19 @@ TEST_CASE("#2500 — a non-object body is refused, not read as an unnamed target
         REQUIRE(res);
         CHECK(res->status == 400);
         CHECK(h.dispatch_calls == 0);
+        // Counted and audited like its four sibling refusals. An uncounted
+        // refusal cannot reach the alert this change ships — the argument the
+        // fold used to call an invisible refusal blocking, applied to itself.
+        CHECK(h.metrics
+                  .counter("yuzu_server_dispatch_target_rejected_total",
+                           {{"route", "instruction_execute"}, {"reason", "body_type"}})
+                  .value() == 1.0);
+        bool denied_audit = false;
+        for (const auto& a : h.audit_calls)
+            if (a.action == "instruction.execute" && a.result == "denied" &&
+                a.detail == "reason=body_type")
+                denied_audit = true;
+        CHECK(denied_audit);
     }
 }
 
