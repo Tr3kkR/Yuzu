@@ -330,12 +330,87 @@ configuration is required.
 ## Retention and cleanup
 
 Audit events are retained for 365 days by default. A background thread runs
-every hour and deletes events whose `timestamp` falls outside the retention
-window. Deletion is permanent --- there is no soft-delete or archive step.
+every hour and deletes events whose `ttl_expires_at` has passed. That TTL is
+stamped once, when the row is written, as `insert time + retention window` -- it
+is not derived from the event's own `timestamp`, and nothing ever rewrites it.
+Deletion is permanent --- there is no soft-delete or archive step.
 
 To preserve audit data beyond the retention window, export events periodically
 using the REST API or forward them to an external system (see Planned Features
 below).
+
+### The retention clock guard
+
+Retention is driven by the server's wall clock, so a clock that jumps forward
+--- a restored VM snapshot, an NTP correction after a dead CMOS battery, a
+hand-set date --- can mark the whole table expired at once. A cleanup pass
+refuses to act on that:
+
+- **It declines a pass that would expire every datable row**, logs a warning,
+  and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
+  applies when the gap since the previous pass exceeds **a fixed 7 days**, or
+  when the stored reading is *ahead* of the current clock. That reading is
+  persisted, so the check still fires on the first pass after a restart --- including
+  a server that *booted* with an already-wrong clock. The 7 days is
+  **absolute, not derived from `audit_retention_days`**: how far the clock moved
+  has nothing to do with how long rows are kept, and scaling it to the window
+  put the threshold at a full year on the 365-day default, where it could never
+  fire. Elapsed time still cannot tell a clock jump from an outage, so a server
+  that was genuinely down for more than a week declines one cleanup pass ---
+  deliberately cheap, and the warning names both causes. The decline is
+  latched, so an audit table that is *legitimately* all-expired still ages out
+  --- it just costs one cleanup interval first.
+- **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
+  default), oldest first. A wipe the guard chose to allow therefore ages out at
+  a paced rate an operator can still catch, rather than in one statement.
+- Rows whose TTL sits implausibly far in the future --- beyond the retention
+  window plus two days, i.e. written while the clock was already skewed forward
+  --- are excluded from the "would this expire everything?" question. Without
+  that, one such row would disarm the guard permanently.
+
+**Capacity.** The drain is a fixed 25,000 rows per hourly pass -- about 600,000
+rows/day, or a sustained ceiling of roughly **6.9 audit events/second**. Above
+that, expiry outruns deletion and `audit.db` grows without bound;
+`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that
+figure against your own audit-event rate before deploying at scale. The cap is a
+compile-time constant today, so exceeding it needs an engineering change rather
+than configuration.
+
+**Retention is a floor, not a ceiling.** The guard errs toward keeping evidence
+longer than configured, which is the safe direction for an evidence store.
+Changing `--audit-retention-days` does **not** re-date existing rows:
+`ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
+expires nothing retroactively and reclaims no disk. What it does change is this
+guard's survivor horizon, which is derived from the current window -- so after a
+reduction (and a restart, per issue #483) the older long-TTL rows stop counting
+as survivors, and a single declined pass becomes more likely.
+
+**What this does and does not promise.** The cap is the half that always
+applies: it bounds the damage of any allowed wipe unconditionally. The two
+detectors are best-effort, and the outcome test has a known blind spot --- it is
+defeated by *any* audit row written after the clock moved, because a fresh row
+counts as a survivor. On a server that is up and serving, that is the common
+case, which is why the elapsed-time reading is persisted across restarts. Taken
+together the guard converts an instantaneous wipe into a paced one plus an
+operator signal; it does not guarantee every clock anomaly is detected.
+
+Six metrics report on this. All but `rows_deleted_total` ship with an alert rule
+in `docs/prometheus/yuzu-alerts.yml`; that one is a rate to read alongside the
+others, not an alert on its own. Do not collapse the first two:
+
+| Metric | Meaning |
+|---|---|
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was *ahead* of the clock. The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
+| `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
+| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
+| `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. **Evaluated once at startup**, so it will not detect an index dropped while the server is running. |
+| `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
+
+The first two both leave rows undeleted, so an audit table that never shrinks
+looks identical either way --- only the pair distinguishes "the guard is
+protecting the table" from "cleanup is broken". The third covers the failure the
+cap itself introduces, which neither of the first two would show.
 
 ## Integration patterns
 
