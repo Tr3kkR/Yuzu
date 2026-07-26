@@ -10,6 +10,8 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include "../test_helpers.hpp"
 
 #include <libpq-fe.h>
@@ -721,6 +723,59 @@ TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[p
     REQUIRE_FALSE(uninitialized.encrypt(id, bytes_of("y")).has_value());
     REQUIRE(hook_calls == 0);
     REQUIRE(uninitialized.decrypt_failure_counts().empty());
+}
+
+// ── ADR-0010 §Decision 3 metric exposition ─────────────────────────────────
+//
+// server.cpp exports decrypt_failure_counts() at scrape time as
+// `yuzu_server_secret_decrypt_failures_total{store,failure_class}`. That
+// export carries a subtlety worth pinning: the value lives in the GAUGE
+// family (it is a `set()` of a total the codec owns, not an increment), so
+// without an explicit `describe(..., "counter")` the scrape would emit
+// `# TYPE ... gauge` under a `_total` name — a silent violation of
+// docs/observability-conventions.md that a reader of server.cpp cannot see.
+// This asserts the exposition, so a future edit that drops the describe or
+// switches families is caught here rather than in a Grafana query.
+TEST_CASE("SecretCodec decrypt-failure counts export as a Prometheus counter", "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    const auto id = test_id();
+    auto blob = codec.encrypt(id, bytes_of("x"));
+    REQUIRE(blob.has_value());
+    auto tampered = *blob;
+    set_blob_kek_version(tampered, 99);
+    REQUIRE_FALSE(codec.decrypt(id, tampered).has_value());
+
+    // Mirror server.cpp's describe + scrape-time export exactly.
+    yuzu::MetricsRegistry metrics;
+    metrics.describe("yuzu_server_secret_decrypt_failures_total",
+                     "Envelope-encrypted secret decrypt failures by store and failure class "
+                     "(tamper, unresolvable KEK, malformed blob)",
+                     "counter");
+    for (const auto& [key, count] : codec.decrypt_failure_counts()) {
+        const auto& [store, cls] = key;
+        metrics
+            .gauge("yuzu_server_secret_decrypt_failures_total",
+                   {{"store", store}, {"failure_class", std::string(SecretCodec::to_string(cls))}})
+            .set(static_cast<double>(count));
+    }
+
+    const std::string out = metrics.serialize();
+    INFO(out);
+    // Declared type wins over the gauge family's default.
+    CHECK(out.find("# TYPE yuzu_server_secret_decrypt_failures_total counter") !=
+          std::string::npos);
+    CHECK(out.find("# TYPE yuzu_server_secret_decrypt_failures_total gauge") == std::string::npos);
+    // The labelled sample the yuzu-secrets alert rules match on.
+    CHECK(out.find(R"(store="tstore")") != std::string::npos);
+    CHECK(out.find(R"(failure_class="kek_unresolvable")") != std::string::npos);
 }
 
 TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails closed",

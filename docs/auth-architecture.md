@@ -21,7 +21,7 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
   - `DELETE /api/v1/sessions/me` — any interactive authenticated principal. Wipes cookie sessions AND revokes the caller's API tokens (lost-laptop UX). MCP-tier and service-scoped tokens rejected with 403. Response sets `Set-Cookie: yuzu_session=; Max-Age=0` so the client side completes the disposition.
-  - Both wrap `AuthManager::invalidate_user_sessions`, which performs the dual-write (AuthDB DELETE first outside `mu_`, then in-memory `sessions_` erase under `mu_`) and returns `RevokeResult { count, db_persisted }`. In-memory wipe runs even if the DB write fails (operator's "stop NOW" intent), but `db_persisted=false` surfaces up so the REST handler audits `result="partial"` with `detail` carrying `db_error=true`. Defence-in-depth: the AuthDB primitive itself validates username (matches sibling `add_user` / `update_role`).
+  - Both wrap `AuthManager::invalidate_user_sessions`, which erases matching entries from the in-memory `sessions_` map under `mu_` and returns `RevokeResult { count, db_persisted }`. **Sessions have never had a durable row since the Postgres cutover** (ADR-0006 — the SQLite-era `sessions` table was dropped, not migrated; see "AuthDB — persistent authentication store" below), so `invalidate_user_sessions` no longer performs a companion AuthDB write — `db_persisted` is always `true` today. The field is kept on `RevokeResult` (rather than removed) so the REST handler's `result="partial"`/`db_error=true` audit path stays available without a wire-shape change, should a future durable session mirror return.
   - Audit actions split for SIEM correlation: `session.revoke_all` (cross-user) vs `session.revoke_all.self` (self via either route, including admin self-target through the admin path). Both use `target_type=User` (project PascalCase convention). `result` ∈ {`success`, `partial`, `denied`}.
   - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
   - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
@@ -33,13 +33,16 @@ path (`POST /login`). OIDC delegates throttling to the IdP; the MFA
 code-verification path has its own per-token failure rate-limit — neither is in
 scope here.
 
-- **State** lives in three columns on the `users` table (`auth.db` migration
-  v3): `failed_login_count`, `last_failed_login_at`, `locked_until`
-  (`NULL` = not locked). A non-existent username has no row, so spraying random
-  usernames neither locks a non-existent account nor grows storage
-  (anti-enumeration). All three accessors (`AuthDB::lockout_status` /
-  `record_failed_login` / `clear_failed_logins`) are parameterised and use
-  `RETURNING`, never `sqlite3_changes()` (#1033).
+- **State** lives in three columns on `auth.users` (Postgres schema `auth` —
+  originally SQLite `auth.db` migration v3, carried unchanged into the
+  single-migration Postgres schema, ADR-0006): `failed_login_count`,
+  `last_failed_login_at`, `locked_until` (`NULL` = not locked). A non-existent
+  username has no row, so spraying random usernames neither locks a
+  non-existent account nor grows storage (anti-enumeration). All three
+  accessors (`AuthDB::lockout_status` / `record_failed_login` /
+  `clear_failed_logins`) are parameterised via `pg::exec_params` and use
+  `RETURNING` (the SQLite-era `sqlite3_changes()` race, #1033, does not apply
+  on Postgres — `RETURNING` was already the idiom here).
 - **Policy** is config, not schema, so operators retune without a migration:
   - `--auth-lockout-threshold` (`YUZU_AUTH_LOCKOUT_THRESHOLD`, default `5`,
     `0` disables) — consecutive failures before lock.
@@ -74,10 +77,15 @@ scope here.
   the lock arms (covered by a barrier-style concurrent route test). Different
   usernames hash to different stripes and log in fully in parallel — only a burst
   against one account is throttled, which is the intended effect. This is
-  **single-process** scope, adequate for the current single-node SQLite
-  `auth.db`; the HA/multi-replica-correct form is a DB-atomic attempt-reservation
-  that lands with the auth store's Postgres migration (tracked follow-up).
-  `login_rate_limit` remains the companion control for the distributed vector.
+  **still single-process (in-memory) scope** — the auth store's ADR-0006
+  Postgres migration (Wave 3, shipped) moved the underlying `users` table
+  substrate but did **not** change this algorithm: the striped lock lives in
+  `AuthRoutes`, not the database, so it still only serializes attempts within
+  one server process. A DB-atomic attempt-reservation (now straightforward on
+  Postgres — e.g. `UPDATE ... WHERE failed_login_count < threshold RETURNING`)
+  is the multi-replica-correct form and remains a tracked follow-up, not
+  something this migration delivered incidentally. `login_rate_limit` remains
+  the companion control for the distributed vector.
   - *On failure*: `record_failed_login` increments the counter and arms
     `locked_until` on the threshold-th failure. A window that has **fully
     expired** starts a fresh attempt budget (the waited-out user gets their
@@ -109,9 +117,13 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   user mid-coffee-break is a behaviour change, so it is off unless an operator
   turns it on (recommended `900` = 15 min). Boot posture is logged for CC6.3
   evidence. Enabling it satisfies the CC6.3 inactivity-timeout control.
-- **In-memory is authoritative.** Sessions are validated from the in-memory
-  `AuthManager::sessions_` map (the `auth.db` `sessions` rows are v1
-  dead-writes), so the idle state lives on the in-memory `Session`:
+- **In-memory is authoritative — and, since the Postgres cutover, the ONLY
+  copy.** Sessions are validated from the in-memory `AuthManager::sessions_`
+  map. The SQLite-era `sessions` table (whose rows were always v1
+  dead-writes — never read back) was **dropped, not migrated**, when `AuthDB`
+  moved to Postgres (ADR-0006) — there is no `auth.sessions` table at all
+  today, durable or otherwise. So the idle state lives *only* on the
+  in-memory `Session`:
   `last_activity_at` (a monotonic `steady_clock` stamp — an NTP step can neither
   extend nor collapse the window). `AuthManager::session_inactivity_` holds the
   configured window (set once at startup via `set_session_inactivity`).
@@ -134,14 +146,18 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   `synthesize_token_session` (their own store), never `validate_session`, so a
   long-lived automation token is **never** idle-timed-out. OIDC sessions are
   subject to the same idle window but the user simply re-authenticates via SSO.
-- **Durable mirror is best-effort + throttled.** On a touch, the in-memory stamp
-  is authoritative; the `auth.db` column is updated via
-  `AuthDB::touch_session_activity` (mirrors `mfa_mark_session_stepup`) at most
-  once per session per `kActivityPersistGranularity` (60 s), off the `mu_` lock
-  (snapshot-and-release), so the per-request touch is **not** a per-request SQL
-  write. Idle expiry is not separately audited (neither is absolute expiry) and
-  emits **no Prometheus counter** — the observable signal is the `auth.login`
-  audit row on re-authentication.
+- **No durable mirror since the Postgres cutover.** Before ADR-0006, a touch
+  best-effort-persisted the timestamp via `AuthDB::touch_session_activity`
+  (mirroring `mfa_mark_session_stepup`), throttled to at most once per session
+  per `kActivityPersistGranularity` (60 s). That method — and the `sessions`
+  table it wrote — was **removed**, not ported, when `AuthDB` moved to
+  Postgres: there is no session surface on the Postgres-backed `AuthDB` at all
+  (see "AuthDB — persistent authentication store" below), so `last_activity_at`
+  now lives purely in `AuthManager::sessions_` and does not survive a server
+  restart (idle-timeout state resets along with the rest of the in-memory
+  session table). Idle expiry is not separately audited (neither was absolute
+  expiry) and emits **no Prometheus counter** — the observable signal is the
+  `auth.login` audit row on re-authentication.
 
 ## MFA / TOTP (v0.12+, SOC 2 CC6.6)
 
@@ -158,14 +174,23 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   TTL) when the user has TOTP enrolled; browser swaps to a TOTP form
   and posts to `POST /login/mfa`. Recovery codes share the same
   endpoint.
-- **Storage** — TOTP secret as raw 20-byte BLOB in `users.mfa_totp_secret`,
-  protected by the same 0600 file mode that backs `password_hash`.
-  Encryption-at-rest (AES-256-GCM with key in `auth_kv`) is a follow-up;
-  the `auth_kv` table is provisioned empty.
-  **ADR-0010 (2026-06-10) supersedes the `auth_kv` plan:** the mechanism is
-  `SecretCodec` (AES-256-GCM, DEK wrapped by the `KeyProvider`-custodied KEK),
-  landing with the `auth` store's Postgres migration. `auth_kv` will not be
-  used for this purpose.
+- **Storage — encryption-at-rest SHIPPED (ADR-0010).** `auth.users.mfa_totp_secret`
+  (BYTEA) is envelope-encrypted via `pg::SecretCodec` — AES-256-GCM, DEK
+  wrapped by the `FileKeyProvider`-custodied install KEK, AAD-bound to
+  `{"auth", "users", "mfa_totp_secret", <row id>}` so a ciphertext blob
+  cannot be swapped between rows. This landed with the `auth`/`scim_store`
+  Postgres cutover (ADR-0006 Wave 3) and is `SecretCodec`'s **first real
+  consumer** (ADR-0010 was accepted with no production caller until this).
+  The SQLite-era `auth_kv` scaffolding table this doc previously described as
+  the planned mechanism was **not** carried into the Postgres schema — it was
+  unused scaffolding, superseded outright by `SecretCodec`. A store/decrypt
+  failure on this column (tamper, wrong/rotated KEK, corrupt blob) surfaces
+  as the distinct `AuthDBError::SecretUnavailable` and every MFA reader fails
+  **closed** on it — see "MFA fails closed on secret-read failure" below;
+  this is a hard invariant, not an implementation detail.
+- **Everything else stays a verify-only hash** — password hashes, recovery
+  codes, enrollment tokens, and SCIM bearer tokens are unaffected by
+  `SecretCodec`; there is nothing to decrypt for a one-way hash.
 - **CLI flags / Config** — `--mfa-enforcement <optional|admin-only|required>`
   (PR 1 honours `optional` only), `--mfa-step-up-window-secs` (default
   300), `--mfa-login-pending-secs` (default 120).
@@ -177,6 +202,28 @@ Full design: `docs/auth-mfa-design.md`. Summary:
   execute, file-retrieval upload) and the `/login/mfa/stepup` route.
 - **OIDC `amr` short-circuit** (PR 3) — `IdTokenClaims.amr` parsing so
   IdP-asserted MFA skips the local TOTP step.
+- **MFA fails CLOSED on a secret-read/decrypt failure (ADR-0006/0010
+  hardening, shipped with the Postgres cutover).** `AuthDBError::SecretUnavailable`
+  is a distinct outcome from both "not enrolled" and "code rejected" — it
+  means `mfa_totp_secret`'s envelope could not be read/decrypted (Postgres
+  outage mid-read, tamper, an unresolvable/rotated KEK, a corrupt blob) while
+  `mfa_enrolled_at` says the account IS enrolled. Every reader that touches
+  the secret (`mfa_status`, `mfa_verify_login_code`, `mfa_verify_enrollment`,
+  `mfa_init_enrollment`'s provisional-reuse arm) returns this distinctly, and
+  every caller (`auth_routes.cpp`'s `/login/mfa` + `/login`'s MFA-pending
+  branch, `mfa_step_up.cpp`'s `require_mfa_step_up`, `settings_routes.cpp`'s
+  MFA fragment + enrollment routes) maps it to a **503** (retry/alert) —
+  **never** to "not enrolled" (which would silently drop an enrolled
+  privileged account's second factor and let a password-only login mint a
+  session) and **never** to "code rejected" (which would burn one of the
+  user's limited verification attempts against a transient outage). This
+  closes a pre-existing latent MFA-bypass class: before this hardening, ANY
+  read failure on the enrollment state collapsed to "not enrolled" by
+  omission, and a Postgres substrate makes read failures during a network
+  partition or failover materially more likely than a local SQLite file ever
+  did — the fail-closed handling was bundled into this migration precisely
+  because the substrate change made the gap exploitable, not merely
+  theoretical.
 
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
@@ -188,8 +235,9 @@ pre-authorized operator holds a non-admin base role day-to-day and **activates**
 admin **just-in-time** for a bounded, justified, MFA-gated window, then
 auto-reverts — so a compromised everyday session is not a standing admin session.
 
-- **Eligibility is a per-user flag** — `users.elevation_eligible` (auth.db
-  migration v5), distinct from holding standing admin and trivially enumerable
+- **Eligibility is a per-user flag** — `users.elevation_eligible`
+  (originally SQLite `auth.db` migration v5; now a column on the single-migration
+  Postgres `auth.users` schema, ADR-0006), distinct from holding standing admin and trivially enumerable
   for access reviews. Admin-managed (and MFA-step-up-gated) via
   `POST /api/v1/users/<name>/elevation-eligibility` `{"eligible": bool}`
   (`AuthDB::set_elevation_eligible`/`is_elevation_eligible`, parameterised,
@@ -353,7 +401,7 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   currently-active elevation window (`AuthManager::revoke_user_elevations`);
   (2) `DELETE /api/v1/sessions?username=<principal>` — force-logs-out the
   operator's current cookie session(s). Neither lever deactivates the
-  `auth.db` row itself or stops the IdP from minting the operator a fresh
+  `auth.users` row itself or stops the IdP from minting the operator a fresh
   session on next login (that requires IdP-side deprovisioning today); (1)+
   (2) together are the full standing-access kill switch available in this
   slice. #1859 will add a durable-side deactivation/reaper so a stale IdP
@@ -449,10 +497,14 @@ account policy)"* — this ships **both** halves.
   standard mode.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
-  `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--data-dir`)
-  arms the account for the window and exits — mirroring the `--mfa-reset`
-  break-glass contract (#1226): it validates the account (exists + MFA),
-  verifies the audit store is **writable before** mutating, and writes
+  `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--postgres-dsn`
+  for the auth store, and `--data-dir` for the audit-store write below — the
+  auth store itself moved to Postgres/ADR-0006 and no longer needs
+  `--data-dir`, but the one-shot still verifies the SQLite `audit.db` under
+  `--data-dir` before mutating) arms the account for the window and exits —
+  mirroring the `--mfa-reset` break-glass contract (#1226): it validates the
+  account (exists + MFA), verifies the audit store is **writable before**
+  mutating, and writes
   `auth.breakglass.armed` attributed to the **kernel-authoritative OS identity**
   (`resolve_os_principal`, not the forgeable `USER` env var), `principal_role =
   break-glass`. Refuses to arm — and exits non-zero — if any check fails or the
@@ -685,11 +737,11 @@ fixed:
   `AuthManager::provision_sso_identity` immediately after
   `create_oidc_session` mints the session — a new, independent call, not
   folded into `create_oidc_session` itself (that method holds `mu_` for the
-  in-memory session map; provisioning does unrelated `auth.db` I/O that must
+  in-memory session map; provisioning does unrelated auth-store I/O that must
   not serialize behind it). It forwards to `AuthDB::upsert_sso_identity`
-  (auth.db migration v6: `users` gains `identity_source`, `external_iss`,
-  `external_sub`, `display_name`, `last_seen_at`, all nullable/defaulted so
-  every existing row survives without backfill), which `INSERT ... ON
+  (originally SQLite `auth.db` migration v6, now columns on the Postgres
+  `auth.users` schema: `identity_source`, `external_iss`,
+  `external_sub`, `display_name`, `last_seen_at`), which `INSERT ... ON
   CONFLICT(username) DO UPDATE`s a row for the stable principal —
   `password_hash`/`salt_hex` are `''` (never resolvable on the local login
   path — see the constant-time-compare note at the top of this document),
@@ -811,13 +863,18 @@ missing-row problem here, unlike elevation. `DELETE
 that charset-only validator predates #1837 and would already have rejected
 most OIDC display-name-keyed usernames (spaces, `@`) before this change
 too, so this is a narrow, pre-existing, easily-widened validator gap, not a
-new #1837 regression and not gated on #1852. Separately, the
+new #1837 regression and not gated on #1852. Separately, the historical
 `auth.db`-persisted half of revocation
 (`AuthDB::invalidate_all_sessions`'s `DELETE FROM sessions`, surfaced as
 `db_persisted=false` for an SSO target) was **already** a no-op for OIDC
-before #1837 too: `AuthDB::create_session` is never called for an OIDC
+before #1837 too: `AuthDB::create_session` was never called for an OIDC
 login — SSO sessions have always been in-memory-only and were never
-written to `auth.db`'s `sessions` table in the first place.
+written to `auth.db`'s `sessions` table in the first place. **This whole
+distinction is now moot for every login path, not just OIDC:** the ADR-0006
+Postgres cutover dropped `AuthDB::invalidate_all_sessions`/`create_session`
+and the `sessions` table entirely (see "AuthDB — persistent authentication
+store" below) — `invalidate_user_sessions` today is purely the in-memory
+sweep described at the top of this bullet, for every `auth_source`.
 
 Implementation: `Session::username`/`display_name`
 (`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
@@ -914,8 +971,8 @@ identical lifetime to OIDC sessions — 8-hour absolute, subject to
   otherwise — including every login when the two group→role flags are unset
   (the unconfigured default). JIT elevation is non-functional for SAML users
   regardless of role: the elevation endpoint checks `is_elevation_eligible` and
-  `mfa_status` in `auth.db`, and SAML users have no row in the local `users`
-  table — both lookups fail-closed and the elevation is denied. A SAML admin
+  `mfa_status` against the Postgres auth store, and SAML users have no row in
+  `auth.users` — both lookups fail-closed and the elevation is denied. A SAML admin
   therefore gets `role=admin` permissions immediately at login, not via
   elevation.
 
@@ -1220,9 +1277,10 @@ you enable SCIM.
 **SCIM may only ever mutate accounts that SCIM itself provisioned, and only
 while they are still floor-privilege.** Every deactivate / reactivate /
 delete / update re-verifies **both**
-`provisioning_source == "scim"` (a new `users` column,
-`AuthDB::set_provisioning_source`/`get_provisioning_source`, auth.db
-migration **v7**) **and** `role == "user"` **immediately before** touching
+`provisioning_source == "scim"` (a `users` column,
+`AuthDB::set_provisioning_source`/`get_provisioning_source`; originally
+SQLite `auth.db` migration v7, now a column on the Postgres `auth.users`
+schema) **and** `role == "user"` **immediately before** touching
 the auth account — not at lookup time, at the mutation site. Either mismatch
 (the target `scim_id` maps to a username whose `provisioning_source` is
 `local` or anything else, **or** whose `role` has since been elevated, e.g.
@@ -1262,8 +1320,8 @@ advertised alongside `User` in `/scim/v2/ResourceTypes` and
 `urn:ietf:params:scim:schemas:core:2.0:Group`).
 
 **Role resolution reuses the existing machinery, not a parallel
-implementation.** Because the `auth.db` role model is binary (`admin` |
-`user`), granting admin via group membership is a parity check, not a
+implementation.** Because the auth store's role model (`auth.users.role`) is
+binary (`admin` | `user`), granting admin via group membership is a parity check, not a
 richer mapping: a SCIM-provisioned user is `role=admin` **iff** they are
 currently a member of the group whose `displayName` equals
 `--scim-admin-group` (`YUZU_SCIM_ADMIN_GROUP`, default empty — no SCIM
@@ -1346,7 +1404,7 @@ acts on users a Group mutation or reprovision actually resolves to.
   on an existing `displayName`, or a `PUT` rename onto one) rather than
   silently permitting a second same-named group, but this only prevents
   *duplicate* names — it does not make `displayName` a stable key.
-- **Binary `admin`|`user` only.** `auth.db`'s role model has exactly two
+- **Binary `admin`|`user` only.** The auth store's role model (`auth.users.role`) has exactly two
   values; Groups → role mapping cannot express anything finer even if a
   future RBAC expansion introduces more roles — the same constraint SAML
   and OIDC group→role mapping already operate under.
@@ -1419,41 +1477,42 @@ Prometheus counters (all in the `yuzu_scim_*` namespace):
 
 ### Storage
 
-SCIM's resource-mapping table (`scim_resources` — the IdP-facing `id`/
-`externalId` ↔ Yuzu `username` mapping) and its bearer-token table
-(`scim_tokens` — sha256 hashes only) live **inside `auth.db`**, under their
-own `MigrationRunner` component (`"scim"`, independent of AuthDB's own
-`"auth_db"` migration track on the same underlying file) — **not** a new,
-separate store. `ScimStore` opens its own `sqlite3` connection to the same
-db file `AuthDB` manages. This keeps user identity on one substrate and lets
-SCIM's tables ride `auth.db`'s eventual Postgres migration (ADR-0006) rather
-than needing a second migration path. Group resources and membership are
-new rows under the same `"scim"` `MigrationRunner` component, not a second
-store or migration track.
+**SHIPPED (ADR-0006 Wave 3): `ScimStore` is now its own born-on-Postgres
+store, schema `scim_store`, alongside `AuthDB`'s `auth` schema — not a table
+riding inside `auth.db` any more.** `ScimStore`'s resource-mapping table
+(`scim_resources` — the IdP-facing `id`/`externalId` ↔ Yuzu `username`
+mapping), its bearer-token table (`scim_tokens` — sha256 hashes only), and
+its Group tables (`scim_groups`/`scim_group_members`) all live under the
+`scim_store` Postgres schema, migrated by `ScimStore`'s own
+`PgMigrationRunner` instance, independent of (but constructed alongside)
+`AuthDB`'s `auth`-schema migration. `ScimStore(pg::PgPool&)` takes the same
+shared server `PgPool` `AuthDB` does — a distinct schema, not a distinct
+database or connection identity. This closed out the former SQLite-era
+`auth.db`-cohabitation design (see history below) as part of the same
+migration that moved `AuthDB` itself.
 
-**ADR-0006 exception note.** The 2026-06-22 update to ADR-0006 commits every
-server store to Postgres, with no *new* server-side SQLite store absent an
-explicit exception. `scim_resources`/`scim_tokens` are a deliberate,
-eyes-open exception: they ride the existing `auth.db` SQLite file (their own
-`"scim"` `MigrationRunner` component) rather than standing up a new Postgres
-store, so identity state — accounts, sessions, provenance, and now SCIM's
-id/token mapping — stays on one substrate until `auth.db` itself makes its
-Postgres/`SecretCodec` cutover (`docs/postgres-migration-ladder.md` Wave 3,
-`auth DB (auth_db.{hpp,cpp})` row). Recorded as a dated ADR-0006 exception bullet in
-`docs/postgres-migration-ladder.md` "Notes" — the same place, and in the
-same eyes-open-override style, as the existing `NvdDatabase` SQLite
-carve-out — rather than a fresh standalone exception ADR.
+**History (pre-migration; kept for context).** Before ADR-0006 Wave 3,
+`scim_resources`/`scim_tokens` were a deliberate, dated, eyes-open exception
+to ADR-0006's "no new server-side SQLite store" rule — they rode the
+existing SQLite `auth.db` file (their own `"scim"` `MigrationRunner`
+component) rather than standing up a new Postgres store, pending `auth.db`'s
+own eventual Postgres cutover. That cutover has now happened for both stores
+in lockstep — the exception is retired, not carried forward. See
+`docs/postgres-migration-ladder.md`'s auth/SCIM row for the shipped record.
 
 ### Residual risks / deferred (next slice)
 
-- **Crash-window non-atomicity in the two-connection deactivate/reactivate
-  path.** `ScimStore` and `AuthDB` open separate `sqlite3` connections onto
-  the same `auth.db` file; a deactivate that soft-deletes the auth account
-  and revokes sessions is not one atomic transaction across both. A crash
-  between the two steps is an **irreducible** window given the two-connection
-  design — it is reconciled by the IdP's own periodic re-sync (a deactivated
-  user whose session survived the crash gets a follow-up deactivate call on
-  the next sync cycle), not by a code-level fix in this slice.
+- **Crash-window non-atomicity in the two-store deactivate/reactivate
+  path — still applies on Postgres.** `ScimStore` and `AuthDB` are separate
+  stores (separate schemas, separate per-call leases/transactions off the
+  shared `PgPool`) even though both are now Postgres; a deactivate that
+  soft-deletes the auth account and touches SCIM state is not one atomic
+  cross-schema transaction. A crash between the two steps remains an
+  **irreducible** window given the two-store design — it is reconciled by
+  the IdP's own periodic re-sync (a deactivated user whose session survived
+  the crash gets a follow-up deactivate call on the next sync cycle), not by
+  a code-level fix. The Postgres migration changed the storage engine under
+  each store, not this cross-store boundary.
 - **No per-route SCIM rate limit.** SCIM calls share the server's global
   rate-limit only — there is no SCIM-specific throttle tuned to expected IdP
   connector call patterns.
@@ -1468,12 +1527,12 @@ carve-out — rather than a fresh standalone exception ADR.
   offboarding order, not tracked as a defect.
 - **`userName` rename via `PUT`.** Rejected `400 mutability` this slice;
   delete + re-provision is the only path for a username change.
-- **At-rest encryption of the SCIM token.** The token is stored as a sha256
-  hash (verify-only, like `ApiTokenStore`), not a reversible encrypted blob —
-  there is nothing to decrypt, so this is a lower-urgency follow-up than the
-  TOTP-secret case. It rides `auth.db`'s future Postgres/`SecretCodec`
-  migration (ADR-0010) alongside the TOTP-secret-at-rest follow-up, should a
-  reversible form ever be needed.
+- **The SCIM token stays a verify-only sha256 hash, unaffected by the
+  `SecretCodec` rollout.** Like `ApiTokenStore`, there is nothing to decrypt
+  — a reversible encrypted form was never planned and is not needed; the
+  `mfa_totp_secret` envelope-encryption (shipped, see MFA/TOTP above) is a
+  genuinely different case because TOTP verification needs the *plaintext*
+  secret back, not just a compare.
 
 Implementation: `server/core/include/yuzu/server/scim_store.hpp` +
 `server/core/src/scim_store.cpp` (storage layer), `server/core/include/yuzu/
@@ -1482,254 +1541,9 @@ discovery documents), `server/core/src/scim_routes.{hpp,cpp}` (HTTP routes).
 Tests: `tests/unit/server/test_scim_store.cpp`,
 `test_scim_json.cpp`, `test_scim_routes.cpp`.
 
-## Periodic access reviews (SOC 2 CC6.2)
-
-A fleet-wide access-review capability across all three RBAC principal types
-— **user**, **group**, and **engine** — closing the "Periodic access
-reviews with manager/security attestation" CC6.2 gap. Two independent
-pieces: a stateless **export** (the current grant population, for a quick
-spot-check or an offline CSV pull) and a durable **attestation campaign**
-(freeze the population, have reviewers sign off on each grant, keep the
-evidence forever).
-
-### Export model
-
-`GET /api/v1/access-reviews/export` (`AccessReview:Read`) builds one row per
-principal via the pure read-model `access_review_model.hpp`
-(`build_access_review`). For **all three** principal types uniformly it
-reads the principal's **direct** role grants and expands each to its
-permission set — deliberately **not**
-`RbacStore::get_effective_permissions(username)`, which is user-keyed and
-would silently mis-resolve if called with a group name (it would look up
-`principal_type='user' AND principal_id=<group name>`, never the group's own
-grants). A consequence: a user row lists only that user's own direct
-grants — group-inherited access is not flattened onto the user row, it
-appears on the **group's own row** instead. A reviewer must read both a
-user's row and the rows of every group they belong to for the complete
-picture; a future "resolved effective access" column is a tracked follow-up.
-
-**Grant-table-driven completeness (UP-1).** The export's SPINE is the grant
-table, not any roster. `build_access_review` reads **every**
-`(principal_type, principal_id, role_name)` row on record via
-`RbacStore::list_all_principal_roles_checked()` — one bulk read — and groups
-it by principal; the users/groups/engine-principal rosters are still read,
-but only to *enrich* a grant-table row with display metadata. Two
-consequences that change what the export means and what it shows:
-
-- **A principal with zero role grants produces no row.** This narrows the
-  export's scope on purpose: it answers "who currently has access", not
-  "who exists" — a dormant local account or a never-assigned engine
-  principal is out of scope for a CC6.2 review because there is nothing on
-  it to review.
-- **A grant belonging to a principal that matches nothing in any roster is
-  now surfaced, never silently dropped.** A since-deleted user, a stale
-  IdP-provisioned row, or an OIDC/SSO principal minted outside every roster
-  (e.g. `oidc:<iss>#<sub>`) still holds a live grant if one exists on
-  record — that row is emitted with `display_name = principal_id`,
-  `source = "orphan"`, `lifecycle_state = "unknown"` rather than being
-  silently omitted. The prior design walked the three rosters and asked
-  RBAC per member; a grant belonging to a principal outside every roster
-  was a silent false negative in exactly the evidence CC6.2 exists to
-  produce. Orphan/stale grants are exactly the kind of finding a periodic
-  access review is supposed to catch — a reviewer should expect to see
-  `source="orphan"` rows and treat them as a `flagged_revoke` candidate by
-  default unless the principal is independently known-good.
-
-**Disabled-user lifecycle honesty.** A user who is disabled but still holds
-a live role grant is enriched from the `AuthDB` roster like any other user
-row — `source="user"`, `lifecycle_state="disabled"` — never conflated with
-`source="orphan"`/`lifecycle_state="unknown"`, which means "no roster entry
-matched this grant at all". A disabled-but-still-granted user is exactly
-the kind of finding a periodic access review exists to catch (a likely
-`flagged_revoke` candidate); showing it as an unresolvable orphan would
-obscure that it is a known, roster-matched account.
-
-**Non-atomic, best-effort cross-substrate read.** The grant population this
-export (and every campaign freeze) computes is a **point-in-time
-best-effort cut** across two substrates — `RbacStore`/`EnginePrincipalStore`/
-`AccessReviewStore` on PostgreSQL and `AuthDB` on SQLite — not a
-transactional snapshot: there is no cross-database transaction spanning the
-several bulk reads `build_access_review` issues, so a grant or user change
-that lands mid-read may or may not be reflected in the result. This is an
-accepted property, not a defect — the alternative (a distributed
-transaction across two storage engines) is out of scope for this feature.
-The **freeze itself**, once the population is computed, is atomic: `open_campaign`
-inserts the campaign row and every frozen attestation row in **one**
-PostgreSQL transaction (see "Attestation campaign model" below) — the
-non-atomicity is confined to *assembling* the population, not to persisting
-it once assembled.
-
-**Fail-loud, never a silent partial export (R1).** `build_access_review`
-returns `std::unexpected` on the FIRST read failure it hits across users,
-groups, engine principals, API tokens, and every per-principal role/
-permission read — never a partial `vector`. A compliance export that
-silently drops rows on a transient read failure is worse than one that
-fails loudly: a partial grant set that reads as "the complete list" is a
-false negative in exactly the evidence this feature exists to produce. The
-REST route maps a `build_access_review` failure to `503`, not a 200 with
-fewer rows.
-
-`last_activity_ms`/`last_activity_kind` and `owner_or_email` are
-best-effort enrichment (`ApiTokenStore` for an engine row's most recent
-credential use; `DirectorySync` for a user's email) — a missing enrichment
-source degrades that one field, it does not fail the export. **Known
-scoping, stated plainly rather than silently shipped:** every user row's
-`last_activity_kind` is `"n/a"` today (`AuthDB` has no read accessor for
-last-login yet — a noted follow-up, not a bug); `source="scim"` is
-forward-compat and not yet populated by any write path.
-
-### Attestation campaign model
-
-`POST /api/v1/access-reviews` (`AccessReview:Attest`) expands the export into
-one `GrantRef` per `(principal, role)` pair and calls
-`AccessReviewStore::open_campaign`, which — in **one transaction** — inserts
-the campaign row and one `decision='pending'` attestation row per frozen
-grant. This is the **freeze-at-open completeness property**: every grant
-that existed the instant the campaign opened has a reviewable row, and that
-is a provable invariant, not a hope. A grant created after `open_campaign`
-returns is simply out of scope for *this* campaign (it will appear in the
-next one); a grant revoked afterward is **still reviewable here** — the row
-is frozen, not re-derived from live state — because "who had access, on
-this date, and did a reviewer sign off on it" is exactly the question CC6.2
-evidence must answer, and a campaign that quietly dropped a since-revoked
-grant would erase that history.
-
-Reviewers record a decision via `POST /api/v1/access-reviews/{id}/attestations`
-(`AccessReview:Attest`): `attested` (still appropriate) or `flagged_revoke`
-(should be revoked). **`flag ≠ revoke`.** `flagged_revoke` records evidence
-only — no RBAC or `EnginePrincipalStore` mutation happens on this path.
-Acting on the flag (unassigning the role, revoking the engine principal,
-etc.) is a separate, explicit operator action performed after reading the
-evidence, on the ordinary RBAC/engine-principal write surface. This
-deliberately keeps the access-review surface (`AccessReview:Attest`) from
-becoming a second, less-audited path to a real authorization change — every
-actual grant/revoke still goes through its own gated, individually-audited
-route.
-
-`POST /api/v1/access-reviews/{id}/close` (`AccessReview:Attest`) closes a
-campaign without requiring every attestation to be decided — an incomplete
-review is itself a fact the evidence should show (partial coverage), not
-something the route silently forces to completion by auto-attesting the
-remainder.
-
-`GET /api/v1/access-reviews` (`AccessReview:Read`) lists every campaign's
-metadata (not its attestations — `GET /api/v1/access-reviews/{id}` for
-those), newest-first, capped at the most recent 500 — the surface an
-auditor needs to prove reviews ran on cadence without already knowing a
-`campaign_id` out-of-band.
-
-### Store
-
-`AccessReviewStore` (`server/core/src/access_review_store.{hpp,cpp}`,
-schema `access_review_store`) is a born-on-Postgres store (ADR-0006) with
-**authoritative/fail-hard** posture per ADR-0012 §1 — construction is
-fail-**closed** (a reachable database whose schema can't migrate leaves
-`!is_open()`, which `server.cpp` wires to `startup_failed_`, same as
-`EnginePrincipalStore`), and every mutator/completeness-reader returns a
-typed `std::expected`. Two tables: `access_review_campaign` (one row per
-opened campaign) and `access_review_attestation` (one row per frozen
-`(campaign, principal_type, principal_id, role_name)` grant — the PK is the
-full 4-tuple, so a decision can only ever be recorded against a grant that
-was actually in the frozen population; an unknown tuple never matches, and
-`record_attestation`/`get_campaign`/`close_campaign` signal that with a
-machine-checkable `"not_found: "`-prefixed error the REST/MCP layers map to
-`404`/`kInvalidParams`, distinct from a genuine `503`/`kInternalError` read
-or write failure). **Deliberately no prune method** — unlike the `/auto`
-pre-flight/deployment runs (operational scratch state, 14-day-pruned), a
-closed access-review campaign **is** the compliance evidence; it persists
-indefinitely. Any future retention policy is an explicit, separately-
-reviewed decision, never a default cadence inherited from an unrelated
-store.
-
-### #2225 — why this is a global gate, not `authorize_list_read`
-
-Every new list/fan-out read of **per-agent** data must use the ADR-0017
-`authorize_list_read` admit-then-filter chokepoint (see "Authentication,
-RBAC..." in the routed-concerns table). Access-review export/campaign-open/
-campaign-list are list reads too, but every one of them is deliberately
-gated on the **global** `AccessReview:Read`/`AccessReview:Attest` instead —
-a considered exception, not an oversight:
-
-- The confinement model exists to stop a management-group-scoped operator
-  from seeing agents/devices outside their scope. **A grant/role assignment
-  is not scoped to a management group at all** — RBAC role assignments are
-  fleet-wide facts about a principal, so there is no per-agent boundary to
-  admit-then-filter against in the first place.
-- Even if a confinement filter were bolted on (e.g. "only show grants for
-  principals who touch devices in my groups"), the result would be
-  **useless as CC6.2 evidence**: an auditor/reviewer certifying the access
-  posture of the organization must see the *complete* grant population, not
-  one operator's confined slice of it. A partial certification is not a
-  certification.
-- Access review is therefore intentionally **admin/auditor-only and
-  unconfined by design**. The seeded `Reviewer` role (`AccessReview:Read` +
-  `AccessReview:Attest` only — no Write/Delete/Approve/Push on
-  `AccessReview`) is the least-privilege way to grant this: an organization
-  can appoint a dedicated reviewer without also granting full
-  `Administrator` access (separation of duties), mirroring the existing
-  `GET /api/v1/audit/auth-sample` precedent (also gated on a dedicated
-  read permission, not admin-only).
-
-**Round-2 fix — dedicated `AccessReview` securable, not `AuditLog`.** The
-original implementation gated this surface on the existing
-`AuditLog:Read`/`AuditLog:Attest` operations, on the assumption that
-`AuditLog:Read` was effectively `Reviewer`-only. A reviewer found that
-assumption false: `AuditLog:Read` is also seeded to the built-in `Operator`
-and `PlatformEngineer` roles (for `GET /api/v1/audit/auth-sample` and the
-general audit-log read routes), neither of which holds
-`UserManagement:Read` (`/rbac/roles`) or `Security:Read`
-(`/engine-principals/{id}/roles`) — so both roles could pull the *complete*
-fleet-wide grant population via the access-review export despite being
-denied the two purpose-built routes for reading role-assignment data. The
-fix is the dedicated `AccessReview` securable described above: it preserves
-every argument in this section (the gate is still global/unconfined, and
-still a dedicated RBAC-privileged operation nobody gets by default) while
-closing the over-disclosure — `Operator`/`PlatformEngineer` keep
-`AuditLog:Read` for their legitimate uses but hold no `AccessReview`
-operation, so neither can reach `/api/v1/access-reviews*` any more. Full
-narrative: `docs/security-reviews/access-reviews-2026-07-21.md` "#2225
-round 2".
-
-### RBAC additions
-
-- New dedicated securable type **`AccessReview`** with two operations,
-  **`Read`** (export/get/list) and **`Attest`** (open/attest/close),
-  granted only to `Administrator` and the new `Reviewer` role. Not folded
-  into the existing `AuditLog` securable — see the "Round-2 fix" note above
-  for why a shared/broadly-seeded permission over-disclosed the fleet-wide
-  grant population to `Operator`/`PlatformEngineer`. The `AuditLog:Attest`
-  operation from the first round of this PR is removed as unused now that
-  `AccessReview:Attest` exists; `AuditLog:Read`/`AuditLog:Write`/etc. are
-  otherwise unchanged and keep their pre-existing scope.
-- New seeded system role **`Reviewer`** — `AccessReview:Read` +
-  `AccessReview:Attest` only (7 built-in roles total: Administrator,
-  PlatformEngineer, Operator, ApiTokenManager, ITServiceOwner, Viewer,
-  Reviewer).
-
-### MCP twins
-
-`export_access_review`, `open_access_review`, `record_attestation`,
-`get_access_review`, `list_access_reviews`, `close_access_review` — JSON
-only (CSV stays a REST-only presentation of the same export).
-`record_attestation` carries `destructiveHint:true` — a second call for the
-same `(campaign_id, principal_type, principal_id, role_name)` **overwrites**
-the prior reviewer's decision, reviewer, and justification (an UPSERT with
-no retained history of the earlier decision). `close_access_review` also
-carries `destructiveHint:true` — a one-way `open`->`closed` lifecycle
-transition (no reopen path) that permanently freezes outstanding attestations
-(corrected 2g PR 2, was shipped `false`). The other four are
-`destructiveHint:false` (`export_access_review`/`get_access_review`/
-`list_access_reviews` are additionally `readOnlyHint:true`; `open_access_review`
-mints campaign evidence but never a live access grant). See `docs/mcp-server.md`
-and `docs/user-manual/mcp.md`
-"Available Tools".
-
 ## Granular RBAC (Phase 3)
 
-- 7 roles, 22 securable types (adds `AccessReview`, dedicated to Periodic
-  Access Reviews — see "Periodic access reviews" above), 7 operations
-  (`Read`/`Write`/`Execute`/`Delete`/`Approve`/`Push`/`Attest`),
-  per-operation permissions, deny-override logic.
+- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -2297,16 +2111,50 @@ Any handler that destroys, demotes, or otherwise revokes a principal's privilege
 
 **Scaling note:** when the third such handler ships, lift the comparison logic into a helper.
 
-## AuthDB — persistent authentication store (v0.12.0+)
+## AuthDB — persistent authentication store (Postgres, ADR-0006 — v0.12.0
+SQLite retired)
 
-`auth.db` (lives in `--data-dir`) is the v0.12.0 SQLite-backed store for user
-accounts, sessions, and enrollment tokens. Replaces the prior in-memory +
-on-config-flush model that lost users on every restart (#618, #388, #527).
-Operator recovery: `docs/ops-runbooks/auth-db-recovery.md`. Security review
-record: `docs/security-reviews/authdb-2026-04-30.md`.
+`AuthDB` is **born-on-Postgres**, schema `auth` (`AuthDB(pg::PgPool&,
+pg::SecretCodec&)`, migrated via `PgMigrationRunner`, fail-closed
+construction — `is_open()`/`is_ready()` false means the server refuses to
+start, ADR-0012 §1). It replaced the v0.12.0 SQLite `auth.db` file (itself
+the replacement for the original in-memory + on-config-flush model that lost
+users on every restart, #618/#388/#527) in the ADR-0006 Wave 3 substrate
+migration. Tables: `users`, `enrollment_tokens`, `pending_agents`,
+`mfa_recovery_codes`. **Dropped, not migrated:** the SQLite-era `sessions`
+table (sessions are in-memory-authoritative in `AuthManager::sessions_` —
+the DB mirror was a permanent v1 dead-write, never read back) and `auth_kv`
+(unused scaffolding, superseded outright by `pg::SecretCodec`, ADR-0010).
+`ScimStore` migrated in lockstep to its own `scim_store` Postgres schema —
+see "Storage" under SCIM v2 provisioning above.
 
-The hard invariants for AuthDB-touching changes (file-mode, migration
-pattern, lifetime, config-as-seed-only, role-field ignored, gate-level audit,
-cleanup cadence, snapshot-and-release publishing) live in
-`.claude/agents/authdb.md` — the AuthDB review agent loads them on any
-change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth.{hpp,cpp}`.
+**This was a fresh-start cutover — NOT a backfill.** On first boot against a
+Postgres database whose `auth.users` table is empty, `main.cpp` seeds
+exactly the config-file admin via `AuthDB::seed_admin_if_empty` (a single
+`INSERT ... SELECT ... WHERE NOT EXISTS`, TOCTOU-free against a second
+instance racing first boot) and logs a loud "AUTH DATA RESET ON POSTGRES
+CUTOVER" warning. **A legacy SQLite `auth.db` is never read** — any prior
+local accounts, roles, and MFA enrollments that existed only in a pre-cutover
+`auth.db` are gone on upgrade; SCIM self-heals on the IdP's next sync cycle;
+humans re-enroll MFA. This is a breaking upgrade by design, matching the
+`ApiTokenStore` fresh-start precedent (4.1) rather than attempting a
+cross-substrate data migration.
+
+`mfa_totp_secret` is `SecretCodec`'s first production consumer (ADR-0010) —
+see "MFA / TOTP" above for the envelope-encryption shape and the
+`AuthDBError::SecretUnavailable` fail-closed contract. Everything else
+(password hashes, recovery codes, enrollment/SCIM tokens) stays a
+verify-only hash, unaffected by `SecretCodec`.
+
+Operator recovery: `docs/ops-runbooks/auth-db-recovery.md` (SQLite-era —
+verify against the current Postgres substrate before following it verbatim).
+Security review record: `docs/security-reviews/authdb-2026-04-30.md`
+(SQLite-era baseline).
+
+The hard invariants for AuthDB-touching changes (schema/`PgPool`
+construction, fail-closed posture, `SecretCodec` registration,
+config-as-seed-only / fresh-start, role-field ignored, gate-level audit,
+MFA fail-closed on secret-read failure, cleanup cadence, snapshot-and-release
+publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
+loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
+`auth.{hpp,cpp}`.

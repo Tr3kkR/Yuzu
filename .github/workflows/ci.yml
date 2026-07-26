@@ -1091,14 +1091,27 @@ jobs:
           fi
           echo "OK: no dynamic libpq dependency — static archive linked"
 
-      # Postgres for server tests (ADR-0006 decision 8, #1318). GHA
-      # macOS runners have no docker; the script brew-installs
-      # postgresql@18 (bottle, ~1 min), boots a throwaway trust-auth
-      # cluster under $RUNNER_TEMP on 127.0.0.1:15432 and exports
-      # YUZU_TEST_POSTGRES_DSN. Required since #1320 PR 1 (SOFT_EXIT=1) — a
-      # missing Postgres fails the job here, before the test step.
-      - name: Ensure Postgres (server tests)
-        run: bash scripts/ci/ensure-postgres.sh
+      # The server Postgres suite is DELIBERATELY NOT run on macOS (ADR-0035:
+      # the Yuzu server is a Linux-only component; macOS/Windows are agent-only
+      # platforms). macos-15 GHA runners have a SINGLE brew Postgres cluster,
+      # and the auth->Postgres migration (ADR-0006) ~doubled the [pg] test
+      # population to ~660 clone-bound cases (each does CREATE DATABASE ...
+      # TEMPLATE + DROP ... FORCE). One slow cluster cannot service that within
+      # the per-suite meson budget, and sharding does NOT help — parallel shards
+      # contend on the one cluster (both shards hit their 600s timeout, #2394).
+      # So we intentionally do NOT provision Postgres / export
+      # YUZU_TEST_POSTGRES_DSN here: every [pg] server test then SKIPS
+      # (env-unset -> skip, the same contract the Catch2 PG fixtures and
+      # tests/shell/test_mfa_reset.sh use), while the non-PG server suite
+      # (~[pg]), the agent suite, and the Apple-Clang compile all still run.
+      # Linux + Windows keep FULL [pg] coverage (multi-cluster, faster I/O).
+      # Do NOT re-add ensure-postgres here without first solving the
+      # single-cluster capacity problem — see the shard comment in
+      # tests/meson.build and docs/ci-architecture.md.
+      - name: Server Postgres suite skipped on macOS (ADR-0035; no DSN exported)
+        run: |
+          echo "macOS: server [pg] tests SKIP (YUZU_TEST_POSTGRES_DSN intentionally unset)."
+          echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
         run: python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs
