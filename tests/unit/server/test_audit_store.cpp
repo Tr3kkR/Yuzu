@@ -1486,7 +1486,8 @@ TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired"
         REQUIRE(reopened.is_open());
         LogCapture log;
         REQUIRE(reopened.cleanup_once(kNow + 120) == 0);
-        CHECK(log.says("not a plausible past reading"));
+        CHECK(log.says("not usable"));
+        CHECK(log.says("ahead of the current clock")); // the shape THIS case exercises
         CHECK(log.says("re-anchoring"));
         CHECK_FALSE(log.says("elapsed since the last retention pass"));
     }
@@ -1564,7 +1565,12 @@ TEST_CASE("AuditStore #2360: a non-integer stored reading is rejected, not coerc
     LogCapture log;
     CHECK(reopened.cleanup_once(kNow + 120) == 0);
     CHECK(reopened.clock_anomaly_skips_count() == 1);
-    CHECK(log.says("not a plausible past reading"));
+    // Assert the SHAPE is named, not just the generic phrase. A bare
+    // `says("not usable")` passed for a whole round while the message's cause
+    // list still said only "negative, or ahead of the current clock" -- an
+    // operator paged for a corrupted row would not have recognised their case.
+    CHECK(log.says("not usable"));
+    CHECK(log.says("not an integer"));
     CHECK_FALSE(log.says("elapsed since the last retention pass"));
     // And it self-heals: the pass re-anchored a real integer over the bad value.
     {
@@ -1606,4 +1612,33 @@ TEST_CASE("AuditStore #2360: a wrong index squatting the name reports degraded, 
     seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
     CHECK(store.cleanup_once(kNow) == 5);
     CHECK(store.cleanup_failed_count() == 0);
+}
+
+TEST_CASE("AuditStore #2360: durable state that cannot be READ is an anomaly, not a clean slate",
+          "[audit_store][retention][clock-guard]") {
+    // The third MetaReadError arm. A read failure -- corruption, SQLITE_BUSY, an
+    // I/O error, or (as induced here) the table being gone -- must NOT present as
+    // the fresh-install shape: doing so silently disarms the persisted step check
+    // for the whole process lifetime, on exactly the boot where it matters. Only
+    // ABSENT is benign.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-unread-"}};
+    {
+        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(seed.is_open());
+        seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+        seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
+        REQUIRE(seed.cleanup_once(kNow) == 5); // establishes a real durable reading
+    }
+    // Make the read FAIL rather than come back empty.
+    exec_raw(tmp.path, "DROP TABLE audit_retention_meta");
+
+    seed_rows_with_ttl(tmp.path, kNow - 50, 5);
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+
+    LogCapture log;
+    CHECK(store.cleanup_once(kNow + 120) == 0);   // declined, not treated as fresh
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    CHECK(log.says("not usable"));
+    CHECK_FALSE(log.says("elapsed since the last retention pass"));
 }

@@ -189,13 +189,15 @@ public:
         return emit_failed_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that DECLINED to delete. Three
-    /// triggers: the pass would have aged out every datable row; the gap since
-    /// the previous pass exceeded kAuditMinBigStepSec; or the stored clock
-    /// reading was AHEAD of the current clock (or otherwise not a plausible past
-    /// reading). The middle one cannot distinguish a forward clock jump from an
-    /// outage that long, so a non-zero value means "this server's clock moved,
-    /// OR it was down that long" -- not the clock alone.
+    /// Cumulative count of retention passes that DECLINED to delete. Triggers:
+    /// the pass would have aged out every datable row; the gap since the
+    /// previous pass exceeded kAuditMinBigStepSec; or the stored clock reading
+    /// was not usable -- ahead of the current clock, negative, present but not
+    /// an integer, or unreadable. Reducing `audit_retention_days` also declines
+    /// a pass by design, since it narrows the survivor horizon. The elapsed-time
+    /// trigger cannot distinguish a forward clock jump from an outage that long,
+    /// so a non-zero value means "this server's clock moved, OR it was down that
+    /// long, OR retention was just reconfigured" -- not the clock alone.
     uint64_t clock_anomaly_skips_count() const noexcept {
         return clock_anomaly_skips_.load(std::memory_order_relaxed);
     }
@@ -352,13 +354,15 @@ private:
     // and collapsing the two suppresses the check on the pass right after NTP
     // corrects.
     std::optional<std::int64_t> last_pass_now_;
-    // Set at construction when the durable row EXISTED but was not an integer.
+    // Set at construction when durable state EXISTED but could not be used --
+    // either not an integer, or unreadable (corruption, busy, I/O error).
+    // Absent is NOT carried: that is the ordinary fresh-install shape.
     // Cleared only where it is CONSUMED -- the pass that declines on it, or the
     // pass that accepts and deletes -- never on a pass that returns early
     // (unreadable probe, nothing expired). Clearing early would swallow the
     // corruption signal with no decline, no counter and no warn, which is the
     // failure mode this flag exists to prevent.
-    bool loaded_meta_malformed_{false};
+    bool loaded_meta_unusable_{false};
     static constexpr const char* kLastPassNowKey = "last_pass_now";
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;

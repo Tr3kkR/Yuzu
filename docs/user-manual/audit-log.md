@@ -349,9 +349,11 @@ refuses to act on that:
 - **It declines a pass that would expire every datable row**, logs a warning,
   and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
   applies when the gap since the previous pass exceeds **a fixed 7 days**, or
-  when the stored reading is not a plausible past reading --
-  *ahead* of the current clock, or negative. Neither can be reasoned about, so the pass
-  declines either way. They are NOT proof of tampering: this code itself
+  when the stored reading is not usable -- *ahead* of the current clock,
+  negative, present but not an integer, or unreadable. Reducing
+  `audit_retention_days` also declines a pass by design, because it narrows the
+  survivor horizon. None of the unusable shapes can be reasoned about, so the
+  pass declines either way. They are NOT proof of tampering: this code itself
   persists a negative reading on a dead-CMOS machine, and an ordinary backward
   NTP correction leaves a legitimate earlier reading ahead of `now`. That reading is
   persisted, so the check still fires on the first pass after a restart --- including
@@ -444,7 +446,7 @@ directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, or present but not an integer. Reducing `audit_retention_days` can also cause a decline by design. Historically described as not a plausible past reading (*ahead* of the clock, or negative). Not proof of tampering -- a backward NTP correction produces the first, and a dead-CMOS boot produces the second. The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. |
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

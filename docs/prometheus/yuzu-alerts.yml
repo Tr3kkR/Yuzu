@@ -456,7 +456,8 @@ groups:
             An audit retention pass declined. Triggers: it would have expired every datable
             row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
             threshold, not scaled to audit_retention_days); or the stored clock reading was
-            not a plausible past reading (ahead of the clock, OR negative). This is NOT
+            not usable (ahead of the clock, negative, present but not an integer, or
+            unreadable). This is NOT
             exclusively a clock signal: REDUCING audit_retention_days narrows the survivor
             horizon by design, so the first pass after that change can decline, and a
             genuinely all-expired table declines once on its first pass. Check whether
@@ -488,8 +489,12 @@ groups:
             NOT prove nothing was deleted; read it as "retention is not fully healthy".
             This is NOT the clock guard (that is
             yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
-            free disk and the server log for "AuditStore: retention probe failed" /
-            "AuditStore: cleanup error". NOTE /healthz stores.audit will report healthy
+            free disk and the server log. The seven sites do NOT share one message - grep
+            for any of: "retention probe failed", "cleanup error", "the post-delete backlog
+            probe failed", "retention pass called with an implausible clock reading",
+            "retention pass threw". The seventh (a closed store, after a failed migration)
+            logs NOTHING from the pass itself - look for "schema migration failed" at
+            startup instead. NOTE /healthz stores.audit will report healthy
             in this state - it reflects only whether the database is OPEN, and a pass
             failing on a SQLite fault leaves it open. Surfacing retention health there
             is tracked in #2509.

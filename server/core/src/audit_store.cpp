@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <exception>
 #include <random>
@@ -108,7 +109,18 @@ void AuditStore::create_tables() {
         last_pass_now_ = *r;
     } else {
         last_pass_now_.reset();
-        loaded_meta_malformed_ = (r.error() == MetaReadError::Malformed);
+        // BOTH non-benign shapes are carried as an anomaly. Absent alone is the
+        // ordinary fresh-install case and says nothing. Malformed and Unreadable
+        // both mean "there is durable state and we could not use it", which the
+        // first pass must report rather than treat as a clean slate.
+        loaded_meta_unusable_ = (r.error() != MetaReadError::Absent);
+        if (r.error() == MetaReadError::Malformed)
+            spdlog::error("AuditStore: the stored retention clock reading is not an integer; "
+                          "treating it as a clock anomaly and re-anchoring on the next pass");
+        else if (r.error() == MetaReadError::Unreadable)
+            spdlog::error("AuditStore: could not read the stored retention clock reading; the "
+                          "restart-surviving half of the clock guard starts this process with no "
+                          "comparison point");
     }
 }
 
@@ -162,38 +174,47 @@ void AuditStore::ensure_retention_index() {
     // "the lock hold is no longer bounded" reports healthy while every pass
     // full-scans.
     {
-        // STRUCTURAL check, not a substring match on the DDL text. A wrong index
-        // can trivially contain the right words -- `CREATE INDEX idx_audit_ttl_id
-        // ON audit_events(timestamp) WHERE ttl_expires_at > 0` indexes the wrong
-        // column while mentioning `ttl_expires_at` and `WHERE`, and a substring
-        // heuristic passes it. `PRAGMA index_info` reports the indexed columns in
-        // order, which is the thing the probes and the ordered delete actually
-        // depend on; the DDL text is then only consulted for the partial
-        // predicate, which `index_info` does not expose.
-        SqliteStmt cols;
-        std::vector<std::string> indexed;
-        if (sqlite3_prepare_v2(db_.get(), "PRAGMA index_info(idx_audit_ttl_id)", -1, cols.addr(),
-                               nullptr) == SQLITE_OK) {
-            while (sqlite3_step(cols.get()) == SQLITE_ROW) {
-                const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(cols.get(), 2));
-                indexed.emplace_back(name ? name : "");
+        // Ask the PLANNER, do not pattern-match the DDL. Both previous
+        // attempts were wrong in the same direction: a substring test passed an
+        // index on the wrong column, and the structural column check left a
+        // TAUTOLOGICAL predicate test (`index_info` had already proved the
+        // column list, so searching the DDL for `ttl_expires_at` was free) which
+        // passed `... (ttl_expires_at, id) WHERE id > 0`. It also produced a
+        // FALSE NEGATIVE: a plain non-partial index on the same columns serves
+        // these queries strictly better and would have reported degraded.
+        //
+        // EXPLAIN QUERY PLAN over the real probe asserts the only property that
+        // matters -- SQLite will actually use this index for this query -- and
+        // is immune to formatting, case and predicate spelling.
+        bool matches = false;
+        {
+            SqliteStmt eqp;
+            if (sqlite3_prepare_v2(db_.get(),
+                                   "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM audit_events "
+                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < 1)",
+                                   -1, eqp.addr(), nullptr) == SQLITE_OK) {
+                while (sqlite3_step(eqp.get()) == SQLITE_ROW) {
+                    const auto* detail =
+                        reinterpret_cast<const char*>(sqlite3_column_text(eqp.get(), 3));
+                    // SEARCH, not merely a mention. Measured on the shipped
+                    // SQLite for the three shapes that matter:
+                    //   (ttl_expires_at, id) WHERE ttl>0  -> SEARCH ... COVERING INDEX
+                    //   (ttl_expires_at, id) no predicate -> SEARCH ... COVERING INDEX
+                    //   (timestamp)          WHERE ttl>0  -> SCAN ... USING INDEX
+                    // The wrong-column index IS used, as a full SCAN, which is
+                    // exactly the degraded state the gauge must report -- so
+                    // matching the index name alone accepts it. Requiring a seek
+                    // also correctly ACCEPTS a non-partial index on the right
+                    // columns, which serves these queries strictly better.
+                    const std::string_view d{detail ? detail : ""};
+                    if (d.find("SEARCH") != std::string_view::npos &&
+                        d.find("idx_audit_ttl_id") != std::string_view::npos) {
+                        matches = true;
+                        break;
+                    }
+                }
             }
         }
-        bool partial = false;
-        SqliteStmt chk;
-        if (sqlite3_prepare_v2(db_.get(),
-                               "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", -1,
-                               chk.addr(), nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(chk.get(), 1, "idx_audit_ttl_id", -1, SQLITE_STATIC);
-            if (sqlite3_step(chk.get()) == SQLITE_ROW) {
-                const auto* def = reinterpret_cast<const char*>(sqlite3_column_text(chk.get(), 0));
-                const std::string_view sv{def ? def : ""};
-                partial = sv.find("WHERE") != std::string_view::npos &&
-                          sv.find("ttl_expires_at") != std::string_view::npos;
-            }
-        }
-        const bool matches =
-            indexed.size() == 2 && indexed[0] == "ttl_expires_at" && indexed[1] == "id" && partial;
         if (!matches) {
             spdlog::error("AuditStore: idx_audit_ttl_id exists but does not match the expected "
                           "definition; retention will run WITHOUT a usable index");
@@ -216,7 +237,8 @@ AuditStore::load_meta(const char* key) const {
                            stmt.addr(), nullptr) != SQLITE_OK)
         return std::unexpected(MetaReadError::Unreadable);
     sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
         // Check the STORED TYPE, do not just coerce. The table is not `STRICT`,
         // so `value INTEGER NOT NULL` is an affinity preference, not a
         // constraint: SQLite accepts a TEXT value into it, and
@@ -230,11 +252,18 @@ AuditStore::load_meta(const char* key) const {
             return std::unexpected(MetaReadError::Malformed); // present, but not a number
         return sqlite3_column_int64(stmt.get(), 0);
     }
-    // Absent is NOT the same as malformed -- see MetaReadError. Returning a
-    // typed error rather than 0 matters because 0 is a LEGITIMATE reading: a
-    // dead CMOS reporting the Unix epoch is the motivating case for this whole
-    // guard, and collapsing it into a sentinel would suppress the check on the
-    // very pass after NTP corrects.
+    // A non-DONE step is a READ FAILURE (SQLITE_CORRUPT, SQLITE_BUSY,
+    // SQLITE_IOERR), not an empty table. Collapsing it into Absent would make a
+    // transient error at boot look exactly like a fresh install and silently
+    // disable the persisted step check for the whole process lifetime -- the
+    // silence-means-healthy hole this guard exists to close.
+    if (rc != SQLITE_DONE)
+        return std::unexpected(MetaReadError::Unreadable);
+    // Absent is NOT the same as malformed or unreadable -- see MetaReadError.
+    // Returning a typed error rather than 0 matters because 0 is a LEGITIMATE
+    // reading: a dead CMOS reporting the Unix epoch is the motivating case for
+    // this whole guard, and collapsing it into a sentinel would suppress the
+    // check on the very pass after NTP corrects.
     return std::unexpected(MetaReadError::Absent);
 }
 
@@ -581,6 +610,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         DeclineWipe,
         DeclineStep,
         DeclineImplausible,
+        CorruptStateReported,
         Deleted,
         DeleteFailed
     };
@@ -656,7 +686,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // decline, no counter and no warn. It is cleared only where it is
         // actually CONSUMED, below. (The durable row is already re-anchored, so
         // the flag is the only remaining carrier of "the state was corrupt".)
-        bool prev_implausible = loaded_meta_malformed_;
+        bool prev_implausible = loaded_meta_unusable_;
         if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now)) {
             prev_implausible = true;
             prev_pass_now.reset();
@@ -727,6 +757,24 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // here is the same rule the accepting path applies below: the
             // anomaly is over once no expired backlog remains.
             clock_anomaly_latched_ = false;
+            // But a malformed durable reading must still be REPORTED here, not
+            // carried. This branch reached a verdict, so deferring the flag
+            // would attribute the corruption to some later, healthy pass -- and
+            // on a retention-disabled store (`window == 0`, nothing ever
+            // expires) this is the ONLY branch ever taken, so the anomaly would
+            // never be reported at all. Report once, then clear.
+            if (loaded_meta_unusable_) {
+                // Deliberately NOT gated on `clock_anomaly_latched_`, unlike
+                // every other decline. The latch exists to stop a PERSISTENT
+                // condition re-declining every pass; this one is one-shot by
+                // construction -- the flag is set once at construction and
+                // cleared here -- so it cannot spam. It gets its own message
+                // because nothing was pending deletion on this branch, so
+                // calling it a "decline" would misdescribe the pass.
+                clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+                loaded_meta_unusable_ = false;
+                emit = Emit::CorruptStateReported;
+            }
         } else {
             const bool would_wipe = !*has_datable_survivor;
             // Supplement, not a replacement. `would_wipe` only fires when a
@@ -744,7 +792,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             if ((would_wipe || big_step || prev_implausible) && !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 clock_anomaly_latched_ = true;
-                loaded_meta_malformed_ = false; // consumed: reported and re-anchored
+                loaded_meta_unusable_ = false; // consumed: reported and re-anchored
                 // Name the trigger that actually fired. Reporting an elapsed
                 // delta for a would_wipe-only decline attributes a clock step or
                 // outage that did not happen, in a SOC 2-relevant log line.
@@ -753,7 +801,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                        : !prev_pass_now ? Emit::DeclineFirstPass
                                         : Emit::DeclineWipe;
             } else {
-                loaded_meta_malformed_ = false; // consumed: the pass acted on it
+                loaded_meta_unusable_ = false; // consumed: the pass acted on it
                 auto outcome = delete_capped_locked(now, would_wipe);
                 if (!outcome) {
                     emit = Emit::DeleteFailed;
@@ -784,10 +832,16 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     case Emit::None:
         break;
     case Emit::DeclineImplausible:
-        spdlog::warn("AuditStore: the stored retention clock reading is not a plausible past "
-                     "reading (negative, or ahead of the current clock), so this server's clock "
-                     "moved backward or that state was corrupted; declining once and re-anchoring "
-                     "on the current reading");
+        spdlog::warn("AuditStore: the stored retention clock reading is not usable (negative, "
+                     "ahead of the current clock, or present but not an integer), so this "
+                     "server's clock moved backward or that durable state was corrupted; "
+                     "declining once and re-anchoring on the current reading");
+        break;
+    case Emit::CorruptStateReported:
+        spdlog::warn("AuditStore: the stored retention clock reading was unusable (corrupted or "
+                     "not an integer) and has been re-anchored. Nothing was pending deletion on "
+                     "this pass, so nothing was declined -- but the restart-surviving half of the "
+                     "clock guard had no comparison point until now");
         break;
     case Emit::ProbeFailed:
         spdlog::warn("AuditStore: retention probe failed ({}); skipping this pass", emit_err);
