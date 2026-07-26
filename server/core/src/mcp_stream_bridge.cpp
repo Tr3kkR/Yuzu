@@ -653,11 +653,18 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         const std::shared_ptr<BridgeRecord>& rec;
         std::optional<MailboxEntry>& term;
         bool terminal_settled = false;
-        ~ClaimGuard() {
-            std::lock_guard<std::mutex> rlk(rec->mu);
-            if (term.has_value() && !terminal_settled) {
-                rec->terminal_slot = std::move(term);
-            } else if (terminal_settled) {
+        ~ClaimGuard() noexcept {
+            // Contained: this destructor is implicitly noexcept and its FIRST act is a
+            // mutex acquisition - the one throw site this file's own fault model treats
+            // as real (it injects resource_deadlock_would_occur elsewhere). Unguarded,
+            // a lock failure here is std::terminate on the projector thread, and
+            // guaranteed so if the destructor runs during unwinding. release_charge and
+            // project_record were restructured for exactly this seam; this was not.
+            try {
+                std::lock_guard<std::mutex> rlk(rec->mu);
+                if (term.has_value() && !terminal_settled) {
+                    rec->terminal_slot = std::move(term);
+                } else if (terminal_settled) {
                 // The terminal was committed to the wire but the bookkeeping below
                 // may not have run - it is the one thing between the commit and the
                 // flag that can throw (two mutex acquisitions). Without this, such a
@@ -667,9 +674,11 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
                 // wedged victim stalls ring-only pressure relief bridge-wide. Setting
                 // it here is safe precisely because terminal_settled means the frame
                 // is already published - it cannot cause a republish.
-                rec->terminal_projected = true;
+                    rec->terminal_projected = true;
+                }
+                rec->projection_in_flight = false;
+            } catch (...) {  // NOLINT(bugprone-empty-catch) - see the note above
             }
-            rec->projection_in_flight = false;
         }
     } guard{rec, term};
 
@@ -792,9 +801,10 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // forever. run_projector's per-record catch swallows it, so nothing retries.
         // Fixing release_charge alone would have fixed the instance and left the sink.
         // NOT the last site: arm()'s cancel-degrade path still clears the flag under
-        // rec->mu and takes bridge_mu_ afterwards. It is out of scope here (request
-        // thread, guarded by the caller) and tracked separately - this comment used to
-        // claim it was the last, which was simply wrong.
+        // rec->mu and takes bridge_mu_ afterwards. Its caller's guard stops the
+        // exception ESCAPING but does nothing about the desync - a throw there strands
+        // streamed_unpinned_[session] identically, so the sink is the same one. Out of
+        // scope here (request thread, different failure posture) and NOT YET FILED.
         std::lock_guard<std::mutex> lk(bridge_mu_);
         std::lock_guard<std::mutex> rlk(rec->mu);
         rec->terminal_projected = true;
@@ -1228,7 +1238,11 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // the floor; it is itself contained because formatting allocates.
     const auto log_incomplete = [&](const char* stage) noexcept {
         (void)contained([&] {
-            spdlog::error("MCP bridge teardown incomplete [stage={} execution_id={}]: "
+            // "reason=" matches the metric label so an operator can correlate the log
+            // line with yuzu_mcp_bridge_teardown_incomplete_total{reason} directly.
+            // It said "stage=" while the label was renamed, which meant grepping the
+            // journal for the label value found nothing.
+            spdlog::error("MCP bridge teardown incomplete [reason={} execution_id={}]: "
                           "resource retained until shutdown",
                           stage, exec_id);
         });
@@ -1308,12 +1322,12 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
             break;  // real final already pinned, or nothing to publish
     }
 
-    // Did anything actually reach the client? Every later audit detail keys off
-    // this rather than off which branch was INTENDED.
-    const bool published = decision != TeardownFinal::kNone &&
-                           (rung == TerminalRung::kPrimary || rung == TerminalRung::kFallback);
-    // Derived ONCE and passed to every bail site below. See disposition_phrase().
+    // Derived ONCE and passed to every audit site below, bail or not. See
+    // disposition_phrase(); nothing here re-derives the terminal's fate.
     const char* const disposition = disposition_phrase(decision, rung);
+    const bool terminal_delivered = decision == TeardownFinal::kNone ||
+                                    rung == TerminalRung::kPrimary ||
+                                    rung == TerminalRung::kFallback;
 
     // ── Step 2: unsubscribe ────────────────────────────────────────────────────
     if (!contained([&] {
@@ -1408,95 +1422,31 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     publish_records_gauge(active);
 
     // ── Step 5: audit the real outcome ─────────────────────────────────────────
-    // The detail names WHAT ACTUALLY HAPPENED, not what this branch intended. The
-    // committed event id alone cannot distinguish the rungs - a nonzero id from the
-    // retry is indistinguishable from one from the primary frame - which is why the
-    // ladder reports its rung. `result` additionally reflects whether every OWNED
-    // resource was settled: a terminal that delivered while the streamed charge
-    // leaked is not a successful teardown.
+    // The terminal's fate comes from disposition_phrase, the SAME source the bail
+    // sites use - this block used to hand-roll its own per-rung wording, which is
+    // how two of its literals were left asserting "the stream was NOT poisoned"
+    // after that claim had been corrected one function over. One source, no drift.
     //
-    // kNone detail stays empty: teardown_claimed(kNone) is shared with the pin-ack /
-    // session-death reaps, whose records need not hold a real final.
-    const char* audit_detail = "";
-    bool delivered = true;
-    switch (decision) {
-        case TeardownFinal::kSynthesizeUnavailable:
-            switch (rung) {
-                case TerminalRung::kPrimary:
-                    audit_detail = "terminal-unavailable synthesized (pressure)";
-                    break;
-                case TerminalRung::kFallback:
-                    audit_detail = "terminal-unavailable synthesis failed; fallback final "
-                                   "published instead (pressure)";
-                    break;
-                case TerminalRung::kPoisoned:
-                    audit_detail = "terminal-unavailable synthesis failed; session poisoned, "
-                                   "nothing published (pressure)";
-                    delivered = false;
-                    break;
-                case TerminalRung::kPublishThrew:
-                    audit_detail = "terminal-unavailable frame was built but publishing threw; "
-                                   "nothing confirmed published and the stream was NOT "
-                                   "poisoned - recover by execution_id (pressure)";
-                    delivered = false;
-                    break;
-                case TerminalRung::kNotAttempted:
-                    audit_detail = "terminal-unavailable frame could not be built; nothing "
-                                   "published and the stream was NOT poisoned - recover by "
-                                   "execution_id (pressure)";
-                    delivered = false;
-                    break;
-            }
-            break;
-        case TeardownFinal::kFallbackFinal:
-            switch (rung) {
-                case TerminalRung::kPrimary:
-                case TerminalRung::kFallback:
-                    audit_detail = "fallback final published (terminal payload lost)";
-                    break;
-                case TerminalRung::kPoisoned:
-                    audit_detail = "fallback final failed; session poisoned, nothing published "
-                                   "(terminal payload lost)";
-                    delivered = false;
-                    break;
-                case TerminalRung::kPublishThrew:
-                    audit_detail = "fallback final was reached but publishing threw; nothing "
-                                   "confirmed published and the stream was NOT poisoned - "
-                                   "recover by execution_id (terminal payload lost)";
-                    delivered = false;
-                    break;
-                case TerminalRung::kNotAttempted:
-                    audit_detail = "fallback final could not be copied; nothing published and "
-                                   "the stream was NOT poisoned - recover by execution_id "
-                                   "(terminal payload lost)";
-                    delivered = false;
-                    break;
-            }
-            break;
-        case TeardownFinal::kNone:
-            break;
-    }
+    // kNone contributes no disposition at all, so a clean pin-ack / session-death
+    // reap still emits a byte-identical empty-detail row.
+    const char* stage_detail = "";
     if (!charge_released) {
-        // A leaked admission slot outlives the request and is the operator-actionable
-        // half, so it takes priority over the publish disposition - but it must not
-        // ERASE it. Overwriting unconditionally meant a teardown that both poisoned
-        // the session and leaked a slot reported only the slot, and the poisoning
-        // went unevidenced entirely.
-        // Stage text only - the terminal's fate comes from the shared disposition, so
-        // this site cannot drift from the other two.
-        audit_detail = "teardown incomplete: streamed charge not released; the record was "
+        // The stage half: a leaked admission slot outlives the request and is the
+        // operator-actionable part. It no longer REPLACES the disposition - both are
+        // passed and joined, so a teardown that leaked a slot AND poisoned reports
+        // both halves.
+        stage_detail = "teardown incomplete: streamed charge not released; the record was "
                        "erased but one per-session admission slot is held until shutdown";
-        delivered = false;
     }
-    // A clean teardown keeps its existing decision-specific wording and passes NO
-    // disposition, so a normal kNone reap's row stays byte-identical to before this
-    // work started. A charge failure, though, makes this the FAILURE row for the
-    // teardown - so it carries the shared disposition exactly like the other bail
-    // sites, or it would be the fourth site to describe a mechanical failure while
-    // staying silent about the terminal.
-    audit_contained(audit_action, exec_id, audit_detail,
-                    charge_released ? std::string_view{} : std::string_view{disposition},
-                    delivered ? AuditResult::kSuccess : AuditResult::kFailure);
+    // The disposition is dropped ONLY on a wholly clean kNone reap, so that the most
+    // common row stays byte-identical to before this work. Any FAILURE row keeps it -
+    // dropping it there would be the same silence this round exists to remove, and a
+    // kNone teardown that leaked a slot still needs to say it published nothing.
+    const bool clean_kNone = decision == TeardownFinal::kNone && charge_released;
+    audit_contained(audit_action, exec_id, stage_detail,
+                    clean_kNone ? std::string_view{} : std::string_view{disposition},
+                    charge_released && terminal_delivered ? AuditResult::kSuccess
+                                                          : AuditResult::kFailure);
 }
 
 void McpStreamBridge::release_charge(const std::shared_ptr<BridgeRecord>& rec) {
@@ -1651,13 +1601,13 @@ const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
             // is reachable but has no fault seam (nothing can make close_sink throw
             // from a test), so it is stated conservatively rather than pinned.
             return "the terminal was built but publishing threw; nothing was confirmed "
-                   "published and the stream's poison state is indeterminate (a throw at this "
+                   "published and the session's poison state is indeterminate (a throw at this "
                    "point usually means it WAS poisoned) - recover the result by execution_id";
         case TerminalRung::kNotAttempted:
             break;
     }
-    return "the terminal frame could not be built; nothing was published and the stream was "
-           "NOT poisoned - recover the result by execution_id";
+    return "the terminal frame could not be built; nothing was published and THIS teardown did "
+           "not poison the session - recover the result by execution_id";
 }
 
 void McpStreamBridge::audit_contained(const char* action, const std::string& execution_id,

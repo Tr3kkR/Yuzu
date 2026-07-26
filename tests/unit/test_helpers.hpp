@@ -1197,11 +1197,13 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
 /// clang-tidy's cppcoreguidelines-special-member-functions wants all five named
 /// once a destructor exists.
 ///
-/// Promoted here from the four server test files that had each hand-rolled the same
-/// `SqliteHandleGuard` (test_chrome_ir_chain, test_workflow_routes,
-/// test_rest_api_events, test_rest_result_sets_async) when a fifth needed it - the
-/// repo's promote-on-second-use rule. Callers include <sqlite3.h> themselves; this
-/// header deliberately does not, so tests with no SQLite dependency stay clean.
+/// Added when a fifth test needed the pattern that four server test files had each
+/// hand-rolled as `SqliteHandleGuard` (test_chrome_ir_chain, test_workflow_routes,
+/// test_rest_api_events, test_rest_result_sets_async). NOTE those four have NOT been
+/// migrated - they still carry their own copies, still using plain `sqlite3_close`,
+/// which is the leak this one fixes. Migrating them is #2521; until then there are
+/// five copies, not one. Callers include <sqlite3.h> themselves; this header
+/// deliberately does not, so tests with no SQLite dependency stay clean.
 template <typename Sqlite3T> struct SqliteHandleOwner;
 template <typename T>
 inline constexpr bool kSqliteOwnerIsSealed = !std::is_copy_constructible_v<SqliteHandleOwner<T>> &&

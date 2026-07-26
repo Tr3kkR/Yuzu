@@ -1062,6 +1062,16 @@ timeout and the `execution_id` you were given at dispatch, and fall back to
 supported recovery path for every streamed-result failure mode on this surface, not just
 this one.
 
+Like the `-32014` case above, this cannot occur for `execute_instruction` progress in the
+current release - the parked-result path it arises from activates with the later
+SSE-on-`POST` rung. It is documented here for forward compatibility.
+
+**A related case**: if the failure happens while the server is publishing rather than
+building the frame, the session may additionally be left *poisoned* - every later attach
+returns 410 and the client must re-initialize rather than resume. The server records the
+poison state honestly in its own audit trail when it can determine it, but there is no
+frame telling the client, so the same timeout-plus-`execution_id` recovery applies.
+
 ### -32004: MCP tier does not allow this operation
 
 **Symptom**: A tool call returns error code `-32004`.

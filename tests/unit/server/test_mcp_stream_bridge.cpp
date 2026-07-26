@@ -784,7 +784,7 @@ TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, ne
         bool ok = false;
         for (const auto& row : fx.audits) {
             if (row.action == "mcp.bridge.forced_expire" &&
-                row.detail == "fallback final published (terminal payload lost)") {
+                row.detail == "the fallback final was published") {
                 ok = true;
             }
         }
@@ -1136,7 +1136,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         // reporting only the leaked slot: an unconditional charge message used to
         // ERASE the publish disposition, which meant a teardown that both poisoned
         // the session and leaked a slot evidenced only the slot.
-        CHECK(row.detail.find("published nothing") != std::string::npos);
+        CHECK(row.detail.find("this teardown published nothing") != std::string::npos);
     }
     SECTION("erase fails: subscription and charge settled, record retained, and the "
             "row is NOT silently skipped") {
@@ -1564,7 +1564,7 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
         build(fx, s);
         fx.bridge->sweep();
         CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
-              "terminal-unavailable synthesized (pressure)");
+              "the terminal-unavailable frame was published");
     }
     SECTION("primary fails, the fallback commits: the row says so, and does not claim a "
             "synthesis") {
@@ -1576,8 +1576,8 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 1);
         fx.bridge->sweep();
         CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
-              "terminal-unavailable synthesis failed; fallback final published instead "
-              "(pressure)");
+              "the intended terminal failed and the prebuilt fallback final was published "
+              "instead");
     }
     SECTION("both rungs fail: the row says poisoned, nothing published") {
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
@@ -1586,8 +1586,8 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
         fx.bridge->sweep();
         CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
-              "terminal-unavailable synthesis failed; session poisoned, nothing published "
-              "(pressure)");
+              "the terminal publish POISONED the session - every later attach 410s and the "
+              "client must re-initialize; recover the result by execution_id");
         CHECK(result_for(fx, "mcp.bridge.forced_expire") == "failure");
     }
     SECTION("the frame never gets built: NOT reported as a poisoning") {
@@ -1602,8 +1602,8 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
         fx.bridge->inject_terminal_build_fault_for_test(1);
         fx.bridge->sweep();
         CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
-              "terminal-unavailable frame could not be built; nothing published and the "
-              "stream was NOT poisoned - recover by execution_id (pressure)");
+              "the terminal frame could not be built; nothing was published and THIS teardown "
+              "did not poison the session - recover the result by execution_id");
         CHECK(result_for(fx, "mcp.bridge.forced_expire") == "failure");
         // The claim really is that the stream is still usable: a resume must still
         // attach rather than 410.

@@ -588,7 +588,7 @@ private:
     /// Making it a parameter means a new bail site cannot forget it. The two are
     /// joined INSIDE the guard, so the join's allocation stays contained (#2487).
     void audit_contained(const char* action, const std::string& execution_id,
-                         std::string_view stage, std::string_view disposition = {},
+                         std::string_view stage, std::string_view disposition,
                          AuditResult result = AuditResult::kSuccess) noexcept;
 
     /// The ONE derivation of "what happened to the terminal", shared by every

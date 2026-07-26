@@ -150,8 +150,8 @@ groups:
             never-terminating executions, or raise capacity when 3b lands.
             Distinguish transient load from a PERMANENT strand via
             yuzu_mcp_bridge_teardown_incomplete_total: if that is non-zero the
-            occupancy will not recede on its own and only a restart clears it
-            (docs/ops-runbooks/mcp-bridge-teardown-recovery.md).
+            occupancy will not recede on its own and only a restart clears it.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpStreamTerminalPublishFailures
         expr: |
           rate(yuzu_mcp_stream_terminal_publish_failures_total[15m]) > 0
@@ -193,7 +193,7 @@ groups:
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpMaintenanceTickFailing
         expr: |
-          sum by (tick) (yuzu_mcp_maintenance_tick_failures_total) > 0
+          sum by (tick) (increase(yuzu_mcp_maintenance_tick_failures_total[15m])) > 0
         labels:
           severity: warning
         annotations:
@@ -207,6 +207,12 @@ groups:
             exception aborted the whole process, so a firing here is strictly
             better than the alternative - but a sustained rate means that class of
             maintenance is not running at all. Correlate with host memory pressure.
+            DELIBERATELY increase() over a window, unlike the teardown-incomplete
+            rule next to it: a skipped tick is retried on the next cycle, so this
+            condition is self-healing and the alert must clear when it stops. The
+            raw-counter form is correct ONLY where the retention it reports is
+            permanent until restart, which is true of teardown_incomplete and not
+            of this.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeRecordsNearCap
