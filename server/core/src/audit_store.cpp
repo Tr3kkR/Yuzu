@@ -88,7 +88,7 @@ void AuditStore::create_tables() {
         // time check survive a restart. Without it the check is process-local,
         // so a server that BOOTS with an already-wrong clock never sees a step
         // at all -- which is the dead-CMOS / restored-snapshot case the guard
-        // exists for. The per-table decline latch is deliberately NOT persisted:
+        // exists for. The per-store decline latch is deliberately NOT persisted:
         // re-declining once after a restart is the safe direction.
         //
         // One row today, written once per cleanup interval. Nothing here is
@@ -872,15 +872,26 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
                                        "SELECT EXISTS(SELECT 1 FROM audit_events "
                                        "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
                                        binds);
-        // Unreadable: assume a backlog remains, so the drain continues rather
-        // than re-declining every pass on a table that really is working off an
-        // accepted anomaly.
+        // Unreadable: assume a backlog remains.
         //
-        // NOT "conservative", despite what this comment used to say: an ARMED
-        // latch makes the next pass take the accepting branch and DELETE. This
-        // is the permissive default, chosen deliberately. Most unknowns in this
-        // guard resolve the safe way; this one does not, and mislabelling it
-        // invites the next author to reason backwards about the latch.
+        // Say SET, not "armed". Elsewhere in this file "re-arm" means
+        // `clock_anomaly_latched_ = false` -- restoring the ability to decline
+        // -- so calling a SET latch "armed" inverts the vocabulary in the same
+        // file (Gate re-review). A set latch makes the next pass take the
+        // accepting branch and DELETE.
+        //
+        // This is the PERMISSIVE default, not the conservative one this comment
+        // used to claim. Every other unknown in this guard resolves toward
+        // preserving evidence; this is the single deliberate exception.
+        //
+        // Do not overstate what it buys: clearing the latch would HALVE the
+        // drain (decline, re-set, delete, alternate), not stall it. And it
+        // cannot grant permission from nothing -- `would_wipe` implies an
+        // anomaly, so reaching here with it true means the latch was already
+        // set. This extends a permission by one pass; it never creates one.
+        //
+        // NOTE the audit latch is per-STORE (one `clock_anomaly_latched_` over
+        // one table). Per-table is TAR's model; do not import that phrasing.
         backlog_remains = !more || *more;
         if (backlog_remains)
             cap_reached_.fetch_add(1, std::memory_order_relaxed);

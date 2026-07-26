@@ -13,7 +13,9 @@ Background: `docs/user-manual/audit-log.md`, ADR-0006, issue #2360.
 > the guard's only durable signal is a counter nobody is watching. Wiring that up
 > is a prerequisite for treating any of this as a SOC 2 detective control.
 
-## What the guard does, in one paragraph
+## The retention guard, in one paragraph
+
+(For the write path, see the `YuzuAuditPersistFailures` section above.)
 
 `audit_events` rows expire on a TTL derived from the server's wall clock. A
 forward clock jump makes every row look expired at once, and the delete that
@@ -34,8 +36,9 @@ alert is the control. The guard is the seatbelt.
 
 ## YuzuAuditPersistFailures - audit WRITES are failing
 
-Not a retention problem, and much louder than one: `audit_emit_failed_total` is
-rising, so events are not reaching `audit.db` at all. Behavioural-PII REST routes
+Not a retention problem, and much louder than one:
+`yuzu_server_audit_emit_failed_total` is rising, so events are not reaching
+`audit.db` at all. Behavioural-PII REST routes
 are fail-closed, so they are returning `503` while this persists, and the
 evidence for whatever is happening right now is not being recorded.
 
@@ -43,6 +46,11 @@ Check, in order: disk space and inode exhaustion on the `audit.db` volume; file
 permissions; whether a failed migration closed the store (the log says so
 explicitly, and `/healthz` will show it); and SQLite errors in the log. Retention
 alerts may be silent throughout - a closed store does not run passes.
+
+**If behavioural-data routes are returning 503 but this counter is FLAT**, look
+for a `bad_alloc`-class throw in the audit pipeline instead. That path fails
+closed the same way but is only warn-logged, never counted, so the counter
+cannot see it.
 
 ## YuzuAuditRetentionClockAnomaly - a pass declined
 

@@ -449,8 +449,11 @@ A retention pass therefore refuses to act on that:
   switched off over a long weekend reports nothing; one switched off for a month
   declines one tick. A fourth trigger fires when there is NO stored reading at
   all -- the first pass after an agent upgrade or a restore -- because the
-  elapsed-time check cannot run without one; that is expected exactly once per
-  database. The first three triggers LATCH; the fourth deliberately does not,
+  elapsed-time check cannot run without one; that is expected once per database
+  (the reading is one `tar_config` key shared by every source and table, not one
+  per table). It recurs only if the agent cannot WRITE that key at all -- a
+  read-only or full disk -- in which case the declines keep coming, which is the
+  safe direction and is what `retention_guard_failures_total` is for. The first three triggers LATCH; the fourth deliberately does not,
   since a missing comparison point is not an anomaly and spending the latch on it
   would let a real one on the very next pass go undeclined. The latch is per
   table, so a warehouse that is legitimately all-expired still ages out -- it
@@ -489,7 +492,8 @@ persistently wrong clock will still drain the window over several ticks.
 The operator surface is `retention_guard_declines_total` and
 `retention_guard_failures_total` (plus the per-table `retention_guard|<table>|<n>`
 and `retention_guard_failed|<table>|<n>` lines) in the `status` action, described
-above. A non-zero declines total means the endpoint's clock moved **or** the
+above. A non-zero declines total means this is the expected once-per-database first
+pass after an agent upgrade or restore, or that the endpoint's clock moved **or** the
 endpoint was dark for longer than the threshold, **or** the stored reading was
 ahead of the clock (a backward correction, or tampering) -- elapsed time cannot
 separate these, so check the host's time synchronisation *and* its uptime

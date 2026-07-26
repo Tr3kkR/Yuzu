@@ -716,14 +716,30 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // expired row exists -- bounded, index-driven, and only for a table
             // that is actually in the wipe condition, so the healthy path pays
             // nothing. An unreadable answer is treated as "yes": assume the
-            // backlog remains, so the drain continues rather than re-declining.
+            // backlog remains.
             //
-            // NOT the "conservative" direction, whatever an earlier version of
-            // this comment said -- an ARMED latch makes the next pass take the
-            // else branch and DELETE. Unknown->armed is the permissive choice.
-            // It is the right one here (a table that really is draining should
-            // not re-decline every tick) but the label mattered: the guard is
-            // full of unknown->safe defaults and this is deliberately not one.
+            // Say SET, not "armed". Everywhere else in this file "re-arm" means
+            // `latched = false` -- restoring the guard's ability to decline --
+            // so calling a SET latch "armed" inverts the vocabulary in the same
+            // file (Gate re-review). A set latch makes the next pass skip the
+            // decline arm and fall through to the DELETE.
+            //
+            // And this default is the PERMISSIVE one, not the conservative one
+            // an earlier version of this comment claimed. Every other unknown
+            // here resolves toward preserving data (probe failure, unparseable
+            // or out-of-range reading, missing reading, batch failure); this is
+            // the single exception, chosen deliberately.
+            //
+            // What it actually buys is modest, so do not overstate it: clearing
+            // the latch would not stall the drain, it would HALVE it. The next
+            // pass would decline and re-set the latch, the one after would
+            // delete, giving alternate-pass deletion. Worth having, not vital.
+            //
+            // Note also this cannot grant permission from nothing: `would_wipe`
+            // implies `anomaly`, so reaching here with `would_wipe` true means
+            // the latch was ALREADY set (otherwise the decline arm fired). The
+            // unreadable probe extends an existing permission by one pass; it
+            // never creates one.
             bool cap_will_bind = false;
             if (would_wipe) {
                 const auto more = exists_where(

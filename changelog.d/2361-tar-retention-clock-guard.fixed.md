@@ -3,16 +3,21 @@
   with the cutoff derived from the endpoint's own wall clock -- the clock in a fleet
   most likely to be wrong (dead CMOS battery, long suspend, cloned VM, boot before
   NTP converges). One bad reading took the device's whole forensic window with it.
-  A pass now declines once per table, latched, when it would delete every datable
-  row, when the gap since the previous pass exceeds a fixed 30 days (an absolute
-  threshold, deliberately NOT scaled to the tier's retention window: that put it a
-  year out on the monthly tier, where it could never fire), or
-  when the stored reading is ahead of the clock, or when there is no stored reading at all so the elapsed-time check cannot run (the first pass after an agent upgrade - expected once, and the one trigger that does NOT latch). That reading is persisted in
+  A pass now declines per table when it would delete every datable row, when the
+  gap since the previous pass exceeds a fixed 30 days (an absolute threshold,
+  deliberately NOT scaled to the tier's retention window: that put it a year out
+  on the monthly tier, where it could never fire), or when the stored reading is
+  ahead of the clock. Each of those latches, so the table declines once and then
+  paces. It ALSO declines when there is no stored reading at all, because the
+  elapsed-time check cannot run without one - the first pass after an agent
+  upgrade or a restore. That fourth trigger deliberately does not latch, so a
+  real anomaly on the very next pass is still declined. That reading is persisted in
   `tar_config` and sanitised, so it still fires after an agent restart and cannot be
   disabled by a poisoned value. Every accepted delete is capped at 5,000 rows per
   table per pass, oldest first. A deliberate dead band remains: a forward error under
   30 days is caught only by the outcome test, which any row written after the jump
-  defeats, so the cap alone bounds it. Rows stamped implausibly far in the future are excluded so one
+  defeats, so the cap alone bounds it. Rows stamped implausibly far in the
+  future are excluded so one
   forward-skewed row cannot disarm the guard. Row-count retention keeps its
   clock-free ceiling semantics, but is now capped per pass too -- the whole batch runs
   under one held database mutex, so an uncapped prune over a large backlog would stall

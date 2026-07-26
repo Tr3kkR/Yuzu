@@ -356,9 +356,15 @@ refuses to act on that:
   put the threshold at a full year on the 365-day default, where it could never
   fire. Elapsed time still cannot tell a clock jump from an outage, so a server
   that was genuinely down for more than a week declines one cleanup pass ---
-  deliberately cheap, and the warning names both causes. The decline is
-  latched, so an audit table that is *legitimately* all-expired still ages out
-  --- it just costs one cleanup interval first.
+  deliberately cheap, and the warning names both causes. A fourth trigger fires
+  when there is NO stored reading at all --- the first pass after upgrading to a
+  build that has the guard, or after a restore --- because the elapsed-time
+  check cannot run without one. That is expected once per database and needs no
+  action. The first three triggers LATCH, so an audit table that is
+  *legitimately* all-expired still ages out --- it just costs one cleanup
+  interval first. The fourth deliberately does not latch: a missing comparison
+  point is not an anomaly, and spending the latch on it would let a real one on
+  the very next pass go undeclined.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
   default), oldest first. A wipe the guard chose to allow therefore ages out at
   a paced rate an operator can still catch, rather than in one statement.
@@ -386,7 +392,7 @@ as survivors, and a single declined pass becomes more likely.
 
 **What this does and does not promise.** The cap is the half that always
 applies: it bounds the damage of any allowed wipe unconditionally. The two
-detectors are best-effort, and the outcome test has a known blind spot --- it is
+detectors are all best-effort, and the outcome test has a known blind spot --- it is
 defeated by *any* audit row written after the clock moved, because a fresh row
 counts as a survivor. On a server that is up and serving, that is the common
 case, which is why the elapsed-time reading is persisted across restarts. Taken

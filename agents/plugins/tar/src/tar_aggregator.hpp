@@ -193,9 +193,16 @@ format_retention_guard_lines(const RetentionGuardState& guard);
  * Row-count retention is unguarded but no longer unbounded: it still only trims
  * the excess over a fixed ceiling, so no clock reading can make it delete more than it was
  * always going to. Time-based retention is clock-guarded (#2361): a pass that
- * would delete every datable row of a table, or that follows a wall-clock jump
+ * would delete every datable row of a table, that follows a wall-clock jump
  * larger than kTarMinBigStepSec (an ABSOLUTE threshold -- NOT the tier's
- * retention window), declines once and is counted instead. Every accepted pass
+ * retention window), that finds the stored reading AHEAD of the current clock,
+ * or that finds NO stored reading at all (the elapsed-time check cannot run
+ * without one -- the first pass after an agent upgrade or a restore), declines
+ * and is counted instead. The first three LATCH, so a table that is genuinely
+ * all-expired still ages out on the next pass; the fourth deliberately does
+ * NOT, because a missing comparison point is not an anomaly and spending the
+ * latch on it would let a real one on the very next pass go undeclined.
+ * Every accepted pass
  * deletes at most kMaxTarDeletesPerTablePerPass rows per table, oldest first --
  * that cap applies to BOTH retention kinds.
  *
