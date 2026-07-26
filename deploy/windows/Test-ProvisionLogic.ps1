@@ -270,6 +270,10 @@ Check 'the top-level gate is NOT nested inside a scriptblock (Step would swallow
 # textually first, so it passed trivially — green while two blockers were live
 # in the code it had just "tested". Pair EVERY restart with its own nearby gate
 # instead, and require any deliberate exception to be marked in the source.
+# NB: this is a TEXTUAL smoke guard, not a control-flow proof. It catches a
+# literal revert of either gate, which is what it is for. It would NOT catch a
+# gate call sitting in a dead branch, gating a different service, or merely
+# adjacent by coincidence. Do not cite it as a safety proof.
 Check 'EVERY Restart-Service is immediately preceded by a gate or a DRAIN-EXEMPT marker' {
   if(-not $restarts.Count){ return $false }
   $srcLines   = $text -split "`r?`n"
@@ -301,6 +305,31 @@ Check 'Step() aborts the process on a drain-tagged failure instead of continuing
   if(-not $stepFn){ return $false }
   $body = $stepFn[0].Extent.Text
   ($body -match 'kDrainTag') -and ($body -match '\bexit\s+\d')
+}
+# Round-4 blocker 2: the drain probe is also called inside the rollback recovery
+# try. If that throws, the recovery catch must NOT re-wrap it — doing so strips
+# the tag and demotes "cannot tell if the box is safe" to a routine per-agent
+# failure at the outer catch, and the script continues.
+Check 'EVERY catch enclosing a drain-probe call re-throws the tag before re-wrapping' {
+  # Two known re-throw sites: the per-agent outer catch and the rollback
+  # recovery catch. Both must be present, and the recovery one must come before
+  # the string that re-wraps into "ALSO FAILED verification".
+  $rethrows = @([regex]::Matches($text, '\$_\.Exception\.Message\.StartsWith\(\$kDrainTag\)\)\s*\{\s*throw\s*\}'))
+  if($rethrows.Count -lt 2){ return $false }
+  $wrapIdx = $text.IndexOf('ALSO FAILED verification')
+  if($wrapIdx -lt 0){ return $false }
+  # At least one re-throw must guard the re-wrap (appear before it in the same
+  # catch block — approximated as within the 800 chars preceding it).
+  @($rethrows | Where-Object { $_.Index -lt $wrapIdx -and $_.Index -gt ($wrapIdx - 800) }).Count -gt 0
+}
+# Round-4 blocker 1: the DRAIN-EXEMPT restart must be earned by a liveness probe,
+# not by an assumption that a failed forward path implies a dead cluster.
+# Restart-Service can throw in its STOP phase with the original postmaster still
+# serving.
+Check 'the DRAIN-EXEMPT restart is conditional on a proven-not-serving cluster' {
+  ($text -match 'function Test-PgServingNow') -and
+  ($text -match '\$stillServing\s*=\s*\(-not \$restartCompleted\)\s*-and\s*\(Test-PgServingNow') -and
+  ($text -match '\$restartCompleted\s*=\s*\$true')
 }
 Check 'the drain check fails CLOSED when it cannot observe the box' {
   $probe = $ast.FindAll({ param($n)

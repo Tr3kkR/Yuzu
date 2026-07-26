@@ -330,9 +330,15 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   # install runs between it and here, real minutes on a cold box — so re-assert
   # immediately before dropping this service's live connections.
   Assert-RunnersDrained "refusing to restart $svc"
-  Restart-Service $svc -Force
+  Restart-Service $svc -Force -EA Stop
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
+  # The wait loop used to fall through silently on timeout, reporting the
+  # cluster "ready" while the service was stopped. Match the per-agent step's
+  # posture: a restart that does not come back is a step failure.
+  if((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running'){
+    throw "$svc did not return to Running within 90s of the restart"
+  }
   "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
 }
 
@@ -479,6 +485,17 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
     }
     [pscustomobject]@{ Exe=$exe; DataDir=$data }
   }
+  function Test-PgServingNow([string]$bin,[int]$port){
+    # Single-shot liveness probe — deliberately NOT Assert-PgServing's 90s wait
+    # loop. Answers one question on the recovery path: is a postmaster serving
+    # this port RIGHT NOW? Used to tell "the cluster is down, restarting it can
+    # only help" from "the cluster is still up and a restart would drop live
+    # connections".
+    $ready = Join-Path $bin 'pg_isready.exe'
+    if(-not (Test-Path $ready)){ return $false }
+    & $ready -q -h 127.0.0.1 -p $port 2>$null
+    return ($LASTEXITCODE -eq 0)
+  }
   function Assert-PgServing([string]$bin,[int]$port,[string]$context){
     $ready = Join-Path $bin 'pg_isready.exe'
     $psql  = Join-Path $bin 'psql.exe'
@@ -590,8 +607,13 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
         # robocopy/icacls of agent 0..n, which can take minutes.
         Assert-RunnersDrained "refusing to restart $svc"
         Set-ItemProperty $regPath -Name ImagePath -Value $newImage -Type $imageKind
+        # Which of the two calls below threw decides whether the cluster is
+        # actually down on the recovery path — Restart-Service can fail in its
+        # STOP phase, leaving the original postmaster alive and serving.
+        $restartCompleted = $false
         try {
           Restart-Service $svc -Force -EA Stop
+          $restartCompleted = $true
           Assert-PgServing $dstbin $port "agent $n repointed service"
           Write-Host "agent ${n}: postgres.exe now private ($dstbin), svc $svc on :$port verified"
         } catch {
@@ -601,19 +623,35 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
           $forwardError = $_.Exception.Message
           try {
             Set-ItemProperty $regPath -Name ImagePath -Value $curImage -Type $imageKind -EA Stop
-            # DRAIN-EXEMPT: recovery, deliberately not gated. Reaching here means
-            # the forward repoint already failed, so this service is ALREADY not
-            # serving — refusing to restart would strand it broken, which is
-            # strictly worse for any job that just started than the restart is.
-            # Reachable only if a runner appeared inside the narrow window
-            # between the check at the forward restart and this catch, so warn
-            # loudly and recover anyway.
-            if(-not $AllowActiveRunners -and (Get-ActiveRunnerProcess).Count -gt 0){
-              Write-Warning "agent ${n}: a runner became active during recovery; restoring $svc anyway — leaving a non-serving cluster behind would be worse"
+            # Do NOT assume the cluster is down. If Restart-Service itself threw,
+            # it may have failed before stopping the old postmaster, which is
+            # then still serving live connections on the ORIGINAL binary. Since
+            # ImagePath is only read at process start, the registry restore
+            # ALONE completes the rollback in that case — restarting would drop
+            # connections that predate the gate above and were never authorised.
+            $originalBin = Split-Path $curExe -Parent
+            $stillServing = (-not $restartCompleted) -and (Test-PgServingNow $originalBin $port)
+            if($stillServing){
+              Write-Host "agent ${n}: $svc still serving the ORIGINAL binary (the restart failed before stopping it) — ImagePath restored, no restart needed"
+            } else {
+              # DRAIN-EXEMPT: recovery on a cluster PROVEN not to be serving
+              # (either the new binary came up unhealthy, or the restart killed
+              # the old one and nothing is answering). Refusing here would strand
+              # it broken, which is worse for any job than the restart. Narrow by
+              # construction — the liveness probe above is what earns the
+              # exemption, not an assumption about how we got here.
+              if(-not $AllowActiveRunners -and (Get-ActiveRunnerProcess).Count -gt 0){
+                Write-Warning "agent ${n}: a runner became active during recovery; restarting $svc anyway — it is not serving, and leaving it that way would be worse"
+              }
+              Restart-Service $svc -Force -EA Stop
+              Assert-PgServing $originalBin $port "agent $n rollback service"
             }
-            Restart-Service $svc -Force -EA Stop
-            Assert-PgServing (Split-Path $curExe -Parent) $port "agent $n rollback service"
           } catch {
+            # The drain probe is called inside THIS try (above). If it failed
+            # closed, that tag must survive: re-wrapping it below would strip the
+            # prefix and demote "I cannot tell if this box is safe" to a routine
+            # per-agent failure at the outer catch.
+            if($_.Exception.Message.StartsWith($kDrainTag)){ throw }
             $rollbackError = $_.Exception.Message
             throw "repoint of $svc failed ($forwardError); rollback to '$curExe' ALSO FAILED verification ($rollbackError)"
           }
