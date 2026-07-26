@@ -798,16 +798,28 @@ How it works:
 - Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.
 - Multiple stores share one database connection but keep independent version counters.
 
-**Index builds are deliberately kept OUT of the migration runner.** A failed
-migration closes the store, and for `audit_store` that means every audit write
-then fails - so an `O(N log N)` index build on a multi-million-row table is not
-routed through the fail-closed path. The `audit_store` retention index
-(`idx_audit_ttl_id`, #2360) is created best-effort after migrations instead: on a
-large existing `audit_events` this is a one-time build at first boot after
-upgrade (~1.4 s and ~81 MB at 5M rows, extrapolating to ~16 s at 50M), and the
-elapsed time is logged when it exceeds a second. If it fails, retention still
-runs - each pass just scans instead of seeking, and the failure is logged as an
-error.
+**Indexes are normally migration entries. `audit_store`'s retention index is a
+deliberate, single exception** (`idx_audit_ttl_id`, #2360) - every other index in
+the server is created inside `MigrationRunner`, and new code should follow that
+rule, not this one. Two conditions justify the exception here and both must hold
+before it is copied: (a) a failed migration closes the store, and for
+`audit_store` that means every audit write then fails, taking the SOC 2 trail
+offline; and (b) the build is `O(N log N)` over an existing multi-million-row
+table, unlike the v1 indexes which are created on an empty one. A best-effort
+object may silently not exist, so nothing with a CORRECTNESS dependency may use
+this path - the retention guard is correct without its index, only slower.
+
+Cost on a large existing `audit_events`: a one-time build at first boot after
+upgrade, measured at ~81 MB and ~1.8-3.3 s at 5M rows on NVMe. At 50M rows the
+build reads a ~16 GB table - tens of seconds on local NVMe, and potentially
+minutes on container overlayfs or network storage, so a large first
+post-upgrade boot may need a raised orchestrator `startupProbe` window. The
+elapsed time is logged when it exceeds a second, and subsequent boots are a
+no-op. If the build fails, retention still runs, but each pass then scans the
+table AND sorts the whole expired backlog for its `ORDER BY ... LIMIT` (measured
+2.0 s vs 285 ms at a 4.5M backlog) - still far better than the unguarded code it
+replaced, but the failure is logged as an error and
+`yuzu_server_audit_retention_index_ok` reads 0.
 
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 

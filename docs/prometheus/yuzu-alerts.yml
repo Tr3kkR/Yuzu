@@ -479,8 +479,11 @@ groups:
             yuzu_server_audit_cleanup_failed_total is rising: the audit retention pass
             itself is erroring, so audit.db grows without bound. This is NOT the clock
             guard (that is yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
-            health (/healthz stores.audit), free disk, and the server log for
-            "AuditStore: retention probe failed" / "AuditStore: cleanup error".
+            free disk and the server log for "AuditStore: retention probe failed" /
+            "AuditStore: cleanup error". NOTE /healthz stores.audit will report healthy
+            in this state - it reflects only whether the database is OPEN, and a pass
+            failing on a SQLite fault leaves it open. Surfacing retention health there
+            is tracked in #2509.
           runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
 
       # The per-pass delete cap is what turns an allowed wipe into a paced drain,
@@ -530,6 +533,35 @@ groups:
             and that cost grows with the table. Check the server log for "could not create
             idx_audit_ttl_id" and for a migration failure. NOTE this gauge is evaluated
             once at startup, so it does not detect an index dropped while the server runs.
+          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+
+      # THE ABSENCE ALERT. Every other rule in this group fires on a counter
+      # RISING; none of them fires when the cleanup thread simply never runs
+      # (never started because the store was closed at boot, died, or was
+      # stopped and not restarted). In that state all six other series sit flat
+      # at 0 -- indistinguishable from a quiet, healthy store -- while audit.db
+      # grows without bound and rows are retained past the stated window. This
+      # is the only rule that catches it.
+      #
+      # Threshold assumes the default 60-minute cleanup interval: no pass in 3h
+      # is unambiguously broken. A deployment that lengthens cleanup_interval_min
+      # must widen this window; PromQL cannot read the server's own interval.
+      - alert: YuzuAuditRetentionNotRunning
+        expr: |
+          increase(yuzu_server_audit_retention_passes_total[3h]) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention has not run for 3 hours"
+          description: >-
+            No audit retention pass has been attempted in 3 hours, so audit.db is not
+            being drained and rows are being retained past the configured window. Note the
+            other retention alerts CANNOT fire in this state - they all key on a counter
+            rising, and nothing is running to raise one. Check the server log for
+            "AuditStore: retention pass threw", confirm the store opened at boot
+            (a failed migration closes it and start_cleanup() then early-returns), and
+            check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
           runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
 
       # The durable clock reading is what makes anomaly detection survive a

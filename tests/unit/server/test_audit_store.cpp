@@ -426,13 +426,35 @@ namespace {
 // passes to cleanup_once(). Seeding through a second connection to the same
 // database lets each test state the TTL it means. Uses the production schema
 // (AuditStore's migrations have already run by the time the fixture seeds).
+// RAII for the raw second connection the helpers below open. A `REQUIRE` that
+// fails mid-helper throws Catch2's exception, which would skip a bare
+// `sqlite3_close(raw)` and leave a second writable connection open against the
+// same file the AuditStore under test holds -- a plausible amplifier for a
+// follow-on "database is locked" flake. `sqlite3_open` allocates the handle even
+// when it fails, so the owner takes it from the first call.
+struct RawConn {
+    sqlite3* db{nullptr};
+    explicit RawConn(const std::filesystem::path& path) {
+        const int rc = sqlite3_open(path.string().c_str(), &db);
+        REQUIRE(rc == SQLITE_OK);
+        sqlite3_exec(db, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+    }
+    // close_v2, not close: a statement left unfinalized by a throwing REQUIRE
+    // makes plain close() return SQLITE_BUSY and NOT close, which would defeat
+    // the point. close_v2 defers the close until the last statement finalizes.
+    ~RawConn() {
+        if (db)
+            sqlite3_close_v2(db);
+    }
+    RawConn(const RawConn&) = delete;
+    RawConn& operator=(const RawConn&) = delete;
+};
+
 void seed_rows_with_ttl(const std::filesystem::path& path, std::int64_t ttl, int count) {
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
-    sqlite3_exec(raw, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    REQUIRE(sqlite3_exec(raw, "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+    RawConn c{path};
+    REQUIRE(sqlite3_exec(c.db, "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_stmt* stmt = nullptr;
-    REQUIRE(sqlite3_prepare_v2(raw,
+    REQUIRE(sqlite3_prepare_v2(c.db,
                                "INSERT INTO audit_events (timestamp, principal, principal_role, "
                                "action, result, ttl_expires_at) VALUES (?,?,?,?,?,?)",
                                -1, &stmt, nullptr) == SQLITE_OK);
@@ -447,18 +469,14 @@ void seed_rows_with_ttl(const std::filesystem::path& path, std::int64_t ttl, int
         REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
     }
     sqlite3_finalize(stmt);
-    REQUIRE(sqlite3_exec(raw, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(raw);
+    REQUIRE(sqlite3_exec(c.db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 // Run arbitrary SQL through a second connection (used to remove a survivor row
 // or to break the table for the fail-closed test).
 void exec_raw(const std::filesystem::path& path, const char* sql) {
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
-    sqlite3_exec(raw, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    REQUIRE(sqlite3_exec(raw, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(raw);
+    RawConn c{path};
+    REQUIRE(sqlite3_exec(c.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 // Retention window used by every guard test below: 1 day. `cleanup_interval_min
@@ -782,6 +800,14 @@ TEST_CASE("AuditStore #2360: cleanup passes race-free against concurrent writers
     // Interleaving-independent: the concurrently-written rows are stamped from
     // the real clock, so they are far beyond every `now` the cleaners used and
     // survive; no pass errored.
+    // The REAL assertion. `total_count() > 0` was near-vacuous: three writer
+    // threads flood in rows for the whole test, so it holds even if retention
+    // deleted nothing, or double-deleted. `mtx_` makes the OUTCOME deterministic
+    // regardless of interleaving, so the 400 seeded-expired rows must be deleted
+    // exactly once between the two racing cleaners -- never twice, never lost.
+    // This one fails on a broken lock without needing TSan, so the Tier 1/2 CI
+    // legs get signal from it too, not just the nightly sanitizer leg.
+    CHECK(f.store.rows_deleted_count() == 400);
     CHECK(f.store.total_count() > 0);
     CHECK(f.store.cleanup_failed_count() == 0);
 }
@@ -946,17 +972,15 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
                                .c_str());
     };
     auto stored_reading = [&]() -> std::int64_t {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &raw) == SQLITE_OK);
+        RawConn c{tmp.path};
         sqlite3_stmt* st = nullptr;
-        REQUIRE(sqlite3_prepare_v2(raw,
+        REQUIRE(sqlite3_prepare_v2(c.db,
                                    "SELECT value FROM audit_retention_meta WHERE key='last_pass_now'",
                                    -1, &st, nullptr) == SQLITE_OK);
         std::int64_t v = -1;
         if (sqlite3_step(st) == SQLITE_ROW)
             v = sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
-        sqlite3_close(raw);
         return v;
     };
 
@@ -1265,4 +1289,52 @@ TEST_CASE("AuditStore #2360: the healthy path reports the retention index as pre
     // `retention_index_ok()` return false unconditionally would still pass.
     GuardFixture f;
     CHECK(f.store.retention_index_ok());
+}
+
+TEST_CASE("AuditStore #2360: a second pass at the same `now` is a clean no-op",
+          "[audit_store][retention][clock-guard]") {
+    // The contract a caller can rely on: passes are not destructive to repeat.
+    // Every other test advances `now` between calls, so nothing pinned this --
+    // an accidental re-delete or a double-count would have gone unnoticed.
+    GuardFixture f;
+    f.seed(kNow - 100, 6);
+    f.seed(kNow + kWindow, 1); // survivor, so the first pass accepts
+
+    REQUIRE(f.store.cleanup_once(kNow) == 6);
+    const auto passes = f.store.retention_passes_count();
+    const auto deleted = f.store.rows_deleted_count();
+
+    CHECK(f.store.cleanup_once(kNow) == 0); // nothing left below the cutoff
+    CHECK(f.store.rows_deleted_count() == deleted); // not double-counted
+    CHECK(f.store.total_count() == 1);             // the survivor is untouched
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+    CHECK(f.store.cleanup_failed_count() == 0);
+    // The pass still RAN, which is exactly what the liveness counters must show
+    // even when there was nothing to do.
+    CHECK(f.store.retention_passes_count() == passes + 1);
+    CHECK(f.store.last_pass_unixtime() == kNow);
+}
+
+TEST_CASE("AuditStore #2360: liveness counters move on declined and failed passes too",
+          "[audit_store][retention][clock-guard]") {
+    // The whole point of these two is to distinguish "the reaper ran and had
+    // nothing to do" from "the reaper is not running". If they only moved on
+    // successful deletes they would be silent in exactly the states the other
+    // counters already cover, and still silent in the one they do not.
+    GuardFixture f;
+    CHECK(f.store.retention_passes_count() == 0);
+    CHECK(f.store.last_pass_unixtime() == 0);
+
+    f.seed(kNow - 100, 5); // all expired -> the first pass DECLINES
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+    CHECK(f.store.retention_passes_count() == 1);
+    CHECK(f.store.last_pass_unixtime() == kNow);
+
+    // A failed pass: break the table so the probes error.
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events RENAME TO audit_events_hidden");
+    CHECK(f.store.cleanup_once(kNow + 1) == 0);
+    CHECK(f.store.cleanup_failed_count() == 1);
+    CHECK(f.store.retention_passes_count() == 2);
+    CHECK(f.store.last_pass_unixtime() == kNow + 1);
 }

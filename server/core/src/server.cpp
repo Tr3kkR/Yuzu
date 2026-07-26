@@ -1041,6 +1041,18 @@ public:
                           "full-scans audit_events under the store lock. Evaluated once at "
                           "startup, so it cannot detect an index dropped at runtime",
                           "gauge");
+        // Liveness. Every other retention series is silence-means-healthy, so a
+        // cleanup thread that never runs leaves them all flat at 0 -- identical
+        // to a quiet, healthy store, while audit.db grows without bound. These
+        // two are what an operator alerts on the ABSENCE of.
+        metrics_.describe("yuzu_server_audit_retention_passes_total",
+                          "Audit retention passes attempted, including declined and failed ones. "
+                          "Flat means the cleanup thread is not running",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
+                          "Wall-clock reading of the most recent audit retention pass, 0 if none "
+                          "has run in this process. Staleness means the reaper stopped",
+                          "gauge");
         metrics_.describe("yuzu_server_audit_retention_persist_failed_total",
                           "Failures to persist the audit retention clock reading, which degrades "
                           "clock-anomaly detection across a restart",
@@ -4016,6 +4028,10 @@ public:
                         .set(audit_store_->retention_index_ok() ? 1.0 : 0.0);
                     metrics_.gauge("yuzu_server_audit_retention_persist_failed_total")
                         .set(static_cast<double>(audit_store_->persist_failed_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_passes_total")
+                        .set(static_cast<double>(audit_store_->retention_passes_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_last_pass_unixtime")
+                        .set(static_cast<double>(audit_store_->last_pass_unixtime()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore

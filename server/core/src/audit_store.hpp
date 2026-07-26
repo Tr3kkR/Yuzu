@@ -1,8 +1,11 @@
 #pragma once
 
+#include "sqlite_raii.hpp"
+
 #include <sqlite3.h>
 
 #include <atomic>
+#include <expected>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -230,6 +233,23 @@ public:
         return retention_index_ok_.load(std::memory_order_relaxed);
     }
 
+    /// Cumulative retention passes ATTEMPTED, and the wall-clock reading of the
+    /// most recent one (0 if none has run in this process).
+    ///
+    /// These exist because every other counter here is silence-means-healthy: a
+    /// cleanup thread that never starts, dies, or is stopped leaves all of them
+    /// flat at 0 forever, which is indistinguishable from a quiet, healthy
+    /// store. `audit.db` then grows without bound and rows are retained past
+    /// the stated window with no signal at all. An operator alerts on ABSENCE
+    /// here (`passes_total` not increasing, or `last_pass_unixtime` going
+    /// stale), which is the only way to detect a reaper that is not running.
+    uint64_t retention_passes_count() const noexcept {
+        return retention_passes_.load(std::memory_order_relaxed);
+    }
+    std::int64_t last_pass_unixtime() const noexcept {
+        return last_pass_unixtime_.load(std::memory_order_relaxed);
+    }
+
     /// Cumulative failures to persist the retention clock reading. A sustained
     /// non-zero rate means the restart-surviving half of the guard is degraded.
     uint64_t persist_failed_count() const noexcept {
@@ -251,7 +271,14 @@ public:
     void stop_cleanup();
 
 private:
-    sqlite3* db_{nullptr};
+    // Owned by an RAII wrapper, NOT a raw handle: `create_tables()` and
+    // `ensure_retention_index()` both run from the CONSTRUCTOR and both format
+    // log messages, so a throw there (fmt, `bad_alloc`) escapes the constructor
+    // and `~AuditStore` never runs. Member destruction DOES run during that
+    // unwind, so holding the connection here is what stops it -- and its WAL/SHM
+    // files -- from leaking. Access is `db_.get()`; `db_.close()` is the
+    // deliberate early close on a failed migration.
+    SqliteDb db_;
     int retention_days_;
     int cleanup_interval_min_;
     mutable std::shared_mutex mtx_;
@@ -272,6 +299,11 @@ private:
     std::atomic<uint64_t> rows_deleted_{0};
     std::atomic<uint64_t> cap_reached_{0};
     std::atomic<uint64_t> persist_failed_{0};
+    // Liveness. Incremented/stamped on EVERY pass including declined and failed
+    // ones -- the question these answer is "did the reaper run at all", which is
+    // not the same question as "did it delete anything".
+    std::atomic<uint64_t> retention_passes_{0};
+    std::atomic<std::int64_t> last_pass_unixtime_{0};
     // Defaults FALSE and is set true only on the index-build success path. A
     // store whose migration failed never reaches the build at all, so an
     // initialise-true/clear-on-failure scheme would publish "index healthy" for
@@ -319,15 +351,18 @@ private:
     /// why that is not folded into a 0.
     std::optional<std::int64_t> load_meta(const char* key) const;
     bool store_meta(const char* key, std::int64_t value);
+    /// What one accepted delete did. `backlog_remains` is the POST-delete fact
+    /// the latch, the cap counter and the operator log line are ALL derived
+    /// from, so they cannot disagree.
+    struct DeleteOutcome {
+        std::size_t deleted{0};
+        bool backlog_remains{false};
+    };
     /// The accepted-delete half of a pass. Caller must hold `mtx_` exclusively.
-    /// `would_wipe` is the pre-delete outcome test; `out_err` receives a SQLite
-    /// message on failure so the caller can log it after releasing the lock.
-    /// `out_backlog_remains` receives the POST-delete fact the latch and the
-    /// cap counter are both derived from -- the caller needs it too, so its log
-    /// line does not promise a remainder that an exact-cap clean drain left
-    /// behind.
-    std::size_t delete_capped_locked(std::int64_t now, bool would_wipe, std::string& out_err,
-                                     bool& out_backlog_remains);
+    /// `would_wipe` is the pre-delete outcome test. On failure returns the SQLite
+    /// message so the caller can log it AFTER releasing the lock.
+    std::expected<DeleteOutcome, std::string> delete_capped_locked(std::int64_t now,
+                                                                   bool would_wipe);
 #ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
 #else

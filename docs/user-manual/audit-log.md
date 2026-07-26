@@ -376,6 +376,21 @@ figure against your own audit-event rate before deploying at scale. The cap is a
 compile-time constant today, so exceeding it needs an engineering change rather
 than configuration.
 
+In practice the **file-size** ceiling binds first: sustaining 6.9 events/second
+for a 365-day retention window means roughly 219M rows, on the order of 44 GB of
+row data plus a comparable index footprint, in a single SQLite file. A deployment
+approaching the drain-rate ceiling has a storage problem before it has a
+retention-pacing problem. Audit rows are emitted per operator REQUEST, not per
+device, so a large fleet reaches high rates through agentic per-device sweeps --
+bursts, which the 600,000 rows/day drain absorbs -- rather than through steady
+state.
+
+**The cap also bounds peak WAL.** The old unguarded delete cleared its whole
+backlog in one uncheckpointable transaction: measured at 152 MB of WAL for a
+337k-row backlog, extrapolating to about 2 GB at 4.5M. A capped pass writes
+about 51 MB for its 25,000 rows and checkpoints between passes, so disk
+high-water is bounded too, not just lock-hold time.
+
 **Retention is a floor, not a ceiling.** The guard errs toward keeping evidence
 longer than configured, which is the safe direction for an evidence store.
 Changing `--audit-retention-days` does **not** re-date existing rows:
@@ -406,6 +421,8 @@ others, not an alert on its own. Do not collapse the first two:
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. **Evaluated once at startup**, so it will not detect an index dropped while the server is running. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state every other row here stays flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass ran; `0` if none has in this process. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is
