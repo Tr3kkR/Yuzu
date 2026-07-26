@@ -26,13 +26,14 @@ const char* to_string(DecommissionOutcome o) noexcept {
 }
 
 AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
-    // Fixed registration order: the SQLite generic store first, then each
-    // born-on-PG typed projection. Every store is registered even when null so
-    // the result reports it as Skipped. The lambdas bind the raw store pointer
-    // by value (non-owning) and RETURN delete_agent's commit status (true iff
-    // the delete committed). InventoryStore takes `const std::string&`; the four
-    // PG stores take `std::string_view` — the adapter unifies them under one
-    // `bool(std::string_view)` deleter signature.
+    // Fixed registration order: the generic inventory store first, then each
+    // typed projection (all born-on-PG). Every store is registered even when
+    // null so the result reports it as Skipped. The lambdas bind the raw store
+    // pointer by value (non-owning) and RETURN delete_agent's commit status
+    // (true iff the delete committed). InventoryStore takes `const
+    // std::string&`; the four sibling PG stores take `std::string_view` — the
+    // adapter unifies them under one `bool(std::string_view)` deleter
+    // signature.
     using Fn = std::function<bool(std::string_view)>;
 
     targets_.push_back({"inventory", stores.inventory

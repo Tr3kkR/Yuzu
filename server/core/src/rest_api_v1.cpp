@@ -5036,14 +5036,19 @@ void RestApiV1::register_routes(
         }
 
         auto tables = inventory_store->list_tables();
+        if (!tables) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "inventory store degraded"), "application/json");
+            return;
+        }
         JArr arr;
-        for (const auto& t : tables) {
+        for (const auto& t : *tables) {
             arr.add(JObj()
                         .add("plugin", t.plugin)
                         .add("agent_count", t.agent_count)
                         .add("last_collected", t.last_collected));
         }
-        res.set_content(list_json(arr.str(), static_cast<int64_t>(tables.size())),
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(tables->size())),
                         "application/json");
     });
 
@@ -5062,22 +5067,29 @@ void RestApiV1::register_routes(
                  auto plugin = req.matches[2].str();
 
                  auto record = inventory_store->get(agent_id, plugin);
-                 if (!record) {
+                 if (!record.has_value()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "inventory store degraded"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!record->has_value()) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "no inventory data found"), "application/json");
                      return;
                  }
 
+                 const InventoryRecord& rec = **record;
                  // Embed data_json as raw JSON if valid, otherwise as a quoted string
-                 auto parsed = nlohmann::json::parse(record->data_json, nullptr, false);
+                 auto parsed = nlohmann::json::parse(rec.data_json, nullptr, false);
                  JObj data;
-                 data.add("agent_id", record->agent_id).add("plugin", record->plugin);
+                 data.add("agent_id", rec.agent_id).add("plugin", rec.plugin);
                  if (!parsed.is_discarded()) {
-                     data.raw("data", record->data_json);
+                     data.raw("data", rec.data_json);
                  } else {
-                     data.add("data", record->data_json);
+                     data.add("data", rec.data_json);
                  }
-                 data.add("collected_at", record->collected_at);
+                 data.add("collected_at", rec.collected_at);
                  res.set_content(ok_json(data.str()), "application/json");
              });
 
@@ -5108,8 +5120,13 @@ void RestApiV1::register_routes(
             q.limit = 1000;
 
         auto records = inventory_store->query(q);
+        if (!records) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "inventory store degraded"), "application/json");
+            return;
+        }
         JArr arr;
-        for (const auto& r : records) {
+        for (const auto& r : *records) {
             auto parsed = nlohmann::json::parse(r.data_json, nullptr, false);
             JObj item;
             item.add("agent_id", r.agent_id).add("plugin", r.plugin);
@@ -5121,7 +5138,7 @@ void RestApiV1::register_routes(
             item.add("collected_at", r.collected_at);
             arr.add(item);
         }
-        res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(records->size())),
                         "application/json");
     });
 
@@ -5731,6 +5748,12 @@ void RestApiV1::register_routes(
                   [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                       if (!perm_fn(req, res, "Inventory", "Read"))
                           return;
+                      if (!inventory_store->is_open()) {
+                          res.status = 503;
+                          res.set_content(detail::a4_error(res, "inventory store not available"),
+                                          "application/json");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded()) {
                           res.status = 400;
@@ -5764,8 +5787,14 @@ void RestApiV1::register_routes(
                           iq.agent_id = eval_req.agent_id;
                       iq.limit = 5000;
                       auto records_raw = inventory_store->query(iq);
+                      if (!records_raw) {
+                          res.status = 503;
+                          res.set_content(detail::a4_error(res, "inventory store degraded"),
+                                          "application/json");
+                          return;
+                      }
                       std::vector<std::pair<std::string, std::string>> records;
-                      for (const auto& r : records_raw) {
+                      for (const auto& r : *records_raw) {
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
@@ -6145,9 +6174,13 @@ void RestApiV1::register_routes(
                       InventoryQuery iq;
                       iq.limit = 5000;
                       auto records_raw = inventory_store->query(iq);
+                      if (!records_raw) {
+                          rs_err(res, 503, "inventory store degraded");
+                          return;
+                      }
                       std::vector<std::pair<std::string, std::string>> records;
-                      records.reserve(records_raw.size());
-                      for (const auto& r : records_raw)
+                      records.reserve(records_raw->size());
+                      for (const auto& r : *records_raw)
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
 
                       auto results = evaluate_inventory(eval_req, records);

@@ -1,245 +1,392 @@
 #include "inventory_store.hpp"
-#include "migration_runner.hpp"
 
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
 
+#include <charconv>
 #include <chrono>
+#include <cstdint>
+#include <string_view>
+#include <system_error>
+#include <utility>
 
 namespace yuzu::server {
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 namespace {
 
-int64_t now_epoch() {
+constexpr const char* kStoreName = "inventory_store";
+
+// Bounded acquires (ADR-0012 lease discipline). Ingest runs on the gRPC/
+// gateway thread so it must give up fast on a saturated pool — best-effort,
+// the agent's next report re-sends the same blob. Reads get a longer budget
+// since they back interactive REST/MCP/dashboard callers.
+constexpr std::chrono::milliseconds kIngestAcquireTimeout{500};
+constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
+// Hard ceiling on rows a single query will materialise, independent of the
+// caller's `limit`, so the store can never allocate an unbounded result set.
+constexpr int kQueryRowCap = 100000;
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets `search_path` to the store schema for
+    // the migration transaction, so these tables land in `inventory_store`.
+    // Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE inventory_data ("
+         "  agent_id     TEXT NOT NULL,"
+         "  plugin       TEXT NOT NULL,"
+         "  data_json    TEXT NOT NULL DEFAULT '{}',"
+         "  collected_at BIGINT NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (agent_id, plugin));"
+         "CREATE INDEX inventory_data_plugin_idx ON inventory_data (plugin);"
+         "CREATE INDEX inventory_data_collected_idx ON inventory_data (collected_at);"},
+        {2,
+         // Backfill stamp (ADR-0009/0037): a single-row sentinel so
+         // migrate_from_sqlite() is a cheap no-op on every boot after the
+         // first. `legacy_rows` is a diagnostic breadcrumb, not load-bearing.
+         "CREATE TABLE backfill_state ("
+         "  id           INT PRIMARY KEY,"
+         "  migrated_at  BIGINT NOT NULL,"
+         "  legacy_rows  BIGINT NOT NULL DEFAULT 0);"},
+    };
+    return kMigrations;
+}
+
+std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
 
-std::string col_text(sqlite3_stmt* stmt, int col) {
-    auto p = sqlite3_column_text(stmt, col);
-    return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
+// Parse a Postgres text-format integer cell into int64 (count(*)/MAX()/etc.
+// are text on the wire). Mirrors SoftwareInventoryStore::result_i64.
+std::int64_t result_i64(const pg::PgResult& res, int row, int col) {
+    const char* txt = PQgetvalue(res.get(), row, col);
+    const auto len = static_cast<std::size_t>(PQgetlength(res.get(), row, col));
+    std::int64_t v = 0;
+    std::from_chars(txt, txt + len, v); // leaves v=0 on parse failure/NULL
+    return v;
 }
 
 } // namespace
 
-// ── Construction / destruction ──────────────────────────────────────────────
+// ── Construction ─────────────────────────────────────────────────────────────
 
-InventoryStore::InventoryStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("InventoryStore: failed to open DB {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+InventoryStore::InventoryStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("InventoryStore: no database connection at construction ({}) — generic "
+                      "inventory persistence disabled",
+                      pool_.last_error());
         return;
     }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-
-    create_tables();
-    if (db_)
-        spdlog::info("InventoryStore: opened {}", db_path.string());
-}
-
-InventoryStore::~InventoryStore() {
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("InventoryStore: schema migration failed — generic inventory persistence "
+                      "disabled");
+        return;
     }
+    open_ = true;
 }
 
-bool InventoryStore::is_open() const {
-    return db_ != nullptr;
-}
+// ── Backfill (ADR-0009/0037) ─────────────────────────────────────────────────
 
-void InventoryStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS inventory_data (
-                agent_id TEXT NOT NULL,
-                plugin TEXT NOT NULL,
-                data_json TEXT NOT NULL DEFAULT '{}',
-                collected_at INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (agent_id, plugin)
-            );
+bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    if (!open_)
+        return false;
 
-            CREATE INDEX IF NOT EXISTS idx_inventory_plugin ON inventory_data(plugin);
-            CREATE INDEX IF NOT EXISTS idx_inventory_collected ON inventory_data(collected_at);
-        )"},
+    // Idempotency check on a short-lived lease, released BEFORE any legacy
+    // SQLite I/O or the write transaction below — holding two connections
+    // from this call at once would deadlock a size-1 pool (e.g. a test pool).
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: no database connection ({})",
+                          pool_.last_error());
+            return false;
+        }
+        pg::PgResult stamp_check = pg::exec_params(
+            lease.get(), "SELECT 1 FROM inventory_store.backfill_state WHERE id = 1",
+            std::vector<std::string>{});
+        if (stamp_check.status() != PGRES_TUPLES_OK) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: backfill_state lookup failed: {}",
+                          PQerrorMessage(lease.get()));
+            return false;
+        }
+        if (PQntuples(stamp_check.get()) > 0) {
+            spdlog::debug("InventoryStore: migrate_from_sqlite already completed, skipping");
+            return true;
+        }
+    }
+
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
+    if (ec) {
+        spdlog::error("InventoryStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
+                      legacy_db_path.string(), ec.message());
+        return false;
+    }
+
+    struct LegacyRow {
+        std::string agent_id;
+        std::string plugin;
+        std::string data_json;
+        std::int64_t collected_at{0};
     };
-    if (!MigrationRunner::run(db_, "inventory_store", kMigrations)) {
-        spdlog::error("InventoryStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
+    std::vector<LegacyRow> legacy_rows;
+
+    if (legacy_exists) {
+        sqlite3* legacy = nullptr;
+        // READONLY: the legacy file is retained as a read-only rollback net
+        // for one release (ADR-0009) — this call never writes to it.
+        if (sqlite3_open_v2(legacy_db_path.string().c_str(), &legacy, SQLITE_OPEN_READONLY,
+                            nullptr) != SQLITE_OK) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: failed to open legacy db {}: {}",
+                          legacy_db_path.string(), legacy ? sqlite3_errmsg(legacy) : "open failed");
+            if (legacy)
+                sqlite3_close(legacy);
+            return false;
+        }
+
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT agent_id, plugin, data_json, collected_at FROM inventory_data";
+        if (sqlite3_prepare_v2(legacy, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: legacy prepare failed: {}",
+                          sqlite3_errmsg(legacy));
+            sqlite3_close(legacy);
+            return false;
+        }
+
+        auto col_text = [&](int i) {
+            auto p = sqlite3_column_text(stmt, i);
+            return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
+        };
+
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            LegacyRow r;
+            r.agent_id = col_text(0);
+            r.plugin = col_text(1);
+            r.data_json = col_text(2);
+            r.collected_at = sqlite3_column_int64(stmt, 3);
+            legacy_rows.push_back(std::move(r));
+        }
+        const bool read_ok = (rc == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        sqlite3_close(legacy);
+        if (!read_ok) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: legacy read failed (rc={})", rc);
+            return false;
+        }
     }
+
+    // One transaction: insert every legacy row (ON CONFLICT DO NOTHING — a
+    // live agent may have already re-reported since this boot started, and
+    // that live row must win, never be clobbered by a stale legacy copy)
+    // then stamp completion, atomically. A one-time cost (row-by-row insert
+    // is fine for a boot-time backfill of this scale; a fleet-scale batched
+    // insert is the follow-up if a future fleet's legacy table proves large).
+    const auto rows_copied = static_cast<std::int64_t>(legacy_rows.size());
+    const bool ok = pool_.with_txn([&](PGconn* c) -> bool {
+        for (const auto& r : legacy_rows) {
+            pg::PgResult ins = pg::exec_params(
+                c,
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) "
+                "VALUES ($1, $2, $3, $4::bigint) ON CONFLICT (agent_id, plugin) DO NOTHING",
+                std::vector<std::string>{r.agent_id, r.plugin, r.data_json,
+                                         std::to_string(r.collected_at)});
+            if (ins.status() != PGRES_COMMAND_OK)
+                return false;
+        }
+        pg::PgResult stamp = pg::exec_params(
+            c,
+            "INSERT INTO inventory_store.backfill_state (id, migrated_at, legacy_rows) "
+            "VALUES (1, $1::bigint, $2::bigint) ON CONFLICT (id) DO NOTHING",
+            std::vector<std::string>{std::to_string(now_secs()), std::to_string(rows_copied)});
+        return stamp.status() == PGRES_COMMAND_OK;
+    });
+    if (!ok) {
+        spdlog::error("InventoryStore: migrate_from_sqlite: backfill transaction failed for {}",
+                      legacy_db_path.string());
+        return false;
+    }
+
+    spdlog::info("InventoryStore: migrate_from_sqlite backfilled {} legacy row(s) from {}",
+                 rows_copied, legacy_db_path.string());
+    return true;
 }
 
-// ── Upsert ──────────────────────────────────────────────────────────────────
+// ── Upsert (fail-soft ingest) ────────────────────────────────────────────────
 
 void InventoryStore::upsert(const std::string& agent_id, const std::string& plugin,
                             const std::string& data_json, int64_t collected_at) {
     if (collected_at == 0)
-        collected_at = now_epoch();
-
-    std::unique_lock lock(mtx_);
-
-    const char* sql =
-        "INSERT INTO inventory_data (agent_id, plugin, data_json, collected_at) "
-        "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(agent_id, plugin) DO UPDATE SET "
-        "data_json = excluded.data_json, collected_at = excluded.collected_at";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("InventoryStore: upsert prepare failed: {}", sqlite3_errmsg(db_));
+        collected_at = now_secs();
+    if (!open_) {
+        spdlog::warn("InventoryStore: upsert skipped for agent={} plugin={}, store not open",
+                     agent_id, plugin);
         return;
     }
-
-    sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, plugin.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, data_json.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 4, collected_at);
-
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        spdlog::error("InventoryStore: upsert failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("InventoryStore: upsert skipped for agent={} plugin={}, no connection ({})",
+                     agent_id, plugin, pool_.last_error());
+        return;
     }
-    sqlite3_finalize(stmt);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO inventory_store.inventory_data (agent_id, plugin, data_json, collected_at) "
+        "VALUES ($1, $2, $3, $4::bigint) "
+        "ON CONFLICT (agent_id, plugin) DO UPDATE SET "
+        "data_json = EXCLUDED.data_json, collected_at = EXCLUDED.collected_at",
+        std::vector<std::string>{agent_id, plugin, data_json, std::to_string(collected_at)});
+    if (res.status() != PGRES_COMMAND_OK)
+        spdlog::warn("InventoryStore: upsert failed for agent={} plugin={}: {}", agent_id, plugin,
+                     PQerrorMessage(lease.get()));
 }
 
-// ── List tables ─────────────────────────────────────────────────────────────
+// ── List tables (authoritative read) ─────────────────────────────────────────
 
-std::vector<InventoryTable> InventoryStore::list_tables() const {
-    std::shared_lock lock(mtx_);
-    std::vector<InventoryTable> result;
-
-    const char* sql =
-        "SELECT plugin, COUNT(DISTINCT agent_id) AS agent_count, MAX(collected_at) AS last_collected "
-        "FROM inventory_data "
-        "GROUP BY plugin "
-        "ORDER BY plugin";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return result;
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+std::optional<std::vector<InventoryTable>> InventoryStore::list_tables() const {
+    if (!open_) {
+        spdlog::warn("InventoryStore: list_tables degraded — store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("InventoryStore: list_tables degraded — no connection ({})",
+                     pool_.last_error());
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT plugin, COUNT(DISTINCT agent_id) AS agent_count, "
+        "MAX(collected_at) AS last_collected "
+        "FROM inventory_store.inventory_data GROUP BY plugin ORDER BY plugin",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("InventoryStore: list_tables degraded — query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    std::vector<InventoryTable> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
         InventoryTable t;
-        t.plugin = col_text(stmt, 0);
-        t.agent_count = sqlite3_column_int64(stmt, 1);
-        t.last_collected = sqlite3_column_int64(stmt, 2);
-        result.push_back(std::move(t));
+        t.plugin = PQgetvalue(res.get(), i, 0);
+        t.agent_count = result_i64(res, i, 1);
+        t.last_collected = result_i64(res, i, 2);
+        out.push_back(std::move(t));
     }
-    sqlite3_finalize(stmt);
-    return result;
+    return out;
 }
 
-// ── Get single record ───────────────────────────────────────────────────────
+// ── Get single record (authoritative, three-state) ──────────────────────────
 
-std::optional<InventoryRecord> InventoryStore::get(const std::string& agent_id,
-                                                    const std::string& plugin) const {
-    std::shared_lock lock(mtx_);
-
-    const char* sql =
-        "SELECT agent_id, plugin, data_json, collected_at "
-        "FROM inventory_data WHERE agent_id = ? AND plugin = ?";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::nullopt;
-
-    sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, plugin.c_str(), -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return std::nullopt;
+std::expected<std::optional<InventoryRecord>, InventoryReadError>
+InventoryStore::get(const std::string& agent_id, const std::string& plugin) const {
+    if (!open_) {
+        spdlog::warn("InventoryStore: get degraded — store not open");
+        return std::unexpected(InventoryReadError::kDegraded);
     }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("InventoryStore: get degraded — no connection ({})", pool_.last_error());
+        return std::unexpected(InventoryReadError::kDegraded);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, plugin, data_json, collected_at "
+        "FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2",
+        std::vector<std::string>{agent_id, plugin});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("InventoryStore: get degraded — query failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(InventoryReadError::kDegraded);
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<InventoryRecord>{std::nullopt}; // genuinely absent, not a degrade
 
     InventoryRecord r;
-    r.agent_id = col_text(stmt, 0);
-    r.plugin = col_text(stmt, 1);
-    r.data_json = col_text(stmt, 2);
-    r.collected_at = sqlite3_column_int64(stmt, 3);
-    sqlite3_finalize(stmt);
-    return r;
+    r.agent_id = PQgetvalue(res.get(), 0, 0);
+    r.plugin = PQgetvalue(res.get(), 0, 1);
+    r.data_json = PQgetvalue(res.get(), 0, 2);
+    r.collected_at = result_i64(res, 0, 3);
+    return std::optional<InventoryRecord>{std::move(r)};
 }
 
-// ── Query ───────────────────────────────────────────────────────────────────
+// ── Query (authoritative read) ───────────────────────────────────────────────
 
-std::vector<InventoryRecord> InventoryStore::query(const InventoryQuery& q) const {
-    std::shared_lock lock(mtx_);
-    std::vector<InventoryRecord> result;
+std::optional<std::vector<InventoryRecord>> InventoryStore::query(const InventoryQuery& q) const {
+    if (!open_) {
+        spdlog::warn("InventoryStore: query degraded — store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("InventoryStore: query degraded — no connection ({})", pool_.last_error());
+        return std::nullopt;
+    }
+
+    int limit = q.limit > 0 ? q.limit : 100;
+    if (limit > kQueryRowCap)
+        limit = kQueryRowCap;
+    const int offset = q.offset > 0 ? q.offset : 0;
 
     std::string sql =
-        "SELECT agent_id, plugin, data_json, collected_at FROM inventory_data WHERE 1=1";
-    std::vector<std::string> text_binds;
-    std::vector<int64_t> int_binds;
-
-    // Track bind order: 't' for text, 'i' for int64
-    std::string bind_order;
-
+        "SELECT agent_id, plugin, data_json, collected_at FROM inventory_store.inventory_data "
+        "WHERE 1=1";
+    std::vector<std::string> params;
+    int p = 0;
     if (!q.agent_id.empty()) {
-        sql += " AND agent_id = ?";
-        text_binds.push_back(q.agent_id);
-        bind_order += 't';
+        sql += " AND agent_id = $" + std::to_string(++p);
+        params.push_back(q.agent_id);
     }
     if (!q.plugin.empty()) {
-        sql += " AND plugin = ?";
-        text_binds.push_back(q.plugin);
-        bind_order += 't';
+        sql += " AND plugin = $" + std::to_string(++p);
+        params.push_back(q.plugin);
     }
     if (q.since > 0) {
-        sql += " AND collected_at >= ?";
-        int_binds.push_back(q.since);
-        bind_order += 'i';
+        sql += " AND collected_at >= $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.since));
     }
     if (q.until > 0) {
-        sql += " AND collected_at <= ?";
-        int_binds.push_back(q.until);
-        bind_order += 'i';
+        sql += " AND collected_at <= $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.until));
     }
+    sql += " ORDER BY collected_at DESC LIMIT $" + std::to_string(++p) + "::bigint OFFSET $" +
+           std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(limit));
+    params.push_back(std::to_string(offset));
 
-    sql += " ORDER BY collected_at DESC LIMIT ? OFFSET ?";
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return result;
-
-    int idx = 1;
-    size_t ti = 0, ii = 0;
-    for (char c : bind_order) {
-        if (c == 't') {
-            sqlite3_bind_text(stmt, idx++, text_binds[ti].c_str(), -1, SQLITE_TRANSIENT);
-            ++ti;
-        } else {
-            sqlite3_bind_int64(stmt, idx++, int_binds[ii]);
-            ++ii;
-        }
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("InventoryStore: query degraded — query failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
     }
-    sqlite3_bind_int(stmt, idx++, q.limit);
-    sqlite3_bind_int(stmt, idx, q.offset);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    std::vector<InventoryRecord> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
         InventoryRecord r;
-        r.agent_id = col_text(stmt, 0);
-        r.plugin = col_text(stmt, 1);
-        r.data_json = col_text(stmt, 2);
-        r.collected_at = sqlite3_column_int64(stmt, 3);
-        result.push_back(std::move(r));
+        r.agent_id = PQgetvalue(res.get(), i, 0);
+        r.plugin = PQgetvalue(res.get(), i, 1);
+        r.data_json = PQgetvalue(res.get(), i, 2);
+        r.collected_at = result_i64(res, i, 3);
+        out.push_back(std::move(r));
     }
-    sqlite3_finalize(stmt);
-    return result;
+    return out;
 }
 
-// ── Get agent inventory ─────────────────────────────────────────────────────
+// ── Get agent inventory (delegates to query) ─────────────────────────────────
 
-std::vector<InventoryRecord> InventoryStore::get_agent_inventory(
+std::optional<std::vector<InventoryRecord>> InventoryStore::get_agent_inventory(
     const std::string& agent_id) const {
     InventoryQuery q;
     q.agent_id = agent_id;
@@ -247,53 +394,57 @@ std::vector<InventoryRecord> InventoryStore::get_agent_inventory(
     return query(q);
 }
 
-// ── Delete agent ────────────────────────────────────────────────────────────
+// ── Delete agent ──────────────────────────────────────────────────────────────
 
 bool InventoryStore::delete_agent(const std::string& agent_id) {
-    // Empty-id guard, matching the four PG stores: never run a
+    // Empty-id guard, matching every sibling PG store: never run a
     // `DELETE ... WHERE agent_id = ''` (a footgun, never a fleet wipe). The
-    // decommission cascade already short-circuits an empty id to all-Skipped, but
-    // guarding here keeps that safety local to the store, not solely at the seam.
+    // decommission cascade already short-circuits an empty id to all-Skipped,
+    // but guarding here keeps that safety local to the store.
     if (agent_id.empty())
         return false;
-
-    std::unique_lock lock(mtx_);
-
-    const char* sql = "DELETE FROM inventory_data WHERE agent_id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        // Store-level diagnostic on the failure branch, matching the four PG
-        // siblings' spdlog::debug — so the decommission cascade's `Failed` line
-        // has a locatable root cause (the return value alone is unrecoverable).
-        spdlog::debug("InventoryStore: delete_agent prepare failed for agent={}: {}", agent_id,
-                      sqlite3_errmsg(db_));
+    if (!open_) {
+        spdlog::debug("InventoryStore: delete_agent skipped for agent={}, store not open",
+                      agent_id);
         return false;
     }
-
-    sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE)
-        spdlog::debug("InventoryStore: delete_agent step failed for agent={}: rc={} ({})", agent_id,
-                      rc, sqlite3_errmsg(db_));
-    return rc == SQLITE_DONE;
+    auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("InventoryStore: delete_agent skipped for agent={}, no connection ({})",
+                      agent_id, pool_.last_error());
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM inventory_store.inventory_data WHERE agent_id = $1",
+        std::vector<std::string>{agent_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::debug("InventoryStore: delete_agent failed for agent={}: {}", agent_id,
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
 }
 
-// ── Count ───────────────────────────────────────────────────────────────────
+// ── Count (authoritative read) ───────────────────────────────────────────────
 
-int64_t InventoryStore::count() const {
-    std::shared_lock lock(mtx_);
-
-    const char* sql = "SELECT COUNT(*) FROM inventory_data";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return 0;
-
-    int64_t c = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        c = sqlite3_column_int64(stmt, 0);
-    sqlite3_finalize(stmt);
-    return c;
+std::optional<int64_t> InventoryStore::count() const {
+    if (!open_) {
+        spdlog::warn("InventoryStore: count degraded — store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("InventoryStore: count degraded — no connection ({})", pool_.last_error());
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT COUNT(*) FROM inventory_store.inventory_data",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("InventoryStore: count degraded — query failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    return result_i64(res, 0, 0);
 }
 
 } // namespace yuzu::server

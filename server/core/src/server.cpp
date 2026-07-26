@@ -2947,15 +2947,30 @@ public:
             offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
         }
 
-        // Phase 7: Inventory Store (Issue 7.17)
-        {
-            auto inv_db = cfg_.db_dir() / "inventory.db";
-            inventory_store_ = std::make_unique<InventoryStore>(inv_db);
-            if (inventory_store_ && inventory_store_->is_open()) {
-                spdlog::info("InventoryStore initialized at {}", inv_db.string());
+        // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
+        // migrated to Postgres (ADR-0006/0008/0009/0037, schema `inventory_store`).
+        // Coexists with the typed SoftwareInventoryStore below (that store's own
+        // migration, not this one). Fails closed like every PG store: a reachable
+        // database whose schema/backfill cannot complete must not serve degraded.
+        if (pg_pool_ && !startup_failed_) {
+            inventory_store_ = std::make_unique<InventoryStore>(*pg_pool_);
+            if (!inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: generic inventory store migration/open "
+                              "failed (database reachable but the inventory_store schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto inv_db = cfg_.db_dir() / "inventory.db";
+                if (!inventory_store_->migrate_from_sqlite(inv_db)) {
+                    spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
+                                  "legacy {} failed (ADR-0009 fail-closed)",
+                                  inv_db.string());
+                    startup_failed_ = true;
+                } else {
+                    if (gateway_service_)
+                        gateway_service_->set_inventory_store(inventory_store_.get());
+                }
             }
-            if (gateway_service_)
-                gateway_service_->set_inventory_store(inventory_store_.get());
         }
 
         // Typed software-inventory projection — born-on-Postgres (ADR-0016).
@@ -4109,8 +4124,9 @@ public:
     /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
     /// `delete_agent` methods had no production caller before this). Best-effort
     /// in execution, ACCOUNTABLE in result, and null-tolerant: a store that is
-    /// not configured (e.g. no Postgres, so only the SQLite `InventoryStore` is
-    /// live) is skipped, and one store's failure never aborts the others — but
+    /// not configured (e.g. no Postgres reachable, so every per-agent store —
+    /// all born-on-PG — is absent) is skipped, and one store's failure never
+    /// aborts the others — but
     /// each `delete_agent` now reports its commit status, so a delete that did
     /// NOT commit is recorded `Failed` (not `Deleted`) and
     /// `DecommissionResult::ok()` confirms erasure across every configured store.
@@ -10042,8 +10058,15 @@ private:
                 return;
             }
             auto tables = inventory_store_->list_tables();
+            if (!tables) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : tables) {
+            for (const auto& t : *tables) {
                 arr.push_back({{"plugin", t.plugin},
                                {"agent_count", t.agent_count},
                                {"last_collected", t.last_collected}});
@@ -10067,23 +10090,31 @@ private:
             auto agent_id = req.matches[1].str();
             auto plugin = req.matches[2].str();
             auto record = inventory_store_->get(agent_id, plugin);
-            if (!record) {
+            if (!record.has_value()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (!record->has_value()) {
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
             }
+            const InventoryRecord& rec = **record;
             nlohmann::json data_obj;
             try {
-                data_obj = nlohmann::json::parse(record->data_json);
+                data_obj = nlohmann::json::parse(rec.data_json);
             } catch (...) {
-                data_obj = record->data_json;
+                data_obj = rec.data_json;
             }
-            res.set_content(nlohmann::json({{"agent_id", record->agent_id},
-                                            {"plugin", record->plugin},
+            res.set_content(nlohmann::json({{"agent_id", rec.agent_id},
+                                            {"plugin", rec.plugin},
                                             {"data", data_obj},
-                                            {"collected_at", record->collected_at}})
+                                            {"collected_at", rec.collected_at}})
                                 .dump(),
                             "application/json");
         });
@@ -10118,8 +10149,15 @@ private:
                 q.limit = 1000;
 
             auto records = inventory_store_->query(q);
+            if (!records) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : records) {
+            for (const auto& r : *records) {
                 nlohmann::json data_obj;
                 try {
                     data_obj = nlohmann::json::parse(r.data_json);
