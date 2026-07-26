@@ -209,11 +209,18 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/instructions/{id}/execute` | `agent_ids` `[]`, non-array | broadcast to all | `400` |
 | `POST /api/instructions/{id}/execute` | `scope` `""` or non-string | broadcast to all | `400` |
 | `POST /api/v1/result-sets/from-*` | `parent_id` empty, non-string, or `null` | searched/dispatched unscoped | `400` |
+| `POST /api/policies/{id}/remediate` | `agent_ids` `[]`, non-array, or containing a non-string | remediated **every non-compliant agent** in the policy | `400` |
+| `POST /api/policies/{id}/remediate` | `scope` supplied at all | silently ignored, so a narrowing selector remediated every non-compliant agent | `400` — the route selects targets by `agent_ids` only |
 | `POST /api/command` | body is not a JSON object | treated as "no target" → broadcast | `400` |
 | `POST /api/command` | `plugin`/`action` outside `[A-Za-z0-9_.-]` or over 128 bytes | accepted | `400` |
 | `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
 | `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
 | `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
+
+The two remediation rows matter for the same reason as the rest: on that route an **absent**
+`agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
+nothing — or a `scope`, which that route cannot act on — quietly became a fleet-wide *mutating*
+remediation. Omitting `agent_ids` entirely still targets every non-compliant agent, unchanged.
 
 The instructions-execute row is the one to read twice: `"scope": "" + empty agent_ids = broadcast`
 was **documented** behaviour in `rest-api.md`, so a client written against the published contract

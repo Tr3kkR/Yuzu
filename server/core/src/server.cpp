@@ -663,7 +663,7 @@ public:
         // can never emit them. Seeding the full product would publish series
         // that no code path can reach, which reads on a dashboard as "this has
         // never happened" when the truth is "this cannot happen" (governance).
-        for (const char* route : {"command", "instruction_execute", "policy_remediate"}) {
+        for (const char* route : {"command", "instruction_execute"}) {
             for (const auto reason : yuzu::server::kTargetingShapeReasons)
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
@@ -675,6 +675,20 @@ public:
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
+        // It refuses `scope` outright (PolicyEvaluator::remediate takes only
+        // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
+        // never be emitted there — seeding them would publish series no code
+        // path can reach, which reads on a dashboard as "never happened" when
+        // the truth is "cannot happen".
+        for (const auto reason : {yuzu::server::kReasonBodyType,
+                                  yuzu::server::kReasonScopeUnsupported,
+                                  yuzu::server::kReasonAgentIdsType,
+                                  yuzu::server::kReasonAgentIdsEmpty,
+                                  yuzu::server::kReasonAgentIdType}) {
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "policy_remediate"}, {"reason", std::string(reason)}});
+        }
         // The shared dispatch closure's last-line-of-defence arm. Its own route
         // label because it is not a REST surface — background runners reach it
         // too — and a non-zero value here means a CALLER forgot to name a

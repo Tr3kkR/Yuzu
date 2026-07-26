@@ -808,6 +808,27 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                            "request body must be a JSON object");
                     return;
                 }
+                // `scope` is NOT honoured on this route: PolicyEvaluator::remediate
+                // takes only (policy_id, agent_ids). Refuse it BEFORE the shared
+                // shape check, which would otherwise type-check it, empty-check
+                // it, and then let the route discard it — so `{"scope":"tag:x"}`
+                // passed validation, left agent_ids empty, and empty here means
+                // EVERY non-compliant agent in the policy. A narrowing selector
+                // producing a wider MUTATING remediation: this PR's own defect
+                // class, arriving through the guard added to prevent it.
+                //
+                // Worse than the silent drop it replaced, until now: the shared
+                // check's `target_conflict` message tells a caller who sends both
+                // fields to "supply exactly one", steering them straight into the
+                // widening case. Refusing scope outright is the only honest
+                // answer on a route that cannot act on it. (Review finding, #2548.)
+                if (j.contains("scope")) {
+                    refuse(yuzu::server::kReasonScopeUnsupported,
+                           "scope is not supported on this route; remediation targets are "
+                           "selected by agent_ids, or by omitting it to target every "
+                           "non-compliant agent in the policy");
+                    return;
+                }
                 if (auto bv = yuzu::server::check_targeting_shape(j)) {
                     refuse(bv->reason, bv->message);
                     return;

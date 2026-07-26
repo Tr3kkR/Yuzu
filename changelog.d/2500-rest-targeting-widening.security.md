@@ -28,7 +28,10 @@
   non-string entries silently — so `{"agent_ids":[1,2,3]}` remediated the entire non-compliant
   set, answered `202`, and audited success. A mutating remediation path, found by an independent
   review after the in-house rounds had cleared `PolicyEvaluator` as a *dispatch caller* without
-  reading the *route's* own parsing.
+  reading the *route's* own parsing. That route also now refuses a supplied `scope` outright
+  (`400`): `remediate()` selects targets by `agent_ids` only, so validating a `scope` and then
+  discarding it let `{"scope":"tag:canary"}` widen to every non-compliant agent — the same defect
+  arriving through the guard added to stop it.
 
 - **Behaviour change: `agent_ids` and `scope` are now exclusive.** Supplying both returns `400`
   on `POST /api/command`, `POST /api/instructions/{id}/execute` and MCP `execute_instruction`.

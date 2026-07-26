@@ -115,12 +115,14 @@ inline constexpr std::string_view kReasonBodyType{"body_type"};
 inline constexpr std::string_view kReasonParentIdType{"parent_id_type"};
 inline constexpr std::string_view kReasonParentIdEmpty{"parent_id_empty"};
 inline constexpr std::string_view kReasonClosureNoTarget{"closure_no_target"};
+inline constexpr std::string_view kReasonScopeUnsupported{"scope_unsupported"};
 
-inline constexpr std::array<std::string_view, 4> kRouteRejectReasons{
-    kReasonBodyType,        ///< the request body was not a JSON object
-    kReasonParentIdType,    ///< parent_id was supplied and is not a string
-    kReasonParentIdEmpty,   ///< parent_id was supplied and is an empty string
-    kReasonClosureNoTarget, ///< a dispatch closure was called naming no target
+inline constexpr std::array<std::string_view, 5> kRouteRejectReasons{
+    kReasonBodyType,         ///< the request body was not a JSON object
+    kReasonParentIdType,     ///< parent_id was supplied and is not a string
+    kReasonParentIdEmpty,    ///< parent_id was supplied and is an empty string
+    kReasonClosureNoTarget,  ///< a dispatch closure was called naming no target
+    kReasonScopeUnsupported, ///< the route cannot honour `scope` and refuses it
 };
 
 /// Reject a targeting argument that was SUPPLIED but names nothing.
