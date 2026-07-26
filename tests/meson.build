@@ -650,7 +650,11 @@ if build_server
   # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
   # meson runs the entries in parallel, so suite wall time is max(shards),
   # and each shard gets its own budget. Both budgets are sized for the *contended*
-  # Wee Tam box, not per-op cost: ~[pg] = 600s (quiet Windows ~231s), [pg] = 900s.
+  # Wee Tam box, not per-op cost: ~[pg] = 900s (quiet Windows ~231s), [pg] = 900s.
+  # ~[pg] was raised 600->900 on 2026-07-26: even with the with-test-slot gate
+  # live it hit 602.52s (PR #2483) — 600 sat exactly on the measured c4 worst
+  # case (603s below), leaving zero margin, so the at-cap kill was reproducible
+  # contention, not a hang.
   #
   # HISTORY / do-not-regress: [pg] was raised 600->900 on 2026-07-14 when the
   # fsync-bound CREATE DATABASE ... TEMPLATE + DROP DATABASE WITH (FORCE) (~20x
@@ -678,7 +682,7 @@ if build_server
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
-  test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
+  test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 900)
   test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
 endif
 
