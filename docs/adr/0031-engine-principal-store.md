@@ -179,6 +179,53 @@ request without needing to consult the other two.
   MCP tool wrapping them. That authoring surface (dashboard + REST + MCP for the identity itself,
   as opposed to PR 4.2's role-*assignment* surface) is PR 4.3 scope; this ADR does not change
   that boundary.
+- **Liveness re-checks are cached; authorization decisions are not** (#2367). `get_for_auth`
+  remains the authoritative chokepoint and always reads through to Postgres. A sibling,
+  `get_for_auth_revalidate`, serves the per-tick "is this already-authenticated stream's backing
+  principal still alive?" question from a 15 s positive cache, and has exactly one caller:
+  the now-**private** `AuthRoutes::engine_credential_state`, reached only from
+  `revalidate_stream`. Session synthesis and the REST/MCP on-behalf-of target checks still read
+  through on every call, so revoking a principal stops new sessions and new delegations at once.
+  Without the cache, every engine stream cost one uncached lease-bounded read per ~3 s tick,
+  which under a pool brownout was self-amplifying (unreachable → indeterminate → keep retrying)
+  and starved the data plane, not just the streaming feature.
+- **Caching a credential check changes the stream-lifetime arithmetic, and that had to be paid
+  for explicitly** (#2367). A cached "still valid" is not a re-confirmation. Reported as a plain
+  valid answer it resets the pump's grace clock, so cache residency and the grace window ADD: the
+  stream rides the cache, then collects a full fresh grace window once it expires. So the store
+  reports *where* the answer came from (`EngineRevalidate::from_cache`), `engine_credential_state`
+  propagates it as `auth::CredentialCheck::kValidStale`, and `McpStreamPump` measures its grace
+  budget from the last AUTHORITATIVE confirmation rather than from the tick an outage was noticed.
+  Total survival past a real confirmation is therefore bounded by `revalidate_grace` however much
+  of it was spent on cached answers. The TTL is deliberately well below that window (15 s against
+  60 s): at parity a fully-aged entry would leave zero remaining grace and an outage would cut
+  engine streams instantly — worse than the uncached behaviour. That coupling is pinned by a
+  `static_assert` in `mcp_stream.cpp` rather than left to a comment, so lowering the grace window
+  or raising the TTL fails the build. The cache is keyed by PRINCIPAL while the grace budget is
+  per-STREAM, so a principal with several concurrent streams would otherwise refresh the shared
+  entry from whichever stream ticks first and leave the others accumulating unbounded staleness;
+  the pump clamps its authoritative floor forward to `now - kAuthCacheTtl` on a cached answer,
+  which bounds that to one cache window per stream and can only ever move the floor forward.
+  **The same additive window still exists on the API-token half of `revalidate_stream`**, whose
+  60 s cache reports a hit as plain valid; that is pre-existing and tracked as #2447, not
+  introduced here. The mechanism this ADR
+  adds (`kValidStale` + a backdated grace budget) is what that fix will wire in.
+- **The cache is bounded, and a failed lookup is rate-limited rather than retried per tick**
+  (#2367). Only `Active` is cached — `MissingOrRevoked` is terminal and rare, and negative-caching
+  it would need `create()` invalidation to avoid masking a freshly minted principal. A read that
+  could not reach the store instead arms a short jittered backoff (5 s) during which that
+  principal is answered `StoreUnreachable` without taking a lease: a rate limiter, not a negative
+  cache, and the thing that stops the amplifier returning the moment positive entries age out
+  during a sustained brownout. Its jitter is ADDITIVE (5-10 s), the opposite sign to the TTL's:
+  extending a backoff is always safe, whereas a positive TTL must never overshoot the bound the
+  grace arithmetic depends on. Entries carry subtractive TTL jitter so a cohort warmed together
+  does not expire together; BOTH maps carry the same hard entry ceiling with an expired-entry
+  sweep on their own insert path (declining to record rather than evicting something live when
+  still full) — bounding only the positive map would bound neither, since the backoff map is
+  filled precisely when the positive one is not; and
+  `revoke()`/`transfer_owner()` invalidate synchronously **after** their write under a generation
+  guard modelled on `ApiTokenStore`'s. The writing replica cuts the stream on the next tick; the
+  cross-replica window is bounded by the TTL, the same residual property the token cache carries.
 - A boot-time collision scan (`server.cpp`, hardened alongside this store in the PR 4.2 fix round
   to require `rbac_store_->is_open()` before trusting a clean result) refuses to start the server
   if a pre-existing `engine:`-named local user or RBAC group predates the reservation — see

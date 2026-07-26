@@ -110,13 +110,78 @@ JournalReject check_field(std::string_view f) {
 
 } // namespace
 
-std::string journal_batch_key(std::string_view boot_nonce, std::uint64_t seq) {
-    return std::format("lc:{}:{:012}", boot_nonce, seq);
+std::string journal_batch_key(std::int64_t ts_ms, std::string_view boot_nonce, std::uint64_t seq) {
+    // CLAMP, do not pass through. A negative ts (dead RTC reading pre-1970) would emit a '-'
+    // and sort before every well-formed key while reversing order among its own kind; a ts
+    // past the 13-digit horizon would WIDEN the field and sort after everything. Either breaks
+    // the fixed-width property that makes `ORDER BY key` chronological, which retention and
+    // replay both now rely on. Both inputs are clock anomalies the retention layer already
+    // distrusts (see the future-slack handling in prune), so pinning them to the ends of the
+    // representable range is the honest, order-preserving answer. Do NOT "fix" this into a
+    // sign-carrying or variable-width key.
+    const std::int64_t clamped = ts_ms < 0 ? 0 : (ts_ms > kJournalKeyMaxTsMs ? kJournalKeyMaxTsMs
+                                                                            : ts_ms);
+    // std::format needs literal widths, so bind them to the constants the PARSER uses.
+    // Editing one without the other desynchronises mint from parse, at which point every
+    // key fails the strict check and the whole journal self-quarantines.
+    static_assert(kJournalKeyTsDigits == 13 && kJournalKeySeqDigits == 12 &&
+                      kJournalKeyMaxTsMs == 9'999'999'999'999LL,
+                  "the width literals in this format string are hand-written - update them "
+                  "together with the constants");
+    return std::format("lc:{:013}:{}:{:012}", clamped, boot_nonce, seq);
 }
 
-std::string journal_sent_key(std::string_view boot_nonce, std::uint64_t seq) {
-    return std::format("sent:{}:{:012}", boot_nonce, seq);
+std::optional<std::int64_t> parse_journal_batch_key_ts(std::string_view batch_key) {
+    if (!batch_key.starts_with(kBatchKeyPrefix)) return std::nullopt;
+    std::string_view rest = batch_key.substr(kBatchKeyPrefix.size());
+
+    // "<ts13>:<nonce>:<seq12>" - widths are exact, not minimums, so a key that parses here
+    // is byte-comparable with every other key that parses here.
+    const auto ts_digits = static_cast<std::size_t>(kJournalKeyTsDigits);
+    const auto seq_digits = static_cast<std::size_t>(kJournalKeySeqDigits);
+    if (rest.size() < ts_digits + 1) return std::nullopt;
+    if (rest[ts_digits] != ':') return std::nullopt;
+
+    std::int64_t ts = 0;
+    for (std::size_t i = 0; i < ts_digits; ++i) {
+        const char c = rest[i];
+        if (c < '0' || c > '9') return std::nullopt;
+        ts = ts * 10 + (c - '0'); // <= kJournalKeyMaxTsMs by construction: cannot overflow
+    }
+
+    std::string_view tail = rest.substr(ts_digits + 1); // "<nonce>:<seq12>"
+    const auto sep = tail.rfind(':');
+    if (sep == std::string_view::npos || sep == 0) return std::nullopt; // no nonce
+    const std::string_view nonce = tail.substr(0, sep);
+    if (nonce.find(':') != std::string_view::npos) return std::nullopt; // exactly three fields
+    const std::string_view seq = tail.substr(sep + 1);
+    if (seq.size() != seq_digits) return std::nullopt;
+    for (const char c : seq)
+        if (c < '0' || c > '9') return std::nullopt;
+
+    return ts;
 }
+
+bool looks_like_pre_ts_batch_key(std::string_view batch_key) {
+    // "lc:" + a non-empty nonce with no ':' + ':' + exactly 12 digits. Deliberately checked
+    // against the OLD shape rather than "not the new shape": arbitrary corruption must not be
+    // reported as a format-migration artefact.
+    if (!batch_key.starts_with(kBatchKeyPrefix)) return false;
+    const std::string_view rest = batch_key.substr(kBatchKeyPrefix.size());
+    const auto sep = rest.rfind(':');
+    if (sep == std::string_view::npos || sep == 0) return false;
+    const std::string_view nonce = rest.substr(0, sep);
+    if (nonce.find(':') != std::string_view::npos) return false;
+    const std::string_view seq = rest.substr(sep + 1);
+    if (seq.size() != static_cast<std::size_t>(kJournalKeySeqDigits)) return false;
+    for (const char c : seq)
+        if (c < '0' || c > '9') return false;
+    return true;
+}
+
+// journal_sent_key(nonce, seq) was deleted with the ts-in-key change: a sent-label is only
+// ever DERIVED from the batch key it labels (journal_sent_key_from_batch_key), so a second
+// mint path could only ever disagree with it.
 
 std::string journal_quarantine_key(std::string_view batch_key) {
     return std::string(kQuarantineKeyPrefix) + std::string(batch_key);

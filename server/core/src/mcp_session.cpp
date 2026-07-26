@@ -122,6 +122,13 @@ McpSessionRegistry::MintResult McpSessionRegistry::mint(const std::string& princ
                 result = {false, {}, "id_generation"};
             } else {
                 const auto t = now();
+                // Attribute this stream's rare publish() WARN lines to the session. Set
+                // WHILE the stream is still exclusively owned by this local (before the
+                // emplace hands it to the map under mu_) - that is the write-once-before-
+                // shared contract set_log_context relies on. An 8-char prefix is enough to
+                // correlate against the audit log without putting the full session id in
+                // application logs.
+                stream->set_log_context("sid=" + id.substr(0, 8));
                 sessions_.emplace(id, Entry{principal, t, t, std::move(stream)});
                 opened = true;
                 result = {true, id, {}};
@@ -205,6 +212,15 @@ bool McpSessionRegistry::terminate(const std::string& id, const std::string& pri
 std::size_t McpSessionRegistry::active_count() const {
     std::lock_guard<std::mutex> lk(mu_);
     return sessions_.size();
+}
+
+bool McpSessionRegistry::exists(const std::string& id, const std::string& principal) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = sessions_.find(id);
+    if (it == sessions_.end() || it->second.principal != principal) {
+        return false;
+    }
+    return now() - it->second.last_seen <= cfg_.idle_ttl;  // gc_locked's predicate, negated
 }
 
 }  // namespace yuzu::server::mcp

@@ -36,6 +36,22 @@ std::size_t ExecutionEventBus::subscribe(const std::string& execution_id, Listen
     return id;
 }
 
+std::size_t ExecutionEventBus::subscribe_and_replay(const std::string& execution_id,
+                                                    std::uint64_t since_id, Listener listener) {
+    auto ch = get_or_create(execution_id);
+    std::lock_guard<std::mutex> g(ch->mu);
+    // Install FIRST - the emplace is the only allocating step, so an insertion failure
+    // throws before any replay side effect. Then replay under the SAME lock so no publisher
+    // can interleave between the install and the replay (the race replay_since+subscribe
+    // leaves open). `it` stays valid for the loop: nothing rehashes the map while we hold mu.
+    auto id = ++ch->next_sub_id;
+    auto it = ch->listeners.emplace(id, std::move(listener)).first;
+    for (const auto& ev : ch->buffer) {
+        if (ev.id > since_id) it->second(ev);
+    }
+    return id;
+}
+
 void ExecutionEventBus::unsubscribe(const std::string& execution_id, std::size_t sub_id) {
     auto ch = find(execution_id);
     if (!ch) return;
@@ -66,6 +82,8 @@ void ExecutionEventBus::publish(const std::string& execution_id, const std::stri
         if (is_terminal && !ch->terminal) {
             ch->terminal = true;
             ch->terminal_at_ms = ev.timestamp_ms;
+            // C5 (#2409): name the exact terminal event, atomically with the flag.
+            ch->first_terminal_id = ev.id;
         }
         // Fan out under the channel mutex — listeners must not block.
         // The intended pattern is queue-and-notify on a per-connection

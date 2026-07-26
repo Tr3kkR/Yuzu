@@ -83,6 +83,7 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
@@ -117,6 +118,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
+#include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "stream_budget.hpp" // shared held-open-SSE admission budget (2f PR 2, Decision 15(h))
 #include "notification_routes.hpp"
 #include "offload_routes.hpp"
@@ -482,7 +484,7 @@ public:
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
                           "gauge");
-        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
+        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
                           "Frames dropped before reaching a connection's per-connection queue — "
@@ -506,15 +508,118 @@ public:
                           "construction failed before commit (#2366); the frame was never "
                           "published and no event id was consumed",
                           "counter");
+        metrics_.describe("yuzu_mcp_tool_security_misconfig_total",
+                          "MCP tools/call denials for a served tool with no security "
+                          "registration (C8 fail-closed, #2383) — the boot validator makes "
+                          "this state unbootable, so any non-zero value means it was "
+                          "bypassed; alert on > 0 "
+                          "(docs/ops-runbooks/mcp-tool-registration-recovery.md)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_tool_args_invalid_total",
+                          "MCP tools/call denials where the arguments failed the tool's "
+                          "input schema before approval-ticket mint/consume (#2405); a "
+                          "spike on one tool means a supervised worker is submitting "
+                          "malformed arguments or probing",
+                          "counter");
+        // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
+        // degrade reason is a static literal inside the bridge, never derived
+        // from caller input.
+        metrics_.describe("yuzu_mcp_bridge_records_active",
+                          "Progress-bridge correlation records currently live (global cap 256)",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_bridge_reject_total",
+                          "Progress-bridge reservation rejections by reason", "counter");
+        metrics_.describe("yuzu_mcp_bridge_degrade_total",
+                          "execute_instruction progress requests silently degraded to the plain "
+                          "path, by reason (the plain response is self-sufficient - it carries "
+                          "execution_id)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_listener_failures_total",
+                          "Bus-listener copy failures contained at the noexcept boundary - the "
+                          "event was not latched; the terminal backstop is the durable "
+                          "execution_id fetch",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_mailbox_drops_total",
+                          "Oldest-progress frames dropped from a record's bounded arming mailbox "
+                          "(terminals are never dropped)",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
+                          "Terminal-frame publish failures seen by the bridge's "
+                          "publish_final → fallback → poison ladder (Decision 15(f))",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_projector_cycles_total",
+                          "Progress-bridge projector wake cycles. An event-driven liveness signal: "
+                          "records_active > 0 with a flat rate here means the projector is wedged",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
+                          "Committed terminal frames that found no free pin slot and were published "
+                          "UNPINNED (a real terminal is committed rather than lost to preserve a "
+                          "pin). Not expected: the bridge caps streamed records per session at the "
+                          "pin count, so any non-zero value means that admission accounting was "
+                          "violated and the affected final is evictable from the replay ring "
+                          "(still recoverable by execution_id). Alert on > 0",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
+        metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
+        metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
+        metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
+        metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
+        metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
+        // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
+        // meaningful on a healthy/idle server (observability-conventions; the
+        // reason literals mirror the bridge's reject/degrade taxonomies).
+        for (auto reason : {"disabled", "unknown_session", "shutdown", "duplicate_request_id",
+                            "global_cap", "pin_slots"}) {
+            metrics_.counter("yuzu_mcp_bridge_reject_total", {{"reason", reason}});
+        }
+        for (auto reason : {"reserve_rejected", "reserve_threw", "no_execution_row",
+                            "subscribe_failed", "arm_threw"}) {
+            metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
+        }
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
+        metrics_.counter("yuzu_mcp_tool_security_misconfig_total");
+        // Pre-seed the #2405 schema-denial counter for every approval-gated
+        // tool — the closed label set that can reach the gate — so absent()
+        // alerts stay meaningful (observability-conventions.md).
+        for (const auto& tool : mcp::approval_gated_tool_names()) {
+            metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
+        }
+        // #2437 handler-side bound denials. The label set is closed on BOTH
+        // axes: `tool` is execute_instruction alone (the only tool that EMITS
+        // this counter today; the two kAgenticParamMaxLen read tools bound in
+        // the handler but audit without a metric) and `reason` is the fixed
+        // literal set below - so this pre-seed is exhaustive and absent() stays
+        // meaningful. Extend both lists together if a second tool gains bounds.
+        // Iterated from the ONE array in mcp_input_bounds.hpp rather than
+        // restated here: a second literal list is how a new rule ends up
+        // emitted-but-unseeded, which passes its own test and silently breaks
+        // absent() alerting. This commit's six targeting reasons went into
+        // that array, not into a list here - which is the tether working.
+        for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
+            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                             {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+        }
+        // #2437 transport-layer body rejection (pre-routing, pre-auth). No
+        // `tool` label: the body is never read, so nothing is known about the
+        // call beyond its path — a tool label here would be a fabrication.
+        // `reason` distinguishes a measured over-cap body (413) from one this
+        // server refuses to measure at all (411: chunked, or POST with no
+        // Content-Length — both would otherwise revert to httplib's 100 MB
+        // default and evade the cap entirely).
+        for (auto reason : {"over_cap", "unmeasurable"}) {
+            metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
+        }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
-                            "credential_revoked", "auth_unavailable", "internal_error"}) {
+                            "credential_revoked", "auth_unavailable", "internal_error",
+                            // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
+                            // pre-seeded here so the closed label set is complete from C4.
+                            "cancelled", "cap_expired", "completed"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
@@ -825,12 +930,17 @@ public:
         // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
         // no HELP, or with HELP that drifts from what the rollup actually computes.
-        // Unlabelled by design; all 29 are ABSENT until some agent's journal reports.
+        // Unlabelled by design; all 30 are ABSENT until some agent's journal reports.
         // Read the type-honesty note on kGuardianJournalMetrics before writing an
         // alert: no sound alerting form exists over these fleet sums yet (neither
-        // increase() nor bare `> 0` survives a churning population), so the 29 are
+        // increase() nor bare `> 0` survives a churning population), so the 30 are
         // MONITOR-ONLY until a per-agent axis lands (#2083-class; see the note).
         for (const auto& m : detail::kGuardianJournalMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        // The journal AGE family (item 6 + #2364) - its own table because it rolls up
+        // as MAX, not SUM (a fleet sum of ages is meaningless; see the table comment in
+        // guardian_journal_fleet_tags.hpp for the emission differences too).
+        for (const auto& m : detail::kGuardianJournalAgeMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
         // The two meta-signals are NOT in that table (it is pinned 1:1 to the agent's
         // GuardianJournalStats) and are published every sweep including at 0.
@@ -855,6 +965,23 @@ public:
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
+        // #2367 engine-principal liveness cache — same shape as the token
+        // siblings above, described so the families ship typed and with HELP
+        // rather than as bare untyped samples.
+        metrics_.describe("yuzu_server_engine_revalidate_cache_hits_total",
+                          "Engine-principal stream liveness re-checks served from cache",
+                          "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_cache_misses_total",
+                          "Engine-principal stream liveness re-checks that read through to "
+                          "PostgreSQL",
+                          "counter");
+        metrics_.describe("yuzu_server_engine_revalidate_cache_size",
+                          "Engine principals with a live (unexpired) liveness cache entry",
+                          "gauge");
+        metrics_.describe("yuzu_server_engine_revalidate_backoff_suppressed_total",
+                          "Engine-principal liveness re-checks answered StoreUnreachable from the "
+                          "failure backoff without taking a connection lease",
+                          "counter");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
         // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
@@ -1150,6 +1277,30 @@ public:
                           "Cumulative engine-credential rotation-sweep ticks that failed with an "
                           "exception (predecessor auto-revocation skipped for that tick)",
                           "counter");
+        // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
+        // 503-transient retry storm on confirm is alertable instead of
+        // invisible (yuzu_http_requests_total has no per-route label). SCOPE
+        // CONTRACT (deliberately narrow, so the label set stays a fact): counts
+        // only confirm calls that reached the credential store OR found it
+        // unavailable at the store-open guard — NOT pre-store denials
+        // (permission / input-validation / MCP approval-gate), which are other
+        // families' concern. `result` mirrors the engine_store_error_class
+        // taxonomy plus `success`. Operational, NOT event="security" (a replay
+        // conflict is an expected agent retry shape, not an attack signal); no
+        // principal_id label (bounded cardinality only) — pair with the
+        // `engine_principal.credential.confirm` audit rows for per-principal
+        // forensics. One describe site only (#2446 last-write-wins on dup).
+        metrics_.describe("yuzu_engine_principal_confirm_total",
+                          "Engine-credential rotation confirm outcomes by surface (rest|mcp) and "
+                          "result (success|conflict|client_error|transient); store-reaching calls "
+                          "only, pre-store denials excluded (#2404)",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+                metrics_.counter("yuzu_engine_principal_confirm_total",
+                                 {{"surface", surface}, {"result", result}});
+            }
+        }
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent", "Server process CPU usage percentage",
                           "gauge");
@@ -3614,6 +3765,25 @@ public:
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
                 }
+                // #2367: the same observability for the engine-principal
+                // revalidation cache. Without these the cache is invisible —
+                // its whole job is to keep per-tick stream re-validation off
+                // the pool, and there would be no way to see whether it is
+                // doing it. `backoff_suppressed` is the brownout signal: it
+                // only moves while the store is unreachable AND the per-tick
+                // retry amplifier is being held off.
+                if (engine_principal_store_) {
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_hits_total")
+                        .set(static_cast<double>(engine_principal_store_->revalidate_cache_hits()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_misses_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revalidate_cache_misses()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_cache_size")
+                        .set(static_cast<double>(engine_principal_store_->revalidate_cache_size()));
+                    metrics_.gauge("yuzu_server_engine_revalidate_backoff_suppressed_total")
+                        .set(static_cast<double>(
+                            engine_principal_store_->revalidate_backoff_suppressed()));
+                }
                 // Publish FleetTopologyStore internals so the 256 MiB store-
                 // level oversize cap and single-flight refill timeouts are
                 // observable -- the route-level yuzu_viz_oversize_response_total
@@ -3666,6 +3836,24 @@ public:
                         .set(static_cast<double>(execution_event_bus_->gc_sweeps_total()));
                     metrics_.gauge("yuzu_server_sse_gc_channels_total")
                         .set(static_cast<double>(execution_event_bus_->gc_channels_total()));
+                }
+                // 2f PR 3a - the bridge sweep tick: pin-ack teardown, session-
+                // death teardown, the kArming age-reaper, and the ring-only
+                // pressure hatch all advance here. PAIRED with registry gc ON
+                // PURPOSE: the bridge's non-touching exists() classifies a dead
+                // session but never destroys its stream, so without this gc() an
+                // idle server would hold an expired session's stream (and its
+                // pinned finals) until the next client request happened to run
+                // one. BOUNDED WORK (governance sre): this shares the
+                // security-relevant serial health-recompute budget, so both
+                // calls are O(records ≤256) / O(sessions) in-memory scans placed
+                // AFTER the CRL/stale-agent sweep (no same-tick delay to it) -
+                // microseconds at the 15s cadence, no request-path contention.
+                if (mcp_stream_bridge_) {
+                    mcp_stream_bridge_->sweep();
+                    if (mcp_sessions_) {
+                        mcp_sessions_->gc();
+                    }
                 }
                 // Guardian scalars + cumulative write/reap counters. Use
                 // gauges for the count-now values (SQL COUNT(*)) and for the
@@ -4162,6 +4350,14 @@ public:
         agent_service_.set_revocation_checker(nullptr);
         agent_service_.set_peer_cert_recognizer(nullptr);
 
+        // 2f PR 3a: the bridge borrows the bus (unsubscribe on teardown) and the
+        // session registry - shut it down and release it BEFORE the tracker/bus
+        // reset below ([BRIDGE-AFTER-SESSIONS]). shutdown() is idempotent, so
+        // the dtor's call becomes a no-op.
+        if (mcp_stream_bridge_) {
+            mcp_stream_bridge_->shutdown();
+            mcp_stream_bridge_.reset();
+        }
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -5600,6 +5796,40 @@ private:
                          target_streams, pool_max, effective_streams,
                          detail::kPlainRestReserveDefault, detail::kMaxProvidersPerStream);
         }
+        // #2367: held-open streams and the Postgres pool are coupled capacities,
+        // and nothing else says so at boot. Every live stream re-validates its
+        // credential each pump tick against this pool. Those reads are cached,
+        // so steady state is O(streams / TTL) rather than O(streams x tick) —
+        // but the refreshes still land here alongside ordinary request traffic,
+        // and a stream capacity far above the pool size is the shape that turns
+        // a pool blip into a correlated stall.
+        //
+        // Deliberately warned on the EFFECTIVE capacity, not the configured
+        // target: a hand-pinned --http-worker-threads can clamp the target well
+        // below what was asked for, and warning about capacity the server will
+        // never admit is just noise.
+        //
+        // Advisory only — not a clamp and not a startup failure. The safe ratio
+        // depends on link latency and traffic mix, so this points at the metrics
+        // that answer it rather than inventing a rule. The threshold sits above
+        // the shipped default ratio (128 streams / 16 connections = 8:1, so a
+        // default server is quiet) and below the cliff #2367 names (512 on a
+        // pool of 16 = 32:1).
+        if (pg_pool_) {
+            constexpr std::size_t kStreamsPerPgConnAdvisory = 16;
+            if (effective_streams > pg_pool_->size() * kStreamsPerPgConnAdvisory) {
+                spdlog::warn(
+                    "[PG] effective SSE stream capacity {} is more than {}x --postgres-pool-size "
+                    "{}. Held-open streams re-validate their credential against this pool, so at "
+                    "this ratio a pool brownout can stall streams and ordinary requests together. "
+                    "Watch yuzu_pg_acquire_wait_seconds and yuzu_pg_pool_in_use; if they climb, "
+                    "lower the stream capacity or raise --postgres-pool-size (and check the "
+                    "database can carry the extra connections — enlarging the pool against an "
+                    "already-struggling server makes things worse, not better). Engine-principal "
+                    "streams are the heaviest case; other SSE surfaces re-validate more cheaply.",
+                    effective_streams, kStreamsPerPgConnAdvisory, pg_pool_->size());
+            }
+        }
         stream_budget_ =
             std::make_unique<detail::StreamBudget>(detail::StreamBudget::Config{effective_streams});
         metrics_.gauge("yuzu_http_held_open_capacity")
@@ -5751,6 +5981,177 @@ private:
                     R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
+            }
+
+            // MCP request-body bound (#2437). Placed HERE, after the rate
+            // limiter and before auth, for two reasons that are easy to get
+            // wrong:
+            //   * httplib calls this pre-routing handler BEFORE it reads the
+            //     request body (httplib.h: pre_routing_handler_ in routing(),
+            //     read_content later in the same function), so returning
+            //     Handled costs a header parse and never buffers the payload.
+            //     Enforcing the same bound inside the MCP handler would be too
+            //     late — the body is already in memory by then.
+            //   * it is per-path, NOT the server-global
+            //     `set_payload_max_length` knob, which would also cap the
+            //     multipart certificate upload and content distribution on
+            //     this same httplib instance. httplib's 100 MB default stays
+            //     as the outer backstop for every other route.
+            // Unlike the on-behalf-of guard above, this sits AFTER the rate
+            // limiter: there is no diagnostic reason to let an oversized-body
+            // flood bypass the limiter, and no misconfiguration it would mask.
+            // A chunked or Content-Length-less POST/PUT/PATCH is REFUSED 411,
+            // not admitted: httplib consults Transfer-Encoding before
+            // Content-Length and reads a header-less POST to EOF, so either
+            // shape would revert to the 100 MB default and evade this cap
+            // entirely. A bound removable by deleting a header is not a bound.
+            // ON THE UNREAD BODY (checked at primary source against the
+            // vendored httplib 0.37.1 — don't re-derive, and re-check on a
+            // vcpkg baseline bump). Returning Handled means the body is never
+            // read off the socket. What ACTUALLY happens next:
+            //   * write_response_core stamps `Connection: close` on any status
+            //     >= 400 (httplib.h:10789, "Don't leave connections open after
+            //     errors"), so a conforming client closes.
+            //   * but NOTHING sets httplib's `connection_closed` flag for an
+            //     error response, so process_server_socket_core loops again
+            //     (httplib.h:5516-5531). A client that already transmitted the
+            //     declared body — which it always has under
+            //     `Expect: 100-continue`, since process_request auto-answers
+            //     100 BEFORE routing — leaves those bytes to be parsed as
+            //     subsequent request lines on this same socket.
+            //   * bounded: <= keep_alive_max_count_ (100) parses and the idle
+            //     timeout, then teardown. Malformed lines 400 before
+            //     pre-routing runs (so they skip the rate limiter); a
+            //     well-formed smuggled request goes through the FULL middleware
+            //     chain including auth, so there is no auth bypass.
+            // Same shape as the two early returns above (on-behalf-of 403,
+            // rate-limit 429), which have always returned Handled on POSTs
+            // carrying bodies — this adds an instance of an existing pattern,
+            // not a new one.
+            // CAVEAT IF A REVERSE PROXY IS EVER PUT IN FRONT: an unread
+            // Content-Length body is a textbook request-smuggling primitive
+            // between proxy and origin. The shipped rigs expose the server
+            // directly, so this is a documented constraint, not a live bug.
+            // The DECISION lives in web_utils.hpp so it has direct unit
+            // coverage (same reason is_login_exempt_path was extracted from
+            // this lambda); only this call site is review-only.
+            // The path test is hoisted to the CALL SITE, not left inside the
+            // predicate: get_header_value_u64 is a function ARGUMENT and is
+            // therefore evaluated unconditionally, so the predicate's internal
+            // && cannot short-circuit it. Measured at 14.22 ns/request
+            // unguarded vs 0.84 ns guarded, on EVERY request server-wide
+            // (governance perf-S1).
+            if (is_mcp_path(req.path)) {
+              // Hoisted ABOVE the try so the catch below can answer with the
+              // right status: collapsing an unmeasurable-body refusal into a
+              // 413 would tell the client to shrink a body whose size was
+              // never the problem.
+              bool unmeasurable_cause = false;
+              // CONTAIN THE WHOLE BRANCH, not just the metric (governance Gate 8,
+              // security + cpp-safety). httplib invokes this handler from TWO
+              // sites: routing() (inside process_request's try/catch) and the
+              // WebSocket-upgrade path at httplib.h:11741, which is NOT — and
+              // ThreadPool::worker runs tasks bare. A GET /mcp/v1/ carrying
+              // `Upgrade: websocket` and an oversized Content-Length reaches
+              // here via that second site, so a bad_alloc from the header read,
+              // the log, the sanitizers, the counter OR the envelope build is
+              // std::terminate. The first attempt guarded only the one operation
+              // it had been told about; the hazard is the path.
+              try {
+                const bool oversize = mcp_body_exceeds_cap(
+                    req.path, req.get_header_value_u64("Content-Length", 0),
+                    mcp::kMcpMaxRequestBodyBytes);
+                // Header VALUES passed through, not a re-implementation of
+                // httplib's parsing — matching its decision by hand is what
+                // let `Transfer-Encoding: Chunked` through last round.
+                const bool unmeasurable = mcp_body_unmeasurable(
+                    req.path, req.method, req.has_header("Content-Length"),
+                    req.get_header_value("Transfer-Encoding"),
+                    req.get_header_value("Content-Encoding"));
+                unmeasurable_cause = unmeasurable;
+                if (oversize || unmeasurable) {
+                    // Throttled log: this is a pre-auth ingress rejection with
+                    // NO principal to audit, and observability-conventions.md
+                    // requires metric + sampled log for exactly that shape.
+                    // Mirrors the on-behalf-of guard above, whose sanitizer
+                    // this reuses (httplib percent-decodes req.path, so raw
+                    // control bytes would otherwise forge log lines).
+                    // OWN throttle, NOT onbehalf::note_rejection (governance
+                    // Gate 8 security HIGH-1). Reusing it fed
+                    // yuzu_onbehalf_rejected_total, which carries a CRITICAL
+                    // alert reading "likely a header-injecting proxy" — so an
+                    // unauthenticated chunked-POST flood would have paged
+                    // someone about an ADR-1005 breach that never happened,
+                    // and would have consumed the shared 1-in-100 log slot
+                    // that the genuine on-behalf-of warnings need. Never
+                    // borrow a security control's counter for a transport
+                    // bound.
+                    // ONE COUNTER PER REASON. A shared counter lets a cheap
+                    // over_cap flood (huge Content-Length, no body sent)
+                    // suppress ~99% of the unmeasurable lines, hiding the
+                    // rarer signal behind the noisier one.
+                    static std::atomic<std::uint64_t> over_cap_hits{0};
+                    static std::atomic<std::uint64_t> unmeasurable_hits{0};
+                    constexpr std::uint64_t kBodyLogEvery = 100;
+                    auto& hits = unmeasurable ? unmeasurable_hits : over_cap_hits;
+                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
+                        spdlog::warn("[#2437] rejected {} {} from {}: {} (1 log per {} "
+                                     "rejections; the counter records all)",
+                                     onbehalf::sanitize_for_log(req.method, 16),
+                                     onbehalf::sanitize_for_log(req.path),
+                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                     unmeasurable ? "unmeasurable body" : "body over cap",
+                                     kBodyLogEvery);
+                    }
+                    try {
+                        metrics_
+                            .counter("yuzu_mcp_body_too_large_total",
+                                     {{"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // Guarded because this call site is NOT inside
+                        // httplib's try/catch on the WebSocket-upgrade path
+                        // (httplib.h:11741 vs routing()'s at :11811), and
+                        // ThreadPool::worker invokes tasks bare — an escaped
+                        // throw here is std::terminate (cpp-safety S1 / UP-9).
+                        // The sibling handler-side increment is guarded the
+                        // same way; observability must never kill the process.
+                    }
+                    res.status = unmeasurable ? 411 : 413;
+                    res.set_content(
+                        unmeasurable
+                            ? detail::a4_denial(
+                                  res, 411,
+                                  "MCP requests must carry a body this server can size "
+                                  "in advance",
+                                  detail::A4ErrorOpts{
+                                      .remediation =
+                                          "send the JSON-RPC body with a Content-Length "
+                                          "header, no Transfer-Encoding, and no "
+                                          "Content-Encoding other than identity; a body "
+                                          "whose size cannot be checked before reading it "
+                                          "cannot be admitted under the 4 MiB MCP cap "
+                                          "(see docs/mcp-server.md)"})
+                            : detail::a4_denial(
+                                  res, 413, "request body exceeds the MCP transport limit",
+                                  detail::A4ErrorOpts{
+                                      .remediation =
+                                          "the largest accepted MCP request body is 4 MiB; "
+                                          "reduce the arguments, or for a large "
+                                          "execute_bundle use the REST twin POST "
+                                          "/api/v1/bundles (see docs/mcp-server.md)"}),
+                        "application/json");
+                  return httplib::Server::HandlerResponse::Handled;
+                }
+              } catch (...) { // NOLINT(bugprone-empty-catch)
+                  // Last-resort containment for the WHOLE branch, including the
+                  // header read that decides it. We cannot build an envelope if
+                  // we got here, but we can still refuse rather than let the
+                  // throw reach httplib's UNGUARDED WebSocket-upgrade call site
+                  // and take the process down.
+                  res.status = unmeasurable_cause ? 411 : 413;
+                  return httplib::Server::HandlerResponse::Handled;
+              }
             }
 
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
@@ -11909,6 +12310,37 @@ private:
             // runs after the join, so member-destruction order is irrelevant.
             mcp_sessions_ = std::make_unique<mcp::McpSessionRegistry>(
                 mcp::McpSessionRegistry::Config{}, mcp::McpSessionRegistry::ClockFn{}, &metrics_);
+            // Progress bridge core (2f PR 3a). Constructed only when the
+            // execution bus exists (no instruction DB ⇒ no bus ⇒ bridge stays
+            // null and execute_instruction never reserves - today's behavior).
+            // Borrows the bus + registry raw; safe because stop() shuts the
+            // bridge down and resets it BEFORE the bus resets, and the member
+            // is declared after mcp_sessions_ ([BRIDGE-AFTER-SESSIONS]) so the
+            // no-stop() teardown order is bridge → registry → (much earlier
+            // decl) bus. The audit sink is request-free (G1 - the bridge's
+            // lifecycle events fire from sweeps/projector, not a handler);
+            // principal "system" marks them as server-side maintenance rows.
+            if (execution_event_bus_) {
+                mcp_stream_bridge_ = std::make_unique<mcp::McpStreamBridge>(
+                    execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
+                    [this](const std::string& action, const std::string& execution_id,
+                           const std::string& detail) {
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                            ev.principal = "system";
+                            ev.action = action;
+                            ev.target_type = "Execution";
+                            ev.target_id = execution_id;
+                            ev.detail = detail;
+                            ev.result = "success";
+                            (void)audit_store_->log(ev);
+                        }
+                    });
+                mcp_server_->set_stream_bridge(mcp_stream_bridge_.get());
+            }
             // PR 4.3 (T13): wire the engine-principal store + the SAME
             // engine-credential store (api_token_store_) + the shared
             // owner-existence predicate the 8 engine tools need. Setters
@@ -12512,6 +12944,17 @@ private:
     // /mcp/v1/ handlers; safe because stop() joins web_server_ before members
     // destruct (see ~ServerImpl → stop() → web_server_->stop()).
     std::unique_ptr<mcp::McpSessionRegistry> mcp_sessions_;
+    // [BRIDGE-AFTER-SESSIONS] - DO NOT reorder these two members or insert a new
+    // member between them. The progress bridge (2f PR 3a) borrows BOTH the
+    // registry (stream_for/exists) and the execution bus (subscribe/unsubscribe)
+    // by raw pointer; members destruct in reverse declaration order, so the
+    // bridge declared AFTER mcp_sessions_ destructs FIRST (its dtor runs the
+    // idempotent shutdown(): joins the projector and unsubscribes from the bus
+    // while both borrows are still alive - the bus is declared far earlier and
+    // destructs later still). The explicit stop() path mirrors this: bridge
+    // shutdown+reset BEFORE execution_tracker_/bus reset. Same contract family
+    // as [BUS-BEFORE-TRACKER]; grep both tags before touching this block.
+    std::unique_ptr<mcp::McpStreamBridge> mcp_stream_bridge_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;

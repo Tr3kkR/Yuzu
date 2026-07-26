@@ -91,6 +91,54 @@ bounded-resource machine credential) as a CC6.6 control for any privileged/
 machine-identity access review. See `docs/user-manual/engine-principals.md`
 "Per-principal quota cap" for the operator-facing reference.
 
+**Addendum — engine-credential rotation confirm pinning (CC6.1/CC6.3, #2384).**
+The overlap-pair rotation's maker-checker confirm step is pinned to the exact
+credential being confirmed: the confirm call (REST and MCP) requires the
+successor `token_id` the rotate response returned, a stale or mismatched id is
+rejected with no state change, and the success audit row records
+`token_id=<confirmed id>` — binding the attestation evidence to one specific
+credential. This closes a rotation-confirm replay hazard (a blind retry of an
+old confirm landing after a second rotation started could previously revoke
+that later rotation's still-live credential). Credit as a CC6.3
+credential-rotation control with per-credential attestation evidence; the
+operator-facing flow is `docs/user-manual/engine-principals.md` §4 and the
+audit contract is the `engine_principal.credential.confirm` row in
+`docs/user-manual/audit-log.md`.
+
+**Addendum — engine-principal revocation latency for LIVE streams (CC6.2, #2367).**
+Answering "how quickly is a revoked machine identity cut off?" now has three
+distinct figures, and they should be quoted separately:
+
+- **New sessions and new delegations: immediate.** Session synthesis and the
+  REST/MCP on-behalf-of target checks read the principal store authoritatively
+  on every call. A revoked engine principal cannot obtain a new session or a
+  new delegation at any point after the revoke commits.
+- **Live held-open streams, same server: next heartbeat tick (~3 s).** The
+  per-tick liveness re-check is served from a 15 s cache, but the revoking
+  server invalidates that cache synchronously as part of the revoke write.
+- **Live held-open streams, other replicas: bounded by the 15 s cache TTL plus
+  a tick.** The cache is per-process, so a peer replica honours its own entry
+  until it expires. This is the same class of residual property the 60 s API
+  token cache already carries, and is the figure to quote for a multi-replica
+  deployment.
+
+These figures apply to streams authenticated by an **engine** principal.
+Streams authenticated by an ordinary API token have a *different, currently-open*
+profile: a token-cache hit is still treated as a fresh confirmation, so for
+those the cache residency and the outage grace window can still add — the
+non-additive guarantee below is engine-specific (pre-existing, tracked as
+#2447). Do not generalise the engine figures to all streams when answering a
+questionnaire.
+
+An auth store that is *unreachable* is deliberately not treated as a
+revocation (it would cut every stream on the fleet at once); such streams ride
+a bounded grace window and then close with a distinct `auth_unavailable`
+reason. For engine streams that window is measured from the last authoritative
+confirmation, so cached answers cannot extend total survival beyond it. Credit
+as a CC6.2 revocation control with the bounds above; the operator-facing
+reference is `docs/mcp-server.md` "Revocation." and the upgrade note in
+`docs/user-manual/server-admin.md`.
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security
@@ -109,6 +157,7 @@ machine-identity access review. See `docs/user-manual/engine-principals.md`
 - Dependency and image scanning gates in CI.
 - Signed release artifacts and provenance attestation.
 - Formal secure coding standard + threat modeling for high-risk subsystems.
+- MCP tool dispatch validates its internal authorization-registration tables at startup and refuses to boot on drift, rather than silently serving an under-governed tool (fail-closed on internal misconfiguration; #2383).
 
 ### Evidence
 

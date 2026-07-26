@@ -115,13 +115,27 @@ loop explicitly instead of waiting for the sweep:
 
 ```bash
 curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce/credentials/confirm \
-  -H "Cookie: $COOKIE"
+  -H "Cookie: $COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"token_id": "<token_id from the rotate response>"}'
 ```
 
 This revokes the predecessor immediately and promotes the successor to the
 principal's sole active credential. `confirm` is a **separate attestation**
 from the `rotate` reveal — the server never infers "installed" from "the
-rotate call returned 200."
+rotate call returned 200." The required `token_id` is the successor id the
+rotate response returned: it pins the confirm to that exact rotation, so a
+blind retry of an old confirm can never resolve a **later** rotation early
+(a stale or mismatched id gets a `409` and changes nothing).
+
+If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
+double-submit, or a client racing the auto-revoke sweep — you get a *terminal*
+`409` (`rotation already confirmed` / `no rotation in flight ... already the
+sole active credential`), not a retryable `503`. Treat it as done: the rotation
+is resolved and there is nothing left to confirm. Rotate again only if you
+genuinely need a fresh credential. (The one case that stays `503`-retryable is
+a genuine store hiccup — an empty read, lock contention, or a persist failure —
+where retrying is the right move.)
 
 ### 5. Transfer ownership
 

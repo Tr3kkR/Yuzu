@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -44,8 +45,64 @@ inline constexpr std::size_t kMaxJournalBatchBytes = 256 * 1024; // 256 KiB
 /// Bounded staging reserve (RAM). Overflow → drop-oldest + journal_stage_dropped.
 inline constexpr std::size_t kMaxPendingJournalRecords = 4096;
 
+/// What ONE heartbeat retry-persist may write (C0 flip-checklist item 11). The heartbeat
+/// thread holds the engine mutex across the call, so the cost is a LATENCY budget - but a
+/// latency budget expressed only in batches silently becomes a THROUGHPUT floor, and those
+/// two are not the same number.
+///
+/// Why both caps. Each batch is a separate autocommit insert that can approach the KvStore's
+/// 5 s busy timeout under contention, so the BATCH cap is what bounds a tick's worst case
+/// (~4 x 5 s, inside the 30 s heartbeat) instead of leaving it unbounded. But a batch is
+/// capped at kMaxJournalEntriesPerBatch entries AND kMaxJournalBatchBytes, so how many
+/// RECORDS four batches carry depends entirely on record size: ~1024 when records are small
+/// and batches fill on the entry cap, but as few as ~48 when large fields make the byte cap
+/// split them - a 21x swing in sustained drain rate, from ~34 rec/s down to ~1.6 rec/s
+/// (governance Gate 3 performance). The heartbeat tick is the only steady-state drain, so at
+/// the low end a sustained event rate the pre-cap code absorbed would instead overflow the
+/// bounded staging buffer and shed records through the counted journal_stage_dropped path.
+/// That would be a NEW loss channel introduced by a latency fix, which is not a trade worth
+/// making silently.
+///
+/// The RECORD cap therefore floors the throughput independently of record size: whichever
+/// limit is reached first ends the call, so the tick is bounded in round trips AND the drain
+/// rate cannot collapse with record size. 1024 records matches the small-record regime the
+/// batch cap already allowed, and stays two orders above any plausible sustained arm/disarm
+/// rate. A burst above it drains over the next few ticks.
+inline constexpr std::size_t kJournalPersistMaxBatchesPerTick = 4;
+inline constexpr std::size_t kJournalPersistMaxRecordsPerTick = 1024;
+
+/// Explicit "no cap" for persist()'s bounds - the one-shot callers (boot re-arm, apply_rules,
+/// and both shutdown flushes) each have to drain what they were given. Named rather than a
+/// defaulted 0 so that omitting the argument is not the unbounded case: a future cadence
+/// caller that forgot it would otherwise get an unbounded write run under the engine mutex,
+/// which is exactly the defect the cap exists to prevent (governance Gate 3 architect).
+inline constexpr std::size_t kJournalPersistUnbounded = 0;
+
 /// Per-field byte cap. An oversized field keeps the whole record out (counted).
 inline constexpr std::size_t kMaxJournalFieldBytes = 4096;
+
+/// The largest stored value `persist()` can produce, with slack. A batch stops at
+/// kMaxJournalBatchBytes, and the one case that can exceed it - the first record of a batch is
+/// admitted unconditionally - is itself bounded by 7 fields at kMaxJournalFieldBytes, far below
+/// this. So a row LARGER than this cannot have been written by this code: it is corruption,
+/// detectable from the scan's byte length ALONE with no value read.
+///
+/// Retention needs that check because it no longer parses values (#2299). Before, an
+/// unparseable row was quarantined out of the candidate set and never counted toward the byte
+/// ceiling; now a well-keyed row counts for its full size whatever the value contains, so one
+/// tampered or bit-rotted 40 MiB row would push the journal over its 32 MiB ceiling and make an
+/// UNCAPPED single pass evict every older batch - deleting undelivered evidence and counting it
+/// as ordinary retention (governance Gate 4 unhappy-path UP-1). Quarantining by size restores
+/// the pre-#2299 property at zero I/O cost.
+inline constexpr std::size_t kMaxPlausibleJournalValueBytes = 2 * kMaxJournalBatchBytes;
+/// The threshold is a QUARANTINE trigger, and a quarantined row is eventually deleted by the
+/// over-cap shed - so it must never be reachable by a legitimate batch. Bind it to the write
+/// path's own bound rather than leaving the 2x margin as a comment: narrowing this constant,
+/// raising kMaxJournalBatchBytes, or adding a JournalRecord string field that est_entry_bytes
+/// does not count would otherwise silently quarantine-then-delete real audit evidence with
+/// only a counter to show for it (governance Gate 8 security).
+static_assert(kMaxPlausibleJournalValueBytes >= 2 * kMaxJournalBatchBytes,
+              "the implausible-value threshold must stay above anything persist() can write");
 
 /// Retention bounds (evict oldest by (ts_ms, key)).
 inline constexpr int kJournalRetentionDays = 7;
@@ -109,8 +166,8 @@ inline constexpr std::int64_t kJournalFutureSlackMs = 24LL * 3600 * 1000;
 /// count ceiling is what evicts, and it evicts ~1000 in one pass (#2345 Gate 8 UP5-2).
 inline constexpr std::size_t kMaxAgeEvictionsPerPass = 64;
 
-/// Key prefixes within kJournalNamespace. A batch key is "lc:<nonce>:<seq12>";
-/// its sent-label is "sent:<nonce>:<seq12>"; a quarantined batch is
+/// Key prefixes within kJournalNamespace. A batch key is "lc:<ts13>:<nonce>:<seq12>";
+/// its sent-label is "sent:<ts13>:<nonce>:<seq12>"; a quarantined batch is
 /// "quarantine:" + the original batch key. The three prefixes are disjoint so a
 /// prefix scan of one never sees another.
 inline constexpr std::string_view kBatchKeyPrefix = "lc:";
@@ -136,13 +193,42 @@ struct JournalBatch {
 
 // ── Key helpers ──────────────────────────────────────────────────────────────
 
-/// "lc:<boot_nonce>:<seq12>" - seq is a per-process counter from 0, zero-padded
-/// to 12 digits (side-steps list()'s fail-open max+1 overwrite). Ordering across
-/// batches is by (ts_ms, key), NOT lexical key: the boot-nonce is random.
-YUZU_EXPORT std::string journal_batch_key(std::string_view boot_nonce, std::uint64_t seq);
+/// Widths of the two fixed-width key fields. `ts_ms` is padded to 13 digits, which
+/// covers every representable instant up to 9'999'999'999'999 ms (Nov 2286) - a value
+/// beyond it, or below zero, is CLAMPED at mint rather than allowed to change the field
+/// width or emit a '-' sign, either of which would break the fixed-width ordering the
+/// key exists to provide. `seq` keeps its 12 digits (a per-process counter from 0).
+inline constexpr int kJournalKeyTsDigits = 13;
+inline constexpr int kJournalKeySeqDigits = 12;
+inline constexpr std::int64_t kJournalKeyMaxTsMs = 9'999'999'999'999LL;
 
-/// "sent:<boot_nonce>:<seq12>" - the (best-effort) sent-label for a batch.
-YUZU_EXPORT std::string journal_sent_key(std::string_view boot_nonce, std::uint64_t seq);
+/// "lc:<ts13>:<boot_nonce>:<seq12>" - the batch's wall-clock ms zero-padded to a FIXED
+/// 13 digits, then the boot-nonce, then the per-process sequence.
+///
+/// The timestamp leads because that makes SQLite's `ORDER BY key` identical to the
+/// (ts_ms, key) ordering every consumer wants: equal-ts keys tie-break on
+/// "<nonce>:<seq>", exactly as the old comparator did. That is what lets a maintenance
+/// pass select and order candidates from KEYS ALONE and read only the values it will
+/// actually use (#2299 perf-P-1) - with the nonce leading, key order was random per
+/// boot and retention would have evicted arbitrary rather than oldest evidence.
+///
+/// `ts_ms` is clamped to [0, kJournalKeyMaxTsMs]; see the width note above.
+YUZU_EXPORT std::string journal_batch_key(std::int64_t ts_ms, std::string_view boot_nonce,
+                                          std::uint64_t seq);
+
+/// The batch timestamp carried by a batch key, or nullopt if `batch_key` is not a
+/// well-formed batch key. The check is STRICT ("lc:" + 13 digits + ':' + a non-empty
+/// nonce with no ':' + ':' + 12 digits): the journal is dormant until the prefer_spark
+/// flip, so no key in the old format can exist on disk and a key that fails this check
+/// is corruption, never legacy data. Callers quarantine or skip on nullopt.
+YUZU_EXPORT std::optional<std::int64_t> parse_journal_batch_key_ts(std::string_view batch_key);
+
+/// True if `batch_key` has the RETIRED pre-#2299 shape `lc:<nonce>:<seq12>` - no timestamp.
+/// Diagnostic only: such a key is malformed and quarantined either way, but distinguishing it
+/// lets the log say "stale journal from a pre-cutover local build" rather than leaving an
+/// operator to read a quarantine as corrupt-page data loss. Retire this a release after the
+/// prefer_spark flip.
+YUZU_EXPORT bool looks_like_pre_ts_batch_key(std::string_view batch_key);
 
 /// "quarantine:" + batch_key - where a corrupt/unparseable batch is moved.
 YUZU_EXPORT std::string journal_quarantine_key(std::string_view batch_key);

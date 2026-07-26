@@ -35,9 +35,9 @@ int64_t now_epoch_seconds() {
 
 // Build the LIKE operand for a prefix match: escape the wildcards SQLite's LIKE would otherwise
 // interpret ('%', '_') and the escape char itself, then append '%'. Every prefix-scanning query
-// pairs this with ESCAPE '\'. Extracted so the three call sites (list, list_entries,
-// namespace_size) cannot drift - an unescaped '_' silently widens the scan to keys the caller
-// never asked for.
+// pairs this with ESCAPE '\'. Extracted so the four call sites (list, list_entries,
+// namespace_size, list_keys_sized) cannot drift - an unescaped '_' silently widens the scan to
+// keys the caller never asked for.
 std::string escape_like_prefix(std::string_view prefix) {
     std::string escaped;
     escaped.reserve(prefix.size() + 1);
@@ -116,7 +116,16 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     // Busy timeout for concurrent access
     sqlite3_busy_timeout(raw_db, 5000);
 
-    // Create table
+    // Create table.
+    //
+    // `key` MUST stay BINARY-collated (SQLite's default - do NOT add COLLATE NOCASE or any
+    // other collation). Guardian's durable journal mints fixed-width keys whose leading field
+    // is a zero-padded timestamp precisely so that `ORDER BY key` IS chronological order, and
+    // its retention pass evicts oldest-first off that ordering. A collation change here would
+    // silently reorder those scans and evict the wrong audit records - with nothing in that
+    // component able to detect it, because it never sees this schema (governance Gate 3
+    // architect). The PRIMARY KEY's implicit index is also what makes the prefix scans
+    // ordered-by-key for free; see list_keys_sized.
     const char* create_sql = R"(
         CREATE TABLE IF NOT EXISTS kv_store (
             plugin     TEXT NOT NULL,
@@ -382,6 +391,75 @@ KvStore::namespace_size(std::string_view plugin, std::string_view prefix) {
     const std::int64_t b = sqlite3_column_int64(stmt.get(), 1);
     return KvNamespaceSize{n > 0 ? static_cast<std::uint64_t>(n) : 0,
                            b > 0 ? static_cast<std::uint64_t>(b) : 0};
+}
+
+std::expected<std::vector<KvKeySize>, KvStoreError>
+KvStore::list_keys_sized(std::string_view plugin, std::string_view prefix) {
+    std::lock_guard lock(mu_);
+    std::vector<KvKeySize> result;
+    if (!db_)
+        return std::unexpected(KvStoreError{"kv_store is closed"});
+
+    const std::string escaped_prefix = escape_like_prefix(prefix);
+
+    // octet_length(value), not the value itself: the point of this method is that a scan over a
+    // namespace at its byte ceiling costs the key column and a header-only length read, never the
+    // value pages. See namespace_size() for why octet_length rather than LENGTH().
+    const char* sql = "SELECT key, octet_length(value) FROM kv_store "
+                      "WHERE plugin = ? AND key LIKE ? ESCAPE '\\' ORDER BY key";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK)
+        return std::unexpected(
+            KvStoreError{std::format("list_keys_sized prepare failed: {}", sqlite3_errmsg(db_))});
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, escaped_prefix.c_str(),
+                      static_cast<int>(escaped_prefix.size()), SQLITE_STATIC);
+
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+        const auto* ktext = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        const std::int64_t b = sqlite3_column_int64(stmt.get(), 1);
+        result.push_back(KvKeySize{ktext ? std::string(ktext) : std::string{},
+                                   b > 0 ? static_cast<std::uint64_t>(b) : 0});
+    }
+    // Same mid-scan discipline as list_entries(): an error is not end-of-rows.
+    if (rc != SQLITE_DONE)
+        return std::unexpected(
+            KvStoreError{std::format("list_keys_sized step failed: {}", sqlite3_errmsg(db_))});
+    return result;
+}
+
+std::expected<std::optional<std::string>, KvStoreError>
+KvStore::get_entry(std::string_view plugin, std::string_view key) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected(KvStoreError{"kv_store is closed"});
+
+    const char* sql = "SELECT value FROM kv_store WHERE plugin = ? AND key = ?";
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK)
+        return std::unexpected(
+            KvStoreError{std::format("get_entry prepare failed: {}", sqlite3_errmsg(db_))});
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, key.data(), static_cast<int>(key.size()), SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+        // Blob read: an embedded NUL must survive to the parser (list_entries() rationale).
+        const auto* vblob = static_cast<const char*>(sqlite3_column_blob(stmt.get(), 0));
+        const int vbytes = sqlite3_column_bytes(stmt.get(), 0);
+        return std::optional<std::string>{
+            vblob ? std::string(vblob, static_cast<std::size_t>(vbytes)) : std::string{}};
+    }
+    if (rc == SQLITE_DONE)
+        return std::optional<std::string>{}; // absent, definitively
+    return std::unexpected(
+        KvStoreError{std::format("get_entry step failed: {}", sqlite3_errmsg(db_))});
 }
 
 KvInsert KvStore::insert_if_absent(std::string_view plugin, std::string_view key,
