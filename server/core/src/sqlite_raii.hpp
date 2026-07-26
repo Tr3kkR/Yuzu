@@ -39,7 +39,15 @@ public:
     }
 
     /// Address for `sqlite3_prepare_v2(db, sql, -1, stmt.addr(), nullptr)`.
-    sqlite3_stmt** addr() noexcept { return &s_; }
+    /// Finalizes any statement already held, so re-preparing through one owner
+    /// is safe. All three owners in this header share that contract - without it
+    /// a second prepare would leak the first statement, and because `SqliteDb`
+    /// closes with `close_v2`, a leaked statement also pins the connection as a
+    /// zombie until process exit.
+    sqlite3_stmt** addr() noexcept {
+        reset();
+        return &s_;
+    }
     sqlite3_stmt* get() const noexcept { return s_; }
     explicit operator bool() const noexcept { return s_ != nullptr; }
 

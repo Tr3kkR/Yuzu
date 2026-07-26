@@ -349,7 +349,7 @@ refuses to act on that:
 - **It declines a pass that would expire every datable row**, logs a warning,
   and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
   applies when the gap since the previous pass exceeds **a fixed 7 days**, or
-  when the stored reading is *ahead* of the current clock. That reading is
+  when the stored reading is stored reading is not a plausible past reading -- *ahead* of the current clock, or negative, which no pass this code ran could have written and so signals tampering or corruption. That reading is
   persisted, so the check still fires on the first pass after a restart --- including
   a server that *booted* with an already-wrong clock. The 7 days is
   **absolute, not derived from `audit_retention_days`**: how far the clock moved
@@ -434,7 +434,7 @@ directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was *ahead* of the clock. The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not a plausible past reading (*ahead* of the clock, or negative -- the tamper/corruption signal). The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
 | `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

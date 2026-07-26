@@ -39,7 +39,7 @@ AuditStore::AuditStore(const std::filesystem::path& db_path, int retention_days,
 
 AuditStore::~AuditStore() {
     // Join FIRST: the cleanup thread touches `db_.get()` every pass, so the connection
-    // must outlive it. `db_.get()`'s own destructor then closes the handle.
+    // must outlive it. `db_`'s own destructor then closes the handle.
     stop_cleanup();
 }
 
@@ -118,9 +118,12 @@ void AuditStore::ensure_retention_index() {
     // -- so routing an O(N log N) index build through that fail-closed path
     // would let a transient temp-space shortfall at the first post-upgrade boot
     // take the SOC 2 audit trail offline. The index is a PERFORMANCE artifact;
-    // the guard is correct without it. Measured cost at 5M rows: ~1.4s and
-    // ~81MB, paid once (extrapolating to ~16s at 50M rows), so the elapsed time
-    // is logged when it is long enough for an operator to have noticed.
+    // the guard is correct without it. Measured cost at 5M rows on NVMe: ~81 MB
+    // and ~1.8-3.3 s, paid once. At 50M rows the build reads a ~16 GB table --
+    // tens of seconds on local NVMe, potentially minutes on overlayfs or network
+    // storage, which is why `upgrading.md` tells operators to widen the
+    // orchestrator's startup budget. The elapsed time is logged when it is long
+    // enough for an operator to have noticed.
     if (!db_)
         return; // symmetry with load_meta/store_meta; also true after a failed migration
     const auto t0 = std::chrono::steady_clock::now();
@@ -516,6 +519,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     std::size_t deleted = 0;
     std::int64_t emit_delta = 0, emit_window = 0;
     bool emit_full_wipe = false, emit_capped = false;
+    std::string emit_backlog_probe_err;
 
     {
         std::unique_lock lock(mtx_);
@@ -674,6 +678,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                     // post-delete fact the cap counter uses, so the log line and
                     // the metric cannot disagree.
                     emit_capped = outcome->backlog_remains;
+                    emit_backlog_probe_err = std::move(outcome->backlog_probe_err);
                     if (deleted > 0)
                         emit = Emit::Deleted;
                 }
@@ -681,6 +686,11 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         }
     } // lock released before any formatting
 
+    if (!emit_backlog_probe_err.empty())
+        spdlog::warn("AuditStore: the post-delete backlog probe failed ({}); this pass assumed a "
+                     "backlog remains, so the cap counter and the clock-anomaly latch are both "
+                     "acting on an assumption rather than a reading",
+                     emit_backlog_probe_err);
     if (emit_persist_failed)
         spdlog::warn("AuditStore: could not persist the retention clock reading; a restart before "
                      "the next pass will lose its clock-step comparison point");
@@ -787,6 +797,7 @@ AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe) {
     // real anomaly arriving before the next pass deletes with no decline, no
     // warn and no counter. The latch must come from a POST-delete fact.
     bool backlog_remains = false;
+    std::string probe_err;
     if (deleted >= kMaxAuditDeletesPerPass) {
         const std::int64_t binds[] = {now};
         const auto more = exists_probe(db_.get(),
@@ -794,7 +805,18 @@ AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe) {
                                        "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
                                        binds);
         // Unreadable: assume a backlog remains. That keeps the latch armed and
-        // the counter moving, the conservative direction for both.
+        // the counter moving, the conservative direction for both -- but SAY SO.
+        // Without this the failure is the only one in the pass that moves no
+        // counter and writes no line, and `cap_reached_` would then be
+        // incremented on an assumption while its own description claims it
+        // proves a backlog. Near-unreachable (the exclusive lock means only an
+        // out-of-process writer could make the delete succeed and an
+        // identical-predicate probe fail), which is exactly why it must not be
+        // the one silent path.
+        if (!more) {
+            probe_err = more.error();
+            cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
+        }
         backlog_remains = !more || *more;
         if (backlog_remains)
             cap_reached_.fetch_add(1, std::memory_order_relaxed);
@@ -807,7 +829,7 @@ AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe) {
     // leaves it armed after a clean drain, which does the same thing for the
     // window until the next pass clears it.
     clock_anomaly_latched_ = would_wipe && backlog_remains;
-    return DeleteOutcome{deleted, backlog_remains};
+    return DeleteOutcome{deleted, backlog_remains, std::move(probe_err)};
 }
 
 void AuditStore::start_cleanup() {

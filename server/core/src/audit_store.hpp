@@ -200,8 +200,13 @@ public:
         return clock_anomaly_skips_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that failed outright (a probe or the
-    /// delete itself returned a SQLite error). Scraped SEPARATELY from
+    /// Cumulative count of retention passes that FAILED, for any of six reasons:
+    /// an unreadable pre-delete probe; a failed delete prepare; a failed delete
+    /// step; an unreadable POST-delete backlog probe; a pass refused because the
+    /// caller's clock was implausible; a pass against a closed store; or an
+    /// exception escaping the pass (caught at the thread boundary). The common
+    /// thread is "this pass did not do its job", not any particular SQLite call.
+    /// Scraped SEPARATELY from
     /// `clock_anomaly_skips_count()` on purpose: both leave rows undeleted, but
     /// one means "the guard is protecting the table" and the other means "the
     /// cleanup loop is broken". A single counter could not tell an operator
@@ -357,6 +362,13 @@ private:
     struct DeleteOutcome {
         std::size_t deleted{0};
         bool backlog_remains{false};
+        /// Empty when the post-delete backlog probe was read. Non-empty means it
+        /// could NOT be, so `backlog_remains` above is an ASSUMPTION
+        /// (conservative: true) rather than an observation, and this carries the
+        /// reason out for the caller to log after the lock. Carried IN the
+        /// outcome rather than through an out-param: conventions forbid those,
+        /// and the delete itself still succeeded, so this is not an error return.
+        std::string backlog_probe_err;
     };
     /// The accepted-delete half of a pass. Caller must hold `mtx_` exclusively.
     /// `would_wipe` is the pre-delete outcome test. On failure returns the SQLite
