@@ -2146,8 +2146,9 @@ see "MFA / TOTP" above for the envelope-encryption shape and the
 (password hashes, recovery codes, enrollment/SCIM tokens) stays a
 verify-only hash, unaffected by `SecretCodec`.
 
-Operator recovery: `docs/ops-runbooks/auth-db-recovery.md` (SQLite-era —
-verify against the current Postgres substrate before following it verbatim).
+Operator recovery: `docs/ops-runbooks/auth-db-recovery.md` (rewritten for
+the Postgres substrate — detection signals, the KEK backup-pairing rule, and
+the break-glass one-shots' `--postgres-dsn`/`--ca-dir` requirements).
 Security review record: `docs/security-reviews/authdb-2026-04-30.md`
 (SQLite-era baseline).
 
