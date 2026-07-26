@@ -164,7 +164,7 @@ groups:
             this is an allocation-pressure or stream-state signal worth paging.
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
-          sum by (stage) (increase(yuzu_mcp_bridge_teardown_incomplete_total[15m])) > 0
+          sum by (stage) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
         labels:
           severity: warning
         annotations:
@@ -179,6 +179,10 @@ groups:
             erase = the correlation record itself. Client results stay durably
             fetchable by execution_id. Expected value is 0; investigate memory
             pressure or lock contention on the health-recompute thread.
+            DELIBERATELY a raw counter test, not increase() over a window: the
+            retention lasts until the process restarts, so an alert that cleared
+            after 15 minutes would contradict the contract it exists to report.
+            It clears on restart, which is exactly when the resource is released.
       - alert: YuzuMcpMaintenanceTickFailing
         expr: |
           increase(yuzu_mcp_bridge_sweep_tick_failures_total[15m]) > 0

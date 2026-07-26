@@ -12601,7 +12601,7 @@ private:
                 mcp_stream_bridge_ = std::make_unique<mcp::McpStreamBridge>(
                     execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
                     [this](const std::string& action, const std::string& execution_id,
-                           const std::string& detail) {
+                           const std::string& detail, const char* result) {
                         if (audit_store_ && audit_store_->is_open()) {
                             AuditEvent ev;
                             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -12612,7 +12612,10 @@ private:
                             ev.target_type = "Execution";
                             ev.target_id = execution_id;
                             ev.detail = detail;
-                            ev.result = "success";
+                            // NOT hardcoded "success" (#2487 review): a teardown that
+                            // could not complete, or a disposition that published
+                            // nothing, must not be evidenced as a successful action.
+                            ev.result = result;
                             (void)audit_store_->log(ev);
                         }
                     });

@@ -144,6 +144,7 @@ struct Fx {
     mcp::McpSessionRegistry sessions;
     std::mutex audit_mu;
     std::vector<std::pair<std::string, std::string>> audits;  // (action, detail)
+    std::vector<std::pair<std::string, std::string>> audit_results;  // (action, result)
     std::optional<Bridge> bridge;                             // optional: dtor-order tests
 
     explicit Fx(Bridge::Config cfg = {})
@@ -151,9 +152,10 @@ struct Fx {
                    [b = base, c = clock_s] { return b + std::chrono::seconds(c->load()); }, &reg) {
         bridge.emplace(&bus, &sessions, &reg,
                        [this](const std::string& action, const std::string&,
-                              const std::string& detail) {
+                              const std::string& detail, const char* result) {
                            std::lock_guard<std::mutex> lk(audit_mu);
                            audits.emplace_back(action, detail);
+                           audit_results.emplace_back(action, result ? result : "");
                        },
                        cfg);
     }
@@ -557,6 +559,9 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     REQUIRE(fx.bus.subscriber_count("exec-pin-1") == 1);
     fx.bridge->sweep();  // pin-ack teardown reaps the consumed record
     CHECK(fx.bridge->record_count() == 3);
+    // record_count alone would also pass if the WRONG key were erased, so name it.
+    CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
+    CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());
     CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
     CHECK(fx.audit_count("mcp.bridge.pin_acked") == 1);
     // #2487: teardown owns THREE things - the map entry, the streamed charge, and
@@ -942,6 +947,18 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
         }
         CHECK(saw_incomplete);  // the audit must not claim a teardown that did not happen
     }
+    {
+        // ...and the row's result field must say so too. The production sink used to
+        // stamp every bridge row "success" regardless of detail (#2487 review).
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool saw_failure = false;
+        for (const auto& [action, result] : fx.audit_results) {
+            if (action == "mcp.bridge.session_dead" && result == "failure") {
+                saw_failure = true;
+            }
+        }
+        CHECK(saw_failure);
+    }
 
     // The claim is one-way ON PURPOSE (re-opening it is a change to the exactly-once
     // teardown protocol, not a containment fix), so healing the fault does NOT make a
@@ -1181,6 +1198,15 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
         }
         return std::string{"<absent>"};
     };
+    auto result_for = [](Fx& fx, const std::string& action) {
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        for (const auto& [a, r] : fx.audit_results) {
+            if (a == action) {
+                return r;
+            }
+        }
+        return std::string{"<absent>"};
+    };
     // Two parked records so the pressure hatch has an oldest to pick; A never
     // completes, so its disposition is kSynthesizeUnavailable (the -32014 arm).
     auto build = [](Fx& fx, Fx::Session& s) {
@@ -1229,6 +1255,33 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
         CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
               "terminal-unavailable synthesis failed; session poisoned, nothing published "
               "(pressure)");
+        CHECK(result_for(fx, "mcp.bridge.forced_expire") == "failure");
+    }
+    SECTION("the frame never gets built: NOT reported as a poisoning") {
+        // The distinction that matters. The catch around frame construction only
+        // counts a metric - it does NOT call poison_terminal() - so an audit row
+        // claiming the session was poisoned would assert an outcome that never
+        // happened, on exactly the allocation-failure path this work exists to
+        // harden. kNotAttempted is a separate rung for this reason.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        build(fx, s);
+        fx.bridge->inject_terminal_build_fault_for_test(1);
+        fx.bridge->sweep();
+        CHECK(detail_for(fx, "mcp.bridge.forced_expire") ==
+              "terminal-unavailable frame could not be built; nothing published and the "
+              "stream was NOT poisoned - recover by execution_id (pressure)");
+        CHECK(result_for(fx, "mcp.bridge.forced_expire") == "failure");
+        // The claim really is that the stream is still usable: a resume must still
+        // attach rather than 410.
+        auto att = s.stream->attach_and_replay(0, nullptr, "alice");
+        CHECK(att.status == mcp::McpStreamState::AttachStatus::kAttached);
+        if (att.sink) {
+            s.stream->detach(att.sink);
+        }
+        // Teardown still completed its OTHER two obligations.
+        CHECK_FALSE(fx.bridge->phase_for(s.id, json("a")).has_value());
+        CHECK(fx.bus.subscriber_count("exec-f4-a") == 0);
     }
 }
 
@@ -1438,13 +1491,31 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
     // final to status:"unknown" with the counts silently missing, and the whole
     // suite would stay green. This drives a real tracker so the payload under test
     // is the one production emits.
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    // RAII: a fatal REQUIRE below must not skip the close (repo ownership rule).
+    // Non-copyable on purpose - the implicit copy would double-close.
+    struct SqliteHandle {
+        sqlite3* db = nullptr;
+        SqliteHandle() = default;
+        SqliteHandle(const SqliteHandle&) = delete;
+        SqliteHandle& operator=(const SqliteHandle&) = delete;
+        ~SqliteHandle() {
+            if (db != nullptr) {
+                sqlite3_close(db);
+            }
+        }
+    } handle;
+    REQUIRE(sqlite3_open(":memory:", &handle.db) == SQLITE_OK);
+    // DECLARATION ORDER IS LOAD-BEARING. The tracker borrows &fx.bus and the
+    // collector listener below borrows `seen`/`seen_mu`, and a listener lives as
+    // long as its bus channel. Declaring fx FIRST would destroy the bus last,
+    // leaving the tracker and the installed listener holding dangling references
+    // through teardown. Everything the bus borrows must therefore outlive fx.
+    Fx fx;
     {
-        yuzu::server::ExecutionTracker tracker(db);
+        std::mutex seen_mu;
+        std::vector<std::pair<std::string, std::string>> seen;
+        yuzu::server::ExecutionTracker tracker(handle.db);
         tracker.create_tables();
-
-        Fx fx;
         tracker.set_event_bus(&fx.bus);
         auto s = fx.make_session();
 
@@ -1493,6 +1564,42 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
         CHECK((*result)["agents_success"] == 1);
         CHECK((*result)["agents_failure"] == 1);
         CHECK((*result)["execution_id"] == *exec_id);
+
+        // The OTHER half of the same contract, and the one the assertions above
+        // cannot reach. refresh_counts publishes TWO events on a terminal
+        // transition: a terminal-flagged execution-progress FIRST, then
+        // execution-completed. C5's pressure visitor keys on the first of those and
+        // feeds ITS payload to the same build_real_final. So dropping a key from
+        // progress_payload while leaving terminal_payload intact would keep every
+        // assertion above green and still degrade the memory-pressure recovery path
+        // to status:"unknown". Pin the producer directly by replaying what the bus
+        // actually buffered.
+        const auto collector = fx.bus.subscribe_and_replay(
+            *exec_id, 0, [&](const yuzu::server::ExecutionEvent& ev) noexcept {
+                std::lock_guard<std::mutex> lk(seen_mu);
+                seen.emplace_back(ev.event_type, ev.data);
+            });
+        // The terminal-flagged progress is the one IMMEDIATELY BEFORE the first
+        // execution-completed, not simply the last progress event: update_agent_status
+        // drives the transition itself, so a later refresh_counts appends a further,
+        // non-transition progress frame that carries no status at all.
+        std::optional<json> terminal_progress;
+        for (std::size_t i = 0; i < seen.size(); ++i) {
+            if (seen[i].first == "execution-completed") {
+                REQUIRE(i > 0);
+                REQUIRE(seen[i - 1].first == "execution-progress");
+                terminal_progress = json::parse(seen[i - 1].second);
+                break;
+            }
+        }
+        REQUIRE(terminal_progress.has_value());
+        CHECK((*terminal_progress)["status"] == "completed");
+        CHECK((*terminal_progress)["agents_success"] == 1);
+        CHECK((*terminal_progress)["agents_failure"] == 1);
+
+        // Drop both borrows before `seen`/`seen_mu`/`tracker` leave scope: the
+        // channel outlives this block inside fx.
+        fx.bus.unsubscribe(*exec_id, collector);
+        tracker.set_event_bus(nullptr);
     }
-    sqlite3_close(db);
 }

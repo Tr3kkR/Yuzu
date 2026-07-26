@@ -321,8 +321,27 @@ bool McpStreamBridge::subscribe(const std::string& session_id, const nlohmann::j
         throw std::bad_alloc{};  // test seam: model a subscribe allocation failure
     }
     {
-        // Written before any listener exists; immutable afterwards.
+        // EXACTLY-ONCE, STATE-CHECKED (#2487 review). The "written before any
+        // listener exists, immutable afterwards" contract is what lets
+        // teardown_claimed BORROW execution_id instead of copying it, and what
+        // stops a second listener being installed on a record a sweep has already
+        // claimed. It used to be a comment; now it is a gate.
+        //
+        // The window that made it load-bearing: a sweep claimant sets torn_down
+        // and releases both locks before teardown_claimed runs, and the record is
+        // erased from records_ only at the very END of teardown. A subscribe()
+        // arriving in between still resolves the record, would reassign the string
+        // out from under teardown's borrowed reference (a reallocating assignment
+        // = a genuine data race on the read), and would install a fresh listener
+        // that the imminent erase then strands forever - recreating precisely the
+        // orphan-listener leak this change exists to prevent. Reachable via the
+        // kArming reaper, which cannot distinguish a dead handler from a very slow
+        // one.
         std::lock_guard<std::mutex> rlk(rec->mu);
+        if (rec->subscribed || rec->torn_down ||
+            rec->phase.load(std::memory_order_acquire) != Phase::kArming) {
+            return false;
+        }
         rec->execution_id = execution_id;
     }
     // ORDERING INVARIANT (governance performance/UP-5): the caller MUST invoke
@@ -1189,13 +1208,17 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
         count_teardown_incomplete("unsubscribe");
         audit_contained(audit_action, exec_id,
                         "teardown incomplete: bus unsubscribe failed, record retained "
-                        "for shutdown");
+                        "for shutdown",
+                        "failure");
         return;
     }
-    // #2506 F4: initialised BEFORE the switch on purpose - frame construction can
-    // throw before the ladder is ever reached, and kPoisoned ("nothing reached the
-    // ring") is the honest default for that case too.
-    TerminalRung rung = TerminalRung::kPoisoned;
+    // #2506 F4: initialised BEFORE the switch, because frame construction can throw
+    // before the ladder is ever reached. The default is kNotAttempted, NOT
+    // kPoisoned: the catch below increments a counter and does not call
+    // poison_terminal(), so defaulting to kPoisoned would make the audit assert a
+    // session poisoning that never happened - the same class of false-outcome claim
+    // this finding is about (#2487 review).
+    TerminalRung rung = TerminalRung::kNotAttempted;
     switch (decision) {
         case TeardownFinal::kSynthesizeUnavailable:
             // Pressure victim that genuinely NEVER saw a terminal (verified at
@@ -1203,6 +1226,10 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
             // so a later resume still finds truth in the ring. A4 grammar:
             // error.data carries the durable handle.
             try {
+                if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
+                    terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+                    throw std::bad_alloc{};  // inject_terminal_build_fault_for_test
+                }
                 std::string data =
                     std::string(R"({"execution_id":)") + detail::json_quoted(exec_id) +
                     R"(,"correlation_id":)" +
@@ -1230,6 +1257,10 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
             // ("fetch by execution_id"), NEVER -32014. Contain the by-value copy of
             // fallback_final (may OOM).
             try {
+                if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
+                    terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+                    throw std::bad_alloc{};  // models the by-value fallback_final copy failing
+                }
                 rung = publish_terminal_ladder(rec, rec->fallback_final).rung;  // 0 twice ⇒ poison
             } catch (...) {
                 if (metrics_ != nullptr) {
@@ -1274,21 +1305,48 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
     // a nonzero id from the retry is indistinguishable from one from the primary
     // frame - which is why the ladder reports its rung.
     const char* audit_detail = "";
+    bool delivered = true;
     if (decision == TeardownFinal::kSynthesizeUnavailable) {
-        audit_detail = rung == TerminalRung::kPrimary
-                           ? "terminal-unavailable synthesized (pressure)"
-                           : rung == TerminalRung::kFallback
-                                 ? "terminal-unavailable synthesis failed; fallback final "
-                                   "published instead (pressure)"
-                                 : "terminal-unavailable synthesis failed; session poisoned, "
-                                   "nothing published (pressure)";
+        switch (rung) {
+            case TerminalRung::kPrimary:
+                audit_detail = "terminal-unavailable synthesized (pressure)";
+                break;
+            case TerminalRung::kFallback:
+                audit_detail = "terminal-unavailable synthesis failed; fallback final "
+                               "published instead (pressure)";
+                break;
+            case TerminalRung::kPoisoned:
+                audit_detail = "terminal-unavailable synthesis failed; session poisoned, "
+                               "nothing published (pressure)";
+                delivered = false;
+                break;
+            case TerminalRung::kNotAttempted:
+                audit_detail = "terminal-unavailable frame could not be built; nothing "
+                               "published and the stream was NOT poisoned - recover by "
+                               "execution_id (pressure)";
+                delivered = false;
+                break;
+        }
     } else if (decision == TeardownFinal::kFallbackFinal) {
-        audit_detail = rung == TerminalRung::kPoisoned
-                           ? "fallback final failed; session poisoned, nothing published "
-                             "(terminal payload lost)"
-                           : "fallback final published (terminal payload lost)";
+        switch (rung) {
+            case TerminalRung::kPrimary:
+            case TerminalRung::kFallback:
+                audit_detail = "fallback final published (terminal payload lost)";
+                break;
+            case TerminalRung::kPoisoned:
+                audit_detail = "fallback final failed; session poisoned, nothing published "
+                               "(terminal payload lost)";
+                delivered = false;
+                break;
+            case TerminalRung::kNotAttempted:
+                audit_detail = "fallback final could not be copied; nothing published and "
+                               "the stream was NOT poisoned - recover by execution_id "
+                               "(terminal payload lost)";
+                delivered = false;
+                break;
+        }
     }
-    audit_contained(audit_action, exec_id, audit_detail);
+    audit_contained(audit_action, exec_id, audit_detail, delivered ? "success" : "failure");
 }
 
 void McpStreamBridge::release_charge(const std::shared_ptr<BridgeRecord>& rec) {
@@ -1399,11 +1457,11 @@ void McpStreamBridge::flush_core_obs() noexcept {
 }
 
 void McpStreamBridge::audit_contained(const char* action, const std::string& execution_id,
-                                      std::string_view detail) noexcept {
+                                      std::string_view detail, const char* result) noexcept {
     if (audit_) {
         // Both owned strings the AuditFn signature needs (action from a const char*,
         // detail from the view) are constructed HERE, inside the guard - #2487.
-        obs_guard([&] { audit_(action, execution_id, std::string(detail)); });
+        obs_guard([&] { audit_(action, execution_id, std::string(detail), result); });
     }
 }
 
@@ -1461,6 +1519,10 @@ void McpStreamBridge::inject_visit_copy_fault_for_test(int times) {
 
 void McpStreamBridge::inject_teardown_unsubscribe_fault_for_test(int times) {
     teardown_unsub_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {
+    terminal_build_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }
