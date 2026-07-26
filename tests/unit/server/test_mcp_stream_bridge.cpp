@@ -13,7 +13,10 @@
 #include "../../../server/core/src/mcp_jsonrpc.hpp"
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
+#include "../../../server/core/src/execution_tracker.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
+
+#include <sqlite3.h>
 
 #include <yuzu/metrics.hpp>
 
@@ -1422,4 +1425,74 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
     CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
           "pin_slots");
+}
+
+TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL ExecutionTracker "
+          "(#2506 F2)",
+          "[mcp][bridge][2f]") {
+    // The producer (ExecutionTracker::refresh_counts) and the consumer
+    // (McpStreamBridge::build_real_final) agree on exactly three keys of the
+    // execution-completed payload: status, agents_success, agents_failure. Nothing
+    // bound them: every other case in this file and in the [2409] set hand-writes
+    // the terminal payload, so a rename on either side would degrade every parked
+    // final to status:"unknown" with the counts silently missing, and the whole
+    // suite would stay green. This drives a real tracker so the payload under test
+    // is the one production emits.
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    {
+        yuzu::server::ExecutionTracker tracker(db);
+        tracker.create_tables();
+
+        Fx fx;
+        tracker.set_event_bus(&fx.bus);
+        auto s = fx.make_session();
+
+        yuzu::server::Execution exec;
+        exec.definition_id = "def-f2";
+        exec.scope_expression = "agent_id = 'agent-1'";
+        exec.dispatched_by = "tester";
+        exec.status = "running";
+        exec.agents_targeted = 2;
+        auto exec_id = tracker.create_execution(exec);
+        REQUIRE(exec_id.has_value());
+
+        // Park a streamed record on that execution: kRingOnly is the phase whose
+        // final goes through build_real_final.
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), *exec_id));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+
+        // One success, one failure: distinct nonzero values, so a swapped or dropped
+        // key cannot coincidentally match. Both agents responding drives the
+        // terminal transition, and agents_failure > 0 makes the status "completed"
+        // rather than "succeeded" - a value only the tracker can produce.
+        yuzu::server::AgentExecStatus ok;
+        ok.agent_id = "agent-1";
+        ok.status = "success";
+        tracker.update_agent_status(*exec_id, ok);
+        yuzu::server::AgentExecStatus bad;
+        bad.agent_id = "agent-2";
+        bad.status = "failure";
+        tracker.update_agent_status(*exec_id, bad);
+        tracker.refresh_counts(*exec_id);
+
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+        auto frames = ring_frames(*s.stream, "alice");
+        std::optional<json> result;
+        for (const auto& f : frames) {
+            auto j = json::parse(f.data);
+            if (j.contains("result")) {
+                result = j["result"];  // embedded raw by success_response, not a string
+            }
+        }
+        REQUIRE(result.has_value());
+        CHECK((*result)["status"] == "completed");
+        CHECK((*result)["agents_success"] == 1);
+        CHECK((*result)["agents_failure"] == 1);
+        CHECK((*result)["execution_id"] == *exec_id);
+    }
+    sqlite3_close(db);
 }
