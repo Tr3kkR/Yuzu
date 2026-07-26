@@ -453,9 +453,8 @@ A retention pass therefore refuses to act on that:
   database. The first three triggers LATCH; the fourth deliberately does not,
   since a missing comparison point is not an anomaly and spending the latch on it
   would let a real one on the very next pass go undeclined. The latch is per
-  table, so a warehouse that is
-  legitimately all-expired still ages out -- it just costs one rollup tick
-  (900 s) first.
+  table, so a warehouse that is legitimately all-expired still ages out -- it
+  just costs one rollup tick (900 s) first.
 - **Every accepted pass deletes at most 5,000 rows per table**, oldest first
   (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
   A wipe the guard chose to allow ages out at a paced rate rather than in one

@@ -1,4 +1,4 @@
-# Runbook: audit retention clock guard
+# Runbook: audit store health - retention clock guard and write path
 
 Covers the `YuzuAuditRetention*` alert family and `YuzuAuditPersistFailures`
 (`docs/prometheus/yuzu-alerts.yml`) - i.e. `audit.db` health, both the write path
