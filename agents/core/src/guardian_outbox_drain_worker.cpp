@@ -202,8 +202,13 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
     if (!maint_.journal)
         return result;
     // NOTE: no engine mtx_ anywhere on this path, by construction - see the class doc.
-    if (ops.prune)
-        maint_.journal->prune(journal_now_ms());
+    if (ops.prune) {
+        result.prune_attempted = true;
+        // Capture the positive progress_or_verified signal: a prune whose scan OR delete fails, or
+        // that a stop aborts before the delete, returns without throwing, so the success stamp
+        // cannot use "did not throw" (nor scan-only read_ok) as its liveness signal (#2452 Gate 8).
+        result.prune_progress_or_verified = maint_.journal->prune(journal_now_ms()).progress_or_verified;
+    }
     if (ops.page) {
         result.page_attempted = true;
         const auto stats = maint_.journal->page_into_window(rt_, journal_now_ms(), ops.replay_sent);
@@ -213,6 +218,7 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
         result.deferred_no_token = stats.deferred_no_token;
         result.skipped_already_sent = stats.skipped_already_sent;
         result.sent_scan_failed = stats.sent_scan_failed;
+        result.progress_or_verified_idle = stats.progress_or_verified_idle;
     }
     return result;
 }
@@ -370,16 +376,24 @@ void GuardianOutboxDrainWorker::loop() {
         };
 
         if (prune_due && !stop_requested()) {
-            const bool ok = firewalled([this] { maintenance_once({.prune = true}); });
+            GuardianMaintenanceResult prune_result;
+            const bool ok = firewalled([&] { prune_result = maintenance_once({.prune = true}); });
             // Stamped AFTER the attempt, so the cadence is a minimum GAP rather than
             // start-to-start. Start-to-start means a pass that runs longer than its own
             // interval is due again the instant it finishes, which under KvStore contention
             // degenerates back into continuous scanning (#2298 Sol review).
             last_prune = std::chrono::steady_clock::now();
-            // The SUCCESS stamp, by contrast, moves only when the pass did not throw - a
-            // permanently-throwing prune must read as a growing age (item 6), while the
-            // cadence stamp above deliberately advances regardless (min-GAP pacing).
-            if (ok)
+            // The SUCCESS stamp moves only when retention genuinely RAN: the pass did not throw
+            // (ok), a stop did not abort it, and it either applied the delete or verified nothing
+            // was eligible (prune_progress_or_verified, the prune-side mirror of the page stamp's
+            // positive flag). A prune whose scan fails, whose DELETE fails, or that a stop aborts
+            // before the delete returns WITHOUT throwing, so gating on `ok` (or on scan-only
+            // read_ok, as the first cut did) would read a stalled retention loop as fresh - the
+            // same blindness #2452 closes on the page side (Gate 8 UP-7 / UP8-3). The cadence stamp
+            // above deliberately advances regardless (min-GAP pacing). A forward-clock-jump wipe
+            // that deletes the whole journal still advances here (the delete DID succeed) - that is
+            // the L5 clock-guard's job (#2360/#2361), not this gauge's.
+            if (ok && !stop_requested() && prune_result.prune_progress_or_verified)
                 last_prune_success_steady_ms_.store(success_stamp_now_ms(),
                                                     std::memory_order_relaxed);
         }
@@ -389,7 +403,18 @@ void GuardianOutboxDrainWorker::loop() {
             const bool ok = firewalled(
                 [&] { page_result = maintenance_once({.replay_sent = forced_page, .page = true}); });
             last_page = std::chrono::steady_clock::now();
-            if (ok) // success stamp: non-throwing passes only (see the prune site)
+            // The page success stamp is the age gauge an on-call engineer trusts FIRST once the
+            // journal is live, so it must read fresh ONLY when this pass made real replay progress
+            // OR positively verified a clean idle backlog (#2452). page_into_window computes that
+            // as a SINGLE positive signal - progress_or_verified_idle - since only it has full
+            // visibility of every exit; the gate here just consumes it. An earlier per-cause
+            // NEGATIVE enumeration (advance unless deferred/sent-scan/read-failed) kept missing
+            // no-progress exits - boot-barrier, then headroom-blocked and quarantine-only found in
+            // review - because each new exit had to remember to opt out. The positive flag is false
+            // by construction on every early return, so those, plus a stop-aborted or throwing
+            // pass, all read as a growing age; a healthy pass (records placed, or a clean scan that
+            // found nothing to do) reads fresh. Mirrors the prune stamp's prune_progress_or_verified.
+            if (ok && !stop_requested() && page_result.progress_or_verified_idle)
                 last_page_success_steady_ms_.store(success_stamp_now_ms(),
                                                    std::memory_order_relaxed);
             // A FORCED page that never ran must not be lost: re-arm so the next cycle
