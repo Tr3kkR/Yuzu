@@ -201,7 +201,7 @@ std::string form(std::initializer_list<std::pair<std::string, std::string>> kv) 
 } // namespace
 
 TEST_CASE("POST /login no-MFA success returns 200 + session cookie + auth.login audit",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
                            "application/x-www-form-urlencoded");
@@ -216,7 +216,7 @@ TEST_CASE("POST /login no-MFA success returns 200 + session cookie + auth.login 
 }
 
 TEST_CASE("POST /login bad password returns 401 + auth.login_failed audit",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "wrong"}}),
                            "application/x-www-form-urlencoded");
@@ -228,7 +228,7 @@ TEST_CASE("POST /login bad password returns 401 + auth.login_failed audit",
 }
 
 TEST_CASE("POST /login MFA-enrolled returns 202 + mfa_pending_token, no cookie",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
     auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
@@ -248,7 +248,7 @@ TEST_CASE("POST /login MFA-enrolled returns 202 + mfa_pending_token, no cookie",
 
 TEST_CASE("POST /login/mfa with valid TOTP mints session and emits dual audit (mfa.login.verified "
           "+ auth.login)",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     auto secret_b32 = h.enroll_mfa("admin");
     // First leg: /login → 202 + pending token
@@ -274,7 +274,7 @@ TEST_CASE("POST /login/mfa with valid TOTP mints session and emits dual audit (m
 }
 
 TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used + auth.login",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
     // Pull a freshly minted recovery code by regenerating (init's reveal
@@ -309,7 +309,7 @@ TEST_CASE("POST /login/mfa with valid recovery code emits mfa.recovery_code.used
 }
 
 TEST_CASE("POST /login/mfa with invalid pending token returns 401 + audit",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     auto res = h.sink.Post(
         "/login/mfa",
@@ -322,7 +322,7 @@ TEST_CASE("POST /login/mfa with invalid pending token returns 401 + audit",
 }
 
 TEST_CASE("POST /login/mfa attempts cap erases pending after 5 failures",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
     auto step1 = h.sink.Post("/login",
@@ -365,7 +365,7 @@ TEST_CASE("POST /login/mfa attempts cap erases pending after 5 failures",
 }
 
 TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
     auto codes = h.auth_db.mfa_regenerate_recovery_codes("admin");
@@ -400,7 +400,7 @@ TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path
     CHECK(saw_recovery);
 }
 
-TEST_CASE("POST /login/mfa pending token expires after TTL", "[mfa][routes][auth_routes]") {
+TEST_CASE("POST /login/mfa pending token expires after TTL", "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
     auto step1 = h.sink.Post("/login",
@@ -476,7 +476,7 @@ std::string login_with_mfa(AuthRoutesHarness& h, const std::string& username,
 
 TEST_CASE(
     "POST /login/mfa/stepup with valid fresh TOTP succeeds and emits mfa.step_up.passed",
-    "[mfa][stepup][routes]") {
+    "[mfa][stepup][routes][pg]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
     auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
@@ -505,7 +505,7 @@ TEST_CASE(
 
 TEST_CASE(
     "POST /login/mfa/stepup with a recovery code succeeds and emits mfa.step_up.passed",
-    "[mfa][stepup][routes]") {
+    "[mfa][stepup][routes][pg]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
     auto codes = h.auth_db.mfa_regenerate_recovery_codes("admin");
@@ -533,7 +533,7 @@ TEST_CASE(
 }
 
 TEST_CASE("POST /login/mfa/stepup without a session returns 401 (require_auth gate)",
-          "[mfa][stepup][routes]") {
+          "[mfa][stepup][routes][pg]") {
     AuthRoutesHarness h;
     h.enroll_mfa("admin");
     auto res = h.sink.Post("/login/mfa/stepup", form({{"code", "123456"}}),
@@ -546,7 +546,7 @@ TEST_CASE("POST /login/mfa/stepup without a session returns 401 (require_auth ga
 }
 
 TEST_CASE("POST /login/mfa/stepup with empty code body returns 400 + audit",
-          "[mfa][stepup][routes]") {
+          "[mfa][stepup][routes][pg]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
     auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
@@ -560,7 +560,7 @@ TEST_CASE("POST /login/mfa/stepup with empty code body returns 400 + audit",
 }
 
 TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.failed",
-          "[mfa][stepup][routes]") {
+          "[mfa][stepup][routes][pg]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
     auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
@@ -591,7 +591,7 @@ TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.fail
 // ── /login/mfa/enroll + enforcement bootstrap tests (PR3) ─────────────────
 
 TEST_CASE("POST /login load-sheds with 503 when the pending-token map is at capacity (H-2)",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     // Hermes H-2 / governance qe-B: the pending-map cap is exercised via the
     // test-only seam (the production 50k is impractical to fill). The login
     // challenge and enrollment issuance sites share byte-identical cap logic
@@ -615,7 +615,7 @@ TEST_CASE("POST /login load-sheds with 503 when the pending-token map is at capa
 
 TEST_CASE("POST /login under mfa_enforcement=required: un-enrolled user gets 202 enrollment "
           "challenge, no cookie",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "required"; // cfg_ is held by reference
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
@@ -634,7 +634,7 @@ TEST_CASE("POST /login under mfa_enforcement=required: un-enrolled user gets 202
 }
 
 TEST_CASE("POST /login/mfa/enroll completes enforced enrollment: 200 + cookie + recovery codes",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "required";
     auto step1 =
@@ -667,7 +667,7 @@ TEST_CASE("POST /login/mfa/enroll completes enforced enrollment: 200 + cookie + 
 
 TEST_CASE("POST /login under mfa_enforcement=admin-only: admin enrolls, regular user logs in "
           "normally",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "admin-only";
 
@@ -690,7 +690,7 @@ TEST_CASE("POST /login under mfa_enforcement=admin-only: admin enrolls, regular 
 
 TEST_CASE("POST /login under enforcement: already-enrolled user gets the login challenge, not "
           "enrollment",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "required";
     h.enroll_mfa("alice");
@@ -703,7 +703,7 @@ TEST_CASE("POST /login under enforcement: already-enrolled user gets the login c
 }
 
 TEST_CASE("enrollment token replayed at /login/mfa is rejected",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "required";
     auto e1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
@@ -734,7 +734,7 @@ TEST_CASE("enrollment token replayed at /login/mfa is rejected",
 }
 
 TEST_CASE("login-challenge token replayed at /login/mfa/enroll is rejected",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     auto secret = h.enroll_mfa("admin");
     auto step1 = h.sink.Post("/login",
@@ -765,7 +765,7 @@ TEST_CASE("login-challenge token replayed at /login/mfa/enroll is rejected",
 }
 
 TEST_CASE("POST /login enforced + auth_db unavailable fails CLOSED with 503",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     // GOVERNANCE qe-B1 / SOC 2 CC6.6 fail-closed. Under enforcement, if the
     // store that holds TOTP secrets is unavailable, /login must refuse to
     // mint a session (503) rather than silently mint an unprotected one.
@@ -781,7 +781,7 @@ TEST_CASE("POST /login enforced + auth_db unavailable fails CLOSED with 503",
 }
 
 TEST_CASE("POST /login/mfa/enroll + auth_db unavailable fails closed with uniform 401",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     // qe-B1 + Hermes L-1: the enroll db-null branch fails closed with the
     // uniform 401 body (matching /login/mfa), not a distinct 503 that would
     // leak pending-token validity during a store outage. No session minted.
@@ -805,7 +805,7 @@ TEST_CASE("POST /login/mfa/enroll + auth_db unavailable fails closed with unifor
 }
 
 TEST_CASE("POST /login/mfa/enroll attempts cap erases pending after 5 failures",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     // qe-B2: enrollment-bootstrap brute-force cap parity with /login/mfa.
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "required";
@@ -845,7 +845,7 @@ TEST_CASE("POST /login/mfa/enroll attempts cap erases pending after 5 failures",
 }
 
 TEST_CASE("POST /login/mfa/enroll non-6-digit code is rejected as malformed, token survives",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     // qe-S1: shape gate. Recovery codes don't exist at enroll time, so a
     // non-6-digit code is "malformed", not routed to recovery.
     AuthRoutesHarness h;
@@ -881,7 +881,7 @@ TEST_CASE("POST /login/mfa/enroll non-6-digit code is rejected as malformed, tok
 }
 
 TEST_CASE("POST /login/mfa/enroll concurrent submit with same token: exactly one wins",
-          "[mfa][enroll][routes][auth_routes]") {
+          "[mfa][enroll][routes][auth_routes][pg]") {
     // qe-S2: the enroll endpoint's atomic move-out-on-lookup must mint
     // exactly one session under a same-token race, like /login/mfa.
     AuthRoutesHarness h;
@@ -914,7 +914,7 @@ TEST_CASE("POST /login/mfa/enroll concurrent submit with same token: exactly one
 }
 
 TEST_CASE("POST /login/mfa concurrent submit with same token: exactly one wins",
-          "[mfa][routes][auth_routes]") {
+          "[mfa][routes][auth_routes][pg]") {
     AuthRoutesHarness h;
     auto secret_b32 = h.enroll_mfa("admin");
     auto step1 = h.sink.Post("/login",
@@ -958,7 +958,7 @@ TEST_CASE("POST /login/mfa concurrent submit with same token: exactly one wins",
 // invariant, and the success-clears-the-counter path.
 
 TEST_CASE("POST /login: N bad passwords locks the account, applied audit fires once",
-          "[mfa][routes][auth_routes][lockout]") {
+          "[mfa][routes][auth_routes][lockout][pg]") {
     AuthRoutesHarness h;
     h.cfg.auth_lockout_threshold = 3;
     h.cfg.auth_lockout_window_secs = 900;
@@ -987,7 +987,7 @@ TEST_CASE("POST /login: N bad passwords locks the account, applied audit fires o
 }
 
 TEST_CASE("POST /login: locked-account 401 body is byte-identical to a bad-password 401 (no oracle)",
-          "[mfa][routes][auth_routes][lockout]") {
+          "[mfa][routes][auth_routes][lockout][pg]") {
     AuthRoutesHarness h;
     h.cfg.auth_lockout_threshold = 2;
 
@@ -1014,7 +1014,7 @@ TEST_CASE("POST /login: locked-account 401 body is byte-identical to a bad-passw
 }
 
 TEST_CASE("POST /login: a successful login clears a non-zero failure counter",
-          "[mfa][routes][auth_routes][lockout]") {
+          "[mfa][routes][auth_routes][lockout][pg]") {
     AuthRoutesHarness h;
     h.cfg.auth_lockout_threshold = 3;
 
@@ -1042,7 +1042,7 @@ TEST_CASE("POST /login: a successful login clears a non-zero failure counter",
 }
 
 TEST_CASE("POST /login: lockout disabled (threshold=0) never locks",
-          "[mfa][routes][auth_routes][lockout]") {
+          "[mfa][routes][auth_routes][lockout][pg]") {
     AuthRoutesHarness h;
     h.cfg.auth_lockout_threshold = 0; // disabled
 
@@ -1061,7 +1061,7 @@ TEST_CASE("POST /login: lockout disabled (threshold=0) never locks",
 }
 
 TEST_CASE("POST /login: concurrent burst for one user cannot exceed the threshold (C1 race close)",
-          "[mfa][routes][auth_routes][lockout][concurrency]") {
+          "[mfa][routes][auth_routes][lockout][concurrency][pg]") {
     // Adversarial C1: without per-username serialization, a synchronized burst
     // of attempts for ONE username could all pass the stale lockout pre-check
     // and each verify a password before any failure was recorded, so the

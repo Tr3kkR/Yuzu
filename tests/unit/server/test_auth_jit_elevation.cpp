@@ -254,7 +254,7 @@ TEST_CASE("AuthManager::reap_expired_elevation is exactly-once under concurrent 
 
 // ── AuthDB eligibility column ────────────────────────────────────────────────
 
-TEST_CASE("AuthDB::set/is_elevation_eligible round-trips, fail-closed", "[jit][authdb]") {
+TEST_CASE("AuthDB::set/is_elevation_eligible round-trips, fail-closed", "[jit][authdb][pg]") {
     auto dir = yuzu::test::TempDir{};
     fs::create_directories(dir.path);
     AuthDB db(dir.path, /*cleanup_interval_secs=*/0);
@@ -439,7 +439,7 @@ struct JitHarness {
 };
 } // namespace
 
-TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
 
@@ -490,7 +490,7 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[jit]
 // is already expired), passes post-fix (ceil'd remaining).
 TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
           "truncated to 0",
-          "[jit][routes]") {
+          "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice"); // normal, full-lifetime session
 
@@ -529,7 +529,7 @@ TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
 // no other test forces a clamp at the REST layer.
 TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
           "duration_secs in sync with the response expires_in",
-          "[jit][routes]") {
+          "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
 
@@ -567,7 +567,7 @@ TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
     CHECK(audit_duration == expires_in);
 }
 
-TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][routes]") {
+TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // Before elevation: the admin-gated eligibility endpoint is forbidden.
@@ -585,7 +585,7 @@ TEST_CASE("an elevated operator can perform an admin-gated action", "[jit][route
     CHECK(h.auth_db.is_elevation_eligible("bob").value() == false);
 }
 
-TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[jit][routes]") {
+TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice"); // base role: user
     REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
@@ -598,7 +598,7 @@ TEST_CASE("an elevated admin action is audited as principal_role=admin (H1)", "[
     CHECK(h.audit_role("role.elevation.granted", "alice") == "admin");
 }
 
-TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit][routes][pg]") {
     JitHarness h;
     // bob is eligible but has NO second factor enrolled — elevation is the
     // privilege-crossing boundary, so it is refused regardless of mfa_enforcement
@@ -629,7 +629,7 @@ TEST_CASE("POST /api/v1/elevate: MFA enrollment is mandatory to elevate", "[jit]
 // asserting a successful OIDC-amr grant were removed here and belong with #1852.
 TEST_CASE("POST /api/v1/elevate: an OIDC session cannot elevate — denied at the "
           "eligibility gate (#1837/#1857 severance; restoration tracked in #1852)",
-          "[jit][routes][oidc]") {
+          "[jit][routes][oidc][pg]") {
     JitHarness h;
     // bob has a local users row (eligible), but his OIDC session's principal is
     // the namespaced oidc:<iss>#<sub>, NOT "bob" — it can never match bob's (or
@@ -656,7 +656,7 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session cannot elevate — denied at th
 
 TEST_CASE("POST /api/v1/elevate: a federated-only OIDC identity (no local users row) "
           "is likewise denied (#1837/#1857 severance)",
-          "[jit][routes][oidc]") {
+          "[jit][routes][oidc][pg]") {
     JitHarness h;
     // "dave" was never seeded into auth.db — a genuinely federated-only
     // identity. Same outcome as an OIDC session whose sub coincides with a
@@ -677,7 +677,7 @@ TEST_CASE("POST /api/v1/elevate: a federated-only OIDC identity (no local users 
 // admin's local session with a fresh local step-up proof — the OIDC branch
 // must never engage for auth_source=="local".
 TEST_CASE("POST /api/v1/elevate: a local session is unaffected by the OIDC-amr path",
-          "[jit][routes][oidc]") {
+          "[jit][routes][oidc][pg]") {
     JitHarness h;
     auto token = h.session_for("alice"); // local session, alice IS enrolled
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
@@ -689,7 +689,7 @@ TEST_CASE("POST /api/v1/elevate: a local session is unaffected by the OIDC-amr p
 
 TEST_CASE("POST /api/v1/elevate: audit detail places mfa= before justification= "
           "(anti-forgery, consistency S-3)",
-          "[jit][routes]") {
+          "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // A crafted justification embeds a forged "mfa=oidc_amr" token. Free-text
@@ -709,7 +709,7 @@ TEST_CASE("POST /api/v1/elevate: audit detail places mfa= before justification= 
     CHECK(detail.substr(mfa_pos, std::string("mfa=local_totp").size()) == "mfa=local_totp");
 }
 
-TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", "[jit][routes][pg]") {
     JitHarness h;
     // alice IS enrolled but the session has no fresh proof (mfa_verified_at at the
     // epoch sentinel) → the step-up gate challenges; elevation is NOT granted.
@@ -721,7 +721,7 @@ TEST_CASE("POST /api/v1/elevate: a stale MFA proof is challenged, not granted", 
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[jit][routes][pg]") {
     JitHarness h;
     REQUIRE(h.auth_db.set_elevation_eligible("alice", false).has_value()); // revoke eligibility
     auto token = h.session_for("alice");
@@ -732,7 +732,7 @@ TEST_CASE("POST /api/v1/elevate: an ineligible operator is denied", "[jit][route
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("POST /api/v1/elevate: justification is mandatory", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: justification is mandatory", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"   "})"); // whitespace only
@@ -741,7 +741,7 @@ TEST_CASE("POST /api/v1/elevate: justification is mandatory", "[jit][routes]") {
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // A present-but-wrong-type field must be a clean client error (review UP-2).
@@ -765,7 +765,7 @@ TEST_CASE("POST /api/v1/elevate: wrong-typed fields are a 400, not a 500", "[jit
     CHECK(huge_expires_in == h.cfg.jit_max_elevation_secs);
 }
 
-TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     auto res = h.post("/api/v1/elevate", token,
@@ -778,7 +778,7 @@ TEST_CASE("POST /api/v1/elevate: duration is clamped to the cap", "[jit][routes]
     CHECK(expires_in == h.cfg.jit_max_elevation_secs);
 }
 
-TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
@@ -791,7 +791,7 @@ TEST_CASE("POST /api/v1/elevate/revoke reverts the elevation", "[jit][routes]") 
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(token)));
 }
 
-TEST_CASE("revoking eligibility terminates an active elevation", "[jit][routes]") {
+TEST_CASE("revoking eligibility terminates an active elevation", "[jit][routes][pg]") {
     JitHarness h;
     // alice elevates, then an admin revokes her eligibility — her in-flight
     // elevation must drop immediately (review UP-1), not linger for the window.
@@ -806,7 +806,7 @@ TEST_CASE("revoking eligibility terminates an active elevation", "[jit][routes]"
     CHECK_FALSE(auth::is_elevated(*h.auth_mgr.validate_session(alice))); // elevation cleared
 }
 
-TEST_CASE("an operator cannot set their own elevation eligibility", "[jit][routes]") {
+TEST_CASE("an operator cannot set their own elevation eligibility", "[jit][routes][pg]") {
     JitHarness h;
     // Self-grant is blocked (review UP-6) so a temporary admin window cannot
     // manufacture a durable self-elevation right.
@@ -816,7 +816,7 @@ TEST_CASE("an operator cannot set their own elevation eligibility", "[jit][route
     CHECK(res->status == 403);
 }
 
-TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "[jit][routes]") {
+TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "[jit][routes][pg]") {
     JitHarness h;
     // No Cookie header → not an interactive session → 401 (API/MCP tokens, which
     // resolve without a cookie, can never elevate).
@@ -829,7 +829,7 @@ TEST_CASE("POST /api/v1/elevate: a tokenless (no-cookie) request is rejected", "
 
 TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
          "request after a passive lapse",
-         "[jit][routes]") {
+         "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     // Force a lapsed elevation directly via AuthManager (bypassing the REST
@@ -858,7 +858,7 @@ TEST_CASE("role.elevation.expired is audited lazily on the next authenticated "
 }
 
 TEST_CASE("a manually revoked elevation does not ALSO emit role.elevation.expired",
-         "[jit][routes]") {
+         "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.post("/api/v1/elevate", token, R"({"justification":"x"})")->status == 200);
@@ -875,7 +875,7 @@ TEST_CASE("a manually revoked elevation does not ALSO emit role.elevation.expire
 
 TEST_CASE("a reap that fires within a request leaves THAT request's session "
          "resolving as base role (UP-9)",
-         "[jit][routes]") {
+         "[jit][routes][pg]") {
     JitHarness h;
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());
@@ -899,7 +899,7 @@ TEST_CASE("a reap that fires within a request leaves THAT request's session "
 
 TEST_CASE("a lazy role.elevation.expired reap survives an unwritable audit store "
          "(best-effort, UP-3)",
-         "[jit][routes]") {
+         "[jit][routes][pg]") {
     JitHarness h(/*audit_store_broken=*/true);
     auto token = h.session_for("alice");
     REQUIRE(h.auth_mgr.elevate_session(token, std::chrono::seconds(1)).has_value());

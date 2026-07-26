@@ -683,7 +683,7 @@ TEST_CASE("extract_form_value — key absent returns empty", "[saml][auth_routes
 // GET /auth/saml/start — provider not configured (null pointer)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_routes]") {
+TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_routes][pg]") {
     SamlRoutesFixture fix; // saml_provider defaults to nullptr
     auto res = fix.sink.Get("/auth/saml/start");
     REQUIRE(res != nullptr);
@@ -710,7 +710,7 @@ TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_route
 // POST /saml/acs — provider not configured
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes][pg]") {
     SamlRoutesFixture fix;
     auto res = fix.sink.Post("/saml/acs",
                              "SAMLResponse=garbage&RelayState=%2Fdashboard",
@@ -742,7 +742,7 @@ TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]
 // Platform-independent: the empty-field check runs before validate_response.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     // On Windows the provider stub makes is_enabled()=false, so the route 404s
     // before the field-check. Skip the redirect assertion on Windows.
@@ -783,7 +783,7 @@ TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][
 // POST /saml/acs — malformed SAMLResponse (validate_response returns error)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -820,7 +820,7 @@ TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml
 // GET /auth/saml/start — provider enabled → redirects to IdP
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_routes]") {
+TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -851,7 +851,7 @@ TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_rout
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — RelayState open-redirect: absolute URL falls back to /",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -909,7 +909,7 @@ TEST_CASE("SAML ACS — RelayState open-redirect: absolute URL falls back to /",
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_source=saml",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1059,7 +1059,7 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
 }
 
 TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an admin session",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1153,7 +1153,7 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
 }
 
 TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint a user session",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1241,7 +1241,7 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
 }
 
 TEST_CASE("SAML ACS — a near-miss group value does not mint admin (qa-S1)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1266,7 +1266,7 @@ TEST_CASE("SAML ACS — a near-miss group value does not mint admin (qa-S1)",
 }
 
 TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1291,7 +1291,7 @@ TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)
 }
 
 TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mint admin (qa-S2)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1328,7 +1328,7 @@ TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mi
 
 TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-truncation counter "
           "(#1828.3 boundary)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1356,7 +1356,7 @@ TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-tru
 }
 
 TEST_CASE("SAML ACS — a trailing space in --saml-admin-group still matches after trim (UP-4)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1397,7 +1397,7 @@ TEST_CASE("trim_ascii_whitespace — trims leading/trailing space/tab/CR/LF, "
 
 TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user session even when "
           "--saml-admin-group is configured",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1490,7 +1490,7 @@ TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user sessio
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1565,7 +1565,7 @@ TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
 // Browser-binding CSRF tests
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1619,7 +1619,7 @@ TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes
 #endif
 }
 
-TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1686,7 +1686,7 @@ TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_ro
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie (H-B)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1753,7 +1753,7 @@ TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1813,7 +1813,7 @@ TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D
 }
 
 TEST_CASE("SAML ACS — valid RelayState /dashboard is accepted (H-D)",
-          "[saml][auth_routes]") {
+          "[saml][auth_routes][pg]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else

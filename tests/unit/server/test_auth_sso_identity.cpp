@@ -286,7 +286,7 @@ bool column_exists(sqlite3* db, const char* table, const char* column) {
 } // namespace
 
 TEST_CASE("AuthDB migration v6: identity columns added, existing v5 rows survive",
-          "[sso][authdb][migration]") {
+          "[sso][authdb][migration][pg]") {
     auto dir = yuzu::test::TempDir{};
     fs::create_directories(dir.path);
     auto db_path = dir.path / "auth.db";
@@ -435,7 +435,7 @@ struct SsoJitHarness {
 } // namespace
 
 TEST_CASE("POST /api/v1/elevate: a provisioned, eligible OIDC session elevates",
-          "[sso][jit][routes]") {
+          "[sso][jit][routes][pg]") {
     SsoJitHarness h;
     auto [token, principal] = h.oidc_session("sub-alice");
 
@@ -459,7 +459,7 @@ TEST_CASE("POST /api/v1/elevate: a provisioned, eligible OIDC session elevates",
 }
 
 TEST_CASE("POST /api/v1/elevate: an OIDC session with no durable row is denied fail-closed",
-          "[sso][jit][routes]") {
+          "[sso][jit][routes][pg]") {
     SsoJitHarness h;
     // No upsert_sso_identity call — simulates a provisioning miss (or simply
     // no admin having granted eligibility, since a never-provisioned
@@ -477,7 +477,7 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session with no durable row is denied f
 
 TEST_CASE("POST /api/v1/elevate: an OIDC session with no amr-attested MFA is denied "
           "unconditionally (even under the default --mfa-enforcement=optional)",
-          "[sso][jit][routes]") {
+          "[sso][jit][routes][pg]") {
     SsoJitHarness h;
     // Provisioned + eligible, but the IdP never attested MFA (amr_mfa=false)
     // — mfa_verified_at is unset (epoch sentinel).
@@ -513,7 +513,7 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session with no amr-attested MFA is den
 
 TEST_CASE("POST /api/v1/elevate: an OIDC session cannot borrow a legacy identity_source='local' "
           "row's eligibility grant even when the principal strings collide",
-          "[sso][jit][routes]") {
+          "[sso][jit][routes][pg]") {
     SsoJitHarness h;
     // Simulate the exact landmine cons-N2 describes: a row named exactly
     // like a durable OIDC principal, but whose identity_source is 'local'
@@ -546,7 +546,7 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session cannot borrow a legacy identity
 
 TEST_CASE("POST /api/v1/elevate: a SAML session whose NameID collides with a provisioned OIDC "
           "principal is denied (identity-source mismatch, not just the no-amr gate)",
-          "[sso][jit][routes][saml]") {
+          "[sso][jit][routes][saml][pg]") {
     SsoJitHarness h;
     // The other half of cons-N2: a crafted SAML NameID equal to a real,
     // eligible OIDC principal string. SAML sessions already fail closed at
@@ -649,7 +649,7 @@ TEST_CASE("AuthDB::invalidate_all_sessions accepts a durable SSO principal", "[s
 
 TEST_CASE("POST /api/v1/users/elevation-eligibility?username=: the query form reaches "
           "a durable SSO principal that the path form can never carry",
-          "[sso][routes]") {
+          "[sso][routes][pg]") {
     SsoJitHarness h;
     // A realistic OIDC principal — contains '/' (in the issuer URL) and '#'
     // (the iss/sub separator). httplib percent-decodes the path (%2F -> '/',

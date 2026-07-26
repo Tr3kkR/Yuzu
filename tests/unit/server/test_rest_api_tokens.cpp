@@ -203,7 +203,7 @@ struct RestTokensHarness {
 
 } // namespace
 
-TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][token][owner]") {
+TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][token][owner][pg]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -227,7 +227,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: owner can revoke own token", "[rest][toke
 }
 
 TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)",
-          "[rest][token][owner][idor]") {
+          "[rest][token][owner][idor][pg]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -259,7 +259,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: non-owner non-admin gets 404 (no oracle)"
 
 TEST_CASE("REST DELETE /api/v1/tokens: response body is identical for "
           "unknown id and not-owner (enumeration oracle closed)",
-          "[rest][token][owner][idor]") {
+          "[rest][token][owner][idor][pg]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -278,7 +278,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: response body is identical for "
 }
 
 TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
-          "[rest][token][owner][admin]") {
+          "[rest][token][owner][admin][pg]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
 
@@ -302,7 +302,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: admin bypass revokes any token",
 }
 
 TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audit",
-          "[rest][token]") {
+          "[rest][token][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -326,7 +326,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
 // ──────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)",
-          "[rest][token][csprng][audit]") {
+          "[rest][token][csprng][audit][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -370,7 +370,7 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)"
 }
 
 TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure emits failure audit (F-002)",
-          "[rest][token][csprng][audit]") {
+          "[rest][token][csprng][audit][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -474,7 +474,7 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
 }
 
 TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard)",
-          "[rest][token][csprng][audit]") {
+          "[rest][token][csprng][audit][pg]") {
     // Defensive: confirm the new failure-path branch did not perturb the
     // success-path audit emission. A successful create must still emit a
     // single `success` row, with the F-002 marker absent.
@@ -523,7 +523,7 @@ TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard
 
 TEST_CASE("REST POST /api/v1/tokens: silent audit-drop on CSPRNG failure surfaces "
           "Sec-Audit-Failed header + audit_emitted=false body (UP-H1)",
-          "[rest][token][csprng][audit][uph1]") {
+          "[rest][token][csprng][audit][uph1][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -554,7 +554,7 @@ TEST_CASE("REST POST /api/v1/tokens: silent audit-drop on CSPRNG failure surface
 
 TEST_CASE("REST POST /api/v1/tokens: audit-pipeline exception is caught and surfaced "
           "via Sec-Audit-Failed (UP-H1)",
-          "[rest][token][csprng][audit][uph1]") {
+          "[rest][token][csprng][audit][uph1][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -574,7 +574,7 @@ TEST_CASE("REST POST /api/v1/tokens: audit-pipeline exception is caught and surf
 
 TEST_CASE("REST POST /api/v1/device-tokens: silent audit-drop surfaces Sec-Audit-Failed "
           "header + audit_emitted=false body (UP-H1)",
-          "[rest][token][csprng][audit][uph1]") {
+          "[rest][token][csprng][audit][uph1][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -598,7 +598,7 @@ TEST_CASE("REST POST /api/v1/device-tokens: silent audit-drop surfaces Sec-Audit
 
 TEST_CASE("REST POST /api/v1/tokens: oversized name (>256 chars) rejected with 400 "
           "invalid_input_length and NO audit row (UP-H2)",
-          "[rest][token][csprng][audit][uph2]") {
+          "[rest][token][csprng][audit][uph2][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -621,7 +621,7 @@ TEST_CASE("REST POST /api/v1/tokens: oversized name (>256 chars) rejected with 4
 
 TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rejected with "
           "400 invalid_input_length (UP-H2)",
-          "[rest][token][csprng][audit][uph2]") {
+          "[rest][token][csprng][audit][uph2][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -640,7 +640,7 @@ TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rej
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
           "yuzu_secure_random_failure_total{site=api_token} (sre-1)",
-          "[rest][token][csprng][metrics][sre1]") {
+          "[rest][token][csprng][metrics][sre1][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -669,7 +669,7 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
 
 TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure increments "
           "yuzu_secure_random_failure_total{site=device_token} (sre-1)",
-          "[rest][token][csprng][metrics][sre1]") {
+          "[rest][token][csprng][metrics][sre1][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;
@@ -689,7 +689,7 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure increments "
 
 TEST_CASE("REST POST /api/v1/tokens: validation 400 (oversized) does NOT increment "
           "secure_random metric (sre-1 negative)",
-          "[rest][token][csprng][metrics][sre1]") {
+          "[rest][token][csprng][metrics][sre1][pg]") {
     // Negative case: confirm UP-H2's pre-CSPRNG rejection path doesn't
     // touch the CSPRNG metric. Same input as the UP-H2 oversized-name
     // test, but asserts on the metric.
@@ -711,7 +711,7 @@ TEST_CASE("REST POST /api/v1/tokens: validation 400 (oversized) does NOT increme
 }
 
 TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure returns 503 + Retry-After: 5 (sre-2)",
-          "[rest][token][csprng][sre2]") {
+          "[rest][token][csprng][sre2][pg]") {
     RestTokensHarness h;
     h.session_user = "alice";
     h.session_role = auth::Role::user;

@@ -116,7 +116,7 @@ oidc::OidcConfig make_minimal_oidc_config() {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_total{result=error}",
-          "[oidc][auth_routes]") {
+          "[oidc][auth_routes][pg]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
     REQUIRE(fix.oidc_provider->is_enabled());
@@ -139,7 +139,7 @@ TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_
 
 TEST_CASE("OIDC callback — missing code/state increments "
           "yuzu_auth_oidc_login_total{result=error}",
-          "[oidc][auth_routes]") {
+          "[oidc][auth_routes][pg]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
     REQUIRE(fix.oidc_provider->is_enabled());
@@ -162,7 +162,7 @@ TEST_CASE("OIDC callback — missing code/state increments "
 
 TEST_CASE("OIDC callback — unknown PKCE state increments "
           "yuzu_auth_oidc_login_total{result=error} (no network touched)",
-          "[oidc][auth_routes]") {
+          "[oidc][auth_routes][pg]") {
     OidcRoutesFixture fix;
     fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
     REQUIRE(fix.oidc_provider->is_enabled());
@@ -186,7 +186,7 @@ TEST_CASE("OIDC callback — unknown PKCE state increments "
 }
 
 TEST_CASE("OIDC callback — 404 when provider not configured emits no login counter",
-          "[oidc][auth_routes]") {
+          "[oidc][auth_routes][pg]") {
     OidcRoutesFixture fix; // oidc_provider left null
     auto res = fix.sink.dispatch("GET", "/auth/callback?code=x&state=y");
     REQUIRE(res != nullptr);

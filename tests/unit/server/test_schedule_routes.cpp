@@ -127,7 +127,7 @@ struct ScheduleRouteHarness {
 } // namespace
 
 TEST_CASE("POST /api/schedules: Schedule:Write alone is rejected without Execution:Execute (H-01)",
-          "[server][schedule][h01][rest]") {
+          "[server][schedule][h01][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-writer", "ScheduleOnly", {{"Schedule", "Write"}});
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
@@ -140,7 +140,7 @@ TEST_CASE("POST /api/schedules: Schedule:Write alone is rejected without Executi
 }
 
 TEST_CASE("POST /api/schedules: Execution:Execute alone is rejected without Schedule:Write",
-          "[server][schedule][h01][rest]") {
+          "[server][schedule][h01][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("exec-only", "ExecuteOnly", {{"Execution", "Execute"}});
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
@@ -153,7 +153,7 @@ TEST_CASE("POST /api/schedules: Execution:Execute alone is rejected without Sche
 }
 
 TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together create the schedule",
-          "[server][schedule][h01][rest]") {
+          "[server][schedule][h01][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
                                      {{"Schedule", "Write"}, {"Execution", "Execute"}});

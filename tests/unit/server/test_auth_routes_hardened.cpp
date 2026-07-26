@@ -175,7 +175,7 @@ constexpr const char* kFormCt = "application/x-www-form-urlencoded";
 } // namespace
 
 TEST_CASE("standard mode: local login still works (regression guard)",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     HardenedHarness h("standard", "");
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                            kFormCt);
@@ -186,7 +186,7 @@ TEST_CASE("standard mode: local login still works (regression guard)",
 }
 
 TEST_CASE("sso-only: non-break-glass local login is rejected with a generic 401",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     HardenedHarness h("sso-only", "");
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                            kFormCt);
@@ -205,7 +205,7 @@ TEST_CASE("sso-only: non-break-glass local login is rejected with a generic 401"
 }
 
 TEST_CASE("sso-only: a valid password is still rejected when local login is disabled",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     // Even the correct credential must not mint a session in sso-only mode for a
     // non-exempt user — the disable is unconditional, not a password check.
     HardenedHarness h("sso-only", "");
@@ -220,7 +220,7 @@ TEST_CASE("sso-only: a valid password is still rejected when local login is disa
 }
 
 TEST_CASE("sso-only: break-glass user is still rejected when NOT armed",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     HardenedHarness h("sso-only", "admin");
     // admin is the configured break-glass user but has not been armed.
     auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
@@ -235,7 +235,7 @@ TEST_CASE("sso-only: break-glass user is still rejected when NOT armed",
 }
 
 TEST_CASE("sso-only: armed break-glass user with MFA proceeds to the MFA challenge",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
     h.arm("admin");
@@ -255,7 +255,7 @@ TEST_CASE("sso-only: armed break-glass user with MFA proceeds to the MFA challen
 }
 
 TEST_CASE("sso-only: a non-break-glass user is rejected even while another is armed",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
     h.arm("admin");
@@ -269,7 +269,7 @@ TEST_CASE("sso-only: a non-break-glass user is rejected even while another is ar
 }
 
 TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is HARD-DENIED, not offered enrollment",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     // Governance UP-1 (BLOCKING fix). The boot guard normally refuses to start
     // with an MFA-less break-glass user; if one slips through (MFA cleared
     // out-of-band after boot), the login handler must HARD-DENY — never offer
@@ -290,7 +290,7 @@ TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is HARD-DENIED, not offe
 }
 
 TEST_CASE("sso-only: the break-glass account is exempt from failed-login lockout",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     // Governance Hermes-F / UP-13: without the exemption an attacker who learns
     // the break-glass username could spray wrong passwords to keep it locked and
     // render the escape hatch unreachable during the very IdP outage it exists
@@ -321,7 +321,7 @@ TEST_CASE("sso-only: the break-glass account is exempt from failed-login lockout
 }
 
 TEST_CASE("sso-only: wrong password against an armed break-glass user is a normal login failure",
-          "[auth][hardened][routes]") {
+          "[auth][hardened][routes][pg]") {
     // The break-glass success row (auth.breakglass.login) must fire only AFTER
     // verify_password succeeds — a wrong password takes the standard
     // auth.login_failed path and never produces a spurious "ok" break-glass row.
