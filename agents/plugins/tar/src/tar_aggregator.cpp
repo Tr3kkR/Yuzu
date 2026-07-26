@@ -198,8 +198,10 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
         // baseline", which would then describe the wrong failure.
         //
         // A real fix moves the flag and the baseline together (one transaction --
-        // execute_atomic_batch now exists) and gives the flag-write failure its
-        // own operator message. Out of scope for the retention clock guard.
+        // execute_atomic_batch now exists), gives the flag-write failure its own
+        // operator message, and gates the nstat drain on the write having
+        // actually persisted. Out of scope for the retention clock guard; the
+        // full analysis is in #2490.
         db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
         return true;
