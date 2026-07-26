@@ -21,7 +21,12 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
+
 #include <limits>
+#include <memory>
+#include <sstream>
 #include <vector>
 
 using namespace yuzu::server;
@@ -504,6 +509,47 @@ struct GuardFixture {
         REQUIRE(store.is_open());
     }
     void seed(std::int64_t ttl, int count) { seed_rows_with_ttl(tmp.path, ttl, count); }
+};
+
+
+// ── Log capture, for the decline-attribution tests ────────────────────────────
+//
+// The four decline triggers (first pass / wipe / step / implausible stored
+// reading) all produce ONE observable through the counters:
+// `clock_anomaly_skips_count()` goes up by one. Which trigger fired is carried
+// only by the warning text, and that text is what a SOC 2 reader acts on -- a
+// pass that declined on a would-wipe must not claim a clock step or an outage
+// that did not happen. Without a sink, a mutation that always emitted
+// `DeclineWipe`, or that swapped the big_step/prev_implausible precedence, went
+// green.
+//
+// Swaps a capturing sink onto the default logger for the duration of one test
+// and restores it in the destructor, including on a throwing REQUIRE. Catch2
+// runs cases serially in one process, so no other test is logging concurrently.
+class LogCapture {
+public:
+    LogCapture() : saved_(spdlog::default_logger()) {
+        sink_ = std::make_shared<spdlog::sinks::ostream_sink_mt>(stream_);
+        auto logger = std::make_shared<spdlog::logger>("capture", sink_);
+        logger->set_level(spdlog::level::trace);
+        logger->set_pattern("%v");
+        spdlog::set_default_logger(logger);
+    }
+    ~LogCapture() { spdlog::set_default_logger(saved_); }
+
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+
+    [[nodiscard]] std::string text() const { return stream_.str(); }
+    [[nodiscard]] bool says(std::string_view needle) const {
+        return stream_.str().find(needle) != std::string::npos;
+    }
+    void clear() { stream_.str(std::string{}); }
+
+private:
+    std::ostringstream stream_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+    std::shared_ptr<spdlog::logger> saved_;
 };
 
 } // namespace
@@ -1369,4 +1415,101 @@ TEST_CASE("AuditStore #2360: an implausible caller clock is refused before any a
     CHECK(f.store.cleanup_once(-86'400) == 0);
     CHECK(f.store.cleanup_failed_count() == 1); // unchanged -- not a refusal
     CHECK(f.store.retention_passes_count() == 2);
+}
+
+TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired",
+          "[audit_store][retention][clock-guard]") {
+    // The counters cannot distinguish these four; the warning text is the only
+    // carrier, and it is a SOC 2-relevant line. Attributing an elapsed-time step
+    // to a pass that declined purely on the outcome test would tell an operator
+    // their clock moved when it did not.
+    SECTION("first pass, no stored reading: says so, and claims nothing about the clock") {
+        GuardFixture f;
+        f.seed(kNow - 100, 5); // everything expired, no previous pass
+        LogCapture log;
+        REQUIRE(f.store.cleanup_once(kNow) == 0);
+        CHECK(log.says("first retention pass against this database"));
+        CHECK(log.says("nothing can be said about the clock yet"));
+        CHECK_FALSE(log.says("elapsed since the last retention pass"));
+    }
+
+    SECTION("would-wipe with a sane recent reading: no elapsed-time claim") {
+        GuardFixture f;
+        f.seed(kNow - 100, 5);
+        f.seed(kNow + kWindow, 1);
+        REQUIRE(f.store.cleanup_once(kNow) == 5); // establishes a reading, drains
+        exec_raw(f.tmp.path, "DELETE FROM audit_events"); // remove the survivor
+        f.seed(kNow - 100, 5);                            // all-expired again
+        LogCapture log;
+        REQUIRE(f.store.cleanup_once(kNow + 60) == 0);
+        CHECK(log.says("would expire EVERY datable audit row"));
+        CHECK(log.says("No unusual gap since the last pass"));
+        CHECK_FALSE(log.says("elapsed since the last retention pass"));
+    }
+
+    SECTION("a real step: reports the gap and names BOTH possible causes") {
+        GuardFixture f;
+        f.seed(kNow - 100, 5);
+        f.seed(kNow + kWindow, 1);
+        REQUIRE(f.store.cleanup_once(kNow) == 5);
+        const std::int64_t jumped = kNow + 8 * 86'400; // over the 7-day threshold
+        seed_rows_with_ttl(f.tmp.path, kNow + 10, 5);
+        seed_rows_with_ttl(f.tmp.path, jumped + 3'600, 1); // survivor: not a wipe
+        LogCapture log;
+        REQUIRE(f.store.cleanup_once(jumped) == 0);
+        CHECK(log.says("elapsed since the last retention pass"));
+        // Elapsed time cannot separate these, and the line must not pretend it can.
+        CHECK(log.says("forward clock jump OR an outage"));
+        // Not a wipe, so it must NOT claim every row would have gone.
+        CHECK(log.says("an unexpectedly large slice"));
+        CHECK_FALSE(log.says("EVERY datable audit row"));
+    }
+
+    SECTION("a poisoned stored reading is reported as corrupted state, not as a step") {
+        GuardFixture f;
+        f.seed(kNow - 100, 5);
+        f.seed(kNow + kWindow, 1);
+        REQUIRE(f.store.cleanup_once(kNow) == 5);
+        // A reading AHEAD of now cannot come from any pass this code ran.
+        exec_raw(f.tmp.path, "UPDATE audit_retention_meta SET value = 9000000000 "
+                             "WHERE key = 'last_pass_now'");
+        f.seed(kNow - 50, 5);
+        AuditStore reopened(f.tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(reopened.is_open());
+        LogCapture log;
+        REQUIRE(reopened.cleanup_once(kNow + 120) == 0);
+        CHECK(log.says("not a plausible past reading"));
+        CHECK(log.says("re-anchoring"));
+        CHECK_FALSE(log.says("elapsed since the last retention pass"));
+    }
+}
+
+TEST_CASE("AuditStore #2360: a capped pass only claims a remainder when one exists",
+          "[audit_store][retention][clock-guard]") {
+    // The log line and the cap counter both read one post-delete fact. This is
+    // the assertion the earlier round could not make: reverting `emit_capped` to
+    // `deleted >= cap` made an exact-cap clean drain announce a remainder that
+    // was not there, and nothing caught it.
+    // The discriminating fixture is an EXACT-cap drain that leaves NOTHING behind:
+    // `deleted == cap` while `backlog_remains == false`. A fixture with a surplus
+    // cannot tell the two implementations apart -- pass 1 is capped either way and
+    // pass 2 is under the cap either way, so both agree and the test is toothless.
+    // Seed exactly one cap's worth.
+    GuardFixture f;
+    f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass));
+    f.seed(kNow + kWindow, 1); // survivor, so the pass accepts rather than declines
+
+    LogCapture log;
+    REQUIRE(f.store.cleanup_once(kNow) == kMaxAuditDeletesPerPass);
+    CHECK_FALSE(log.says("per-pass cap reached")); // nothing was left behind
+    CHECK(log.says("expired 25000 rows"));
+    CHECK(f.store.cap_reached_count() == 0);
+    CHECK(f.store.total_count() == 1); // only the survivor
+
+    // And the genuinely-capped case still announces the remainder.
+    log.clear();
+    f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass) + 40);
+    REQUIRE(f.store.cleanup_once(kNow + 1) == kMaxAuditDeletesPerPass);
+    CHECK(log.says("per-pass cap reached"));
+    CHECK(f.store.cap_reached_count() == 1);
 }
