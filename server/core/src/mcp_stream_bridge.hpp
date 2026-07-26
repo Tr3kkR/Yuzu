@@ -88,7 +88,7 @@
 // the bus subscription - and the claim is ONE-WAY (torn_down excludes the record
 // from every later sweep), so nothing retries what teardown leaves unfinished;
 // shutdown() is the only reclaimer. Each step is therefore contained separately and
-// counted by yuzu_mcp_bridge_teardown_incomplete_total{stage} (#2487). The ORDER is
+// counted by yuzu_mcp_bridge_teardown_incomplete_total{reason} (#2487). The ORDER is
 // load-bearing rather than uniform, so be precise about what each failure retains:
 //
 //   unsubscribe fails  -> return immediately, record left WHOLE (in the map, still
@@ -198,16 +198,22 @@ public:
     /// Defaults to steady_clock::now(); only the DIFFERENCE between calls matters.
     using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
 
+    /// Outcome of an audited bridge action. A CLOSED set rather than a string,
+    /// so the core carries no audit-store vocabulary and the sink maps it (a raw
+    /// `const char*` here would also be a nullptr hazard at the sink's
+    /// `std::string` assignment).
+    enum class AuditResult { kSuccess, kFailure };
+
     /// httplib-free audit sink (G1): (action, execution_id, detail, result). Wired
     /// by 3a.7; empty = no audit. Every invocation is exception-contained (C5) -
     /// a throwing sink can never abort a sweep or corrupt accounting.
     ///
-    /// `result` is "success" or "failure" and exists because the sink used to stamp
-    /// EVERY bridge row "success", including rows whose detail says the teardown did
-    /// not complete or that nothing was published (#2487 review). An audit row is a
-    /// compliance artifact; it must not assert an outcome that did not happen.
+    /// `result` exists because the sink used to stamp EVERY bridge row "success",
+    /// including rows whose detail says the teardown did not complete or that
+    /// nothing was published (#2487 review). An audit row is a compliance artifact;
+    /// it must not assert an outcome that did not happen.
     using AuditFn = std::function<void(const std::string& action, const std::string& execution_id,
-                                       const std::string& detail, const char* result)>;
+                                       const std::string& detail, AuditResult result)>;
 
     /// Phases - see the lifecycle diagram above.
     enum class Phase : int { kArming, kStreaming, kArmedGetOnly, kRingOnly, kDone, kAborted };
@@ -233,6 +239,18 @@ public:
     /// record; kSynthesizeUnavailable = the -32014 error, reachable ONLY for a
     /// record that genuinely never saw a terminal.
     enum class TeardownFinal { kNone, kSynthesizeUnavailable, kFallbackFinal };
+
+    /// The three resources a claimed teardown must settle, in the order it settles
+    /// them. ONE source of truth: the metric label set, the pre-seed loop in
+    /// server.cpp and the fault seam all derive from this, so adding a fourth owned
+    /// resource cannot silently leave one of them behind.
+    enum class TeardownStage { kUnsubscribe, kReleaseCharge, kErase };
+    static constexpr std::size_t kTeardownStageCount = 3;
+    static constexpr std::array<const char*, kTeardownStageCount> kTeardownStageNames{
+        "unsubscribe", "release_charge", "erase"};
+    static constexpr const char* stage_name(TeardownStage s) {
+        return kTeardownStageNames[static_cast<std::size_t>(s)];
+    }
 
     struct ReserveResult {
         bool ok = false;
@@ -352,14 +370,15 @@ public:
     /// then lets it settle. Proves defer + keep-listener + terminal_accepted-false
     /// (#2409 safety-S1).
     void inject_visit_copy_fault_for_test(int times = 1);
-    /// The NEXT `times` teardown_claimed unsubscribe steps throw, modelling the one
-    /// failure that step actually admits (a mutex failure - unsubscribe allocates
-    /// nothing given a const& key). Proves the containment does NOT erase around a
-    /// live listener: the record stays in the map, subscribed and charged, for
-    /// shutdown() to reclaim, and nothing escapes to the maintenance thread (#2487).
-    /// A persistent fault (times large) keeps the record un-torn-down, which is what
-    /// distinguishes "the fault path fired" from a silent no-op.
-    void inject_teardown_unsubscribe_fault_for_test(int times = 1);
+    /// The NEXT `times` teardown_claimed steps of `stage` throw, modelling the one
+    /// failure those steps actually admit (a mutex failure - all three allocate
+    /// nothing). Each stage retains a DIFFERENT resource, so each needs its own
+    /// coverage: unsubscribe retains the whole record (and must never erase around a
+    /// live listener), release_charge leaks a per-session admission slot while the
+    /// record is still erased, and erase leaks the record after the other two
+    /// settled. A persistent fault keeps the state observable, which is what
+    /// distinguishes "the fault fired" from a silent no-op (#2487).
+    void inject_teardown_step_fault_for_test(TeardownStage stage, int times = 1);
     /// The NEXT `times` teardown terminal-frame BUILDS throw, modelling an
     /// allocation failure before publish_terminal_ladder is ever reached. Proves the
     /// TerminalRung::kNotAttempted audit path: nothing published AND the stream was
@@ -493,10 +512,16 @@ private:
     /// reached (the frame or the by-value fallback copy threw first). It is a
     /// distinct state on purpose: kPoisoned asserts poison_terminal() ran, and an
     /// audit row must never claim a session was poisoned when it was not.
-    enum class TerminalRung { kNotAttempted, kPrimary, kFallback, kPoisoned };
+    /// kNotAttempted / kPublishThrew are NOT ladder results - they mean the ladder
+    /// was never reached (the frame or the fallback copy threw first) or that it
+    /// threw part-way. Both are distinct from kPoisoned, which asserts
+    /// poison_terminal() actually ran: an audit row must never claim a session was
+    /// poisoned when it was not.
+    enum class TerminalRung { kNotAttempted, kPublishThrew, kPrimary, kFallback, kPoisoned };
     struct LadderResult {
         std::uint64_t id = 0;  ///< committed event id; 0 ⇔ kPoisoned
-        TerminalRung rung = TerminalRung::kPoisoned;
+        /// NOT kPoisoned: a defaulted result must not assert a poisoning either.
+        TerminalRung rung = TerminalRung::kNotAttempted;
     };
     /// The publish_final → retry-fallback → poison ladder (A6). `frame` is only
     /// viewed (passed as a string_view to publish_final); the retry uses the
@@ -508,10 +533,16 @@ private:
     /// (kSynthesizeUnavailable = -32014 for a never-terminal victim; kFallbackFinal
     /// = success-shaped for a terminal-known-payload-lost victim; kNone = nothing),
     /// charge settle, obs transfer, erase.
-    void teardown_claimed(const std::shared_ptr<BridgeRecord>& rec, TeardownFinal decision,
-                          const char* audit_action);
-    /// Release the streamed charge exactly once (clears under record mu - caller
-    /// must NOT hold it - then decrements under bridge_mu_).
+    /// `rec` BY VALUE: teardown borrows a reference into the record and then drops
+    /// one strong reference by erasing it from records_, so the keep-alive must be
+    /// structural rather than an obligation on every call site. noexcept: it runs on
+    /// the bare maintenance thread and every step is internally contained.
+    void teardown_claimed(std::shared_ptr<BridgeRecord> rec, TeardownFinal decision,
+                          const char* audit_action) noexcept;
+    /// Release the streamed charge exactly once. Takes bridge_mu_ THEN rec->mu and
+    /// commits both halves together - caller must hold neither. (It used to clear
+    /// the flag first and lock second, so a lock failure desynchronised the record
+    /// from the ledger permanently.)
     void release_charge(const std::shared_ptr<BridgeRecord>& rec);
     void decrement_streamed_locked(const std::string& session_id);  // holds bridge_mu_
 
@@ -520,7 +551,9 @@ private:
     void count_reject(const char* reason) noexcept;
     /// #2487: a teardown step that could not complete on the maintenance thread.
     /// `stage` is a CLOSED literal set - unsubscribe | release_charge | erase.
-    void count_teardown_incomplete(const char* stage) noexcept;
+    void count_teardown_incomplete(TeardownStage stage) noexcept;
+    /// True iff a fault is armed for `stage` (consumes one). Test seam only.
+    bool take_step_fault(TeardownStage stage) noexcept;
     void publish_records_gauge(std::size_t n) noexcept;  ///< never called under bridge_mu_
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
@@ -531,7 +564,8 @@ private:
     /// bad_alloc is std::terminate (#2487). The view converts without allocating;
     /// the owned string the AuditFn sink needs is built INSIDE the guard.
     void audit_contained(const char* action, const std::string& execution_id,
-                         std::string_view detail, const char* result = "success") noexcept;
+                         std::string_view detail,
+                         AuditResult result = AuditResult::kSuccess) noexcept;
 
     ExecutionEventBus* bus_ = nullptr;
     McpSessionRegistry* sessions_ = nullptr;
@@ -556,7 +590,9 @@ private:
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
     std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
-    std::atomic<int> teardown_unsub_fault_{0}; ///< remaining teardown unsubscribe throws (test seam)
+    /// Remaining injected throws per teardown stage (test seam), indexed by
+    /// TeardownStage.
+    std::array<std::atomic<int>, kTeardownStageCount> teardown_step_fault_{};
     std::atomic<int> terminal_build_fault_{0}; ///< remaining teardown frame-build throws (test seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
 

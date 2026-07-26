@@ -555,20 +555,22 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
-                          "maintenance thread, by stage. The claim is one-way, so a record that "
-                          "fails here is never retried: whatever it still owns (its map entry, its "
-                          "streamed charge, or its bus subscription) is held until shutdown. Alert "
-                          "on > 0",
+                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
+                          "out-of-memory signal: all three steps allocate nothing, so only a "
+                          "mutex failure can reach them today - use "
+                          "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
+                          "pressure. The claim is one-way, so a record that fails here is never "
+                          "retried and what it still owns is held until the process restarts; a "
+                          "retained record also pins that session's whole stream state, its "
+                          "replay ring and any pinned finals. Alert on > 0",
                           "counter");
-        metrics_.describe("yuzu_mcp_bridge_sweep_tick_failures_total",
-                          "Maintenance ticks where the progress-bridge sweep threw and was "
-                          "contained (#2487). The tick is skipped, not retried; sustained growth "
-                          "means pin-ack, session-death and pressure teardown are all stalled",
-                          "counter");
-        metrics_.describe("yuzu_mcp_session_gc_tick_failures_total",
-                          "Maintenance ticks where MCP session gc threw and was contained "
-                          "(#2487). Expired sessions keep their streams and pinned finals until a "
-                          "tick succeeds",
+        metrics_.describe("yuzu_mcp_maintenance_tick_failures_total",
+                          "MCP maintenance ticks that threw and were contained, by tick "
+                          "(#2487). The tick is skipped, not retried. bridge_sweep: pin-ack, "
+                          "session-death and pressure teardown are all stalled while it grows. "
+                          "session_gc: expired sessions keep their streams and pinned finals "
+                          "until a tick succeeds. Both are guarded separately so one failing "
+                          "cannot suppress the other",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
                           "Committed terminal frames that found no free pin slot and were published "
@@ -599,12 +601,14 @@ public:
                             "subscribe_failed", "arm_threw"}) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
-        // #2487: CLOSED stage set, mirroring teardown_claimed's contained steps.
-        for (auto stage : {"unsubscribe", "release_charge", "erase"}) {
-            metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"stage", stage}});
+        // #2487: CLOSED reason set, derived from the bridge's own stage table so a
+        // fourth owned resource cannot be added without this loop following.
+        for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
         }
-        metrics_.counter("yuzu_mcp_bridge_sweep_tick_failures_total");
-        metrics_.counter("yuzu_mcp_session_gc_tick_failures_total");
+        for (auto tick : {"bridge_sweep", "session_gc"}) {
+            metrics_.counter("yuzu_mcp_maintenance_tick_failures_total", {{"tick", tick}});
+        }
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
@@ -4043,7 +4047,9 @@ public:
                     } catch (...) {
                         try {
                             spdlog::error("MCP bridge sweep tick failed; deferring to next tick");
-                            metrics_.counter("yuzu_mcp_bridge_sweep_tick_failures_total")
+                            metrics_
+                                .counter("yuzu_mcp_maintenance_tick_failures_total",
+                                         {{"tick", "bridge_sweep"}})
                                 .increment();
                         } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
                         }
@@ -4055,7 +4061,9 @@ public:
                             try {
                                 spdlog::error(
                                     "MCP session gc tick failed; deferring to next tick");
-                                metrics_.counter("yuzu_mcp_session_gc_tick_failures_total")
+                                metrics_
+                                    .counter("yuzu_mcp_maintenance_tick_failures_total",
+                                             {{"tick", "session_gc"}})
                                     .increment();
                             } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
                             }
@@ -12601,7 +12609,8 @@ private:
                 mcp_stream_bridge_ = std::make_unique<mcp::McpStreamBridge>(
                     execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
                     [this](const std::string& action, const std::string& execution_id,
-                           const std::string& detail, const char* result) {
+                           const std::string& detail,
+                           mcp::McpStreamBridge::AuditResult result) {
                         if (audit_store_ && audit_store_->is_open()) {
                             AuditEvent ev;
                             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -12615,7 +12624,9 @@ private:
                             // NOT hardcoded "success" (#2487 review): a teardown that
                             // could not complete, or a disposition that published
                             // nothing, must not be evidenced as a successful action.
-                            ev.result = result;
+                            ev.result =
+                                result == mcp::McpStreamBridge::AuditResult::kFailure ? "failure"
+                                                                                      : "success";
                             (void)audit_store_->log(ev);
                         }
                     });

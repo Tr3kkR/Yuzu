@@ -1190,4 +1190,29 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
 
 #endif // YUZU_TEST_ENABLE_PG
 
+/// RAII owner for a raw `sqlite3*` a test opened itself (typically `:memory:`).
+/// Closes on scope exit so a fatal REQUIRE between open and close cannot leak the
+/// handle. Non-copyable AND non-movable: the implicit copy would double-close, and
+/// clang-tidy's cppcoreguidelines-special-member-functions wants all five named
+/// once a destructor exists.
+///
+/// Promoted here from the four server test files that had each hand-rolled the same
+/// `SqliteHandleGuard` (test_chrome_ir_chain, test_workflow_routes,
+/// test_rest_api_events, test_rest_result_sets_async) when a fifth needed it - the
+/// repo's promote-on-second-use rule. Callers include <sqlite3.h> themselves; this
+/// header deliberately does not, so tests with no SQLite dependency stay clean.
+template <typename Sqlite3T> struct SqliteHandleOwner {
+    Sqlite3T* db{nullptr};
+    SqliteHandleOwner() = default;
+    SqliteHandleOwner(const SqliteHandleOwner&) = delete;
+    SqliteHandleOwner& operator=(const SqliteHandleOwner&) = delete;
+    SqliteHandleOwner(SqliteHandleOwner&&) = delete;
+    SqliteHandleOwner& operator=(SqliteHandleOwner&&) = delete;
+    ~SqliteHandleOwner() {
+        if (db != nullptr) {
+            sqlite3_close(db);
+        }
+    }
+};
+
 } // namespace yuzu::test
