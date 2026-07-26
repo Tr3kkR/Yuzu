@@ -1331,8 +1331,14 @@ TEST_CASE("AuditStore #2360: a store whose retention index cannot be built stays
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-noidx-"}};
     exec_raw(tmp.path, "CREATE TABLE idx_audit_ttl_id (x INTEGER)");
 
+    // Assert the PREMISE, not just the consequence. With the gauge gone, the
+    // error log is the only evidence the build actually failed -- without this
+    // the test passes identically if CREATE INDEX succeeds, and the fixture's
+    // whole point (squatting the index name) goes unverified.
+    LogCapture log;
     AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
+    REQUIRE(log.says("could not create idx_audit_ttl_id"));
 
     seed_rows_with_ttl(tmp.path, kNow - 100, 5);
     seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
@@ -1679,3 +1685,48 @@ TEST_CASE("AuditStore #2360: an out-of-range durable VALUE is reported even with
     CHECK(reopened.clock_anomaly_skips_count() == 1);
 }
 
+
+TEST_CASE("AuditStore #2360: a PERSISTENTLY implausible reading reports once, not every pass",
+          "[audit_store][retention][clock-guard]") {
+    // The unbounded-emission case. A retention-disabled store on a pre-epoch
+    // clock re-anchors a NEGATIVE reading every pass, so `prev_implausible` is
+    // true forever and the nothing-expired branch is the only one ever taken.
+    // An earlier version cleared the latch unconditionally at the top of that
+    // branch, which made its own `!clock_anomaly_latched_` guard dead code: the
+    // counter moved and a warn was emitted on EVERY pass, indefinitely, and the
+    // clock-anomaly alert would have latched on permanently.
+    //
+    // The contract is report-once-and-latch, with the latch RELEASED when the
+    // condition clears -- not suppressed forever, and not repeated forever.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-persist-"}};
+    {
+        AuditStore seed(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+        REQUIRE(seed.is_open());
+    }
+    // A negative stored reading: exactly what a pre-epoch pass persists.
+    exec_raw(tmp.path, "INSERT INTO audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', -86400)");
+
+    AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+
+    LogCapture log;
+    // Six consecutive passes, each re-anchoring another negative reading.
+    for (int i = 0; i < 6; ++i)
+        CHECK(store.cleanup_once(-86'400 + i) == 0);
+
+    // Reported ONCE across all six, not once per pass.
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    CHECK(store.retention_passes_count() == 6); // the reaper did run every time
+    CHECK(store.cleanup_failed_count() == 0);
+
+    // The clock recovers: the latch must RELEASE so a future anomaly can decline.
+    CHECK(store.cleanup_once(kNow) == 0);       // plausible now; nothing expired
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    log.clear();
+    exec_raw(tmp.path, "UPDATE audit_retention_meta SET value = -1 WHERE key = 'last_pass_now'");
+    AuditStore reopened(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+    REQUIRE(reopened.is_open());
+    CHECK(reopened.cleanup_once(kNow + 1) == 0);
+    CHECK(reopened.clock_anomaly_skips_count() == 1); // a fresh store reports its own
+}

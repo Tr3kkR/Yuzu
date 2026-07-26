@@ -411,9 +411,11 @@ reduction (and a restart, per issue #483) the older long-TTL rows stop counting
 as survivors, and a single declined pass becomes more likely.
 
 **`/healthz` does not report retention health.** `stores.audit` reflects only
-whether the database is OPEN, so it reads healthy while retention is failing,
-not running, or running without its index. Alert on the metrics above rather
-than on the health probe for this (tracked in #2509).
+whether the database is OPEN, so it reads healthy while retention is failing or
+not running. Alert on the metrics above rather than on the health probe for this
+(tracked in #2509). A store running WITHOUT its index is a third blind spot with
+no metric at all -- it is logged as an error at startup and nowhere else
+(#2526).
 
 **A backward clock excursion is the case the guard helps with least.** Rows
 written while the clock was behind (a dead CMOS reporting 1970, before NTP
@@ -451,7 +453,7 @@ directly. Do not collapse the first two:
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
-| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the six *counters* here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other five counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass ran; `0` if none has in this process. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks

@@ -697,42 +697,29 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit = Emit::ProbeFailed;
             emit_err = !has_expired ? has_expired.error() : has_datable_survivor.error();
         } else if (!*has_expired) {
-            // Nothing to delete, so nothing to guard against. Clearing the latch
-            // here is the same rule the accepting path applies below: the
-            // anomaly is over once no expired backlog remains.
-            clock_anomaly_latched_ = false;
-            // But a malformed durable reading must still be REPORTED here, not
-            // carried. This branch reached a verdict, so deferring the flag
-            // would attribute the corruption to some later, healthy pass -- and
-            // on a retention-disabled store (`window == 0`, nothing ever
-            // expires) this is the ONLY branch ever taken, so the anomaly would
-            // never be reported at all. Report once, then clear.
-            // BOTH carriers of "the durable reading was not usable" must be
-            // reported here, not just the load-time one. `prev_implausible` also
-            // comes from a VALUE that parsed but is out of range (negative, or
-            // ahead of now), and the row has already been re-anchored above, so
-            // dropping it here loses the anomaly with no counter and no warn --
-            // the identical defect the load-time carrier was just fixed for.
-            // On a retention-disabled store this is the ONLY branch ever taken.
-            //
-            // The value-derived arm is NOT one-shot, so unlike the load-time
-            // flag it must honour the latch, exactly as every other decline does.
-            if (loaded_meta_unusable_ || (prev_implausible && !clock_anomaly_latched_)) {
-                if (prev_implausible && !loaded_meta_unusable_)
-                    clock_anomaly_latched_ = true;
-                // Deliberately NOT gated on `clock_anomaly_latched_`, unlike
-                // every other decline. The latch exists to stop a PERSISTENT
-                // condition re-declining every pass; this one is one-shot by
-                // construction -- the flag is set once at construction and
-                // cleared here -- so it cannot spam. It gets its own message
-                // and counts on the same counter as every other decline: the
-                // guard fired and the pass deleted nothing, which is what
-                // `clock_anomaly_skips_` means. The separate message exists
-                // because there was nothing expired to delete on this branch
-                // either way, so the operator should not go looking for a
-                // backlog that was held back.
+            // Nothing expired, so there is no backlog anomaly to hold a latch
+            // for -- but there may still be a STATE anomaly, and the two must
+            // not clobber each other. Clearing the latch unconditionally here
+            // (as an earlier version did) made the check below dead code: the
+            // guard `!clock_anomaly_latched_` was always true, so a PERSISTENTLY
+            // implausible reading -- a retention-disabled store on a pre-epoch
+            // clock re-anchors a negative value every pass -- emitted a warn and
+            // moved the counter on EVERY pass, forever.
+            const bool state_anomaly = loaded_meta_unusable_ || prev_implausible;
+            if (!state_anomaly) {
+                // Genuinely quiet: the anomaly, whatever it was, is over.
+                clock_anomaly_latched_ = false;
+            } else if (!clock_anomaly_latched_) {
+                // Report once. Both carriers of "the durable reading was not
+                // usable" land here, because on a retention-disabled store this
+                // is the ONLY branch ever taken -- dropping either would lose the
+                // anomaly with no counter and no warn.
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 loaded_meta_unusable_ = false;
+                // Latch only the PERSISTENT carrier. The load-time flag is
+                // one-shot and just been cleared, so latching for it would block
+                // a later, unrelated backlog anomaly from declining.
+                clock_anomaly_latched_ = prev_implausible;
                 emit = Emit::CorruptStateReported;
             }
         } else {
@@ -799,8 +786,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                      "declining once and re-anchoring on the current reading");
         break;
     case Emit::CorruptStateReported:
-        spdlog::warn("AuditStore: the stored retention clock reading was unusable (corrupted, "
-                     "not an integer, or unreadable) and has been re-anchored. This pass declined "
+        spdlog::warn("AuditStore: the stored retention clock reading was unusable (negative, "
+                     "ahead of the current clock, not an integer, or unreadable) and has been "
+                     "re-anchored. This pass declined "
                      "to trust it and deleted nothing -- there was nothing expired to delete "
                      "either way -- so the restart-surviving half of the clock guard had no "
                      "comparison point until now");

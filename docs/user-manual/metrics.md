@@ -135,11 +135,11 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
 | `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
-| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: every other *counter* here is silence-means-healthy, so a cleanup thread that never runs leaves all six flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: the other five retention counters are silence-means-healthy, so a cleanup thread that never runs leaves them flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | gauge | Wall-clock reading of the most recent pass; `0` if none has run in this process. Read WITH the counter above: stale here while that RISES means the reaper is alive but refusing an implausible clock -- a different fault from stopped. |
 
-**Alert on absence, not just on rising counters.** Four of these fire on something going
-wrong; `..._retention_passes_total` is the only one that catches the reaper not running at
+**Alert on absence, not just on rising counters.** Four of the five retention alert
+rules fire on something going wrong; `..._retention_passes_total` is the only one that catches the reaper not running at
 all, which is the state in which none of the other *counter*-driven rules can fire. The `YuzuAuditRetentionNotRunning`
 rule covers it.
 
