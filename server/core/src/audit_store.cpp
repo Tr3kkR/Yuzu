@@ -598,17 +598,26 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                          "SELECT EXISTS(SELECT 1 FROM audit_events "
                          "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
                          expired_binds);
-        // TERM ORDER IS LOAD-BEARING, and it is what the measurement is about --
-        // not `BETWEEN` as such. The seek-bound term must come BEFORE the
-        // partial index's own `ttl_expires_at > 0`. Written the other way round
-        // SQLite takes the literal `> 0` as the lower seek bound (bytecode:
-        // `Integer 0 -> r5; SeekGT`) and demotes `>= now` to a per-row filter, so
-        // the probe walks the ENTIRE expired prefix. Measured on 5M rows at a
-        // 4.5M backlog, SQLite 3.52: 0.0014 ms this way, 122 ms the other, under
-        // the lock every audit write needs -- with a byte-identical EXPLAIN QUERY
-        // PLAN and identical results, so nothing but this comment and the
-        // wall-time test guard it. `... BETWEEN ? AND ? AND ttl_expires_at > 0`
-        // is equally fast; the ordering is the rule, the syntax is not.
+        // `BETWEEN` IS LOAD-BEARING. Do not rewrite it as `>= ? AND <= ?`.
+        //
+        // The partial index carries the literal `ttl_expires_at > 0`. With two
+        // SEPARATE comparisons SQLite can take that literal as its lower seek
+        // bound and demote `>= now` to a per-row filter, so the probe walks the
+        // ENTIRE expired prefix instead of seeking past it. `BETWEEN` is treated
+        // as one range constraint and is not vulnerable to that.
+        //
+        // Measured here, 3M expired rows + 1 survivor, SQLite 3.52, this index:
+        //   `> 0 AND ttl BETWEEN ? AND ?`    0.0069 ms   <-- as written
+        //   `ttl BETWEEN ? AND ? AND > 0`    0.0068 ms
+        //   `> 0 AND ttl >= ? AND ttl <= ?`  83.6 ms     <-- the trap
+        //   `ttl >= ? AND ttl <= ? AND > 0`  0.0066 ms
+        //
+        // So BETWEEN is safe in EITHER position; only the separate-comparison
+        // form is order-sensitive. A rewrite to `>= AND <=` that leaves `> 0`
+        // first therefore reintroduces an ~84 ms hold under the lock every audit
+        // write takes -- with identical results AND a byte-identical EXPLAIN
+        // QUERY PLAN, so no test and no plan check would notice. This comment is
+        // the guard.
         const auto has_datable_survivor =
             exists_probe(db_.get(),
                          "SELECT EXISTS(SELECT 1 FROM audit_events "
