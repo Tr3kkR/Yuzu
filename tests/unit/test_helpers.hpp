@@ -1019,12 +1019,22 @@ private:
     }
 
     /// Structural fingerprint of a database: md5 over the sorted set of
-    /// non-system schemas, (schema, table, column, type) tuples, index
-    /// definitions, and table constraints. Deliberately structure-only —
+    /// non-system schemas, (schema, table, column, type, nullability) tuples,
+    /// index definitions, and table constraints. Deliberately structure-only —
     /// a setup may reset DATA after migrating (e.g. the secrets template
     /// clears kek_meta) and still be equivalent. NOT covered: triggers and
     /// functions (no store migration creates them today; extend here if
     /// one ever does).
+    ///
+    /// NOT-NULL constraints are excluded from the constraint arm and carried
+    /// by the column arm's is_nullable instead: before PG 18 a NOT NULL is
+    /// surfaced as an auto-named CHECK constraint whose name embeds the
+    /// table/attribute OIDs ("39836_39837_1_not_null"), so two databases with
+    /// IDENTICAL schemas fingerprint differently and every shared-key replay
+    /// verification fails spuriously on PG < 18 (CI is on 18 and never saw
+    /// it; a local PG 16 cluster fails every cross-file shared key). Moving
+    /// nullability to is_nullable keeps the divergence detectable while making
+    /// the fingerprint OID-independent on every supported server version.
     static std::expected<std::string, std::string> structure_fingerprint(const std::string& dsn) {
         yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
         if (PQstatus(conn.get()) != CONNECTION_OK)
@@ -1036,6 +1046,7 @@ private:
             "   WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'"
             "  UNION ALL"
             "  SELECT table_schema || '.' || table_name || '.' || column_name || ':' || data_type"
+            "         || ':null=' || is_nullable"
             "    FROM information_schema.columns"
             "   WHERE table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'"
             "  UNION ALL"
@@ -1047,6 +1058,9 @@ private:
             "         || ':' || constraint_type"
             "    FROM information_schema.table_constraints"
             "   WHERE table_schema NOT LIKE 'pg\\_%' AND table_schema <> 'information_schema'"
+            // OID-named (PG < 18) and column-named (PG >= 18) NOT NULL checks:
+            // nullability rides on the column arm's is_nullable instead.
+            "     AND NOT (constraint_type = 'CHECK' AND constraint_name LIKE '%\\_not\\_null')"
             ") s";
         yuzu::server::pg::PgResult res{PQexec(conn.get(), kQuery)};
         if (PQresultStatus(res.get()) != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
