@@ -39,10 +39,12 @@
  *  - `to_csv`: header + RFC 4180 escaping (comma/quote/newline), plus CWE-1236
  *    formula-injection neutralization (leading `=`/`+`/`-`/`@`/tab/CR).
  *
- * `RbacStore` (SQLite) and `AuthDB` (SQLite) need no PG gate; only
- * `EnginePrincipalStore` is a born-on-Postgres store (ADR-0006), so those
- * cases carry `[pg]` and skip cleanly without `YUZU_TEST_POSTGRES_DSN` — the
- * `to_csv` cases do not and always run.
+ * `RbacStore` (SQLite) needs no PG gate. `AuthDB` and `EnginePrincipalStore`
+ * are BOTH born-on-Postgres stores (ADR-0006) — every case that constructs
+ * `ModelHarness` (or the standalone R1 fixture) carries `[pg]` and skips
+ * cleanly without `YUZU_TEST_POSTGRES_DSN` (via `yuzu::test::AuthDbPg`'s own
+ * SKIP, which now fires before the EnginePrincipalStore SKIP ever would) —
+ * the `to_csv` cases do not depend on either store and always run.
  */
 
 #include "access_review_model.hpp"
@@ -61,7 +63,7 @@
 #include <string>
 #include <vector>
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 using yuzu::server::AccessReviewRow;
 using yuzu::server::AuthDB;
@@ -91,13 +93,13 @@ void setup_access_review_model_eps_tpl(const std::string& dsn) {
 yuzu::test::PgTestTemplate access_review_model_eps_tpl{"accrevmodel",
                                                         &setup_access_review_model_eps_tpl};
 
-/// Shared fixture: a real (SQLite) AuthDB + RbacStore, plus a PG-backed
-/// EnginePrincipalStore. SKIPs (Catch2 SKIP from inside the constructor,
-/// mirroring EnginePrincipalStorePg in test_rest_engine_principal_roles.cpp)
-/// when YUZU_TEST_POSTGRES_DSN is unset.
+/// Shared fixture: a born-on-PG AuthDB + a (SQLite) RbacStore, plus a
+/// PG-backed EnginePrincipalStore. SKIPs (Catch2 SKIP from inside AuthDbPg's
+/// constructor, mirroring EnginePrincipalStorePg in
+/// test_rest_engine_principal_roles.cpp) when YUZU_TEST_POSTGRES_DSN is
+/// unset.
 struct ModelHarness {
-    yuzu::test::TempDir auth_dir{"yuzu_test_access_review_model_authdb-"};
-    AuthDB auth_db{auth_dir.path, /*cleanup_interval_secs=*/0};
+    yuzu::test::AuthDbPg auth_db;
 
     yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_model_rbac-"};
     RbacStore rbac{rbac_file.path};
@@ -107,9 +109,12 @@ struct ModelHarness {
     std::unique_ptr<EnginePrincipalStore> engines;
 
     ModelHarness() {
-        REQUIRE(auth_db.initialize().has_value());
         REQUIRE(rbac.is_open());
 
+        // Redundant with AuthDbPg's own SKIP above (both gate on the same
+        // env var) — kept as a defence-in-depth guard directly on this
+        // fixture's own PG dependency (EnginePrincipalStore), matching the
+        // original shape.
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -122,7 +127,7 @@ struct ModelHarness {
     }
 
     void add_user(const std::string& username) {
-        REQUIRE(auth_db.upsert_user(username, "hash", "salt", Role::user).has_value());
+        REQUIRE(auth_db->upsert_user(username, "hash", "salt", Role::user).has_value());
     }
 
     const AccessReviewRow* find(const std::vector<AccessReviewRow>& rows, const std::string& type,
@@ -166,7 +171,7 @@ TEST_CASE("build_access_review: union of GRANTED user/group/active-engine/revoke
     // answers "who currently has access", not "who exists".
     h.add_user("carol-no-grants");
 
-    auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
     const auto& rows = *result;
 
@@ -222,7 +227,7 @@ TEST_CASE("build_access_review: R2 — a group's permission count comes from the
     REQUIRE(h.rbac.set_permission({"UserRole", "Security", "Write", "allow"}).has_value());
     REQUIRE(h.rbac.assign_role({"user", "g1", "UserRole"}).has_value());
 
-    auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
 
     const auto* group_row = h.find(*result, "group", "g1");
@@ -250,7 +255,7 @@ TEST_CASE("build_access_review: an engine principal's effective_permission_count
                .has_value());
     REQUIRE(h.rbac.assign_role({"engine", "engine:perm", "EngineRole"}).has_value());
 
-    auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
     const auto* row = h.find(*result, "engine", "engine:perm");
     REQUIRE(row != nullptr);
@@ -284,7 +289,7 @@ TEST_CASE("build_access_review: a user row carries DIRECT grants only — group 
     REQUIRE(h.rbac.set_permission({"DirectRole", "Security", "Write", "allow"}).has_value());
     REQUIRE(h.rbac.assign_role({"user", "dana", "DirectRole"}).has_value());
 
-    auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
 
     // UP-1: bob holds ZERO direct grants — group membership is not a
@@ -330,7 +335,7 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
         const std::string orphan_id = "oidc:https://idp.example.com#deleted-abc";
         REQUIRE(h.rbac.assign_role({"user", orphan_id, "OrphanRole"}).has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "user", orphan_id);
@@ -358,9 +363,9 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
         REQUIRE(h.rbac.assign_role({"user", "evicted-eve", "OrphanRole"}).has_value());
         // Soft-delete via remove_user (is_active=0); the RBAC grant lives in a
         // separate store and survives, reproducing the disabled-but-granted case.
-        REQUIRE(h.auth_db.remove_user("evicted-eve").has_value());
+        REQUIRE(h.auth_db->remove_user("evicted-eve").has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "user", "evicted-eve");
@@ -379,7 +384,7 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
     SECTION("orphan group — a grant against a group name no longer in the groups roster") {
         REQUIRE(h.rbac.assign_role({"group", "deleted-group", "OrphanRole"}).has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "group", "deleted-group");
@@ -393,7 +398,7 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
             "roster") {
         REQUIRE(h.rbac.assign_role({"engine", "engine:deleted", "OrphanRole"}).has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "engine", "engine:deleted");
@@ -409,7 +414,7 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
         const std::string orphan_id = "oidc:https://idp.example.com#deleted-xyz";
         REQUIRE(h.rbac.assign_role({"user", orphan_id, "OrphanRole"}).has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         // The rostered grant enriches normally — NOT flagged as an orphan.
@@ -445,9 +450,9 @@ TEST_CASE("build_access_review: disabled-user edges — zero grants still yields
     SECTION("a disabled user with ZERO grants produces NO row — the 'who has access' invariant "
             "holds even for a disabled account") {
         h.add_user("disabled-no-grants");
-        REQUIRE(h.auth_db.remove_user("disabled-no-grants").has_value());
+        REQUIRE(h.auth_db->remove_user("disabled-no-grants").has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         CHECK(h.find(*result, "user", "disabled-no-grants") == nullptr);
@@ -458,12 +463,12 @@ TEST_CASE("build_access_review: disabled-user edges — zero grants still yields
         h.add_user("disabled-with-grant");
         REQUIRE(h.rbac.assign_role({"user", "disabled-with-grant", "DisabledEdgeRole"})
                     .has_value());
-        REQUIRE(h.auth_db.remove_user("disabled-with-grant").has_value());
+        REQUIRE(h.auth_db->remove_user("disabled-with-grant").has_value());
 
         h.add_user("active-with-grant");
         REQUIRE(h.rbac.assign_role({"user", "active-with-grant", "DisabledEdgeRole"}).has_value());
 
-        auto result = build_access_review(&h.auth_db, &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* disabled_row = h.find(*result, "user", "disabled-with-grant");
@@ -496,10 +501,8 @@ TEST_CASE("build_access_review: R1 — a genuine read failure MID-enumeration re
     auto engines = std::make_unique<EnginePrincipalStore>(*pool);
     REQUIRE(engines->is_open());
 
-    yuzu::test::TempDir auth_dir{"yuzu_test_access_review_r1_authdb-"};
-    AuthDB auth_db{auth_dir.path, /*cleanup_interval_secs=*/0};
-    REQUIRE(auth_db.initialize().has_value());
-    REQUIRE(auth_db.upsert_user("alice", "hash", "salt", Role::user).has_value());
+    yuzu::test::AuthDbPg auth_db;
+    REQUIRE(auth_db->upsert_user("alice", "hash", "salt", Role::user).has_value());
 
     yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_r1_rbac-"};
     RbacStore rbac{rbac_file.path};
@@ -517,7 +520,7 @@ TEST_CASE("build_access_review: R1 — a genuine read failure MID-enumeration re
     // trivial "the call never even started" guard case.
     engine_db.reset(); // DROP DATABASE ... WITH (FORCE)
 
-    auto result = build_access_review(&auth_db, &rbac, engines.get(), nullptr, nullptr);
+    auto result = build_access_review(auth_db.get(), &rbac, engines.get(), nullptr, nullptr);
     REQUIRE_FALSE(result.has_value());
     // std::expected holding `unexpected` structurally CANNOT also carry a
     // vector — there is no "partial vector" representation to leak here;

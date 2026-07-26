@@ -721,7 +721,6 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     // already touched within the granularity — stay on the shared lock with no
     // serialisation (UP-1) and no O(N) sweep (UP-2).
     const bool need_write = idle_expired || need_touch || sessions_.size() > 100;
-    bool persist = false;
     if (need_write) {
         lock.unlock();
         std::unique_lock wlock(mu_);
@@ -760,7 +759,6 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
                                     kActivityPersistGranularity) {
                     wit->second.last_activity_persisted_at = wnow;
                     session_copy.last_activity_persisted_at = wnow;
-                    persist = true;
                 }
             } else {
                 // Raced an evict/invalidate between the two locks → reject.
@@ -768,13 +766,6 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
             }
         }
         wlock.unlock();
-
-        // Snapshot-and-release: the AuthDB mirror write happens OUTSIDE mu_
-        // (AuthDB invariant — never call a sibling subsystem under the lock).
-        // Best-effort: touch_session_activity is fail-silent — discard the
-        // [[nodiscard]] std::expected (MSVC /W4 C4834 otherwise).
-        if (persist && auth_db_)
-            (void)auth_db_->touch_session_activity(token);
     }
 
     return session_copy;
@@ -802,13 +793,6 @@ AuthManager::invalidate_user_sessions(const std::string& username) {
     // surface `db_persisted=false` so the caller can audit the partial
     // outcome and the operator knows to retry or restart.
     bool db_persisted = true;
-    if (auth_db_) {
-        auto result = auth_db_->invalidate_all_sessions(username);
-        if (!result) {
-            spdlog::error("AuthDB invalidate_all_sessions failed for '{}'", username);
-            db_persisted = false;
-        }
-    }
     std::unique_lock lock(mu_);
     const auto before = sessions_.size();
     std::erase_if(sessions_, [&](const auto& pair) {

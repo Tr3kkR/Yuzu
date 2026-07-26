@@ -121,6 +121,15 @@ struct Config {
     // --postgres-pool-size / YUZU_POSTGRES_POOL_SIZE.
     int postgres_pool_size{16};
 
+    // Set by main.cpp iff `AuthDB::seed_admin_if_empty` actually seeded the
+    // sole admin user this boot (a genuinely-empty `auth.users` — fresh
+    // start / Postgres cutover). Threaded through Config rather than set
+    // directly on a metrics registry because the seed happens before
+    // `Server::create()` constructs `ServerImpl` (and therefore before
+    // `metrics_` exists) — ServerImpl's ctor reads this once to pre-seed
+    // `yuzu_auth_fresh_start_reset_total`.
+    bool auth_fresh_start_seeded{false};
+
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding

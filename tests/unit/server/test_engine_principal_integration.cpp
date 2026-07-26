@@ -8,10 +8,11 @@
  * test_rbac_store.cpp / test_auth_db*.cpp — this file exercises them wired
  * together the way server.cpp actually wires them.
  *
- * PG-gated where PG stores are involved (ApiTokenStore, EnginePrincipalStore):
- * skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken
- * (test_helpers.hpp skip-vs-fail contract). The RBAC/AuthDB namespace-collision
- * coverage is plain SQLite and needs no PG gate.
+ * PG-gated where PG stores are involved (ApiTokenStore, EnginePrincipalStore,
+ * and — since the ADR-0006 substrate migration — AuthDB itself): skips when
+ * YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken
+ * (test_helpers.hpp skip-vs-fail contract). The RBAC-only namespace-collision
+ * coverage stays plain SQLite and needs no PG gate.
  */
 
 #include "auth_routes.hpp"
@@ -23,17 +24,19 @@
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
 
+#include <libpq-fe.h>
 #include <sqlite3.h>
 
 #include <chrono>
@@ -416,40 +419,27 @@ TEST_CASE("Engine namespace: local group create inside 'engine:' is rejected",
 }
 
 TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-existing rows",
-          "[engine_principal][integration][collision_scan]") {
+          "[pg][engine_principal][integration][collision_scan]") {
     // ── AuthDB side: seed a users row that predates the 'engine:' reservation.
     // `upsert_sso_identity` now rejects an 'engine:'-shaped principal outright
     // (the write surface itself guards the reserved namespace per design
     // §3.3 — a dedicated `[auth_db]` test proves the rejection), so a
     // pre-existing colliding row can no longer be produced through the API.
     // Simulate "a row that predates the reservation" the same way the RBAC
-    // side does below: migrate the schema via the real store, close it, seed
-    // the row with a second raw connection, close that, then reopen (required
-    // on Windows).
-    auto auth_dir = yuzu::test::TempDir{"engine-ns-users-"};
-    fs::create_directories(auth_dir.path);
-    auto auth_db_path = auth_dir.path / "auth.db";
+    // side does below, but over a SECOND libpq connection (AuthDB is now
+    // Postgres-backed, ADR-0006) rather than a raw sqlite3 handle.
+    yuzu::test::AuthDbPg auth_db;
     {
-        AuthDB seed_db(auth_dir.path, /*cleanup_interval_secs=*/0);
-        REQUIRE(seed_db.initialize().has_value());
+        yuzu::server::pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res{PQexec(
+            conn.get(),
+            "INSERT INTO auth.users (username, password_hash, salt_hex, role, "
+            "identity_source, external_iss, external_sub, display_name) "
+            "VALUES ('engine:legacy', '', '', 'user', 'oidc', "
+            "'https://issuer.example', 'sub-1', 'Legacy Engine-Named Row')")};
+        REQUIRE(res.ok());
     }
-    {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2(auth_db_path.string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) ==
-               SQLITE_OK);
-        char* err = nullptr;
-        int rc = sqlite3_exec(raw,
-                              "INSERT INTO users (username, password_hash, salt_hex, role, "
-                              "identity_source, external_iss, external_sub, display_name) "
-                              "VALUES ('engine:legacy', '', '', 'user', 'oidc', "
-                              "'https://issuer.example', 'sub-1', 'Legacy Engine-Named Row')",
-                              nullptr, nullptr, &err);
-        REQUIRE(rc == SQLITE_OK);
-        sqlite3_close(raw);
-    }
-    AuthDB auth_db(auth_dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
 
     // ── RbacStore side: seed a local group row that predates the reservation.
     // create_group() now rejects this shape outright (previous TEST_CASE), so
@@ -478,7 +468,7 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     REQUIRE(rbac_store.is_open());
 
     SECTION("both scanners individually find the seeded collisions") {
-        auto colliding_users = auth_db.find_reserved_prefix_users("engine:");
+        auto colliding_users = auth_db->find_reserved_prefix_users("engine:");
         REQUIRE(colliding_users.has_value());
         REQUIRE(colliding_users->size() == 1);
         CHECK((*colliding_users)[0] == "engine:legacy");
@@ -490,7 +480,7 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     }
 
     SECTION("simulated server.cpp preflight: either non-empty scan means fail-closed") {
-        auto colliding_users = auth_db.find_reserved_prefix_users("engine:");
+        auto colliding_users = auth_db->find_reserved_prefix_users("engine:");
         auto colliding_groups = rbac_store.find_local_groups_with_prefix("engine:");
         // A scan error (nullopt) on EITHER half must read as fail-closed (G3 + symmetric users half).
         bool would_refuse_to_start =
@@ -500,16 +490,13 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     }
 
     SECTION("a clean database has no collisions and would NOT fail closed") {
-        auto clean_auth_dir = yuzu::test::TempDir{"engine-ns-users-clean-"};
-        fs::create_directories(clean_auth_dir.path);
-        AuthDB clean_auth_db(clean_auth_dir.path, /*cleanup_interval_secs=*/0);
-        REQUIRE(clean_auth_db.initialize().has_value());
+        yuzu::test::AuthDbPg clean_auth_db;
 
         auto clean_rbac_path = yuzu::test::unique_temp_path("engine-ns-groups-clean-");
         RbacStore clean_rbac(clean_rbac_path);
         REQUIRE(clean_rbac.is_open());
 
-        auto colliding_users = clean_auth_db.find_reserved_prefix_users("engine:");
+        auto colliding_users = clean_auth_db->find_reserved_prefix_users("engine:");
         auto colliding_groups = clean_rbac.find_local_groups_with_prefix("engine:");
         bool would_refuse_to_start =
             !colliding_users.has_value() || !colliding_users->empty() ||

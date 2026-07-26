@@ -1,19 +1,43 @@
 #pragma once
 
 /**
- * scim_store.hpp — storage layer for SCIM v2 provisioning (slice 1).
+ * scim_store.hpp — storage layer for SCIM v2 provisioning (slice 1),
+ * born-on-Postgres (ADR-0006, schema `scim_store`).
  *
  * Maps the IdP-facing SCIM `id` / `externalId` to a Yuzu username, and holds
  * the SCIM bearer credential(s) as sha256 hashes only — mirrors
  * `ApiTokenStore`'s token-hashing pattern (server/core/src/api_token_store.cpp).
+ * SCIM tokens stay verify-only hashes (no `SecretCodec` — there is no
+ * plaintext to envelope-encrypt; a hash cannot be decrypted back to a raw
+ * bearer value the way a `SecretCodec` blob can).
  *
- * Opens its OWN sqlite3 connection to the SAME auth.db file `AuthDB` manages
- * (constructor takes the full db path, not a directory) so SCIM's tables ride
- * auth.db's substrate — and its eventual Postgres migration, ADR-0006 —
- * without a second .db file. Schema is tracked under `MigrationRunner`
- * component "scim"; `schema_meta` is keyed by that component string
- * (verified against migration_runner.cpp/.hpp), so this track is independent
- * of AuthDB's own "auth_db" migration track on the same underlying file.
+ * Posture (ADR-0012 §1): FRESH START, no `migrate_from_sqlite()` — this is a
+ * greenfield born-on-PG store (no prior release shipped a Postgres SCIM
+ * store to backfill from); any pre-existing `auth.db`-resident SCIM mappings
+ * are not carried forward. Construction is fail-CLOSED: `is_open()` is false
+ * if the pool lease or schema migration fails, and server.cpp treats that as
+ * a fatal startup error (same pattern as every other born-on-PG store).
+ * Runtime reads/mutations degrade to the empty/false/nullopt value the
+ * existing (SQLite-era) callers already treat as "operation did not
+ * succeed" — `scim_routes.cpp` (a separate, un-touched slice) already
+ * handles that outcome as a 5xx, so this store keeps the same signatures
+ * rather than introducing a parallel `std::expected` surface here.
+ *
+ * Substrate contract (ADR-0008/0012): holds a `pg::PgPool&` (not a
+ * `sqlite3*`), runs its migration at construction on a pinned lease,
+ * schema-qualifies every runtime statement (`scim_store.scim_resources`,
+ * `scim_store.scim_tokens`, `scim_store.scim_groups`,
+ * `scim_store.scim_group_members`), and uses `RETURNING` for
+ * mutate-and-return (never `sqlite3_changes()`/row-count polling, #1033).
+ * Bounded `try_acquire_for` leases on every runtime path.
+ *
+ * NO per-connection `db_mtx_` anymore (the SQLite single-handle serialization
+ * this store used to rely on) — a `PgPool` hands out independent connections
+ * per lease, same as every other born-on-PG store. `scim_routes.cpp`'s
+ * `recompute_scim_user_role` doc comment references a "LOCK ORDER ...
+ * ScimStore::db_mtx_" that predates this port; that comment is stale as of
+ * this port (member removed) and is out of this store's scope to fix
+ * (routes layer, not touched here) — flagged for the routes owner.
  *
  * This class does NOT implement any HTTP/REST route or JSON codec — it is
  * the data + token layer only (slice 1 of 3; a sibling junior owns the JSON
@@ -27,13 +51,13 @@
  */
 
 #include <cstdint>
-#include <filesystem>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
-struct sqlite3;
+namespace yuzu::server::pg {
+class PgPool;
+}
 
 namespace yuzu::server {
 
@@ -44,7 +68,7 @@ struct ScimResource {
     std::string external_id; ///< IdP's `externalId` claim. Empty if the IdP never sent one.
     std::string username;    ///< The Yuzu username this resource maps to.
     bool active{true};
-    std::string created_at; ///< SQLite `CURRENT_TIMESTAMP` text, UTC.
+    std::string created_at; ///< ISO-8601 UTC text (`YYYY-MM-DDTHH:MM:SSZ`).
     std::string updated_at;
     int64_t etag_version{1}; ///< Bumped on every mutation; usable as a SCIM ETag.
 };
@@ -57,17 +81,19 @@ struct ScimGroup {
     std::string external_id; ///< IdP's `externalId` claim. Empty if the IdP never sent one.
     std::string display_name; ///< The Group's SCIM `displayName`.
     bool active{true};
-    std::string created_at; ///< SQLite `CURRENT_TIMESTAMP` text, UTC.
+    std::string created_at; ///< ISO-8601 UTC text (`YYYY-MM-DDTHH:MM:SSZ`).
     std::string updated_at;
     int64_t etag_version{1}; ///< Bumped on every mutation; usable as a SCIM ETag.
 };
 
 class ScimStore {
 public:
-    /// `db_path` is the full path to the auth.db file (the SAME file AuthDB
-    /// manages) — not a directory and not a distinct database file.
-    explicit ScimStore(const std::filesystem::path& db_path);
-    ~ScimStore();
+    /// Borrows the shared pool and runs the `scim_store` schema migration on
+    /// a pinned lease. `is_open()` is false if the lease was empty or the
+    /// migration failed — the server fails closed (startup_failed_) before
+    /// reaching here in production.
+    explicit ScimStore(pg::PgPool& pool);
+    ~ScimStore() = default;
 
     ScimStore(const ScimStore&) = delete;
     ScimStore& operator=(const ScimStore&) = delete;
@@ -98,6 +124,22 @@ public:
                                                 const std::string& external_id = {});
 
     std::optional<ScimResource> get_by_scim_id(const std::string& scim_id) const;
+
+    /// Tri-state existence check: `true` = a resource with this `scim_id`
+    /// exists, `false` = it definitively does not, `nullopt` = the store
+    /// could not answer (closed, lease timeout, failed statement).
+    ///
+    /// ★ SECURITY (2026-07-25 Hermes pass, MEDIUM): `get_by_scim_id` collapses
+    /// "no such resource" and "read failed" into the same `nullopt`, which is
+    /// harmless for a plain lookup but NOT for group-membership resolution:
+    /// `resolve_member_values` treats an unresolvable id as validate-and-skip,
+    /// so on a transient blip a genuinely-provisioned member is dropped and
+    /// the PUT/PATCH handler then persists the SMALLER set — a partial version
+    /// of the durable membership loss the tri-state membership reads fix. Use
+    /// this (not `get_by_scim_id().has_value()`) anywhere a negative answer
+    /// feeds a write. Deliberately additive: `get_by_scim_id`'s many read-only
+    /// call sites keep their existing contract.
+    std::optional<bool> resource_exists(const std::string& scim_id) const;
     std::optional<ScimResource> get_by_username(const std::string& username) const;
 
     /// Empty `external_id` always returns `nullopt` (an empty externalId is
@@ -123,11 +165,10 @@ public:
     /// Delete the resource mapping. Tri-state return so a caller can treat
     /// "the row is already gone" as idempotent success rather than a
     /// failure (UP-N4): `nullopt` on a genuine DB error (no connection,
-    /// prepare failure, or a step-time error such as SQLITE_BUSY/LOCKED/
-    /// IOERR/CORRUPT — the caller should fail closed/retry, never treat it
-    /// as "already gone"); `true` if a row existed and was deleted; `false`
-    /// if no row matched `scim_id` (e.g. a concurrent/duplicate DELETE
-    /// already removed it).
+    /// lease timeout, or a query-time error — the caller should fail
+    /// closed/retry, never treat it as "already gone"); `true` if a row
+    /// existed and was deleted; `false` if no row matched `scim_id` (e.g. a
+    /// concurrent/duplicate DELETE already removed it).
     std::optional<bool> delete_by_scim_id(const std::string& scim_id);
 
     // ── SCIM groups (slice 2, #2021) ─────────────────────────────────────
@@ -200,23 +241,37 @@ public:
     /// absent member returns true (no-op), not an error.
     bool remove_group_member(const std::string& group_scim_id, const std::string& user_scim_id);
 
-    /// All `user_scim_id`s currently a member of `group_scim_id`. Empty
-    /// vector on no members or an unknown/absent group (not distinguished —
-    /// callers that need existence should check `get_group_by_id` first).
-    std::vector<std::string> list_group_member_user_scim_ids(const std::string& group_scim_id) const;
+    /// All `user_scim_id`s currently a member of `group_scim_id`.
+    ///
+    /// ★ SECURITY (2026-07-25 review, HIGH #3): returns `nullopt` when the
+    /// store could not answer (pool-lease timeout, failed statement) —
+    /// DISTINCT from an engaged-but-empty vector, which means the group
+    /// genuinely has no members. These were fused into a bare empty vector,
+    /// and because this read feeds a read-modify-write membership replace,
+    /// a momentary blip read as "no current members" and the subsequent
+    /// write then DURABLY DELETED the real membership. Callers MUST fail
+    /// closed on `nullopt` and never treat it as an empty set. Existence of
+    /// the group itself is still not distinguished — check `get_group_by_id`
+    /// first if you need that.
+    std::optional<std::vector<std::string>>
+    list_group_member_user_scim_ids(const std::string& group_scim_id) const;
 
     /// Reverse lookup: every group `displayName` that `user_scim_id` is
     /// currently a member of (join scim_group_members -> scim_groups). This
-    /// is the primary read the role-application task (a later, separate
-    /// task) consumes to decide SCIM-group-to-Yuzu-role mapping.
-    std::vector<std::string>
+    /// is the primary read the role-application task consumes to decide
+    /// SCIM-group-to-Yuzu-role mapping.
+    ///
+    /// ★ SECURITY (same finding): `nullopt` on store failure. An empty vector
+    /// here resolves the user to `role=user`, so a blip that read as "member
+    /// of no groups" would silently demote a SCIM-provisioned admin — the
+    /// authoritative-read-fails-open anti-pattern `docs/postgres-store-playbook.md`
+    /// rejects, and the same argument this PR makes for MFA.
+    std::optional<std::vector<std::string>>
     list_group_display_names_for_user(const std::string& user_scim_id) const;
 
 private:
-    sqlite3* db_{nullptr};
-    mutable std::mutex db_mtx_; // Serializes access to this connection.
-
-    void create_tables();
+    pg::PgPool& pool_;
+    bool open_{false};
 };
 
 } // namespace yuzu::server
