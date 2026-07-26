@@ -416,7 +416,13 @@ std::optional<bool> exists_where(TarDatabase& db, std::string_view table,
 // per-table warns would bury the signal ~20 lines deep on an endpoint nobody is
 // tailing. Per-table detail is at debug; the durable operator surface is the
 // `tar status` counters, since the agent has no /metrics endpoint.
-void warn_if_degraded(int declined, int unreadable, int total, bool persist_failed) {
+void warn_if_degraded(int declined, int unreadable, int total, bool persist_failed, int capped) {
+    if (capped > 0)
+        spdlog::warn("TAR retention: the per-pass cap bound on {} table(s) this pass, so a backlog "
+                     "was left behind. Sustained, this means expiry is outrunning the drain and "
+                     "tar.db grows without bound -- neither a decline nor a failure, so nothing "
+                     "else reports it (see retention_guard_capped in `tar status`)",
+                     capped);
     if (declined > 0)
         spdlog::warn("TAR retention: clock guard declined {} of {} time-based tables this pass. "
                      "More than the retention threshold elapsed since the last pass, or the whole "
@@ -441,7 +447,7 @@ RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard
     // Probe failures and delete failures are merged: both mean "this table is
     // not being retained", which is the only distinction the operator surface
     // needs to draw against a clock decline.
-    RetentionGuardCounters out{guard.declines, guard.failures};
+    RetentionGuardCounters out{guard.declines, guard.failures, guard.cap_binds};
     for (const auto& [table, count] : guard.delete_failures)
         out.failures[table] += count;
     return out;
@@ -463,12 +469,24 @@ std::vector<std::string> format_retention_guard_lines(const RetentionGuardState&
         total_failures += count;
         lines.push_back(std::format("retention_guard_failed|{}|{}", table, count));
     }
-    // Both totals are ALWAYS emitted, including zeros: an absent line is
+    int64_t total_cap_binds = 0;
+    for (const auto& [table, count] : counters.cap_binds) {
+        if (count <= 0)
+            continue;
+        total_cap_binds += count;
+        lines.push_back(std::format("retention_guard_capped|{}|{}", table, count));
+    }
+    // All three totals are ALWAYS emitted, including zeros: an absent line is
     // ambiguous between "no declines" and "an agent too old to report", and the
     // failures total is what stops a zero declines total from being read as
     // "this endpoint's clock is fine" when retention has actually stopped.
+    //
+    // The capped total is the third leg and covers the state neither of the
+    // others can express: nothing declined, nothing failed, and the table is
+    // STILL growing because expiry is outrunning the per-pass cap.
     lines.push_back(std::format("retention_guard_declines_total|{}", total_declines));
     lines.push_back(std::format("retention_guard_failures_total|{}", total_failures));
+    lines.push_back(std::format("retention_guard_capped_total|{}", total_cap_binds));
     return lines;
 }
 
@@ -501,7 +519,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         std::string sql;
     };
     std::vector<Plan> plans;
-    int declined_tables = 0, time_based_tables = 0, unreadable_tables = 0;
+    int declined_tables = 0, time_based_tables = 0, unreadable_tables = 0, capped_tables = 0;
     bool persist_failed = false;
 
     // Durable across restarts, so the elapsed-time check still fires on the
@@ -598,6 +616,26 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             if (g.retention_type != RetentionType::kTimeBased) {
                 if (retention_sql(table_name, now_epoch).empty())
                     continue; // not a retention-bearing table
+                // Will the cap bind? Ask whether a row survives BEYOND
+                // ceiling + cap: if one does, this pass deletes its 5000 and
+                // still leaves a backlog.
+                //
+                // This is the state that made capping row-count retention a
+                // REGRESSION rather than a pure improvement. Before the cap the
+                // delete trimmed to the ceiling every pass; now a table gaining
+                // more than the cap per 900s tick grows for ever -- and NOTHING
+                // else reports it, because nothing declined and nothing failed.
+                // An unreadable probe is counted as binding (conservative: the
+                // operator sees a signal rather than silence).
+                const auto over = exists_where(
+                    db, table_name,
+                    std::format("id <= (SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
+                                table_name, g.retention_default + kMaxTarDeletesPerTablePerPass));
+                if (!over || *over) {
+                    std::lock_guard lock(guard.mu);
+                    ++guard.cap_binds[table_name];
+                    ++capped_tables;
+                }
                 plans.push_back(Plan{
                     table_name,
                     std::format("DELETE FROM {} WHERE id IN ("
@@ -688,17 +726,26 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // deleted with no decline and no counter (#2361 Gate 8 / Sol).
             //
             // "Will the cap bind?" is answered by asking whether a (cap+1)th
-            // expired row exists -- bounded, index-driven, and only for a table
-            // that is actually in the wipe condition, so the healthy path pays
-            // nothing. An unreadable answer is treated as "yes", keeping the
-            // latch armed, which is the conservative direction.
-            bool cap_will_bind = false;
-            if (would_wipe) {
-                const auto more = exists_where(
-                    db, table_name,
-                    std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
-                                kMaxTarDeletesPerTablePerPass));
-                cap_will_bind = !more || *more;
+            // expired row exists -- bounded and index-driven (`idx_{table}_{ts}`
+            // exists for every warehouse table), measured at well under a
+            // millisecond across the whole registry.
+            //
+            // Probed on EVERY accepted pass, not just the wipe condition. It
+            // feeds two things now: the latch (as before -- an unreadable answer
+            // counts as binding, keeping the latch armed, the conservative
+            // direction), and the cap-binding counter. A table can be cap-bound
+            // WITHOUT being in the wipe condition -- ordinary expiry outrunning
+            // the drain -- and that is the state no other counter can express,
+            // because nothing declined and nothing failed while the table grows
+            // (#2361 Gate 4, unhappy-path UP-1).
+            const auto more =
+                exists_where(db, table_name,
+                             std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
+                                         kMaxTarDeletesPerTablePerPass));
+            const bool cap_will_bind = !more || *more;
+            if (cap_will_bind) {
+                ++guard.cap_binds[table_name]; // already under guard.mu here
+                ++capped_tables;
             }
             latched = would_wipe && cap_will_bind;
             // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
@@ -715,7 +762,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
 
 
     if (plans.empty()) {
-        warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
+        warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed,
+                     capped_tables);
         return; // nothing queued: no BEGIN, no COMMIT.
         // NOTE this is emptiness of the PLAN list, which is not the same as
         // "every time-based table declined": row-count tiers are queued
@@ -768,7 +816,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                          "were not attempted and nothing was retained this pass",
                          plans.size());
     }
-    warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
+    warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed,
+                     capped_tables);
 }
 
 } // namespace yuzu::tar

@@ -546,6 +546,29 @@ groups:
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
       # degrades to nothing on the next boot.
+      # LIVENESS. Every other rule in this group fires on activity, so the one
+      # state none of them can express is "retention never ran at all" -- an
+      # audit.db growing without bound, six counters reading zero, /healthz ok,
+      # indistinguishable from an idle server. Reachable with NO fault: the
+      # cleanup loop sleeps the full interval before its first pass, so a server
+      # restarting more often than cleanup_interval_min (default 60m) never
+      # completes one. Alert on the ABSENCE of increase (#2360, UP-2).
+      - alert: YuzuAuditRetentionNotRunning
+        expr: |
+          increase(yuzu_server_audit_retention_passes_total[3h]) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit retention has not run for 3 hours"
+          description: >-
+            No audit retention pass has completed in 3 hours (default cadence is
+            hourly). audit.db is growing without bound and NO other retention
+            alert will fire, because they all key on activity. Most likely the
+            server is restarting more often than the cleanup interval, or the
+            cleanup thread died. Check uptime and restart history first.
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
       - alert: YuzuAuditRetentionStateNotPersisting
         expr: |
           increase(yuzu_server_audit_retention_persist_failed_total[1h]) > 0

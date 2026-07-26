@@ -226,6 +226,21 @@ public:
         return persist_failed_.load(std::memory_order_relaxed);
     }
 
+    /// Cumulative retention passes ATTEMPTED, whatever the outcome -- deleted,
+    /// declined, nothing-to-do, or failed.
+    ///
+    /// The liveness counter. Every other retention metric only moves when
+    /// something HAPPENED, so "retention has not run at all" is invisible to all
+    /// of them: an audit.db growing without bound looks exactly like an idle
+    /// server, with six counters reading zero and /healthz reporting ok. That
+    /// state is reachable without any fault -- `run_cleanup` sleeps the FULL
+    /// interval before its first pass, so a server restarting more often than
+    /// `cleanup_interval_min` never completes one (#2360 Gate 4, unhappy-path
+    /// UP-2). Alert on the ABSENCE of increase here, not on a value.
+    uint64_t passes_total() const noexcept {
+        return passes_total_.load(std::memory_order_relaxed);
+    }
+
     /// Run exactly ONE retention pass against `now` (epoch seconds) and return
     /// the number of rows deleted. Returns 0 when the pass declined (clock
     /// guard), when nothing was expired, or when the pass failed.
@@ -263,6 +278,8 @@ private:
     std::atomic<uint64_t> rows_deleted_{0};
     std::atomic<uint64_t> cap_reached_{0};
     std::atomic<uint64_t> persist_failed_{0};
+    /// Liveness: bumped once per cleanup_once() call whatever the outcome.
+    std::atomic<uint64_t> passes_total_{0};
     std::atomic<bool> retention_index_ok_{false};
     // Guard state for cleanup_once(). Plain (non-atomic) members: both are read
     // and written only under the exclusive mtx_ that cleanup_once() holds for

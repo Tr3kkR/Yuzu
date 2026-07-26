@@ -165,12 +165,30 @@ struct RetentionGuardState {
     /// "this table is not being retained", which is why the status surface sums
     /// them into one total.
     std::map<std::string, int64_t> delete_failures;
+    /// Cumulative passes where the per-pass cap BOUND for this table -- i.e. the
+    /// pass deleted its 5000 and left a backlog behind.
+    ///
+    /// This is the failure the cap itself introduces, and it needs its own
+    /// counter because NEITHER of the two above moves in that state: nothing
+    /// declined and nothing failed, so a table growing without bound reports as
+    /// perfectly healthy. Row-count tiers made that reachable -- before the cap
+    /// they trimmed to their ceiling every pass, and any table gaining more than
+    /// kMaxTarDeletesPerTablePerPass rows per 900s tick now grows for ever.
+    ///
+    /// The audit store has exactly this counter for exactly this reason
+    /// (`yuzu_server_audit_retention_cap_reached_total`); the agent side was
+    /// missing it (#2361 Gate 4, unhappy-path UP-1).
+    std::map<std::string, int64_t> cap_binds;
 };
 
 /// Snapshot of the operator-facing counters, taken under `RetentionGuardState::mu`.
 struct RetentionGuardCounters {
     std::map<std::string, int64_t> declines;
     std::map<std::string, int64_t> failures;
+    /// Passes that hit the per-pass cap and left a backlog. Read ALONGSIDE the
+    /// other two: sustained growth here means expiry is outrunning the drain,
+    /// which neither declines nor failures can express.
+    std::map<std::string, int64_t> cap_binds;
 };
 
 [[nodiscard]] RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard);
