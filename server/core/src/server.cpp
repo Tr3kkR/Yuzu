@@ -599,7 +599,8 @@ public:
         // Iterated from the ONE array in mcp_input_bounds.hpp rather than
         // restated here: a second literal list is how a new rule ends up
         // emitted-but-unseeded, which passes its own test and silently breaks
-        // absent() alerting.
+        // absent() alerting. This commit's six targeting reasons went into
+        // that array, not into a list here - which is the tether working.
         for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
             metrics_.counter("yuzu_mcp_tool_args_too_large_total",
                              {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
