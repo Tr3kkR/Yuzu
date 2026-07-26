@@ -162,11 +162,11 @@ nothing happened.
 - **Single-admin deployments:** there is no self-service unlock for the *only*
   admin (the unlock endpoint requires a second privileged principal), so either
   wait out the window or use the offline recovery procedure in
-  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. **Note:**
-  since the AuthDB → Postgres migration (see "⚠️ Breaking: local accounts + MFA
-  enrolments reset" below), that runbook's SQL-surgery steps are SQLite-era and
-  do not apply — for a PG-backed deployment there is no offline SQL fallback
-  for the sole-admin case today; wait out the window.
+  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. That
+  runbook is now Postgres-native throughout: its fallback clears
+  `failed_login_count` / `locked_until` with `psql "$YUZU_POSTGRES_DSN"`
+  against `auth.users`, which is exactly the sole-admin case. It writes no
+  audit row, so record it in your change-management system.
 
 ## Behaviour change: operator/API tags now beat agent self-report (#1411)
 
@@ -299,14 +299,17 @@ collision check above). At boot, the server now scans for any pre-existing
 it finds one — silently coexisting with (or being shadowed by) a real engine
 principal is not an acceptable outcome, so this fails closed rather than
 booting into an ambiguous state (decision log #3). Before upgrading, run
-against your `auth.db` and `rbac.db`:
+against both stores. Note they live on different substrates: local users are in
+Postgres (`auth.users`), while local RBAC groups are still SQLite (`rbac.db`):
 
-```sql
--- auth.db
-SELECT username FROM users WHERE username LIKE 'engine:%';
+```bash
+# Local users — Postgres.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username FROM auth.users WHERE username LIKE 'engine:%';"
 
--- rbac.db
-SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';
+# Local RBAC groups — SQLite, per-node. Run on every node.
+sqlite3 /var/lib/yuzu/rbac.db \
+  "SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';"
 ```
 
 If either query returns rows, rename or remove those users/groups **before**
@@ -374,9 +377,9 @@ the token expires, restart with `optional`, log in, enroll, then re-enable.
 **Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
 admin can't enroll): restart the server with `--mfa-enforcement=optional`
 (this re-seeds the in-memory config), log in, resolve enrollment, then
-re-enable. See `docs/ops-runbooks/auth-db-recovery.md` (SQLite-era; the
-restart procedure above works unchanged post-AuthDB→Postgres migration, but
-that runbook's SQL-surgery steps do not apply to a Postgres-backed AuthDB).
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md` — that runbook is now
+Postgres-native throughout, so both the restart procedure above and its SQL
+steps apply as written to a Postgres-backed AuthDB.
 
 ## Hardened auth mode (`--auth-mode=sso-only`) — opt-in (SOC 2 CC6.3/CC6.6)
 
@@ -407,8 +410,8 @@ the **Postgres** auth store, so `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
 **required** — point it at the same database the server uses; without it the
 command fails closed with "requires the Postgres auth store" and does nothing.
 `--data-dir` is still needed for the audit record. Full runbook:
-`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (its SQL-surgery
-sections elsewhere are SQLite-era and superseded — see its banner).
+`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (that runbook is now
+Postgres-native throughout).
 
 **Migration.** `break_glass_armed_until` is a nullable column on `auth.users`.
 It arrived as SQLite `auth.db` migration v4, but the AuthDB→Postgres cutover
@@ -509,9 +512,9 @@ and does not re-invalidate already-reissued tokens).
 See `docs/auth-architecture.md` § "AuthDB — persistent authentication store"
 for the full design rationale, and
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md)
-for lockout/break-glass recovery — note that runbook predates this cutover
-and its file-based SQL steps do not apply to the Postgres-backed store; see
-its banner.
+for lockout/break-glass recovery — that runbook has been rewritten for this
+cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
+the `auth` schema).
 
 ## Upgrade Order
 

@@ -309,12 +309,20 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
+  --data-dir /var/lib/yuzu \
   --mfa-reset alice
 # {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
 ```
 
 - `--postgres-dsn` is **required** — without it the one-shot exits non-zero
-  with "requires the Postgres auth store". `--data-dir` no longer governs this.
+  with "requires the Postgres auth store". `--data-dir` no longer governs the
+  *auth* store.
+- `--data-dir` is still required for the **audit** store: the mandatory audit
+  row is written to `<data-dir>/audit.db`. Pass the same directory the running
+  service uses. If you omit it the path resolves relative to your current
+  working directory and SQLite silently *creates* a fresh `./audit.db` — the
+  command still prints `{"status":"ok"}`, but the evidence row is orphaned
+  outside the real audit trail (SOC 2 CC6.6).
 - `--ca-dir` is required whenever the KEK is not in the platform default
   location, because the command builds the full auth stack (pool → key
   provider → codec → AuthDB) exactly as the server does.
@@ -383,11 +391,26 @@ sudo -u _yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --postgres-dsn "$YUZU_POSTGRES_DSN" \
   --ca-dir /etc/yuzu/certs \
+  --data-dir /var/lib/yuzu \
+  --break-glass-user alice \
   --break-glass-arm
-# → arms the configured --break-glass-user for --break-glass-window-secs
+# → arms the named --break-glass-user for --break-glass-window-secs
 #   (default 24h, auto-expiring), prints {"status":"ok",…,"armed_until":"…"}
 #   and EXITS without serving.
 ```
+
+`--break-glass-arm` **requires** `--break-glass-user` (or the
+`YUZU_BREAK_GLASS_USER` env var) to name the account. It is a CLI/env option
+only — it does not come from `yuzu-server.cfg`, so the one-shot must repeat
+whatever the running service passes in its unit file. Omit it and the command
+exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
+arming nothing.
+
+Arming is fail-closed on audit: the store is checked writable *before* the
+mutate, and if the row fails to persist afterwards the arm is rolled back
+(the account ends up NOT armed). That makes the `--data-dir` note above load-
+bearing here too — point it at the real audit store, or you will arm the glass
+and record it somewhere nobody is looking.
 
 Same flag requirements and the same threat model as `--mfa-reset` above. The
 arm is audited at `kCritical` as `auth.breakglass.armed`, attributed to the OS
