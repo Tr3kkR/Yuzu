@@ -343,28 +343,35 @@ below).
 Retention is driven by the server's wall clock, so a clock that jumps forward
 --- a restored VM snapshot, an NTP correction after a dead CMOS battery, a
 hand-set date --- can mark the whole table expired at once. A cleanup pass
-refuses to act on that:
+refuses to act on that. (Triage guidance:
+[the runbook](../ops-runbooks/audit-store-clock-guard.md).)
 
-- **It declines a pass that would expire every datable row**, logs a warning,
-  and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
-  applies when the gap since the previous pass exceeds **a fixed 7 days**, or
-  when the stored reading is *ahead* of the current clock. That reading is
-  persisted, so the check still fires on the first pass after a restart --- including
-  a server that *booted* with an already-wrong clock. The 7 days is
-  **absolute, not derived from `audit_retention_days`**: how far the clock moved
-  has nothing to do with how long rows are kept, and scaling it to the window
-  put the threshold at a full year on the 365-day default, where it could never
-  fire. Elapsed time still cannot tell a clock jump from an outage, so a server
-  that was genuinely down for more than a week declines one cleanup pass ---
-  deliberately cheap, and the warning names both causes. A fourth trigger fires
-  when there is NO stored reading at all --- the first pass after upgrading to a
-  build that has the guard, or after a restore --- because the elapsed-time
-  check cannot run without one. That is expected once per database and needs no
-  action. The first three triggers LATCH, so an audit table that is
-  *legitimately* all-expired still ages out --- it just costs one cleanup
-  interval first. The fourth deliberately does not latch: a missing comparison
-  point is not an anomaly, and spending the latch on it would let a real one on
-  the very next pass go undeclined.
+- **A pass declines, deletes nothing, logs a warning, and increments
+  `yuzu_server_audit_clock_anomaly_skips_total`** when any of these holds:
+
+  1. it would expire **every** datable row;
+  2. more than **a fixed 7 days** elapsed since the previous pass;
+  3. the stored clock reading is **ahead** of now;
+  4. there is **no stored reading at all** --- the first pass after upgrading to
+     a build with the guard, or after a restore.
+
+  **Triggers 1-3 latch**: the pass declines once, then the next resumes paced,
+  so a table that is legitimately all-expired still ages out at the cost of one
+  cleanup interval. **Trigger 4 does not latch** --- a missing comparison point
+  is not an anomaly, and spending the latch on it would let a real one on the
+  very next pass go undeclined.
+
+  **What to do:** for 4, nothing; it is expected once per database. For 2 and 3,
+  check the host's time sync AND its uptime, because elapsed time cannot tell a
+  clock jump from an outage and the warning names both causes. Triage detail is
+  in [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+
+  The 7 days is **absolute, not derived from `audit_retention_days`**: how far
+  the clock moved has nothing to do with how long rows are kept, and scaling it
+  to the window put the threshold at a full year on the 365-day default, where
+  it could never fire. The reading is persisted, so trigger 2 still fires on the
+  first pass after a restart --- including a server that *booted* with an
+  already-wrong clock.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
   default), oldest first. A wipe the guard chose to allow therefore ages out at
   a paced rate an operator can still catch, rather than in one statement.
@@ -392,7 +399,7 @@ as survivors, and a single declined pass becomes more likely.
 
 **What this does and does not promise.** The cap is the half that always
 applies: it bounds the damage of any allowed wipe unconditionally. The two
-detectors are all best-effort, and the outcome test has a known blind spot --- it is
+The detectors are all best-effort, and the outcome test has a known blind spot --- it is
 defeated by *any* audit row written after the clock moved, because a fresh row
 counts as a survivor. On a server that is up and serving, that is the common
 case, which is why the elapsed-time reading is persisted across restarts. Taken

@@ -468,7 +468,7 @@ groups:
             row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
             threshold, not scaled to audit_retention_days); the stored clock reading
             was AHEAD of the current clock; or there was NO stored reading at all, so the
-            elapsed-time check could not run. That last one fires exactly ONCE per
+            elapsed-time check could not run. That last one normally fires ONCE per
             database, on the first pass after upgrading to a build with the guard (or
             after a restore) - so expect one alert per server on a fleet upgrade and
             stand it down; the runbook says how to tell it apart.

@@ -777,13 +777,18 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   (`ttl_expires_at` is stamped at INSERT), so a reduction does not reclaim disk
   retroactively. Full behaviour:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
-- **Expect one retention decline per store, on the first pass after upgrade.**
-  Both guards decline once when they find no stored clock reading to compare
-  against, because the elapsed-time check cannot run without one. It is logged,
-  it increments the decline counter, and it needs no action - the next pass
-  proceeds normally. On a fleet upgrade that is one alert per server if you have
-  wired `YuzuAuditRetentionClockAnomaly`; stand them down. See
-  [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+- **Expect a retention decline on the first pass after upgrade.** Both guards
+  decline when they find no stored clock reading to compare against, because the
+  elapsed-time check cannot run without one. It is logged, it increments the
+  decline counter, and it needs no action - the next pass proceeds normally.
+  **The count differs by store:** the audit store is one table, so it declines
+  exactly once. TAR checks per warehouse table, so on an agent upgrade every
+  enabled time-based table declines in that same pass and
+  `retention_guard_declines_total` rises by the number of those tables (5-10 on
+  a default agent), not by 1. That is still the benign bootstrap case, not a
+  fleet of separate anomalies. On a fleet upgrade expect one
+  `YuzuAuditRetentionClockAnomaly` per server if you have wired it; stand them
+  down. See [the runbook](../ops-runbooks/audit-store-clock-guard.md).
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the best-effort index build described
   under Schema Migrations above.

@@ -184,7 +184,8 @@ public:
     /// fired); or the stored reading was AHEAD of the current
     /// clock; or there was NO stored reading at all, so the elapsed-time check
     /// could not run (the first pass after upgrading to a build with the guard,
-    /// or after a restore -- expected exactly once per database, and the one
+    /// or after a restore -- expected once per database, recurring only if the
+    /// reading cannot be written at all, and the one
     /// trigger that does NOT spend the decline latch).
     ///
     /// The elapsed-time one cannot distinguish a forward clock jump from an

@@ -568,10 +568,10 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         auto enabled_key = std::format("{}_enabled", src.name);
         if (canonical_source_enabled(
                 db.get_config(enabled_key, src.default_enabled ? "true" : "false")) != "true") {
-            // Clear this source's latches while it is skipped. A latch left armed
+            // Clear this source's latches while it is skipped. A latch left SET
             // across a pause is spent: the first pass after the operator
             // re-enables the source would delete capped with no decline, no
-            // counter and no warn, even if the anomaly that armed it is still
+            // counter and no warn, even if the anomaly that set it is still
             // live. Counters are cumulative and deliberately survive.
             std::lock_guard lock(guard.mu);
             for (const auto& g : src.granularities)
@@ -706,40 +706,22 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                 continue;
             }
             // Hold the latch only while an anomaly is STILL BEING WORKED OFF:
-            // the wipe condition held AND the cap will leave rows behind. The
-            // second half is what an earlier round got wrong -- latching purely
-            // on `would_wipe` left the latch armed after a pass that drained the
-            // whole backlog, so a real anomaly arriving before the next tick
-            // deleted with no decline and no counter (#2361 Gate 8 / Sol).
+            // the wipe condition held AND the cap will leave rows behind.
+            // Latching on `would_wipe` alone left the latch set after a pass
+            // that drained the whole backlog (#2361 Gate 8 / Sol).
             //
-            // "Will the cap bind?" is answered by asking whether a (cap+1)th
-            // expired row exists -- bounded, index-driven, and only for a table
-            // that is actually in the wipe condition, so the healthy path pays
-            // nothing. An unreadable answer is treated as "yes": assume the
-            // backlog remains.
+            // The probe asks whether a (cap+1)th expired row exists: bounded,
+            // index-driven, and only for a table already in the wipe condition.
             //
-            // Say SET, not "armed". Everywhere else in this file "re-arm" means
-            // `latched = false` -- restoring the guard's ability to decline --
-            // so calling a SET latch "armed" inverts the vocabulary in the same
-            // file (Gate re-review). A set latch makes the next pass skip the
-            // decline arm and fall through to the DELETE.
-            //
-            // And this default is the PERMISSIVE one, not the conservative one
-            // an earlier version of this comment claimed. Every other unknown
-            // here resolves toward preserving data (probe failure, unparseable
-            // or out-of-range reading, missing reading, batch failure); this is
-            // the single exception, chosen deliberately.
-            //
-            // What it actually buys is modest, so do not overstate it: clearing
-            // the latch would not stall the drain, it would HALVE it. The next
-            // pass would decline and re-set the latch, the one after would
-            // delete, giving alternate-pass deletion. Worth having, not vital.
-            //
-            // Note also this cannot grant permission from nothing: `would_wipe`
-            // implies `anomaly`, so reaching here with `would_wipe` true means
-            // the latch was ALREADY set (otherwise the decline arm fired). The
-            // unreadable probe extends an existing permission by one pass; it
-            // never creates one.
+            // UNREADABLE defaults to "yes", i.e. leave the latch SET, which
+            // PERMITS the next delete. That is the one default here that leans
+            // toward deleting; every other unknown in this guard leans toward
+            // preserving. It is safe because it cannot grant permission from
+            // nothing -- `would_wipe` implies an anomaly, so reaching here with
+            // it true means the latch was already set -- and cheap to be wrong
+            // about: clearing it would at worst give alternate-pass deletion on
+            // a quiet table, while an active one mints fresh rows via
+            // `run_aggregation` and deletes at full rate regardless.
             bool cap_will_bind = false;
             if (would_wipe) {
                 const auto more = exists_where(

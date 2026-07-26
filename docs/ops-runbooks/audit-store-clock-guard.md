@@ -15,7 +15,7 @@ Background: `docs/user-manual/audit-log.md`, ADR-0006, issue #2360.
 
 ## The retention guard, in one paragraph
 
-(For the write path, see the `YuzuAuditPersistFailures` section above.)
+(For the write path, see the `YuzuAuditPersistFailures` section below.)
 
 `audit_events` rows expire on a TTL derived from the server's wall clock. A
 forward clock jump makes every row look expired at once, and the delete that

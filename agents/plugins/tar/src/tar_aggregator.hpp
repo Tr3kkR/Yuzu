@@ -150,6 +150,10 @@ struct RetentionGuardState {
     mutable std::mutex mu;
     /// "This table already declined for the current anomaly." Keyed by real
     /// table name. Cleared once the wipe condition stops holding.
+    /// VOCABULARY, because this file uses both words: the latch is SET or
+    /// CLEAR. A SET latch means "already declined for the current anomaly", so
+    /// it PERMITS the next pass to delete. "Re-arm the guard" means CLEARING it
+    /// -- restoring the ability to decline. Set != armed; they are opposites.
     std::map<std::string, bool> latched;
     /// Cumulative declines per table, surfaced through the `tar status` action.
     /// The agent has no /metrics endpoint, so this is the operator's only
@@ -195,7 +199,8 @@ format_retention_guard_lines(const RetentionGuardState& guard);
  * always going to. Time-based retention is clock-guarded (#2361): a pass that
  * would delete every datable row of a table, that follows a wall-clock jump
  * larger than kTarMinBigStepSec (an ABSOLUTE threshold -- NOT the tier's
- * retention window), that finds the stored reading AHEAD of the current clock,
+ * retention window), that finds the stored reading IMPLAUSIBLE (ahead of the
+ * current clock, negative, or unparseable),
  * or that finds NO stored reading at all (the elapsed-time check cannot run
  * without one -- the first pass after an agent upgrade or a restore), declines
  * and is counted instead. The first three LATCH, so a table that is genuinely

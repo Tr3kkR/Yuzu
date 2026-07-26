@@ -294,9 +294,9 @@ config|process_enabled|errored
 ever writes (corruption or tampering); the source is fail-closed until it is
 re-`configure`d. See the tri-state description below.
 
-`retention_guard_declines_total` counts retention passes this agent declined -
-because its clock moved, or because there was no stored reading yet to compare
-against (the first pass after an agent upgrade, expected once) - and
+`retention_guard_declines_total` counts retention passes this agent declined
+(see [The retention clock guard](#the-retention-clock-guard) for the four
+triggers and which of them are benign), and
 `retention_guard_failures_total` counts tables that
 could not be retained at all -- whether the probes could not be read or the
 delete itself failed (see "The retention clock guard" below). Both
@@ -435,29 +435,40 @@ window with it.
 
 A retention pass therefore refuses to act on that:
 
-- **It declines a pass that would delete every datable row of a table**, and
-  counts the decline. The same applies when more than **a fixed 30 days** of
-  wall-clock time has elapsed since the previous pass, or when the stored
-  reading is *ahead* of the current clock. That reading is persisted in
-  `tar_config`, so it still fires on the first pass after an agent restart,
-  including an agent that *booted* with a wrong RTC. The 30 days is **absolute,
-  not derived from the tier's retention window**: how far the clock moved has
-  nothing to do with how long that tier keeps rows, and scaling it to the window
-  put the threshold at a year on the monthly tier, where it could never fire.
-  Elapsed time still cannot tell a jump from a dark laptop, which is why the
-  threshold sits past the point where an outage is itself remarkable -- a laptop
-  switched off over a long weekend reports nothing; one switched off for a month
-  declines one tick. A fourth trigger fires when there is NO stored reading at
-  all -- the first pass after an agent upgrade or a restore -- because the
-  elapsed-time check cannot run without one; that is expected once per database
-  (the reading is one `tar_config` key shared by every source and table, not one
-  per table). It recurs only if the agent cannot WRITE that key at all -- a
-  read-only or full disk -- in which case the declines keep coming, which is the
-  safe direction and is what `retention_guard_failures_total` is for. The first three triggers LATCH; the fourth deliberately does not,
-  since a missing comparison point is not an anomaly and spending the latch on it
-  would let a real one on the very next pass go undeclined. The latch is per
-  table, so a warehouse that is legitimately all-expired still ages out -- it
-  just costs one rollup tick (900 s) first.
+- **A pass declines for a table, deletes nothing from it, and counts the
+  decline** when any of these holds:
+
+  1. it would delete **every** datable row of that table;
+  2. more than **a fixed 30 days** elapsed since the previous pass;
+  3. the stored reading is **ahead** of the current clock;
+  4. there is **no stored reading at all** -- the first pass after an agent
+     upgrade or a restore.
+
+  **Triggers 1-3 latch** per table, so a warehouse that is legitimately
+  all-expired still ages out at the cost of one rollup tick (900 s).
+  **Trigger 4 does not latch**, since a missing comparison point is not an
+  anomaly and spending the latch on it would let a real one on the very next
+  pass go undeclined.
+
+  **What to do:** for 4, nothing. The reading is a single `tar_config` key
+  shared by every source and table, so it is expected once per agent -- but note
+  EVERY enabled time-based table declines in that one pass, so the total jumps
+  by the table count, not by 1. It recurs only if the agent cannot WRITE that
+  key at all (read-only or full disk), which is the safe direction and is what
+  `retention_guard_failures_total` is for. For 2 and 3, check the endpoint's
+  clock and its uptime; see
+  [the runbook](../ops-runbooks/audit-store-clock-guard.md) for the audit twin
+  of this triage.
+
+  The 30 days is **absolute, not derived from the tier's retention window**: how
+  far the clock moved has nothing to do with how long that tier keeps rows, and
+  scaling it to the window put the threshold at a year on the monthly tier,
+  where it could never fire. Elapsed time cannot tell a jump from a dark laptop,
+  so the threshold sits past the point where an outage is itself remarkable -- a
+  laptop off over a long weekend reports nothing; one off for a month declines
+  one tick. The reading is persisted in `tar_config`, so trigger 2 still fires
+  on the first pass after an agent restart, including one that *booted* with a
+  wrong RTC.
 - **Every accepted pass deletes at most 5,000 rows per table**, oldest first
   (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
   A wipe the guard chose to allow ages out at a paced rate rather than in one
@@ -492,12 +503,12 @@ persistently wrong clock will still drain the window over several ticks.
 The operator surface is `retention_guard_declines_total` and
 `retention_guard_failures_total` (plus the per-table `retention_guard|<table>|<n>`
 and `retention_guard_failed|<table>|<n>` lines) in the `status` action, described
-above. A non-zero declines total means this is the expected once-per-database first
-pass after an agent upgrade or restore, or that the endpoint's clock moved **or** the
-endpoint was dark for longer than the threshold, **or** the stored reading was
-ahead of the clock (a backward correction, or tampering) -- elapsed time cannot
-separate these, so check the host's time synchronisation *and* its uptime
-history. A non-zero failures total means retention has stopped for that table
+above. A non-zero declines total has four possible causes, listed in
+[The retention clock guard](#the-retention-clock-guard). One of them is benign
+and expected after an agent upgrade; the rest mean the endpoint's clock moved,
+it was dark longer than the threshold, or the stored reading was ahead of the
+clock. Elapsed time cannot separate those, so check the host's time
+synchronisation *and* its uptime history. A non-zero failures total means retention has stopped for that table
 for a reason that is not the clock: either its probes could not be read, or its
 delete failed. What happens to the REST of the pass depends on the error. One
 that aborts the transaction itself (a disk-full, an I/O error) rolls the whole

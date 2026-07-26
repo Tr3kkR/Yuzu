@@ -872,26 +872,15 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
                                        "SELECT EXISTS(SELECT 1 FROM audit_events "
                                        "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
                                        binds);
-        // Unreadable: assume a backlog remains.
-        //
-        // Say SET, not "armed". Elsewhere in this file "re-arm" means
-        // `clock_anomaly_latched_ = false` -- restoring the ability to decline
-        // -- so calling a SET latch "armed" inverts the vocabulary in the same
-        // file (Gate re-review). A set latch makes the next pass take the
-        // accepting branch and DELETE.
-        //
-        // This is the PERMISSIVE default, not the conservative one this comment
-        // used to claim. Every other unknown in this guard resolves toward
-        // preserving evidence; this is the single deliberate exception.
-        //
-        // Do not overstate what it buys: clearing the latch would HALVE the
-        // drain (decline, re-set, delete, alternate), not stall it. And it
-        // cannot grant permission from nothing -- `would_wipe` implies an
-        // anomaly, so reaching here with it true means the latch was already
-        // set. This extends a permission by one pass; it never creates one.
-        //
-        // NOTE the audit latch is per-STORE (one `clock_anomaly_latched_` over
-        // one table). Per-table is TAR's model; do not import that phrasing.
+        // UNREADABLE defaults to "a backlog remains", i.e. leave the latch SET,
+        // which PERMITS the next delete. That is the one default in this guard
+        // that leans toward deleting; every other unknown leans toward
+        // preserving evidence. Safe because it cannot grant permission from
+        // nothing -- `would_wipe` implies an anomaly, so reaching here with it
+        // true means the latch was already set -- and cheap to be wrong about:
+        // clearing it would at worst give alternate-pass deletion on an idle
+        // store, while one taking writes stamps a future ttl between passes and
+        // deletes at full rate regardless.
         backlog_remains = !more || *more;
         if (backlog_remains)
             cap_reached_.fetch_add(1, std::memory_order_relaxed);
@@ -899,9 +888,9 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
 
     // Hold the latch only while an anomaly is STILL BEING WORKED OFF: the wipe
     // condition held for this pass AND the cap left rows behind. Both halves
-    // matter. Dropping the first arms it on an ordinary over-cap backlog, which
+    // matter. Dropping the first SETS it on an ordinary over-cap backlog, which
     // masks the decline of a real anomaly arriving next. Dropping the second
-    // leaves it armed after a clean drain, which does the same thing for the
+    // leaves it set after a clean drain, which does the same thing for the
     // window until the next pass clears it.
     clock_anomaly_latched_ = would_wipe && backlog_remains;
     return deleted;
