@@ -162,6 +162,39 @@ groups:
             failure poisons that session's stream). Results remain durably
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
+      - alert: YuzuMcpBridgeTeardownIncomplete
+        expr: |
+          sum by (stage) (increase(yuzu_mcp_bridge_teardown_incomplete_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge teardown could not complete (resource retained)"
+          description: >-
+            stage={{ $labels.stage }}. A claimed teardown could not finish on the
+            maintenance thread. The sweep's claim is one-way, so the record is
+            NEVER retried: whatever it still owns is held until the server
+            restarts - unsubscribe = its event-bus subscription (which also
+            blocks that execution's channel from being garbage-collected),
+            release_charge = a streamed admission slot on its session,
+            erase = the correlation record itself. Client results stay durably
+            fetchable by execution_id. Expected value is 0; investigate memory
+            pressure or lock contention on the health-recompute thread.
+      - alert: YuzuMcpMaintenanceTickFailing
+        expr: |
+          increase(yuzu_mcp_bridge_sweep_tick_failures_total[15m]) > 0
+          or increase(yuzu_mcp_session_gc_tick_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP maintenance tick is throwing (sweep or session gc skipped)"
+          description: >-
+            A bridge sweep or MCP session gc tick threw and was contained
+            (#2487); the tick is skipped rather than retried. Before that
+            containment existed the same exception aborted the whole process,
+            so this firing is strictly better than the alternative - but a
+            sustained rate means pin-ack, session-death and memory-pressure
+            teardown are all stalled, and expired sessions keep their streams
+            and pinned finals. Correlate with host memory pressure.
 
       - alert: YuzuMcpBodyTooLargeRejecting
         expr: |
