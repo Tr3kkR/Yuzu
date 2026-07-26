@@ -22,7 +22,7 @@ until the process restarts.
 
 | reason | settled | retained until restart |
 |---|---|---|
-| `unsubscribe` | the terminal disposition **if there was one** - most teardowns (session death, pin-ack, arming reap, done reap) publish nothing at all, and even a memory-pressure teardown delivers nothing if its publish failed. The audit row says which: it reads either "after the decided terminal was published" or "and nothing was published". | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
+| `unsubscribe` | the terminal disposition **if there was one** - most teardowns (session death, pin-ack, arming reap, done reap) publish nothing at all, and even a memory-pressure teardown delivers nothing if its publish failed. The audit row says which, in one of three forms: "after the decided terminal was published", "the terminal publish POISONED the session" (session-wide - every later attach 410s), or "nothing was published". | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
 | `release_charge` | terminal and subscription; the record is still erased | one per-session streamed admission slot |
 | `erase` | terminal and subscription, and the charge **unless** `release_charge` also fired | the record and one global record slot, plus the admission slot if both fired |
 
@@ -98,6 +98,14 @@ Every incomplete teardown emits, in order of reliability:
 The log line exists because the metric and the audit row both route through guards that
 swallow failures; under severe pressure both can be lost, so the log is the floor. If
 you have the metric but no log line, or vice versa, that itself is worth reporting.
+
+## If the row says the session was poisoned
+
+A poisoned stream is **session-wide**: every later attach on that session returns 410,
+not just the affected request. The client must re-initialize the MCP session to stream
+again. Poisoning is reached only on a double publish failure, so it travels with
+allocation pressure; results remain fetchable by `execution_id` throughout, and no
+server-side action other than the usual restart decision applies.
 
 ## Known gaps
 

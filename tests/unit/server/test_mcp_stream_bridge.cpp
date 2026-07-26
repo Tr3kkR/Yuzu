@@ -1116,7 +1116,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         // reporting only the leaked slot: an unconditional charge message used to
         // ERASE the publish disposition, which meant a teardown that both poisoned
         // the session and leaked a slot evidenced only the slot.
-        CHECK(row.detail.find("nothing was published") != std::string::npos);
+        CHECK(row.detail.find("published nothing") != std::string::npos);
     }
     SECTION("erase fails: subscription and charge settled, record retained, and the "
             "row is NOT silently skipped") {
@@ -1133,6 +1133,68 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         CHECK(row.result == "failure");
         CHECK(row.detail.find("record erase failed") != std::string::npos);
         CHECK(row.detail.find("charge") != std::string::npos);  // says it WAS settled
+    }
+    SECTION("release_charge fails on a teardown that DID publish: the row says so") {
+        // The published==true arm of the charge literal. Covers the pairing the
+        // other sections do not: a delivery happened AND a slot leaked, so the row
+        // must report both rather than implying the client got nothing.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-pub-a"));
+        REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-pub-b"));
+        REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+        fx.bus.publish("exec-pub-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+        // The synthesis publishes normally; only the charge release fails.
+        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE_NOTHROW(fx.bridge->sweep());
+
+        const auto row = row_for(fx, "mcp.bridge.forced_expire");
+        CHECK(row.result == "failure");
+        CHECK(row.detail.find("the terminal was published") != std::string::npos);
+        CHECK(row.detail.find("admission slot is held") != std::string::npos);
+        CHECK(row.detail.find("published nothing") == std::string::npos);
+    }
+    SECTION("release_charge fails on a POISONED teardown: the row names both, not just the "
+            "slot") {
+        // Compound failure across two independent axes: the publish ladder poisoned
+        // the session AND the charge leaked. Reporting only the slot omits the
+        // session-wide poisoning (every later attach 410s), which is the more
+        // consequential half. The three-way split exists on the unsubscribe-bail
+        // path; this pins that it was mirrored onto the charge literal too.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+        auto s = fx.make_session();
+        // Two parked records so the pressure hatch picks the older, terminal-less one.
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-pois-a"));
+        REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-pois-b"));
+        REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+        fx.bus.publish("exec-pois-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+        // Both publish rungs fail -> poison; and the charge release fails too.
+        s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
+        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE_NOTHROW(fx.bridge->sweep());
+
+        const auto row = row_for(fx, "mcp.bridge.forced_expire");
+        CHECK(row.result == "failure");
+        CHECK(row.detail.find("charge not released") != std::string::npos);
+        CHECK(row.detail.find("POISONED") != std::string::npos);
     }
     SECTION("release_charge AND erase both fail: the row names BOTH retained resources") {
         // The compound case. Nothing stops both stages failing in one call - they

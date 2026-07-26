@@ -1485,16 +1485,27 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // went unevidenced entirely.
         // `published`, NOT `delivered`. They differ exactly where it matters:
         // `delivered` stays true for a kNone teardown, which publishes nothing at
-        // all, so keying off it would claim a delivery on the majority path. That
-        // conflation is the same one this round has now corrected three times.
-        audit_detail = published
-                           ? "teardown incomplete: streamed charge not released; the record "
-                             "was erased and the terminal was published, but one per-session "
-                             "admission slot is held until shutdown"
-                           : "teardown incomplete: streamed charge not released AND nothing "
-                             "was published; the record was erased but one per-session "
-                             "admission slot is held until shutdown - recover any result by "
-                             "execution_id";
+        // all, so keying off it would claim a delivery on the majority path.
+        //
+        // THREE literals, matching the unsubscribe-bail path above. A poisoned
+        // session is not "nothing was published": the poison is session-wide and
+        // every later attach 410s, so collapsing it into the generic no-delivery
+        // wording omits the most consequential half of a compound failure. The
+        // three-way split was applied to the unsubscribe path first and NOT mirrored
+        // here, which left this call site with the exact defect the comment above it
+        // describes.
+        audit_detail = published ? "teardown incomplete: streamed charge not released; the "
+                                   "record was erased and the terminal was published, but one "
+                                   "per-session admission slot is held until shutdown"
+                       : rung == TerminalRung::kPoisoned
+                           ? "teardown incomplete: streamed charge not released AND the "
+                             "terminal publish POISONED the session (every later attach 410s); "
+                             "the record was erased but one per-session admission slot is held "
+                             "until shutdown - recover any result by execution_id"
+                           : "teardown incomplete: streamed charge not released AND this "
+                             "teardown published nothing; the record was erased but one "
+                             "per-session admission slot is held until shutdown - if no final "
+                             "was pinned earlier, recover by execution_id";
         delivered = false;
     }
     audit_contained(audit_action, exec_id, audit_detail,
