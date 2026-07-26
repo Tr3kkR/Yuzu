@@ -872,8 +872,15 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
                                        "SELECT EXISTS(SELECT 1 FROM audit_events "
                                        "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
                                        binds);
-        // Unreadable: assume a backlog remains. That keeps the latch armed and
-        // the counter moving, which is the conservative direction for both.
+        // Unreadable: assume a backlog remains, so the drain continues rather
+        // than re-declining every pass on a table that really is working off an
+        // accepted anomaly.
+        //
+        // NOT "conservative", despite what this comment used to say: an ARMED
+        // latch makes the next pass take the accepting branch and DELETE. This
+        // is the permissive default, chosen deliberately. Most unknowns in this
+        // guard resolve the safe way; this one does not, and mislabelling it
+        // invites the next author to reason backwards about the latch.
         backlog_remains = !more || *more;
         if (backlog_remains)
             cap_reached_.fetch_add(1, std::memory_order_relaxed);

@@ -447,7 +447,13 @@ A retention pass therefore refuses to act on that:
   Elapsed time still cannot tell a jump from a dark laptop, which is why the
   threshold sits past the point where an outage is itself remarkable -- a laptop
   switched off over a long weekend reports nothing; one switched off for a month
-  declines one tick. The decline is latched per table, so a warehouse that is
+  declines one tick. A fourth trigger fires when there is NO stored reading at
+  all -- the first pass after an agent upgrade or a restore -- because the
+  elapsed-time check cannot run without one; that is expected exactly once per
+  database. The first three triggers LATCH; the fourth deliberately does not,
+  since a missing comparison point is not an anomaly and spending the latch on it
+  would let a real one on the very next pass go undeclined. The latch is per
+  table, so a warehouse that is
   legitimately all-expired still ages out -- it just costs one rollup tick
   (900 s) first.
 - **Every accepted pass deletes at most 5,000 rows per table**, oldest first

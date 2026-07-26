@@ -1,6 +1,8 @@
 # Runbook: audit retention clock guard
 
-Covers the `YuzuAuditRetention*` alert family (`docs/prometheus/yuzu-alerts.yml`).
+Covers the `YuzuAuditRetention*` alert family and `YuzuAuditPersistFailures`
+(`docs/prometheus/yuzu-alerts.yml`) - i.e. `audit.db` health, both the write path
+and the retention path.
 Background: `docs/user-manual/audit-log.md`, ADR-0006, issue #2360.
 
 > **Read this first.** These rules are NOT active unless you wired them up.
@@ -29,6 +31,18 @@ very next pass delete undeclined.
 **It bounds the blast radius; it does not prevent loss.** A sustained clock or
 operational fault drains roughly 600k rows/day after that single decline. The
 alert is the control. The guard is the seatbelt.
+
+## YuzuAuditPersistFailures - audit WRITES are failing
+
+Not a retention problem, and much louder than one: `audit_emit_failed_total` is
+rising, so events are not reaching `audit.db` at all. Behavioural-PII REST routes
+are fail-closed, so they are returning `503` while this persists, and the
+evidence for whatever is happening right now is not being recorded.
+
+Check, in order: disk space and inode exhaustion on the `audit.db` volume; file
+permissions; whether a failed migration closed the store (the log says so
+explicitly, and `/healthz` will show it); and SQLite errors in the log. Retention
+alerts may be silent throughout - a closed store does not run passes.
 
 ## YuzuAuditRetentionClockAnomaly - a pass declined
 

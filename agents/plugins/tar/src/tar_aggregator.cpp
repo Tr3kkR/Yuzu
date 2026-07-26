@@ -715,8 +715,15 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // "Will the cap bind?" is answered by asking whether a (cap+1)th
             // expired row exists -- bounded, index-driven, and only for a table
             // that is actually in the wipe condition, so the healthy path pays
-            // nothing. An unreadable answer is treated as "yes", keeping the
-            // latch armed, which is the conservative direction.
+            // nothing. An unreadable answer is treated as "yes": assume the
+            // backlog remains, so the drain continues rather than re-declining.
+            //
+            // NOT the "conservative" direction, whatever an earlier version of
+            // this comment said -- an ARMED latch makes the next pass take the
+            // else branch and DELETE. Unknown->armed is the permissive choice.
+            // It is the right one here (a table that really is draining should
+            // not re-decline every tick) but the label mattered: the guard is
+            // full of unknown->safe defaults and this is deliberately not one.
             bool cap_will_bind = false;
             if (would_wipe) {
                 const auto more = exists_where(

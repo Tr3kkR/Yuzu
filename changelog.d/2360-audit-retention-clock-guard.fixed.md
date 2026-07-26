@@ -6,8 +6,11 @@
   when it would expire every datable row, when the gap since the previous pass
   exceeds a fixed 7 days (an absolute threshold, deliberately NOT scaled to
   `--audit-retention-days`: at the 365-day default that would put it a year out,
-  where it could never fire), or when the stored reading is ahead of
-  the current clock. That reading is persisted and sanitised, so the check still
+  where it could never fire), when the stored reading is ahead of
+  the current clock, or when there is no stored reading at all so the
+  elapsed-time check cannot run (the first pass after upgrading to a guarded
+  build - expected once per database, and the one trigger that does NOT latch,
+  so a real anomaly on the very next pass is still declined). That reading is persisted and sanitised, so the check still
   fires on a server that BOOTED with an already-wrong clock and cannot be
   disabled by a poisoned value. Every accepted pass is capped at 25,000 rows
   oldest-first. Rows whose TTL sits

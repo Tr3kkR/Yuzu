@@ -7,7 +7,7 @@
   row, when the gap since the previous pass exceeds a fixed 30 days (an absolute
   threshold, deliberately NOT scaled to the tier's retention window: that put it a
   year out on the monthly tier, where it could never fire), or
-  when the stored reading is ahead of the clock. That reading is persisted in
+  when the stored reading is ahead of the clock, or when there is no stored reading at all so the elapsed-time check cannot run (the first pass after an agent upgrade - expected once, and the one trigger that does NOT latch). That reading is persisted in
   `tar_config` and sanitised, so it still fires after an agent restart and cannot be
   disabled by a poisoned value. Every accepted delete is capped at 5,000 rows per
   table per pass, oldest first. A deliberate dead band remains: a forward error under

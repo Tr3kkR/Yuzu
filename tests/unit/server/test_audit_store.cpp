@@ -1334,6 +1334,7 @@ TEST_CASE("AuditStore #2360: a failed persist of the clock reading is counted",
     f.store.cleanup_once(kNow + 1);
     CHECK(f.store.persist_failed_count() > 0);
 }
+
 TEST_CASE("AuditStore #2360: the FIRST pass with no stored anchor declines instead of deleting",
           "[audit_store][retention][clock-guard]") {
     // Sol adversarial review, BLOCKING. The bootstrap hole the persisted-reading
