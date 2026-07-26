@@ -4,8 +4,9 @@
   battery, a hand-set date) could empty the SOC 2 evidence table in one statement
   with no counter and no actionable log line. A pass now declines once, latched,
   when it would expire every datable row, when the gap since the previous pass
-  exceeds a threshold (the retention window, floored at 7 days so an ordinary
-  outage is not reported as a clock jump), or when the stored reading is ahead of
+  exceeds a fixed 7 days (an absolute threshold, deliberately NOT scaled to
+  `--audit-retention-days`: at the 365-day default that would put it a year out,
+  where it could never fire), or when the stored reading is ahead of
   the current clock. That reading is persisted and sanitised, so the check still
   fires on a server that BOOTED with an already-wrong clock and cannot be
   disabled by a poisoned value. Every accepted pass is capped at 25,000 rows

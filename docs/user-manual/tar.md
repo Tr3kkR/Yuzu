@@ -434,16 +434,20 @@ window with it.
 A retention pass therefore refuses to act on that:
 
 - **It declines a pass that would delete every datable row of a table**, and
-  counts the decline. The same applies when more wall-clock time than that
-  table's retention window -- floored at 30 days -- has elapsed since the
-  previous pass, or when the stored reading is *ahead* of the current clock.
-  That reading is persisted in `tar_config`, so it still fires on the first pass
-  after an agent restart, including an agent that *booted* with a wrong RTC.
-  **The floor is why an endpoint that was simply switched off does not report a
-  clock anomaly**: elapsed time cannot tell a jump from a dark laptop, and the
-  shortest window here is 24 hours. The decline is latched per table, so a
-  warehouse that is legitimately all-expired still ages out -- it just costs one
-  rollup tick (900 s) first.
+  counts the decline. The same applies when more than **a fixed 30 days** of
+  wall-clock time has elapsed since the previous pass, or when the stored
+  reading is *ahead* of the current clock. That reading is persisted in
+  `tar_config`, so it still fires on the first pass after an agent restart,
+  including an agent that *booted* with a wrong RTC. The 30 days is **absolute,
+  not derived from the tier's retention window**: how far the clock moved has
+  nothing to do with how long that tier keeps rows, and scaling it to the window
+  put the threshold at a year on the monthly tier, where it could never fire.
+  Elapsed time still cannot tell a jump from a dark laptop, which is why the
+  threshold sits past the point where an outage is itself remarkable -- a laptop
+  switched off over a long weekend reports nothing; one switched off for a month
+  declines one tick. The decline is latched per table, so a warehouse that is
+  legitimately all-expired still ages out -- it just costs one rollup tick
+  (900 s) first.
 - **Every accepted pass deletes at most 5,000 rows per table**, oldest first
   (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
   A wipe the guard chose to allow ages out at a paced rate rather than in one
@@ -453,9 +457,13 @@ A retention pass therefore refuses to act on that:
   "would this delete everything?" question. Without that, one such row would
   disarm the guard permanently.
 
-**Row-count retention is deliberately unguarded.** The `*_live` tiers trim only
-the excess over a fixed row ceiling, computed with no clock at all, so no clock
-reading can make them delete more than they always would.
+**Row-count retention is deliberately unguarded, but it is capped.** The tiers
+that trim to a fixed row ceiling do so with no clock involved, so no clock
+reading can make them delete more than they always would -- hence no guard and
+no decline. They ARE capped at the same 5,000 rows per table per pass, for a
+different reason: the whole retention batch runs under one held database lock,
+and an uncapped prune over a large excess would stall every collector on the
+endpoint. A big backlog now drains over a few rollup ticks instead.
 
 **A paused or errored source is skipped before the guard is consulted**, so it
 neither deletes nor records a decline -- an operator who paused a source for
@@ -487,14 +495,17 @@ row-count tables, which are otherwise outside the guard.
 If that rollback ITSELF fails and the database is left inside the transaction,
 the agent **closes the TAR database**. Every later write on a connection stuck in
 an uncommittable transaction would be reported durable and then lost at restart,
-so it fails all of them closed instead. `tar status` then reports
-`storage_state|offline` and nothing else; collection and retention are both
-stopped on that endpoint until the agent restarts. This needs a disk-level fault
-to reach, but read `storage_state` before trusting any other line in that
-output.
+so it fails all of them closed instead. `tar status` then returns non-zero and
+emits an `error|` line followed by `storage_state|offline`, and nothing else --
+every `config|` line is withheld. Collection and retention are both stopped on
+that endpoint until the agent restarts. **Historical data stays readable**: the
+close affects only the read-write connection, so `tar sql` can still query what
+was already collected. This needs a disk-level fault to reach, but read
+`storage_state` before trusting any other line in that output.
 
-**Known dead band.** Because the threshold is floored at 30 days, a forward
-clock error *between* a table's own window and 30 days trips neither detector:
+**Known dead band.** Because the threshold is a fixed 30 days, a forward clock
+error smaller than that trips neither detector on a table whose own window is
+shorter:
 the step check is below its floor, and the outcome test is separately defeated
 by the rollup minting fresh rows before retention runs. In that band the table
 drains at the capped rate with no decline and no counter. The cap still bounds

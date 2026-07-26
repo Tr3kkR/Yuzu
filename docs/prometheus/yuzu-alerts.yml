@@ -409,8 +409,9 @@ groups:
           summary: "Audit retention declined a pass - clock moved, or the server was down"
           description: >-
             An audit retention pass declined. Triggers: it would have expired every datable
-            row; the gap since the previous pass exceeded the threshold (retention window,
-            floored at 7 days); or the stored clock reading was AHEAD of the current clock.
+            row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
+            threshold, not scaled to audit_retention_days); or the stored clock reading
+            was AHEAD of the current clock.
             Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
             uptime history before concluding the clock is at fault. Nothing was deleted;

@@ -710,13 +710,13 @@ How it works:
 
 **Index builds are deliberately kept OUT of the migration runner.** A failed
 migration closes the store, and for `audit_store` that means every audit write
-then fails — so an `O(N log N)` index build on a multi-million-row table is not
+then fails - so an `O(N log N)` index build on a multi-million-row table is not
 routed through the fail-closed path. The `audit_store` retention index
 (`idx_audit_ttl_id`, #2360) is created best-effort after migrations instead: on a
 large existing `audit_events` this is a one-time build at first boot after
 upgrade (~1.4 s and ~81 MB at 5M rows, extrapolating to ~16 s at 50M), and the
 elapsed time is logged when it exceeds a second. If it fails, retention still
-runs — each pass just scans instead of seeking, and the failure is logged as an
+runs - each pass just scans instead of seeking, and the failure is logged as an
 error.
 
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
@@ -766,13 +766,21 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   retroactively. Full behaviour:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
-  table holding the durable clock reading — one row, instant) plus the best-effort index build described
+  table holding the durable clock reading - one row, instant) plus the best-effort index build described
   under Schema Migrations above.
-- **Agents surface new `tar status` lines** (`retention_guard_declines_total`,
-  `retention_guard_failures_total`, and per-table detail). Existing consumers
-  filter on the `config|` prefix and ignore unknown lines, so nothing breaks; see
-  [tar.md](tar.md) if you scrape this output. TAR persists its own clock reading
-  in `tar_config` (`retention_guard_last_pass`) — no schema change.
+- **Agents surface new `tar status` lines**: `storage_state` (always first),
+  `retention_guard_declines_total`, `retention_guard_failures_total`, and
+  per-table detail. On the healthy path existing consumers filter on the
+  `config|` prefix and ignore unknown lines, so nothing breaks. **On the offline
+  path they do break**: when the TAR database has been closed after a wedged
+  rollback, `tar status` returns non-zero and emits only an `error|` line plus
+  `storage_state|offline` - no `record_count`, no `config|` lines at all. A
+  consumer keyed on the presence of `record_count` must handle that. See
+  [tar.md](tar.md#the-retention-clock-guard). TAR persists its own clock reading
+  in `tar_config` (`retention_guard_last_pass`) - no schema change.
+- **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
+  but a large excess (after a long disable, or an upgrade backlog) drains over
+  several 900 s rollup ticks rather than in one statement.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 

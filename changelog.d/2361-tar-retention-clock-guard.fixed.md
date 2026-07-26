@@ -4,14 +4,15 @@
   most likely to be wrong (dead CMOS battery, long suspend, cloned VM, boot before
   NTP converges). One bad reading took the device's whole forensic window with it.
   A pass now declines once per table, latched, when it would delete every datable
-  row, when the gap since the previous pass exceeds a threshold (that table's window,
-  floored at 30 days so a switched-off laptop is not reported as a clock anomaly), or
+  row, when the gap since the previous pass exceeds a fixed 30 days (an absolute
+  threshold, deliberately NOT scaled to the tier's retention window: that put it a
+  year out on the monthly tier, where it could never fire), or
   when the stored reading is ahead of the clock. That reading is persisted in
   `tar_config` and sanitised, so it still fires after an agent restart and cannot be
   disabled by a poisoned value. Every accepted delete is capped at 5,000 rows per
-  table per pass, oldest first. The floor leaves a deliberate dead band: a forward
-  error between a table's own window and 30 days trips neither detector, and the cap
-  alone bounds it. Rows stamped implausibly far in the future are excluded so one
+  table per pass, oldest first. A deliberate dead band remains: a forward error under
+  30 days is caught only by the outcome test, which any row written after the jump
+  defeats, so the cap alone bounds it. Rows stamped implausibly far in the future are excluded so one
   forward-skewed row cannot disarm the guard. Row-count retention keeps its
   clock-free ceiling semantics, but is now capped per pass too -- the whole batch runs
   under one held database mutex, so an uncapped prune over a large backlog would stall
@@ -29,3 +30,20 @@
   `retention_guard_failed|<table>|<n>` lines (probe and delete failures merged); the
   two totals must be read together, since a table whose probes or deletes fail every
   pass has silently stopped being retained.
+
+- **Behaviour change:** a retention transaction whose rollback fails while the
+  transaction is still open now takes TAR storage **offline on that endpoint until the
+  agent restarts**. Collection, retention and `tar configure` all stop; historical rows
+  stay readable through the separate read-only connection (`tar sql`), and `tar status`
+  replies with a single `error|...` line followed by `storage_state|offline` -- no
+  `record_count`, no `config|` lines. Anything keyed off `record_count` in a `tar status`
+  reply sees an absent field rather than a zero. There is no automatic recovery today.
+  The alternative was reporting every subsequent write durable and losing it at restart,
+  which is silent forensic-data loss behind a healthy-looking surface.
+
+- **Behaviour change:** row-count retention (`$Process_Live`, `$NetQual_Live`,
+  `$DNS_Live`, `$ARP_Live`, `$Software_Live`, `$NetConn_Live`) is now capped at the same
+  5,000 rows per table per pass. Its ceiling semantics are unchanged -- it still trims
+  only the excess over a fixed row count, with no clock involved -- but a large excess
+  (an upgrade backlog, or a source re-enabled after a long pause) now drains over
+  successive 900 s rollup ticks instead of in one statement.
