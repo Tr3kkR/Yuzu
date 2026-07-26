@@ -617,12 +617,21 @@ public:
         // stays meaningful. A reason added at an emit site instead of in that array
         // is emitted-but-unseeded: it passes its own test while the dashboard reads
         // zero and the alert never fires.
-        for (const char* route : {"command", "instruction_execute", "result_set_parent"}) {
-            for (const auto reason : yuzu::server::kTargetingShapeReasons) {
+        // Seeded PER ROUTE rather than as a cross-product: `result_set_parent`
+        // can only ever emit the two parent_id reasons, and the dispatch routes
+        // can never emit them. Seeding the full product would publish series
+        // that no code path can reach, which reads on a dashboard as "this has
+        // never happened" when the truth is "this cannot happen" (governance).
+        for (const char* route : {"command", "instruction_execute"}) {
+            for (const auto reason : yuzu::server::kTargetingShapeReasons)
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
-            }
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route}, {"reason", "body_type"}});
         }
+        for (const char* reason : {"parent_id_type", "parent_id_empty"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_parent"}, {"reason", reason}});
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -7943,6 +7952,17 @@ private:
             // reviewers found this independently; the precondition is enforced here
             // and pinned by a route test, not left as a comment on the header.
             if (!body.is_object()) {
+                // Counted and audited like every other refusal in this family.
+                // The fold's own argument against an uncounted refusal applies
+                // here: an invisible one cannot reach the alert this change
+                // ships, and this is the shape three reviewers had to find by
+                // reading rather than by watching a dashboard.
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", "body_type"}})
+                    .increment();
+                (void)audit_log(req, "command.dispatch", "denied", "command", "",
+                                "reason=body_type");
                 res.status = 400;
                 res.set_content(
                     R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
@@ -12090,7 +12110,16 @@ private:
                 agent_service_.record_send_time(command_id);
 
                 int sent = 0;
-                if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                // Same classifier as the other three sinks (#2500). This
+                // closure KEEPS broadcast-on-unnamed: dashboard_routes.cpp maps
+                // its form's `__all__` selection to empty+empty before calling,
+                // so `None` here means the operator picked "all agents" in the
+                // UI. Routed through the shared function anyway so a future
+                // refactor pointing this at command_dispatch_fn — whose `None`
+                // reaches nobody — becomes a visible decision rather than a
+                // silent conversion of every dashboard fleet-execute to a no-op.
+                const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+                if (arm == DispatchArm::Group) {
                     auto group_id = scope_expr.substr(6);
                     if (mgmt_group_store_) {
                         auto members = mgmt_group_store_->get_members(group_id);
@@ -12099,7 +12128,7 @@ private:
                                 ++sent;
                         }
                     }
-                } else if (!scope_expr.empty()) {
+                } else if (arm == DispatchArm::Scope) {
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
@@ -12110,13 +12139,13 @@ private:
                                 ++sent;
                         }
                     }
-                } else if (agent_ids.empty()) {
-                    sent = registry_.send_to_all(cmd);
-                } else {
+                } else if (arm == DispatchArm::Ids) {
                     for (const auto& aid : agent_ids) {
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                     }
+                } else {
+                    sent = registry_.send_to_all(cmd);
                 }
 
                 forward_gateway_pending();
@@ -12765,15 +12794,21 @@ private:
                     }
 
                     int sent = 0;
-                    if (!scope_expr.empty() && scope_expr != "__all__" &&
-                        scope_expr.starts_with("group:")) {
+                    // Same classifier as the other two sinks (#2500). MCP's
+                    // handler normalises an omitted target to kBroadcastScope
+                    // before dispatching (mcp_server.cpp), so `None` cannot
+                    // arrive here meaning "unnamed"; the tail maps it to
+                    // broadcast so MCP's deliberate broadcast-on-empty contract
+                    // is stated rather than left as a fallthrough.
+                    const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+                    if (arm == DispatchArm::Group) {
                         auto group_id = scope_expr.substr(6);
                         if (mgmt_group_store_) {
                             for (const auto& m : mgmt_group_store_->get_members(group_id))
                                 if (registry_.send_to(m.agent_id, cmd))
                                     ++sent;
                         }
-                    } else if (!scope_expr.empty() && scope_expr != "__all__") {
+                    } else if (arm == DispatchArm::Scope) {
                         // Owner-scoped from_result_set: recover the principal
                         // from the MCP-created execution row (review B1).
                         std::string principal;
@@ -12799,12 +12834,17 @@ private:
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }
-                    } else if (agent_ids.empty()) {
-                        sent = registry_.send_to_all(cmd);
-                    } else {
+                    } else if (arm == DispatchArm::Ids) {
                         for (const auto& aid : agent_ids)
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
+                    } else {
+                        // Broadcast, or None — which mcp_server.cpp has already
+                        // normalised to kBroadcastScope, so it cannot arrive
+                        // here meaning "unnamed". MCP keeps broadcast-on-empty
+                        // deliberately: its guard is upstream at the C8 gate and
+                        // in the handler, not at this sink.
+                        sent = registry_.send_to_all(cmd);
                     }
 
                     forward_gateway_pending();

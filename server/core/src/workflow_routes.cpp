@@ -1399,6 +1399,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // class this route is being fixed for, arriving through the guard itself.
         // Found independently by three Gate-3 reviewers.
         if (!j.is_object()) {
+            if (metrics) {
+                metrics
+                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                              {{"route", "instruction_execute"}, {"reason", "body_type"}})
+                    .increment();
+            }
+            if (audit_fn) {
+                audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                         "reason=body_type");
+            }
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",

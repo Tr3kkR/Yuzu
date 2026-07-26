@@ -5920,14 +5920,14 @@ void RestApiV1::register_routes(
                 // fires, which is the exact absent()-alerting hole the closed
                 // label set exists to prevent.
                 const char* reason =
-                    body["parent_id"].is_string() ? "scope_empty" : "scope_type";
+                    body["parent_id"].is_string() ? "parent_id_empty" : "parent_id_type";
                 if (metrics_registry)
                     metrics_registry
                         ->counter("yuzu_server_dispatch_target_rejected_total",
                                   {{"route", "result_set_parent"}, {"reason", reason}})
                         .increment();
                 if (audit_fn)
-                    audit_fn(req, "result_set.create", "denied", "result_set", "",
+                    audit_fn(req, "result_set.create", "denied", "ResultSet", "",
                              std::string("reason=") + reason);
                 rs_err(res, 400,
                        "RESULT_SET_BAD_PARENT: parent_id was supplied but names no parent set; "
@@ -6075,8 +6075,8 @@ void RestApiV1::register_routes(
             if (!session)
                 return;
             auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                rs_err(res, 400, "invalid JSON");
+            if (body.is_discarded() || !body.is_object()) {
+                rs_err(res, 400, "invalid JSON: body must be a JSON object");
                 return;
             }
             CreateRequest cr;
@@ -6145,8 +6145,8 @@ void RestApiV1::register_routes(
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
-                      if (body.is_discarded()) {
-                          rs_err(res, 400, "invalid JSON");
+                      if (body.is_discarded() || !body.is_object()) {
+                          rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
 
@@ -6180,14 +6180,14 @@ void RestApiV1::register_routes(
                           (!body["parent_id"].is_string() ||
                            body["parent_id"].get_ref<const std::string&>().empty())) {
                           const char* reason =
-                              body["parent_id"].is_string() ? "scope_empty" : "scope_type";
+                              body["parent_id"].is_string() ? "parent_id_empty" : "parent_id_type";
                           if (metrics_registry)
                               metrics_registry
                                   ->counter("yuzu_server_dispatch_target_rejected_total",
                                             {{"route", "result_set_parent"}, {"reason", reason}})
                                   .increment();
                           if (audit_fn)
-                              audit_fn(req, "result_set.create", "denied", "result_set", "",
+                              audit_fn(req, "result_set.create", "denied", "ResultSet", "",
                                        std::string("reason=") + reason);
                           rs_err(res, 400,
                                  "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
@@ -6279,8 +6279,8 @@ void RestApiV1::register_routes(
                       if (!session)
                           return;
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
-                      if (body.is_discarded()) {
-                          rs_err(res, 400, "invalid JSON");
+                      if (body.is_discarded() || !body.is_object()) {
+                          rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
                       std::string sql = body.value("sql", "");
@@ -6324,8 +6324,8 @@ void RestApiV1::register_routes(
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
-                      if (body.is_discarded()) {
-                          rs_err(res, 400, "invalid JSON");
+                      if (body.is_discarded() || !body.is_object()) {
+                          rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
                       std::string instruction_id = body.value("instruction_id", "");

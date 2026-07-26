@@ -5285,7 +5285,7 @@ Send a command to one or more connected agents.
 | `plugin` | string | Yes | -- | Target plugin name. |
 | `action` | string | Yes | -- | Action within the plugin. |
 | `agent_ids` | array of string | No | -- | Target agent IDs. **Omit the field** to broadcast. A supplied `[]`, a non-array value, or a non-string entry returns `400` (#2500). |
-| `parameters` | object | No | `{}` | Key-value parameters passed to the plugin. |
+| `params` | object | No | `{}` | Key-value parameters passed to the plugin. (This table previously named the field `parameters`; the handler has always read `params`, so a client written to the old text silently dispatched with no parameters at all.) |
 | `scope` | string | No | -- | Scope expression for device targeting (alternative to `agent_ids`), or `__all__` for every enrolled agent. A supplied `""` or non-string value returns `400` (#2500). |
 | `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. |
 | `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). |

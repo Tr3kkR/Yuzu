@@ -159,11 +159,13 @@ TEST_CASE("#2500 — a real scope expression outranks both ids and broadcast",
     CHECK(classify_dispatch_arm(true, "group:servers") == DispatchArm::Group);
     CHECK(classify_dispatch_arm(false, "from_result_set:rs_1") == DispatchArm::Scope);
 
-    // `__all__` is deliberately NOT a scope expression here — it short-circuits
+    // `__all__` is deliberately NOT a scope expression — it short-circuits
     // per-device evaluation and never reaches the parser, which is what
     // /discover/scope-kinds documents. Treating it as one is what made
-    // /api/command 503 on the string its sibling route broadcast on.
-    CHECK(classify_dispatch_arm(true, "group:servers") != DispatchArm::Broadcast);
+    // /api/command answer 400 "invalid scope" on the exact string its sibling
+    // route broadcast on. A `group:` prefix on the sentinel is still the
+    // sentinel, not a group named "__all__".
+    CHECK(classify_dispatch_arm(false, "__all__") == DispatchArm::Broadcast);
 }
 
 TEST_CASE("#2500 — ids-only and the empty-string scope are unchanged",

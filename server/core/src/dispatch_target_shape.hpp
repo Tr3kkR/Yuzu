@@ -79,8 +79,27 @@ struct BoundViolation {
 /// Every entry here is also a member of `kExecInstrBoundReasons` in
 /// `mcp_input_bounds.hpp`, and a static_assert there enforces that containment
 /// — the MCP counter's pre-seed must not lose a label when one is added here.
+/// That is why this array holds ONLY what `check_targeting_shape` itself emits:
+/// route-level reasons live in `kRouteRejectReasons` below, because forcing
+/// them into this array would force them into the MCP array too, and a reason
+/// MCP can never emit does not belong in MCP's closed set.
 inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
     "agent_ids_type", "agent_ids_empty", "agent_id_type", "scope_type", "scope_empty",
+};
+
+/// Reasons emitted by the ROUTES rather than by `check_targeting_shape`.
+///
+/// Separate from the array above for a reason found in review: the containment
+/// static_assert made every shared reason also an MCP reason, and the first
+/// attempt at labelling a `parent_id` violation therefore reused `scope_empty`
+/// / `scope_type` — so the metric and the audit row both named a `scope` field
+/// the caller had never sent. A tether added to prevent drift had produced a
+/// lie. These labels are honest about which field was wrong, and are excluded
+/// from the MCP set because MCP has neither a request body nor a `parent_id`.
+inline constexpr std::array<std::string_view, 3> kRouteRejectReasons{
+    "body_type",       ///< the request body was not a JSON object
+    "parent_id_type",  ///< parent_id was supplied and is not a string
+    "parent_id_empty", ///< parent_id was supplied and is an empty string
 };
 
 /// Reject a targeting argument that was SUPPLIED but names nothing.
@@ -110,10 +129,17 @@ inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
 /// for enforcing that BEFORE calling. `nlohmann::contains()` returns false for
 /// an array, a scalar or null, so a non-object body looks exactly like one
 /// that named no target, and "named no target" means the whole fleet. Passing
-/// `["dev-1","dev-2"]` here would therefore broadcast. Both REST callers
-/// reject a non-object body with their existing invalid-body 400 before
-/// reaching this function, and `test_dispatch_target_shape.cpp` pins that
-/// behaviour on each route rather than trusting this paragraph.
+/// `["dev-1","dev-2"]` here would therefore broadcast.
+///
+/// Both REST callers reject a non-object body before reaching this function.
+/// That rejection is pinned by a test on `POST /api/instructions/{id}/execute`
+/// only (`test_workflow_routes.cpp`, "a non-object body is refused"). It is
+/// NOT pinned on `/api/command`, which no test can reach — that route is
+/// registered inline on a raw httplib::Server inside `Server::start()` rather
+/// than through HttpRouteSink (#1786). An earlier version of this paragraph
+/// claimed both routes were pinned; they are not, and a false verification
+/// claim in the header that is the source of truth for this invariant is worse
+/// than the gap it was papering over.
 ///
 /// Pure and total: no I/O. Returns the FIRST violation in a deterministic
 /// order so a denial is reproducible.

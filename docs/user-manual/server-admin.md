@@ -209,18 +209,33 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/instructions/{id}/execute` | `agent_ids` `[]`, non-array | broadcast to all | `400` |
 | `POST /api/instructions/{id}/execute` | `scope` `""` or non-string | broadcast to all | `400` |
 | `POST /api/v1/result-sets/from-*` | `parent_id` empty, non-string, or `null` | searched/dispatched unscoped | `400` |
-| all of the above | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
+| `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
 
 The instructions-execute row is the one to read twice: `"scope": "" + empty agent_ids = broadcast`
 was **documented** behaviour in `rest-api.md`, so a client written against the published contract
 is affected. The `from-*` row covers `from-tar-query`, `from-instruction-result`, `re-eval` and
 `from-inventory-query`.
 
-**What still works, unchanged.** **Omitting both** `agent_ids` and `scope` broadcasts to the whole
-fleet, on every route. So does an explicit `"scope": "__all__"` — the ground scope kind already
+**One thing got LOOSER, not tighter.** `POST /api/command` previously rejected
+`"scope": "__all__"` with `400 invalid scope` — the scope parser has no rule for it — while the
+sibling instruction-execute route broadcast on the same string. It now broadcasts on both. This
+grants no new access: broadcast was already reachable on that route by omitting targeting
+entirely, under the same `Execution:Execute`, so `__all__` only gives a name to something a
+caller could already do. But if you have a script that sends `__all__` and treats the `400` as a
+no-op, it will now dispatch to the fleet.
+
+**What still works, unchanged.** **Omitting both** `agent_ids` and `scope` broadcasts to all
+connected agents, on every route. So does an explicit `"scope": "__all__"` — the ground scope kind already
 advertised by `/discover/scope-kinds` and by the MCP `execute_instruction` schema. If you have a
 client sending `"scope": ""` to mean "everything", change it to omit the field or to send
 `"__all__"`; both are supported and neither is deprecated.
+
+**Stored data changes shape.** An execution row for a fleet-wide dispatch now records
+`scope_expression = "__all__"` where it previously recorded `""`. Any saved query, report or
+dashboard filter that selects historical broadcasts by `scope_expression = ''` will not match
+new rows.
 
 **Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
 sends `__all__` instead of an empty string.
