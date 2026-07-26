@@ -118,11 +118,22 @@ inline constexpr std::size_t kPerPrincipalDashboard = 16;
 /// caller could not pin the pool if one ever arrived.
 inline constexpr std::size_t kPerPrincipalAnonymous = 4;
 
+/// Max concurrent STREAMED-POST responses one principal may hold on POST /mcp/v1/ (2f PR 3b,
+/// SSE-on-POST). The budget-side per-principal anti-monopoly cap for the streamed-POST surface.
+/// It is deliberately the twin of `kMaxStreamedPostsPerSession` (mcp_stream.hpp): the same
+/// number bounds the eviction-exempt pinned final-frame slots the ring reserves per session, so
+/// admission here can never let in more streamed POSTs than the ring can pin finals for. The
+/// equality is enforced by a `static_assert` in mcp_stream.hpp (both constants are visible there;
+/// stream_budget.hpp cannot include mcp_stream.hpp without a cycle, so the assert lives on that
+/// side of the one-way include edge).
+inline constexpr std::size_t kPerPrincipalMcpPost = 4;
+
 /// The surfaces that hold a response open. A CLOSED set — it is the metric label, and it is
 /// the list ADR-0034 says must be exhaustive. Adding a new streaming route means adding a
 /// value here and taking a lease; there is no third option.
 enum class SseSurface {
     kMcpGet,          ///< GET /mcp/v1/          — token, principal-bound session
+    kMcpPost,         ///< POST /mcp/v1/ (streamed, SSE-on-POST — 2f PR 3b) — token, principal-bound session
     kApiEvents,       ///< GET /api/v1/events    — token, Execution:Read
     kDashboardExec,   ///< GET /sse/executions/{id} — cookie, the executions drawer
     kLegacyEvents,    ///< GET /events           — the legacy dashboard stream
@@ -132,6 +143,8 @@ inline const char* to_string(SseSurface s) {
     switch (s) {
     case SseSurface::kMcpGet:
         return "mcp_get";
+    case SseSurface::kMcpPost:
+        return "mcp_post";
     case SseSurface::kApiEvents:
         return "api_events";
     case SseSurface::kDashboardExec:

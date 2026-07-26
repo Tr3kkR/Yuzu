@@ -84,6 +84,14 @@
 //   projector). bridge_mu_ holders MAY call the bus (subscribe under bridge_mu_
 //   serializes installation against teardown, A3; shutdown's unsubscribe walk) -
 //   legal precisely because listeners never take bridge_mu_.
+//
+//   C5 (#2409) pressure visitor: the sweep calls unsubscribe_and_visit_terminal
+//   WITHOUT holding bridge_mu_ (it re-validates map identity, releases bridge_mu_,
+//   then calls the bus). The visit takes Channel::mu → record mu (a valid suffix);
+//   its callback runs under Channel::mu and, like a listener, touches record mu +
+//   WakeCore::mu ONLY - never bridge_mu_, never the bus (either would invert the
+//   order). The streamed-charge decrement it would owe is deferred to the
+//   post-visit teardown_claimed (under bridge_mu_), preserving exactly-once.
 
 #include "execution_event_bus.hpp"
 
@@ -166,6 +174,13 @@ public:
         kAcceptedPending,  ///< recorded; arm()/abandon() will arbitrate (C1 - no audit yet)
         kNoOp,             ///< not kArming (nothing to cancel in 3a), duplicate, or unknown
     };
+
+    /// C5 (#2409): the terminal frame a claimed pressure-teardown publishes.
+    /// kNone = real final already pinned (or nothing to publish); kFallbackFinal =
+    /// success-shaped "fetch by execution_id" for a terminal-known-payload-lost
+    /// record; kSynthesizeUnavailable = the -32014 error, reachable ONLY for a
+    /// record that genuinely never saw a terminal.
+    enum class TeardownFinal { kNone, kSynthesizeUnavailable, kFallbackFinal };
 
     struct ReserveResult {
         bool ok = false;
@@ -278,6 +293,13 @@ public:
     /// reserve/subscribe guards degrade to the plain path (governance quality).
     void inject_reserve_fault_for_test();
     void inject_subscribe_fault_for_test();
+    /// The NEXT `times` pressure-visitor terminal-payload copies (kTerminalBuffered
+    /// latch) throw std::bad_alloc, modelling a copy OOM. A persistent fault (times
+    /// large) makes the record NEVER settle (the copy never latches), which is what
+    /// distinguishes "the fault path fired" from a silent no-op; healing (times=0)
+    /// then lets it settle. Proves defer + keep-listener + terminal_accepted-false
+    /// (#2409 safety-S1).
+    void inject_visit_copy_fault_for_test(int times = 1);
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -399,9 +421,11 @@ private:
     std::uint64_t publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
                                           std::string frame);
 
-    /// Claimed-kDone teardown: unsubscribe, optional -32014 synthesis (pressure
-    /// victims without a secured terminal), charge settle, obs transfer, erase.
-    void teardown_claimed(const std::shared_ptr<BridgeRecord>& rec, bool synthesize_unavailable,
+    /// Claimed-kDone teardown: unsubscribe, publish the decided terminal frame
+    /// (kSynthesizeUnavailable = -32014 for a never-terminal victim; kFallbackFinal
+    /// = success-shaped for a terminal-known-payload-lost victim; kNone = nothing),
+    /// charge settle, obs transfer, erase.
+    void teardown_claimed(const std::shared_ptr<BridgeRecord>& rec, TeardownFinal decision,
                           const char* audit_action);
     /// Release the streamed charge exactly once (clears under record mu - caller
     /// must NOT hold it - then decrements under bridge_mu_).
@@ -439,6 +463,7 @@ private:
     std::atomic<bool> arm_fault_{false};       ///< one-shot arm() throw seam
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
+    std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
 
     std::chrono::steady_clock::time_point now() const {
