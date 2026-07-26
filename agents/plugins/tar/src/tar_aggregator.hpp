@@ -122,16 +122,20 @@ inline constexpr int64_t kTarMinBigStepSec = 30 * 86400;
  * right behaviour for the wrong-RTC-at-boot case this exists to catch.
  *
  * The state carries its own mutex for the individual map touches, so reading
- * the counters (e.g. from `tar status`) never waits on a pass. That does NOT
+ * the counters (e.g. from `tar status`) never waits on a whole pass. It IS held
+ * briefly across one database read -- the cap-will-bind probe in the decide
+ * step -- which is safe because no TarDatabase path ever takes this mutex, so
+ * no cycle exists; an earlier version of this comment claimed it was never held
+ * across a database call at all, which stopped being true in round 4. That does NOT
  * make a pass atomic: each table's probe / decide / update-latch sequence spans
  * several statements, so the CALLER must still serialise whole rollup passes
  * against each other -- a manual `tar rollup` can arrive while the 900-second
  * trigger is mid-pass. TarPlugin holds `rollup_mu_` for exactly that.
  */
 struct RetentionGuardState {
-    /// Guards every member below. Held only for the brief map touches, NEVER
-    /// across a database call -- so `tar status` can read the counters without
-    /// waiting for a whole rollup pass to finish. Serialising the passes
+    /// Guards every member below. Held only for brief touches -- the map writes
+    /// and one bounded probe -- never for a whole pass, so `tar status` can read
+    /// the counters without waiting for a rollup. Serialising the passes
     /// themselves is a separate obligation the caller still owns (TarPlugin's
     /// `rollup_mu_`); this mutex does not provide it.
     mutable std::mutex mu;

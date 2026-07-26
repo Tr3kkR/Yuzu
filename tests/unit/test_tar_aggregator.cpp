@@ -20,6 +20,7 @@
 #include <chrono>
 #include <format>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1447,15 +1448,29 @@ TEST_CASE("TAR #2361: a delete failure stops the pass instead of leaking autocom
 
 TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writer's work",
           "[tar][retention][clock-guard]") {
-    // Kimi / Gate 8, and the defect that survived four rounds. Driving
+    // Kimi / Gate 8, and the defect that survived four rounds: driving
     // BEGIN/COMMIT through execute_sql releases the database mutex between
-    // statements, so a concurrent collector INSERT or set_config joined the
-    // retention transaction -- and once retention started rolling back on
-    // failure, the rollback discarded that write after its caller had been told
-    // it succeeded. Silent collateral data loss on the endpoint.
+    // statements, so a concurrent collector INSERT or set_config joined
+    // retention's transaction -- and once retention rolled back on failure, that
+    // rollback discarded the other writer's work after its caller had been told
+    // it succeeded.
     //
-    // execute_atomic_batch holds the mutex for the whole transaction, so an
-    // interleaved write can no longer be inside it.
+    // HOW MUCH THIS TEST IS WORTH (measured, Sol round-5 review). Against a
+    // deliberately reverted implementation this catches the defect roughly 1 run
+    // in 5. Two attempts to improve that made it WORSE, not better: widening the
+    // window to a 5,000-row delete dropped detection to 0 in 6, and asserting the
+    // stronger property directly ("no writer completes while the batch is open")
+    // also passed 6 of 6 against the broken shape. The interleaving simply is not
+    // reliably reachable from outside the store.
+    //
+    // So this is an opportunistic guard, NOT a regression barrier, and it is
+    // labelled as one rather than left to look like proof. The deterministic
+    // assurance for this fix is the sibling test below (a batch rolls back as a
+    // unit and does not reach outside itself) plus the lock structure itself:
+    // execute_atomic_batch holds mu_ across the whole transaction, which is
+    // verifiable by reading it and is what two reviewers checked. The assertion
+    // here is at least sound -- a DISTINCT key per write, and every acknowledged
+    // key must survive, so a discarded write cannot be masked by a later one.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
     seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
@@ -1463,26 +1478,79 @@ TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writ
                               "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
 
     std::atomic<bool> stop{false};
-    std::atomic<int> written{0};
+    std::mutex ack_mu;
+    std::vector<int> acknowledged;
     std::thread writer([&] {
-        // A stand-in for a collector tick: an ordinary committed write on the
-        // same connection, racing the retention pass.
+        int n = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            if (f.db->set_config("collector_heartbeat", std::to_string(written.load() + 1)))
-                written.fetch_add(1, std::memory_order_relaxed);
+            const int mine = ++n;
+            if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
+                std::lock_guard lk(ack_mu);
+                acknowledged.push_back(mine);
+            }
         }
     });
+    // Join on EVERY path: run_retention is not noexcept, and destroying a
+    // joinable thread calls std::terminate while it still holds a db reference.
+    struct Joiner {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~Joiner() {
+            stop.store(true, std::memory_order_relaxed);
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{stop, writer};
+
     run_retention(*f.db, kT0, f.guard);
     stop.store(true, std::memory_order_relaxed);
-    writer.join();
+    if (writer.joinable())
+        writer.join();
 
-    REQUIRE(written.load() > 0); // the racing writer really did commit something
-    // Its last acknowledged write must still be there: the retention rollback
-    // reaches only retention's own statements.
-    CHECK(f.db->get_config("collector_heartbeat", "") == std::to_string(written.load()));
-    // And retention itself still failed closed.
-    CHECK(row_count(*f.db, "process_hourly") == 6);
+    std::vector<int> acked;
+    {
+        std::lock_guard lk(ack_mu);
+        acked = acknowledged;
+    }
+    REQUIRE(acked.size() > 0); // the racing writer really did commit something
+    for (int n : acked) {
+        INFO("acknowledged write " << n << " of " << acked.size());
+        CHECK(f.db->get_config(std::format("collector_probe_{}", n), "") == std::to_string(n));
+    }
+    CHECK(row_count(*f.db, "process_hourly") == 6); // retention still failed closed
     CHECK(failures_of(f.guard, "process_hourly") >= 1);
+}
+
+TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside itself",
+          "[tar][retention][clock-guard]") {
+    // The deterministic half of the isolation contract, testing
+    // execute_atomic_batch directly rather than racing it. A write made BEFORE
+    // the batch must survive its rollback, and a successful statement INSIDE the
+    // batch must not survive a later failing one.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
+    for (int h = 0; h < 4; ++h) {
+        REQUIRE(f.db->execute_sql(
+            std::format("INSERT INTO tcp_hourly (hour_ts,remote_addr,remote_port,proto,"
+                        "process_name,connect_count,disconnect_count) "
+                        "VALUES ({}, '10.0.0.1', 5000, 'tcp', 'sshd', 1, 1)",
+                        kT0 - 10 * kHourlyCutoffSec)));
+    }
+    REQUIRE(f.db->set_config("pre_batch_write", "kept"));
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
+
+    // First statement succeeds, second aborts the transaction.
+    const auto r = f.db->execute_atomic_batch(
+        {"DELETE FROM tcp_hourly", "DELETE FROM process_hourly", "DELETE FROM tcp_hourly"});
+
+    CHECK_FALSE(r.committed);
+    REQUIRE(r.failed.size() == 3);
+    for (char c : r.failed)
+        CHECK(c == 1); // rolled back as a unit, so every statement is reported failed
+    CHECK(row_count(*f.db, "tcp_hourly") == 4);     // the successful delete was undone
+    CHECK(row_count(*f.db, "process_hourly") == 4);
+    CHECK(f.db->get_config("pre_batch_write", "") == "kept"); // rollback stayed inside the batch
 }
 
 TEST_CASE("TAR #2361: the latch is HELD through a capped drain, then released",
@@ -1566,4 +1634,37 @@ TEST_CASE("TAR #2361: a failed delete re-arms the latch, matching the audit sibl
     CHECK(row_count(*f.db, "process_hourly") ==
           yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus);
     CHECK(declines_of(f.guard, "process_hourly") == 2);
+}
+
+TEST_CASE("TAR #2361: row-count retention is capped too, so the batch lock stays bounded",
+          "[tar][retention][clock-guard]") {
+    // Sol / round-5 review. Row-count retention needs no CLOCK guard, but it does
+    // need the same per-pass bound: the whole batch now runs under one held
+    // database mutex, so an uncapped `DELETE ... OFFSET ceiling` over a large
+    // excess would stall every collector, `tar status` and config write on this
+    // connection for as long as the delete takes. netqual_boot's ceiling is 400.
+    constexpr int kCeiling = 400;
+    const int64_t kCap = yuzu::tar::kMaxTarDeletesPerTablePerPass;
+    TarGuardFixture f;
+    f.db->set_config("netqual_enabled", "true"); // opt-in source
+
+    // Ceiling + cap + 200: one pass can only remove `cap`, leaving 200 excess.
+    const int total = static_cast<int>(kCeiling + kCap + 200);
+    REQUIRE(f.db->execute_sql("BEGIN TRANSACTION"));
+    for (int i = 0; i < total; ++i) {
+        REQUIRE(f.db->execute_sql(std::format("INSERT INTO netqual_boot (ts,boot_ts,window_s) "
+                                              "VALUES ({}, {}, 60)",
+                                              kT0 - 10 * kHourlyCutoffSec,
+                                              kT0 - 10 * kHourlyCutoffSec - 60)));
+    }
+    REQUIRE(f.db->execute_sql("COMMIT"));
+
+    run_retention(*f.db, kT0, f.guard);
+    // Bounded: exactly one cap's worth removed, not the whole excess.
+    CHECK(row_count(*f.db, "netqual_boot") == total - kCap);
+    CHECK(declines_of(f.guard, "netqual_boot") == 0); // still no clock guard on it
+
+    // And it converges: the next pass takes the remainder down to the ceiling.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(row_count(*f.db, "netqual_boot") == kCeiling);
 }

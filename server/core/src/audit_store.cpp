@@ -507,6 +507,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     enum class Emit {
         None,
         ProbeFailed,
+        DeclineFirstPass,
         DeclineWipe,
         DeclineStep,
         DeclineImplausible,
@@ -672,8 +673,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                 // delta for a would_wipe-only decline attributed a clock step or
                 // outage that did not happen, in the SOC 2-relevant log line.
                 emit = prev_implausible ? Emit::DeclineImplausible
-                       : big_step       ? Emit::DeclineStep
-                                        : Emit::DeclineWipe;
+                       : big_step         ? Emit::DeclineStep
+                       : !prev_pass_now   ? Emit::DeclineFirstPass
+                                          : Emit::DeclineWipe;
             } else {
                 deleted = delete_capped_locked(now, would_wipe, emit_err);
                 if (!emit_err.empty())
@@ -703,6 +705,12 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         break;
     case Emit::DeleteFailed:
         spdlog::warn("AuditStore: cleanup error: {}", emit_err);
+        break;
+    case Emit::DeclineFirstPass:
+        spdlog::warn("AuditStore: the first retention pass against this database would expire "
+                     "EVERY datable audit row; declining once so a clock anomaly cannot delete "
+                     "the audit trail wholesale. (There is no previous reading to compare "
+                     "against, so nothing can be said about the clock yet.)");
         break;
     case Emit::DeclineWipe:
         spdlog::warn("AuditStore: this retention pass would expire EVERY datable audit row; "

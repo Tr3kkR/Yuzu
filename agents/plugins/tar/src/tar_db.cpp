@@ -1757,7 +1757,7 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
         return out;
 
     std::lock_guard lock(mu_);
-    if (!db_) {
+    if (!db_ || txn_wedged_.load(std::memory_order_relaxed)) {
         out.failed.assign(statements.size(), 1);
         return out;
     }
@@ -1801,11 +1801,25 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
 
     // Rolled back as a whole, so every statement is reported failed.
     err = nullptr;
-    if (sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, &err) != SQLITE_OK) {
-        // SQLite may already have rolled back automatically; that is not an
-        // additional failure, it is the state we wanted.
-        spdlog::debug("TarDatabase::execute_atomic_batch ROLLBACK: {}",
-                      err ? err : "no transaction active");
+    const int rb = sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, &err);
+    if (rb != SQLITE_OK) {
+        // A ROLLBACK error USUALLY means SQLite already rolled back on its own,
+        // which is the state we wanted. But it can also mean the rollback itself
+        // failed with the transaction still open -- and returning then would
+        // release mu_ with the connection still inside a transaction, so the
+        // NEXT writer's INSERT would silently join it and be lost, which is
+        // precisely the defect this whole method exists to prevent. Do not
+        // assume; ask.
+        if (sqlite3_get_autocommit(db_) == 0) {
+            spdlog::error("TarDatabase::execute_atomic_batch: ROLLBACK failed and the connection "
+                          "is STILL in a transaction ({}); marking the database unhealthy so "
+                          "later writes are not reported as durable",
+                          err ? err : "unknown error");
+            txn_wedged_.store(true, std::memory_order_relaxed);
+        } else {
+            spdlog::debug("TarDatabase::execute_atomic_batch ROLLBACK: {}",
+                          err ? err : "already rolled back");
+        }
     }
     sqlite3_free(err);
     out.failed.assign(statements.size(), 1);

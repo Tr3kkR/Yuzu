@@ -2768,8 +2768,9 @@ private:
                 // in a narrower re-check.
                 //
                 // Lock order is rollup_mu_ ≺ collect_mu_ ≺ software_collect_mu_.
-                // do_rollup takes ONLY rollup_mu_ (then db_->mu_ per statement)
-                // and never collect_mu_, so no cycle exists. Cost: a configure
+                // do_rollup takes ONLY rollup_mu_ (then db_->mu_ -- per statement
+                // for the probes, and for the whole batch during the retention
+                // deletes) and never collect_mu_, so no cycle exists. Cost: a configure
                 // waits out an in-flight rollup, which is the correct trade for a
                 // mutation whose whole purpose is to stop data being deleted.
                 std::lock_guard rollup_lock(rollup_mu_);

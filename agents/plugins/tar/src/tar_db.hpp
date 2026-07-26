@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -465,8 +466,16 @@ public:
      * automatically, and continuing would run the rest as autocommits that the
      * rollback cannot undo.
      *
-     * Cost: collectors block for the batch's duration. Bounded by the caller's
-     * own per-statement caps, and the same trade `purge_source` already accepts.
+     * Cost: collectors and every other user of this connection block for the
+     * batch's duration, so the CALLER must bound each statement. `run_retention`
+     * caps every statement it queues, including the row-count prunes -- an
+     * uncapped `DELETE` here would hold the lock for an unbounded time and stall
+     * the whole plugin (#2361 Gate 8 / Sol). Same trade `purge_source` accepts,
+     * but purge is operator-initiated and rare; this runs every 900 seconds.
+     *
+     * If a ROLLBACK fails with the transaction still open, the connection is
+     * marked wedged and every later batch fails fast rather than reporting
+     * success for writes that would silently join a doomed transaction.
      */
     BatchResult execute_atomic_batch(const std::vector<std::string>& statements);
 
@@ -498,6 +507,10 @@ private:
     // for untrusted operator SQL (#760). Null if it could not be opened, in
     // which case user queries fail closed.
     sqlite3* query_db_{nullptr};
+    // Set only when a ROLLBACK failed with the transaction still active. From
+    // then on batches fail fast: continuing would let writes join a transaction
+    // that will never commit. Never cleared -- recovery is an agent restart.
+    std::atomic<bool> txn_wedged_{false};
     std::mutex mu_;
     std::mutex query_mu_;
 };

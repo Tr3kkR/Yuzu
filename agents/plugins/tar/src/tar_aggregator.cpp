@@ -180,7 +180,13 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
             if (!db.set_state(std::string{key}, ""))
                 return false; // baseline NOT cleared → do not disable
         }
-        db.set_config(enabled_key, std::string{new_value});
+        // The flag write is the whole transition: if it does not persist, the
+        // source stays ENABLED while the operator is told it is paused, and both
+        // collection and retention keep running on data they believe is frozen.
+        // That is the same failure the baseline-clear check above exists to
+        // prevent, one line down (found reviewing #2361; pre-existing).
+        if (!db.set_config(enabled_key, std::string{new_value}))
+            return false;
         db.set_config(paused_at_key, std::to_string(now_epoch));
         return true;
     }
@@ -547,16 +553,32 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         }
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);
-            // Row-count retention is left exactly as it was, INCLUDING its place
-            // inside the transaction below. It trims only the excess over a fixed
-            // ceiling, computed with no clock at all, so no clock reading can
-            // make it delete more than it always would -- hence no guard, no cap,
-            // no decline. Queued rather than executed here so it keeps sharing
-            // the single M17 transaction with the guarded deletes.
+            // Row-count retention needs no CLOCK guard -- it trims only the
+            // excess over a fixed ceiling, computed with no clock at all, so no
+            // reading can make it delete more than it always would. It does need
+            // the same per-pass BOUND, for a different reason: the whole batch
+            // now runs under one held database mutex, so an uncapped
+            // `DELETE ... WHERE id <= (... OFFSET ceiling)` over a large excess
+            // would stall every collector, `tar status` and config write on this
+            // connection for as long as it takes (#2361 Gate 8 / Sol).
+            //
+            // Rerouted at the caller, exactly as the time-based branch is, so
+            // `retention_sql`'s pinned SQL text stays byte-identical. In steady
+            // state the excess is one tick's inflow, far below the cap, so this
+            // is a no-op; it only bites after a long disable or an upgrade
+            // backlog, which then drains over a few ticks instead of stalling
+            // the plugin once.
             if (g.retention_type != RetentionType::kTimeBased) {
-                auto sql = retention_sql(table_name, now_epoch);
-                if (!sql.empty())
-                    plans.push_back(Plan{table_name, std::move(sql)});
+                if (retention_sql(table_name, now_epoch).empty())
+                    continue; // not a retention-bearing table
+                plans.push_back(Plan{
+                    table_name,
+                    std::format("DELETE FROM {} WHERE id IN ("
+                                "SELECT id FROM {} WHERE id <= "
+                                "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {}) "
+                                "ORDER BY id ASC LIMIT {})",
+                                table_name, table_name, table_name, g.retention_default,
+                                kMaxTarDeletesPerTablePerPass)});
                 continue;
             }
 
@@ -677,8 +699,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     // widened by the deliberate rollback rather than caused by it.
     std::vector<std::string> sql;
     sql.reserve(plans.size());
-    for (const auto& p : plans)
-        sql.push_back(p.sql);
+    for (auto& p : plans)
+        sql.push_back(std::move(p.sql)); // `.table` is all the caller reads afterwards
     const auto batch = db.execute_atomic_batch(sql);
 
     {
@@ -690,8 +712,10 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // Re-arm, exactly as the audit sibling does on its delete-failure
             // path. Nothing was deleted, so the pass learned nothing about the
             // clock; carrying a set latch forward would let the next pass accept
-            // a real anomaly with no decline and no counter.
-            guard.latched[plans[i].table] = false;
+            // a real anomaly with no decline and no counter. Only for tables that
+            // HAVE a latch -- row-count tables share this batch but no guard.
+            if (auto it = guard.latched.find(plans[i].table); it != guard.latched.end())
+                it->second = false;
         }
     }
     if (!batch.committed)
