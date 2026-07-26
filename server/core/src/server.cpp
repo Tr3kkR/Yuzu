@@ -553,6 +553,23 @@ public:
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
                           "records_active > 0 with a flat rate here means the projector is wedged",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
+                          "Progress-bridge teardown steps that could not complete on the "
+                          "maintenance thread, by stage. The claim is one-way, so a record that "
+                          "fails here is never retried: whatever it still owns (its map entry, its "
+                          "streamed charge, or its bus subscription) is held until shutdown. Alert "
+                          "on > 0",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_sweep_tick_failures_total",
+                          "Maintenance ticks where the progress-bridge sweep threw and was "
+                          "contained (#2487). The tick is skipped, not retried; sustained growth "
+                          "means pin-ack, session-death and pressure teardown are all stalled",
+                          "counter");
+        metrics_.describe("yuzu_mcp_session_gc_tick_failures_total",
+                          "Maintenance ticks where MCP session gc threw and was contained "
+                          "(#2487). Expired sessions keep their streams and pinned finals until a "
+                          "tick succeeds",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
                           "Committed terminal frames that found no free pin slot and were published "
                           "UNPINNED (a real terminal is committed rather than lost to preserve a "
@@ -582,6 +599,12 @@ public:
                             "subscribe_failed", "arm_threw"}) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
+        // #2487: CLOSED stage set, mirroring teardown_claimed's contained steps.
+        for (auto stage : {"unsubscribe", "release_charge", "erase"}) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"stage", stage}});
+        }
+        metrics_.counter("yuzu_mcp_bridge_sweep_tick_failures_total");
+        metrics_.counter("yuzu_mcp_session_gc_tick_failures_total");
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
@@ -3994,10 +4017,49 @@ public:
                 // calls are O(records ≤256) / O(sessions) in-memory scans placed
                 // AFTER the CRL/stale-agent sweep (no same-tick delay to it) -
                 // microseconds at the 15s cadence, no request-path contention.
+                //
+                // S-BRIDGE-TICK-GUARD (#2487): this loop is a bare std::thread body,
+                // so an exception escaping it is std::terminate - a WHOLE-PROCESS
+                // abort triggered by a transient allocation failure inside a
+                // maintenance sweep. Both calls allocate (each snapshots its map),
+                // and the bridge's teardown path allocates again beneath that.
+                //
+                // GUARDED SEPARATELY, on purpose: gc() is what actually destroys an
+                // expired session's stream and releases its memory, so sharing one
+                // try with sweep() would let a snapshot failure under memory
+                // pressure skip the call most likely to relieve that pressure. The
+                // pairing above is preserved - gc() still runs only alongside a live
+                // bridge - but neither failure now suppresses the other. A missed
+                // tick simply defers to the next one.
+                //
+                // The handlers NEST their own observability: spdlog formatting and
+                // the metric lookup both allocate, so a flat handler re-throws from
+                // inside the very catch meant to contain the failure and terminates
+                // anyway (precedent: the nested guard in mcp_stream.cpp's publish
+                // boundary). Do not collapse these into a single flat catch.
                 if (mcp_stream_bridge_) {
-                    mcp_stream_bridge_->sweep();
+                    try {
+                        mcp_stream_bridge_->sweep();
+                    } catch (...) {
+                        try {
+                            spdlog::error("MCP bridge sweep tick failed; deferring to next tick");
+                            metrics_.counter("yuzu_mcp_bridge_sweep_tick_failures_total")
+                                .increment();
+                        } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
+                        }
+                    }
                     if (mcp_sessions_) {
-                        mcp_sessions_->gc();
+                        try {
+                            mcp_sessions_->gc();
+                        } catch (...) {
+                            try {
+                                spdlog::error(
+                                    "MCP session gc tick failed; deferring to next tick");
+                                metrics_.counter("yuzu_mcp_session_gc_tick_failures_total")
+                                    .increment();
+                            } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
+                            }
+                        }
                     }
                 }
                 // Guardian scalars + cumulative write/reap counters. Use

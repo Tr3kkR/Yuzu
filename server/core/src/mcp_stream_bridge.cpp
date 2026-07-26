@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <new>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,12 @@ constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
 constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
+// #2487: a teardown_claimed step that could not complete on the bare maintenance
+// thread. `stage` is a CLOSED literal set (unsubscribe | release_charge | erase),
+// pre-seeded in server.cpp. Any nonzero value means a record, its streamed charge,
+// or its bus subscription outlived its teardown and now waits for shutdown() -
+// alert on > 0.
+constexpr const char* kMetricTeardownIncomplete = "yuzu_mcp_bridge_teardown_incomplete_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -1120,18 +1127,69 @@ void McpStreamBridge::sweep() {
 
 void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
                                        TeardownFinal decision, const char* audit_action) {
-    // Claimant owns the record (phase == kDone, stored under record mu).
-    std::string exec_id;
-    {
-        std::lock_guard<std::mutex> rlk(rec->mu);
-        exec_id = rec->execution_id;
-    }
-    {
+    // Claimant owns the record: the phase (kDone / kAborted) AND `torn_down` were
+    // both stored under record mu before we got here. `torn_down` PERMANENTLY
+    // excludes this record from every later sweep claim (the guard at the top of
+    // pass 0-2), so THERE IS NO RETRIER - whatever this function leaves unfinished
+    // stays unfinished until shutdown() walks records_.
+    //
+    // #2487: this runs on the bare maintenance thread (the server.cpp health loop),
+    // where an escaped exception is std::terminate. Ownership here is THREE things,
+    // not two: the records_ entry, the streamed charge, and the BUS SUBSCRIPTION.
+    // Erasing the map entry while the subscription survives is the worst available
+    // outcome - make_listener captures a shared_ptr to this record, so erasing
+    // destroys nothing; the listener stays installed and keeps waking a record
+    // nothing can find, shutdown() can no longer reach it (it walks records_), and
+    // channel GC refuses to reap the channel because it requires listeners.empty().
+    // Hence: unsubscribe FIRST, and on failure leave the record wholly intact for
+    // shutdown() rather than erase around a live listener.
+    //
+    // `execution_id` is immutable after subscribe() (see the BridgeRecord field
+    // notes) and `rec` keeps it alive for this whole call, so BIND it - never copy.
+    // The copy this replaced was an uncontained allocation on this thread (#2487);
+    // the lock-free read is the documented "safe after observing a post-write phase
+    // via the record mutex" case, and matches the unsubscribe sites in shutdown(),
+    // abandon() and the pressure pass, which already read it unlocked.
+    const std::string& exec_id = rec->execution_id;
+
+    // Contained step runner: nothing below may propagate. Declaring the wrapper
+    // noexcept is safe (and NOT the "noexcept defeats an outer catch" trap) because
+    // the catch that contains the work lives INSIDE it.
+    const auto contained = [](auto&& f) noexcept -> bool {
+        try {
+            f();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    const bool unsubscribed = contained([&] {
+        if (teardown_unsub_fault_.load(std::memory_order_acquire) > 0 &&
+            teardown_unsub_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+            // system_error, not bad_alloc: a mutex failure is the only thing this
+            // step actually admits, and the seam should model the real fault.
+            throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
+                                    "injected teardown unsubscribe failure");
+        }
         std::lock_guard<std::mutex> lk(bridge_mu_);
         if (rec->subscribed && bus_ != nullptr) {
             bus_->unsubscribe(exec_id, rec->sub_id);
         }
         rec->subscribed = false;
+    });
+    if (!unsubscribed) {
+        // Only a mutex failure reaches here - unsubscribe allocates nothing given a
+        // const& key. Bail with the record still in records_, still subscribed and
+        // still charged: internally consistent, reclaimed by shutdown(), and never
+        // an orphan listener. Deliberately does NOT clear torn_down to re-open the
+        // claim - re-entering the exactly-once teardown protocol is a design change,
+        // filed separately rather than smuggled into a containment fix.
+        count_teardown_incomplete("unsubscribe");
+        audit_contained(audit_action, exec_id,
+                        "teardown incomplete: bus unsubscribe failed, record retained "
+                        "for shutdown");
+        return;
     }
     switch (decision) {
         case TeardownFinal::kSynthesizeUnavailable:
@@ -1177,16 +1235,26 @@ void McpStreamBridge::teardown_claimed(const std::shared_ptr<BridgeRecord>& rec,
         case TeardownFinal::kNone:
             break;  // real final already pinned, or nothing to publish
     }
-    release_charge(rec);
-    flush_record_obs(*rec);
+    // Past the unsubscribe the subscription is gone, so the remaining two owned
+    // things MUST both be settled - and independently: a failure to release the
+    // charge must not also strand the map entry, and vice versa (#2487). Each step
+    // is contained on its own; a failure is counted, never propagated.
+    if (!contained([&] { release_charge(rec); })) {
+        count_teardown_incomplete("release_charge");
+    }
+    flush_record_obs(*rec);  // already noexcept
     std::size_t active = 0;
-    {
-        std::lock_guard<std::mutex> lk(bridge_mu_);
-        auto it = records_.find(rec->key);
-        if (it != records_.end() && it->second == rec) {
-            records_.erase(it);
-        }
-        active = records_.size();
+    if (!contained([&] {
+            std::lock_guard<std::mutex> lk(bridge_mu_);
+            auto it = records_.find(rec->key);
+            if (it != records_.end() && it->second == rec) {
+                records_.erase(it);
+            }
+            active = records_.size();
+        })) {
+        count_teardown_incomplete("erase");
+        return;  // gauge would be a lie and the audit would claim a teardown that
+                 // did not complete; the record is still reachable by shutdown().
     }
     publish_records_gauge(active);
     // kNone detail stays empty: teardown_claimed(kNone) is shared with pass-2
@@ -1249,6 +1317,13 @@ void McpStreamBridge::count_reject(const char* reason) noexcept {
     }
 }
 
+void McpStreamBridge::count_teardown_incomplete(const char* stage) noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard(
+            [&] { metrics_->counter(kMetricTeardownIncomplete, {{"stage", stage}}).increment(); });
+    }
+}
+
 void McpStreamBridge::publish_records_gauge(std::size_t n) noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->gauge(kMetricRecordsActive).set(static_cast<double>(n)); });
@@ -1301,9 +1376,11 @@ void McpStreamBridge::flush_core_obs() noexcept {
 }
 
 void McpStreamBridge::audit_contained(const char* action, const std::string& execution_id,
-                                      const std::string& detail) noexcept {
+                                      std::string_view detail) noexcept {
     if (audit_) {
-        obs_guard([&] { audit_(action, execution_id, detail); });
+        // Both owned strings the AuditFn signature needs (action from a const char*,
+        // detail from the view) are constructed HERE, inside the guard - #2487.
+        obs_guard([&] { audit_(action, execution_id, std::string(detail)); });
     }
 }
 
@@ -1357,6 +1434,10 @@ void McpStreamBridge::inject_subscribe_fault_for_test() {
 
 void McpStreamBridge::inject_visit_copy_fault_for_test(int times) {
     visit_copy_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_teardown_unsubscribe_fault_for_test(int times) {
+    teardown_unsub_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }

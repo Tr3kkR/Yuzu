@@ -108,6 +108,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -300,6 +301,14 @@ public:
     /// then lets it settle. Proves defer + keep-listener + terminal_accepted-false
     /// (#2409 safety-S1).
     void inject_visit_copy_fault_for_test(int times = 1);
+    /// The NEXT `times` teardown_claimed unsubscribe steps throw, modelling the one
+    /// failure that step actually admits (a mutex failure - unsubscribe allocates
+    /// nothing given a const& key). Proves the containment does NOT erase around a
+    /// live listener: the record stays in the map, subscribed and charged, for
+    /// shutdown() to reclaim, and nothing escapes to the maintenance thread (#2487).
+    /// A persistent fault (times large) keeps the record un-torn-down, which is what
+    /// distinguishes "the fault path fired" from a silent no-op.
+    void inject_teardown_unsubscribe_fault_for_test(int times = 1);
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -435,11 +444,20 @@ private:
     // ── noexcept observability (C5) ────────────────────────────────────────
     template <typename F> bool obs_guard(F&& f) noexcept;
     void count_reject(const char* reason) noexcept;
+    /// #2487: a teardown step that could not complete on the maintenance thread.
+    /// `stage` is a CLOSED literal set - unsubscribe | release_charge | erase.
+    void count_teardown_incomplete(const char* stage) noexcept;
     void publish_records_gauge(std::size_t n) noexcept;  ///< never called under bridge_mu_
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
+    /// `detail` is a string_view, NOT a `const std::string&`: every caller passes a
+    /// `const char*` literal, and a `const std::string&` parameter materialises that
+    /// temporary in the CALLER's frame - outside this function's obs_guard. On the
+    /// teardown path that caller is the bare maintenance thread, where an escaped
+    /// bad_alloc is std::terminate (#2487). The view converts without allocating;
+    /// the owned string the AuditFn sink needs is built INSIDE the guard.
     void audit_contained(const char* action, const std::string& execution_id,
-                         const std::string& detail) noexcept;
+                         std::string_view detail) noexcept;
 
     ExecutionEventBus* bus_ = nullptr;
     McpSessionRegistry* sessions_ = nullptr;
@@ -464,6 +482,7 @@ private:
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
     std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
+    std::atomic<int> teardown_unsub_fault_{0}; ///< remaining teardown unsubscribe throws (test seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
 
     std::chrono::steady_clock::time_point now() const {

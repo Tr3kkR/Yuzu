@@ -549,10 +549,23 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     s.stream->detach(att.sink);
     CHECK(s.stream->pinned_count() == 3);
 
+    // The reaped record is exec-pin-1: pins are published in loop order, so the
+    // smallest pinned id is the first record's final.
+    REQUIRE(fx.bus.subscriber_count("exec-pin-1") == 1);
     fx.bridge->sweep();  // pin-ack teardown reaps the consumed record
     CHECK(fx.bridge->record_count() == 3);
     CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
     CHECK(fx.audit_count("mcp.bridge.pin_acked") == 1);
+    // #2487: teardown owns THREE things - the map entry, the streamed charge, and
+    // the bus subscription. The two lines above cover the first two; without this
+    // one a teardown that erased the record while leaving its listener installed
+    // would pass. That listener would keep a shared_ptr to the record alive, keep
+    // waking it, be unreachable from shutdown() (which walks records_), and block
+    // channel GC forever (it requires listeners.empty()).
+    CHECK(fx.bus.subscriber_count("exec-pin-1") == 0);
+    CHECK(fx.bus.subscriber_count("exec-pin-2") == 1);  // siblings untouched
+    CHECK(fx.bus.subscriber_count("exec-pin-3") == 1);
+    CHECK(fx.bus.subscriber_count("exec-pin-4") == 1);
 }
 
 TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final is never lost",
@@ -882,6 +895,63 @@ TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched"
     CHECK(fx.sessions.active_count() == 1);
     fx.sessions.gc();
     CHECK(fx.sessions.active_count() == 0);
+}
+
+TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orphans its listener "
+          "(#2487)",
+          "[mcp][bridge][2f]") {
+    // teardown_claimed runs on the bare maintenance thread, so it may not throw; and
+    // because the sweep claim is ONE-WAY (torn_down permanently excludes the record
+    // from later claims) whatever it cannot finish is held until shutdown(). The one
+    // failure the unsubscribe step actually admits is a mutex failure - it allocates
+    // nothing given a const& key. The contained posture must therefore be "leave the
+    // record whole", NOT "erase it and hope something reclaims the subscription":
+    // the listener owns a shared_ptr to the record, so erasing destroys nothing and
+    // strands a live listener that shutdown() can no longer reach.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2487"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    REQUIRE(fx.bus.subscriber_count("exec-2487") == 1);
+
+    fx.clock_s->store(1801);  // session death: the pass-2 teardown this exercises
+    fx.bridge->inject_teardown_unsubscribe_fault_for_test(1000);  // persistent
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // the whole point - no escape to the thread
+
+    // SELF-VALIDATING: with the fault reduced to a no-op the record is torn down and
+    // record_count() is 0, so a mutant seam fails right here rather than passing
+    // identically.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(fx.bus.subscriber_count("exec-2487") == 1);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"stage", "unsubscribe"}})
+              .value() == 1.0);
+    {
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool saw_incomplete = false;
+        for (const auto& [action, detail] : fx.audits) {
+            if (action == "mcp.bridge.session_dead" &&
+                detail.find("teardown incomplete") != std::string::npos) {
+                saw_incomplete = true;
+            }
+        }
+        CHECK(saw_incomplete);  // the audit must not claim a teardown that did not happen
+    }
+
+    // The claim is one-way ON PURPOSE (re-opening it is a change to the exactly-once
+    // teardown protocol, not a containment fix), so healing the fault does NOT make a
+    // later sweep retry. This is the honest bound the metric exists to surface.
+    fx.bridge->inject_teardown_unsubscribe_fault_for_test(0);
+    fx.bridge->sweep();
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(fx.bus.subscriber_count("exec-2487") == 1);
+
+    // shutdown() is the reclaimer: it walks records_, which is exactly why the
+    // contained path must leave the record THERE.
+    fx.bridge->shutdown();
+    CHECK(fx.bus.subscriber_count("exec-2487") == 0);
 }
 
 TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
