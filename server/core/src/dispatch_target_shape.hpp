@@ -88,10 +88,11 @@ inline constexpr std::string_view kReasonAgentIdsEmpty{"agent_ids_empty"};
 inline constexpr std::string_view kReasonAgentIdType{"agent_id_type"};
 inline constexpr std::string_view kReasonScopeType{"scope_type"};
 inline constexpr std::string_view kReasonScopeEmpty{"scope_empty"};
+inline constexpr std::string_view kReasonTargetConflict{"target_conflict"};
 
-inline constexpr std::array<std::string_view, 5> kTargetingShapeReasons{
+inline constexpr std::array<std::string_view, 6> kTargetingShapeReasons{
     kReasonAgentIdsType, kReasonAgentIdsEmpty, kReasonAgentIdType,
-    kReasonScopeType,    kReasonScopeEmpty,
+    kReasonScopeType,    kReasonScopeEmpty,    kReasonTargetConflict,
 };
 
 /// Reasons emitted by the ROUTES rather than by `check_targeting_shape`.
@@ -177,6 +178,27 @@ check_targeting_shape(const nlohmann::json& args) {
             if (!v.is_string())
                 return BoundViolation{kReasonAgentIdType.data(), "agent_ids entries must be strings"};
         }
+    }
+    // ── both selectors at once is AMBIGUOUS, so it is refused ────────────
+    // Supplying `agent_ids` AND a real `scope` used to resolve by precedence:
+    // scope won, and the explicit id list was discarded. So
+    // `{"agent_ids":["dev-a"],"scope":"tag:prod"}` ran on every device matching
+    // `tag:prod`, not on `dev-a`. Pre-existing, and the exact invariant this
+    // rule exists to protect - the executed set was not the requested set -
+    // just reached by disagreement between two selectors rather than by an
+    // erased one. Found by an independent review AFTER the earlier rounds had
+    // pinned the precedence in a test and published it in the API docs,
+    // which is how preserving a behaviour quietly becomes endorsing it.
+    //
+    // `__all__` is exempt: it is not a narrowing selector, it is the broadcast
+    // request, and `classify_dispatch_arm` already resolves ids-beat-broadcast
+    // in the safe direction. Rejecting that pair would break the dashboard.
+    if (args.contains("agent_ids") && args.contains("scope") &&
+        args["scope"].is_string() &&
+        args["scope"].get_ref<const std::string&>() != kBroadcastScope) {
+        return BoundViolation{kReasonTargetConflict.data(),
+                              "agent_ids and scope are alternatives; supply exactly one (or "
+                              "neither, to target all agents)"};
     }
     if (args.contains("scope")) {
         const auto& sc = args["scope"];

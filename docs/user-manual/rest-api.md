@@ -5298,8 +5298,15 @@ non-string entry, an empty `scope`, or a non-string `scope`. Before this, a clie
 numeric device ids (`"agent_ids": [1,2,3]`) or one whose device filter matched nothing
 (`"agent_ids": []`) dispatched to the **entire fleet** and received a success response.
 
-If both are supplied, an explicit `agent_ids` list wins over `"scope": "__all__"`; any other
-`scope` value wins over `agent_ids`.
+`agent_ids` and `scope` are **alternatives — supply exactly one, or neither.** Supplying
+`agent_ids` together with a real `scope` returns `400` (`reason=target_conflict`). They used to
+resolve by precedence, with the scope winning and the explicit id list silently discarded, so
+`{"agent_ids":["dev-a"],"scope":"tag:prod"}` ran on every device matching `tag:prod` rather than
+on `dev-a` — the same "the executed set is not the requested set" defect this section is about,
+reached by two selectors disagreeing instead of by one being erased.
+
+The single exception is `"scope": "__all__"` alongside `agent_ids`: `__all__` is the broadcast
+*request* rather than a narrowing selector, and the explicit id list wins.
 
 Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",reason=...}` and
 write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body

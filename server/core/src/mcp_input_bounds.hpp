@@ -66,7 +66,7 @@ inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      //
 /// `docs/user-manual/metrics.md`. The boot pre-seed follows automatically; the
 /// docs copy does not, and a test asserts this array's size so the third copy
 /// cannot be forgotten quietly.
-inline constexpr std::array<std::string_view, 13> kExecInstrBoundReasons{
+inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
     // Length/count bounds.
     "ident_len",       "scope_len",       "param_count",     "param_key_len",
     "param_value_len", "agent_ids_count", "agent_id_len",
@@ -76,6 +76,10 @@ inline constexpr std::array<std::string_view, 13> kExecInstrBoundReasons{
     // plugin/action-required guard so that rejection is counted too.
     "agent_id_type",   "agent_ids_type",  "agent_ids_empty", "scope_type",
     "scope_empty",     "ident_empty",
+    // #2500: agent_ids AND a real scope together are ambiguous - the old
+    // precedence silently discarded the explicit id list in favour of the
+    // broader scope. Same surface, same rule, so the same closed label.
+    "target_conflict",
 };
 
 // ── Sizing: the per-field caps must fit under the TRANSPORT cap ───────────

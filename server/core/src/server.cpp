@@ -636,7 +636,7 @@ public:
         // can never emit them. Seeding the full product would publish series
         // that no code path can reach, which reads on a dashboard as "this has
         // never happened" when the truth is "this cannot happen" (governance).
-        for (const char* route : {"command", "instruction_execute"}) {
+        for (const char* route : {"command", "instruction_execute", "policy_remediate"}) {
             for (const auto reason : yuzu::server::kTargetingShapeReasons)
                 metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                                  {{"route", route}, {"reason", std::string(reason)}});
@@ -11280,7 +11280,7 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
-            policy_evaluator_.get());
+            policy_evaluator_.get(), &metrics_); // #2500 targeting-refusal counter
 
         // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
         // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are

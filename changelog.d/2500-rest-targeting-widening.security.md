@@ -23,6 +23,21 @@
   fields still broadcasts, on both routes — that is unchanged and is the supported way to target
   the whole fleet deliberately.
 
+- **`POST /api/policies/{id}/remediate` had the same defect and is fixed with it.** An empty
+  target list there means "every non-compliant agent in this policy", and the route dropped
+  non-string entries silently — so `{"agent_ids":[1,2,3]}` remediated the entire non-compliant
+  set, answered `202`, and audited success. A mutating remediation path, found by an independent
+  review after the in-house rounds had cleared `PolicyEvaluator` as a *dispatch caller* without
+  reading the *route's* own parsing.
+
+- **Behaviour change: `agent_ids` and `scope` are now exclusive.** Supplying both returns `400`
+  on `POST /api/command`, `POST /api/instructions/{id}/execute` and MCP `execute_instruction`.
+  They previously resolved by precedence — the scope won and the explicit id list was silently
+  discarded, so `{"agent_ids":["dev-a"],"scope":"tag:prod"}` ran on every device matching
+  `tag:prod`. Supply exactly one, or neither. The single exception is `"scope": "__all__"`
+  alongside `agent_ids`, where the explicit list wins: `__all__` is the broadcast request rather
+  than a narrowing selector.
+
 - Refusals are observable: `yuzu_server_dispatch_target_rejected_total{route,reason}` (both
   labels closed sets, every pair pre-seeded at boot) plus an audit row —
   `command.dispatch|denied` or `instruction.execute|denied` with `detail=reason=<reason>`. A

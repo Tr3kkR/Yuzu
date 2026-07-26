@@ -70,7 +70,9 @@ TEST_CASE("#2500 — a genuinely omitted target is accepted (the over-broadness 
     CHECK(reason_for(R"({"plugin":"service","action":"restart"})").empty());
     CHECK(reason_for(R"({"agent_ids":["agent-1"]})").empty());
     CHECK(reason_for(R"({"scope":"tag:prod"})").empty());
-    CHECK(reason_for(R"({"agent_ids":["a","b"],"scope":"tag:prod"})").empty());
+    // (agent_ids + a REAL scope is now `target_conflict` - see the dedicated
+    // case below. `__all__` is the one legal pairing.)
+    CHECK(reason_for(R"({"agent_ids":["a","b"],"scope":"__all__"})").empty());
 
     // `params` and unrelated keys are none of this function's business — it
     // decides targeting only. The size bounds live with the surface that
@@ -100,6 +102,26 @@ TEST_CASE("#2500 — agent_ids is decided before scope, so a denial is reproduci
     CHECK(reason_for(R"({"agent_ids":"x","scope":5})") == "agent_ids_type");
 }
 
+TEST_CASE("#2500 — agent_ids and a real scope together are refused as ambiguous",
+          "[targeting][dispatch][security]") {
+    // The two selectors used to resolve by PRECEDENCE - scope won and the
+    // explicit id list was discarded - so a caller naming one device ran on
+    // every device the scope matched. The executed set was not the requested
+    // set, which is the same invariant as the rest of this issue, reached by
+    // disagreement between selectors rather than by an erased one.
+    CHECK(reason_for(R"({"agent_ids":["dev-a"],"scope":"tag:prod"})") == "target_conflict");
+    CHECK(reason_for(R"({"agent_ids":["dev-a"],"scope":"group:servers"})") == "target_conflict");
+
+    // `__all__` is NOT a narrowing selector - it is the broadcast request, and
+    // classify_dispatch_arm already resolves ids-beat-broadcast in the safe
+    // direction. Refusing this pair would break the dashboard's own dialog.
+    CHECK(reason_for(R"({"agent_ids":["dev-a"],"scope":"__all__"})").empty());
+
+    // Either one alone is still fine.
+    CHECK(reason_for(R"({"agent_ids":["dev-a"]})").empty());
+    CHECK(reason_for(R"({"scope":"tag:prod"})").empty());
+}
+
 TEST_CASE("#2500 — every emitted reason is a member of the closed label set",
           "[targeting][dispatch][metrics]") {
     // The boot pre-seed iterates kTargetingShapeReasons. A reason emitted from
@@ -120,7 +142,7 @@ TEST_CASE("#2500 — every emitted reason is a member of the closed label set",
     // And the set is exactly the five this function can produce — a sixth added
     // to the array without an emit site would leave a permanently-zero series
     // that reads as "this can never happen".
-    CHECK(kTargetingShapeReasons.size() == 5);
+    CHECK(kTargetingShapeReasons.size() == 6); // +target_conflict (#2500)
 }
 
 // ── classify_dispatch_arm — the branch selection with fleet-wide blast radius ──
@@ -157,6 +179,15 @@ TEST_CASE("#2500 — a real scope expression outranks both ids and broadcast",
     // changed it silently: a scope expression has always won over agent_ids on
     // these closures, and `group:` is dispatched by member lookup rather than
     // through the scope engine.
+    // NOTE the `has_agent_ids=true` rows below describe the CLASSIFIER only.
+    // A caller can no longer reach them: `check_targeting_shape` rejects
+    // agent_ids + a real scope as `target_conflict` (#2500). They remain
+    // meaningful for INTERNAL callers, which pass exactly one selector by
+    // construction. An earlier revision pinned this precedence as if it were a
+    // caller-facing contract, which is how preserving a behaviour becomes
+    // endorsing it - an independent review caught that the pinned behaviour was
+    // itself a widening: {"agent_ids":["dev-a"],"scope":"tag:prod"} ran on every
+    // device matching tag:prod, not on dev-a.
     CHECK(classify_dispatch_arm(true, "tag:prod") == DispatchArm::Scope);
     CHECK(classify_dispatch_arm(false, "tag:prod") == DispatchArm::Scope);
     CHECK(classify_dispatch_arm(true, "group:servers") == DispatchArm::Group);
