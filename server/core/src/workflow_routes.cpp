@@ -1,6 +1,7 @@
 #include "workflow_routes.hpp"
 
 #include "compliance_eval.hpp"
+#include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
@@ -62,6 +63,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
     auto* execution_event_bus = deps.execution_event_bus;
+    auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
 
     // -- HTMX fragments --------------------------------------------------------
@@ -1356,9 +1358,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
-                                                       execution_tracker, approval_manager](
-                                                          const httplib::Request& req,
-                                                          httplib::Response& res) {
+                                                       execution_tracker, approval_manager,
+                                                       metrics](const httplib::Request& req,
+                                                                httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
             return;
         if (!instruction_store || !instruction_store->is_open()) {
@@ -1380,11 +1382,55 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // Parse request body
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(req.body);
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        // ── Targeting shape: supplied-but-names-nothing is an ERROR (#2500) ──
+        // The same rule, from the same function, that MCP execute_instruction
+        // enforces (#2492). Before this, `{"agent_ids": []}`, a non-array
+        // `agent_ids` and a non-string `scope` all fell through to the sink's
+        // broadcast default and dispatched to the entire fleet.
+        //
+        // It runs BEFORE the extraction below rather than after, because
+        // extraction is where a non-string entry used to be refused — by
+        // `get<std::string>()` throwing `type_error` into the generic catch and
+        // surfacing as "invalid request body". That 400 was accidental, said
+        // nothing about targeting, emitted no metric and no audit row, and was
+        // one refactor away from disappearing. Rejecting here makes it
+        // deliberate and countable, and the extraction loop below now operates
+        // on types this function has already guaranteed.
+        if (auto bv = yuzu::server::check_targeting_shape(j)) {
+            if (metrics) {
+                metrics
+                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                              {{"route", "instruction_execute"}, {"reason", bv->reason}})
+                    .increment();
+            }
+            if (audit_fn) {
+                audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                         std::string("reason=") + bv->reason);
+            }
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+
         std::vector<std::string> agent_ids;
         std::string scope_expr;
         std::unordered_map<std::string, std::string> params;
         try {
-            auto j = nlohmann::json::parse(req.body);
             if (j.contains("agent_ids") && j["agent_ids"].is_array()) {
                 for (const auto& a : j["agent_ids"])
                     agent_ids.push_back(a.get<std::string>());
@@ -1465,7 +1511,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        // Empty agent_ids + empty scope = broadcast to all agents
+        // OMITTED agent_ids + OMITTED scope = broadcast to all agents. That is
+        // still the contract and is deliberate. What changed in #2500 is the
+        // other half: a targeting argument the caller SUPPLIED can no longer
+        // arrive here having silently resolved to nothing — `{"agent_ids": []}`,
+        // a non-array `agent_ids` and a non-string `scope` are refused above, so
+        // reaching this point empty now means the caller genuinely named no
+        // target rather than named one the parser threw away.
 
         // PR 2: create the execution row BEFORE dispatch so the
         // execution_id is known when cmd_dispatch generates command_id —

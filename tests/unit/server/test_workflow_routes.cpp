@@ -103,6 +103,17 @@ struct ExecHarness {
         std::string action, result, target_type, target_id, detail;
     };
     std::vector<AuditCall> audit_calls;
+    /// #2500 targeting-widening regression net. `dispatch_calls` is the
+    /// load-bearing one: a refusal that still dispatched would be no fix at
+    /// all, and the pre-#2500 bug was precisely a 200-with-dispatch. The
+    /// captured targeting lets a test assert WHAT the sink was asked to reach
+    /// rather than only that it was reached.
+    int dispatch_calls{0};
+    std::vector<std::string> last_dispatch_agent_ids;
+    std::string last_dispatch_scope;
+    /// Borrowed by the routes' lambdas, so it must outlive `routes` — hence
+    /// declared above it.
+    yuzu::MetricsRegistry metrics;
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -179,10 +190,15 @@ struct ExecHarness {
         // race close). The test stub captures the last (command_id,
         // execution_id) pair for assertion.
         auto cmd_dispatch = [this](const std::string&, const std::string&,
-                                   const std::vector<std::string>&, const std::string&,
+                                   const std::vector<std::string>& agent_ids,
+                                   const std::string& scope_expr,
                                    const std::unordered_map<std::string, std::string>&,
                                    const std::string& execution_id) -> std::pair<std::string, int> {
             last_dispatch_execution_id = execution_id;
+            // #2500: capture what the sink was actually asked to target.
+            ++dispatch_calls;
+            last_dispatch_agent_ids = agent_ids;
+            last_dispatch_scope = scope_expr;
             return {dispatch_cmd_override, dispatch_sent_override};
         };
 
@@ -204,6 +220,7 @@ struct ExecHarness {
         // nullptr but is still registered, which is the qe-S1 path.
         wf_deps.execution_event_bus = event_bus.get();
         wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
+        wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
         routes.register_routes(sink, std::move(wf_deps));
     }
 
@@ -1349,4 +1366,146 @@ TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
     for (const auto& a : h.audit_calls) {
         CHECK_FALSE(a.action == "execution.live_subscribe");
     }
+}
+
+// ── #2500: supplied-but-names-nothing targeting must never widen ──────────
+//
+// The REST twin of #2492. Before this, POST /api/instructions/{id}/execute
+// dispatched to the ENTIRE FLEET when `agent_ids` was `[]`, when `agent_ids`
+// was not an array, or when `scope` was not a string — the parser dropped what
+// it could not use and the sink's `agent_ids.empty()` branch read the result as
+// "no target named". `[1,2,3]` did 400, but only because `get<std::string>()`
+// threw into a generic catch; that was an accident of parse order, not a check.
+//
+// `dispatch_calls` is the assertion that matters in every rejecting section: a
+// 400 that still dispatched would leave the defect intact behind a nicer
+// status code, and the original bug returned a SUCCESS response.
+
+TEST_CASE("#2500 — supplied-but-empty agent_ids is refused, not widened to the fleet",
+          "[workflow][executions][execute][targeting][security]") {
+    ExecHarness h;
+    h.make_def("def-T1", "T1");
+
+    auto res = h.sink.Post("/api/instructions/def-T1/execute", R"({"agent_ids":[]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 400);
+    // The message must name the field and the deliberate way to broadcast —
+    // an operator whose device filter matched nothing needs to be told the
+    // difference between "no devices" and "every device".
+    CHECK(body["error"]["message"].get<std::string>().find("agent_ids") != std::string::npos);
+    CHECK(body["meta"]["api_version"] == "v1");
+
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "agent_ids_empty"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("#2500 — non-array agent_ids and non-string scope are refused, not ignored",
+          "[workflow][executions][execute][targeting][security]") {
+    // Both were SILENTLY SKIPPED by the `is_array()` / `is_string()` guards and
+    // fell through to broadcast. Neither ever produced an error before.
+    SECTION("non-array agent_ids") {
+        ExecHarness h;
+        h.make_def("def-T2", "T2");
+        auto res = h.sink.Post("/api/instructions/def-T2/execute", R"({"agent_ids":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metrics
+                  .counter("yuzu_server_dispatch_target_rejected_total",
+                           {{"route", "instruction_execute"}, {"reason", "agent_ids_type"}})
+                  .value() == 1.0);
+    }
+    SECTION("non-string scope") {
+        ExecHarness h;
+        h.make_def("def-T3", "T3");
+        auto res = h.sink.Post("/api/instructions/def-T3/execute", R"({"scope":123})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metrics
+                  .counter("yuzu_server_dispatch_target_rejected_total",
+                           {{"route", "instruction_execute"}, {"reason", "scope_type"}})
+                  .value() == 1.0);
+    }
+    SECTION("supplied-but-empty scope") {
+        ExecHarness h;
+        h.make_def("def-T4", "T4");
+        auto res = h.sink.Post("/api/instructions/def-T4/execute", R"({"scope":""})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.dispatch_calls == 0);
+        CHECK(h.metrics
+                  .counter("yuzu_server_dispatch_target_rejected_total",
+                           {{"route", "instruction_execute"}, {"reason", "scope_empty"}})
+                  .value() == 1.0);
+    }
+}
+
+TEST_CASE("#2500 — numeric agent_ids entries are refused DELIBERATELY, with a targeting reason",
+          "[workflow][executions][execute][targeting][security]") {
+    // This shape already 400'd before the fix — via `get<std::string>()`
+    // throwing `type_error` into the body-parse catch, which reported
+    // "invalid request body", emitted no metric and no audit row, and would
+    // have vanished the moment anyone made that loop tolerant. Pin that it is
+    // now refused BY THE TARGETING RULE: the reason label is the proof, because
+    // only the deliberate path can produce it.
+    ExecHarness h;
+    h.make_def("def-T5", "T5");
+
+    auto res = h.sink.Post("/api/instructions/def-T5/execute", R"({"agent_ids":[1,2,3]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "agent_id_type"}})
+              .value() == 1.0);
+
+    bool denied_audit = false;
+    for (const auto& a : h.audit_calls) {
+        if (a.action == "instruction.execute" && a.result == "denied" &&
+            a.detail == "reason=agent_id_type" && a.target_id == "def-T5")
+            denied_audit = true;
+    }
+    CHECK(denied_audit);
+}
+
+TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broadness guard)",
+          "[workflow][executions][execute][targeting]") {
+    // The half of the rule that is NOT a refusal, and the one a careless fix
+    // breaks: omitting both fields is how a caller deliberately says "the whole
+    // fleet", and it must keep working. Without this section a fix that
+    // rejected every untargeted execute would pass every test above.
+    ExecHarness h;
+    h.make_def("def-T6", "T6");
+    h.dispatch_cmd_override = "cmd-1";
+    h.dispatch_sent_override = 3;
+
+    auto res = h.sink.Post("/api/instructions/def-T6/execute", R"({"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_agent_ids.empty());
+    CHECK(h.last_dispatch_scope.empty());
+}
+
+TEST_CASE("#2500 — an explicit non-empty target is unaffected",
+          "[workflow][executions][execute][targeting]") {
+    ExecHarness h;
+    h.make_def("def-T7", "T7");
+    h.dispatch_cmd_override = "cmd-2";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/instructions/def-T7/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 1);
+    CHECK(h.last_dispatch_agent_ids[0] == "agent-1");
 }

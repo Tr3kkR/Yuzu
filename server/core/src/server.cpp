@@ -85,6 +85,7 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -606,6 +607,21 @@ public:
         for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
             metrics_.counter("yuzu_mcp_tool_args_too_large_total",
                              {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+        }
+        // #2500 REST targeting refusals. Deliberately NOT the MCP counter above:
+        // these are different surfaces with different gates, and folding them into
+        // one series would make `yuzu_mcp_*` count calls that never touched MCP.
+        // Both axes are closed — `route` is the two REST twins that dispatch on
+        // caller-supplied targeting, `reason` iterates the ONE array in
+        // dispatch_target_shape.hpp — so this pre-seed is exhaustive and absent()
+        // stays meaningful. A reason added at an emit site instead of in that array
+        // is emitted-but-unseeded: it passes its own test while the dashboard reads
+        // zero and the alert never fires.
+        for (const char* route : {"command", "instruction_execute"}) {
+            for (const auto reason : yuzu::server::kTargetingShapeReasons) {
+                metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", route}, {"reason", std::string(reason)}});
+            }
         }
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
@@ -7897,6 +7913,49 @@ private:
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
 
+            // ── Targeting shape: supplied-but-names-nothing is an ERROR (#2500) ──
+            // Run on the PARSED BODY, never on `agent_ids` above.
+            // `extract_json_string_array` returns {} for omitted, empty, not-an-array
+            // AND parse-failure alike, and that erasure IS this defect: a check
+            // written against its output cannot see `{"agent_ids":"dev-01"}` or
+            // `{"scope":5}` at all, and would ship half the bug with green tests.
+            //
+            // Placed AFTER require_permission so a refusal is attributable to a
+            // principal and can carry an audit row; before any dispatch-shaped work.
+            // The `plugin`/`action` emptiness check above deliberately stays where it
+            // is rather than being subsumed the way `ident_empty` subsumed MCP's: it
+            // currently runs BEFORE require_permission, and moving an auth-adjacent
+            // check is not something to do silently inside a targeting fix.
+            bool named_target = false;
+            bool target_rejected = false;
+            try {
+                const auto body = nlohmann::json::parse(req.body);
+                if (auto bv = yuzu::server::check_targeting_shape(body)) {
+                    metrics_
+                        .counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", "command"}, {"reason", bv->reason}})
+                        .increment();
+                    (void)audit_log(req, "command.dispatch", "denied", "command", "",
+                                    std::string("reason=") + bv->reason);
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                    target_rejected = true;
+                } else {
+                    named_target = yuzu::server::targeting_supplied(body);
+                }
+            } catch (const std::exception&) {
+                // Unreachable: a body that does not parse yields an empty `plugin`,
+                // which the check above already refused. Left as "named no target"
+                // rather than swallowed silently, so a future reorder of that check
+                // degrades to today's broadcast semantics, not to an unguarded one.
+            }
+            if (target_rejected)
+                return;
+
             // Per-action securable elevation + scope confinement for DESTRUCTIVE
             // generic-dispatch actions (governance HIGH #2). /api/command otherwise
             // base-gates only Execution:Execute and applies NO per-device visibility to
@@ -8039,7 +8098,33 @@ private:
                     }
                 }
             } else if (agent_ids.empty()) {
-                // Broadcast to all agents
+                // Broadcast ONLY when the caller named no target at all (#2500).
+                // A target that was SUPPLIED but resolved to nothing must never
+                // widen to the whole fleet — `{"agent_ids": []}` from a device
+                // filter that matched nothing is the likelier shape than the
+                // type-confused one, and it read as "no devices" to whoever sent it.
+                //
+                // The shape check ~150 lines above already refuses those bodies, so
+                // this branch is UNREACHABLE today. It is second line of defence,
+                // not the fix: the silent-drop `extract_json_string_array` call and
+                // this sink sit far apart with the permission gate, the destructive
+                // block and the params extraction between them, and this is the one
+                // place where a reorder turns a specific-looking target list into
+                // the entire fleet. Falsifiable on its own terms — neuter the shape
+                // check and `{"agent_ids": []}` is still refused here.
+                if (named_target) {
+                    metrics_
+                        .counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", "command"}, {"reason", "agent_ids_empty"}})
+                        .increment();
+                    (void)audit_log(req, "command.dispatch", "denied", "command", command_id,
+                                    "reason=agent_ids_empty");
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":{"code":400,"message":"a targeting argument was supplied but resolved to no target; omit it entirely to target all agents"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 sent = registry_.send_to_all(cmd);
             } else {
                 for (const auto& aid : agent_ids) {
@@ -12065,6 +12150,7 @@ private:
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
+        wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
