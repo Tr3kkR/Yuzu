@@ -386,6 +386,20 @@ public:
     /// settled. A persistent fault keeps the state observable, which is what
     /// distinguishes "the fault fired" from a silent no-op (#2487).
     void inject_teardown_step_fault_for_test(TeardownStage stage, int times = 1);
+    /// The NEXT `times` ~ClaimGuard record-lock acquisitions throw, modelling the
+    /// mutex failure this file's fault model already treats as real. Drives the
+    /// #2528 DEGRADED SETTLE: the claim must still be released (else the record is
+    /// wedged out of all four consumers and one victim stalls ring-only pressure
+    /// relief bridge-wide), and the settle bookkeeping that could not run must be
+    /// recorded honestly - terminal_projected when the frame was already published,
+    /// terminal_payload_lost when it was extracted and never published.
+    void inject_claim_lock_fault_for_test(int times = 1);
+    /// The NEXT `times` project_record terminal builds fail BOTH ways (real final
+    /// and the prebuilt fallback copy) - the only path that leaves the terminal
+    /// extracted but unpublished, and therefore the only path whose recovery is
+    /// the guard's restore. Pairs with inject_claim_lock_fault_for_test to reach
+    /// the #2528 degraded settle's payload-lost arm.
+    void inject_projection_build_fault_for_test(int times = 1);
     /// The NEXT `times` teardown terminal-frame BUILDS throw, modelling an
     /// allocation failure before publish_terminal_ladder is ever reached. Proves the
     /// TerminalRung::kNotAttempted audit path: nothing published AND the stream was
@@ -419,6 +433,7 @@ private:
         /// projector passes; records also drain their locals here at teardown.
         std::atomic<std::uint64_t> pending_listener_failures{0};
         std::atomic<std::uint64_t> pending_mailbox_drops{0};
+        std::atomic<std::uint64_t> pending_projection_degraded{0};
     };
 
     struct BridgeRecord {
@@ -468,7 +483,27 @@ private:
         /// B2/C2: claimed around EVERY batch that may publish (progress or
         /// terminal). Sweep never claims kDone while set; stays asserted until
         /// any deferred charge decrement under bridge_mu_ completes (D4).
-        bool projection_in_flight = false;
+        ///
+        /// PROTOCOL (#2528) - atomic so the claim can ALWAYS be released:
+        ///  - SET only under `mu`, as a test-and-set inside one locked critical
+        ///    section. Mutual exclusion between claimants comes from `mu`, not
+        ///    from the atomic, so the SET may be relaxed; the atomic exists for
+        ///    the release below.
+        ///  - CLEARED unconditionally by ~ClaimGuard: under `mu` on the normal
+        ///    path, and with a lock-free release store when `mu` cannot be
+        ///    acquired. It used to be cleared inside the try whose FIRST act was
+        ///    that acquisition, so a lock failure left it set forever and wedged
+        ///    the record out of all four consumers - and because a defer exits
+        ///    the pressure loop, one wedged victim stalled ring-only pressure
+        ///    relief bridge-wide.
+        ///  - READ under `mu` at every consumer, with acquire, to pair with that
+        ///    lock-free store.
+        ///  - CLEARED LAST, always: whatever settle bookkeeping the degraded path
+        ///    can still do is stored (release) BEFORE it, so no consumer can
+        ///    observe a released claim over stale bookkeeping.
+        /// What the SKIPPED in-try bookkeeping means is stated once, at
+        /// ~ClaimGuard in project_record - do not restate it here.
+        std::atomic<bool> projection_in_flight{false};
         bool pressure_requested = false;   ///< E1 - projector claims no new progress batch
         /// H1 (MCP MUST: notifications/progress `progress` strictly increases):
         /// the highest `progress` value already committed to the wire for this
@@ -477,7 +512,20 @@ private:
         /// no synchronization is needed.
         std::uint64_t last_progress_sent = 0;
         bool progress_sent_any = false;
-        bool terminal_projected = false;   ///< settled (published, GET-only-consumed, or poisoned)
+        /// Settled: published, GET-only-consumed, or poisoned. Atomic for the
+        /// same reason as projection_in_flight - ~ClaimGuard's degraded path must
+        /// be able to record a settle it could not take `mu` to write. Written
+        /// under `mu` on every normal path; read with acquire everywhere.
+        std::atomic<bool> terminal_projected{false};
+        /// STICKY (#2528): a terminal payload was extracted from terminal_slot and
+        /// then LOST, because the restore-and-retry path could not retake `mu`.
+        /// terminal_slot is empty and no listener will refill it (terminal_accepted
+        /// is sticky write-once), so the real payload is gone for good and no
+        /// projector retry exists. Consumers MUST map this to the success-shaped
+        /// fallback final (TeardownFinal::kFallbackFinal) - the same disposition as
+        /// TerminalVisit::kTerminalKnownLost. NEVER kNone (which answers the client
+        /// nothing) and NEVER -32014 (a terminal demonstrably did happen).
+        std::atomic<bool> terminal_payload_lost{false};
         bool final_published = false;      ///< a REAL final committed to the ring
         /// A5/C3: the per-session streamed-admission charge. Released exactly
         /// once (pin proof, cancel-degrade, pinless settle incl. poison, or
@@ -501,6 +549,11 @@ private:
         // itself never touches a metrics mutex.
         std::atomic<std::uint64_t> mailbox_drop_delta{0};
         std::atomic<std::uint64_t> listener_failure_delta{0};
+        /// #2528: ~ClaimGuard released the claim without `mu` and therefore could
+        /// not run the settle bookkeeping normally. "Should never happen" - it
+        /// needs a genuinely broken platform mutex - so any nonzero value is a
+        /// signal, not a rate.
+        std::atomic<std::uint64_t> projection_degraded_delta{0};
     };
 
     static std::string make_key(const std::string& session_id, const nlohmann::json& jsonrpc_id);
@@ -618,6 +671,8 @@ private:
     std::atomic<bool> reserve_fault_{false};   ///< one-shot reserve() throw seam
     std::atomic<bool> subscribe_fault_{false}; ///< one-shot subscribe() throw seam
     std::atomic<int> visit_copy_fault_{0};     ///< remaining pressure-visit copy throws (test seam)
+    std::atomic<int> claim_lock_fault_{0};     ///< remaining ~ClaimGuard lock throws (test seam)
+    std::atomic<int> projection_build_fault_{0}; ///< remaining project_record double-build failures
     /// Remaining injected throws per teardown stage (test seam), indexed by
     /// TeardownStage.
     std::array<std::atomic<int>, kTeardownStageCount> teardown_step_fault_{};

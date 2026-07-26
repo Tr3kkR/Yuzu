@@ -23,6 +23,7 @@ constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
 constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
+constexpr const char* kMetricProjectionDegraded = "yuzu_mcp_bridge_projection_degraded_total";
 // #2487: a teardown_claimed step that could not complete on the bare maintenance
 // thread. `stage` is a CLOSED literal set (unsubscribe | release_charge | erase),
 // pre-seeded in server.cpp. Any nonzero value means a record, its streamed charge,
@@ -614,18 +615,23 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         if (ph != Phase::kArmedGetOnly && ph != Phase::kRingOnly) {
             return;  // kArming latches; kStreaming is pump-owned (3b); kDone/kAborted dead
         }
-        if (rec->projection_in_flight) {
+        if (rec->projection_in_flight.load(std::memory_order_acquire)) {
             return;  // single projector today, but the claim also fences sweep (B2)
         }
         // E1: while a pressure sweep is waiting on this record, no NEW progress
         // batch may start - only an already-latched terminal settles.
         const bool want_progress = rec->mb_count > 0 && !rec->pressure_requested;
-        const bool want_terminal =
-            rec->terminal_accepted && !rec->terminal_projected && rec->terminal_slot.has_value();
+        const bool want_terminal = rec->terminal_accepted &&
+                                   !rec->terminal_projected.load(std::memory_order_acquire) &&
+                                   rec->terminal_slot.has_value();
         if (!want_progress && !want_terminal) {
             return;
         }
-        rec->projection_in_flight = true;  // the claim - everything below is noexcept
+        // The claim - everything below is noexcept. Relaxed: this critical
+        // section IS the mutual exclusion, and every consumer reads under the
+        // same `mu`; the acquire/release pair matters only for ~ClaimGuard's
+        // lock-free clear (#2528 protocol, stated on the field).
+        rec->projection_in_flight.store(true, std::memory_order_relaxed);
         if (want_progress) {
             for (std::size_t i = 0; i < rec->mb_count; ++i) {
                 batch[i] = std::move(rec->mailbox[(rec->mb_head + i) % kBridgeMailboxCap]);
@@ -652,23 +658,21 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     struct ClaimGuard {
         const std::shared_ptr<BridgeRecord>& rec;
         std::optional<MailboxEntry>& term;
+        std::atomic<int>& lock_fault;
         bool terminal_settled = false;
         ~ClaimGuard() noexcept {
             // Contained: this destructor is implicitly noexcept and its FIRST act is a
             // mutex acquisition - the one throw site this file's own fault model treats
             // as real (it injects resource_deadlock_would_occur elsewhere). Unguarded,
             // a lock failure here is std::terminate on the projector thread, and
-            // guaranteed so if the destructor runs during unwinding. release_charge and
-            // project_record were restructured for exactly this seam; this was not.
-            //
-            // NOTE the containment is not the whole fix: projection_in_flight is
-            // cleared INSIDE this try, so a lock failure leaves it set and the record
-            // is deferred by every consumer forever - and because a defer exits the
-            // pressure loop, one wedged victim stalls ring-only pressure relief
-            // bridge-wide. Fixing that needs projection_in_flight to become atomic
-            // with a stated protocol (a finally-style clear would race the readers),
-            // which is a design change: tracked as #2528, deliberately not done here.
+            // guaranteed so if the destructor runs during unwinding.
             try {
+                if (lock_fault.load(std::memory_order_relaxed) > 0 &&
+                    lock_fault.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+                    // inject_claim_lock_fault_for_test - the modelled mutex failure
+                    throw std::system_error(
+                        std::make_error_code(std::errc::resource_deadlock_would_occur));
+                }
                 std::lock_guard<std::mutex> rlk(rec->mu);
                 if (term.has_value() && !terminal_settled) {
                     rec->terminal_slot = std::move(term);
@@ -682,13 +686,48 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
                 // wedged victim stalls ring-only pressure relief bridge-wide. Setting
                 // it here is safe precisely because terminal_settled means the frame
                 // is already published - it cannot cause a republish.
-                    rec->terminal_projected = true;
+                    rec->terminal_projected.store(true, std::memory_order_release);
                 }
-                rec->projection_in_flight = false;
-            } catch (...) {  // NOLINT(bugprone-empty-catch) - see the note above
+                rec->projection_in_flight.store(false, std::memory_order_release);
+                return;
+            } catch (...) {  // NOLINT(bugprone-empty-catch) - degraded settle below
             }
+
+            // DEGRADED SETTLE (#2528). `mu` is unavailable, so none of the above
+            // ran. The claim must be released anyway - leaving it set wedges the
+            // record out of all four consumers, and because a defer exits the
+            // pressure loop, one wedged victim stalls ring-only pressure relief
+            // bridge-wide. This is the ONE statement of what the skipped
+            // bookkeeping means; the field comments point here rather than
+            // restate it.
+            //
+            //  (a) progress-only batch (no terminal extracted): nothing was owed.
+            //      Releasing the claim is a COMPLETE recovery.
+            //  (b) terminal_settled: the frame is already committed to the ring;
+            //      the only lost write is terminal_projected. Storing it here is
+            //      honest - settled means published, so it cannot cause a
+            //      republish - and it lets the pressure visitor claim with kNone
+            //      instead of deferring on "latched but unprojected" forever.
+            //  (c) extracted but NOT settled (the restore-and-retry path): the
+            //      payload cannot go back into terminal_slot, and no listener will
+            //      refill it, so the retry is gone. Mark it lost. The consumer
+            //      contract - success-shaped fallback final, never kNone, never
+            //      -32014 - is stated on terminal_payload_lost and honoured in the
+            //      pressure visitor.
+            //
+            // Ordering is load-bearing: the bookkeeping stores are released BEFORE
+            // the claim, so no consumer can observe a released claim over stale
+            // bookkeeping. A consumer that races and reads the pre-store values
+            // merely defers one sweep tick and re-reads - bounded, not wedged.
+            if (terminal_settled) {
+                rec->terminal_projected.store(true, std::memory_order_release);
+            } else if (term.has_value()) {
+                rec->terminal_payload_lost.store(true, std::memory_order_release);
+            }
+            rec->projection_degraded_delta.fetch_add(1, std::memory_order_relaxed);
+            rec->projection_in_flight.store(false, std::memory_order_release);
         }
-    } guard{rec, term};
+    } guard{rec, term, claim_lock_fault_};
 
     // Phase observed under the mutex ⇒ arm() completed ⇒ the immutable-after-arm
     // fields (progress_token, execution_id, fallback_final, result_base, stream,
@@ -769,7 +808,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // already answered this request. Settle and finish the lifecycle.
         guard.terminal_settled = true;
         std::lock_guard<std::mutex> rlk(rec->mu);
-        rec->terminal_projected = true;
+        rec->terminal_projected.store(true, std::memory_order_release);
         Phase expected = Phase::kArmedGetOnly;
         rec->phase.compare_exchange_strong(expected, Phase::kDone, std::memory_order_acq_rel);
         return;  // sweep reaps kDone
@@ -778,14 +817,22 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     // kRingOnly: real final via the pinned ladder.
     std::string frame;
     bool built = false;
-    try {
-        frame = build_real_final(*rec, term->data);
-        built = true;
-    } catch (...) {
+    if (projection_build_fault_.load(std::memory_order_acquire) > 0 &&
+        projection_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+        // inject_projection_build_fault_for_test. Models the DOUBLE allocation
+        // failure - the real final AND the prebuilt fallback copy - which is the
+        // only way to leave this scope with the terminal extracted but never
+        // published, i.e. the one path that depends on the guard restoring it.
+    } else {
         try {
-            frame = rec->fallback_final;  // prebuilt at arm; copy can only OOM
+            frame = build_real_final(*rec, term->data);
             built = true;
-        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        } catch (...) {
+            try {
+                frame = rec->fallback_final;  // prebuilt at arm; copy can only OOM
+                built = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
         }
     }
     if (!built) {
@@ -815,7 +862,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         // scope here (request thread, different failure posture); tracked as #2529.
         std::lock_guard<std::mutex> lk(bridge_mu_);
         std::lock_guard<std::mutex> rlk(rec->mu);
-        rec->terminal_projected = true;
+        rec->terminal_projected.store(true, std::memory_order_release);
         if (fid != 0) {
             rec->final_published = true;
             rec->pinned_event_id = fid;
@@ -941,7 +988,7 @@ void McpStreamBridge::sweep() {
                 // H4: const pin poll - the ring's unpin (resume-cursor ack) is
                 // the consumption proof; no stream→bridge callback edge.
                 if (rec->final_published && rec->pinned_event_id != 0 &&
-                    !rec->projection_in_flight &&
+                    !rec->projection_in_flight.load(std::memory_order_acquire) &&
                     !rec->stream->is_pinned(rec->pinned_event_id)) {
                     claim = true;
                     action = "mcp.bridge.pin_acked";
@@ -963,7 +1010,7 @@ void McpStreamBridge::sweep() {
             }
             std::lock_guard<std::mutex> rlk(rec->mu);
             const Phase cur = rec->phase.load(std::memory_order_acquire);
-            if (rec->projection_in_flight || rec->torn_down) {
+            if (rec->projection_in_flight.load(std::memory_order_acquire) || rec->torn_down) {
                 continue;  // B2: never claim mid-projection; teardown is exactly-once
             }
             if (cur != ph && cur != Phase::kDone) {
@@ -1057,7 +1104,8 @@ void McpStreamBridge::sweep() {
                     return false;  // stale: a competing claimant already owns it
                 }
                 // Record-side state dominates the bus verdict (CORE-2).
-                if (oldest->terminal_accepted && oldest->terminal_projected) {
+                if (oldest->terminal_accepted &&
+                    oldest->terminal_projected.load(std::memory_order_acquire)) {
                     // Settled real final already pinned: claim, publish nothing.
                     oldest->phase.store(Phase::kDone, std::memory_order_release);
                     oldest->torn_down = true;
@@ -1065,10 +1113,26 @@ void McpStreamBridge::sweep() {
                     decision = TeardownFinal::kNone;
                     return true;
                 }
-                if (oldest->terminal_accepted && !oldest->terminal_projected) {
+                if (oldest->terminal_accepted &&
+                    !oldest->terminal_projected.load(std::memory_order_acquire)) {
+                    if (oldest->terminal_payload_lost.load(std::memory_order_acquire)) {
+                        // #2528 degraded settle: a real terminal existed, but its
+                        // payload was extracted and then lost when ~ClaimGuard could
+                        // not retake mu. terminal_slot is empty and sticky
+                        // terminal_accepted stops any listener refill, so NO projector
+                        // retry exists and deferring here would defer forever. Same
+                        // disposition as kTerminalKnownLost: the success-shaped
+                        // fallback, never -32014 (a terminal did happen) and never
+                        // kNone (which would answer the client nothing).
+                        oldest->phase.store(Phase::kDone, std::memory_order_release);
+                        oldest->torn_down = true;
+                        claimed_by_me = true;
+                        decision = TeardownFinal::kFallbackFinal;
+                        return true;
+                    }
                     return false;  // latched, not pinned: defer; projector settles
                 }
-                if (oldest->projection_in_flight) {
+                if (oldest->projection_in_flight.load(std::memory_order_acquire)) {
                     return false;  // a progress projection is mid-flight: defer
                 }
                 // No secured terminal: the bus verdict arbitrates. Secure any
@@ -1168,9 +1232,17 @@ void McpStreamBridge::sweep() {
                 // kAbsentChannel). Claim ONLY an unambiguous settled real final; a
                 // record that never secured a terminal defers (NEVER synthesize
                 // -32014 from an absent channel - that would re-open #2409).
+                // NOTE (#2528): a terminal_payload_lost record is NOT claimed here.
+                // Its honest disposition is kFallbackFinal, and this block is
+                // deliberately kNone-only - every publishing disposition must stay
+                // reachable solely from the visitor above, where the bus has already
+                // removed the listener. Such a record defers on this near-unreachable
+                // path and is reclaimed by shutdown(); widening the guard block would
+                // trade a bounded defer for a publish over a live listener.
                 if (!oldest->torn_down &&
                     oldest->phase.load(std::memory_order_acquire) == Phase::kRingOnly &&
-                    oldest->terminal_accepted && oldest->terminal_projected) {
+                    oldest->terminal_accepted &&
+                    oldest->terminal_projected.load(std::memory_order_acquire)) {
                     guard_claim = true;
                     guard_decision = TeardownFinal::kNone;
                     oldest->phase.store(Phase::kDone, std::memory_order_release);
@@ -1557,6 +1629,16 @@ void McpStreamBridge::flush_record_obs(BridgeRecord& rec) noexcept {
             core_->pending_listener_failures.fetch_add(fails, std::memory_order_relaxed);
         }
     }
+    const auto degraded = rec.projection_degraded_delta.exchange(0, std::memory_order_relaxed);
+    if (degraded != 0) {
+        if (metrics_ == nullptr ||
+            !obs_guard([&] {
+                metrics_->counter(kMetricProjectionDegraded)
+                    .increment(static_cast<double>(degraded));
+            })) {
+            core_->pending_projection_degraded.fetch_add(degraded, std::memory_order_relaxed);
+        }
+    }
 }
 
 void McpStreamBridge::flush_core_obs() noexcept {
@@ -1577,6 +1659,13 @@ void McpStreamBridge::flush_core_obs() noexcept {
             metrics_->counter(kMetricListenerFailures).increment(static_cast<double>(fails));
         })) {
         core_->pending_listener_failures.fetch_add(fails, std::memory_order_relaxed);
+    }
+    const auto degraded = core_->pending_projection_degraded.exchange(0, std::memory_order_relaxed);
+    if (degraded != 0 &&
+        !obs_guard([&] {
+            metrics_->counter(kMetricProjectionDegraded).increment(static_cast<double>(degraded));
+        })) {
+        core_->pending_projection_degraded.fetch_add(degraded, std::memory_order_relaxed);
     }
 }
 
@@ -1688,6 +1777,14 @@ void McpStreamBridge::inject_subscribe_fault_for_test() {
 
 void McpStreamBridge::inject_visit_copy_fault_for_test(int times) {
     visit_copy_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_claim_lock_fault_for_test(int times) {
+    claim_lock_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_projection_build_fault_for_test(int times) {
+    projection_build_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {

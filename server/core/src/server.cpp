@@ -576,6 +576,13 @@ public:
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
                           "records_active > 0 with a flat rate here means the projector is wedged",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_projection_degraded_total",
+                          "Progress-bridge projections whose claim had to be released WITHOUT the "
+                          "record lock, so the settle bookkeeping could not run normally (#2528). "
+                          "Needs a genuinely broken platform mutex, so ANY nonzero value is a "
+                          "signal, not a rate: the record is still reclaimable, but a terminal "
+                          "payload mid-retry is lost and answered by the fallback final",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
                           "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
@@ -623,6 +630,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
+        metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
         metrics_.counter("yuzu_mcp_stream_pin_displaced_total");

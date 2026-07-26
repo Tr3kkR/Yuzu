@@ -108,6 +108,31 @@ again. Poisoning is reached only on a double publish failure, so it travels with
 allocation pressure; results remain fetchable by `execution_id` throughout, and no
 server-side action other than the usual restart decision applies.
 
+## If `yuzu_mcp_bridge_projection_degraded_total` is non-zero
+
+A different failure from the ones above, reached by the same broken-mutex fault, so the
+two alerts often fire together. A projection could not retake the record lock at the end
+of its batch and released its projection claim **without** it.
+
+Releasing the claim is deliberate and is the better half of the trade: a claim left set
+excludes that record from every consumer, and because a deferred record exits the
+pressure loop, one such record stalls ring-only pressure relief for every session until
+the process restarts. What is lost instead is that batch's settle bookkeeping:
+
+- a progress-only batch loses **nothing** - the claim release is a complete recovery;
+- a batch holding a terminal payload that had not yet been published loses that payload
+  permanently (it cannot be put back and nothing re-latches it). The request is then
+  answered by the success-shaped fallback final - `status:"unknown"` plus the
+  `execution_id` - rather than its real result.
+
+**What to do.** No bridge-specific remediation exists; the affected request has already
+been answered. Treat a non-zero value as a host-level signal: the fault is a failing
+`pthread_mutex_lock`, which on a healthy box does not happen. Check the same host for
+`yuzu_mcp_bridge_teardown_incomplete_total`, for OOM-killer activity, and for thread or
+file-descriptor exhaustion. Clients that saw a fallback final can fetch the real result
+with `GET /api/v1/executions/{execution_id}`; a restart clears nothing here, because
+nothing is retained - the record itself is reclaimed normally.
+
 ## Known gaps
 
 Tracked follow-ups an on-call engineer may hit:
