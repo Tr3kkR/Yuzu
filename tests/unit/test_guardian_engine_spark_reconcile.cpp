@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -432,6 +433,62 @@ TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spa
     spark_engine.stop();
 }
 
+// ── Journal AGE gauges: dormancy is an ABSENCE (item 6 + #2364) ───────────────
+
+TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt when dormant",
+          "[spark][guardian][reconcile][journal]") {
+    // prefer_spark=true + wired: the drain worker STARTED, its stamps are seeded, so the
+    // age stats are PRESENT - including all-zero ages on a fresh worker (0 is a real
+    // reading here; the emit layer ships the staleness pair including 0).
+    {
+        SparkReconcileFixture f;
+        const auto ages = f.engine->journal_age_stats();
+        REQUIRE(ages.has_value());
+        // Fresh worker: ages in seconds must be tiny (the stamps were just seeded), and
+        // no headroom episode exists.
+        CHECK(ages->page_stale_seconds < 60);
+        CHECK(ages->prune_stale_seconds < 60);
+        CHECK(ages->headroom_blocked_seconds == 0);
+        // COMPOSED with the real emitter (governance Gate 3 QE - the same
+        // engine->emitter composition the counter family's aggregate-inertness test
+        // pins): a live fresh worker ships EXACTLY the two staleness tags, including
+        // their zero values, and no blocked tag.
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_journal_age_tags(tags, ages);
+        REQUIRE(tags.size() == 2);
+        CHECK(tags.count("yuzu.guardian_journal_page_stale_seconds") == 1);
+        CHECK(tags.count("yuzu.guardian_journal_prune_stale_seconds") == 1);
+        CHECK(tags.count("yuzu.guardian_journal_headroom_blocked_seconds") == 0);
+    }
+    // prefer_spark=false + wired: the worker is CONSTRUCTED but never started (the flag
+    // gates start()), and the ages must be ABSENT - not zero. This is the dormancy
+    // posture that keeps a pre-flip fleet from paging on a "stale" inert journal: a
+    // fabricated 0 would be wrong the other way (it claims a live fresh worker).
+    {
+        auto opened = KvStore::open(unique_kv_path());
+        REQUIRE(opened.has_value());
+        KvStore kv{std::move(*opened)};
+        SparkEngine spark_engine;
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+        spark_engine.start();
+        GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+        REQUIRE(engine.start_local().has_value());
+        engine.wire_spark_engine(&spark_engine, false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+        const auto ages = engine.journal_age_stats();
+        CHECK_FALSE(ages.has_value());
+        // Composed: nullopt through the real emitter ships NOTHING - the dormancy
+        // contract at the exact seam agent.cpp uses.
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_guardian_journal_age_tags(tags, ages);
+        CHECK(tags.empty());
+        engine.stop();
+        spark_engine.stop();
+    }
+}
+
 // ── Durable-journal persist boundary + inertness (item 7 PR-Ag C2) ───────────
 
 TEST_CASE("prefer_spark=true: an armed rule's record is persisted to the durable journal",
@@ -562,7 +619,8 @@ TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal u
     REQUIRE(opened.has_value());
     KvStore kv{std::move(*opened)};
     // Seed the journal namespace with a batch that must be left untouched.
-    REQUIRE(kv.set(yuzu::agent::kJournalNamespace, "lc:seed:000000000000",
+    const auto seed_key = yuzu::agent::journal_batch_key(1'700'000'000'000LL, "seed", 0);
+    REQUIRE(kv.set(yuzu::agent::kJournalNamespace, seed_key,
                    R"({"v":4,"ts_ms":1700000000000,"entries":[{"rule_id":"r","generation":1,)"
                    R"("event_id":"e","enqueued_ns":1700000000000000000,"kind":"armed",)"
                    R"("guard_type":"file","rule_name":"n"}]})"));
@@ -579,7 +637,10 @@ TEST_CASE("prefer_spark=false: page_journal + tick are inert (no pass, journal u
     engine.page_journal();
     engine.journal_maintenance_tick();
     CHECK(engine.lifecycle_journal_for_test()->pages() == 0);            // no paging pass ran
-    CHECK(kv.exists(yuzu::agent::kJournalNamespace, "lc:seed:000000000000")); // seed untouched
+    CHECK(kv.exists(yuzu::agent::kJournalNamespace, seed_key)); // seed untouched
+    // A WELL-FORMED key on purpose: seeded with the retired pre-ts format this would
+    // prove only "a row that prune would quarantine anyway is untouched", which is true
+    // of a dormant journal for the wrong reason (governance Gate 3 architect/QE).
 
     engine.stop();
     spark_engine.stop();
@@ -612,6 +673,57 @@ TEST_CASE("prefer_spark=false: journal telemetry is all-zero (aggregate inertnes
     std::map<std::string, std::string> tags;
     yuzu::agent::emit_guardian_journal_heartbeat_tags(tags, engine.journal_stats());
     CHECK(tags.empty());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
+TEST_CASE("journal_stats() surfaces evicted_unclassified from the engine's real journal",
+          "[spark][guardian][reconcile][journal]") {
+    // The one plumbing seam the fleet-tags sizeof static_assert cannot cover: the
+    // GuardianEngine::journal_stats() assignment that copies the journal's counter into the
+    // struct. Every other test reads the journal accessor or builds GuardianJournalStats
+    // directly, so a dropped assignment there leaves them all green while the sparse emitter
+    // ships field 0 -> the fleet gauge is permanently ABSENT, reading as "nothing to report".
+    // This drives the engine's OWN journal to one unclassified eviction and asserts it arrives
+    // through journal_stats(). Deleting the assignment turns this red (item 3, consult gap 1).
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    // Wiring the spark path is what constructs the lifecycle journal (prefer_spark=false only
+    // gates the drain worker's start, not the journal), so journal_stats() has a real source.
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+
+    auto* journal = engine.lifecycle_journal_for_test();
+    REQUIRE(journal != nullptr);
+    journal->set_retention_limits_for_test(/*days=*/100000, /*max_batches=*/0,
+                                           /*max_bytes=*/std::numeric_limits<std::size_t>::max(),
+                                           /*max_quarantine=*/100); // count cap 0 -> evict all
+    const std::vector<std::shared_ptr<const yuzu::agent::JournalRecord>> pending{
+        std::make_shared<const yuzu::agent::JournalRecord>(yuzu::agent::JournalRecord{
+            .rule_id = "r1", .generation = 1, .event_id = "e1", .enqueued_ns = 1,
+            .kind = "armed", .guard_type = "file", .rule_name = "n"})};
+    REQUIRE(journal->persist(pending, nullptr, yuzu::agent::kJournalPersistUnbounded,
+                             yuzu::agent::kJournalPersistUnbounded) == 1);
+    // A correlated scan+read failure makes the single evicted batch land in unclassified. This
+    // seam drives only the READ-FAILURE cause of unclassified; the shutdown-mid-pass and
+    // throw-mid-classification causes are pinned at the component level in
+    // test_guardian_lifecycle_journal.cpp. That is sufficient here because the plumbing line
+    // under test (journal_stats()'s assignment) is cause-agnostic - it copies one atomic.
+    journal->inject_prune_sent_scan_failures_for_test(1);
+    journal->inject_prune_sent_read_failures_for_test(5);
+    REQUIRE(journal->prune(0).evicted == 1);
+    REQUIRE(journal->evicted_unclassified() == 1);
+
+    CHECK(engine.journal_stats().evicted_unclassified == 1); // the assignment under test
 
     engine.stop();
     spark_engine.stop();
@@ -836,18 +948,9 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
                                  return SendResult::Sent;
                              });
 
-    // RAII safety net (mirrors OrphanExitGuard in agents/core/src/hard_exit.hpp):
-    // the send callback above parks the drain worker on `release`. If a REQUIRE
-    // below fires while the worker is en route to (or already parked in) that
-    // callback, Catch2 unwinds this scope; without releasing the worker first,
-    // ~GuardianEngine's stop()-join blocks on a `release` that never flips and
-    // the still-live worker races the destruction of these stack-local sync
-    // primitives - the #1648 non-Catch2 process exit (42) that defeats
-    // flake-retry classification and hard-blocks the whole agent suite. Declared
-    // AFTER `engine` so reverse-declaration-order destruction runs this FIRST:
-    // the worker is released (then joined by ~GuardianEngine) while send_mu/
-    // send_cv/release are still alive, so any assertion failure exits as an
-    // ordinary, classifiable Catch2 failure instead of a crash.
+    // A fatal assertion at the wait boundary can unwind while the worker is racing into
+    // the parked callback. Declared after engine so this releases the worker before
+    // ~GuardianEngine joins it, while send_mu/send_cv/release are still alive.
     struct ReleaseParkedWorker {
         std::mutex& mu;
         std::condition_variable& cv;
@@ -867,7 +970,10 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     gpb::GuaranteedStatePush push;
     push.set_full_sync(true);
     *push.add_rules() = make_service_rule("r1");
-    engine.apply_rules(push);
+    // Serialize-then-dispatch because the rule carries a protobuf Map; see the fixture's
+    // apply() helper above for the Windows EXE/DLL abseil hash-seed boundary.
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, push.SerializeAsString())
+                .exit_code == 0);
     REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
 
     {   // Park the worker inside a send, so the join below cannot complete.

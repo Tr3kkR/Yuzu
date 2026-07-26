@@ -1,10 +1,14 @@
 #include "mcp_server.hpp"
+
+#include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
+#include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
-#include "mcp_transport.hpp" // Streamable HTTP transport pre-checks (2f)
+#include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
+#include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -22,6 +26,7 @@
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
@@ -39,10 +44,12 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server::mcp {
 namespace {
@@ -184,7 +191,12 @@ int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
 // Server-side length cap for free-text agentic params (question, scenario) that
 // are lowercased/echoed/searched. Bounds work + error-message echo (G-S11); the
 // matching input schemas also carry "maxLength": 2048.
+// SCOPE NOTE (#2437): this constant serves exactly two READ tools —
+// classify_operational_question and get_incident_playbook. It is NOT a
+// general handler-side byte cap, and in particular execute_instruction has
+// never used it; see kExecInstr* below for that tool's bounds.
 constexpr std::size_t kAgenticParamMaxLen = 2048;
+
 
 std::string json_quoted_string(std::string_view value) {
     std::string quoted;
@@ -264,6 +276,14 @@ std::string lower_copy(std::string v) {
 }
 
 // All 26 Phase 1 read-only tools.
+//
+// SCHEMA AUTHORING (#2405): every input_schema_json below must compile under
+// the CLOSED keyword catalogue in mcp_input_schema.cpp — an unsupported
+// keyword, a malformed operand, or (on an approval-gated tool) a root
+// `additionalProperties:false` without a declared `approval_id` is a BOOT
+// FAILURE, not a warning. Adding a keyword means extending that catalogue
+// (semantics + operand grammar + tests + docs) in the same change. See
+// docs/mcp-server.md "Adding a tool".
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})"},
@@ -555,21 +575,39 @@ static const ToolDef kTools[] = {
     // Phase 2 write tool
     {"execute_instruction",
      "Execute a plugin action on one or more agents. ASYNC: returns immediately with command_id "
-     "+ execution_id + agents_reached; the agents run the action and report back separately. To "
-     "get results, poll query_responses with the returned execution_id — an EMPTY result means "
-     "the run is still in flight, so wait ~2-5s and retry a few times (or call "
-     "get_execution_status to confirm a terminal state), or subscribe to live JSON events via GET "
-     "/api/v1/events?execution_id=<id>. Find valid plugin/action names AND their parameters via "
-     "discover_plugins (parameter_schema is inline for actions with a published definition) or "
-     "discover_instructions — do not guess action names. "
+     "+ execution_id + agents_reached; the agents run the action and report back separately. "
+     "LIVE PROGRESS: on a Streamable HTTP session, include _meta.progressToken (string|int) in "
+     "the tools/call params and notifications/progress frames (agents responded / targeted, with "
+     "the execution_id in _meta under \"yuzu.execution_id\") arrive on this session's GET SSE "
+     "stream as the fleet responds. Progress is always BEST-EFFORT: even after supplying a "
+     "token you MUST still be prepared to poll (a reservation can silently degrade under load "
+     "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "FALLBACK when not streaming: poll query_responses with the "
+     "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
+     "and retry a few times (or call get_execution_status to confirm a terminal state), or "
+     "subscribe to live JSON events via GET /api/v1/events?execution_id=<id>. Find valid "
+     "plugin/action names AND their parameters via discover_plugins (parameter_schema is inline "
+     "for actions with a published definition) or discover_instructions - do not guess action "
+     "names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
+     // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
+     // contract (A5 materiality backfill), and since #2437 they are ENFORCED
+     // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
+     // kExecInstr* constants in this file before dispatch, so the operator
+     // tier (which executes with no approval, and was therefore the unbounded
+     // one) is now bounded too. Enforcement had been split since #2405:
+     // approval-gated calls were validated by the C8 gate against this schema
+     // before a ticket was minted or consumed, while operator/readonly calls
+     // got client-advisory bounds only.
+     // THE LITERALS BELOW AND kExecInstr* ARE ONE CONTRACT IN TWO PLACES:
+     // change a bound here and change its twin, or the gap reopens silently.
      R"j({"type":"object","properties":{)j"
-     R"j("plugin":{"type":"string","description":"Plugin name (e.g. os_info, hardware)"},)j"
-     R"j("action":{"type":"string","description":"Action name (e.g. version, list)"},)j"
-     R"j("params":{"type":"object","additionalProperties":{"type":"string"},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
+     R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
+     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -579,12 +617,14 @@ static const ToolDef kTools[] = {
      "Fan one instruction out into several plugin actions on ONE device, async. The server "
      "dispatches each step as an ordinary command under a shared correlation id and returns "
      "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
-     "bundle_id for the collated result. Use this instead of N execute_instruction calls when "
-     "refreshing a device (cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 "
-     "steps, distinct (plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
+     "bundle_id for the collated result - bundles do NOT emit notifications/progress "
+     "(no _meta.progressToken support in the 2f scope; polling is the contract here). Use "
+     "this instead of N execute_instruction calls when refreshing a device "
+     "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
+     "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
-     R"j("steps":{"type":"array","description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
+     R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
      R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
@@ -722,12 +762,20 @@ static const ToolDef kTools[] = {
      "installed by its consumer (design doc §7 follow-on). Distinct from rotate_engine_credential "
      "itself — rotate is the 'here is the secret' reveal step; confirm is a SEPARATE attestation "
      "that closes the loop, gated behind its own Security:Write check rather than being inferred "
-     "from a successful rotate call. Mirrors POST "
+     "from a successful rotate call. Requires the successor token_id the rotate call returned — "
+     "the confirm is pinned to that exact rotation and a stale or mismatched id is rejected with "
+     "no state change, so a blind retry can never confirm a later rotation. Replaying a confirm "
+     "after this rotation already resolved (a network-dropped success, a double-submit) returns a "
+     "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
+     "re-rotate if a fresh rotation is needed. Note: an exact supervised replay carrying the same "
+     "consumed approval_id is denied earlier at the approval gate ('approval already used') before "
+     "this logic runs. Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
-     R"j(},"required":["principal_id"]})j",
+     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
+     R"j(},"required":["principal_id","token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
     {"transfer_engine_principal_owner",
@@ -1028,7 +1076,10 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 // members (delete_tag, quarantine_device, and — via the generic C8 gate —
 // execute_instruction/revoke_certificate/execute_bundle on the supervised
 // tier) route through the ticket-then-recall approval flow.
-static const std::unordered_set<std::string> kWriteTools = {
+// RAW authoritative sequence (#2423 review F1): the boot validator consumes
+// THIS array, before the lookup set below is derived, so a duplicate entry is
+// an offence — not a silent first-wins collapse at static init.
+static const char* const kWriteToolsRaw[] = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle",
@@ -1045,6 +1096,16 @@ static const std::unordered_set<std::string> kWriteTools = {
     "open_access_review", "record_attestation", "close_access_review",
 };
 
+// Lookup set DERIVED from the raw sequence; collapse here is safe because the
+// ctor validator rejects duplicates in kWriteToolsRaw before the server serves.
+static const std::unordered_set<std::string> kWriteTools = [] {
+    std::unordered_set<std::string> s;
+    s.reserve(std::size(kWriteToolsRaw));
+    for (const auto* n : kWriteToolsRaw)
+        s.insert(n);
+    return s;
+}();
+
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
 // Every tool declares its securable type and operation so that tier_allows()
 // and requires_approval() can be evaluated generically before dispatch.
@@ -1053,7 +1114,17 @@ struct ToolSecurity {
     const char* operation;
 };
 
-static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
+struct ToolSecurityEntry {
+    const char* name;
+    ToolSecurity sec;
+};
+
+// RAW authoritative registration sequence (#2423 review F1): the boot
+// validator consumes THIS array, before the lookup map below is derived, so a
+// duplicate entry — e.g. a merge-conflict resolution pasting a weak
+// (securable, operation) row above the intended one — is an offence, not a
+// silent first-wins collapse at static init.
+static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
     {"get_agent_details", {"Infrastructure", "Read"}},
@@ -1164,6 +1235,263 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"list_access_reviews", {"AccessReview", "Read"}},
     {"close_access_review", {"AccessReview", "Attest"}},
 };
+
+// Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
+// because the ctor validator rejects duplicates in kToolSecurityRows before
+// the server serves.
+static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = [] {
+    std::unordered_map<std::string, ToolSecurity> m;
+    m.reserve(std::size(kToolSecurityRows));
+    for (const auto& r : kToolSecurityRows)
+        m.emplace(r.name, r.sec);
+    return m;
+}();
+
+// ── C8 fail-closed registration machinery (#2383) ────────────────────────
+// Three-way dispatch classification. Knownness (kTools membership) decides
+// FIRST: a kToolSecurity row for an unserved name must NOT make it
+// dispatchable, and a SERVED tool with no kToolSecurity row is a
+// security-registration defect that denies fail-closed instead of silently
+// skipping the generic tier+approval gate.
+enum class ToolSecurityClass {
+    kUnknown,               // not a served tool → "Unknown tool" (kMethodNotFound)
+    kKnownRegistered,       // served + registered → C7 / tier / approval as normal
+    kKnownMissingSecurity,  // served but unregistered → deny fail-closed
+};
+
+// The served kTools[] name set, shared by the dispatch classifier and the
+// McpServer ctor validator so it is built during construction, not lazily on
+// the first request. ToolDef::name points at string literals (static storage
+// duration), so the views never dangle.
+const std::unordered_set<std::string_view>& known_tool_names() {
+    static const std::unordered_set<std::string_view> names = [] {
+        std::unordered_set<std::string_view> s;
+        s.reserve(kToolCount);
+        for (const auto& t : kTools)
+            s.insert(t.name);
+        return s;
+    }();
+    return names;
+}
+
+// Compiled input schemas, keyed by served tool name (#2405). DERIVED from
+// kTools[] — the ctor forces this to build only AFTER
+// validate_tool_security_registration() has accepted the raw sequences, so a
+// schema the subset compiler rejects is an unbootable offence there, never a
+// throw from this cache (the throw below is belt-and-braces for a validator
+// bypass, mirroring the dispatch pre-gate's defense-in-depth posture).
+// Immutable after construction; concurrent validate() calls are const reads.
+const std::unordered_map<std::string_view, CompiledInputSchema>& compiled_input_schemas() {
+    static const std::unordered_map<std::string_view, CompiledInputSchema> schemas = [] {
+        std::unordered_map<std::string_view, CompiledInputSchema> m;
+        m.reserve(kToolCount);
+        for (const auto& t : kTools) {
+            auto compiled = compile_input_schema(t.input_schema_json);
+            if (!compiled)
+                throw std::runtime_error(
+                    std::string("MCP input schema failed to compile for tool '") + t.name +
+                    "' (#2405; the boot validator should have rejected this build)");
+            m.emplace(t.name, std::move(*compiled));
+        }
+        return m;
+    }();
+    return schemas;
+}
+
+// Pure classifier — the REAL dispatch path calls this, and the testonly
+// wrapper (classify_tool_for_test) runs the same function over synthetic
+// tables, so the three-way split cannot silently regress while tests stay
+// green.
+ToolSecurityClass classify_tool_security(
+    const std::string& tool_name, const std::unordered_set<std::string_view>& known_tools,
+    const std::unordered_map<std::string, ToolSecurity>& security) {
+    if (!known_tools.contains(std::string_view{tool_name}))
+        return ToolSecurityClass::kUnknown;
+    if (!security.contains(tool_name))
+        return ToolSecurityClass::kKnownMissingSecurity;
+    return ToolSecurityClass::kKnownRegistered;
+}
+
+// Borrowed (name, securable, operation) row for the registration validator.
+// Views are valid only for the duration of the call; nothing is retained.
+struct ToolSecurityTuple {
+    std::string_view name;
+    std::string_view securable;
+    std::string_view operation;
+};
+
+// Closed RBAC operation vocabulary — mirrors rbac_store.cpp's seeded `ops[]`
+// catalogue (MOVE TOGETHER; the [rbac_store] binding test compares both
+// mirrors against a live store). An operation typo (e.g. "read") is NOT
+// harmlessly conservative: supervised tier_allows() permits every operation
+// while requires_approval() matches exact strings, so a typo'd op skips its
+// intended approval rule — fail OPEN. Reject at boot instead.
+constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete",
+                                         "Approve", "Push",  "Attest"};
+
+// Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
+// `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
+// fail-open class as a typo'd op: supervised tier_allows() permits every
+// type and requires_approval() exact-matches type strings, so e.g.
+// {"quarantine_device", {"Securty", "Execute"}} would silently skip its
+// approval rule (governance UP-6).
+constexpr std::string_view kRbacSecurables[] = {
+    "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
+    "Execution",      "Schedule",           "Approval",              "Tag",
+    "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
+    "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
+    "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
+    "AccessReview",   "SoftwareLicensing"};
+
+// Borrowed (name, input_schema_json) row for the registration validator's
+// 4th sequence (#2405). Views are valid only for the duration of the call.
+struct ToolSchemaSource {
+    std::string_view name;
+    std::string_view input_schema_json;
+};
+
+// Pure registration validator (#2383) — throws std::runtime_error naming every
+// offender (sorted, so the message is deterministic regardless of hash-map
+// iteration order). Called by the McpServer ctor with the real tables and by
+// validate_tool_registration_for_test with synthetic ones. Inputs are raw
+// (possibly-duplicated) sequences, NOT pre-deduplicated sets — a duplicate
+// entry is itself an offence (a dropped duplicate could silently discard the
+// stricter of two conflicting registrations).
+//
+// #2405 adds the 4th sequence: every served input schema must compile under
+// the mcp_input_schema subset compiler, so the C8 gate's pre-approval
+// validation can never meet a schema it only partially enforces. A non-empty
+// sequence is also held to duplicate-rejection and name-parity with the
+// served set (below), so a testonly caller cannot pass a shorter or disjoint
+// schema list; {} deliberately skips the schema checks (#2383-only tests).
+void validate_tool_security_registration(const std::vector<std::string_view>& tool_names,
+                                         const std::vector<ToolSecurityTuple>& security_rows,
+                                         const std::vector<std::string_view>& write_tools,
+                                         const std::vector<ToolSchemaSource>& input_schemas) {
+    std::vector<std::string> offences;
+
+    // An EMPTY schema sequence skips the schema checks entirely — the
+    // #2383-only synthetic validator tests pass {} deliberately. A NON-empty
+    // sequence must be honest: duplicates rejected and name-parity with the
+    // served set both directions, so a testonly caller cannot "pass" by
+    // supplying a shorter or disjoint schema list (Gate 2 sec-LOW-1).
+    if (!input_schemas.empty()) {
+        std::unordered_set<std::string_view> schema_names;
+        schema_names.reserve(input_schemas.size());
+        for (const auto& s : input_schemas) {
+            if (!schema_names.insert(s.name).second)
+                offences.push_back("duplicate input schema row for '" + std::string(s.name) +
+                                   "'");
+        }
+        for (const auto& n : tool_names)
+            if (!schema_names.contains(n))
+                offences.push_back("served tool '" + std::string(n) + "' has no input schema row");
+        for (const auto& s : input_schemas)
+            if (std::find(tool_names.begin(), tool_names.end(), s.name) == tool_names.end())
+                offences.push_back("input schema row '" + std::string(s.name) +
+                                   "' names no served tool");
+        for (const auto& s : input_schemas) {
+            auto compiled = compile_input_schema(s.input_schema_json);
+            if (!compiled)
+                for (const auto& e : compiled.error())
+                    offences.push_back("tool '" + std::string(s.name) + "' input schema: " + e);
+        }
+        // Unrecallable-ticket trap (#2405 governance UP-4): an approval-gated
+        // tool whose schema sets root additionalProperties:false without
+        // declaring approval_id would reject its OWN recall argument — every
+        // ticket it mints would be unredeemable, silently, forever. The
+        // checklist documents the rule; this makes it unbootable instead.
+        for (const auto& s : input_schemas) {
+            const auto row = std::find_if(security_rows.begin(), security_rows.end(),
+                                          [&](const auto& r) { return r.name == s.name; });
+            if (row == security_rows.end())
+                continue;  // parity offence already reported above
+            const bool gated = requires_approval("operator", row->securable, row->operation) ||
+                               requires_approval("supervised", row->securable, row->operation);
+            if (!gated)
+                continue;
+            const auto parsed =
+                nlohmann::json::parse(s.input_schema_json, nullptr, /*allow_exceptions=*/false);
+            if (!parsed.is_object())
+                continue;  // compile offence already reported above
+            const bool forbids_extra = parsed.contains("additionalProperties") &&
+                                       parsed["additionalProperties"].is_boolean() &&
+                                       !parsed["additionalProperties"].get<bool>();
+            const bool declares_ticket = parsed.contains("properties") &&
+                                         parsed["properties"].is_object() &&
+                                         parsed["properties"].contains("approval_id");
+            if (forbids_extra && !declares_ticket)
+                offences.push_back("approval-gated tool '" + std::string(s.name) +
+                                   "' sets additionalProperties:false without declaring "
+                                   "approval_id — its approval tickets would be unrecallable");
+        }
+    }
+
+    std::unordered_set<std::string_view> names;
+    names.reserve(tool_names.size());
+    for (const auto& n : tool_names)
+        if (!names.insert(n).second)
+            offences.push_back("duplicate served tool name '" + std::string(n) + "'");
+    std::unordered_map<std::string_view, ToolSecurityTuple> rows;
+    rows.reserve(security_rows.size());
+    for (const auto& r : security_rows)
+        if (!rows.emplace(r.name, r).second)
+            offences.push_back("duplicate kToolSecurity row for '" + std::string(r.name) + "'");
+    std::unordered_set<std::string_view> writes;
+    writes.reserve(write_tools.size());
+    for (const auto& w : write_tools)
+        if (!writes.insert(w).second)
+            offences.push_back("duplicate kWriteTools entry '" + std::string(w) + "'");
+
+    // Exact set equality BOTH directions: a subset-only check would accept an
+    // extra security row, and an extra row for an unserved name is the drift
+    // state under which the dispatch pre-gate's knownness ordering matters.
+    for (const auto& n : names)
+        if (!rows.contains(n))
+            offences.push_back("served tool '" + std::string(n) + "' has no kToolSecurity row");
+    for (const auto& [n, row] : rows) {
+        if (!names.contains(n))
+            offences.push_back("kToolSecurity row '" + std::string(n) + "' names no served tool");
+        if (std::find(std::begin(kRbacOps), std::end(kRbacOps), row.operation) ==
+            std::end(kRbacOps))
+            offences.push_back("tool '" + std::string(n) + "' has operation '" +
+                               std::string(row.operation) +
+                               "' outside the RBAC operation catalogue");
+        if (std::find(std::begin(kRbacSecurables), std::end(kRbacSecurables), row.securable) ==
+            std::end(kRbacSecurables))
+            offences.push_back("tool '" + std::string(n) + "' has securable type '" +
+                               std::string(row.securable) +
+                               "' outside the RBAC securable catalogue");
+    }
+    // kWriteTools must be EXACTLY the non-Read subset: the C7 --mcp-read-only
+    // guard keys on kWriteTools, so a non-Read tool missing from it silently
+    // executes in read-only mode (a second, independent fail-open surface).
+    for (const auto& [n, row] : rows) {
+        if (!names.contains(n))
+            continue;  // already reported above
+        const bool non_read = (row.operation != "Read");
+        if (non_read && !writes.contains(n))
+            offences.push_back("non-Read tool '" + std::string(n) +
+                               "' is missing from kWriteTools");
+        if (!non_read && writes.contains(n))
+            offences.push_back("Read tool '" + std::string(n) + "' must not be in kWriteTools");
+    }
+    for (const auto& w : writes)
+        if (!rows.contains(w))
+            offences.push_back("kWriteTools entry '" + std::string(w) +
+                               "' has no kToolSecurity row");
+
+    if (offences.empty())
+        return;
+    std::sort(offences.begin(), offences.end());
+    std::string msg = "MCP tool security registration invalid (C8 fail-closed, #2383): ";
+    for (size_t i = 0; i < offences.size(); ++i) {
+        if (i)
+            msg += "; ";
+        msg += offences[i];
+    }
+    throw std::runtime_error(msg);
+}
 
 // ── Tool annotation classification (ADR-1005 track 2g PR 2, invariant A5 item 1) ──
 //
@@ -1283,10 +1611,19 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"mint_engine_credential", {ToolEffect::Additive, false, "Mint engine credential"}},
     {"rotate_engine_credential", {ToolEffect::Destructive, false, "Rotate engine credential"}},
     // confirm_engine_rotation: revokes the predecessor credential in the confirm
-    // txn (api_token_store.cpp) → Destructive; only takes principal_id (does not
-    // pin the rotation), so a blind retry can confirm a LATER rotation early →
-    // NOT idempotent. Both were shipped wrong (2g PR 2 fix).
-    {"confirm_engine_rotation", {ToolEffect::Destructive, false, "Confirm engine credential rotation"}},
+    // txn (api_token_store.cpp) → Destructive. Since #2384 the required
+    // token_id arg pins the confirm to the exact pending successor, so a
+    // same-args replay can only ever target the pair it was issued for: while
+    // pending it confirms it (once); after cutover or once a later rotation is
+    // in flight NOTHING is written → idempotent per the MCP hint's
+    // no-additional-effect semantics (the replay errors, but errors safely).
+    // #2404 preserves the hint: the post-resolution replay still writes
+    // nothing, it just changes the ERROR from retryable to a terminal
+    // already-confirmed/already-resolved conflict (a same-pin match yields
+    // "already confirmed"; a moved-on rotation yields "the rotation was
+    // resolved"). Pre-#2384 the hint was false (unpinned blind retry could
+    // confirm a LATER rotation early).
+    {"confirm_engine_rotation", {ToolEffect::Destructive, true, "Confirm engine credential rotation"}},
     // assign/unassign_engine_role: INSERT OR IGNORE (additive) vs DELETE grant
     // (destructive). Both reach a fixed end state on retry → idempotent.
     {"assign_engine_role", {ToolEffect::Additive, true, "Assign fleet-wide role to engine principal"}},
@@ -1456,6 +1793,54 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 }
 
 } // anonymous namespace
+
+// ── C8 fail-closed boot validator (#2383) ────────────────────────────────
+// Refuse to construct — and therefore refuse to boot: the throw propagates
+// from start_web_server() to main()'s fatal-exception handler → EXIT_FAILURE
+// — when kTools / kToolSecurity / kWriteTools disagree. Every direct
+// test-harness construction runs the same check, so CI trips a
+// misregistration deterministically. --mcp-disable skips construction, which
+// is fine: no MCP surface, nothing to enforce.
+McpServer::McpServer() {
+    // Force the dispatch classifier's name set to build here, at construction,
+    // rather than lazily on the first request.
+    (void)known_tool_names();
+    // Feed the validator the RAW sequences for ALL THREE tables (#2423 review
+    // F1) — never the derived map/set, whose static-init first-wins collapse
+    // would hide a duplicate before validation could see it.
+    std::vector<std::string_view> names;
+    names.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        names.push_back(t.name);
+    std::vector<ToolSecurityTuple> rows;
+    rows.reserve(std::size(kToolSecurityRows));
+    for (const auto& r : kToolSecurityRows)
+        rows.push_back({r.name, r.sec.securable_type, r.sec.operation});
+    std::vector<std::string_view> writes(std::begin(kWriteToolsRaw), std::end(kWriteToolsRaw));
+    // 4th raw sequence (#2405): the served input schemas, from the SAME
+    // kTools[] array as `names`, so a schema the C8 gate cannot fully
+    // enforce refuses to boot alongside the other registration offences.
+    std::vector<ToolSchemaSource> schemas;
+    schemas.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        schemas.push_back({t.name, t.input_schema_json});
+    validate_tool_security_registration(names, rows, writes, schemas);
+    // Build the derived compiled-schema cache now — after the validator has
+    // accepted the raw sequences — rather than lazily on the first request.
+    (void)compiled_input_schemas();
+}
+
+std::vector<std::string> approval_gated_tool_names() {
+    std::vector<std::string> out;
+    for (const auto& r : kToolSecurityRows)
+        for (const char* tier : {"operator", "supervised"})
+            if (requires_approval(tier, r.sec.securable_type, r.sec.operation)) {
+                out.emplace_back(r.name);
+                break;
+            }
+    std::sort(out.begin(), out.end());
+    return out;
+}
 
 // ── Handler construction ─────────────────────────────────────────────────
 //
@@ -2202,8 +2587,17 @@ McpServer::HandlerFn McpServer::build_handler(
             // matches the REST a4 envelope, which emits retry_after_ms:5000 on the
             // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
-                                  std::string_view remediation = {}, long retry_after_ms = -1) {
-                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                  std::string_view remediation = {}, long retry_after_ms = -1,
+                                  std::string_view cid_override = {}) {
+                // cid_override lets a caller mint the correlation id FIRST and
+                // stamp it into its log/audit records before building the
+                // envelope (#2423 review F4); default preserves mint-here.
+                // Raw-embedded into the JSON below (like the minted cid), so it
+                // MUST be a server-generated make_correlation_id() token —
+                // never caller-derived text.
+                const std::string cid = cid_override.empty()
+                                            ? yuzu::server::detail::make_correlation_id()
+                                            : std::string(cid_override);
                 std::string data = R"({"correlation_id":")" + cid + R"(","retry_after_ms":)" +
                                    (retry_after_ms >= 0 ? std::to_string(retry_after_ms)
                                                         : std::string("null")) +
@@ -2251,10 +2645,66 @@ McpServer::HandlerFn McpServer::build_handler(
                 return a.dump();
             };
 
+            // ── C8 pre-gate: three-way knownness classification (#2383) ─
+            // Knownness is decided BEFORE C7 and the generic C8 gate: an
+            // unknown tool name must fall through to the "Unknown tool"
+            // kMethodNotFound branch untouched (no read-only denial, no tier
+            // denial, no approval mint — even if a stray kToolSecurity /
+            // kWriteTools row exists for it), and a SERVED tool with no
+            // kToolSecurity row is a security-registration defect → deny
+            // fail-closed with a misconfig-flavored error, distinct from the
+            // tier/authz denials so audit can tell the two apart. The ctor
+            // validator makes this state unbootable; this branch is defense
+            // in depth should the validator ever be bypassed.
+            const auto sec_class =
+                classify_tool_security(tool_name, known_tool_names(), kToolSecurity);
+            if (sec_class == ToolSecurityClass::kUnknown) {
+                // Structural early exit (#2423 review F2): an unknown name's
+                // termination must not depend on handler↔kTools parity — the
+                // boot validator sees tables, not the handler chain, so a
+                // future orphaned handler branch would otherwise execute with
+                // no tier/approval gate. Same audit + response as the terminal
+                // "Unknown tool" backstop at the bottom of the chain.
+                mcp_audit("failure", "unknown tool");
+                res.set_content(
+                    error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
+                    "application/json");
+                return;
+            }
+            if (sec_class == ToolSecurityClass::kKnownMissingSecurity) {
+                // Server-side fault, not an authz denial — and PERMANENT, not
+                // retryable, despite kInternalError's transient-store use in
+                // mcp_error_for_store_msg (retry_after_ms stays null). Loud on
+                // every channel — journal + metric + audit (governance UP-5):
+                // this branch firing at all means the boot validator was
+                // bypassed, which is itself the incident to surface. The A4
+                // correlation_id is minted FIRST so the journal line, the
+                // audit row, and the client envelope all carry the same token
+                // (#2423 review F4, agentic-first §122 backfill).
+                const std::string cid = yuzu::server::detail::make_correlation_id();
+                spdlog::error("MCP dispatch: tool '{}' has no security registration — "
+                              "denied fail-closed (#2383) correlation_id={}",
+                              tool_name, cid);
+                if (metrics != nullptr)
+                    metrics->counter("yuzu_mcp_tool_security_misconfig_total").increment();
+                mcp_audit("failure", "tool security registration missing correlation_id=" + cid);
+                res.set_content(
+                    a4_error(kInternalError,
+                             "tool security registration missing — denied fail-closed",
+                             "this server build serves the tool without a security "
+                             "registration; report this misconfiguration to the server "
+                             "administrator",
+                             -1, cid),
+                    "application/json");
+                return;
+            }
+
             // ── C7: read_only_mode enforcement ──────────────────────────
             // When the server is in read-only mode, reject any tool that
-            // performs a Write/Execute/Delete operation.
-            if (*p_read_only && kWriteTools.contains(tool_name)) {
+            // performs a Write/Execute/Delete operation. Known tools only —
+            // an unknown name skips straight to kMethodNotFound below.
+            if (sec_class == ToolSecurityClass::kKnownRegistered && *p_read_only &&
+                kWriteTools.contains(tool_name)) {
                 mcp_audit("denied", "read-only mode");
                 res.set_content(a4_error(kTierDenied, "MCP is in read-only mode",
                                          "the server is running with --mcp-read-only; use the "
@@ -2268,9 +2718,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // tier_allows() / requires_approval() generically.  This fires
             // for EVERY tool so Phase 2 write tools get policy enforcement
             // the moment they are registered in kToolSecurity.
-            auto sec_it = kToolSecurity.find(tool_name);
-            if (sec_it != kToolSecurity.end()) {
-                const auto& [sec_type, sec_op] = sec_it->second;
+            if (sec_class == ToolSecurityClass::kKnownRegistered) {
+                // kKnownRegistered guarantees the row exists (same map the
+                // classifier consulted).
+                const auto& [sec_type, sec_op] = kToolSecurity.find(tool_name)->second;
 
                 if (!tier_allows(tier, sec_type, sec_op)) {
                     mcp_audit("denied", "tier=" + std::string(tier));
@@ -2318,6 +2769,119 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string audit_agent = param_str(args, "agent_id");
                     const std::string mint_detail_prefix =
                         audit_agent.empty() ? std::string{} : "agent_id=" + audit_agent + " ";
+
+                    // Observability must never fail a dispatch. Both C8
+                    // rejection paths below - the #2405 schema violation and
+                    // the #2437 bound violation - count through this ONE
+                    // guarded helper rather than incrementing inline, so the
+                    // guard cannot land on one path and not the other. (The
+                    // handler's own `too_large` has carried the same guard
+                    // since #2437; before this BOTH C8 sites were the
+                    // outliers.) MetricsRegistry::counter is a lock_guard plus
+                    // a map insert with no backend and no cardinality limit,
+                    // so in practice only bad_alloc escapes - the guard costs
+                    // nothing and removes the question.
+                    //
+                    // SCOPE, stated precisely because the first version of this
+                    // comment overclaimed: this closes the two rejection paths
+                    // in the C8 block. It is NOT a file-wide guarantee -
+                    // `yuzu_mcp_tool_security_misconfig_total` and
+                    // `yuzu_mcp_stream_rejects_total` still increment inline
+                    // elsewhere in this file. Both of those fail CLOSED, so
+                    // they are hardening rather than defects; lifting this
+                    // helper to cover them is #2437 follow-up work, not a
+                    // property to assume here.
+                    //
+                    // The label vector is built INSIDE the try on purpose. An
+                    // earlier signature took a `const yuzu::Labels&`, which
+                    // materialised the vector plus its strings at the CALL
+                    // site - outside the guard - making this helper strictly
+                    // weaker than the `too_large` sibling it was modelled on.
+                    auto count_denial = [metrics, &tool_name](const char* family,
+                                                              const char* reason) noexcept {
+                        if (metrics == nullptr) return;
+                        try {
+                            yuzu::Labels labels{{"tool", tool_name}};
+                            if (reason != nullptr)
+                                labels.emplace_back("reason", reason);
+                            metrics->counter(family, labels).increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    };
+
+                    // ── #2405: input-schema validation BEFORE any ticket work ──
+                    // A schema-invalid call must neither MINT a ticket (an
+                    // admin's approval would be wasted on args the handler
+                    // rejects) nor CONSUME one on recall (a one-time capability
+                    // burned for nothing). This single check sits above the
+                    // mint/recall fork, so the two paths cannot diverge.
+                    // Validate the ORIGINAL args, approval_id included:
+                    // stripping it first (as canonical_args does for ticket
+                    // binding) would let a malformed non-string approval_id
+                    // fall through param_str's "" into the fresh-mint path
+                    // unseen. approval_id is control-plane, not tool input —
+                    // reject a non-string one explicitly (uniform across all
+                    // gated tools; only delete_tag/quarantine_device declare
+                    // it, the rest tolerate it as an undeclared property).
+                    // Handler-side validation stays as defense in depth.
+                    {
+                        std::optional<SchemaViolation> violation;
+                        if (args.contains("approval_id") && !args["approval_id"].is_string())
+                            violation = SchemaViolation{"/approval_id", "expected a string"};
+                        else
+                            violation = compiled_input_schemas().at(tool_name).validate(args);
+                        if (violation) {
+                            // One cid across audit row + client envelope
+                            // (#2423 review F4). No spdlog line: a client
+                            // fault, not a server fault. `path` carries no
+                            // caller-derived text (SchemaViolation contract:
+                            // caller-derived keys are wildcarded to '*').
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            count_denial("yuzu_mcp_tool_args_invalid_total", nullptr);
+                            mcp_audit("denied",
+                                      "arguments do not match the tool input schema at '" +
+                                          violation->path + "' correlation_id=" + cid);
+                            res.set_content(
+                                a4_error(kInvalidParams,
+                                         "arguments do not match the tool input schema at '" +
+                                             violation->path + "': " + violation->reason,
+                                         "correct the arguments to match this tool's "
+                                         "tools/list inputSchema and re-call; no approval "
+                                         "ticket was created or consumed",
+                                         -1, cid),
+                                "application/json");
+                            return;
+                        }
+                    }
+
+                    // #2437: the two bounds the CLOSED subset cannot express
+                    // (params key count, params key length) get checked HERE
+                    // too, not only in the handler. A handler-only check would
+                    // mint a ticket, spend a human's approval, CONSUME the
+                    // one-time ticket, and only then fail — the exact waste
+                    // this gate exists to prevent, and unavoidable for a client
+                    // since neither bound is published in the schema. Same
+                    // deny-without-consume shape as the schema violation above;
+                    // the handler keeps its own copy as defense in depth for
+                    // the ungated tiers.
+                    if (tool_name == "execute_instruction") {
+                        if (auto bv = check_exec_instruction_shape(args)) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            count_denial("yuzu_mcp_tool_args_too_large_total", bv->reason);
+                            mcp_audit("denied",
+                                      std::string("input bound exceeded: ") + bv->reason +
+                                          " correlation_id=" + cid);
+                            res.set_content(
+                                a4_error(kInvalidParams, bv->message,
+                                         "reduce the argument and re-call; no approval "
+                                         "ticket was created or consumed",
+                                         -1, cid),
+                                "application/json");
+                            return;
+                        }
+                    }
 
                     if (supplied_id.empty()) {
                         // First call → mint a ticket, but DEDUP first (governance
@@ -4706,6 +5270,133 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // ── Server-side input bounds (#2437) ──────────────────────────
+                // These mirror this tool's SERVED inputSchema exactly. Until now
+                // the schema's maxLength/maxItems were enforced only on the
+                // approval-gated (supervised) path, where the C8 gate validates
+                // arguments before minting or consuming a ticket — on the
+                // operator tier, which executes without approval, they were pure
+                // advice to a cooperating client. That asymmetry is the hole:
+                // the tier that needs no human in the loop was the unbounded one.
+                //
+                // Bounds are BYTE counts, matching the schema compiler's
+                // documented "maxLength counts bytes" deviation, so schema and
+                // enforcement can be compared literally rather than approximately.
+                //
+                // Deliberately NOT narrowing the charset. `execute_bundle`'s
+                // is_ident() restricts plugin/action to [a-z0-9_], but dotted
+                // server actions are live shipped content (content/definitions/
+                // workflow_management.yaml: plugin "server", action
+                // "workflow.list"), so importing that rule here would reject
+                // working calls. Length/count only.
+                auto too_large = [&](const char* reason, std::string_view what) {
+                    // ONE correlation id across the audit row and the client
+                    // envelope, minted FIRST (#2423 review F4 gave a4_error
+                    // its cid_override parameter for exactly this). Without
+                    // it the envelope mints an id the audit row never sees
+                    // and a SIEM cannot join the CC7.2 evidence row to the
+                    // error the caller got - which docs/mcp-server.md
+                    // already advertises as this surface's contract.
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_tool_args_too_large_total",
+                                      {{"tool", tool_name}, {"reason", reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // observability must never fail the dispatch
+                        }
+                    }
+                    mcp_audit("denied", std::string("input bound exceeded: ") + reason +
+                                        " correlation_id=" + cid);
+                    res.set_content(
+                        a4_error(kInvalidParams, what,
+                                 "reduce the argument to within this tool's tools/list "
+                                 "inputSchema bounds and re-call",
+                                 -1, cid),
+                        "application/json");
+                };
+                {
+                    // The schema-inexpressible rules, from the SAME pure
+                    // function the C8 gate ran pre-mint. Defense in depth for
+                    // the ungated tiers (readonly/operator never reach C8), and
+                    // structurally the reason a new rule cannot land on one
+                    // path only.
+                    if (auto bv = check_exec_instruction_shape(args)) {
+                        too_large(bv->reason, bv->message);
+                        return;
+                    }
+                    // Every rejection leaves EVIDENCE. A bound whose whole
+                    // purpose is detecting abuse must not be the one silent
+                    // denial here: the sibling free-text caps audit
+                    // ("question_too_long"/"scenario_too_long") and the C8
+                    // schema gate audits AND counts, so this does both. The
+                    // -32602 rides HTTP 200, so without this the only trace
+                    // would be yuzu_http_requests_total{status="200"}.
+                    // `reason` is a closed set of server literals — it is a
+                    // metric label, so it must never carry caller-derived text.
+                    if (plugin.size() > kExecInstrIdentMaxLen ||
+                        action.size() > kExecInstrIdentMaxLen) {
+                        too_large("ident_len", std::format("plugin and action must each be at most {} bytes", kExecInstrIdentMaxLen));
+                        return;
+                    }
+                    if (args.contains("scope") && args["scope"].is_string() &&
+                        args["scope"].get_ref<const std::string&>().size() >
+                            kExecInstrScopeMaxLen) {
+                        too_large("scope_len", std::format("scope must be at most {} bytes", kExecInstrScopeMaxLen));
+                        return;
+                    }
+                    if (args.contains("params") && args["params"].is_object()) {
+                        const auto& p = args["params"];
+                        if (p.size() > kExecInstrParamCountMax) {
+                            too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
+                            return;
+                        }
+                        for (const auto& [k, v] : p.items()) {
+                            // Key length is NOT expressible in the served schema
+                            // (the subset has no propertyNames/maxProperties), so
+                            // this bound and the count above exist only here.
+                            // Borrowed from bundle_service.hpp so the two
+                            // execute surfaces agree on what a param may be.
+                            if (k.size() > kExecInstrParamKeyMaxLen) {
+                                too_large("param_key_len", std::format("a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
+                                return;
+                            }
+                            // Measure what the handler will actually store: a
+                            // non-string value is dumped to text below, and the
+                            // dump is what reaches the agent, so bounding the
+                            // raw JSON value would under-count.
+                            const std::size_t vlen =
+                                v.is_string() ? v.get_ref<const std::string&>().size()
+                                              : v.dump().size();
+                            if (vlen > kExecInstrParamValueMaxLen) {
+                                too_large("param_value_len", std::format("a params value exceeds {} bytes", kExecInstrParamValueMaxLen));
+                                return;
+                            }
+                        }
+                    }
+                    if (args.contains("agent_ids") && args["agent_ids"].is_array()) {
+                        const auto& a = args["agent_ids"];
+                        if (a.size() > kExecInstrAgentIdsMaxItems) {
+                            too_large("agent_ids_count", std::format("agent_ids must have at most {} entries", kExecInstrAgentIdsMaxItems));
+                            return;
+                        }
+                        for (const auto& v : a) {
+                            // is_string() guard is load-bearing: get_ref throws
+                            // a type_error on a non-string. (A non-string entry
+                            // is silently DROPPED by the extraction loop below,
+                            // which is a separate hazard - it lands with the
+                            // targeting-safety change, not here.)
+                            if (v.is_string() &&
+                                v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
+                                too_large("agent_id_len", std::format("an agent_ids entry exceeds {} bytes", kExecInstrIdentMaxLen));
+                                return;
+                            }
+                        }
+                    }
+                }
+
 
                 // Extract params as string map
                 std::unordered_map<std::string, std::string> params;
@@ -4727,6 +5418,59 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Default scope to __all__ if neither scope nor agent_ids provided
                 if (scope.empty() && agent_ids.empty())
                     scope = "__all__";
+
+                // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
+                // A request carrying _meta.progressToken opts into live progress
+                // on the session's GET stream. Reservation happens BEFORE
+                // create_execution (admission rejections must be truthful about
+                // "no execution row"); in 3a every reservation failure DEGRADES
+                // SILENTLY to today's plain path - the plain response is
+                // self-sufficient (it carries execution_id), so a 429 is
+                // reserved for 3b's streamed intent only. The response bytes
+                // are identical with or without a bridge record.
+                mcp::McpStreamBridge* const bridge = stream_bridge_;
+                const auto bridge_sid = req.get_header_value("Mcp-Session-Id");
+                auto bridge_token = extract_progress_token(rpc.params);
+                bool bridge_active = false;
+                const auto bridge_degrade = [&](const char* reason) {
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // observability must never fail the dispatch
+                        }
+                    }
+                };
+                if (streaming_on && bridge != nullptr && execution_tracker != nullptr &&
+                    !bridge_sid.empty() && bridge_token.has_value()) {
+                    // The session id was validated (principal-bound) at handler
+                    // entry; reserve re-checks it against the registry anyway
+                    // (no TOCTOU widening - a dead session just degrades).
+                    // GUARD: reserve allocates (make_shared + map insert); a
+                    // bad_alloc here must degrade to the plain path, not turn a
+                    // dispatchable command into a 500 (byte-identical contract).
+                    try {
+                        auto rr = bridge->reserve(bridge_sid, session->username, id,
+                                                  std::move(bridge_token),
+                                                  /*streamed_intent=*/false);
+                        if (rr.ok) {
+                            bridge_active = true;
+                        } else {
+                            // L1: a coarse single degrade reason - reserve()
+                            // already counted the FINE reject reason into
+                            // yuzu_mcp_bridge_reject_total{reason=...}, so
+                            // forwarding it here too would double-taxonomy the
+                            // degrade counter with an open (undocumented) label
+                            // set. "why did progress degrade" = reserve_rejected;
+                            // "which reserve reject" lives in reject_total.
+                            bridge_degrade("reserve_rejected");
+                        }
+                    } catch (...) {
+                        bridge_degrade("reserve_threw");
+                    }
+                }
 
                 // #1088 — create the execution row BEFORE dispatch so the
                 // execution_id is known when cmd_dispatch generates
@@ -4775,6 +5519,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
+                // S2/S3 (2f PR 3a): no execution row ⇒ no durable fetch handle ⇒
+                // no bridge record (degrade); otherwise subscribe the reserved
+                // record to the bus (atomic install-then-replay routes any
+                // pre-subscribe event - the operator-cancel class - through the
+                // normal listener). A subscribe failure has zero side effects
+                // (3a.3 contract), so abandon + degrade keeps the plain path
+                // byte-identical.
+                if (bridge_active && execution_id.empty()) {
+                    bridge->abandon(bridge_sid, id);
+                    bridge_active = false;
+                    bridge_degrade("no_execution_row");
+                }
+                if (bridge_active) {
+                    bool subscribed = false;
+                    try {
+                        subscribed = bridge->subscribe(bridge_sid, id, execution_id);
+                    } catch (...) {
+                        subscribed = false;
+                    }
+                    if (!subscribed) {
+                        bridge->abandon(bridge_sid, id);
+                        bridge_active = false;
+                        bridge_degrade("subscribe_failed");
+                    }
+                }
+
                 // governance R1 unhappy-UP-1 BLOCKING: dispatch_fn can
                 // throw (mgmt_group_store->get_members SQLite, scope
                 // parser bug, registry_.send_to_* gRPC stream write,
@@ -4791,6 +5561,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         dispatch_fn(plugin, action, agent_ids, scope, params, execution_id);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
+                    // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
+                    // out in-flight listeners), then mark_cancelled - the cancel
+                    // terminal then has no bridge listener to reach. Error bytes
+                    // below are unchanged.
+                    if (bridge_active) {
+                        bridge->abandon(bridge_sid, id);
+                        bridge_active = false;
+                    }
                     if (execution_tracker && !execution_id.empty()) {
                         execution_tracker->mark_cancelled(execution_id, session->username);
                     }
@@ -4802,6 +5580,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 if (agents_reached == 0) {
+                    // 2f PR 3a: zero agents = the pre-dispatch failure class -
+                    // abandon the bridge record before mark_cancelled (same
+                    // ordering rationale as the dispatch-throw path above).
+                    if (bridge_active) {
+                        bridge->abandon(bridge_sid, id);
+                        bridge_active = false;
+                    }
                     // Mirror the REST sibling — cancel the pre-created
                     // execution row so it doesn't sit at status=running
                     // forever. mark_cancelled records the attempt for
@@ -4846,6 +5631,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Mirrors workflow_routes.cpp:1461-1463.
                 if (execution_tracker && !execution_id.empty()) {
                     execution_tracker->set_agents_targeted(execution_id, agents_reached);
+                    // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
+                    // arrived BEFORE set_agents_targeted saw agents_targeted==0
+                    // and could not transition the row to terminal
+                    // (refresh_counts requires targeted > 0), and
+                    // set_agents_targeted itself publishes nothing - an
+                    // all-respond-early execution stayed `running` forever with
+                    // no bus terminal. Re-evaluating here publishes fresh counts
+                    // and, when everyone already responded, the terminal. The
+                    // zero-agents path returned above, so this never fires with
+                    // targeted==0. (The identical REST/scheduled sibling holes -
+                    // workflow_routes.cpp, rest_api_v1.cpp, schedule_runner.cpp -
+                    // are tracked in issue #2408.)
+                    execution_tracker->refresh_counts(execution_id);
                 }
 
                 // #1088 — include execution_id in the result so the
@@ -4866,6 +5664,39 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add(JObj().add("type", "text").add("text", result_obj.str()))
                                  .str())
                         .str();
+                // S5 (2f PR 3a): arm GET-only - the atomic flip-and-drain hands
+                // the latched mailbox to the projector, which publishes progress
+                // LIVE onto this session's GET stream. `result` is passed as the
+                // result_base (B5): a parked record's real final re-emits today's
+                // result object with status/agents_* added as top-level keys.
+                // The plain JSON below answers this POST either way - GET-only
+                // mode NEVER emits a second final response (no pin, no final
+                // frame; the H2/G9-class byte test pins this).
+                if (bridge_active) {
+                    // GUARD (Sol code-review finding, 2026-07-23): passing the
+                    // lvalue `result` to arm()'s by-value result_base copies it,
+                    // and arm() builds a fallback string, both BEFORE the phase
+                    // flip - either can bad_alloc. An escaped throw here would
+                    // turn a successful dispatch into an httplib 500 (breaking the
+                    // byte-identical plain-path contract) AND strand the record in
+                    // kArming (sweep excludes kArming → a permanently leaked
+                    // global slot). Contain it: best-effort abandon the still-
+                    // kArming record and fall through to the unchanged success
+                    // response below.
+                    try {
+                        bridge->arm(bridge_sid, id, McpStreamBridge::ArmMode::kGetOnly, result);
+                    } catch (...) {
+                        try {
+                            bridge->abandon(bridge_sid, id);
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Under sustained OOM even abandon may fail; the record
+                            // then leaks one bounded slot (global cap 256) but the
+                            // plain response below still goes out - the contract
+                            // that matters.
+                        }
+                        bridge_degrade("arm_threw");
+                    }
+                }
                 // governance R1 happy-LOW-1: include command_id and
                 // execution_id in audit detail so SOC 2 investigators
                 // can join the audit row to the execution tracker row
@@ -6476,15 +7307,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // rotate_engine_credential returns only the raw secret; look up the
-                // successor (the newest active credential) for its token_id +
-                // overlap_expires_at.
+                // successor for its token_id + overlap_expires_at. Selected
+                // STRUCTURALLY (the row whose supersedes_token_id links back to
+                // the predecessor), NOT by newest created_at — created_at is
+                // second-resolution, so a same-second mint→rotate ties and the
+                // newest-scan could return the predecessor's id, which would
+                // break the #2384 confirm token_id pin.
                 ApiToken successor;
                 bool found_successor = false;
                 for (const auto& t :
                     engine_credential_store_->list_active_for_principal(principal_id)) {
-                    if (!found_successor || t.created_at > successor.created_at) {
+                    // At most one active row links (the store clears
+                    // supersedes_token_id at cutover, revoke-resolution, and
+                    // sweep), so first match is THE successor.
+                    if (!t.supersedes_token_id.empty()) {
                         successor = t;
                         found_successor = true;
+                        break;
                     }
                 }
                 // §7: every reveal — the original successor mint OR a within-grace-
@@ -6513,6 +7352,17 @@ McpServer::HandlerFn McpServer::build_handler(
             // POST /api/v1/engine-principals/{id}/credentials/confirm. Own
             // Security:Write gate (not inferred from rotate having succeeded).
             if (tool_name == "confirm_engine_rotation") {
+                // #2404 confirm-outcome counter (surface=mcp). Twin of the REST
+                // route's; stamped at the store-open guard and on every store
+                // result below, NOT on the tier / perm / input-validation
+                // early-outs (family scope contract, server.cpp describe).
+                const auto confirm_metric = [metrics](const char* result) {
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_engine_principal_confirm_total",
+                                      {{"surface", "mcp"}, {"result", result}})
+                            .increment();
+                };
                 if (!tier_allows(tier, "Security", "Write")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
@@ -6524,6 +7374,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (deny_if_engine_session())
                     return;
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    confirm_metric("transient"); // store unavailable at the open guard
                     mcp_audit("failure", "engine credential store unavailable");
                     res.set_content(a4_error(kInternalError, "engine credential store unavailable",
                                              "retry the request", /*retry_after_ms=*/5000),
@@ -6536,9 +7387,24 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto confirmed = engine_credential_store_->confirm_rotation(principal_id,
-                                                                            session->username);
+                // #2384: the successor token_id from the rotate response pins
+                // the exact rotation being confirmed (defense in depth — the
+                // store re-checks it against the pending pair under the lock).
+                const auto confirm_token_id = param_str(args, "token_id");
+                if (confirm_token_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "token_id is required",
+                                             "pass the token_id returned by "
+                                             "rotate_engine_credential"),
+                                    "application/json");
+                    return;
+                }
+                auto confirmed = engine_credential_store_->confirm_rotation(
+                    principal_id, confirm_token_id, session->username);
                 if (!confirmed) {
+                    // Increment BEFORE the audit emission so an audit-store
+                    // failure cannot suppress the operational counter (#2404).
+                    confirm_metric(yuzu::server::detail::confirm_result_label(
+                        yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                     const bool denied_audit_ok =
                         audit_fn(req, "engine_principal.credential.confirm", "failure",
                                 "EnginePrincipal", principal_id, confirmed.error());
@@ -6550,8 +7416,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                confirm_metric("success");
+                // Success detail records WHICH credential was confirmed — the
+                // store validated confirm_token_id equals the pending
+                // successor's token_id, so this is server-verified (not a
+                // caller-supplied echo) and it is not the raw secret.
                 const bool audit_ok = audit_fn(req, "engine_principal.credential.confirm", "success",
-                                               "EnginePrincipal", principal_id, "");
+                                               "EnginePrincipal", principal_id,
+                                               "token_id=" + confirm_token_id);
                 JObj payload;
                 payload.add("confirmed", true).add("principal_id", principal_id);
                 if (!audit_ok)
@@ -7553,10 +8425,11 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     }
 }
 
-// Test-only accessor for the internal kToolSecurity map (2g PR 2). The map has
-// internal linkage in the anonymous namespace above but is visible here in the
-// same translation unit; this exposes a copy so the annotation cross-check test
-// (a separate TU) can assert the served hints against each tool's operation.
+// Test-only accessor for the internal kToolSecurity map (decls in
+// mcp_server_testonly.hpp, #2385). The map has internal linkage in the
+// anonymous namespace above but is visible here in the same translation unit;
+// this exposes a copy so the annotation cross-check test (a separate TU) can
+// assert the served hints against each tool's operation.
 std::vector<ToolSecurityRow> tool_security_rows_for_test() {
     std::vector<ToolSecurityRow> rows;
     rows.reserve(kToolSecurity.size());
@@ -7579,6 +8452,69 @@ std::vector<std::string_view> write_tool_names_for_test() {
     for (const auto& n : kWriteTools)
         names.push_back(n);
     return names;
+}
+
+std::vector<std::string> tool_names_for_test() {
+    std::vector<std::string> names;
+    names.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        names.emplace_back(t.name);
+    return names;
+}
+
+ToolClassForTest classify_tool_for_test(const std::string& tool_name,
+                                        const std::vector<std::string>& known_tools,
+                                        const std::vector<std::string>& registered_tools) {
+    const std::unordered_set<std::string_view> known(known_tools.begin(), known_tools.end());
+    std::unordered_map<std::string, ToolSecurity> sec;
+    sec.reserve(registered_tools.size());
+    for (const auto& r : registered_tools)
+        sec.emplace(r, ToolSecurity{"", "Read"});  // literals: static storage, no dangle
+    switch (classify_tool_security(tool_name, known, sec)) {
+    case ToolSecurityClass::kUnknown:
+        return ToolClassForTest::kUnknown;
+    case ToolSecurityClass::kKnownRegistered:
+        return ToolClassForTest::kKnownRegistered;
+    case ToolSecurityClass::kKnownMissingSecurity:
+        return ToolClassForTest::kKnownMissingSecurity;
+    }
+    // Not a fallback mapping: a 4th enumerator must extend the switch (kept
+    // live by -Wswitch), never silently classify as kUnknown in tests while
+    // real dispatch diverges (governance C-4).
+    std::unreachable();
+}
+
+void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
+                                         const std::vector<ToolSecurityRowOwned>& security_rows,
+                                         const std::vector<std::string>& write_tools,
+                                         const std::vector<ToolSchemaRowOwned>& input_schemas) {
+    std::vector<std::string_view> names(tool_names.begin(), tool_names.end());
+    std::vector<ToolSecurityTuple> rows;
+    rows.reserve(security_rows.size());
+    for (const auto& r : security_rows)
+        rows.push_back({r.name, r.securable, r.operation});
+    std::vector<std::string_view> writes(write_tools.begin(), write_tools.end());
+    std::vector<ToolSchemaSource> schemas;
+    schemas.reserve(input_schemas.size());
+    for (const auto& s : input_schemas)
+        schemas.push_back({s.name, s.schema_json});
+    validate_tool_security_registration(names, rows, writes, schemas);
+}
+
+std::vector<ToolSchemaRowOwned> input_schemas_for_test() {
+    std::vector<ToolSchemaRowOwned> out;
+    out.reserve(static_cast<size_t>(kToolCount));
+    for (const auto& t : kTools)
+        out.push_back({t.name, t.input_schema_json});
+    return out;
+}
+
+std::vector<std::string> rbac_ops_for_test() {
+    return {std::begin(kRbacOps), std::end(kRbacOps)};
+}
+
+std::vector<std::string> rbac_securables_for_test() {
+    return {std::begin(kRbacSecurables), std::end(kRbacSecurables)};
 }
 
 } // namespace yuzu::server::mcp

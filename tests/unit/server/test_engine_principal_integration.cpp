@@ -221,6 +221,87 @@ TEST_CASE("Engine session synthesis: active principal + engine token -> engine s
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 1b. Engine STREAM RE-VALIDATION end-to-end (#2367) — a real engine token
+//     through revalidate_stream -> engine_credential_state -> the cached
+//     get_for_auth_revalidate, exercising the production seam rather than a
+//     synthetic pump verdict. The store-level and pump-level halves are tested
+//     in isolation elsewhere; this is the wiring in between, which nothing else
+//     covered.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, next cached, "
+          "revoke cuts it (#2367)",
+          "[pg][engine_principal][integration][auth_routes][cache]") {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::test::ApiTokenStorePg api_tokens;
+    EnginePrincipalStorePg engine_store;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+
+    AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, api_tokens.get(),
+                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+    ar.set_engine_principal_store(engine_store.get());
+    api_tokens->set_engine_referent_check(
+        [&](const std::string& id) { return engine_store->get_for_auth(id).status; });
+
+    REQUIRE(engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:reval")
+               .has_value());
+    auto raw = api_tokens->create_token("engine-token", "engine:reval", now_epoch() + 3600, "",
+                                        "readonly", "engine");
+    REQUIRE(raw.has_value());
+
+    // The exact shape revalidate_stream reads: a Bearer credential and the
+    // principal the stream was opened under.
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + *raw);
+    const std::string expected = "engine:reval";
+
+    using R = auth::CredentialCheck;
+
+    // First tick: cold cache, so the engine gate reads through to Postgres.
+    // An authoritative confirmation is plain kValid — NOT kValidStale. This is
+    // what lets a stream pump reset its grace budget.
+    CHECK(ar.revalidate_stream(req, expected) == R::kValid);
+
+    // Later ticks within the TTL are served from the liveness cache, and the
+    // caller MUST see kValidStale so the pump does not treat a cached answer as
+    // a fresh confirmation. This is the seam quality-engineer flagged as
+    // untested: kValidStale reaching a consumer through the real auth path
+    // rather than a hand-written verdict lambda.
+    for (int i = 0; i < 4; ++i)
+        CHECK(ar.revalidate_stream(req, expected) == R::kValidStale);
+
+    SECTION("a revoke cuts the stream on the next tick, cache notwithstanding") {
+        auto revoked = engine_store->revoke("engine:reval");
+        REQUIRE(revoked.has_value());
+        REQUIRE(*revoked);
+        // revoke() invalidated the cache synchronously, so the very next tick
+        // reads through and sees the dead principal — not a stale cached Active.
+        CHECK(ar.revalidate_stream(req, expected) == R::kRevoked);
+    }
+
+    SECTION("an expired entry reverts to an authoritative kValid") {
+        // The outer body already warmed the entry under the real clock, so the
+        // entry's expiry is stamped in real time. Pin a fake clock at ~now and
+        // step it PAST that entry's TTL: the next tick must miss and read
+        // through (kValid), and the tick after that is cached again
+        // (kValidStale). Stepping past a real-stamped entry is what makes this
+        // an expiry test rather than a still-live-hit test.
+        auto fake_now = std::chrono::steady_clock::now();
+        engine_store->set_clock_for_test([&] { return fake_now; });
+        fake_now += std::chrono::seconds(30); // well past the ~12-15 s TTL
+        CHECK(ar.revalidate_stream(req, expected) == R::kValid);      // expired -> read through
+        CHECK(ar.revalidate_stream(req, expected) == R::kValidStale); // re-warmed under fake clock
+        // fake_now is a SECTION-scoped local captured by-ref in the store's
+        // clock_; restore the default before it dies so the borrowed reference
+        // can never dangle (the store outlives this scope).
+        engine_store->set_clock_for_test({});
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 2. RBAC engine resolution — design §4.1/§4.2.
 // ═══════════════════════════════════════════════════════════════════════════
 

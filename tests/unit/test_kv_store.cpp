@@ -6,6 +6,11 @@
 
 #include <yuzu/agent/kv_store.hpp>
 
+// A SECOND, raw connection to the same file - the only way to make a REAL SQLite call
+// fail inside KvStore (drop the table out from under it) rather than testing a
+// stand-in. See the fallible-read tests at the bottom of this file.
+#include <sqlite3.h>
+
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -700,6 +705,77 @@ TEST_CASE("KvStore prefix scans escape LIKE wildcards in the prefix", "[kv_store
     REQUIRE(pct.has_value());
     CHECK(pct->size() == 1);
     CHECK(pct->front().value == "pct");
+
+    // list_keys_sized is the fourth call site of the same helper - it must not drift.
+    auto sized = t.store.list_keys_sized("p1", "a_b:");
+    REQUIRE(sized.has_value());
+    CHECK(sized->size() == 1);
+    CHECK(sized->front().key == "a_b:1");
+}
+
+// ── list_keys_sized / get_entry: the O(work) scan pair (#2299 perf-P-1) ──────────
+
+TEST_CASE("KvStore::list_keys_sized returns keys + value byte lengths in key order",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:b", "678"));     // out of order on purpose
+    REQUIRE(t.store.set("p1", "lc:a", "12345"));
+    REQUIRE(t.store.set("p1", "other:c", "9999")); // different prefix, excluded
+
+    auto rows = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    // ORDER BY key is the contract a fixed-width key prefix turns into ordering by
+    // that field - a caller that drops its own sort depends on it.
+    CHECK((*rows)[0].key == "lc:a");
+    CHECK((*rows)[1].key == "lc:b");
+    CHECK((*rows)[0].bytes == 5);
+    CHECK((*rows)[1].bytes == 3);
+
+    // Byte accounting agrees row-for-row with the value-materializing sibling.
+    auto entries = t.store.list_entries("p1", "lc:");
+    REQUIRE(entries.has_value());
+    REQUIRE(entries->size() == rows->size());
+    for (std::size_t i = 0; i < rows->size(); ++i) {
+        CHECK((*rows)[i].key == (*entries)[i].key);
+        CHECK((*rows)[i].bytes == (*entries)[i].value.size());
+    }
+}
+
+TEST_CASE("KvStore::list_keys_sized sizes multibyte values in BYTES, and empty is not an error",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    auto empty = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE(empty.has_value()); // empty namespace: a clean empty vector, never an error
+    CHECK(empty->empty());
+
+    const std::string v = "café-日本語"; // > one byte per code point
+    REQUIRE(t.store.set("p1", "lc:u", v));
+    auto rows = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().bytes == v.size()); // octet_length, not the glyph count
+}
+
+TEST_CASE("KvStore::get_entry distinguishes absent from failed, and reads bytes exactly",
+          "[kv_store][entries]") {
+    auto t = make_test_store();
+    const std::string with_nul = std::string("head\0tail", 9);
+    REQUIRE(t.store.set("p1", "lc:n", with_nul));
+
+    auto present = t.store.get_entry("p1", "lc:n");
+    REQUIRE(present.has_value());
+    REQUIRE(present->has_value());
+    // get() truncates at the NUL; the fallible point read must not - a corrupt value
+    // has to reach the parser intact to be quarantined rather than silently repaired.
+    CHECK(**present == with_nul);
+    CHECK(t.store.get("p1", "lc:n").value_or("").size() == 4);
+
+    // ABSENT is a value (nullopt), not an error: only that distinction lets a caller
+    // treat "cannot tell" differently from "not there".
+    auto missing = t.store.get_entry("p1", "lc:does-not-exist");
+    REQUIRE(missing.has_value());
+    CHECK(!missing->has_value());
 }
 
 // ── rename_key extended-result-code masking (#2303 K1) ──────────────────────────
@@ -720,4 +796,71 @@ TEST_CASE("KvStore::rename_key reports Conflict even with extended result codes 
     // Both rows survive untouched, exactly as in the primary-code path.
     CHECK(t.store.get("p1", "lc:a").value_or("") == "A");
     CHECK(t.store.get("p1", "lc:b").value_or("") == "B");
+}
+
+// ── The fallible-read contract: "cannot tell" must never read as "not there" ─────
+//
+// These two methods exist BECAUSE they distinguish a failed read from an absent row -
+// `get()`/`list()` collapse both and the journal's eviction classifier would then report a
+// transient DB error as audit loss. So the failure branch IS the feature, and every other
+// "read failed" test in this area injects at the journal layer, never reaching the real call.
+
+TEST_CASE("KvStore fallible reads report a CLOSED handle rather than an empty result",
+          "[kv_store][entries]") {
+    // Reached through a documented state transition, not a test-only seam: the move
+    // constructor nulls the moved-from handle, and the `!db_` guard exists precisely so
+    // that object stays safe to call. An empty vector / nullopt here would be a caller
+    // reading "the namespace is empty" out of "the store is gone".
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:a", "v"));
+    KvStore moved = std::move(t.store);
+    REQUIRE(moved.get("p1", "lc:a").has_value()); // the handle really did transfer
+
+    auto scan = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE_FALSE(scan.has_value());
+    CHECK(scan.error().message.find("closed") != std::string::npos);
+
+    auto point = t.store.get_entry("p1", "lc:a");
+    REQUIRE_FALSE(point.has_value());
+    CHECK(point.error().message.find("closed") != std::string::npos);
+}
+
+TEST_CASE("KvStore fallible reads surface a REAL SQLite failure as an error, not as absence",
+          "[kv_store][entries]") {
+    // The branch that matters in production. Dropping the table through a second connection
+    // makes prepare_v2 fail for real - no injected stand-in - so a live row does not come
+    // back as a clean "absent" once the schema is gone.
+    //
+    // Scope, stated precisely because it is easy to overclaim: this reaches the PREPARE
+    // failure path of both methods, verified by mutation (making either method treat a
+    // failed prepare as absence turns this red). It does NOT reach the mid-SCAN failure
+    // path - `rc != SQLITE_DONE` after rows have already been returned - which needs a VFS
+    // shim or a schema change landing mid-statement. That branch is shared with the
+    // pre-existing `list_entries` and is recorded as a deferred gap rather than faked here:
+    // a test that appears to cover it but does not is worse than a named hole.
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "lc:a", "v"));
+    REQUIRE(t.store.get_entry("p1", "lc:a").value().has_value()); // present before the drop
+
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
+    if (err)
+        sqlite3_free(err);
+    sqlite3_close(raw);
+    REQUIRE(rc == SQLITE_OK);
+
+    auto scan = t.store.list_keys_sized("p1", "lc:");
+    REQUIRE_FALSE(scan.has_value()); // NOT an empty vector
+    CHECK_FALSE(scan.error().message.empty());
+
+    auto point = t.store.get_entry("p1", "lc:a");
+    REQUIRE_FALSE(point.has_value()); // NOT nullopt - the row's absence is unknown, not proven
+    CHECK_FALSE(point.error().message.empty());
+
+    // The contrast that motivates the pair: the fail-OPEN siblings cannot tell you any of
+    // this. Both report the same thing for a dropped table as for an empty namespace.
+    CHECK(t.store.list("p1", "lc:").empty());
+    CHECK_FALSE(t.store.get("p1", "lc:a").has_value());
 }

@@ -115,14 +115,6 @@ public:
     auth::CredentialCheck revalidate_stream(const httplib::Request& req,
                                             const std::string& expected_principal);
 
-    /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
-    /// validates: the `principal_kind` allowlist, and — for an engine token — that the
-    /// backing engine principal is still Active. `revalidate_stream` must apply them
-    /// too, or a deleted/revoked engine principal keeps its live stream while every
-    /// fresh request it makes is refused. Returns kIndeterminate (never kRevoked) when
-    /// the engine store cannot answer, so a store blip defers rather than mass-kills.
-    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token) const;
-
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.
     bool require_admin(const httplib::Request& req, httplib::Response& res);
@@ -236,6 +228,25 @@ public:
     static std::string extract_form_value(const std::string& body, const std::string& key);
 
 private:
+    /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
+    /// validates: the `principal_kind` allowlist, and — for an engine token — that the
+    /// backing engine principal is still Active. `revalidate_stream` must apply them
+    /// too, or a deleted/revoked engine principal keeps its live stream while every
+    /// fresh request it makes is refused. Returns kIndeterminate (never kRevoked) when
+    /// the engine store cannot answer, so a store blip defers rather than mass-kills.
+    ///
+    /// PRIVATE ON PURPOSE (#2367). This is the ONLY site that reads the engine
+    /// principal through `EnginePrincipalStore::get_for_auth_revalidate`, i.e. the
+    /// 15 s cached path. That is sound here and only here, because the stream
+    /// revalidation this serves already tolerates staleness of the same order by
+    /// design (on StoreUnreachable the pump rides out a ~60 s grace window,
+    /// Decision 15(i)/CH-4). A FRESH authorization decision tolerates none, so
+    /// widening access to this method would silently hand a caller a cached
+    /// answer to a question that must be asked of Postgres every time. If you
+    /// need the engine-principal gate somewhere new, call
+    /// `EnginePrincipalStore::get_for_auth` directly — do not make this public.
+    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token) const;
+
     Config& cfg_;
     auth::AuthManager& auth_mgr_;
     RbacStore* rbac_store_;

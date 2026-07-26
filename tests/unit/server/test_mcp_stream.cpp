@@ -19,7 +19,11 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include <nlohmann/json.hpp> // parse the JSON-RPC-wrapped close frame (2f PR 3b)
+
 #include <atomic>
+#include <chrono>
+#include <future> // the two-thread handshake test parks the pump on another thread
 #include <string>
 #include <string_view>
 #include <thread>
@@ -128,6 +132,31 @@ TEST_CASE("StreamBudget: the per-principal map is bounded by LIVE principals",
     // for 50 principals that have long since disconnected.
     CHECK(budget.active() == 0);
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "principal-7") == 0);
+}
+
+TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principal cap does not "
+          "ration the GET surface, and vice versa (2f PR 3b)",
+          "[mcp][stream][ch5][2f]") {
+    // The metric label for the new streamed-POST surface.
+    CHECK(std::string(detail::to_string(detail::SseSurface::kMcpPost)) == "mcp_post");
+
+    detail::StreamBudget budget{{.global_cap = 100}};
+    // Fill alice's streamed-POST allowance to the per-principal cap.
+    std::vector<detail::StreamBudget::Lease> posts;
+    for (std::size_t i = 0; i < detail::kPerPrincipalMcpPost; ++i) {
+        auto r = budget.try_acquire(detail::SseSurface::kMcpPost, "alice", detail::kPerPrincipalMcpPost);
+        REQUIRE(r.lease);
+        posts.push_back(std::move(r.lease));
+    }
+    // One more streamed POST for alice is rejected on the per-principal cap...
+    auto over = budget.try_acquire(detail::SseSurface::kMcpPost, "alice", detail::kPerPrincipalMcpPost);
+    CHECK_FALSE(over.lease);
+    CHECK(std::string(over.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
+    // ...but her GET streams are a separate (surface, principal) key, so a GET admits.
+    auto get = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", mcp::kMcpStreamsPerPrincipalDefault);
+    CHECK(get.lease);
+    CHECK(budget.active_for(detail::SseSurface::kMcpPost, "alice") == detail::kPerPrincipalMcpPost);
+    CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
 }
 
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
@@ -255,6 +284,49 @@ TEST_CASE("McpStreamState: a bogus future cursor takes the same path as an evict
     // cannot be used to probe how many events a session has emitted.
     CHECK(state.attach_and_replay(99, nullptr, "alice").status ==
           mcp::McpStreamState::AttachStatus::kGap);
+}
+
+TEST_CASE("McpStreamState: a nonzero cursor fronting a NON-contiguous surviving suffix is a GAP, "
+          "not a silent skip over frames evicted behind a pinned final (#2435)",
+          "[mcp][stream][ch2][2f]") {
+    // A shared session ring interleaves frames from concurrent streamed POSTs: an early
+    // request's final is PINNED (eviction-exempt, Decision 15(f)) while a later request keeps
+    // publishing progress and wraps the ring, evicting the UNPINNED frames between the pinned
+    // final and the newest. The surviving suffix then has a hole the replay loop would skip.
+    mcp::McpStreamState state{/*ring_cap=*/4};
+    for (int i = 1; i <= 4; ++i)
+        state.publish("message", "p" + std::to_string(i)); // ids 1..4
+    const auto final_id = state.publish_final("message", "final-A"); // id 5, pinned
+    REQUIRE(final_id == 5);
+    for (int i = 6; i <= 10; ++i)
+        state.publish("message", "p" + std::to_string(i)); // ids 6..10
+
+    // Ring is now [5(pinned), 8, 9, 10]: 1..4 and 6,7 were evicted; 5 survives because pinned.
+    REQUIRE(state.pinned_count() == 1);
+    REQUIRE(state.is_pinned(5));
+
+    // A resume from cursor 4 would replay 5 and then JUMP to 8 — a silent Last-Event-ID gap
+    // where 6,7 used to be. #2435: that is a kGap (client re-initializes and fetches the final
+    // by execution_id), not a skip. Checked before any mutation, so a fresh state each time.
+    CHECK(state.attach_and_replay(4, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kGap);
+    // Cursor 5 (client already acked the pinned final) still fronts the 6,7 hole -> kGap.
+    CHECK(state.attach_and_replay(5, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kGap);
+    // Cursor 7 fronts a CONTIGUOUS surviving suffix (8,9,10) -> serviceable.
+    CHECK(state.attach_and_replay(7, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kAttached);
+
+    // Cursor 0 is UNAFFECTED by the contiguity gate: a fresh client explicitly takes whatever
+    // the ring still holds (no resume contract), so the hole is tolerated and it replays the
+    // whole surviving window [5, 8, 9, 10].
+    auto fresh = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(fresh.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(fresh.sink->sse->mu);
+    std::vector<std::uint64_t> ids;
+    for (const auto& ev : fresh.sink->sse->queue)
+        ids.push_back(ev.id);
+    CHECK(ids == std::vector<std::uint64_t>{5, 8, 9, 10});
 }
 
 TEST_CASE("McpStreamState: a live sink receives published frames", "[mcp][stream]") {
@@ -429,6 +501,65 @@ TEST_CASE("McpStreamPump/CH-4: a revoked credential kills the stream within one 
     CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kCredentialRevoked);
 }
 
+TEST_CASE("McpStreamPump: the close frame is a JSON-RPC-wrapped notifications/yuzu.stream_closed "
+          "under the default `message` event type, off-ring and id-less (2f PR 3b, PENDING 2)",
+          "[mcp][stream][ch4][2f]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kRevoked; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer())); // revocation closes on the first tick
+
+    // A normal JSON-RPC message on the stream, NOT the old bespoke `event: stream-closed` (which
+    // a spec MCP client parsing JSON-RPC off the stream would never see).
+    CHECK(wire.contains("event: message"));
+    CHECK_FALSE(wire.contains("event: stream-closed"));
+    CHECK(wire.contains(R"("jsonrpc":"2.0")"));
+    CHECK(wire.contains(R"("method":"notifications/yuzu.stream_closed")"));
+    // The A4-shaped params carry the machine-parseable reason + remediation.
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
+    CHECK(wire.contains(R"("retry_after_ms":null)"));
+    CHECK(wire.contains(R"("remediation":)"));
+    // Off-ring + id-less: a close is a point-in-time terminal signal, never replayed, so it
+    // carries no SSE `id:` line an out-of-the-box client would persist as a resumable cursor.
+    // (This assertion is exact only because the ring is empty on this fresh attach AND kRevoked
+    // trips the very first pump gate, so the close frame is provably the ONLY bytes written — a
+    // ring frame WOULD carry an `id:` line.)
+    CHECK_FALSE(wire.contains("id: "));
+}
+
+TEST_CASE("make_stream_closed_frame: wraps the A4 body and merges caller extras (2f PR 3b)",
+          "[mcp][stream][2f]") {
+    // Bare: just the A4 body inside the JSON-RPC params.
+    const auto bare = mcp::make_stream_closed_frame(mcp::McpStreamClose::kCancelled, "cid-1");
+    auto j = nlohmann::json::parse(bare);
+    CHECK(j["jsonrpc"] == "2.0");
+    CHECK(j["method"] == "notifications/yuzu.stream_closed");
+    CHECK(j["params"]["reason"] == "cancelled");
+    CHECK(j["params"]["correlation_id"] == "cid-1");
+    CHECK(j["params"]["retry_after_ms"].is_null());
+    CHECK(j["params"].contains("remediation"));
+
+    // With extras: the raw fragment (leading comma) merges into params as further fields — the
+    // shape C6c/C7 use to carry execution_id + partial status on a cap/cancel close.
+    const auto extra = mcp::make_stream_closed_frame(mcp::McpStreamClose::kCapExpired, "cid-2",
+                                                     R"(,"execution_id":"exec-9","partial":true)");
+    auto je = nlohmann::json::parse(extra);
+    CHECK(je["params"]["reason"] == "cap_expired");
+    CHECK(je["params"]["execution_id"] == "exec-9");
+    CHECK(je["params"]["partial"] == true);
+
+    // kCompleted is POST-only and never reaches the GET wire, but its to_string / remediation /
+    // envelope must still be valid so the closed metric+audit label set is exhaustive.
+    CHECK(std::string(mcp::to_string(mcp::McpStreamClose::kCompleted)) == "completed");
+    auto jc = nlohmann::json::parse(mcp::make_stream_closed_frame(mcp::McpStreamClose::kCompleted,
+                                                                  "cid-3"));
+    CHECK(jc["params"]["reason"] == "completed");
+    CHECK(jc["params"].contains("remediation"));
+}
+
 TEST_CASE("McpStreamPump/CH-4: an auth-backend outage buys a bounded grace window, not a kill",
           "[mcp][stream][ch4]") {
     auto state = std::make_shared<mcp::McpStreamState>();
@@ -517,6 +648,215 @@ TEST_CASE("McpStreamPump/CH-4: a recovered backend resets the grace window",
     // If the window had NOT reset, this tick would be past the deadline and kill a
     // stream whose credential was verified 900 ms ago.
     CHECK(pump.pump_once(wire.writer()));
+}
+
+TEST_CASE("McpStreamPump/#2367: cached validity does NOT reset the grace budget",
+          "[mcp][stream][ch4]") {
+    // The window that made cache residency and the grace window ADD. A cached
+    // credential answer keeps the stream alive but re-confirms nothing, so the
+    // grace budget must keep running from the last AUTHORITATIVE confirmation.
+    // Treated as plain kValid, the stream would ride the cache and then collect
+    // a full FRESH grace window on top of it.
+    //
+    // NOTE this case runs at fast_cfg's default revalidate_max_staleness of 0
+    // (the conservative "answers are always authoritative" default). It proves
+    // the floor-does-not-reset property in isolation; the sibling case below
+    // ("a sibling-refreshed cache still leaves usable grace") exercises the
+    // PRODUCTION shape with a non-zero staleness bound wired from kAuthCacheTtl.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::milliseconds(1000);
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, fast_cfg(grace),
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    // 900 ms of cached-valid answers. The stream stays up — a cache hit is not
+    // a failure — but the budget is being spent, not refreshed.
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // The cache expires and the store turns out to be unreachable. Only 100 ms
+    // of the 1000 ms budget remains, so a further 200 ms must kill it. Under
+    // the old "arm the deadline at first kIndeterminate" behaviour this stream
+    // would have lived another full second.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(200);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("McpStreamPump/#2367: an authoritative re-confirmation does reset the budget",
+          "[mcp][stream][ch4]") {
+    // The other half: kValidStale must not be so strict that a genuinely
+    // re-confirmed stream inherits a spent budget.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&verdict] { return verdict; },
+                            [] { return true; },
+                            fast_cfg(std::chrono::milliseconds(1000)),
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    clock_now += std::chrono::milliseconds(900); // budget nearly spent on cached answers
+    CHECK(pump.pump_once(wire.writer()));
+
+    verdict = mcp::StreamRevalidate::kValid; // the store was actually asked
+    CHECK(pump.pump_once(wire.writer()));
+
+    // Budget restarts from here, so 900 ms of indeterminate is survivable again.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+}
+
+TEST_CASE("McpStreamPump/#2367: a sibling-refreshed cache still leaves usable grace",
+          "[mcp][stream][ch4]") {
+    // sec-M2 regression. The liveness cache is keyed by PRINCIPAL, but the
+    // grace budget is per-STREAM. With several streams on one principal, only
+    // whichever stream's tick lands on expiry gets an authoritative kValid --
+    // the others ride cache hits indefinitely. If a cached answer never
+    // advanced the authoritative floor, those streams would accumulate
+    // unbounded staleness and then be cut with ZERO grace the instant the
+    // store blipped, all at once. A cache hit is positive evidence the store
+    // confirmed within its TTL, so the floor clamps forward to now - TTL.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    const auto grace = std::chrono::milliseconds(1000);
+    auto verdict = mcp::StreamRevalidate::kValidStale;
+
+    auto cfg = fast_cfg(grace);
+    cfg.revalidate_max_staleness = std::chrono::milliseconds(250);
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, cfg,
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    // Ten seconds of nothing but cached answers - far beyond the grace window.
+    // Without the clamp the floor would still sit at construction time and the
+    // stream would die instantly below.
+    for (int i = 0; i < 10; ++i) {
+        clock_now += std::chrono::seconds(1);
+        REQUIRE(pump.pump_once(wire.writer()));
+    }
+
+    // Store blips. The budget spent is at most one staleness window, so most
+    // of the grace remains: 500 ms must NOT kill it.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(500);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // ...but the budget is still finite: it is not immortal.
+    clock_now += std::chrono::milliseconds(600);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("McpStreamPump/#2367: a cached answer clears a grace deadline armed during an outage",
+          "[mcp][stream][ch4]") {
+    // A cached answer is POSITIVE evidence -- the entry only exists because an
+    // authoritative read succeeded within the staleness window -- so it must
+    // clear a deadline armed earlier, exactly as an authoritative kValid does.
+    //
+    // Getting this wrong kills healthy streams: with two streams on one
+    // principal, the one that ticks first after recovery re-reads and warms the
+    // shared cache entry, and the other then rides hits. If those hits left the
+    // outage-era deadline counting down, that second stream would close
+    // `auth_unavailable` against a reachable store and an Active principal.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    auto clock_now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kIndeterminate;
+
+    auto cfg = fast_cfg(std::chrono::milliseconds(1000));
+    cfg.revalidate_max_staleness = std::chrono::milliseconds(250);
+    mcp::McpStreamPump pump{attached.sink,       state,
+                            attached.generation, [&verdict] { return verdict; },
+                            [] { return true; }, cfg,
+                            [&clock_now] { return clock_now; }};
+    FakeWire wire;
+
+    CHECK(pump.pump_once(wire.writer())); // outage arms the deadline
+    clock_now += std::chrono::milliseconds(900);
+
+    // Store recovers; a sibling stream refreshed the entry, so this one sees a
+    // cache hit. Well past the armed deadline -- it must survive.
+    verdict = mcp::StreamRevalidate::kValidStale;
+    clock_now += std::chrono::milliseconds(900);
+    CHECK(pump.pump_once(wire.writer()));
+    clock_now += std::chrono::seconds(5);
+    CHECK(pump.pump_once(wire.writer()));
+
+    // The budget is still finite: cached answers only advance the floor to
+    // now - max_staleness, so a fresh outage kills it within the window.
+    verdict = mcp::StreamRevalidate::kIndeterminate;
+    clock_now += std::chrono::milliseconds(1300);
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kAuthUnavailable);
+}
+
+TEST_CASE("RevalidateGrace: the extracted grace state machine, exercised directly (2f PR 3b)",
+          "[mcp][stream][ch4][2f]") {
+    using RG = mcp::RevalidateGrace;
+    using R = mcp::StreamRevalidate;
+    // Deterministic: an injected clock and jitter_max=0. RevalidateGrace seeds
+    // last_authoritative_ok_ to now() at construction, so build it at t0 = epoch.
+    auto at = [](std::int64_t ms) {
+        return std::chrono::steady_clock::time_point{std::chrono::milliseconds(ms)};
+    };
+    std::chrono::steady_clock::time_point clock_now = at(0);
+    auto clock = [&clock_now] { return clock_now; };
+    RG::Config cfg;
+    cfg.grace = std::chrono::milliseconds(1000);
+
+    SECTION("kRevoked is an immediate kill, no grace") {
+        RG grace{cfg, clock};
+        CHECK(grace.on_verdict(R::kRevoked) == RG::Outcome::kCloseCredentialRevoked);
+    }
+
+    SECTION("kIndeterminate rides a bounded grace window, then closes auth_unavailable") {
+        RG grace{cfg, clock};                              // last_authoritative_ok_ = 0
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline armed @1000
+        clock_now = at(1001);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+
+    SECTION("an authoritative kValid clears an armed deadline and re-bases the window (#2367)") {
+        RG grace{cfg, clock};
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @1000
+        CHECK(grace.on_verdict(R::kValid) == RG::Outcome::kContinue);         // clears it, floor=500
+        clock_now = at(1001);                                                // past the OLD deadline
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // new deadline @1500
+        clock_now = at(1600);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
+
+    SECTION("a kValidStale cache hit clears the deadline but only advances the floor one window") {
+        cfg.max_staleness = std::chrono::milliseconds(250);
+        RG grace{cfg, clock};
+        clock_now = at(500);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @1000
+        clock_now = at(2000);
+        CHECK(grace.on_verdict(R::kValidStale) == RG::Outcome::kContinue);    // clears; floor=1750
+        // A fresh outage re-arms from the clamped floor (1750 + 1000 = 2750), not from t0.
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kContinue); // deadline @2750
+        clock_now = at(2751);
+        CHECK(grace.on_verdict(R::kIndeterminate) == RG::Outcome::kCloseAuthUnavailable);
+    }
 }
 
 TEST_CASE("McpStreamPump: a terminated session ends the stream with its own reason",
@@ -959,4 +1299,245 @@ TEST_CASE("McpStreamState: a pre-commit failure increments the publish-failures 
     state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
     CHECK(state.publish("message", "lost") == 0);
     CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamState: a post-commit observability fault never un-commits the frame (#2366)",
+          "[mcp][stream]") {
+    // The #2366 boundary must distinguish PRE-commit from POST-commit failure. A throw from
+    // the observability block (a metric increment or the enriched WARN format allocating
+    // under memory pressure) fires AFTER the frame is committed, so it must be swallowed and
+    // the committed id returned - never converted into a 0 the caller reads as "not
+    // published" (the asymmetric caller-obligation the contract turns on). Live registry so
+    // the innermost catch runs on the real path, not the nullptr short-circuit.
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    state->set_log_context("sid=deadbeef");
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_publish_fault_for_test(
+        mcp::McpStreamState::PublishFault::kPostCommitObservability);
+    std::uint64_t id = 0;
+    CHECK_NOTHROW(id = state->publish("message", "committed-despite-obs-fault"));
+    CHECK(id == 1);                     // committed id returned, NOT 0
+    CHECK(state->next_event_id() == 2); // the id was consumed - the frame IS in the ring
+
+    // The frame reached the sink BEFORE the observability throw (enqueue is under mu_; the
+    // observability block runs post-lock), so delivery is entirely unaffected - this is a
+    // swallowed server-side breadcrumb fault, not a dropped frame.
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        REQUIRE(attached.sink->sse->queue.size() == 1);
+        CHECK(attached.sink->sse->queue.front().data == "committed-despite-obs-fault");
+    }
+    CHECK(attached.sink->sse->dropped_total.load() == 0);
+
+    // One-shot: the fault does not linger - the very next publish takes id 2 cleanly.
+    CHECK(state->publish("message", "clean") == 2);
+}
+
+TEST_CASE("McpStreamState: set_log_context does not weaken the publish boundary (#2366)",
+          "[mcp][stream]") {
+    // The enriched WARN lines interpolate the session context and the event_type; that
+    // format + metric lookup allocates and runs inside the boundary's nested guard. So even
+    // a pre-commit failure with a context set must still return a clean 0 and count the
+    // failure - the enrichment must never become an escape hatch out of the boundary.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    state.set_log_context("sid=cafef00d");
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    std::uint64_t id = 7;
+    CHECK_NOTHROW(id = state.publish("progress", "lost"));
+    CHECK(id == 0);
+    CHECK(reg.counter("yuzu_mcp_stream_publish_failures_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decision 15(f))",
+          "[mcp][stream]") {
+    // The eviction-exemption backbone: publish_final pins the terminal frame, then a flood of
+    // ordinary frames wraps the ring many times over. The pinned final must still be in the
+    // ring so a late GET resume recovers it - the whole point of 15(f).
+    mcp::McpStreamState state{/*ring_cap=*/5};
+    REQUIRE(state.publish_final("message", "FINAL") == 1); // id 1, pinned
+    CHECK(state.is_pinned(1));
+    CHECK(state.pinned_count() == 1);
+    for (int i = 0; i < 20; ++i) {
+        state.publish("message", "flood-" + std::to_string(i)); // wraps the 5-frame ring 4x
+    }
+    CHECK(state.is_pinned(1)); // never evicted
+
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    // The oldest surviving frame is the pinned final, ahead of the newest unpinned window.
+    REQUIRE(!attached.sink->sse->queue.empty());
+    CHECK(attached.sink->sse->queue.front().id == 1);
+    CHECK(attached.sink->sse->queue.front().data == "FINAL");
+}
+
+TEST_CASE("McpStreamState: publish_ring_only commits to the ring but not the live sink",
+          "[mcp][stream]") {
+    // A streamed POST's frames ride the POST stream; publishing them onto a concurrent live
+    // GET too would be the spec's forbidden broadcast. publish_ring_only commits for resume
+    // ONLY - the live sink stays empty - while a normal publish still delivers live.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    REQUIRE(state->publish_ring_only("message", "post-bound") == 1);
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        CHECK(attached.sink->sse->queue.empty()); // NOT delivered live
+    }
+    CHECK(state->next_event_id() == 2); // but it IS committed (id consumed)
+
+    state->publish("message", "get-bound"); // a normal publish still reaches the live sink
+    {
+        std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+        REQUIRE(attached.sink->sse->queue.size() == 1);
+        CHECK(attached.sink->sse->queue.front().data == "get-bound");
+    }
+
+    // The ring-only frame is recoverable by resume - a fresh attach from cursor 0 replays it.
+    auto resumed = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(resumed.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(resumed.sink->sse->mu);
+    REQUIRE(resumed.sink->sse->queue.size() == 2);
+    CHECK(resumed.sink->sse->queue.front().data == "post-bound"); // id 1 still in the ring
+}
+
+TEST_CASE("McpStreamState: unpin makes a former final evictable again", "[mcp][stream]") {
+    mcp::McpStreamState state{/*ring_cap=*/2};
+    REQUIRE(state.publish_final("message", "FINAL") == 1); // pinned
+    for (int i = 0; i < 5; ++i) state.publish("message", "x");
+    REQUIRE(state.is_pinned(1)); // survived while pinned
+
+    state.unpin(1);
+    CHECK_FALSE(state.is_pinned(1));
+    CHECK(state.pinned_count() == 0);
+    state.unpin(1); // idempotent - a second unpin is a no-op
+    CHECK(state.pinned_count() == 0);
+
+    for (int i = 0; i < 5; ++i) state.publish("message", "y"); // now id 1 can be evicted
+    // Cursor 0 replays the surviving window; id 1 is gone (no longer protected).
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    for (const auto& ev : attached.sink->sse->queue) {
+        CHECK(ev.id != 1);
+    }
+}
+
+TEST_CASE("McpStreamState: attach unpins finals the cursor proves consumed (unpin rule b)",
+          "[mcp][stream]") {
+    mcp::McpStreamState state;
+    REQUIRE(state.publish_final("message", "FINAL") == 1); // pinned
+    state.publish("message", "after");
+    REQUIRE(state.is_pinned(1));
+
+    // A resume whose Last-Event-ID is at/after the pinned id proves the client consumed it -
+    // the exemption is released on attach.
+    auto attached = state.attach_and_replay(/*last_event_id=*/1, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    CHECK_FALSE(state.is_pinned(1));
+    CHECK(state.pinned_count() == 0);
+}
+
+TEST_CASE("McpStreamState: poison_terminal fails every future attach with kPoisoned",
+          "[mcp][stream]") {
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->poison_terminal();
+    // The live sink is closed honestly rather than left waiting for a terminal.
+    CHECK(attached.sink->sse->closed.load());
+
+    // Every subsequent attach fast-fails - regardless of cursor - so a client is told to
+    // fetch by execution_id, never left heart-beating forever.
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+    state->poison_terminal(); // idempotent
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
+TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and consumes no id",
+          "[mcp][stream]") {
+    mcp::McpStreamState state;
+    state.inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit);
+    CHECK(state.publish_final("message", "lost") == 0); // pre-commit failure
+    CHECK(state.pinned_count() == 0);                   // no ghost pin
+    CHECK(state.next_event_id() == 1);                  // no id consumed
+}
+
+TEST_CASE("McpStreamState: a final past the pin bound commits unpinned rather than lose it",
+          "[mcp][stream]") {
+    // The pin array is sized to the per-session streamed-request cap; the bridge enforces the
+    // same cap at admission, so this is defence-in-depth. If it is ever hit, the final is kept
+    // (committed, evictable) rather than dropped, and the drift is counted.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
+        REQUIRE(state.publish_final("message", "final") != 0);
+    }
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // slots full
+
+    const auto overflow_id = state.publish_final("message", "one-too-many");
+    REQUIRE(overflow_id != 0);                 // committed - never lost
+    CHECK_FALSE(state.is_pinned(overflow_id)); // but not pinned
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession);
+    CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the tick (#2382)",
+          "[mcp][stream]") {
+    // The deferred #2366 follow-up: prove the DETERMINISTIC condvar handoff, not just the
+    // outcome. The existing sink-enqueue test runs pump_once on the SAME thread after the
+    // fault, so the predicate is already true on entry and the pump never parks - it cannot
+    // distinguish "woken by notify" from "predicate true on arrival". Here a second thread
+    // parks the pump in wait_for, then this thread faults+publishes: the containment path
+    // bumps dropped_total UNDER the sink mutex and notify_one's, so a parked waiter wakes at
+    // once and emits the events-dropped synthetic.
+    //
+    // The discriminator is timing, and ONLY timing: even a broken notify would eventually
+    // emit events-dropped when the tick fires (the predicate also tests dropped_total). So
+    // the tick is set to 30 s - far beyond any wakeup latency - and the assertion is "the
+    // pump returned well within a 5 s safety window", i.e. it woke on the notify, not the
+    // 30 s tick. This is a generous margin, not a tight latency bound.
+    //
+    // Never false-RED: if this thread happens to publish BEFORE the pump reaches wait_for,
+    // the predicate is simply true on entry and the pump returns fast anyway (a PASS that
+    // did not exercise the notify). The test can only FAIL if the pump parked AND the notify
+    // failed to wake it - exactly the regression it guards. The atomic handshake biases
+    // heavily toward the parked-first interleaving so CI actually exercises the notify.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump::Config long_tick;
+    long_tick.tick = std::chrono::seconds(30); // a tick-driven wake would blow the safety window
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
+                            long_tick};
+    FakeWire wire;
+
+    std::atomic<bool> about_to_pump{false};
+    auto pumped = std::async(std::launch::async, [&] {
+        about_to_pump.store(true, std::memory_order_release);
+        return pump.pump_once(wire.writer()); // parks in wait_for on an empty, open sink
+    });
+    while (!about_to_pump.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // Fault the live-sink enqueue: the frame commits to the ring, the by-value copy "throws",
+    // and the containment bumps dropped_total under the sink mutex + notify_one.
+    state->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kSinkEnqueue);
+    REQUIRE(state->publish("message", "missed") == 1); // committed under id 1
+
+    // Woken by the notify - ready in milliseconds, nowhere near the 30 s tick.
+    REQUIRE(pumped.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    CHECK(pumped.get()); // pump_once returned true - the stream continues
+    CHECK(wire.contains("event: events-dropped"));
 }
