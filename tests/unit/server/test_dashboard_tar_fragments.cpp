@@ -102,6 +102,7 @@ struct FragmentHarness {
     std::vector<AuditRow> audits;
     std::vector<PermCall> perms;
     bool perm_allow{true}; ///< perm_fn verdict (false → handler's 403 path)
+    bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
 
     /// @param with_dispatch false → register with an empty DispatchFn so the
@@ -109,8 +110,12 @@ struct FragmentHarness {
     explicit FragmentHarness(bool with_dispatch = true) {
         grant_visibility(mg, {"dev-A", "dev-B"});
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            if (!auth_ok) {
+                res.status = 401;
+                return std::nullopt;
+            }
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
@@ -358,11 +363,38 @@ TEST_CASE("fragment reenable: offline agent (0 reached) → 404 + agent_not_conn
     CHECK(h.metric("yuzu_tar_source_reenable_total", "agent_not_connected") == 1.0);
 }
 
-TEST_CASE("fragment purge/reenable: no dispatch wiring → 503, nothing attempted",
+TEST_CASE("fragment purge: the out-of-scope and offline 404s are byte-identical",
           "[server][tar][purge][fragment]") {
+    // The whole point of the collapse is that a caller cannot tell "not yours"
+    // from "not connected". A substring check would still pass if a refactor
+    // added a distinguishing class or marker to one of them, so compare the
+    // full bodies AND the status.
+    FragmentHarness h;
+    auto out_of_scope = h.post(kPurgePath, "device_id=dev-OTHER&source=process");
+    h.dispatch_sent = 0;
+    auto offline = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(out_of_scope->status == offline->status);
+    CHECK(out_of_scope->body == offline->body);
+    // ...and the server-side audit detail still tells the two apart.
+    CHECK(h.audits_for("tar.source.purge", "failure") == 2);
+    CHECK(contains(h.audit_detail("tar.source.purge", "failure"), "scope_violation"));
+}
+
+TEST_CASE("fragment purge/reenable: no dispatch wiring → 503",
+          "[server][tar][purge][fragment]") {
+    // No `calls.empty()` assertion here: with an empty DispatchFn nothing can
+    // ever be recorded, so it would be a tautology rather than evidence.
     FragmentHarness h{/*with_dispatch=*/false};
     CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 503);
     CHECK(h.post(kReenablePath, "device_id=dev-A&source=process")->status == 503);
+}
+
+TEST_CASE("fragment purge/reenable: an unauthenticated session stops before dispatch",
+          "[server][tar][purge][fragment]") {
+    FragmentHarness h;
+    h.auth_ok = false;
+    CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 401);
+    CHECK(h.post(kReenablePath, "device_id=dev-A&source=process")->status == 401);
     CHECK(h.calls.empty());
 }
 
@@ -418,4 +450,25 @@ TEST_CASE("fragment purge: query-string params are honoured like form-body param
     REQUIRE(h.calls.size() == 1);
     CHECK(h.calls[0].agent_ids[0] == "dev-A");
     CHECK(h.calls[0].params.at("source") == "process");
+}
+
+TEST_CASE("fragment purge: form fields are read the way httplib would parse them",
+          "[server][tar][purge][fragment]") {
+    // Guards the TestRouteSink fidelity fix (#1786): the sink must parse a
+    // urlencoded BODY into req.params like httplib::Server does, so these
+    // tests exercise the handler's `req.has_param` branch — the production
+    // path — rather than its `extract_form_value(req.body, ...)` fallback.
+    //
+    // `xsource=` is the discriminator. httplib's parser splits on `&`/`=` and
+    // yields source="tcp"; the fallback's unanchored `body.find("source=")`
+    // matches INSIDE `xsource=` and yields "evil", which the allowlist would
+    // reject with a 400. So a 200 carrying source=tcp proves the params branch
+    // ran. (If the fallback's key matching is ever anchored the two branches
+    // agree and this stops discriminating — it still passes, it just stops
+    // adding information.)
+    FragmentHarness h;
+    auto res = h.post(kPurgePath, "xsource=evil&device_id=dev-A&source=tcp");
+    CHECK(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].params.at("source") == "tcp");
 }

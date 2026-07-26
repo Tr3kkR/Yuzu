@@ -76,6 +76,15 @@ public:
             req.body = body;
             if (!query_text.empty())
                 httplib::detail::parse_query_text(query_text, req.params);
+            // httplib::Server also parses an `application/x-www-form-urlencoded`
+            // request body into `req.params` (same multimap as the query string)
+            // before routing. Without this, a handler that reads a form field via
+            // `req.has_param(...)` — with an `extract_form_value(req.body, ...)`
+            // fallback — silently took the FALLBACK branch under test while
+            // production took the params branch, so the tested path was not the
+            // shipped path (#1786; caught reviewing the TAR fragment tests).
+            if (!body.empty() && content_type.starts_with("application/x-www-form-urlencoded"))
+                httplib::detail::parse_query_text(body, req.params);
             if (!content_type.empty())
                 req.set_header("Content-Type", content_type);
             // Inject test-supplied headers. Done AFTER Content-Type so a
