@@ -188,8 +188,8 @@ bool apply_source_enabled_transition(TarDatabase& db, std::string_view source,
         // own, because the baseline has already been cleared above, so it would
         // leave the source ENABLED with a WIPED baseline and produce exactly the
         // ghost-event burst #538's clear-first ordering exists to prevent. A real
-        // fix needs the flag and the baseline to move together. Tracked
-        // separately; do not "fix" it with a bare early return.
+        // fix needs the flag and the baseline to move together. Tracked in #2490;
+        // do not "fix" it with a bare early return.
         db.set_config(enabled_key, std::string{new_value});
         db.set_config(paused_at_key, std::to_string(now_epoch));
         return true;
