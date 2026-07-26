@@ -117,6 +117,7 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_index_ok` | gauge | `1` while the retention index exists. Evaluated once at startup, so it cannot detect an index dropped at runtime. `0` means every cleanup pass full-scans `audit_events` under the exclusive store lock, and that cost grows with the table - the one condition that makes the pass's lock hold unbounded. Alert on `== 0`. |
 | `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
+| `yuzu_server_audit_retention_passes_total` | counter | Retention passes ATTEMPTED, whatever the outcome. **Liveness: alert on the ABSENCE of increase, not on a value.** Every other retention metric moves only when something happened, so a server whose retention never runs is invisible to all of them and reads exactly like an idle one - `audit.db` growing without bound, every counter at zero, `/healthz` ok. Reachable with no fault at all: the cleanup loop sleeps the full interval before its first pass, so a server restarting more often than the cleanup interval never completes one. See the `YuzuAuditRetentionNotRunning` alert. |
 
 The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical

@@ -255,11 +255,21 @@ config|dns_live_rows|0
 config|dns_oldest_ts|0
 retention_guard_declines_total|0
 retention_guard_failures_total|0
+retention_guard_capped_total|0
 config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
 config|software_last_run_ts|1711050000
 ```
+
+A third total, `retention_guard_capped_total` (with per-table
+`retention_guard_capped|<table>|<n>` lines), counts passes where the per-pass
+cap BOUND - the pass deleted its 5,000 rows for that table and left a backlog
+behind. Read it alongside the other two, because it is the one state neither of
+them can express: nothing declined and nothing failed, yet the table is still
+growing because expiry is outrunning the drain. Sustained non-zero means
+`tar.db` will grow without bound on that endpoint. This is the cost the cap
+itself introduces, and it is why the cap is reported rather than silent.
 
 A block is emitted for every capture source. The opt-in sources report
 `<source>_enabled|false` on a fresh agent — `module`, `software` (both shown
