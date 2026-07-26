@@ -1386,3 +1386,32 @@ TEST_CASE("AuditStore #2360: the FIRST pass with no stored anchor declines inste
     CHECK(f.store.cleanup_once(kNow + 1) == 5);
     CHECK(f.store.clock_anomaly_skips_count() == 1); // not counted twice
 }
+
+TEST_CASE("AuditStore #2360: a bootstrap decline does not spend the latch (UPS-1)",
+          "[audit_store][retention][clock-guard]") {
+    // Gate 4 re-review, BLOCKING. The bootstrap rule closed one silent-deletion
+    // hole and opened another one pass later.
+    //
+    // The latch means "this store already declined FOR THE CURRENT ANOMALY". A
+    // bootstrap is not an anomaly, just a missing comparison point, so spending
+    // the latch on it let the NEXT pass accept a real one undeclined: upgrade,
+    // pass 1 declines and latches, a forward jump lands before pass 2, pass 2
+    // deletes to the cap with no decline, no counter and no warn.
+    GuardFixture f{/*prime_anchor=*/false};
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1); // survivor -> only the anchor rule fires on pass 1
+
+    // Pass 1: bootstrap decline.
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // A REAL anomaly now arrives before pass 2 -- a forward jump well past the
+    // absolute threshold. It must be declined on its own account.
+    const std::int64_t jumped = kNow + kAuditMinBigStepSec + 1;
+    f.seed(jumped + kWindow, 1); // survivor, so only the STEP can fire
+    CHECK(f.store.cleanup_once(jumped) == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 2); // counted, NOT swallowed
+
+    // And the anomaly's own decline DID latch, so the backlog still drains.
+    CHECK(f.store.cleanup_once(jumped + 1) > 0);
+}

@@ -176,13 +176,18 @@ public:
         return emit_failed_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that DECLINED to delete. Three
+    /// Cumulative count of retention passes that DECLINED to delete. FOUR
     /// triggers: the pass would have aged out every datable row; the gap since
     /// the previous pass exceeded kAuditMinBigStepSec (an ABSOLUTE duration --
     /// how far the clock moved is unrelated to how long rows are kept, and a
     /// window-derived threshold was a YEAR on the default setting, so it never
     /// fired); or the stored reading was AHEAD of the current
-    /// clock. The middle one cannot distinguish a forward clock jump from an
+    /// clock; or there was NO stored reading at all, so the elapsed-time check
+    /// could not run (the first pass after upgrading to a build with the guard,
+    /// or after a restore -- expected exactly once per database, and the one
+    /// trigger that does NOT spend the decline latch).
+    ///
+    /// The elapsed-time one cannot distinguish a forward clock jump from an
     /// outage that long, so a non-zero value means "this server's clock moved,
     /// or it was down that long" -- not the clock alone.
     uint64_t clock_anomaly_skips_count() const noexcept {

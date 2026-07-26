@@ -16,9 +16,15 @@ Background: `docs/user-manual/audit-log.md`, ADR-0006, issue #2360.
 `audit_events` rows expire on a TTL derived from the server's wall clock. A
 forward clock jump makes every row look expired at once, and the delete that
 follows takes the whole retained window. The guard bounds that: a pass DECLINES
-ONCE (latched) when it would expire every datable row, when more than 7 days
-elapsed since the previous pass, or when the stored clock reading is ahead of
-now. It then PACES - the next pass deletes, capped at 25,000 rows.
+ONCE when it would expire every datable row, when more than 7 days elapsed
+since the previous pass, when the stored clock reading is ahead of now, or when
+there is no stored reading at all so the elapsed-time check cannot run. It then
+PACES - the next pass deletes, capped at 25,000 rows.
+
+The first three LATCH, so each is declined once and then paced. The fourth (no
+stored reading) deliberately does not: it is a missing comparison point, not an
+anomaly, and spending the latch on it would let a real anomaly arriving on the
+very next pass delete undeclined.
 
 **It bounds the blast radius; it does not prevent loss.** A sustained clock or
 operational fault drains roughly 600k rows/day after that single decline. The
@@ -36,7 +42,16 @@ alert is the control. The guard is the seatbelt.
    clock jump from an outage, which is why the warn text names both.
 3. Check the server log for the specific line - it names which trigger fired
    (`DeclineWipe`, `DeclineStep`, `DeclineImplausible`, `DeclineFirstPass`).
-4. **On a brand-new install, a first-pass decline is expected and benign.**
+4. **Is this simply the first pass since the upgrade?** Check the log for
+   `DeclineFirstPass` -- "no stored clock reading to compare against". Every
+   existing database declines exactly once on its first pass under a build that
+   has the guard, because the elapsed-time check has no anchor yet. It is
+   expected, benign, and self-heals on the next pass. **On a fleet upgrade
+   expect one alert per server; stand them down.**
+
+   Note this does NOT happen on a brand-new install: with nothing expired the
+   pass returns before the guard is reached. The case that fires is an UPGRADE
+   or a RESTORE of a database that already holds an expired backlog.
 
 **Action:** fix time sync. Nothing else is required - the next pass resumes,
 paced. If the clock was genuinely wrong, decide before it drains whether the
@@ -89,12 +104,35 @@ The durable clock reading is not being written. The elapsed-time detector is the
 only half of the guard that survives a restart, so while this persists a restart
 loses its comparison point. Check disk and permissions on `audit.db`.
 
+## YuzuAuditRetentionNotRunning - no pass has run
+
+`audit.db` is growing and NOTHING else will tell you: every other rule here fires
+on activity, so a server whose retention never runs looks exactly like an idle
+one. This rule fires on the ABSENCE of increase in
+`yuzu_server_audit_retention_passes_total`, which counts passes ATTEMPTED
+(whatever the outcome), and on the series being absent entirely.
+
+Most likely causes, in order:
+
+1. **The server is restarting more often than the cleanup interval.** The loop
+   sleeps a full interval (60 minutes by default) BEFORE its first pass, so a
+   server that never stays up an hour never completes one. Check uptime and the
+   restart history first - this needs no fault to reach.
+2. **The series is absent**: the server is down, the scrape target is wrong, or
+   the store was never constructed. Check `up` for the job.
+3. **The cleanup thread died.** Look for a crash or an exception around the
+   store in the log.
+
+The alert is deliberately suppressed for the first 3 hours of a server's uptime,
+because the sleep-first loop makes early zeros expected.
+
 ## Verifying recovery
 
 ```
 yuzu_server_audit_clock_anomaly_skips_total   # stops increasing
 yuzu_server_audit_rows_deleted_total          # resumes increasing
 yuzu_server_audit_retention_cap_reached_total # flat once the backlog drains
+yuzu_server_audit_retention_passes_total      # increasing at the cleanup cadence
 ```
 
 Read the skips and failed counters **together**. Both leave rows undeleted, so a

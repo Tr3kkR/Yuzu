@@ -401,7 +401,7 @@ on a value:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Three triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was *ahead* of the clock. The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Four triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; the stored reading was *ahead* of the clock; or there was no stored reading at all, so the elapsed-time check could not run (the first pass after upgrading or restoring - expected once per database). The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
 | `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

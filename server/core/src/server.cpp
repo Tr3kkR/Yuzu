@@ -1007,8 +1007,10 @@ public:
                           "Audit retention passes declined: the pass would have expired every "
                           "datable row, the gap since the previous pass exceeded a fixed 7 days "
                           "(an ABSOLUTE threshold, not scaled to --audit-retention-days; a "
-                          "forward clock jump OR an outage that long), or the stored clock "
-                          "reading was ahead of the current clock",
+                          "forward clock jump OR an outage that long), the stored clock "
+                          "reading was ahead of the current clock, or there was "
+                          "no stored reading at all so the elapsed-time check "
+                          "could not run (first pass after an upgrade/restore)",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that failed on a SQLite error or ran against a "

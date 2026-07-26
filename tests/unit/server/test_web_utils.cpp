@@ -907,4 +907,16 @@ TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
 
     // No prefix and no newline: returned as-is.
     CHECK(yuzu::server::agent_error_display("plain text") == "plain text");
+
+    // Degenerate shapes must not render an EMPTY message -- the operator would
+    // see "The device reported an error: " with nothing after it. The leading
+    // newline case is a regression the byte window did not have.
+    CHECK(yuzu::server::agent_error_display("error|\ndetail here") == "detail here");
+    CHECK(yuzu::server::agent_error_display("error|line one\r\nline two") == "line one");
+    // A malformed all-continuation run truncates rather than erasing everything.
+    const std::string junk = "error|A" + std::string(50, '\x80');
+    CHECK_FALSE(yuzu::server::agent_error_display(junk, 10).empty());
+    // Genuinely empty input stays empty without reading out of bounds.
+    CHECK(yuzu::server::agent_error_display("error|").empty());
+    CHECK(yuzu::server::agent_error_display("").empty());
 }

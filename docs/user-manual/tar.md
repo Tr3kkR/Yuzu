@@ -304,8 +304,11 @@ config|process_enabled|errored
 ever writes (corruption or tampering); the source is fail-closed until it is
 re-`configure`d. See the tri-state description below.
 
-`retention_guard_declines_total` counts retention passes this agent declined
-because its clock moved, and `retention_guard_failures_total` counts tables that
+`retention_guard_declines_total` counts retention passes this agent declined -
+because its clock moved, or because there was no stored reading yet to compare
+against (the first pass after an agent upgrade, expected once) -
+`retention_guard_capped_total` counts passes where the per-pass cap bound and
+left a backlog, and `retention_guard_failures_total` counts tables that
 could not be retained at all -- whether the probes could not be read or the
 delete itself failed (see "The retention clock guard" below). Both
 are always emitted. **Read them together**: a zero declines total only means the

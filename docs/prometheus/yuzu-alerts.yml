@@ -466,8 +466,12 @@ groups:
           description: >-
             An audit retention pass declined. Triggers: it would have expired every datable
             row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
-            threshold, not scaled to audit_retention_days); or the stored clock reading
-            was AHEAD of the current clock.
+            threshold, not scaled to audit_retention_days); the stored clock reading
+            was AHEAD of the current clock; or there was NO stored reading at all, so the
+            elapsed-time check could not run. That last one fires exactly ONCE per
+            database, on the first pass after upgrading to a build with the guard (or
+            after a restore) - so expect one alert per server on a fleet upgrade and
+            stand it down; the runbook says how to tell it apart.
             Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
             uptime history before concluding the clock is at fault. Nothing was deleted;
@@ -554,8 +558,26 @@ groups:
       # restarting more often than cleanup_interval_min (default 60m) never
       # completes one. Alert on the ABSENCE of increase (#2360, UP-2).
       - alert: YuzuAuditRetentionNotRunning
+        # Two guards, both load-bearing.
+        #
+        # `unless ... uptime < 3h`: the cleanup loop sleeps a FULL interval
+        # before its first pass, so a freshly started server legitimately reports
+        # zero passes for the first hour. Without this, every deploy, container
+        # recreate or instance-label change pages critical from +15m to +60m, and
+        # a rolling deploy pages once per replica.
+        #
+        # `or absent(...)`: `increase() == 0` yields an EMPTY VECTOR when the
+        # series is missing, so the STRONGEST form of "retention is not running"
+        # -- the server gone, or the store never constructed -- was invisible to
+        # the alert written to detect it. It is also what makes the rule survive
+        # a long outage: after 3h down the samples age out of the range and the
+        # bare expression silently resolves while retention is still stopped.
         expr: |
-          increase(yuzu_server_audit_retention_passes_total[3h]) == 0
+          (
+            increase(yuzu_server_audit_retention_passes_total[3h]) == 0
+            unless on(instance) yuzu_server_uptime_seconds < 10800
+          )
+          or absent(yuzu_server_audit_retention_passes_total)
         for: 15m
         labels:
           severity: critical

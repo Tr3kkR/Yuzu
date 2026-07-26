@@ -637,7 +637,20 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                     db, table_name,
                     std::format("id <= (SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
                                 table_name, g.retention_default + kMaxTarDeletesPerTablePerPass));
-                const bool rc_cap_bound = !over || *over;
+                // An UNREADABLE probe must not manufacture a cap event. For the
+                // latch, "unknown" conservatively means armed; for a COUNTER it
+                // means the opposite -- publishing `retention_guard_capped` for
+                // a pass we could not measure invents the "expiry is outrunning
+                // the drain, escalate to engineering" signal out of nothing.
+                // Unreadable is reported as a FAILURE, which is what it is, and
+                // matches how the has_expired/has_survivor probes treat it
+                // (Gate 4 re-review, UPS-8).
+                if (!over) {
+                    std::lock_guard lock(guard.mu);
+                    ++guard.failures[table_name];
+                    ++unreadable_tables;
+                }
+                const bool rc_cap_bound = over && *over;
                 plans.push_back(Plan{
                     table_name,
                     std::format("DELETE FROM {} WHERE id IN ("
@@ -723,8 +736,21 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // That is the dead-CMOS endpoint this guard was written for
             // (#2361, Sol adversarial review).
             const bool no_anchor = !prev_pass_now;
-            if ((would_wipe || big_step || prev_implausible || no_anchor) && !latched) {
-                latched = true;
+            // The ANOMALY triggers, which spend the one-shot latch.
+            const bool anomaly = would_wipe || big_step || prev_implausible;
+            if ((anomaly || no_anchor) && !latched) {
+                // The bootstrap decline deliberately does NOT latch. The latch
+                // means "this table already declined FOR THE CURRENT ANOMALY",
+                // and a bootstrap is not an anomaly -- just a missing comparison
+                // point. Spending the latch on it let the NEXT pass accept a real
+                // anomaly undeclined: agent upgrade, pass 1 declines and latches,
+                // a dead RTC or a resumed snapshot lands before pass 2, and pass
+                // 2 deletes to the cap with no decline and no counter. That is
+                // the silent deletion the bootstrap rule exists to prevent,
+                // moved one pass later rather than removed (Gate 4 re-review,
+                // UPS-1).
+                if (anomaly)
+                    latched = true;
                 ++guard.declines[table_name];
                 ++declined_tables;
                 spdlog::debug("TAR retention: declining {} (wipe={}, bad_state={}, {}s since last "
@@ -757,7 +783,19 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                 exists_where(db, table_name,
                              std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
                                          kMaxTarDeletesPerTablePerPass));
-            const bool cap_will_bind = !more || *more;
+            // Two different questions off one probe, and they want OPPOSITE
+            // defaults when it cannot be read. The LATCH stays conservative --
+            // unknown means armed, so the guard is not silently released. The
+            // COUNTER must not: publishing a cap event for a pass we could not
+            // measure invents an "expiry is outrunning the drain" signal
+            // (Gate 4 re-review, UPS-8). An unreadable probe is a FAILURE.
+            const bool cap_probe_ok = more.has_value();
+            const bool cap_will_bind = !cap_probe_ok || *more; // latch view
+            const bool cap_bound_measured = cap_probe_ok && *more; // counter view
+            if (!cap_probe_ok) {
+                ++guard.failures[table_name]; // already under guard.mu here
+                ++unreadable_tables;
+            }
             latched = would_wipe && cap_will_bind;
             // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
             // KEY` plus an `idx_{table}_{ts_col}` index (generate_warehouse_ddl),
@@ -768,7 +806,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                                              "ORDER BY {} ASC, id ASC LIMIT {})",
                                              table_name, table_name, ts_col, cutoff, ts_col,
                                              kMaxTarDeletesPerTablePerPass),
-                                 cap_will_bind});
+                                 cap_bound_measured});
         }
     }
 

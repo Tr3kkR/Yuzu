@@ -715,17 +715,41 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // expired the `!*has_expired` branch returns long before this
             // (#2360, Sol adversarial review).
             const bool no_anchor = !prev_pass_now;
-            if ((would_wipe || big_step || prev_implausible || no_anchor) &&
-                !clock_anomaly_latched_) {
+            // The ANOMALY triggers, which spend the one-shot latch.
+            const bool anomaly = would_wipe || big_step || prev_implausible;
+            if ((anomaly || no_anchor) && !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
-                clock_anomaly_latched_ = true;
+                // The bootstrap decline deliberately does NOT latch.
+                //
+                // The latch means "this target already declined FOR THE CURRENT
+                // ANOMALY", so spending it on a bootstrap -- which is not an
+                // anomaly at all, just a missing comparison point -- let the
+                // next pass accept a real one undeclined. Concretely: upgrade,
+                // pass 1 declines and latches, a forward jump lands before pass
+                // 2, and pass 2 deletes to the cap with no decline, no counter
+                // and no warn. That is the same silent deletion the bootstrap
+                // rule was added to prevent, moved one pass later rather than
+                // removed (Gate 4 re-review, UPS-1).
+                //
+                // Not latching costs nothing: the anchor is persisted
+                // unconditionally above, so `no_anchor` cannot be true again on
+                // the next pass of a store that can write. If it CANNOT write,
+                // declining every pass is the correct direction -- a store that
+                // cannot record what it is doing should not be deleting
+                // evidence -- and `persist_failed_` reports it loudly.
+                if (anomaly)
+                    clock_anomaly_latched_ = true;
                 // Name the trigger that actually fired. Reporting an elapsed
                 // delta for a would_wipe-only decline attributed a clock step or
                 // outage that did not happen, in the SOC 2-relevant log line.
+                //
+                // ANOMALIES OUTRANK the bootstrap: a first pass that would also
+                // expire every datable row must be reported as the wipe it is,
+                // not as the benign "first pass since upgrading" line (UPS-7).
                 emit = prev_implausible ? Emit::DeclineImplausible
                        : big_step         ? Emit::DeclineStep
-                       : !prev_pass_now   ? Emit::DeclineFirstPass
-                                          : Emit::DeclineWipe;
+                       : would_wipe       ? Emit::DeclineWipe
+                                          : Emit::DeclineFirstPass;
             } else {
                 deleted = delete_capped_locked(now, would_wipe, emit_err);
                 if (!emit_err.empty())

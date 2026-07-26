@@ -15,7 +15,7 @@
   forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe
   into a paced one plus an operator signal rather than preventing every anomaly.
-  Six metrics report it: `yuzu_server_audit_clock_anomaly_skips_total` (declined),
+  Seven metrics report it: `yuzu_server_audit_clock_anomaly_skips_total` (declined),
   `yuzu_server_audit_cleanup_failed_total` (errored or store closed),
   `yuzu_server_audit_retention_cap_reached_total` (the backlog is not draining),
   `yuzu_server_audit_rows_deleted_total`, `yuzu_server_audit_retention_index_ok`
