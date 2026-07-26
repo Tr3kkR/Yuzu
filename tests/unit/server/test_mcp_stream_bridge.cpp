@@ -1931,6 +1931,33 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
     }
 }
 
+TEST_CASE("bridge reserve - the streamed charge and the record commit together (C6a)",
+          "[mcp][bridge][2f]") {
+    // The ledger bump and the map insert BOTH allocate, so either can throw with
+    // the other already applied. A bump that survives a failed insert is a phantom
+    // charge: nothing will ever release it, so the session's streamed admissions
+    // reject pin_slots forever.
+    Fx fx;
+    auto s = fx.make_session();
+    fx.bridge->inject_reserve_commit_fault_for_test();
+    REQUIRE_THROWS_AS(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true),
+                      std::bad_alloc);
+    CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // no orphan record
+
+    // The load-bearing half: the ledger is invisible from outside, so the only
+    // way to prove it rolled back is to spend every slot. kMaxStreamedPostsPerSession
+    // is 4 - if the failed reserve leaked a charge, the FOURTH of these rejects.
+    CHECK(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    // ...and the cap itself still bites, so the test cannot pass by the ledger
+    // simply never counting.
+    auto over = fx.bridge->reserve(s.id, "alice", json(6), json("t"), true);
+    CHECK_FALSE(over.ok);
+    CHECK(std::string(over.reject_reason == nullptr ? "" : over.reject_reason) == "pin_slots");
+}
+
 // ── #2528: ~ClaimGuard must release the claim even when it cannot take mu ──────
 //
 // The claim used to be cleared INSIDE the try whose first act was the record-lock
