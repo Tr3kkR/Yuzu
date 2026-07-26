@@ -128,8 +128,9 @@ std::string lower_scope_block(const ScopeBlock& sb) {
     return out;
 }
 
-std::string resolve_scope_aliases(std::string_view expr, const std::string& owner,
-                                  ResultSetStore* store) {
+std::expected<std::string, ResultSetError> resolve_scope_aliases(std::string_view expr,
+                                                                  const std::string& owner,
+                                                                  ResultSetStore* store) {
     static constexpr std::string_view kPrefix = "from_result_set:";
     if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
         return std::string(expr);
@@ -158,8 +159,18 @@ std::string resolve_scope_aliases(std::string_view expr, const std::string& owne
                 ++j;
             std::string ref(expr.substr(rs, j - rs));
             if (!ref.empty() && !ref.starts_with("rs_")) {
-                if (auto canon = store->resolve_alias(owner, ref))
-                    ref = *canon;
+                auto canon = store->resolve_alias(owner, ref);
+                if (!canon) {
+                    // ADR-0036 fail-closed contract: a DB error mid-rewrite
+                    // ABORTS — returning the expression with this atom left
+                    // unresolved would no-match downstream and, under NOT,
+                    // invert to match-every-agent.
+                    return std::unexpected(canon.error());
+                }
+                if (*canon)
+                    ref = **canon;
+                // else: genuinely not found — leave `ref` as the alias text;
+                // it no-matches downstream (design §4.3), not a DB error.
             }
             out += kPrefix;
             out += ref;
@@ -172,9 +183,9 @@ std::string resolve_scope_aliases(std::string_view expr, const std::string& owne
     return out;
 }
 
-std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
-                                                        const std::string& owner,
-                                                        ResultSetStore* store) {
+std::expected<std::vector<std::string>, ResultSetError>
+scope_refs_failing_owner_check(std::string_view expr, const std::string& owner,
+                               ResultSetStore* store) {
     std::vector<std::string> failing;
     static constexpr std::string_view kPrefix = "from_result_set:";
     if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
@@ -200,7 +211,15 @@ std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
             std::string ref(expr.substr(rs, j - rs));
             if (!ref.empty()) {
                 auto set = store->get(ref);
-                if (!set || set->owner_principal != owner)
+                if (!set) {
+                    // ADR-0036 fail-closed contract: a DB error mid-scan
+                    // ABORTS the whole check rather than returning a partial
+                    // failing-refs list (which the caller would otherwise
+                    // treat as "these are the only problems", silently
+                    // masking others).
+                    return std::unexpected(set.error());
+                }
+                if (!*set || (*set)->owner_principal != owner)
                     failing.push_back(ref);
             }
             i = j;

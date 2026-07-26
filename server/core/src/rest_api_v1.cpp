@@ -5825,12 +5825,22 @@ void RestApiV1::register_routes(
 
         // Load a row and enforce the owner check. Returns nullopt and writes a
         // 404 (existence-oracle-safe: non-owner is indistinguishable from
-        // missing) when the row is absent or not owned by the session.
+        // missing) when the row is absent or not owned by the session — or a
+        // 503 (ADR-0036 fail-closed contract) when the read itself degraded,
+        // which is TYPE-DISTINGUISHABLE from "not found" precisely so this
+        // authorization gate never silently treats "could not verify
+        // ownership" as "not owned, deny" mis-attributed as a clean 404.
         auto load_owned = [result_set_store, rs_err, audit_fn](
                               const httplib::Request& req, const std::string& id,
                               const std::string& owner,
                               httplib::Response& res) -> std::optional<ResultSet> {
-            auto row = result_set_store->get(id);
+            auto row_result = result_set_store->get(id);
+            if (!row_result) {
+                rs_err(res, 503,
+                       "RESULT_SET_STORE_UNAVAILABLE: could not verify result-set ownership");
+                return std::nullopt;
+            }
+            const std::optional<ResultSet>& row = *row_result;
             if (!row || row->owner_principal != owner) {
                 // Audit the failed access so probing the existence oracle leaves
                 // a trail (review finding G). The 404 stays oracle-safe (a
@@ -5850,15 +5860,23 @@ void RestApiV1::register_routes(
         // owner is known here, whereas `evaluate_scope` (which resolves
         // `from_result_set:` deep in the dispatch lambda) has no principal to
         // scope the alias lookup. Writes a 404 and returns nullopt when the
-        // ref doesn't resolve to a row this session owns.
+        // ref doesn't resolve to a row this session owns; writes a 503
+        // (ADR-0036) and returns nullopt when alias resolution itself
+        // degraded — never silently falls through with the raw (unresolved)
+        // reference, which would let a DB blip masquerade as a not-found.
         auto resolve_owned_parent =
-            [result_set_store, load_owned](const httplib::Request& req, const std::string& raw,
-                                           const std::string& owner,
-                                           httplib::Response& res) -> std::optional<std::string> {
+            [result_set_store, load_owned,
+             rs_err](const httplib::Request& req, const std::string& raw, const std::string& owner,
+                     httplib::Response& res) -> std::optional<std::string> {
             std::string id = raw;
             if (!raw.starts_with("rs_")) {
-                if (auto canon = result_set_store->resolve_alias(owner, raw))
-                    id = *canon;
+                auto canon = result_set_store->resolve_alias(owner, raw);
+                if (!canon) {
+                    rs_err(res, 503, "RESULT_SET_STORE_UNAVAILABLE: could not resolve alias");
+                    return std::nullopt;
+                }
+                if (*canon)
+                    id = **canon;
                 // else: id stays = raw; load_owned() below 404s on the miss.
             }
             auto row = load_owned(req, id, owner, res);

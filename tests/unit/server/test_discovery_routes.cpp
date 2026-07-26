@@ -388,8 +388,12 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
             expr = "from_result_set:rs_nonexistent";
             auto parsed = yuzu::scope::parse(expr);
             REQUIRE(parsed.has_value());
+            // No rs_store passed — the from_result_set: preload never runs,
+            // so this call cannot degrade (nullopt); has_value() is always
+            // true here (ADR-0036).
             auto matched = registry.evaluate_scope(*parsed, nullptr);
-            CHECK(matched.empty());
+            REQUIRE(matched.has_value());
+            CHECK(matched->empty());
             continue;
         }
         if (k.kind == "ostype")
@@ -409,14 +413,17 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
         auto parsed = yuzu::scope::parse(expr);
         REQUIRE(parsed.has_value());
         auto matched = registry.evaluate_scope(*parsed, nullptr);
-        CHECK(std::find(matched.begin(), matched.end(), "agent-1") != matched.end());
+        REQUIRE(matched.has_value());
+        CHECK(std::find(matched->begin(), matched->end(), "agent-1") != matched->end());
     }
 
     // A made-up kind the resolver has never heard of must resolve to no match
     // (proves the resolver doesn't silently accept everything as a wildcard).
     auto bogus = yuzu::scope::parse(R"(totally_bogus_kind == "x")");
     REQUIRE(bogus.has_value());
-    CHECK(registry.evaluate_scope(*bogus, nullptr).empty());
+    auto bogus_matched = registry.evaluate_scope(*bogus, nullptr);
+    REQUIRE(bogus_matched.has_value());
+    CHECK(bogus_matched->empty());
 }
 
 // CROSS-CHECK #2: yuzu::scope::operator_token's switch (scope_engine.cpp) has

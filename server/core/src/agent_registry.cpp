@@ -1122,7 +1122,7 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     }
 }
 
-std::vector<std::string>
+std::optional<std::vector<std::string>>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                               const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
                               std::string_view principal) const {
@@ -1142,12 +1142,25 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
             if (rs_members.contains(rsid))
                 continue;
             auto mem = rs_store->member_set_owned(rsid, owner);
+            if (!mem) {
+                // ADR-0036 fail-closed contract: a Postgres error mid-preload
+                // ABORTS the whole evaluation — never proceed with a partial
+                // membership map. Under a NOT combinator, an atom missing from
+                // rs_members would resolve "" (no match) and INVERT to "matches
+                // every agent" — the concrete fleet-wide fail-open this guards
+                // against (a degraded/transient DB blip must never silently
+                // expand a scope to the entire fleet).
+                spdlog::error("AgentRegistry::evaluate_scope: member_set_owned degraded for "
+                              "result-set '{}' (owner={}) — aborting scope evaluation",
+                              rsid, owner);
+                return std::nullopt;
+            }
             // Touch only sets we actually own (non-empty owned membership): keeps
             // a set actively used as scope from being GC'd mid-investigation
             // (review finding I), and never extends another operator's set TTL.
-            if (!mem.empty())
+            if (!mem->empty())
                 rs_store->touch(rsid);
-            rs_members.emplace(rsid, std::move(mem));
+            rs_members.emplace(rsid, std::move(*mem));
         }
     }
 

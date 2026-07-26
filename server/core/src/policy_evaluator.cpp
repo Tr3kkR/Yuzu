@@ -249,8 +249,12 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const
     } else if (!p.scope_expression.empty() && d_.registry) {
         auto parsed = yuzu::scope::parse(p.scope_expression);
         if (parsed) {
-            auto matched =
-                d_.registry->evaluate_scope(*parsed, d_.tag_store, d_.custom_properties_store);
+            // No rs_store/principal passed — the from_result_set: preload
+            // never runs, so this call cannot degrade (nullopt); value_or({})
+            // is a no-op fallback (ADR-0036).
+            auto matched = d_.registry
+                              ->evaluate_scope(*parsed, d_.tag_store, d_.custom_properties_store)
+                              .value_or(std::vector<std::string>{});
             for (const auto& a : matched)
                 if (seen.insert(a).second)
                     out.push_back(a);

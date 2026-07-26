@@ -32,6 +32,25 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    `SecretCodec` envelope-encrypted blob, never plaintext. `SecretCodec::init(conn)` runs
    **before** the store opens. `api_token`/`ca` are hash-/key_ref-only; `auth`, `webhooks`,
    `offload_targets`, `runtime_config` require the codec.
+4. **Authoritative reads must be type-distinguishable (2026-07-25 program policy, ADR-0036).**
+   On an **authoritative** store, every read whose result can feed a grant/target/enforce/skip
+   decision MUST make a runtime DB error TYPE-DISTINGUISHABLE from "no rows" at the call site —
+   `std::expected<T, YourStoreError>` (an `unexpected` for the DB-error case), or
+   `std::optional<Container>` where `nullopt` means "degraded, could not read" and an
+   empty container means "read fine, genuinely nothing here". **Logging the error is never a
+   substitute** — the caller still sees the same empty/false value either way. The store exposes
+   the typed channel unconditionally; the *caller* then applies the reviewer test: **"if this
+   value were silently empty/false, could any downstream branch grant / target / enforce / skip
+   / invert (`NOT`) / report success? If yes, treat a DB error as fail-closed (abort the
+   operation / return 503) — never as an empty result."** Pure render/telemetry callers (a
+   dashboard preview, a metrics gauge) may legitimately render degraded with the error in hand —
+   they don't feed a decision. The concrete motivating bug (`ResultSetStore::member_set_owned`,
+   ADR-0036): a `NOT from_result_set:<id>` scope resolves a missing preload entry to "no match",
+   and `NOT` inverts "no match" to "matches every agent" — so a transient Postgres blip that used
+   to come back as a silently-empty membership set turned into a fleet-wide command-dispatch
+   fail-open, not a theoretical one. Reads whose failure mode is deny-or-benign (a sidebar list
+   comes back empty, a lineage breadcrumb trail is short) may defer widening to a follow-up — but
+   say so explicitly in the PR/issue, don't just leave it unstated.
 
 ---
 

@@ -18,6 +18,7 @@
 
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
 #include "test_route_sink.hpp"
@@ -31,14 +32,25 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "../test_helpers.hpp"
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResultSetStore is now a migrated Postgres store (ADR-0036) — shares the
+// "resultset" template key with test_result_set_store.cpp (identical setup).
+yuzu::test::PgTestTemplate result_set_tpl{"resultset", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("resultset template: store failed to migrate");
+}};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;
@@ -56,7 +68,6 @@ struct SqliteHandleGuard {
 };
 
 struct AsyncHarness {
-    yuzu::test::TempDbFile rs_db{std::string_view("rs-async-store-")};
     SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
@@ -72,8 +83,9 @@ struct AsyncHarness {
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
 
-    explicit AsyncHarness(bool with_dispatch = true) : wire_dispatch(with_dispatch) {
-        store = std::make_unique<ResultSetStore>(rs_db.path);
+    explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true)
+        : wire_dispatch(with_dispatch) {
+        store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
         REQUIRE(sqlite3_open(":memory:", &tracker_guard.db) == SQLITE_OK);
@@ -145,6 +157,16 @@ struct AsyncHarness {
     }
 };
 
+// Unwrap ResultSetStore::get's std::expected<optional<...>,...> (ADR-0036) —
+// every call below hits a live, healthy Postgres, so a DbError here is a
+// genuine test-infrastructure failure; REQUIRE it away and hand back the
+// plain optional these tests were written against.
+std::optional<ResultSet> get_ok(ResultSetStore& s, const std::string& id) {
+    auto r = s.get(id);
+    REQUIRE(r.has_value());
+    return *r;
+}
+
 std::string make_instruction(InstructionStore& s) {
     InstructionDefinition def;
     def.name = "Chrome hash check";
@@ -162,8 +184,11 @@ std::string make_instruction(InstructionStore& s) {
 } // namespace
 
 TEST_CASE("from-tar-query: 202 pending, dispatch to __all__ when no parent",
-          "[result_set][async][tar]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     int status = 0;
     auto j = h.post("/api/v1/result-sets/from-tar-query",
                     R"({"sql":"SELECT pid FROM process_live","name":"chrome-procs"})", status);
@@ -183,15 +208,18 @@ TEST_CASE("from-tar-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(h.calls[0].execution_id == data["source_execution_id"].get<std::string>());
 
     // The row landed pending with the default tar matcher.
-    auto row = h.store->get(data["id"].get<std::string>());
+    auto row = get_ok(*h.store, data["id"].get<std::string>());
     REQUIRE(row.has_value());
     REQUIRE(row->status == ResultSetStatus::Pending);
     REQUIRE(row->matcher.find("tar_rows_ge") != std::string::npos);
 }
 
 TEST_CASE("from-tar-query: parent_id scopes dispatch via from_result_set:",
-          "[result_set][async][tar]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     auto parent = h.seed_materialized("win-fleet", {"a1", "a2"});
     int status = 0;
     auto j = h.post("/api/v1/result-sets/from-tar-query",
@@ -200,14 +228,17 @@ TEST_CASE("from-tar-query: parent_id scopes dispatch via from_result_set:",
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].scope_expr == "from_result_set:" + parent);
     // Lineage: the new set's parent is the seeded set.
-    auto row = h.store->get(j["data"]["id"].get<std::string>());
+    auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
     REQUIRE(row->parent_id.has_value());
     REQUIRE(*row->parent_id == parent);
 }
 
 TEST_CASE("from-tar-query: parent alias is pre-resolved to canonical id",
-          "[result_set][async][tar][alias]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar][alias]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     auto canonical = h.seed_materialized("my-alias", {"a1"});
     int status = 0;
     // parent_id given as the human alias, not the rs_ id.
@@ -215,12 +246,15 @@ TEST_CASE("from-tar-query: parent alias is pre-resolved to canonical id",
                     R"({"sql":"SELECT 1","parent_id":"my-alias"})", status);
     REQUIRE(status == 202);
     REQUIRE(h.calls[0].scope_expr == "from_result_set:" + canonical);
-    REQUIRE(*h.store->get(j["data"]["id"].get<std::string>())->parent_id == canonical);
+    REQUIRE(*get_ok(*h.store, j["data"]["id"].get<std::string>())->parent_id == canonical);
 }
 
 TEST_CASE("from-tar-query: unknown parent alias 404s, no dispatch",
-          "[result_set][async][tar][alias]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar][alias]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     int status = 0;
     h.post("/api/v1/result-sets/from-tar-query",
            R"({"sql":"SELECT 1","parent_id":"nonexistent-alias"})", status);
@@ -229,18 +263,24 @@ TEST_CASE("from-tar-query: unknown parent alias 404s, no dispatch",
 }
 
 TEST_CASE("from-tar-query: include_empty selects the any_response matcher",
-          "[result_set][async][tar]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     int status = 0;
     auto j = h.post("/api/v1/result-sets/from-tar-query",
                     R"({"sql":"SELECT 1","include_empty":true})", status);
     REQUIRE(status == 202);
-    REQUIRE(h.store->get(j["data"]["id"].get<std::string>())->matcher.find("any_response") !=
+    REQUIRE(get_ok(*h.store, j["data"]["id"].get<std::string>())->matcher.find("any_response") !=
             std::string::npos);
 }
 
-TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[result_set][async][tar]") {
-    AsyncHarness h;
+TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     int status = 0;
     h.post("/api/v1/result-sets/from-tar-query", R"({"name":"x"})", status);
     REQUIRE(status == 400);
@@ -248,8 +288,11 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[result_set][async
 }
 
 TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",
-          "[result_set][async][tar]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     h.dispatch_sent = 0; // dispatch reaches nobody
     int status = 0;
     h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
@@ -262,8 +305,11 @@ TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no p
 }
 
 TEST_CASE("from-tar-query: dispatch throw is 500, execution cancelled",
-          "[result_set][async][tar]") {
-    AsyncHarness h;
+          "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     h.dispatch_throws = true;
     int status = 0;
     h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
@@ -272,16 +318,22 @@ TEST_CASE("from-tar-query: dispatch throw is 500, execution cancelled",
     REQUIRE(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
-TEST_CASE("from-tar-query: 503 when command dispatch is unwired", "[result_set][async][tar]") {
-    AsyncHarness h{/*with_dispatch=*/false};
+TEST_CASE("from-tar-query: 503 when command dispatch is unwired", "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, /*with_dispatch=*/false);
     int status = 0;
     h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
     REQUIRE(status == 503);
 }
 
 TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted",
-          "[result_set][async][instruction]") {
-    AsyncHarness h;
+          "[pg][result_set][async][instruction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     auto iid = make_instruction(*h.instr);
     int status = 0;
     std::string body = R"({"instruction_id":")" + iid +
@@ -295,13 +347,17 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     REQUIRE(h.calls[0].action == "check");
     REQUIRE(h.calls[0].params.at("path") == "/x");
     // The operator's column matcher is stored verbatim on the pending row.
-    auto row = h.store->get(j["data"]["id"].get<std::string>());
+    auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
     REQUIRE(row->matcher.find("sha256") != std::string::npos);
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
 }
 
-TEST_CASE("from-instruction-result: unknown instruction_id 404s", "[result_set][async][instruction]") {
-    AsyncHarness h;
+TEST_CASE("from-instruction-result: unknown instruction_id 404s",
+          "[pg][result_set][async][instruction]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     int status = 0;
     h.post("/api/v1/result-sets/from-instruction-result",
            R"({"instruction_id":"does-not-exist"})", status);
@@ -310,8 +366,11 @@ TEST_CASE("from-instruction-result: unknown instruction_id 404s", "[result_set][
 }
 
 TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
-          "[result_set][async][reeval]") {
-    AsyncHarness h;
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     auto grandparent = h.seed_materialized("ground", {"a1", "a2"});
     int status = 0;
     // Original tar_query parented at `grandparent`.
@@ -330,21 +389,27 @@ TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].params.at("sql") == "SELECT 7");
     // Sibling: new set's parent == original's parent (NOT the original).
-    auto row = h.store->get(new_id);
+    auto row = get_ok(*h.store, new_id);
     REQUIRE(row->parent_id.has_value());
     REQUIRE(*row->parent_id == grandparent);
 }
 
-TEST_CASE("re-eval: unsupported source_kind is 400", "[result_set][async][reeval]") {
-    AsyncHarness h;
+TEST_CASE("re-eval: unsupported source_kind is 400", "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     auto manual = h.seed_materialized("hand-curated", {"a1"});
     int status = 0;
     h.post("/api/v1/result-sets/" + manual + "/re-eval", "", status);
     REQUIRE(status == 400);
 }
 
-TEST_CASE("re-eval: not-owned / missing set is 404", "[result_set][async][reeval]") {
-    AsyncHarness h;
+TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
     int status = 0;
     h.post("/api/v1/result-sets/rs_00000000000deadbeef/re-eval", "", status);
     REQUIRE(status == 404);

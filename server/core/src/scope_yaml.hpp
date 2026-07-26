@@ -1,13 +1,18 @@
 #pragma once
 
+#include "result_set_store.hpp" // ResultSetError, used by value in the widened
+                                // resolve_scope_aliases/scope_refs_failing_owner_check
+                                // return types below (ADR-0036) — a forward
+                                // declaration of the enum is not worth the risk
+                                // against std::expected's instantiation needs.
+
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace yuzu::server {
-
-class ResultSetStore;
 
 // Scope-walking YAML DSL surface (PR-E, design docs/scope-walking-design.md §7).
 //
@@ -63,11 +68,21 @@ std::string lower_scope_block(const ScopeBlock& sb);
 
 /// Rewrite each `from_result_set:<alias>` atom (a ref not already a canonical
 /// `rs_` id) to its canonical id via store->resolve_alias(owner, alias).
-/// Canonical ids and unresolved aliases are left as-is (they no-match
-/// downstream — stale drops silently, design §4.3). No-op when `owner` is empty
-/// or `store` is null, mirroring the resolver's empty-principal contract.
-std::string resolve_scope_aliases(std::string_view expr, const std::string& owner,
-                                  ResultSetStore* store);
+/// Canonical ids and unresolved (genuinely-not-found) aliases are left as-is
+/// (they no-match downstream — stale drops silently, design §4.3). No-op
+/// (returns `expr` unchanged) when `owner` is empty or `store` is null,
+/// mirroring the resolver's empty-principal contract.
+///
+/// Returns `std::unexpected(DbError)` — ADR-0036 fail-closed contract — when
+/// `resolve_alias` hits a Postgres error mid-rewrite. The caller MUST treat
+/// this as "abort dispatch" (503/internal-error), never fall back to the
+/// unresolved expression: an unresolved `from_result_set:<alias>` atom
+/// no-matches downstream and, under a `NOT` combinator, INVERTS to
+/// match-every-agent — the same class of fleet-wide fail-open
+/// `member_set_owned`'s contract guards against.
+std::expected<std::string, ResultSetError> resolve_scope_aliases(std::string_view expr,
+                                                                 const std::string& owner,
+                                                                 ResultSetStore* store);
 
 /// Return the `from_result_set:<ref>` atoms in an (already alias-resolved)
 /// expression that fail the owner check: the set is absent/expired
@@ -75,8 +90,14 @@ std::string resolve_scope_aliases(std::string_view expr, const std::string& owne
 /// owned, and is legitimately empty is NOT reported. Empty when `owner` is empty
 /// or `store` is null (no owner context to check against). Drives the
 /// invocation-time INSTRUCTION_SCOPE_RESOLUTION_FAILED audit row (design §7).
-std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
-                                                        const std::string& owner,
-                                                        ResultSetStore* store);
+///
+/// Returns `std::unexpected(DbError)` when `store->get` hits a Postgres error
+/// mid-scan (ADR-0036 fail-closed contract) — the caller MUST abort dispatch
+/// rather than proceed with a partial/no audit-row view (this function is a
+/// forensic side-channel today, but a degraded scan could also mask a
+/// genuinely-failing owner check, which the audit row exists to surface).
+std::expected<std::vector<std::string>, ResultSetError>
+scope_refs_failing_owner_check(std::string_view expr, const std::string& owner,
+                               ResultSetStore* store);
 
 } // namespace yuzu::server

@@ -2365,9 +2365,14 @@ public:
                                 return cached->second;
                             bool member = false;
                             if (auto parsed = yuzu::scope::parse(expr)) {
+                                // No rs_store/principal passed here — the
+                                // from_result_set: preload never runs, so
+                                // evaluate_scope cannot degrade (nullopt) for
+                                // this call; value_or({}) is a no-op fallback.
                                 for (const auto& id : registry_.evaluate_scope(
                                          *parsed, tag_store_.get(),
-                                         custom_properties_store_.get()))
+                                         custom_properties_store_.get())
+                                         .value_or(std::vector<std::string>{}))
                                     if (id == agent_id) {
                                         member = true;
                                         break;
@@ -2762,12 +2767,34 @@ public:
             auto quar_db = cfg_.db_dir() / "quarantine.db";
             quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
-        {
-            // Scope-walking result sets (capability §30).
-            auto rs_db = cfg_.db_dir() / "result_sets.db";
-            result_set_store_ = std::make_unique<ResultSetStore>(rs_db);
-            if (result_set_store_ && result_set_store_->is_open())
-                spdlog::info("ResultSetStore initialized at {}", rs_db.string());
+        // Scope-walking result sets (capability §30). Migrated Postgres store
+        // (ADR-0006/ADR-0036, schema `result_set_store`) — construction fail-CLOSED
+        // per ADR-0012 §1 (same template as OfflineEndpointStore above): a
+        // reachable database whose schema can't migrate/open is a fatal startup
+        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
+        // one-time, idempotent legacy-`result_sets.db` backfill (ADR-0009) —
+        // AUTHORITATIVE posture means a backfill failure is ALSO fatal (never
+        // serve on top of a partially-migrated schema).
+        if (pg_pool_ && !startup_failed_) {
+            result_set_store_ = std::make_unique<ResultSetStore>(*pg_pool_);
+            if (!result_set_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: result-set store migration/open failed "
+                              "(database reachable but the result_set_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto rs_db = cfg_.db_dir() / "result_sets.db";
+                if (!result_set_store_->migrate_from_sqlite(rs_db)) {
+                    spdlog::error("[PG] Refusing to start: result-set legacy-SQLite backfill "
+                                  "failed (see prior log lines) — result_set_store is "
+                                  "authoritative and must not serve partially-migrated data");
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("ResultSetStore initialized (schema result_set_store; legacy "
+                                 "backfill source {})",
+                                 rs_db.string());
+                }
+            }
         }
 
         // Phase 5: Policy Engine
@@ -4422,6 +4449,10 @@ public:
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
+        // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
+        // thread that leased it is already joined above; every HTTP/gRPC handler
+        // holding the raw pointer is quiesced by the drains above.
+        result_set_store_.reset();
         pg_pool_.reset();
     }
 
@@ -6498,9 +6529,12 @@ private:
                 // gov PR-E OBS-1: ResultSetStore became load-bearing — every
                 // scoped command dispatch and the /api/scope/estimate preview
                 // resolve from_result_set: aliases and owner-check membership
-                // against it. A failed migration / corrupt result_sets.db would
-                // silently degrade every scoped dispatch to zero targets while
-                // /readyz reported "ready".
+                // against it. A failed migration/backfill (migrated to Postgres,
+                // schema `result_set_store`, ADR-0036) would silently degrade
+                // every scoped dispatch to zero targets while /readyz reported
+                // "ready" — this construction is already fail-closed
+                // (startup_failed_) per ADR-0012 §1, but the readyz entry stays
+                // as belt-and-braces against a runtime is_open() flip.
                 {"result_set_store", result_set_store_ && result_set_store_->is_open()},
                 // PKI PR2: ca.db is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
@@ -7601,27 +7635,51 @@ private:
                 }
                 // Resolve from_result_set: aliases against the operator's owned
                 // sets before parsing (PR-E): the scope resolver does not.
+                // ADR-0036 fail-closed contract: a DB error at ANY step below
+                // ABORTS this branch — `sent` stays 0, so the shared
+                // "sent == 0 -> 503" fallback below fires. Leaving an atom
+                // unresolved or a preload partial would silently no-match
+                // downstream and, under a NOT combinator, invert to
+                // match-the-entire-fleet (the concrete fail-open this guards).
                 auto resolved_scope =
                     resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
-                // Forensic row when a referenced set is absent/expired/unowned
-                // (design §7 rule 3); does not abort dispatch.
-                for (const auto& ref : scope_refs_failing_owner_check(
-                         resolved_scope, principal, result_set_store_.get()))
-                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
-                auto parsed = yuzu::scope::parse(resolved_scope);
-                if (!parsed) {
-                    res.status = 400;
-                    res.set_content(
-                        nlohmann::json({{"error", "invalid scope: " + parsed.error()}}).dump(),
-                        "application/json");
-                    return;
-                }
-                auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get(),
-                                                            result_set_store_.get(), principal);
-                for (const auto& aid : matched_ids) {
-                    if (registry_.send_to(aid, cmd)) {
-                        ++sent;
+                if (!resolved_scope) {
+                    spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
+                                  to_string(resolved_scope.error()));
+                } else {
+                    // Forensic row when a referenced set is absent/expired/unowned
+                    // (design §7 rule 3); does not abort dispatch.
+                    auto failing_refs = scope_refs_failing_owner_check(*resolved_scope, principal,
+                                                                       result_set_store_.get());
+                    if (!failing_refs) {
+                        spdlog::error("scope dispatch: scope_refs_failing_owner_check degraded "
+                                      "({})",
+                                      to_string(failing_refs.error()));
+                    } else {
+                        for (const auto& ref : *failing_refs)
+                            audit_scope_resolution_failed(principal, principal_role, command_id,
+                                                          ref);
+                        auto parsed = yuzu::scope::parse(*resolved_scope);
+                        if (!parsed) {
+                            res.status = 400;
+                            res.set_content(nlohmann::json(
+                                                {{"error", "invalid scope: " + parsed.error()}})
+                                                .dump(),
+                                            "application/json");
+                            return;
+                        }
+                        if (auto matched_ids = registry_.evaluate_scope(
+                                *parsed, tag_store_.get(), custom_properties_store_.get(),
+                                result_set_store_.get(), principal)) {
+                            for (const auto& aid : *matched_ids) {
+                                if (registry_.send_to(aid, cmd)) {
+                                    ++sent;
+                                }
+                            }
+                        } else {
+                            spdlog::error("scope dispatch: evaluate_scope degraded (result-set "
+                                          "membership preload failed)");
+                        }
                     }
                 }
             } else if (agent_ids.empty()) {
@@ -8295,16 +8353,33 @@ private:
                                 "text/html; charset=utf-8");
             });
 
+        // Owner-checked read shared by every fragment mutation below: a DB
+        // error is treated IDENTICALLY to "not found or not owned" — a
+        // mutation (pin/unpin/delete) must never proceed on a degraded
+        // ownership read (ADR-0036 fail-closed authoritative-read contract).
+        // Collapses ResultSetStore::get's std::expected<optional<...>,...>
+        // into a plain optional so every call site below is unchanged from
+        // its pre-widening shape.
+        auto rs_get_owned = [this](const std::string& id,
+                                   const std::string& owner) -> std::optional<ResultSet> {
+            if (!result_set_store_)
+                return std::nullopt;
+            auto row = result_set_store_->get(id);
+            if (!row || !row->has_value() || (*row)->owner_principal != owner)
+                return std::nullopt;
+            return **row;
+        };
+
         // Detail pane for one set (owner-checked).
         web_server_->Get(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
-            [this](const httplib::Request& req, httplib::Response& res) {
+            [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
                 auto id = req.matches[1].str();
-                auto row = result_set_store_ ? result_set_store_->get(id) : std::nullopt;
-                if (!row || row->owner_principal != session->username) {
+                auto row = rs_get_owned(id, session->username);
+                if (!row) {
                     res.set_content(render_result_set_detail_empty(),
                                     "text/html; charset=utf-8");
                     return;
@@ -8315,10 +8390,11 @@ private:
             });
 
         // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
-        auto rs_detail_after = [this](const std::string& id, const std::string& owner,
-                                      httplib::Response& res) {
-            auto row = result_set_store_->get(id);
-            if (!row || row->owner_principal != owner) {
+        auto rs_detail_after = [this, rs_get_owned](const std::string& id,
+                                                    const std::string& owner,
+                                                    httplib::Response& res) {
+            auto row = rs_get_owned(id, owner);
+            if (!row) {
                 res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                 return;
             }
@@ -8329,13 +8405,14 @@ private:
 
         web_server_->Post(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
-            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+            [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
+                                                  httplib::Response& res) {
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
                 auto id = req.matches[1].str();
-                auto row = result_set_store_->get(id);
-                if (!row || row->owner_principal != session->username) {
+                auto row = rs_get_owned(id, session->username);
+                if (!row) {
                     res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                     return;
                 }
@@ -8363,13 +8440,14 @@ private:
 
         web_server_->Post(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
-            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+            [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
+                                                  httplib::Response& res) {
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
                 auto id = req.matches[1].str();
-                auto row = result_set_store_->get(id);
-                if (!row || row->owner_principal != session->username) {
+                auto row = rs_get_owned(id, session->username);
+                if (!row) {
                     res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                     return;
                 }
@@ -8393,13 +8471,13 @@ private:
 
         web_server_->Post(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
-            [this](const httplib::Request& req, httplib::Response& res) {
+            [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
                 auto id = req.matches[1].str();
-                auto row = result_set_store_->get(id);
-                if (!row || row->owner_principal != session->username) {
+                auto row = rs_get_owned(id, session->username);
+                if (!row) {
                     res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                     return;
                 }
@@ -10223,22 +10301,45 @@ private:
                         principal = ex->dispatched_by;
                 }
                 // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                // ADR-0036 fail-closed contract: a DB error at ANY step below
+                // (alias resolve / owner-check probe / membership preload)
+                // ABORTS this branch — `sent` stays 0 and the caller's normal
+                // "0 agents reached" handling applies. Leaving an atom
+                // unresolved or a preload partial would silently no-match
+                // downstream and, under a NOT combinator, invert to
+                // match-the-entire-fleet (the concrete fail-open this guards).
                 auto resolved_scope =
                     resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
-                // Role is not available on the tracked path (principal recovered
-                // from the execution row, no live session); principal + command
-                // id still identify the actor for the forensic chain.
-                for (const auto& ref : scope_refs_failing_owner_check(
-                         resolved_scope, principal, result_set_store_.get()))
-                    audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
-                auto parsed = yuzu::scope::parse(resolved_scope);
-                if (parsed) {
-                    auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get(),
-                                                            result_set_store_.get(), principal);
-                    for (const auto& aid : matched)
-                        if (registry_.send_to(aid, cmd))
-                            ++sent;
+                if (!resolved_scope) {
+                    spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
+                                  to_string(resolved_scope.error()));
+                } else {
+                    // Role is not available on the tracked path (principal recovered
+                    // from the execution row, no live session); principal + command
+                    // id still identify the actor for the forensic chain.
+                    auto failing_refs = scope_refs_failing_owner_check(*resolved_scope, principal,
+                                                                       result_set_store_.get());
+                    if (!failing_refs) {
+                        spdlog::error("scope dispatch: scope_refs_failing_owner_check degraded "
+                                      "({})",
+                                      to_string(failing_refs.error()));
+                    } else {
+                        for (const auto& ref : *failing_refs)
+                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        auto parsed = yuzu::scope::parse(*resolved_scope);
+                        if (parsed) {
+                            if (auto matched = registry_.evaluate_scope(
+                                    *parsed, tag_store_.get(), custom_properties_store_.get(),
+                                    result_set_store_.get(), principal)) {
+                                for (const auto& aid : *matched)
+                                    if (registry_.send_to(aid, cmd))
+                                        ++sent;
+                            } else {
+                                spdlog::error("scope dispatch: evaluate_scope degraded (result-set "
+                                              "membership preload failed)");
+                            }
+                        }
+                    }
                 }
             } else if (agent_ids.empty()) {
                 sent = registry_.send_to_all(cmd);
@@ -11538,9 +11639,14 @@ private:
                 } else if (!scope_expr.empty()) {
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
+                        // No principal passed here — the from_result_set: preload
+                        // never runs (evaluate_scope's own empty-principal guard),
+                        // so this call cannot degrade (nullopt); value_or({}) is a
+                        // no-op fallback, not a fail-open (ADR-0036).
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                                 custom_properties_store_.get(),
-                                                                result_set_store_.get());
+                                                                result_set_store_.get())
+                                          .value_or(std::vector<std::string>{});
                         for (const auto& aid : matched) {
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
@@ -11627,15 +11733,23 @@ private:
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
-            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            // Resolve from_result_set: aliases for the estimate too (PR-E). This
+            // is a pure preview/telemetry surface (no grant/target/enforce), so
+            // a degrade renders as an honest "0 matched" rather than aborting
+            // the whole page (ADR-0036 fail-closed contract §"pure render
+            // callers may degrade") — it never feeds a dispatch decision.
             auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
-            auto parsed = yuzu::scope::parse(resolved);
+            if (!resolved)
+                return {0, registry_.agent_count()};
+            auto parsed = yuzu::scope::parse(*resolved);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
                 registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get(),
                                          result_set_store_.get(), principal);
-            return {matched.size(), registry_.agent_count()};
+            if (!matched)
+                return {0, registry_.agent_count()};
+            return {matched->size(), registry_.agent_count()};
         };
         wf_deps.workflow_engine = workflow_engine_.get();
         wf_deps.execution_tracker = execution_tracker_.get();
@@ -11954,8 +12068,12 @@ private:
                     auto parsed = yuzu::scope::parse(scope);
                     if (!parsed)
                         return -1;
+                    // No rs_store/principal passed — the from_result_set: preload
+                    // never runs, so this call cannot degrade (nullopt);
+                    // value_or({}) is a no-op fallback (ADR-0036).
                     targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                       custom_properties_store_.get());
+                                                       custom_properties_store_.get())
+                                  .value_or(std::vector<std::string>{});
                 }
 
                 // Per-rule scope membership, evaluated once per distinct scope_expr
@@ -11968,8 +12086,10 @@ private:
                     if (it == scope_cache.end()) {
                         std::unordered_set<std::string> ids;
                         if (auto parsed = yuzu::scope::parse(expr)) {
+                            // Same no-degrade-possible reasoning as above.
                             auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                              custom_properties_store_.get());
+                                                              custom_properties_store_.get())
+                                        .value_or(std::vector<std::string>{});
                             ids.insert(v.begin(), v.end());
                         }
                         it = scope_cache.emplace(expr, std::move(ids)).first;
@@ -12217,21 +12337,47 @@ private:
                                 principal = ex->dispatched_by;
                         }
                         // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        // ADR-0036 fail-closed contract: a DB error at ANY step
+                        // below ABORTS this branch — `sent` stays 0. Leaving an
+                        // atom unresolved or a preload partial would silently
+                        // no-match downstream and, under a NOT combinator,
+                        // invert to match-the-entire-fleet.
                         auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
                                                                     result_set_store_.get());
-                        // Role unavailable on the MCP path (principal recovered
-                        // from the MCP-created execution row); principal + command
-                        // id identify the actor for the forensic chain.
-                        for (const auto& ref : scope_refs_failing_owner_check(
-                                 resolved_scope, principal, result_set_store_.get()))
-                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
-                        auto parsed = yuzu::scope::parse(resolved_scope);
-                        if (parsed) {
-                            for (const auto& aid : registry_.evaluate_scope(
-                                     *parsed, tag_store_.get(), custom_properties_store_.get(),
-                                     result_set_store_.get(), principal))
-                                if (registry_.send_to(aid, cmd))
-                                    ++sent;
+                        if (!resolved_scope) {
+                            spdlog::error("MCP scope dispatch: resolve_scope_aliases degraded "
+                                          "({})",
+                                          to_string(resolved_scope.error()));
+                        } else {
+                            // Role unavailable on the MCP path (principal recovered
+                            // from the MCP-created execution row); principal + command
+                            // id identify the actor for the forensic chain.
+                            auto failing_refs = scope_refs_failing_owner_check(
+                                *resolved_scope, principal, result_set_store_.get());
+                            if (!failing_refs) {
+                                spdlog::error("MCP scope dispatch: "
+                                              "scope_refs_failing_owner_check degraded ({})",
+                                              to_string(failing_refs.error()));
+                            } else {
+                                for (const auto& ref : *failing_refs)
+                                    audit_scope_resolution_failed(principal, /*role=*/"",
+                                                                  command_id, ref);
+                                auto parsed = yuzu::scope::parse(*resolved_scope);
+                                if (parsed) {
+                                    if (auto matched = registry_.evaluate_scope(
+                                            *parsed, tag_store_.get(),
+                                            custom_properties_store_.get(),
+                                            result_set_store_.get(), principal)) {
+                                        for (const auto& aid : *matched)
+                                            if (registry_.send_to(aid, cmd))
+                                                ++sent;
+                                    } else {
+                                        spdlog::error("MCP scope dispatch: evaluate_scope "
+                                                      "degraded (result-set membership preload "
+                                                      "failed)");
+                                    }
+                                }
+                            }
                         }
                     } else if (agent_ids.empty()) {
                         sent = registry_.send_to_all(cmd);
@@ -12680,6 +12826,10 @@ private:
     std::unique_ptr<EnginePrincipalStore> engine_principal_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
+    /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so
+    /// it destructs after the ingest/HTTP paths that hold its raw pointer and
+    /// before the pool; explicit reset() in stop() before pg_pool_.reset().
     std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;

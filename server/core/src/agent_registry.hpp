@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -269,10 +270,23 @@ public:
     // (no cross-operator targeting — review finding B1). Pass the dispatching
     // operator as `principal` on every command path; leave it empty (and/or
     // rs_store null) only where from_result_set is intentionally unsupported
-    // (e.g. server-authored policy scopes). Aliases must be pre-resolved to
-    // canonical ids by the caller. Stale members (offline / decommissioned
-    // agents not in the live registry) drop silently.
-    std::vector<std::string>
+    // (e.g. server-authored policy scopes) — with rs_store null or principal
+    // empty, the preload below never runs and this call cannot degrade.
+    // Aliases must be pre-resolved to canonical ids by the caller. Stale
+    // members (offline / decommissioned agents not in the live registry) drop
+    // silently.
+    //
+    // Returns std::nullopt (ADR-0036 fail-closed contract) when the
+    // from_result_set: membership preload hits a Postgres error mid-scan —
+    // NEVER a partial/degraded membership map. This is load-bearing: under a
+    // NOT combinator, an atom that resolved to "no match" because of a missing
+    // preload entry would silently INVERT to "matches every agent" — the
+    // concrete fleet-wide fail-open a degraded preload must never produce.
+    // Every caller that dispatches/enforces/targets on this result MUST treat
+    // nullopt as "abort — do not proceed", never as "0 matches". A caller that
+    // passes rs_store == nullptr or principal.empty() can never observe
+    // nullopt (the preload is skipped entirely) and may use value_or({}).
+    std::optional<std::vector<std::string>>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                    const CustomPropertiesStore* props_store = nullptr,
                    ResultSetStore* rs_store = nullptr, std::string_view principal = {}) const;
