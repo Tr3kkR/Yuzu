@@ -8,8 +8,9 @@
   `--audit-retention-days`: at the 365-day default that would put it a year out,
   where it could never fire), or when the stored reading is ahead of the current
   clock. That reading is persisted and sanitised, so the check still fires on a
-  server that BOOTED with an already-wrong clock and cannot be disabled by a
-  poisoned value. Every accepted pass is capped at 25,000 rows oldest-first. Rows
+  server that BOOTED with an already-wrong clock, and an out-of-range poisoned
+  value (negative, or ahead of the clock) is reported as an anomaly rather than
+  quietly accepted. Every accepted pass is capped at 25,000 rows oldest-first. Rows
   whose TTL sits implausibly far in the future are excluded from the decision, so
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe

@@ -1,7 +1,9 @@
 /**
  * test_audit_store.cpp — Unit tests for AuditStore
  *
- * Covers: logging, querying, filtering, count, multiple principals.
+ * Covers: logging, querying, filtering, count, multiple principals, and the
+ * retention clock guard (#2360) -- decline/latch/drain, the persisted and
+ * sanitised clock reading, the per-pass cap, and the fail-closed paths.
  */
 
 #include "audit_store.hpp"
@@ -702,10 +704,17 @@ TEST_CASE("AuditStore #2360: a failed probe re-arms the guard instead of spendin
 
 TEST_CASE("AuditStore #2360: retention disabled never declines on an elapsed-time step",
           "[audit_store][retention][clock-guard]") {
-    // retention_days <= 0 means "never expire", so the retention window is zero
-    // and `now - last_pass > window` would be true for ANY forward movement of
-    // the clock at all - every single pass would report a clock anomaly. The step
-    // check is gated on a positive window for exactly that reason.
+    // retention_days <= 0 means "never expire": log() stamps ttl 0, so the store
+    // has no expiry policy of its own to report a step against. The step check is
+    // gated on `window > 0` for that reason, and this test pins the gate.
+    //
+    // What the gate is NOT is a guard against over-firing on short gaps -- the
+    // threshold is the absolute kAuditMinBigStepSec (7 days), so the 2-hour gap
+    // below would not fire either way. Removing the gate changes exactly one
+    // case: a retention-off store holding legacy TTLs that goes more than 7 days
+    // between passes would then take a step decline it has no policy to justify.
+    // `would_wipe` and the per-pass cap both still apply with the gate in place,
+    // so nothing about the damage bound depends on it.
     //
     // Such a store can still hold rows carrying a non-zero TTL stamped while
     // retention was switched on; those are what the passes below age out.
@@ -718,7 +727,7 @@ TEST_CASE("AuditStore #2360: retention disabled never declines on an elapsed-tim
     REQUIRE(store.cleanup_once(kNow) == 5);
     REQUIRE(store.clock_anomaly_skips_count() == 0);
 
-    // Two hours later. With window == 0 an ungated step check fires on this.
+    // Two hours later. Well under the 7-day threshold, so this pass must delete.
     const std::int64_t later = kNow + 7'200;
     seed_rows_with_ttl(tmp.path, kNow - 50, 5);
     seed_rows_with_ttl(tmp.path, later + 3'600, 1); // keeps `would_wipe` false
@@ -884,8 +893,11 @@ TEST_CASE("AuditStore #2360: a stored reading ahead of the clock is an anomaly, 
     // evidence, so it can come back corrupt, hand-edited, or stamped by an
     // earlier pass that ran while the clock was skewed forward. Unsanitised,
     // `now - prev` stays negative until real time catches up -- potentially years
-    // -- silently killing the only detector that survives a restart. INT64_MAX
-    // would make that subtraction signed-overflow UB.
+    // -- silently killing the only detector that survives a restart.
+    //
+    // INT64_MAX is the SILENT-DISABLE case, not a UB case: `now - INT64_MAX`
+    // stays in range for a normal positive epoch. The overflow case is INT64_MIN,
+    // covered by its own test below.
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-poison-"}};
     {
         // Create the schema first; the raw seeding connection needs the table.
@@ -1080,10 +1092,10 @@ TEST_CASE("AuditStore #2360: a negative stored reading is an anomaly, not a quie
 TEST_CASE("AuditStore #2360: INT64_MIN in the stored reading is rejected before any arithmetic",
           "[audit_store][retention][clock-guard][chaos]") {
     // The overflow case that actually exists. `now - INT64_MAX` stays in range
-    // for a normal positive epoch, but `now - INT64_MIN` overflows by ~1.4e18 and
-    // IS reachable with an ordinary expired backlog. An earlier round tested only
-    // INT64_MAX, concluded "no UB", and wrote that into a commit message.
-    // Run under UBSan.
+    // for a normal positive epoch (that one silently DISABLES the check, covered
+    // above), but `now - INT64_MIN` exceeds INT64_MAX -- by `now + 1`, so it is
+    // signed-overflow UB rather than a wrong answer -- and IS reachable with an
+    // ordinary expired backlog. Run under UBSan.
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-min-"}};
     {
         AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
@@ -1189,4 +1201,68 @@ TEST_CASE("AuditStore #2360: a month-long jump fires on a DEFAULT-retention serv
     // 1 survivor from pass 1 + the 6 rows seeded before pass 2: nothing was
     // deleted on the declining pass.
     CHECK(store.total_count() == 7);
+}
+
+TEST_CASE("AuditStore #2360: a pass that cannot persist its clock reading counts the failure",
+          "[audit_store][retention][clock-guard]") {
+    // `persist_failed_` is the only evidence that the restart-surviving half of
+    // the guard is degrading, and it has a Prometheus alert pointed at it. Drop
+    // the meta table out from under a live store to force the write to fail: the
+    // pass must still do its job (the reading is a supplement, not a
+    // precondition) AND count the failure rather than swallowing it.
+    GuardFixture f;
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1); // a survivor, so nothing declines on `would_wipe`
+
+    REQUIRE(f.store.persist_failed_count() == 0);
+    REQUIRE(f.store.cleanup_once(kNow) == 5); // healthy pass, reading persisted
+
+    exec_raw(f.tmp.path, "DROP TABLE audit_retention_meta");
+
+    f.seed(kNow - 100, 3);
+    // The delete still happens: a store that stopped deleting because it could
+    // not write a diagnostic row would be a far worse failure than the one being
+    // reported.
+    CHECK(f.store.cleanup_once(kNow + 1) == 3);
+    CHECK(f.store.persist_failed_count() == 1);
+    // NOT a failed pass: the pass succeeded, one bookkeeping write did not.
+    CHECK(f.store.cleanup_failed_count() == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+}
+
+TEST_CASE("AuditStore #2360: a store whose retention index cannot be built opens degraded, not "
+          "closed",
+          "[audit_store][retention][clock-guard]") {
+    // The index is a PERFORMANCE artifact, built outside the migration runner so
+    // that a failure degrades retention to full scans instead of taking the
+    // audit trail offline. Occupying the index's name with a table makes
+    // `CREATE INDEX IF NOT EXISTS` fail for real ("there is already another
+    // table or index with this name") rather than by injection.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-noidx-"}};
+    exec_raw(tmp.path, "CREATE TABLE idx_audit_ttl_id (x INTEGER)");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    // Open, writable, and retention still works -- only the gauge is 0.
+    REQUIRE(store.is_open());
+    CHECK_FALSE(store.retention_index_ok());
+
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
+    CHECK(store.cleanup_once(kNow) == 5);
+    CHECK(store.cleanup_failed_count() == 0);
+
+    AuditEvent e;
+    e.principal = "admin";
+    e.principal_role = "admin";
+    e.action = "auth.login";
+    e.result = "success";
+    CHECK(store.log(e));
+}
+
+TEST_CASE("AuditStore #2360: the healthy path reports the retention index as present",
+          "[audit_store][retention][clock-guard]") {
+    // The counterpart to the test above: without this one, a change that made
+    // `retention_index_ok()` return false unconditionally would still pass.
+    GuardFixture f;
+    CHECK(f.store.retention_index_ok());
 }

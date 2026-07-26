@@ -86,7 +86,7 @@ inline constexpr std::size_t kAuditSampleScanCap = 10000;
 // server's wall clock. One forward step -- a restored VM snapshot, an NTP
 // correction after a dead CMOS battery, a hand-set date -- marks the whole
 // evidence table expired at once, and an unguarded `DELETE ... WHERE ttl < now`
-// actions that in a single statement. These constants bound that.
+// then acts on that in a single statement. These constants bound it.
 //
 // The division of labour matters and is easy to get backwards: the CAP is the
 // guarantee, the detectors are best-effort. See `cleanup_once`.
@@ -101,9 +101,11 @@ inline constexpr std::size_t kAuditSampleScanCap = 10000;
 // needed. Slack absorbs ordinary NTP correction and the write-to-cleanup gap.
 //
 // The direction of error is deliberate. Rows stamped under a LONGER retention
-// setting (an operator who just cut retention from 365d to 30d) also land past
-// the horizon, so they are excluded too and the wipe test becomes EASIER to
-// fire. Over-firing costs one declined pass and then paced deletion;
+// setting also land past the horizon, so they are excluded too and the wipe test
+// becomes EASIER to fire. That covers two real cases: an operator who just cut
+// retention from 365d to 30d, and a store whose retention was switched OFF
+// entirely (window 0), where every legacy-TTL row sits past a horizon of
+// `now + slack`. Over-firing costs one declined pass and then paced deletion;
 // under-excluding disarms the guard.
 inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86400;
 
@@ -320,7 +322,12 @@ private:
     /// The accepted-delete half of a pass. Caller must hold `mtx_` exclusively.
     /// `would_wipe` is the pre-delete outcome test; `out_err` receives a SQLite
     /// message on failure so the caller can log it after releasing the lock.
-    std::size_t delete_capped_locked(std::int64_t now, bool would_wipe, std::string& out_err);
+    /// `out_backlog_remains` receives the POST-delete fact the latch and the
+    /// cap counter are both derived from -- the caller needs it too, so its log
+    /// line does not promise a remainder that an exact-cap clean drain left
+    /// behind.
+    std::size_t delete_capped_locked(std::int64_t now, bool would_wipe, std::string& out_err,
+                                     bool& out_backlog_remains);
 #ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
 #else

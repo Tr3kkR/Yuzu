@@ -477,7 +477,11 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     std::string emit_err;
     std::size_t deleted = 0;
     std::int64_t emit_delta = 0, emit_window = 0;
-    bool emit_full_wipe = false, emit_capped = false;
+    bool emit_full_wipe = false;
+    // "the cap bound AND rows were left behind", the same post-delete fact the
+    // cap counter uses. Deriving it from `deleted >= cap` alone would make an
+    // exact-cap drain that emptied the backlog log a remainder that is not there.
+    bool emit_capped = false;
 
     {
         std::unique_lock lock(mtx_);
@@ -612,13 +616,11 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                        : !prev_pass_now ? Emit::DeclineFirstPass
                                         : Emit::DeclineWipe;
             } else {
-                deleted = delete_capped_locked(now, would_wipe, emit_err);
+                deleted = delete_capped_locked(now, would_wipe, emit_err, emit_capped);
                 if (!emit_err.empty())
                     emit = Emit::DeleteFailed;
-                else if (deleted > 0) {
+                else if (deleted > 0)
                     emit = Emit::Deleted;
-                    emit_capped = deleted >= kMaxAuditDeletesPerPass;
-                }
             }
         }
     } // lock released before any formatting
@@ -674,7 +676,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
 }
 
 std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
-                                             std::string& out_err) {
+                                             std::string& out_err, bool& out_backlog_remains) {
     // Bound the pass so that even a wipe this guard chose to allow ages out at a
     // paced rate instead of in one statement. Oldest-first so the pacing never
     // strands the oldest evidence behind newer expiries.
@@ -728,7 +730,7 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
     // so a pass that drained the whole backlog would stay latched -- meaning a
     // real anomaly arriving before the next pass deletes with no decline, no
     // warn and no counter. The latch must come from a POST-delete fact.
-    bool backlog_remains = false;
+    out_backlog_remains = false;
     if (deleted >= kMaxAuditDeletesPerPass) {
         const std::int64_t binds[] = {now};
         const auto more = exists_probe(db_,
@@ -737,8 +739,8 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
                                        binds);
         // Unreadable: assume a backlog remains. That keeps the latch armed and
         // the counter moving, the conservative direction for both.
-        backlog_remains = !more || *more;
-        if (backlog_remains)
+        out_backlog_remains = !more || *more;
+        if (out_backlog_remains)
             cap_reached_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -748,7 +750,7 @@ std::size_t AuditStore::delete_capped_locked(std::int64_t now, bool would_wipe,
     // masks the decline of a real anomaly arriving next. Dropping the second
     // leaves it armed after a clean drain, which does the same thing for the
     // window until the next pass clears it.
-    clock_anomaly_latched_ = would_wipe && backlog_remains;
+    clock_anomaly_latched_ = would_wipe && out_backlog_remains;
     return deleted;
 }
 
