@@ -30,9 +30,6 @@ namespace yuzu::server::mcp {
 // Each has a twin in the served inputSchema; the cross-check test binds them.
 inline constexpr std::size_t kExecInstrIdentMaxLen = 128;        // plugin, action, each agent_ids entry
 inline constexpr std::size_t kExecInstrScopeMaxLen = 8192;       // scope expression
-// Borrowed from bundle_service.hpp like the two below, NOT invented: the
-// two execute surfaces bound the same thing and disagreeing by 8x was an
-// accident of which constant was reached for, not a design.
 inline constexpr std::size_t kExecInstrParamValueMaxLen = kMaxParamValueLen; // 64 KiB
 inline constexpr std::size_t kExecInstrAgentIdsMaxItems = 10000; // agent_ids length
 
@@ -66,9 +63,16 @@ inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      //
 /// `docs/user-manual/metrics.md`. The boot pre-seed follows automatically; the
 /// docs copy does not, and a test asserts this array's size so the third copy
 /// cannot be forgotten quietly.
-inline constexpr std::array<std::string_view, 7> kExecInstrBoundReasons{
-    "ident_len",       "scope_len",       "param_count",    "param_key_len",
+inline constexpr std::array<std::string_view, 13> kExecInstrBoundReasons{
+    // Length/count bounds.
+    "ident_len",       "scope_len",       "param_count",     "param_key_len",
     "param_value_len", "agent_ids_count", "agent_id_len",
+    // Targeting shape (#2437 split 3): a type-confused or supplied-but-empty
+    // target is REJECTED, never silently dropped and never widened to
+    // `__all__`. `ident_empty` subsumes the handler's old bare
+    // plugin/action-required guard so that rejection is counted too.
+    "agent_id_type",   "agent_ids_type",  "agent_ids_empty", "scope_type",
+    "scope_empty",     "ident_empty",
 };
 
 // ── Sizing: the per-field caps must fit under the TRANSPORT cap ───────────
@@ -155,6 +159,26 @@ struct BoundViolation {
 /// order so a denial is reproducible.
 [[nodiscard]] inline std::optional<BoundViolation>
 check_exec_instruction_shape(const nlohmann::json& args) {
+    // ── required identifiers must be non-empty ───────────────────────────
+    // The schema marks plugin/action `required`, which C8 enforces, but the
+    // closed subset has no `minLength` (that gap is #2444), so `""` passes
+    // every published check. The handler then refuses it — AFTER the C8 gate
+    // has minted a ticket, waited for a human, and consumed it. Fifth instance
+    // of the burn class, on the two most obvious fields in the tool.
+    // Absent, non-string, or empty - all three, because this must SUBSUME the
+    // handler's own `plugin.empty() || action.empty()` guard rather than sit
+    // behind it. It previously sat behind: that guard returned first with a
+    // bare error, so `ident_empty` never fired on the ungated tiers and the
+    // rule this function exists to make tier-independent was, once again,
+    // supervised-only (governance, security MEDIUM-2).
+    for (const char* key : {"plugin", "action"}) {
+        if (!args.contains(key) || !args[key].is_string() ||
+            args[key].template get_ref<const std::string&>().empty())
+            return BoundViolation{"ident_empty",
+                                  std::format("{} is required and must be a non-empty string",
+                                              key)};
+    }
+
     if (args.contains("params") && args["params"].is_object()) {
         const auto& p = args["params"];
         if (p.size() > kExecInstrParamCountMax)
@@ -168,6 +192,35 @@ check_exec_instruction_shape(const nlohmann::json& args) {
                                       std::format("a params key exceeds {} bytes",
                                                   kExecInstrParamKeyMaxLen)};
         }
+    }
+    // ── targeting: type, and supplied-but-empty ──────────────────────────
+    // Both matter for the same reason: the handler drops what it cannot use,
+    // an emptied target set falls into the `__all__` default, and `__all__`
+    // means the entire fleet. The schema can express neither rule — `items`
+    // type-checking is not applied by the operator tier (which has no C8
+    // gate at all), and there is no `minItems`. A human approving a ticket
+    // that reads `agent_ids: []` must not be approving a fleet-wide dispatch.
+    if (args.contains("agent_ids")) {
+        const auto& a = args["agent_ids"];
+        if (!a.is_array())
+            return BoundViolation{"agent_ids_type", "agent_ids must be an array of strings"};
+        if (a.empty())
+            return BoundViolation{"agent_ids_empty",
+                                  "agent_ids was supplied but is empty; omit it to target "
+                                  "all agents deliberately"};
+        for (const auto& v : a) {
+            if (!v.is_string())
+                return BoundViolation{"agent_id_type", "agent_ids entries must be strings"};
+        }
+    }
+    if (args.contains("scope")) {
+        const auto& sc = args["scope"];
+        if (!sc.is_string())
+            return BoundViolation{"scope_type", "scope must be a string"};
+        if (sc.get_ref<const std::string&>().empty())
+            return BoundViolation{"scope_empty",
+                                  "scope was supplied but is empty; omit it to target all "
+                                  "agents deliberately"};
     }
     return std::nullopt;
 }

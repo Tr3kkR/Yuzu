@@ -109,6 +109,7 @@ CLOSED and pre-seeded at boot, so `absent()` alerting stays meaningful.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_mcp_body_too_large_total{reason}` | counter | `/mcp/v1/` requests rejected at the transport before the body was read (#2437). `reason=over_cap` is a declared `Content-Length` above 4 MiB (`413`); `reason=unmeasurable` is a body this server will not admit because it cannot size it in advance — any `Transfer-Encoding`, any non-`identity` `Content-Encoding` (httplib decompresses before its size check), or a POST/PUT/PATCH with no `Content-Length` (`411`). Pre-auth, so there is no principal and no audit row: the throttled `[#2437]` warn in the journal carries the sanitized method/path/source address. |
+
 ## MCP input-bounds metrics
 
 Argument rejections on the MCP surface (#2405, #2437). Label sets are CLOSED
@@ -117,7 +118,7 @@ and pre-seeded at boot, so `absent()` alerting stays meaningful.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_mcp_tool_args_invalid_total{tool}` | counter | Calls denied by the C8 pre-approval schema gate: arguments did not match the tool's served `inputSchema`, checked before an approval ticket is minted or consumed (#2405). `tool` is bounded to the approval-gated set. |
-| `yuzu_mcp_tool_args_too_large_total{tool,reason}` | counter | Calls denied by a handler-side input bound (#2437), on every tier including operator. `reason` is a closed set: `ident_len`, `scope_len`, `param_count`, `param_key_len`, `param_value_len`, `agent_ids_count`, `agent_id_len`. The paired audit row is `mcp.<tool>|denied` with detail `input bound exceeded: <reason> correlation_id=<cid>`, carrying the same correlation id as the client's error envelope. |
+| `yuzu_mcp_tool_args_too_large_total{tool,reason}` | counter | Calls denied by a handler-side input bound (#2437), on every tier including operator. `reason` is a closed set: `ident_len`, `scope_len`, `scope_type`, `scope_empty`, `param_count`, `param_key_len`, `param_value_len`, `agent_ids_count`, `agent_id_len`, `agent_id_type`, `agent_ids_type`, `agent_ids_empty`, `ident_empty`. The paired audit row is `mcp.<tool>|denied` with detail `input bound exceeded: <reason> correlation_id=<cid>`, carrying the same correlation id as the client's error envelope. |
 
 ## MCP progress-bridge metrics
 
