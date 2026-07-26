@@ -467,10 +467,45 @@ constexpr std::int64_t kWindow = static_cast<std::int64_t>(kGuardRetentionDays) 
 // An arbitrary fixed "now", far from both the epoch and the real clock.
 constexpr std::int64_t kNow = 1'700'000'000;
 
+// `prime_anchor` seeds the persisted clock reading, so the fixture models a
+// store that HAS run before -- which is every pass but one in the life of a
+// database, and the state nearly every test below is about.
+//
+// It matters because "no stored reading" is itself a decline trigger: the
+// elapsed-time detector cannot run without an anchor, so a server whose FIRST
+// guarded pass happens under an already-skewed clock would otherwise delete up
+// to the cap with no decline and then persist the bad clock as the anchor (Sol
+// adversarial review). Tests about that bootstrap path pass false.
+// Seed the durable clock anchor so a store models one that HAS run before.
+// Must happen BEFORE the AuditStore that will use it is constructed: the reading
+// is loaded once, in the constructor.
+void prime_clock_anchor(const std::filesystem::path& path, std::int64_t value) {
+    exec_raw(path, std::string("INSERT OR REPLACE INTO audit_retention_meta (key, value) VALUES "
+                               "('last_pass_now', ")
+                       .append(std::to_string(value))
+                       .append(")")
+                       .c_str());
+}
+
 struct GuardFixture {
+    // The reading is loaded in AuditStore's CONSTRUCTOR, so it has to be on disk
+    // before `store` is built: a warm store creates the schema, the row goes in,
+    // then the real store opens and picks it up. Ordering is by declaration.
+    static bool prime(const std::filesystem::path& path) {
+        {
+            AuditStore warm(path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+            REQUIRE(warm.is_open());
+        }
+        prime_clock_anchor(path, 1'700'000'000);
+        return true;
+    }
+
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-"}};
+    bool primed;
     AuditStore store;
-    GuardFixture() : store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0) {
+    explicit GuardFixture(bool prime_anchor = true)
+        : primed(prime_anchor && prime(tmp.path)),
+          store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0) {
         REQUIRE(store.is_open());
     }
     void seed(std::int64_t ttl, int count) { seed_rows_with_ttl(tmp.path, ttl, count); }
@@ -710,6 +745,12 @@ TEST_CASE("AuditStore #2360: retention disabled never declines on an elapsed-tim
     // Such a store can still hold rows carrying a non-zero TTL stamped while
     // retention was switched on; those are what the passes below age out.
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-off-"}};
+    {
+        AuditStore warm(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    // Anchor present: this test is about the elapsed-time check, not bootstrap.
+    prime_clock_anchor(tmp.path, kNow);
     AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
 
@@ -790,6 +831,13 @@ TEST_CASE("AuditStore #2360: the clock-step check survives a restart",
     // Persisting the reading closes it: a fresh AuditStore over the same file
     // still knows when the last pass ran.
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-restart-"}};
+    {
+        AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    // This test is about the anchor SURVIVING a restart, so it must start with
+    // one -- otherwise the first pass declines for the bootstrap reason instead.
+    prime_clock_anchor(tmp.path, kNow);
 
     {
         AuditStore first(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
@@ -1008,6 +1056,26 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
         CHECK(store.cleanup_failed_count() == 0);
     }
 
+    // SELF-HEAL. With the hostile value replaced by a plausible anchor,
+    // retention resumes and drains -- capped.
+    //
+    // This step is load-bearing for the assertion below, and its absence used to
+    // hide a real defect. Every poisoned pass above now DECLINES, so nothing
+    // drains during the loop. Before the bootstrap fix it did drain, but for the
+    // wrong reason: the "row deleted" poisoning left NO anchor, and a no-anchor
+    // pass used to delete rather than decline. So `remaining < before` was
+    // passing on the strength of the guard's own blind spot (Sol adversarial
+    // review). Draining is now demonstrated deliberately, by a healthy pass.
+    {
+        prime_clock_anchor(tmp.path, kNow);
+        AuditStore healthy(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(healthy.is_open());
+        const std::size_t drained = healthy.cleanup_once(kNow + 1);
+        CHECK(drained > 0);
+        CHECK(drained <= kMaxAuditDeletesPerPass); // the cap always applies
+        remaining = healthy.total_count();
+    }
+
     // The survivor is untouched and the store was never emptied: the hostile
     // state could not cause a wipe, only pace or decline.
     CHECK(remaining > 0);
@@ -1171,6 +1239,7 @@ TEST_CASE("AuditStore #2360: a month-long jump fires on a DEFAULT-retention serv
         AuditStore warm(tmp.path, kLongRetentionDays, /*cleanup_interval_min=*/0);
         REQUIRE(warm.is_open());
     }
+    prime_clock_anchor(tmp.path, kNow); // steady state, not bootstrap
     seed_rows_with_ttl(tmp.path, kNow - 100, 5);        // expired at both readings
     seed_rows_with_ttl(tmp.path, kNow + kLongWindow, 1); // survivor at pass 1
 
@@ -1291,4 +1360,29 @@ TEST_CASE("AuditStore #2360: the liveness counter moves even when the pass does 
     // And an accepting one.
     f.store.cleanup_once(kNow);
     CHECK(f.store.passes_total() == 3);
+}
+
+TEST_CASE("AuditStore #2360: the FIRST pass with no stored anchor declines instead of deleting",
+          "[audit_store][retention][clock-guard]") {
+    // Sol adversarial review, BLOCKING. The bootstrap hole the persisted-reading
+    // fix did not cover.
+    //
+    // On the first guarded pass against an EXISTING database -- an upgrade to
+    // this build, a restore -- there is no stored reading, so `big_step` is false
+    // by construction. If the clock is already skewed forward and any datable
+    // survivor exists, `would_wipe` is false too. Every trigger false meant the
+    // pass deleted up to 25,000 rows of the SOC 2 evidence chain with no decline,
+    // no counter and no log line -- and then persisted the wrong clock as the
+    // anchor, so no later pass could see the step either.
+    GuardFixture f{/*prime_anchor=*/false};
+    f.seed(kNow - 100, 5);     // expired
+    f.seed(kNow + kWindow, 1); // survivor -> not a wipe, so only the anchor rule can fire
+
+    CHECK(f.store.cleanup_once(kNow) == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 1);
+    CHECK(f.store.total_count() == 6); // nothing deleted
+
+    // One-pass cost: the anchor is stored now, so the next pass proceeds.
+    CHECK(f.store.cleanup_once(kNow + 1) == 5);
+    CHECK(f.store.clock_anomaly_skips_count() == 1); // not counted twice
 }

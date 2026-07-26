@@ -858,7 +858,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 // the agent to recover." -- the operator got the problem
                 // without the remedy (#2361 Gate 4, consistency-auditor).
                 note(res, "The device reported an error: " +
-                              html_escape(with_output->output.substr(6, 300)));
+                              html_escape(agent_error_display(with_output->output)));
                 return;
             }
             audit_live_result("rendered");

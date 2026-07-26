@@ -878,3 +878,33 @@ TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
     // Deliberately NOT exempt (requires a session): step-up MFA.
     CHECK_FALSE(is_login_exempt_path("/login/mfa/stepup"));
 }
+
+TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
+          "[web_utils][agent-error]") {
+    // Sol adversarial review. Agent replies are newline-separated records, so a
+    // byte-count truncation of the raw output is wrong in both directions.
+    // `tar status`'s offline reply is `error|<long line>` followed by
+    // `storage_state|offline`, and the 300-byte window that replaced a 200-byte
+    // one ran PAST the newline and rendered a trailing `storage_stat` as debris.
+    const std::string offline =
+        "error|TAR storage is offline on this endpoint; the database was closed after a "
+        "transaction could not be rolled back. Collection and retention are both stopped. The "
+        "read-only query connection is unavailable too, so `tar sql` cannot read the historical "
+        "data either. Restart the agent to recover.\nstorage_state|offline";
+
+    const auto shown = yuzu::server::agent_error_display(offline);
+    CHECK(shown.starts_with("TAR storage is offline")); // prefix stripped
+    CHECK(shown.ends_with("Restart the agent to recover."));
+    // The whole point: no debris from the NEXT record, at any length.
+    CHECK(shown.find("storage_state") == std::string::npos);
+    CHECK(shown.find('\n') == std::string::npos);
+
+    // A message longer than the bound is still cut, but never mid-codepoint.
+    const std::string wide = "error|" + std::string(60, 'x') + "\xC3\xA9" + std::string(60, 'y');
+    const auto cut = yuzu::server::agent_error_display(wide, 61);
+    CHECK(cut.size() == 60); // stepped back off the 2-byte sequence, not split
+    CHECK(cut == std::string(60, 'x'));
+
+    // No prefix and no newline: returned as-is.
+    CHECK(yuzu::server::agent_error_display("plain text") == "plain text");
+}

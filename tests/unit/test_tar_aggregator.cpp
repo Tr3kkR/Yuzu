@@ -114,6 +114,10 @@ TEST_CASE("TAR retention: enabled sources still age out past cutoff",
 
     const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
     seed_process_hourly(db, t_now);
+    // Anchor present: this test is about the source-enabled gate, not about the
+    // first-pass bootstrap decline (a pass with no stored reading declines once,
+    // because the elapsed-time check cannot run without one).
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
 
     REQUIRE(db.get_config("process_enabled", "true") == "true");
 
@@ -546,6 +550,9 @@ TEST_CASE("TAR retention: disabling one source does not pause others",
     const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
     seed_process_hourly(db, t_now);
     seed_tcp_hourly(db, t_now);
+    // Anchor present: this test is about the disabled-source gate, not the
+    // first-pass bootstrap decline.
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
 
     db.set_config("process_enabled", "false");
     // tcp_enabled left at default => "true"
@@ -820,6 +827,9 @@ TEST_CASE("TAR retention: a corrupt/errored _enabled value preserves rows, never
     const int64_t t_now = 1'735'689'600 + kHourlyCutoffSec;
     seed_process_hourly(db, t_now);
     seed_tcp_hourly(db, t_now);
+    // Anchor present: this test is about the errored-source gate, not the
+    // first-pass bootstrap decline.
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now)));
 
     // A value the plugin never writes — canonical_source_enabled => "errored".
     db.set_config("process_enabled", "maybe");
@@ -887,11 +897,22 @@ struct TarGuardFixture {
     std::optional<TarDatabase> db;
     yuzu::tar::RetentionGuardState guard;
 
-    TarGuardFixture() {
+    // `prime_anchor` seeds the persisted clock reading, so the fixture models a
+    // store that HAS run before -- which is every pass but one in the life of a
+    // database, and the state nearly every test below is about.
+    //
+    // It matters because "no stored reading" is itself a decline trigger: the
+    // elapsed-time detector cannot run without an anchor, and an endpoint whose
+    // FIRST guarded pass happens under an already-wrong clock would otherwise
+    // delete with no decline and then persist the bad clock (Sol adversarial
+    // review). Tests about that bootstrap path pass false and assert the decline.
+    explicit TarGuardFixture(bool prime_anchor = true) {
         auto opened = TarDatabase::open(tmp.path);
         REQUIRE(opened.has_value());
         db.emplace(std::move(*opened));
         REQUIRE(db->create_warehouse_tables());
+        if (prime_anchor)
+            REQUIRE(db->set_config("retention_guard_last_pass", std::to_string(1'735'689'600)));
     }
 };
 
@@ -1987,4 +2008,65 @@ TEST_CASE("TAR #2361: a row INSIDE the future-slack band still counts as a survi
 
     CHECK(row_count(*f.db, "process_hourly") == 1); // survivor recognised -> deleted normally
     CHECK(declines_of(f.guard, "process_hourly") == 0);
+}
+
+TEST_CASE("TAR #2361: a rolled-back pass does NOT claim the cap bound",
+          "[tar][retention][clock-guard]") {
+    // Sol adversarial review. The cap counter used to increment at PROBE time,
+    // so a pass whose batch then rolled back still reported a capped deletion
+    // that never happened -- telemetry describing an event that did not occur,
+    // on the one surface whose job is to be believed.
+    //
+    // The existing cap test injects guard state directly and cannot see this;
+    // it takes a real pass whose delete fails.
+    TarGuardFixture f;
+    // Enough expired rows that the cap genuinely would bind, plus a survivor so
+    // the table is ACCEPTED rather than declined.
+    for (int i = 0; i < 12; ++i)
+        seed_process_hourly_at(*f.db, kT0 - (10 + i) * kHourlyCutoffSec, 500);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
+    // RAISE(ROLLBACK) aborts the transaction, so the whole batch rolls back and
+    // nothing is deleted anywhere.
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
+                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
+
+    run_retention(*f.db, kT0, f.guard);
+
+    const auto counters = yuzu::tar::retention_guard_counters(f.guard);
+    const auto it = counters.cap_binds.find("process_hourly");
+    const int64_t claimed = it == counters.cap_binds.end() ? 0 : it->second;
+    CHECK(claimed == 0); // nothing committed, so nothing may be claimed
+    // The failure IS reported -- silence would be the other way to be wrong.
+    CHECK(failures_of(f.guard, "process_hourly") >= 1);
+    CHECK(row_count(*f.db, "process_hourly") == 6001); // nothing deleted
+}
+
+TEST_CASE("TAR #2361: the FIRST pass with no stored anchor declines instead of deleting",
+          "[tar][retention][clock-guard]") {
+    // Sol adversarial review, BLOCKING. The bootstrap hole the persisted-reading
+    // fix did not cover.
+    //
+    // On the first guarded pass against an existing database -- an agent upgrade,
+    // a restored snapshot -- there is no stored reading, so `big_step` is false
+    // BY CONSTRUCTION. And `do_rollup` runs `run_aggregation` FIRST, minting
+    // fresh rows into these very tables, so a survivor exists and `would_wipe` is
+    // false too. Every trigger false meant the pass deleted up to the cap on
+    // every table with no decline, no counter and no log line -- and then
+    // persisted the wrong clock as the anchor, so no LATER pass could see the
+    // step either. A dead-CMOS endpoint is exactly the case the guard is for.
+    TarGuardFixture f{/*prime_anchor=*/false};
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // expired
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);                  // survivor -> not a wipe
+
+    run_retention(*f.db, kT0, f.guard);
+
+    // Declined once, nothing deleted.
+    CHECK(row_count(*f.db, "process_hourly") == 6);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+
+    // And it is a ONE-pass cost: the anchor is now stored, so the next pass
+    // proceeds normally.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 1);
+    CHECK(declines_of(f.guard, "process_hourly") == 1); // not counted twice
 }

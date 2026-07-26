@@ -89,6 +89,34 @@ inline std::string json_escape(std::string_view in) {
     return out;
 }
 
+/// Render an agent's `error|...` reply as display text: the FIRST record only,
+/// prefix stripped, bounded, and never split mid-codepoint.
+///
+/// Agent replies are newline-separated records, so a byte-count truncation of
+/// the RAW output is wrong in both directions. Too small and it cuts the
+/// operator's recovery instruction mid-sentence; too large and it runs past the
+/// newline and renders the head of the NEXT record as debris -- `tar status`'s
+/// offline reply is `error|...` followed by `storage_state|offline`, and a
+/// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
+/// the property that holds whatever the message length becomes.
+///
+/// `max_bytes` is a display bound, so it is walked back off a UTF-8
+/// continuation byte rather than splitting the sequence.
+inline std::string agent_error_display(const std::string& output, std::size_t max_bytes = 400) {
+    static constexpr std::string_view kPrefix = "error|";
+    std::string line = output.substr(output.starts_with(kPrefix) ? kPrefix.size() : 0);
+    if (const auto nl = line.find('\n'); nl != std::string::npos)
+        line.resize(nl);
+    if (line.size() > max_bytes) {
+        std::size_t cut = max_bytes;
+        // 10xxxxxx is a UTF-8 continuation byte; step back to its lead byte.
+        while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80)
+            --cut;
+        line.resize(cut);
+    }
+    return line;
+}
+
 /// Escape HTML special characters for safe rendering.
 inline std::string html_escape(const std::string& s) {
     std::string out;

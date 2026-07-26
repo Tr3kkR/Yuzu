@@ -734,7 +734,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             // because 200 bytes truncates that message mid-recovery-advice.
             note(res, st.output.starts_with("error|")
                           ? "The device failed the status query: " +
-                                html_escape(st.output.substr(6, 300))
+                                html_escape(agent_error_display(st.output))
                           : "The device failed the status query.");
             return;
         }

@@ -696,7 +696,27 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit_window = step_threshold;
             emit_full_wipe = would_wipe;
 
-            if ((would_wipe || big_step || prev_implausible) && !clock_anomaly_latched_) {
+            // `!prev_pass_now` is a decline trigger in its OWN right: NO TRUSTED
+            // ANCHOR means the elapsed-time detector cannot run at all.
+            //
+            // Without it the guard had a bootstrap hole covering exactly the
+            // scenario it exists for. On the first pass against an existing
+            // database -- an upgrade to this build, or a restore -- there is no
+            // stored reading, so `big_step` is false by construction. If the
+            // clock is ALREADY skewed forward and any datable survivor exists
+            // (on TAR, `do_rollup` reliably mints one before retention runs),
+            // `would_wipe` is false too. Every trigger is therefore false and
+            // the pass deletes up to the cap immediately -- no decline, no
+            // counter, no log line -- and then persists the bad clock as the
+            // anchor, so no later pass can see the step either.
+            //
+            // Declining once here costs an upgraded server a single deferred
+            // pass. A genuinely fresh database is unaffected: with nothing
+            // expired the `!*has_expired` branch returns long before this
+            // (#2360, Sol adversarial review).
+            const bool no_anchor = !prev_pass_now;
+            if ((would_wipe || big_step || prev_implausible || no_anchor) &&
+                !clock_anomaly_latched_) {
                 clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 clock_anomaly_latched_ = true;
                 // Name the trigger that actually fired. Reporting an elapsed
@@ -737,10 +757,12 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         spdlog::warn("AuditStore: cleanup error: {}", emit_err);
         break;
     case Emit::DeclineFirstPass:
-        spdlog::warn("AuditStore: the first retention pass against this database would expire "
-                     "EVERY datable audit row; declining once so a clock anomaly cannot delete "
-                     "the audit trail wholesale. (There is no previous reading to compare "
-                     "against, so nothing can be said about the clock yet.)");
+        spdlog::warn("AuditStore: this is the first retention pass against this database and there "
+                     "is no stored clock reading to compare against, so the elapsed-time check "
+                     "cannot run. Declining once and anchoring on the current reading -- if this "
+                     "server's clock is wrong RIGHT NOW (an upgrade, a restore, a dead RTC), that "
+                     "is exactly when nothing else would have caught it. The next pass proceeds, "
+                     "paced.");
         break;
     case Emit::DeclineWipe:
         spdlog::warn("AuditStore: this retention pass would expire EVERY datable audit row; "

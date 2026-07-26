@@ -498,9 +498,14 @@ ahead of the clock (a backward correction, or tampering) -- elapsed time cannot
 separate these, so check the host's time synchronisation *and* its uptime
 history. A non-zero failures total means retention has stopped for that table
 for a reason that is not the clock: either its probes could not be read, or its
-delete failed. The pass stops at the first failed delete and rolls the
-transaction back, so every table queued in that pass is reported -- including
-row-count tables, which are otherwise outside the guard.
+delete failed. What happens to the REST of the pass depends on the error. One
+that aborts the transaction itself (a disk-full, an I/O error) rolls the whole
+pass back, and every table queued in it is reported -- including row-count
+tables, which are otherwise outside the guard. An error that leaves the
+transaction intact -- one table with a corrupt index, say -- fails only that
+table, and the healthy tables in the same pass still have their deletions
+committed. That distinction exists because stopping on every error meant one
+permanently-broken table halted retention for the whole endpoint, for ever.
 
 If that rollback ITSELF fails and the database is left inside the transaction,
 the agent **closes the TAR database**. Every later write on a connection stuck in

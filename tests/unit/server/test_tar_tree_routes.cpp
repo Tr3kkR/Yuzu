@@ -506,10 +506,16 @@ TEST_CASE("TAR capture-sources: an offline device shows the agent's reason, not 
     // capture-sources renderer, which parses only `config|` lines, and draws all
     // ten sources blank.
     TarHarness h;
+    // The REAL two-record reply, not just the error line. An earlier version of
+    // this test supplied only the first line, so it could not see that the route
+    // was truncating on a byte count and running past the newline into
+    // `storage_state|offline` -- the operator saw a trailing `storage_stat`
+    // (Sol adversarial review).
     h.status_output =
         "error|TAR storage is offline on this endpoint; the database was closed after a "
-        "transaction could not be rolled back. Collection and retention are both stopped. "
-        "Historical data remains readable via `tar sql`. Restart the agent to recover.";
+        "transaction could not be rolled back. Collection and retention are both stopped. The "
+        "read-only query connection is unavailable too, so `tar sql` cannot read the historical "
+        "data either. Restart the agent to recover.\nstorage_state|offline";
 
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
@@ -519,6 +525,11 @@ TEST_CASE("TAR capture-sources: an offline device shows the agent's reason, not 
     // composes that sentence and it must survive the trip to the browser.
     CHECK(res->body.find("TAR storage is offline") != std::string::npos);
     CHECK(res->body.find("tar sql") != std::string::npos);
+    // The recovery instruction is the last thing in the record and must survive.
+    CHECK(res->body.find("Restart the agent to recover.") != std::string::npos);
+    // ...and NOTHING from the following record leaks in as debris.
+    CHECK(res->body.find("storage_state") == std::string::npos);
+    CHECK(res->body.find("storage_stat") == std::string::npos);
     // The `error|` prefix itself is stripped, not echoed raw.
     CHECK(res->body.find("error|") == std::string::npos);
     // And it must NOT have rendered the sources grid for a dead store. Assert

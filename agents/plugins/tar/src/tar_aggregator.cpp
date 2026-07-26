@@ -517,6 +517,12 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     struct Plan {
         std::string table; // for failure attribution; both strings are pre-built
         std::string sql;
+        // Predicted by the probe, COUNTED only after the statement commits. The
+        // first version of this counter incremented at probe time, so a batch
+        // that then rolled back still reported a capped deletion that never
+        // happened -- telemetry describing an event that did not occur, on the
+        // surface whose whole job is to be believed (Sol adversarial review).
+        bool cap_bound{false};
     };
     std::vector<Plan> plans;
     int declined_tables = 0, time_based_tables = 0, unreadable_tables = 0, capped_tables = 0;
@@ -631,11 +637,7 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                     db, table_name,
                     std::format("id <= (SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
                                 table_name, g.retention_default + kMaxTarDeletesPerTablePerPass));
-                if (!over || *over) {
-                    std::lock_guard lock(guard.mu);
-                    ++guard.cap_binds[table_name];
-                    ++capped_tables;
-                }
+                const bool rc_cap_bound = !over || *over;
                 plans.push_back(Plan{
                     table_name,
                     std::format("DELETE FROM {} WHERE id IN ("
@@ -643,7 +645,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                                 "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {}) "
                                 "ORDER BY id ASC LIMIT {})",
                                 table_name, table_name, table_name, g.retention_default,
-                                kMaxTarDeletesPerTablePerPass)});
+                                kMaxTarDeletesPerTablePerPass),
+                    rc_cap_bound});
                 continue;
             }
 
@@ -708,7 +711,19 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             const bool big_step =
                 prev_pass_now && now_epoch - *prev_pass_now > step_threshold;
 
-            if ((would_wipe || big_step || prev_implausible) && !latched) {
+            // NO TRUSTED ANCHOR is its own decline trigger, exactly as on the
+            // audit sibling. Without it the guard had a bootstrap hole covering
+            // the case it exists for: on the first pass after an agent upgrade
+            // or a restore there is no stored reading, so `big_step` is false by
+            // construction, and `do_rollup` runs `run_aggregation` FIRST and
+            // mints fresh rows into these very tables -- which makes
+            // `would_wipe` false too. Every trigger false, so an endpoint that
+            // boots with a dead RTC deletes up to the cap on every table with no
+            // decline and no counter, then persists the bad clock as the anchor.
+            // That is the dead-CMOS endpoint this guard was written for
+            // (#2361, Sol adversarial review).
+            const bool no_anchor = !prev_pass_now;
+            if ((would_wipe || big_step || prev_implausible || no_anchor) && !latched) {
                 latched = true;
                 ++guard.declines[table_name];
                 ++declined_tables;
@@ -743,10 +758,6 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                              std::format("{} < {} LIMIT 1 OFFSET {}", ts_col, cutoff,
                                          kMaxTarDeletesPerTablePerPass));
             const bool cap_will_bind = !more || *more;
-            if (cap_will_bind) {
-                ++guard.cap_binds[table_name]; // already under guard.mu here
-                ++capped_tables;
-            }
             latched = would_wipe && cap_will_bind;
             // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
             // KEY` plus an `idx_{table}_{ts_col}` index (generate_warehouse_ddl),
@@ -756,7 +767,8 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                                              "SELECT id FROM {} WHERE {} < {} "
                                              "ORDER BY {} ASC, id ASC LIMIT {})",
                                              table_name, table_name, ts_col, cutoff, ts_col,
-                                             kMaxTarDeletesPerTablePerPass)});
+                                             kMaxTarDeletesPerTablePerPass),
+                                 cap_will_bind});
         }
     }
 
@@ -790,8 +802,18 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     {
         std::lock_guard lock(guard.mu);
         for (std::size_t i = 0; i < plans.size(); ++i) {
-            if (!batch.failed[i])
+            if (!batch.failed[i]) {
+                // Count a cap bind only for a statement that COMMITTED. The
+                // probe predicted it; the commit is what makes it true. A
+                // rolled-back or skipped statement deleted nothing, so claiming
+                // "the cap bound and left a backlog" would describe an event
+                // that did not happen.
+                if (batch.committed && plans[i].cap_bound) {
+                    ++guard.cap_binds[plans[i].table];
+                    ++capped_tables;
+                }
                 continue;
+            }
             ++guard.delete_failures[plans[i].table];
             // Re-arm, exactly as the audit sibling does on its delete-failure
             // path. Nothing was deleted, so the pass learned nothing about the
