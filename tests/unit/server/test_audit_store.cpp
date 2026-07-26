@@ -1578,3 +1578,31 @@ TEST_CASE("AuditStore #2360: a non-integer stored reading is rejected, not coerc
               "integer");
     }
 }
+
+TEST_CASE("AuditStore #2360: a wrong index squatting the name reports degraded, not healthy",
+          "[audit_store][retention][clock-guard]") {
+    // `CREATE INDEX IF NOT EXISTS` is a NO-OP against an existing index of the
+    // same name, whatever its shape, so SQLITE_OK never meant "index-driven".
+    // This shape specifically defeats a substring heuristic: it indexes the WRONG
+    // column while still mentioning `ttl_expires_at` and `WHERE`, so a text match
+    // passes it and only a structural check (PRAGMA index_info) catches it.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-wrongidx-"}};
+    {
+        AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(seed.is_open());
+        REQUIRE(seed.retention_index_ok()); // the real index was built
+    }
+    exec_raw(tmp.path, "DROP INDEX idx_audit_ttl_id");
+    exec_raw(tmp.path, "CREATE INDEX idx_audit_ttl_id ON audit_events(timestamp) "
+                       "WHERE ttl_expires_at > 0");
+
+    AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());       // still usable
+    CHECK_FALSE(store.retention_index_ok()); // but honest about being degraded
+
+    // And retention still works, just unindexed -- the guard is correct without it.
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+    seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
+    CHECK(store.cleanup_once(kNow) == 5);
+    CHECK(store.cleanup_failed_count() == 0);
+}

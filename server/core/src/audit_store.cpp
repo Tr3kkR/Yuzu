@@ -14,6 +14,7 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <vector>
 #include <utility>
 
 namespace yuzu::server {
@@ -161,8 +162,25 @@ void AuditStore::ensure_retention_index() {
     // "the lock hold is no longer bounded" reports healthy while every pass
     // full-scans.
     {
+        // STRUCTURAL check, not a substring match on the DDL text. A wrong index
+        // can trivially contain the right words -- `CREATE INDEX idx_audit_ttl_id
+        // ON audit_events(timestamp) WHERE ttl_expires_at > 0` indexes the wrong
+        // column while mentioning `ttl_expires_at` and `WHERE`, and a substring
+        // heuristic passes it. `PRAGMA index_info` reports the indexed columns in
+        // order, which is the thing the probes and the ordered delete actually
+        // depend on; the DDL text is then only consulted for the partial
+        // predicate, which `index_info` does not expose.
+        SqliteStmt cols;
+        std::vector<std::string> indexed;
+        if (sqlite3_prepare_v2(db_.get(), "PRAGMA index_info(idx_audit_ttl_id)", -1, cols.addr(),
+                               nullptr) == SQLITE_OK) {
+            while (sqlite3_step(cols.get()) == SQLITE_ROW) {
+                const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(cols.get(), 2));
+                indexed.emplace_back(name ? name : "");
+            }
+        }
+        bool partial = false;
         SqliteStmt chk;
-        bool matches = false;
         if (sqlite3_prepare_v2(db_.get(),
                                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", -1,
                                chk.addr(), nullptr) == SQLITE_OK) {
@@ -170,10 +188,12 @@ void AuditStore::ensure_retention_index() {
             if (sqlite3_step(chk.get()) == SQLITE_ROW) {
                 const auto* def = reinterpret_cast<const char*>(sqlite3_column_text(chk.get(), 0));
                 const std::string_view sv{def ? def : ""};
-                matches = sv.find("ttl_expires_at") != std::string_view::npos &&
-                          sv.find("WHERE") != std::string_view::npos;
+                partial = sv.find("WHERE") != std::string_view::npos &&
+                          sv.find("ttl_expires_at") != std::string_view::npos;
             }
         }
+        const bool matches =
+            indexed.size() == 2 && indexed[0] == "ttl_expires_at" && indexed[1] == "id" && partial;
         if (!matches) {
             spdlog::error("AuditStore: idx_audit_ttl_id exists but does not match the expected "
                           "definition; retention will run WITHOUT a usable index");
