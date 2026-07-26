@@ -114,13 +114,22 @@ inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86400;
 // exists for, so over-retaining is the safe direction.
 inline constexpr std::size_t kMaxAuditDeletesPerPass = 25000;
 
-// Floor for the elapsed-time check. The check asks "did more than a retention
-// window pass since the last cleanup?", which on a 365-day default is a sound
-// proxy for a clock jump. On a SHORT retention setting it is not: with
-// `--audit-retention-days 1`, any ordinary outage over a day -- a maintenance
-// window, a restore, a host that was simply off -- looks identical to a clock
-// jump and would report one. Elapsed time cannot distinguish those, so the check
-// only fires past a duration where a real outage is itself remarkable.
+// The elapsed-time check's threshold. ABSOLUTE -- how far the clock moved has
+// nothing to do with how long rows are kept.
+//
+// An earlier round used max(window, this), on the stated theory that "more than a
+// retention window elapsed" was a sound proxy for a clock jump. It is not: at the
+// 365-day default that makes the threshold a YEAR, so the check never fires on a
+// stock server, and because the outcome test is separately defeated by any row
+// written after the jump, BOTH detectors went inert for anything short of a
+// year-long gap. A 30-day jump deleted a month of extra evidence silently. The
+// tests did not catch it because they all used a 1-day-retention fixture, where
+// the constant dominated anyway.
+//
+// Elapsed time still cannot distinguish a jump from an outage, so this is set
+// past the point where an outage is itself remarkable, and the warn text names
+// both causes. A server down for eight days declines once -- cheap, and the right
+// trade for catching a month-long jump.
 inline constexpr std::int64_t kAuditMinBigStepSec = 7 * 86400;
 
 class AuditStore {
@@ -169,8 +178,10 @@ public:
 
     /// Cumulative count of retention passes that DECLINED to delete. Three
     /// triggers: the pass would have aged out every datable row; the gap since
-    /// the previous pass exceeded the threshold (the retention window, floored
-    /// at kAuditMinBigStepSec); or the stored reading was AHEAD of the current
+    /// the previous pass exceeded kAuditMinBigStepSec (an ABSOLUTE duration --
+    /// how far the clock moved is unrelated to how long rows are kept, and a
+    /// window-derived threshold was a YEAR on the default setting, so it never
+    /// fired); or the stored reading was AHEAD of the current
     /// clock. The middle one cannot distinguish a forward clock jump from an
     /// outage that long, so a non-zero value means "this server's clock moved,
     /// or it was down that long" -- not the clock alone.

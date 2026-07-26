@@ -653,13 +653,21 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // the outcome test it still fires when a write has already landed
             // after the jump.
             //
-            // The threshold is floored (kAuditMinBigStepSec). Elapsed time cannot
-            // tell a clock jump from an outage, so on a SHORT retention setting
-            // an ordinary maintenance window would report as a clock anomaly. The
-            // check only fires past a duration where an outage is itself
-            // remarkable -- and the warn text names both causes, because this
-            // signal genuinely cannot distinguish them.
-            const std::int64_t step_threshold = std::max(window, kAuditMinBigStepSec);
+            // ABSOLUTE, not derived from the retention window. An earlier round
+            // used max(window, floor) on the theory that "more than a retention
+            // window elapsed" was a sound proxy for a clock jump. At the 365-day
+            // default that makes the threshold a YEAR, so the check never fires on
+            // a stock server -- and since the outcome test is separately defeated
+            // by any row written after the jump, BOTH detectors went inert for
+            // anything short of a year-long gap (#2360 Gate 6, PR-body audit).
+            //
+            // How long the clock moved has nothing to do with how long rows are
+            // kept, so the threshold is just the constant. Elapsed time still
+            // cannot tell a jump from an outage, which is why it is set past the
+            // point where an outage is itself remarkable and why the warn names
+            // both causes -- but a server down for eight days now declines once,
+            // which is cheap, instead of a 30-day clock jump passing silently.
+            const std::int64_t step_threshold = kAuditMinBigStepSec;
             const bool big_step =
                 prev_pass_now && window > 0 && now - *prev_pass_now > step_threshold;
             emit_delta = prev_pass_now ? now - *prev_pass_now : 0;

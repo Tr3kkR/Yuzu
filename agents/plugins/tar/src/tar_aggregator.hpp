@@ -103,15 +103,20 @@ inline constexpr int64_t kTarRetentionFutureSlackSec = 24 * 3600;
 // never sits permanently set. Sized as a drain rate, not a batch guess.
 inline constexpr int64_t kMaxTarDeletesPerTablePerPass = 5000;
 
-// Floor for the elapsed-time check. Elapsed wall time cannot distinguish a
-// forward clock jump from the agent simply not having run, and on an ENDPOINT
-// not-having-run is routine: the shortest time-based window here is 24h, so
-// without a floor every laptop switched off over a weekend, every suspended VM
-// and every upgrade window longer than a day would report a clock anomaly and
-// destroy the fleet signal this counter exists to carry. 30 days is past the
-// point where an endpoint being dark is itself worth noticing, while still
-// catching the cases that motivate the guard (a dead CMOS reporting 1970, a
-// restored snapshot) by orders of magnitude.
+// The elapsed-time check's threshold. ABSOLUTE, for the same reason as the audit
+// sibling: an earlier round used max(tier window, this), which made it a YEAR on
+// the monthly tier, so the check could never fire there.
+//
+// Elapsed wall time cannot distinguish a forward clock jump from the agent simply
+// not having run, and on an ENDPOINT not-having-run is routine -- the shortest
+// time-based window here is 24h, so a smaller threshold would report every laptop
+// switched off over a weekend as a clock anomaly and destroy the fleet signal this
+// counter carries. 30 days is past the point where an endpoint being dark is
+// itself worth noticing, while still catching what motivates the guard (a dead
+// CMOS reporting 1970, a restored snapshot) by orders of magnitude.
+//
+// It leaves a deliberate dead band: a forward error smaller than 30 days does not
+// fire on a table whose own window is shorter. The per-pass cap still bounds it.
 inline constexpr int64_t kTarMinBigStepSec = 30 * 86400;
 
 /**
@@ -185,9 +190,10 @@ format_retention_guard_lines(const RetentionGuardState& guard);
  * the excess over a fixed ceiling, so no clock reading can make it delete more than it was
  * always going to. Time-based retention is clock-guarded (#2361): a pass that
  * would delete every datable row of a table, or that follows a wall-clock jump
- * larger than that table's whole retention window, declines once and is counted
- * instead; accepted passes delete at most kMaxTarDeletesPerTablePerPass rows per
- * table, oldest first.
+ * larger than kTarMinBigStepSec (an ABSOLUTE threshold -- NOT the tier's
+ * retention window), declines once and is counted instead. Every accepted pass
+ * deletes at most kMaxTarDeletesPerTablePerPass rows per table, oldest first --
+ * that cap applies to BOTH retention kinds.
  *
  * @param db        The TAR database.
  * @param now_epoch Current epoch seconds.

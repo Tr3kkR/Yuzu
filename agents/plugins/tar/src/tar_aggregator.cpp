@@ -661,10 +661,12 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // reliably produces, since run_aggregation runs first and mints rows
             // into these very tables. The step check is durable across restarts
             // (see above), so it is what actually covers the wrong-RTC case.
-            // Floored: see kTarMinBigStepSec. Elapsed time cannot tell a clock
-            // jump from an endpoint that was simply switched off, and on a laptop
-            // the latter is routine.
-            const int64_t step_threshold = std::max(g.retention_default, kTarMinBigStepSec);
+            // ABSOLUTE, not derived from the tier's retention window -- same
+            // correction as the audit sibling. max(window, floor) made the
+            // threshold a YEAR on the monthly tier, so the check could never fire
+            // there. How far the clock moved is unrelated to how long that tier
+            // keeps rows.
+            const int64_t step_threshold = kTarMinBigStepSec;
             const bool big_step =
                 prev_pass_now && now_epoch - *prev_pass_now > step_threshold;
 

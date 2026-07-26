@@ -1151,3 +1151,42 @@ TEST_CASE("AuditStore #2360: the latch does NOT survive a restart",
     CHECK(second.total_count() == 10);
     CHECK(second.clock_anomaly_skips_count() == 1);
 }
+
+TEST_CASE("AuditStore #2360: a month-long jump fires on a DEFAULT-retention server",
+          "[audit_store][retention][clock-guard]") {
+    // Gate 6 / PR-body audit. The threshold used to be max(window, floor), on the
+    // theory that "more than a retention window elapsed" proxied a clock jump. At
+    // the 365-day default that made it a YEAR, so the check never fired on a stock
+    // server -- and the outcome test is separately defeated by any row written
+    // after the jump, so BOTH detectors were inert for anything short of a
+    // year-long gap. A 30-day jump silently deleted a month of extra evidence.
+    //
+    // Deliberately uses a LONG retention: the pre-existing step tests all use a
+    // 1-day fixture where the floor dominated, which is why none of them caught
+    // this.
+    constexpr int kLongRetentionDays = 365;
+    constexpr std::int64_t kLongWindow = static_cast<std::int64_t>(kLongRetentionDays) * 86400;
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-default-"}};
+    {
+        AuditStore warm(tmp.path, kLongRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(warm.is_open());
+    }
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);        // expired at both readings
+    seed_rows_with_ttl(tmp.path, kNow + kLongWindow, 1); // survivor at pass 1
+
+    AuditStore store(tmp.path, kLongRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    REQUIRE(store.cleanup_once(kNow) == 5);
+    REQUIRE(store.clock_anomaly_skips_count() == 0);
+
+    // 30 days later: far short of the 365-day window, far past the 7-day floor.
+    const std::int64_t jumped = kNow + 30 * 86400;
+    seed_rows_with_ttl(tmp.path, kNow - 50, 5);              // more expired rows
+    seed_rows_with_ttl(tmp.path, jumped + kLongWindow, 1);   // survivor at pass 2,
+                                                             // so only the STEP can fire
+    CHECK(store.cleanup_once(jumped) == 0);
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    // 1 survivor from pass 1 + the 6 rows seeded before pass 2: nothing was
+    // deleted on the declining pass.
+    CHECK(store.total_count() == 7);
+}

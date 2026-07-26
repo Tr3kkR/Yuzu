@@ -1877,13 +1877,23 @@ private:
         // agentic-readable surface the agent has (no /metrics), so that
         // false-healthy report would be the whole signal (#2361 Gate 8).
         const bool storage_ok = db_->is_open();
-        ctx.write_output(std::format("storage_state|{}", storage_ok ? "ok" : "offline"));
         if (!storage_ok) {
+            // `error|` FIRST, before storage_state. The server-side consumers gate
+            // on `output.starts_with("error|")` (tar_tree_routes.cpp), and
+            // poll_command treats any non-empty output as success -- so leading
+            // with `storage_state|` made the dashboard fall through to the
+            // capture-sources renderer, which parses only `config|` lines. With
+            // none present it drew all ten sources blank: the one frame an
+            // operator opens to ask "why is this device's data missing" rendered
+            // identically to a healthy device (#2361 Gate 6, enterprise-readiness).
             ctx.write_output("error|TAR storage is offline on this endpoint; the database was "
                              "closed after a transaction could not be rolled back. Collection and "
-                             "retention are both stopped. Restart the agent to recover.");
+                             "retention are both stopped. Historical data remains readable via "
+                             "`tar sql`. Restart the agent to recover.");
+            ctx.write_output("storage_state|offline");
             return 1;
         }
+        ctx.write_output("storage_state|ok");
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
