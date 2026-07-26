@@ -1487,7 +1487,12 @@ TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired"
         REQUIRE(reopened.cleanup_once(kNow + 120) == 0);
         CHECK(log.says("not usable"));
         CHECK(log.says("ahead of the current clock")); // the shape THIS case exercises
-        CHECK(log.says("re-anchoring"));
+        CHECK(log.says("declining once and re-anchoring"));
+        // Distinguish DeclineImplausible from CorruptStateReported TEXTUALLY.
+        // `says("re-anchoring")` alone separated them only because "re-anchoring"
+        // is not a substring of "re-anchored" -- a suffix accident, not an
+        // assertion. This keys on the other message's unique tail instead.
+        CHECK_FALSE(log.says("there was nothing expired to delete"));
         CHECK_FALSE(log.says("elapsed since the last retention pass"));
     }
 }
@@ -1756,10 +1761,17 @@ TEST_CASE("AuditStore #2360: a DIFFERENT anomaly arriving while latched is still
     REQUIRE(f.store.cleanup_once(kNow) == 0);
     REQUIRE(f.store.clock_anomaly_skips_count() == 1);
 
-    // 2. A survivor appears, so would-wipe is gone -- but the clock now jumps
-    //    well past the 7-day threshold. A genuinely different anomaly.
-    f.seed(kNow + 40 * 86'400, 1); // survivor at the later reading
+    // 2. A survivor appears, so would-wipe is genuinely gone -- and the clock
+    //    jumps well past the 7-day threshold. A different anomaly.
+    //
+    //    The survivor must sit inside the datable horizon OF THE PASS THAT READS
+    //    IT (`now + window + slack`). An earlier version of this test put it 40
+    //    days out, where it was excluded as forward-skewed: `would_wipe` never
+    //    cleared, and the Wipe -> Step transition was carried entirely by
+    //    `classify`'s precedence rather than by the mechanism the comment
+    //    described. The test passed for a reason its own comment denied.
     const std::int64_t jumped = kNow + 30 * 86'400;
+    f.seed(jumped + kWindow, 1); // in range for the jumped pass
     CHECK(f.store.cleanup_once(jumped) == 0);          // the step declines too
     CHECK(f.store.clock_anomaly_skips_count() == 2);   // and is REPORTED
 }
@@ -1827,4 +1839,38 @@ TEST_CASE("AuditStore #2360: a SECOND clock step is a second event, not a contin
     seed_rows_with_ttl(f.tmp.path, j2 + kWindow, 1);
     CHECK(f.store.cleanup_once(j2) == 0);              // must decline again
     CHECK(f.store.clock_anomaly_skips_count() == 2);   // and be reported
+}
+
+TEST_CASE("AuditStore #2360: classify pins the anomaly precedence with no database",
+          "[audit_store][retention][clock-guard]") {
+    // `classify` is static and pure -- four bools in, one enum out -- so the
+    // whole precedence contract fits in a table with no fixture, no SQLite and
+    // no clock. This would have killed the precedence mutations (M27/M28) in
+    // microseconds; the integration tests that caught them each need a seeded
+    // database and several passes.
+    using A = AuditStore::Anomaly;
+    struct Case {
+        bool has_expired, would_wipe, big_step, prev_unusable;
+        A expected;
+        const char* why;
+    };
+    const Case cases[] = {
+        // prev_unusable wins outright, even with nothing pending to protect.
+        {false, false, false, true, A::BadState, "unusable reading beats an empty table"},
+        {true, true, true, true, A::BadState, "unusable reading beats step AND wipe"},
+        // Nothing expired short-circuits -- even when the other inputs are set,
+        // because there is nothing for the guard to hold back.
+        {false, true, true, false, A::None, "nothing expired short-circuits step and wipe"},
+        // A step outranks a wipe either way: an elapsed-time jump explains a
+        // wipe better than the wipe explains itself.
+        {true, true, true, false, A::Step, "step beats wipe when both hold"},
+        {true, false, true, false, A::Step, "step alone"},
+        {true, true, false, false, A::Wipe, "wipe alone"},
+        {true, false, false, false, A::None, "expired rows, nothing wrong"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.why);
+        CHECK(AuditStore::classify(c.has_expired, c.would_wipe, c.big_step, c.prev_unusable) ==
+              c.expected);
+    }
 }

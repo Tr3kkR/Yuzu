@@ -260,6 +260,33 @@ public:
         return persist_failed_.load(std::memory_order_relaxed);
     }
 
+    /// What the guard can conclude about a pass, in precedence order. A pure
+    /// function of that pass's inputs -- see `classify`.
+    ///
+    /// PUBLIC deliberately, alongside `cleanup_once`: `classify` holds the
+    /// whole precedence contract and is a pure function of four bools, so it
+    /// can be pinned by a table with no database, no clock and no fixture.
+    /// Exposing a function that reads no state is strictly less invasive than
+    /// the `cleanup_once` seam below, and the alternative -- reaching it only
+    /// through seeded multi-pass integration tests -- is how the precedence
+    /// went unpinned long enough for two mutations to survive.
+    enum class Anomaly { None, Wipe, Step, BadState };
+    /// Classify one pass. PURE: no member reads, no side effects, so it can be
+    /// reasoned about and tested one condition at a time. Precedence is
+    /// BadState > Step > Wipe: a reading we cannot trust makes the other two
+    /// unreliable, and an elapsed-time step explains a wipe better than the wipe
+    /// explains itself.
+    static Anomaly classify(bool has_expired, bool would_wipe, bool big_step,
+                            bool prev_unusable) noexcept {
+        if (prev_unusable)
+            return Anomaly::BadState;
+        if (!has_expired)
+            return Anomaly::None; // nothing to delete, so nothing to guard
+        if (big_step)
+            return Anomaly::Step;
+        return would_wipe ? Anomaly::Wipe : Anomaly::None;
+    }
+
     /// Run exactly ONE retention pass against `now` (epoch seconds) and return
     /// the number of rows deleted. Returns 0 when the pass declined (clock
     /// guard), when nothing was expired, or when the pass failed.
@@ -316,25 +343,6 @@ private:
     // and written only under the exclusive mtx_ that cleanup_once() holds for
     // the whole pass, and no accessor exposes them.
     //
-    /// What the guard can conclude about a pass, in precedence order. A pure
-    /// function of that pass's inputs -- see `classify`.
-    enum class Anomaly { None, Wipe, Step, BadState };
-    /// Classify one pass. PURE: no member reads, no side effects, so it can be
-    /// reasoned about and tested one condition at a time. Precedence is
-    /// BadState > Step > Wipe: a reading we cannot trust makes the other two
-    /// unreliable, and an elapsed-time step explains a wipe better than the wipe
-    /// explains itself.
-    static Anomaly classify(bool has_expired, bool would_wipe, bool big_step,
-                            bool prev_unusable) noexcept {
-        if (prev_unusable)
-            return Anomaly::BadState;
-        if (!has_expired)
-            return Anomaly::None; // nothing to delete, so nothing to guard
-        if (big_step)
-            return Anomaly::Step;
-        return would_wipe ? Anomaly::Wipe : Anomaly::None;
-    }
-
     // The anomaly currently being REPORTED, replacing what used to be a shared
     // bool latch. One variable, one rule (in `cleanup_once`): report when the
     // anomaly differs from this, stand down to None when there is none. That
