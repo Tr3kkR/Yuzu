@@ -355,6 +355,13 @@ bool McpStreamBridge::subscribe(const std::string& session_id, const nlohmann::j
     if (subscribe_fault_.exchange(false, std::memory_order_acq_rel)) {
         throw std::bad_alloc{};  // test seam: model a subscribe allocation failure
     }
+    // Prebuilt HERE, before the record-mu hold, for the same reason arm() does it
+    // (H2): the throwing work happens while nothing has changed, and the commit
+    // below is a noexcept move. Load-bearing for park_after_dispatch_failure - a
+    // record parked before arm() ran has no other source for a fallback final, and
+    // every fallback publisher (the projector ladder and teardown's kFallbackFinal
+    // arm) reads this field. Without it such a record would publish an EMPTY frame.
+    std::string fallback = build_fallback_final(jsonrpc_id, execution_id);
     {
         // EXACTLY-ONCE, STATE-CHECKED (#2487 review). The "written before any
         // listener exists, immutable afterwards" contract is what lets
@@ -385,6 +392,7 @@ bool McpStreamBridge::subscribe(const std::string& session_id, const nlohmann::j
             return false;
         }
         rec->execution_id = execution_id;
+        rec->fallback_final = std::move(fallback);
     }
     // ORDERING INVARIANT (governance performance/UP-5): the caller MUST invoke
     // subscribe() BEFORE dispatch / the first refresh_counts, so the bus channel
@@ -416,18 +424,16 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
         throw std::bad_alloc{};  // test seam: model a pre-flip allocation failure
     }
     // Prebuild the minimal fallback final BEFORE the flip (H2): all throwing
-    // work happens while nothing has changed.
+    // work happens while nothing has changed. subscribe() already stored an
+    // identical string (so a park before arm has one); this rebuild keeps arm
+    // self-sufficient, and both go through build_fallback_final so the bytes have
+    // exactly one derivation.
     std::string exec_id;
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
         exec_id = rec->execution_id;
     }
-    std::string fallback = success_response(
-        jsonrpc_id, std::string(R"({"execution_id":)") + detail::json_quoted(exec_id) +
-                        R"(,"status":"unknown","detail":)" +
-                        detail::json_quoted("terminal counts unavailable - fetch by execution_id "
-                                            "(get_execution_status / query_responses)") +
-                        "}");
+    std::string fallback = build_fallback_final(jsonrpc_id, exec_id);
 
     bool consumed_cancel = false;
     bool release_streamed_charge = false;
@@ -547,6 +553,53 @@ bool McpStreamBridge::abandon(const std::string& session_id, const nlohmann::jso
     }
     flush_record_obs(*rec);
     publish_records_gauge(active);
+    return true;
+}
+
+bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
+                                                  const nlohmann::json& jsonrpc_id) {
+    std::shared_ptr<BridgeRecord> rec;
+    std::uint64_t parked_seq = 0;
+    std::string exec_id;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (shutdown_started_) {
+            return false;  // shutdown owns global teardown
+        }
+        rec = find_locked(make_key(session_id, jsonrpc_id));
+        if (!rec) {
+            return false;  // abandon or a sweep claim won - equally valid
+        }
+        parked_seq = next_parked_seq_++;
+    }
+    {
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        // C6 re-check under the transition hold (same rationale as arm() and
+        // on_post_closed): a shutdown that raced past the top gate must not have
+        // this transition wake a joined projector on a detached record.
+        if (shutdown_called_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        Phase expected = Phase::kArming;
+        if (!rec->phase.compare_exchange_strong(expected, Phase::kRingOnly,
+                                                std::memory_order_acq_rel)) {
+            return false;  // arm() or abandon() already arbitrated this record
+        }
+        // Discarded without audit, exactly as abandon does (C1): the cancel was
+        // intent against a stream that now will never exist. The streamed charge
+        // is deliberately RETAINED - a parked record can still pin its final, and
+        // the pin-ack / teardown paths release it exactly once.
+        rec->cancel_pending = false;
+        rec->parked_seq = parked_seq;
+        exec_id = rec->execution_id;
+    }
+    // The mailbox and any latched terminal survived the transition, so hand the
+    // record to the projector now rather than waiting for the next bus event.
+    wake(*core_);
+    audit_contained("mcp.bridge.dispatch_failure", exec_id,
+                    "parked after a post-dispatch failure: the execution continues and its "
+                    "result stays fetchable by execution_id",
+                    {}, AuditResult::kSuccess);
     return true;
 }
 
@@ -851,22 +904,22 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     // kRingOnly: real final via the pinned ladder.
     std::string frame;
     bool built = false;
-    if (projection_build_fault_.load(std::memory_order_acquire) > 0 &&
-        projection_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
-        // inject_projection_build_fault_for_test. Models the DOUBLE allocation
-        // failure - the real final AND the prebuilt fallback copy - which is the
-        // only way to leave this scope with the terminal extracted but never
-        // published, i.e. the one path that depends on the guard restoring it.
-    } else {
+    try {
+        if (projection_build_fault_.load(std::memory_order_acquire) > 0 &&
+            projection_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+            throw std::bad_alloc{};  // inject_projection_build_fault_for_test
+        }
+        frame = build_real_final(*rec, term->data);
+        built = true;
+    } catch (...) {
         try {
-            frame = build_real_final(*rec, term->data);
-            built = true;
-        } catch (...) {
-            try {
-                frame = rec->fallback_final;  // prebuilt at arm; copy can only OOM
-                built = true;
-            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            if (projection_fallback_fault_.load(std::memory_order_acquire) > 0 &&
+                projection_fallback_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+                throw std::bad_alloc{};  // inject_projection_fallback_fault_for_test
             }
+            frame = rec->fallback_final;  // prebuilt at subscribe/arm; copy can only OOM
+            built = true;
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
         }
     }
     if (!built) {
@@ -911,6 +964,16 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     }
     // D4: the guard clears projection_in_flight only now, AFTER the deferred
     // charge decrement - sweep can never observe a half-settled record.
+}
+
+std::string McpStreamBridge::build_fallback_final(const nlohmann::json& jsonrpc_id,
+                                                  const std::string& execution_id) {
+    return success_response(
+        jsonrpc_id, std::string(R"({"execution_id":)") + detail::json_quoted(execution_id) +
+                        R"(,"status":"unknown","detail":)" +
+                        detail::json_quoted("terminal counts unavailable - fetch by execution_id "
+                                            "(get_execution_status / query_responses)") +
+                        "}");
 }
 
 std::string McpStreamBridge::build_real_final(const BridgeRecord& rec,
@@ -1823,6 +1886,10 @@ void McpStreamBridge::inject_claim_lock_fault_for_test(int times) {
 
 void McpStreamBridge::inject_projection_build_fault_for_test(int times) {
     projection_build_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_projection_fallback_fault_for_test(int times) {
+    projection_fallback_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {
