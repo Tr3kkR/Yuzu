@@ -249,6 +249,19 @@ std::size_t count_error_code(const std::vector<mcp::sse_bus::SseEvent>& frames,
     return n;
 }
 
+/// Poll take_post_batch until it yields something. The projector is asynchronous
+/// and a streamed record is pump-owned, so the first tick after a publish can
+/// legitimately be empty.
+inline mcp::McpStreamBridge::PostBatch poll_batch(mcp::McpStreamBridge& bridge,
+                                                  const std::string& key) {
+    mcp::McpStreamBridge::PostBatch batch;
+    poll_until([&] {
+        batch = bridge.take_post_batch(key, /*cap_expired=*/false);
+        return !batch.progress.empty() || batch.final_frame.has_value();
+    });
+    return batch;
+}
+
 const std::string kProgress13 = R"({"agents_responded":1,"agents_targeted":3})";
 const std::string kCompleted = R"({"status":"completed","agents_success":3,"agents_failure":0})";
 
@@ -1928,6 +1941,137 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
         CHECK((*terminal_progress)["status"] == "completed");
         CHECK((*terminal_progress)["agents_success"] == 1);
         CHECK((*terminal_progress)["agents_failure"] == 1);
+    }
+}
+
+TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
+          "[mcp][bridge][2f]") {
+    // The ring copy is the durable one (GET resume); the returned frames are the
+    // live one. Both come from ONE projection pass, so they cannot disagree.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-tb"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("progress frames") {
+        fx.bus.publish("exec-tb", "execution-progress", prog(1, 3));
+        // The projector must NOT drain a kStreaming record - it is pump-owned.
+        auto batch = poll_batch(*fx.bridge, *key);
+        REQUIRE(batch.progress.size() == 1);
+        CHECK(batch.progress[0].find("notifications/progress") != std::string::npos);
+        CHECK_FALSE(batch.final_frame.has_value());
+        // ...and the same frame is replayable.
+        CHECK(count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 1);
+    }
+    SECTION("the final comes back separately so the pump can write it LAST") {
+        fx.bus.publish("exec-tb", "execution-completed", kCompleted);
+        Bridge::PostBatch batch;
+        REQUIRE(poll_until([&] {
+            batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+            return batch.final_frame.has_value();
+        }));
+        auto j = json::parse(*batch.final_frame, nullptr, /*allow_exceptions=*/false);
+        REQUIRE(j.is_object());
+        CHECK(j["result"]["status"] == "completed");
+        CHECK(j["result"]["execution_id"] == "exec-tb");
+        CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);  // pinned for resume
+    }
+    SECTION("an idle record yields nothing and settles nothing") {
+        auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+        CHECK(batch.progress.empty());
+        CHECK_FALSE(batch.final_frame.has_value());
+        CHECK_FALSE(batch.cap_settled);
+        CHECK_FALSE(batch.deferred);
+    }
+    SECTION("an unknown key is an empty tick, never a throw") {
+        auto batch = fx.bridge->take_post_batch("no-such-key", /*cap_expired=*/true);
+        CHECK(batch.progress.empty());
+        CHECK_FALSE(batch.cap_settled);  // nothing to settle - the record is gone
+    }
+}
+
+TEST_CASE("bridge take_post_batch - a terminal beats an expired cap (C7)",
+          "[mcp][bridge][2f]") {
+    // The cap is decided INSIDE the projection claim precisely so a terminal that
+    // landed in the same instant still wins. Closing with kCapExpired while a real
+    // result sat latched would tell the client to go poll for an answer the server
+    // was holding.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cap"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("cap expires with nothing latched - the pump may close") {
+        auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        CHECK(batch.cap_settled);
+        CHECK_FALSE(batch.final_frame.has_value());
+    }
+    SECTION("cap expires WITH a terminal latched - the terminal wins") {
+        fx.bus.publish("exec-cap", "execution-completed", kCompleted);
+        Bridge::PostBatch batch;
+        REQUIRE(poll_until([&] {
+            batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+            return batch.final_frame.has_value();
+        }));
+        CHECK_FALSE(batch.cap_settled);  // NOT a cap close - deliver the result
+        auto j = json::parse(*batch.final_frame, nullptr, /*allow_exceptions=*/false);
+        CHECK(j["result"]["status"] == "completed");
+    }
+}
+
+TEST_CASE("bridge bind_post_sink - gates on kStreaming and hands off latched work (C7)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-bind"));
+
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    // kArming is not a live wire.
+    CHECK_FALSE(fx.bridge->bind_post_sink(s.id, json(1), sink).has_value());
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+    CHECK_FALSE(fx.bridge->bind_post_sink(s.id, json(99), sink).has_value());  // unknown
+    CHECK_FALSE(fx.bridge->bind_post_sink(s.id, json(1), nullptr).has_value());  // null sink
+
+    SECTION("the projector wakes the bound sink, and does so as a handoff") {
+        // A streamed record's frames are ring-only (deliver_live=false), so the
+        // publish path never notifies this sink - the projector is the ONLY thing
+        // that can, and the record stays pump-owned meanwhile.
+        //
+        // SCOPE OF THIS TEST, stated honestly: it proves the wake ARRIVES. It does
+        // NOT prove the lost-wakeup discipline inside poke_post_sink - dropping
+        // that sink-mutex acquisition leaves this green, verified by mutation,
+        // because the poke only reaches the sink after the bus listener, the
+        // projector wake and a thread switch, by which point this thread is
+        // already inside wait_for. That discipline is recorded as uncovered at
+        // its source rather than given a test that passes for the wrong reason.
+        std::unique_lock<std::mutex> lk(sink->mu);
+        fx.bus.publish("exec-bind", "execution-progress", prog(1, 3));
+        const bool woken =
+            sink->cv.wait_for(lk, std::chrono::seconds(5)) == std::cv_status::no_timeout;
+        lk.unlock();
+        CHECK(woken);
+        // The work really was waiting for the pump, not drained behind its back.
+        auto batch = poll_batch(*fx.bridge, *key);
+        CHECK(batch.progress.size() == 1);
+    }
+    SECTION("the sink is released when the wire goes away") {
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        // Parked: the projector owns it again and drains it to the ring itself.
+        fx.bus.publish("exec-bind", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
     }
 }
 
