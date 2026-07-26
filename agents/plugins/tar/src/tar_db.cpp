@@ -1803,7 +1803,8 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
 
     bool ok = true;
     for (std::size_t i = 0; i < statements.size(); ++i) {
-        if (sqlite3_exec(db_, statements[i].c_str(), nullptr, nullptr, err.addr()) == SQLITE_OK)
+        const int rc = sqlite3_exec(db_, statements[i].c_str(), nullptr, nullptr, err.addr());
+        if (rc == SQLITE_OK)
             continue;
 
         // ASK whether SQLite aborted the transaction; do not assume it did.
@@ -1824,10 +1825,27 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
         //
         // `sqlite3_get_autocommit` is the same question the ROLLBACK path below
         // already asks, for the same reason.
-        const bool txn_aborted = sqlite3_get_autocommit(db_) != 0;
-        spdlog::error("TarDatabase::execute_atomic_batch statement failed: {} ({})", err.text(),
-                      txn_aborted ? "transaction aborted by SQLite, abandoning the pass"
-                                  : "transaction intact, skipping this table only");
+        //
+        // But autocommit ALONE is not sufficient, and reading it alone was a
+        // defect in the first version of this fix (Gate 7 security re-review).
+        // Some conditions leave the transaction technically intact while making
+        // it wrong to continue: SQLITE_CORRUPT/NOTADB would COMMIT onto a
+        // damaged database -- against the fail-closed-and-quarantine posture
+        // this store takes everywhere else (#559) -- and SQLITE_BUSY/LOCKED
+        // would pay the 5s busy_timeout PER TABLE while holding `mu_`, stalling
+        // every collector, where the old unconditional break paid it once.
+        // NOMEM/IOERR/FULL are likewise whole-database conditions, not a
+        // property of one table.
+        //
+        // So continue ONLY for the narrow per-table faults this exists for: a
+        // plain error or a constraint violation, with the transaction intact.
+        const bool per_table_fault = (rc == SQLITE_ERROR || rc == SQLITE_CONSTRAINT);
+        const bool txn_aborted = sqlite3_get_autocommit(db_) != 0 || !per_table_fault;
+        spdlog::error("TarDatabase::execute_atomic_batch statement failed: {} (rc={}, {})",
+                      err.text(), rc,
+                      txn_aborted ? "abandoning the pass"
+                                  : "transaction intact and the fault is per-table, "
+                                    "skipping this table only");
         if (txn_aborted) {
             ok = false;
             break;

@@ -521,8 +521,11 @@ TEST_CASE("TAR capture-sources: an offline device shows the agent's reason, not 
     CHECK(res->body.find("tar sql") != std::string::npos);
     // The `error|` prefix itself is stripped, not echoed raw.
     CHECK(res->body.find("error|") == std::string::npos);
-    // And it must NOT have rendered the sources grid for a dead store.
-    CHECK(res->body.find("capture-source-row") == std::string::npos);
+    // And it must NOT have rendered the sources grid for a dead store. Assert
+    // the id the renderer actually emits (`capTable`, tar_process_tree.cpp:1235)
+    // -- an earlier version of this checked for "capture-source-row", a string
+    // that exists nowhere in the codebase and so passed vacuously.
+    CHECK(res->body.find("capTable") == std::string::npos);
 }
 
 TEST_CASE("TAR capture-sources: a healthy device still renders the sources grid",
@@ -530,11 +533,16 @@ TEST_CASE("TAR capture-sources: a healthy device still renders the sources grid"
     // The other half, so the test above cannot pass by the route being broken
     // for everyone.
     TarHarness h;
-    h.status_output = "storage_state|ok\nrecord_count|42";
+    // Needs a real `config|` line: the renderer builds the grid from those, so a
+    // fixture without one cannot distinguish "rendered the grid" from "rendered
+    // an empty body" and the absence-assertions below would pass vacuously.
+    h.status_output = "storage_state|ok\nrecord_count|42\nconfig|process_enabled|true";
 
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
     REQUIRE(res->status == 200);
+    // Positively assert the grid: `capTable` is what the renderer emits.
+    CHECK(res->body.find("capTable") != std::string::npos);
     CHECK(res->body.find("TAR storage is offline") == std::string::npos);
     CHECK(res->body.find("failed the status query") == std::string::npos);
 }

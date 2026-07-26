@@ -93,8 +93,12 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch);
 // pass delete everything datable?" question. They cannot be too old, so counting
 // them as ordinary survivors would let ONE row written under a forward-skewed
 // clock veto the guard for the life of the endpoint -- the guard would die
-// exactly when it is needed. Mirrors the audit store's kAuditTtlFutureSlackSec
-// and the journal's kJournalFutureSlackMs.
+// exactly when it is needed. Same ROLE as the audit store's
+// kAuditTtlFutureSlackSec and the journal's kJournalFutureSlackMs, but NOT the
+// same value or the same shape: 24h here against 2 days there, and audit's
+// column is a FUTURE ttl so its horizon adds the retention window, while this
+// one is a PAST timestamp. Substrate-tuned rather than drift -- an endpoint
+// skews by smaller amounts more often than a server. Do not "align" them.
 inline constexpr int64_t kTarRetentionFutureSlackSec = 24 * 3600;
 
 // Upper bound on rows one pass deletes from one table. At the 900-second rollup

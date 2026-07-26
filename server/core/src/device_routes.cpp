@@ -851,8 +851,14 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         };
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
+                // 300, matching the sibling site in tar_tree_routes.cpp. Both
+                // render the SAME `tar status` reply, and the storage-offline
+                // line is 231 chars (287 when the read path is gone too), so a
+                // 200-byte cap truncated it mid-sentence and dropped "Restart
+                // the agent to recover." -- the operator got the problem
+                // without the remedy (#2361 Gate 4, consistency-auditor).
                 note(res, "The device reported an error: " +
-                              html_escape(with_output->output.substr(6, 200)));
+                              html_escape(with_output->output.substr(6, 300)));
                 return;
             }
             audit_live_result("rendered");

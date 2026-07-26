@@ -464,8 +464,20 @@ public:
     struct BatchResult {
         bool began{false};     ///< BEGIN IMMEDIATE succeeded
         bool committed{false}; ///< COMMIT succeeded (false => rolled back)
-        /// Per-statement failure flags, sized to the input. On any failure every
-        /// entry is set, because the transaction is rolled back as a whole.
+        /// Per-statement flags, sized to the input. `failed[i]` means statement
+        /// i did not COMPLETE.
+        ///
+        /// READ THIS WITH `committed`, because the batch is NOT all-or-nothing:
+        ///  - `committed == false`: the transaction rolled back, so every entry
+        ///    is set and no statement had any effect.
+        ///  - `committed == true`: statement i was skipped, and every OTHER
+        ///    statement IS DURABLE. A statement whose error left the transaction
+        ///    intact is flagged and stepped over so one broken table cannot stop
+        ///    retention for the rest.
+        ///
+        /// So `failed[i] == 1` does NOT imply "no effect": a `RAISE(FAIL)`-style
+        /// error can leave statement i partly applied and still flagged. Do not
+        /// treat a set flag as a licence to re-run a non-idempotent statement.
         std::vector<char> failed;
     };
 
@@ -481,10 +493,20 @@ public:
      * been told they succeeded. `purge_source` already holds `mu_` across
      * `BEGIN IMMEDIATE`; this is the same pattern, exposed for reuse.
      *
-     * Stops at the FIRST failed statement: several SQLite errors (SQLITE_FULL,
-     * SQLITE_IOERR, a RAISE(ROLLBACK) trigger) abort the transaction
-     * automatically, and continuing would run the rest as autocommits that the
-     * rollback cannot undo.
+     * On a statement error, whether the pass STOPS depends on the error:
+     *  - Errors that abort the transaction themselves (SQLITE_FULL,
+     *    SQLITE_IOERR, SQLITE_CORRUPT, SQLITE_BUSY, a RAISE(ROLLBACK) trigger)
+     *    abandon the whole batch. Continuing would run the rest as autocommits
+     *    the rollback cannot undo, or would commit onto a damaged database.
+     *  - Errors that leave the transaction intact (a plain SQLITE_ERROR from a
+     *    missing column, a corrupt index on ONE table, a RAISE(ABORT) trigger)
+     *    flag that statement and CONTINUE. Stopping there meant one
+     *    permanently-broken table rolled back every pass forever, so nothing was
+     *    ever retained and tar.db grew without bound.
+     *
+     * The discriminator is `sqlite3_get_autocommit()` plus the error code -- see
+     * the implementation. Callers MUST read `failed` together with `committed`;
+     * see BatchResult.
      *
      * Cost: collectors and every other user of this connection block for the
      * batch's duration, so the CALLER must bound each statement. `run_retention`

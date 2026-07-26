@@ -1005,9 +1005,10 @@ public:
         // that never shrinks would read a broken cleanup loop as a working guard.
         metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
                           "Audit retention passes declined: the pass would have expired every "
-                          "datable row, the gap since the previous pass exceeded the floored "
-                          "threshold (a forward clock jump OR an outage that long), or the stored "
-                          "clock reading was ahead of the current clock",
+                          "datable row, the gap since the previous pass exceeded a fixed 7 days "
+                          "(an ABSOLUTE threshold, not scaled to --audit-retention-days; a "
+                          "forward clock jump OR an outage that long), or the stored clock "
+                          "reading was ahead of the current clock",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that failed on a SQLite error or ran against a "

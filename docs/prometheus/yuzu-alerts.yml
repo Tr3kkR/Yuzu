@@ -1,3 +1,15 @@
+# SAMPLE RULES - NOT WIRED UP BY ANYTHING THIS REPO SHIPS.
+#
+# `deploy/prometheus/prometheus.yml` reads `/etc/prometheus/rules/*.yml`, but no
+# compose file under `deploy/docker/` mounts this file there, and the repo ships
+# no Alertmanager configuration at all. Until an operator does both, every
+# `severity:` label below routes nowhere.
+#
+# That matters most for the audit-retention rules later in this file. The clock
+# guard bounds how fast the SOC 2 evidence chain can drain; it does NOT prevent
+# draining. The alert is the actual control and the guard is only the seatbelt,
+# so counting these rules as a detective control before wiring them up would be
+# self-deception. See docs/ops-runbooks/audit-store-clock-guard.md.
 groups:
   - name: yuzu-fleet
     rules:
@@ -435,7 +447,7 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
       # expire every datable audit row, so the evidence table survives a forward
@@ -448,7 +460,7 @@ groups:
           increase(yuzu_server_audit_clock_anomaly_skips_total[1h]) > 0
         for: 5m
         labels:
-          severity: warning
+          severity: critical
         annotations:
           summary: "Audit retention declined a pass - clock moved, or the server was down"
           description: >-
@@ -460,7 +472,7 @@ groups:
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
             uptime history before concluding the clock is at fault. Nothing was deleted;
             retention resumes automatically, paced at the per-pass cap.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # The counterpart signal. Both a declined pass and a broken pass leave rows
       # undeleted, so an audit table that never shrinks looks identical either
@@ -480,7 +492,7 @@ groups:
             guard (that is yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
             health (/healthz stores.audit), free disk, and the server log for
             "AuditStore: retention probe failed" / "AuditStore: cleanup error".
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # The per-pass delete cap is what turns an allowed wipe into a paced drain,
       # but it introduces its own failure: if it binds on every pass, expiry is
@@ -507,7 +519,7 @@ groups:
             pass) is below this fleet's audit volume, so audit.db grows without bound;
             the cap is a compile-time constant today, so this needs an engineering
             escalation rather than a config change.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # The docs tell operators to alert on this gauge; ship the rule so that
       # instruction is not a dead letter. A failed index build turns the pass's
@@ -529,7 +541,7 @@ groups:
             and that cost grows with the table. Check the server log for "could not create
             idx_audit_ttl_id" and for a migration failure. NOTE this gauge is evaluated
             once at startup, so it does not detect an index dropped while the server runs.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
@@ -547,7 +559,7 @@ groups:
             Detection still works within this process, but will not survive a restart --
             a server that reboots with a wrong clock would then see no elapsed-time step.
             Usually a disk or permissions problem on the audit database.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded

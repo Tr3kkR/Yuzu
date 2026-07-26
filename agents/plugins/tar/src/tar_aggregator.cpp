@@ -716,7 +716,14 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
 
     if (plans.empty()) {
         warn_if_degraded(declined_tables, unreadable_tables, time_based_tables, persist_failed);
-        return; // a fully-declining pass writes nothing at all, not even a BEGIN
+        return; // nothing queued: no BEGIN, no COMMIT.
+        // NOTE this is emptiness of the PLAN list, which is not the same as
+        // "every time-based table declined": row-count tiers are queued
+        // whenever they are retention-bearing, without regard to whether they
+        // have anything to delete. So a real device with an enabled _live tier
+        // still issues a BEGIN/COMMIT even while every time-based table is
+        // declining. Cheap (0-row deletes), but the earlier comment here
+        // claimed a guarantee that does not hold in practice (Gate 4 happy-path).
     }
 
     // Hand the whole batch to the store so it runs under ONE held lock. The
