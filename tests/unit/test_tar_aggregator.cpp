@@ -1205,6 +1205,84 @@ TEST_CASE("TAR #2361: concurrent rollup passes are race-free when the caller ser
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
+TEST_CASE("TAR #2361: a status reader racing a rollup is safe (guard.mu has teeth)",
+          "[tar][retention][clock-guard]") {
+    // Governance Gate 3 found the test above has NO teeth on `guard.mu`: every
+    // run_retention call there is wrapped in the test's own `rollup_mu`, so the
+    // calls never overlap and nothing ever races the guard's maps. Removing the
+    // internal `lock_guard(guard.mu)` would not redden it.
+    //
+    // The production race it should model is real: `tar status` calls
+    // format_retention_guard_lines -> retention_guard_counters (taking guard.mu)
+    // on the command-dispatch thread, while do_rollup -> run_retention writes
+    // guard.declines / guard.failures / guard.latched on the rollup thread.
+    // do_status deliberately does NOT take rollup_mu_, precisely so a diagnostic
+    // cannot block behind a rollup -- so guard.mu is the ONLY thing making that
+    // std::map access safe.
+    //
+    // This reproduces it: a reader outside any external lock, concurrent with
+    // writers. Under TSan, removing the lock_guard in retention_guard_counters
+    // (or the ones around the map writes in run_retention) reports a race here.
+    // The writers must touch the SAME maps the reader copies. An earlier version
+    // of this test seeded a healthy table, which only ever wrote `guard.latched`
+    // -- while the reader copies `declines`/`failures`/`delete_failures`. Two
+    // threads hammering disjoint state is not a race, and TSan correctly said
+    // nothing even with every guard.mu removed. Dropping a table makes its probe
+    // fail, so EVERY pass writes `guard.failures[...]`, which the reader reads.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    REQUIRE(f.db->execute_sql("DROP TABLE process_hourly"));
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> reads{0};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            // Both public readers of the guard state, on the exact path
+            // `tar status` uses.
+            const auto counters = yuzu::tar::retention_guard_counters(f.guard);
+            const auto lines = yuzu::tar::format_retention_guard_lines(f.guard);
+            (void)counters.declines.size();
+            (void)lines.size();
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    struct Joiner {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~Joiner() {
+            stop.store(true, std::memory_order_relaxed);
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{stop, reader};
+
+    // Writers serialise among THEMSELVES, exactly as rollup_mu_ does in
+    // production -- but that lock does not exclude the reader above, and that
+    // asymmetry is the whole point. guard.mu is the only thing between them.
+    std::mutex rollup_mu;
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 3; ++t)
+        writers.emplace_back([&, t] {
+            for (int i = 0; i < 10; ++i) {
+                std::lock_guard lock(rollup_mu);
+                run_retention(*f.db, kT0 + t * 10 + i, f.guard);
+            }
+        });
+    for (auto& th : writers)
+        th.join();
+
+    stop.store(true, std::memory_order_relaxed);
+    if (reader.joinable())
+        reader.join();
+
+    // The assertion is mostly that we got here without TSan reporting; still,
+    // pin that the reader actually ran and the state stayed coherent.
+    CHECK(reads.load() > 0);
+    // Every pass failed to probe the dropped table, so the map the reader was
+    // copying was genuinely being written throughout.
+    CHECK(failures_of(f.guard, "process_hourly") > 0);
+}
+
 TEST_CASE("TAR #2361: retention_sql's SQL text is unchanged (the guard reroutes at the caller)",
           "[tar][retention][clock-guard]") {
     // test_tar_warehouse.cpp and test_tar_perf.cpp pin retention_sql's exact
