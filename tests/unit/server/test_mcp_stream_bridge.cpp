@@ -960,6 +960,11 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
                 row.detail.find("teardown incomplete") != std::string::npos &&
                 row.result == "failure") {
                 saw_incomplete = true;
+                // This is a session-death reap: its disposition is kNone, so NOTHING
+                // was published. The row must not claim otherwise - a generic
+                // "teardown incomplete" grep would pass over exactly that lie.
+                CHECK(row.detail.find("nothing was published") != std::string::npos);
+                CHECK(row.detail.find("terminal was published") == std::string::npos);
             }
         }
         CHECK(saw_incomplete);
@@ -1122,6 +1127,34 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         const auto row = row_for(fx, "mcp.bridge.session_dead");
         CHECK(row.result == "failure");
         CHECK(row.detail.find("record erase failed") != std::string::npos);
+        CHECK(row.detail.find("charge") != std::string::npos);  // says it WAS settled
+    }
+    SECTION("release_charge AND erase both fail: the row names BOTH retained resources") {
+        // The compound case. Nothing stops both stages failing in one call - they
+        // fail on the same class of fault - and the erase-failure row used to
+        // hardcode "subscription and charge were settled", affirmatively DENYING the
+        // admission-slot leak it had just caused. That is the audit-accuracy defect
+        // this whole change exists to remove, so it gets its own case rather than
+        // being left to the two single-fault sections, neither of which can see it.
+        Fx fx;
+        auto s = fx.make_session();
+        park_one(fx, s);
+        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE_NOTHROW(fx.bridge->sweep());
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
+                             {{"reason", "release_charge"}})
+                  .value() == 1.0);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "erase"}})
+                  .value() == 1.0);
+        const auto row = row_for(fx, "mcp.bridge.session_dead");
+        CHECK(row.result == "failure");
+        // Both retained resources named; and emphatically NOT a claim that the
+        // charge was settled.
+        CHECK(row.detail.find("erase failed") != std::string::npos);
+        CHECK(row.detail.find("charge was not released") != std::string::npos);
+        CHECK(row.detail.find("were settled") == std::string::npos);
     }
 }
 
@@ -1156,6 +1189,23 @@ TEST_CASE("bridge pressure - the decided terminal is published even if teardown 
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 1);
     CHECK(fx.bridge->record_count() == 2);  // retained, as the unsubscribe stage requires
+    // ...and the row says so. The counterpart assertion lives on the session-death
+    // case, which publishes nothing and must say THAT - the two together are what
+    // stop the detail becoming a convenient constant again.
+    {
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool saw = false;
+        for (const auto& row : fx.audits) {
+            if (row.action == "mcp.bridge.forced_expire" &&
+                row.detail.find("bus unsubscribe failed") != std::string::npos) {
+                saw = true;
+                CHECK(row.detail.find("after the decided terminal was published") !=
+                      std::string::npos);
+                CHECK(row.result == "failure");
+            }
+        }
+        CHECK(saw);
+    }
 }
 
 TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",

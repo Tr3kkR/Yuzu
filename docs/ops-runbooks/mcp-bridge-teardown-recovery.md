@@ -8,9 +8,10 @@ disruptive, so do it deliberately rather than immediately.
 ## What has happened
 
 The MCP progress bridge correlates an execution's events onto a client's live SSE
-stream. When a correlated request finishes, a background sweep tears its record down,
-settling three owned things in order: the **bus subscription**, the **streamed
-admission charge**, and the **records_ map entry**.
+stream. When a correlated request finishes, a background sweep tears its record down.
+It publishes any decided terminal result **first**, so a later failure cannot lose it,
+then settles the three things it owns in order: the **bus subscription**, the
+**streamed admission charge**, and the **records_ map entry**.
 
 Each step is contained separately, so a failure settles some and retains the rest. The
 sweep's claim is **one-way** - a record it has claimed is permanently excluded from
@@ -21,9 +22,12 @@ until the process restarts.
 
 | reason | settled | retained until restart |
 |---|---|---|
-| `unsubscribe` | nothing | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
-| `release_charge` | subscription; the record is still erased | one per-session streamed admission slot |
-| `erase` | subscription and charge | the record and one global record slot |
+| `unsubscribe` | the terminal disposition, which is published first | the record, its admission charge, and its bus subscription - which also stops that execution's channel and replay buffer being collected |
+| `release_charge` | terminal and subscription; the record is still erased | one per-session streamed admission slot |
+| `erase` | terminal and subscription, and the charge **unless** `release_charge` also fired | the record and one global record slot, plus the admission slot if both fired |
+
+When two reasons fire for the same teardown, the audit row names both retained
+resources - trust the row over this table's single-reason rows.
 
 A retained record also pins that session's whole stream state, its replay ring and any
 pinned finals, past normal session garbage collection.

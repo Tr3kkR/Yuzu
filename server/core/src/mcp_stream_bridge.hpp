@@ -91,21 +91,27 @@
 // counted by yuzu_mcp_bridge_teardown_incomplete_total{reason} (#2487). The ORDER is
 // load-bearing rather than uniform, so be precise about what each failure retains:
 //
-//   unsubscribe fails  -> return immediately, record left WHOLE (in the map, still
-//                         subscribed, still charged). Erasing here would strand a
-//                         live listener: it holds a shared_ptr to the record, so the
-//                         erase frees nothing, shutdown() can no longer find it, and
-//                         the bus channel can never be collected (GC needs
-//                         listeners.empty()). This is the only "leave everything"
-//                         case, and it is why unsubscribe goes first.
-//   charge fails       -> the record is STILL erased; a ledger slot leaks instead.
-//   erase fails        -> subscription and charge are already settled; the record
-//                         and one global slot leak.
+//   0. PUBLISH the decided terminal FIRST. A later step failing must never lose a
+//      terminal the pressure visitor already decided on. Safe to do before the
+//      unsubscribe because every publishing disposition comes from the pressure
+//      pass, where unsubscribe_and_visit_terminal has already removed the listener;
+//      every other caller passes kNone and publishes nothing.
+//   1. unsubscribe fails -> return, record left in the map, still subscribed, still
+//      charged. Erasing here would strand a live listener: it holds a shared_ptr to
+//      the record, so the erase frees nothing, shutdown() can no longer find it, and
+//      the bus channel can never be collected (GC needs listeners.empty()). The
+//      terminal from step 0 is already committed, so this is "everything except the
+//      publish".
+//   2. charge fails -> the record is STILL erased; a per-session admission slot
+//      leaks instead.
+//   3. erase fails -> the subscription is settled and the charge MAY be (steps 2 and
+//      3 fail independently); the record and one global slot leak.
 //
-// The dispositions below name what each branch INTENDS to publish. An allocation
-// failure while building the frame publishes nothing and does NOT poison the
-// stream; that outcome is distinguished in the audit (TerminalRung::kNotAttempted)
-// rather than being reported as a poisoning that never happened.
+// Every audit row on these paths is derived from what ACTUALLY happened - whether
+// the ladder committed, and whether the charge released - never from what the branch
+// intended. A row that overstates an outcome is worse than a missing one, and this
+// function has produced that defect once per review round; check it explicitly when
+// changing any branch here.
 //
 // Poison blast radius: poison_terminal() is session-wide - every future attach on
 // that session 410s. Reached only on a double publish-failure (allocation death);
@@ -249,7 +255,8 @@ public:
     static constexpr std::array<const char*, kTeardownStageCount> kTeardownStageNames{
         "unsubscribe", "release_charge", "erase"};
     static constexpr const char* stage_name(TeardownStage s) {
-        return kTeardownStageNames[static_cast<std::size_t>(s)];
+        const auto idx = static_cast<std::size_t>(s);
+        return idx < kTeardownStageCount ? kTeardownStageNames[idx] : "unknown";
     }
 
     struct ReserveResult {
@@ -474,8 +481,12 @@ private:
         bool final_published = false;      ///< a REAL final committed to the ring
         /// A5/C3: the per-session streamed-admission charge. Released exactly
         /// once (pin proof, cancel-degrade, pinless settle incl. poison, or
-        /// teardown of a still-charged record); cleared under mu, decremented
-        /// under bridge_mu_ AFTER releasing mu.
+        /// teardown of a still-charged record). Clear this flag and decrement
+        /// streamed_unpinned_ under BOTH locks, taken bridge_mu_ -> mu, so the two
+        /// commit together. This comment used to say "cleared under mu, decremented
+        /// under bridge_mu_ AFTER releasing mu" - that split is what let a throw at
+        /// the second acquisition desynchronise the record from the ledger
+        /// permanently, and the guidance outlived the bug it caused (#2487).
         bool streamed_charge_held = false;
         /// Exactly-once teardown claim: concurrent sweep() calls may both gather
         /// evidence on the same record; the first to set this under mu owns the
@@ -526,8 +537,15 @@ private:
     /// The publish_final → retry-fallback → poison ladder (A6). `frame` is only
     /// viewed (passed as a string_view to publish_final); the retry uses the
     /// record's fallback_final.
+    /// `frame` is an RVALUE REFERENCE on purpose, so an lvalue argument does not
+    /// compile. A by-value parameter copied at the CALL BOUNDARY is an allocation
+    /// that happens after the caller has already decided it reached the ladder,
+    /// which made a copy failure audit as "publishing threw" when the ladder was
+    /// never entered. Callers must therefore own the frame first and move it in -
+    /// the mistake is now a compile error rather than a mislabelled audit row that
+    /// no test can distinguish (#2487 Gate 8).
     LadderResult publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                         std::string frame);
+                                         std::string&& frame);
 
     /// Claimed-kDone teardown: unsubscribe, publish the decided terminal frame
     /// (kSynthesizeUnavailable = -32014 for a never-terminal victim; kFallbackFinal

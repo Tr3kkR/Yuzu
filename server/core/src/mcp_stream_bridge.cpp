@@ -770,8 +770,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later
     // bookkeeping failure may restore + republish.
     guard.terminal_settled = true;
-    bool release = false;
     {
+        // Locks in hierarchy order and held ACROSS the flag clear and the ledger
+        // decrement. This used to clear the flag under rec->mu, release, and only
+        // then take bridge_mu_ - the same split that broke release_charge, with the
+        // same consequence: a throw at the second acquisition leaves the record
+        // reading "not held" while streamed_unpinned_[session] still counts it, so
+        // that entry never reaches 0, never gets erased, and the session accumulates
+        // forever. run_projector's per-record catch swallows it, so nothing retries.
+        // Fixing release_charge alone would have fixed the instance and left the
+        // sink; this is the second and last site.
+        std::lock_guard<std::mutex> lk(bridge_mu_);
         std::lock_guard<std::mutex> rlk(rec->mu);
         rec->terminal_projected = true;
         if (fid != 0) {
@@ -781,14 +790,10 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec) {
         if (rec->streamed_charge_held) {
             // C3: settled - either the final is pinned (admission now counts it
             // via pinned_count()) or it settled pinless/poisoned (no pin will
-            // ever come). Exactly-once: cleared here, decremented below.
+            // ever come). Exactly-once: cleared and decremented together.
             rec->streamed_charge_held = false;
-            release = true;
+            decrement_streamed_locked(rec->session_id);
         }
-    }
-    if (release) {
-        std::lock_guard<std::mutex> lk(bridge_mu_);
-        decrement_streamed_locked(rec->session_id);
     }
     // D4: the guard clears projection_in_flight only now, AFTER the deferred
     // charge decrement - sweep can never observe a half-settled record.
@@ -827,7 +832,7 @@ std::string McpStreamBridge::build_real_final(const BridgeRecord& rec,
 
 McpStreamBridge::LadderResult
 McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                         std::string frame) {
+                                         std::string&& frame) {
     auto fid = rec->stream->publish_final("message", frame);
     if (fid != 0) {
         return {fid, TerminalRung::kPrimary};
@@ -1265,10 +1270,18 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
             try {
                 if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
                     terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
-                    throw std::bad_alloc{};  // models the by-value fallback_final copy failing
+                    throw std::bad_alloc{};  // models the fallback_final copy failing
                 }
+                // Copy FIRST, then flag. The ladder takes an rvalue reference
+                // precisely so this copy cannot hide at the call boundary: done
+                // there it would allocate AFTER ladder_reached was set, making a
+                // copy OOM audit as "publishing threw" when the ladder was never
+                // entered. No test can distinguish those two orderings (the fault
+                // seam cannot sit at the copy point in both), so the signature
+                // enforces it instead.
+                std::string frame = rec->fallback_final;
                 ladder_reached = true;
-                rung = publish_terminal_ladder(rec, rec->fallback_final).rung;
+                rung = publish_terminal_ladder(rec, std::move(frame)).rung;
             } catch (...) {
                 rung = ladder_reached ? TerminalRung::kPublishThrew : TerminalRung::kNotAttempted;
                 if (metrics_ != nullptr) {
@@ -1279,6 +1292,11 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         case TeardownFinal::kNone:
             break;  // real final already pinned, or nothing to publish
     }
+
+    // Did anything actually reach the client? Every later audit detail keys off
+    // this rather than off which branch was INTENDED.
+    const bool published = decision != TeardownFinal::kNone &&
+                           (rung == TerminalRung::kPrimary || rung == TerminalRung::kFallback);
 
     // ── Step 2: unsubscribe ────────────────────────────────────────────────────
     if (!contained([&] {
@@ -1298,12 +1316,23 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // Bail with the record still in records_, still charged: internally
         // consistent, reclaimed by shutdown(), and never an orphan listener.
         // torn_down is deliberately NOT cleared - re-entering the exactly-once
-        // teardown protocol is a design change, filed separately.
+        // teardown protocol is a design change, deliberately deferred rather than
+        // smuggled into a containment fix. NOT YET FILED as an issue; do not read
+        // "deferred" as "tracked".
         count_teardown_incomplete(TeardownStage::kUnsubscribe);
         log_incomplete(stage_name(TeardownStage::kUnsubscribe));
+        // The detail must not assert a delivery that did not happen. Four of the five
+        // call sites pass kNone and publish nothing at all, and even a publishing
+        // disposition delivers nothing on kPoisoned / kPublishThrew / kNotAttempted -
+        // so "the terminal was published first" is only true when the ladder actually
+        // committed. Two bounded literals rather than one convenient claim.
         audit_contained(audit_action, exec_id,
-                        "teardown incomplete: bus unsubscribe failed; the decided terminal "
-                        "was published first, and the record is retained for shutdown",
+                        published
+                            ? "teardown incomplete: bus unsubscribe failed after the decided "
+                              "terminal was published; the record is retained for shutdown"
+                            : "teardown incomplete: bus unsubscribe failed and nothing was "
+                              "published; the record is retained for shutdown - recover by "
+                              "execution_id",
                         AuditResult::kFailure);
         return;
     }
@@ -1342,9 +1371,18 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // "no row" gap this work closes for the sibling step.
         count_teardown_incomplete(TeardownStage::kErase);
         log_incomplete(stage_name(TeardownStage::kErase));
+        // Must consult charge_released: the two stages fail independently on the same
+        // fault class, so a compound failure previously produced a row asserting a
+        // settled charge while the metric said otherwise - understating the blast
+        // radius to whoever reads the row during an incident.
         audit_contained(audit_action, exec_id,
-                        "teardown incomplete: record erase failed; subscription and charge "
-                        "were settled, the record is retained for shutdown",
+                        charge_released
+                            ? "teardown incomplete: record erase failed; the subscription and "
+                              "the streamed charge were settled, the record is retained for "
+                              "shutdown"
+                            : "teardown incomplete: record erase failed AND the streamed charge "
+                              "was not released; the record and one per-session admission slot "
+                              "are both retained for shutdown",
                         AuditResult::kFailure);
         return;
     }
@@ -1492,7 +1530,11 @@ void McpStreamBridge::count_teardown_incomplete(TeardownStage stage) noexcept {
 }
 
 bool McpStreamBridge::take_step_fault(TeardownStage stage) noexcept {
-    auto& slot = teardown_step_fault_[static_cast<std::size_t>(stage)];
+    const auto idx = static_cast<std::size_t>(stage);
+    if (idx >= kTeardownStageCount) {
+        return false;
+    }
+    auto& slot = teardown_step_fault_[idx];
     return slot.load(std::memory_order_relaxed) > 0 &&
            slot.fetch_sub(1, std::memory_order_acq_rel) > 0;
 }
@@ -1610,7 +1652,11 @@ void McpStreamBridge::inject_visit_copy_fault_for_test(int times) {
 }
 
 void McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {
-    teardown_step_fault_[static_cast<std::size_t>(stage)].store(times, std::memory_order_release);
+    const auto idx = static_cast<std::size_t>(stage);
+    if (idx >= kTeardownStageCount) {
+        return;  // public method: an out-of-range cast must not become an OOB write
+    }
+    teardown_step_fault_[idx].store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {

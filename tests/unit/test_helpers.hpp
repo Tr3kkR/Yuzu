@@ -35,6 +35,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #if defined(_WIN32)
 #include <process.h> // _getpid — part of the process-salt seed (#486 UP-R12)
@@ -1201,6 +1202,10 @@ inline PostgresTestDb::PostgresTestDb(PgTestTemplate& tpl) {
 /// test_rest_api_events, test_rest_result_sets_async) when a fifth needed it - the
 /// repo's promote-on-second-use rule. Callers include <sqlite3.h> themselves; this
 /// header deliberately does not, so tests with no SQLite dependency stay clean.
+template <typename Sqlite3T> struct SqliteHandleOwner;
+template <typename T>
+inline constexpr bool kSqliteOwnerIsSealed = !std::is_copy_constructible_v<SqliteHandleOwner<T>> &&
+                                             !std::is_move_constructible_v<SqliteHandleOwner<T>>;
 template <typename Sqlite3T> struct SqliteHandleOwner {
     Sqlite3T* db{nullptr};
     SqliteHandleOwner() = default;
@@ -1210,9 +1215,15 @@ template <typename Sqlite3T> struct SqliteHandleOwner {
     SqliteHandleOwner& operator=(SqliteHandleOwner&&) = delete;
     ~SqliteHandleOwner() {
         if (db != nullptr) {
-            sqlite3_close(db);
+            // _v2, not sqlite3_close: plain close returns SQLITE_BUSY and LEAKS the
+            // handle when a statement is still outstanding, which a destructor
+            // cannot report. _v2 defers the close instead, so the handle is always
+            // reclaimed.
+            sqlite3_close_v2(db);
         }
     }
 };
+/// Pins the sealing above: a copy or a move would double-close.
+static_assert(kSqliteOwnerIsSealed<struct SqliteOwnerSealCheck>);
 
 } // namespace yuzu::test
