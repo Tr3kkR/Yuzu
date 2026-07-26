@@ -473,9 +473,12 @@ public:
      * the whole plugin (#2361 Gate 8 / Sol). Same trade `purge_source` accepts,
      * but purge is operator-initiated and rare; this runs every 900 seconds.
      *
-     * If a ROLLBACK fails with the transaction still open, the connection is
-     * marked wedged and every later batch fails fast rather than reporting
-     * success for writes that would silently join a doomed transaction.
+     * If a ROLLBACK fails with the transaction still OPEN, the connection is
+     * CLOSED (`db_` nulled). Every write on a connection stuck inside a
+     * transaction that will never commit would be reported durable and then lost
+     * at restart, so failing all of them closed -- via the `if (!db_)` check
+     * every method already has -- is the honest outcome. TAR storage is then
+     * offline on that endpoint until the agent restarts.
      */
     BatchResult execute_atomic_batch(const std::vector<std::string>& statements);
 
@@ -507,10 +510,6 @@ private:
     // for untrusted operator SQL (#760). Null if it could not be opened, in
     // which case user queries fail closed.
     sqlite3* query_db_{nullptr};
-    // Set only when a ROLLBACK failed with the transaction still active. From
-    // then on batches fail fast: continuing would let writes join a transaction
-    // that will never commit. Never cleared -- recovery is an agent restart.
-    std::atomic<bool> txn_wedged_{false};
     std::mutex mu_;
     std::mutex query_mu_;
 };

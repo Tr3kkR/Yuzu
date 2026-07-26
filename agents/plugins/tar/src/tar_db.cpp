@@ -1757,7 +1757,7 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
         return out;
 
     std::lock_guard lock(mu_);
-    if (!db_ || txn_wedged_.load(std::memory_order_relaxed)) {
+    if (!db_) {
         out.failed.assign(statements.size(), 1);
         return out;
     }
@@ -1811,11 +1811,32 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
         // precisely the defect this whole method exists to prevent. Do not
         // assume; ask.
         if (sqlite3_get_autocommit(db_) == 0) {
-            spdlog::error("TarDatabase::execute_atomic_batch: ROLLBACK failed and the connection "
-                          "is STILL in a transaction ({}); marking the database unhealthy so "
-                          "later writes are not reported as durable",
+            // The connection is genuinely stuck inside a transaction that will
+            // never commit. Every subsequent write on it -- a collector INSERT,
+            // a set_config, anything -- would join that transaction, be told it
+            // succeeded, and be lost at the next restart. Collection is not
+            // "still working" in that state; it is silently failing.
+            //
+            // So close the connection rather than flagging it. An earlier
+            // version set a `txn_wedged_` bool that ONLY this method consulted,
+            // which left ~118 other statement sites writing into the doomed
+            // transaction while the comment claimed writes were protected -- a
+            // guard covering one path out of 119 reads as handled and is worse
+            // than none. Nulling `db_` reuses the `if (!db_)` check every
+            // TarDatabase method already has, so all of them fail closed at once.
+            //
+            // close_v2 rather than close: it detaches immediately and defers
+            // deallocation until any outstanding statements finalize, so this is
+            // safe even though callers elsewhere may still hold prepared
+            // statements. We hold `mu_`, and every primary-connection method
+            // takes `mu_`, so no other thread is mid-statement here.
+            spdlog::error("TarDatabase: ROLLBACK failed and the connection is STILL in a "
+                          "transaction ({}). Closing the TAR database: further writes would be "
+                          "reported as durable and then lost. TAR storage is offline on this "
+                          "endpoint until the agent restarts.",
                           err ? err : "unknown error");
-            txn_wedged_.store(true, std::memory_order_relaxed);
+            sqlite3_close_v2(db_);
+            db_ = nullptr;
         } else {
             spdlog::debug("TarDatabase::execute_atomic_batch ROLLBACK: {}",
                           err ? err : "already rolled back");
