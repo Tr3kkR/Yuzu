@@ -24,6 +24,7 @@ constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failur
 constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
 constexpr const char* kMetricProjectionDegraded = "yuzu_mcp_bridge_projection_degraded_total";
+constexpr const char* kMetricStreamingBackstop = "yuzu_mcp_bridge_streaming_backstop_total";
 // #2487: a teardown_claimed step that could not complete on the bare maintenance
 // thread. `stage` is a CLOSED literal set (unsubscribe | release_charge | erase),
 // pre-seeded in server.cpp. Any nonzero value means a record, its streamed charge,
@@ -603,8 +604,24 @@ bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
     return true;
 }
 
+std::optional<std::string> McpStreamBridge::record_key(const std::string& session_id,
+                                                       const nlohmann::json& jsonrpc_id) {
+    auto key = make_key(session_id, jsonrpc_id);  // allocates HERE, which is the point
+    std::lock_guard<std::mutex> lk(bridge_mu_);
+    if (shutdown_started_ || !find_locked(key)) {
+        return std::nullopt;
+    }
+    return key;
+}
+
 bool McpStreamBridge::on_post_closed(const std::string& session_id,
                                      const nlohmann::json& jsonrpc_id) {
+    // ONE implementation; this overload just pays the key allocation. Keeping a
+    // second copy of the transition here is how the two would drift.
+    return on_post_closed_keyed(make_key(session_id, jsonrpc_id));
+}
+
+bool McpStreamBridge::on_post_closed_keyed(const std::string& key) {
     std::shared_ptr<BridgeRecord> rec;
     std::uint64_t parked_seq = 0;
     {
@@ -612,7 +629,7 @@ bool McpStreamBridge::on_post_closed(const std::string& session_id,
         if (shutdown_started_) {
             return false;
         }
-        rec = find_locked(make_key(session_id, jsonrpc_id));
+        rec = find_locked(key);
         if (!rec) {
             return false;
         }
@@ -626,16 +643,40 @@ bool McpStreamBridge::on_post_closed(const std::string& session_id,
         if (shutdown_called_.load(std::memory_order_acquire)) {
             return false;
         }
+        // A delivered final means the client already holds its answer, so there
+        // is nothing left to resume: settle kDone and let sweep reap it. Without
+        // a final, park for GET resume. Both are the same CAS out of kStreaming,
+        // so a record can only ever take one of them.
+        const Phase target = rec->final_written ? Phase::kDone : Phase::kRingOnly;
         Phase expected = Phase::kStreaming;
-        if (!rec->phase.compare_exchange_strong(expected, Phase::kRingOnly,
-                                                std::memory_order_acq_rel)) {
+        if (!rec->phase.compare_exchange_strong(expected, target, std::memory_order_acq_rel)) {
             return false;
         }
         rec->parked_seq = parked_seq;
     }
-    // A1: a terminal latched while the (3b) pump was dying must not wait for
-    // the next bus event or sweep - hand the record to the projector now.
+    // A1: a terminal latched while the pump was dying must not wait for the next
+    // bus event or sweep - hand the record to the projector now.
     wake(*core_);
+    return true;
+}
+
+bool McpStreamBridge::on_final_written(const std::string& key) {
+    std::shared_ptr<BridgeRecord> rec;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (shutdown_started_) {
+            return false;
+        }
+        rec = find_locked(key);
+        if (!rec) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> rlk(rec->mu);
+    if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
+        return false;  // only a live streamed wire can have written a final
+    }
+    rec->final_written = true;
     return true;
 }
 
@@ -1071,6 +1112,35 @@ void McpStreamBridge::sweep() {
             if (now() - rec->created > cfg_.arming_reap_after) {
                 claim = true;
                 action = "mcp.bridge.arming_reaped";
+            }
+        } else if (ph == Phase::kStreaming) {
+            // BACKSTOP for the streamed-POST leak. Every pass below claims only
+            // kDone / kArming / kArmedGetOnly / kRingOnly, so a record stranded
+            // in kStreaming - its releaser swallowed the close, or the process
+            // lost the connection without running one - is invisible to ALL of
+            // them, INCLUDING session death, and leaks for the life of the
+            // process. The primary defence is that the releaser's close path
+            // allocates nothing (on_post_closed_keyed); this is the second one.
+            //
+            // It PARKS, never reaps. A reap would unsubscribe, unpin and erase,
+            // destroying resume state and possibly a real latched terminal that
+            // the client can still legitimately collect. It also deliberately
+            // does NOT set `claim` and go through the block below: that block
+            // sets torn_down, which means "permanently excluded from reclaim",
+            // so a merely-parked record would never be swept again. A transition
+            // is not a teardown.
+            //
+            // Routed through the SAME transition the releaser uses rather than a
+            // second copy of it - including its final_written branch, so a record
+            // whose final reached the wire still settles kDone rather than
+            // parking for a resume nobody needs.
+            const bool session_alive =
+                sessions_ != nullptr && sessions_->exists(rec->session_id, rec->principal);
+            // `created` and `key` are write-once (immutable after reserve, before
+            // the record is shared), so both are safe to read lock-free here.
+            const bool stale = now() - rec->created > cfg_.streaming_park_after;
+            if ((!session_alive || stale) && on_post_closed_keyed(rec->key) && metrics_ != nullptr) {
+                obs_guard([&] { metrics_->counter(kMetricStreamingBackstop).increment(); });
             }
         } else if (ph == Phase::kArmedGetOnly || ph == Phase::kRingOnly) {
             // Registry leaf, no locks held. Non-touching: a parked record must

@@ -206,6 +206,13 @@ public:
         /// so the reserve→arm window is milliseconds; 5 min is many orders of
         /// margin, so a live handler is never reaped.
         std::chrono::seconds arming_reap_after{300};
+        /// A kStreaming record is owned by its POST pump and normally leaves that
+        /// phase when the pump's releaser runs. Past this age it is treated as
+        /// stranded and PARKED (never reaped) by the sweep backstop. Deliberately
+        /// far above the streamed-POST cap so a healthy long stream is never
+        /// parked out from under its own pump - this fires only when a close was
+        /// swallowed or never delivered.
+        std::chrono::seconds streaming_park_after{600};
     };
 
     /// Injectable steady clock for the kArming reaper (deterministic tests).
@@ -337,6 +344,31 @@ public:
     /// 3b pump-releaser seam: kStreaming → kRingOnly, assign parked order, wake the
     /// projector (A1 - a latched terminal must not wait for the next bus event).
     bool on_post_closed(const std::string& session_id, const nlohmann::json& jsonrpc_id);
+
+    /// The record key for a live streamed request, resolved ONCE while the
+    /// caller can still fail safely. The streamed-POST handler captures this in
+    /// its releaser closure and later calls on_post_closed_keyed() with it.
+    ///
+    /// This exists for one reason: httplib runs a response releaser from
+    /// ~Response, so a releaser that rebuilt the key itself would carry a
+    /// `bad_alloc` site INSIDE a destructor - std::terminate, the #2037 class -
+    /// and swallowing that throw instead would strand the record in kStreaming,
+    /// which no sweep pass reclaims. Allocating here moves that cost to a frame
+    /// that can still degrade.
+    std::optional<std::string> record_key(const std::string& session_id,
+                                          const nlohmann::json& jsonrpc_id);
+
+    /// Allocation-free sibling of on_post_closed, keyed by the string
+    /// record_key() already returned. Deliberately a DISTINCT NAME rather than
+    /// an overload: both identify a record by string, so an overload set would
+    /// silently accept a session id and no-op forever.
+    bool on_post_closed_keyed(const std::string& key);
+
+    /// The pump wrote the final response to the POST wire. Recorded so the
+    /// following close settles the record as kDone instead of parking it for a
+    /// GET resume the client no longer needs. Allocation-free for the same
+    /// reason as on_post_closed_keyed.
+    bool on_final_written(const std::string& key);
 
     /// POST-DISPATCH failure unwind: kArming → kRingOnly, retaining the bus
     /// subscription, the mailbox and any latched terminal. PARK, NOT abandon -
@@ -580,6 +612,10 @@ private:
         bool torn_down = false;
         std::uint64_t pinned_event_id = 0;
         std::uint64_t parked_seq = 0;      ///< assigned on entry to kRingOnly
+        /// The pump wrote the final JSON-RPC response to the POST wire. A record
+        /// that closes with this set is DONE (the client has its answer); one that
+        /// closes without it parks for GET resume.
+        bool final_written = false;
 
         // C5: record-local, listener-writable observability. Flushed by the
         // projector / teardown through the noexcept obs guard - the listener

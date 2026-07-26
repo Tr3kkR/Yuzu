@@ -583,6 +583,13 @@ public:
                           "signal, not a rate: the record is still reclaimable, but a terminal "
                           "payload mid-retry is lost and answered by the fallback final",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_streaming_backstop_total",
+                          "Streamed-POST records the sweep had to park because they were still "
+                          "kStreaming with a dead session or long past the cap. The pump's own "
+                          "releaser is what normally ends that phase, so any nonzero value means "
+                          "a close was swallowed or never delivered - without this backstop the "
+                          "record would leak for the life of the process",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
                           "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
@@ -631,6 +638,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
+        metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
         metrics_.counter("yuzu_mcp_stream_pin_displaced_total");
