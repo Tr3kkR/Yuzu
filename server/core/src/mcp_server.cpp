@@ -2949,8 +2949,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // rather than retry a mutating fleet command blind (Decision 15(g)).
             auto a4_error_exec = [&id](int code, std::string_view message,
                                        std::string_view remediation,
-                                       const std::string& execution_id) {
-                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                       const std::string& execution_id,
+                                       std::string_view cid_override = {}) {
+                const std::string cid = cid_override.empty()
+                                            ? yuzu::server::detail::make_correlation_id()
+                                            : std::string(cid_override);
                 std::string data = R"({"correlation_id":")" + cid +
                                    R"(","retry_after_ms":null,"execution_id":)" +
                                    (execution_id.empty() ? std::string("null")
@@ -6286,9 +6289,13 @@ McpServer::HandlerFn McpServer::build_handler(
                             // needed because the key exists only inside this branch:
                             // before bind there is no key to close by.
                             const std::string record_key = *key;
+                            // Minted OUTSIDE the try so the catch can stamp the same
+                            // id into its audit row and its A4 body that the response
+                            // header already carries. A 500 on a still-running
+                            // mutating command with three unjoinable identifiers is
+                            // an investigation that cannot be run.
+                            const std::string cid = yuzu::server::detail::make_correlation_id();
                             try {
-                                const std::string cid =
-                                    yuzu::server::detail::make_correlation_id();
                                 // Built BEFORE the install: once the provider is
                                 // attached the headers are sealed and a throw can no
                                 // longer be answered, so nothing that allocates may
@@ -6486,11 +6493,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                 if (!yuzu::server::detail::try_persist_audit(
                                         audit_fn, req, "mcp.stream.attach", "success",
                                         "McpSession", audit_sid, attach_detail)) {
-                                    // The headers are sealed by the install, so
-                                    // Sec-Audit-Failed is not available here the way it
-                                    // is on GET - but a sink that returns false rather
-                                    // than throwing must not vanish silently.
-                                    bridge_degrade("attach_audit_failed");
+                                    // Its OWN counter, not a bridge_degrade reason:
+                                    // that family means "this request fell back to the
+                                    // plain path", and this one did not - the stream is
+                                    // live and correct, only its evidence is missing.
+                                    // The headers are sealed by the install, so unlike
+                                    // GET there is no Sec-Audit-Failed to set; this
+                                    // counter is the only signal.
+                                    if (metrics != nullptr) {
+                                        try {
+                                            metrics
+                                                ->counter(
+                                                    "yuzu_mcp_stream_attach_audit_failures_total")
+                                                .increment();
+                                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                                        }
+                                    }
                                 }
                                 mcp_audit("success", success_detail);
                                 return; // the provider IS the response
@@ -6515,8 +6533,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // always audited via park_after_dispatch_failure;
                                 // the two must be evidence-equivalent.
                                 mcp_audit("failure",
-                                          std::string("stream_install_failed execution_id=") +
-                                              execution_id + " command_id=" + command_id);
+                                          std::string("stream_install_failed cid=") + cid +
+                                              " execution_id=" + execution_id +
+                                              " command_id=" + command_id);
                                 res.status = 500;
                                 // The remediation names execution_id, so the body must
                                 // CARRY it - a 500 on a MUTATING fleet command that is
@@ -6524,13 +6543,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // up" is useless without the handle, and a client that
                                 // cannot locate the work retries it (governance UP-3;
                                 // the C8 commit message claimed this already worked).
+                                // The SAME cid the response header and the audit row
+                                // carry - minting a fresh one here left a 500 on a
+                                // still-running mutating command with three
+                                // identifiers that could not be joined.
                                 res.set_content(
                                     a4_error_exec(kInternalError,
                                                   "streamed response could not be established",
                                                   "the command IS running - fetch the result by "
                                                   "execution_id (get_execution_status), or retry "
                                                   "without an SSE Accept",
-                                                  execution_id),
+                                                  execution_id, cid),
                                     "application/json");
                                 return;
                             }

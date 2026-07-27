@@ -608,14 +608,22 @@ public:
                           "signal, not a rate: the record is still reclaimable, but a terminal "
                           "payload mid-retry is lost and answered by the fallback final",
                           "counter");
-        metrics_.describe("yuzu_mcp_bridge_sessions_at_pin_cap",
-                          "MCP sessions currently holding every streamed-POST admission slot. "
-                          "A session legitimately running four streamed calls looks identical, "
-                          "from the reject counter alone, to one that is wedged - this is the "
-                          "signal that separates them. A value that never recedes while "
-                          "yuzu_mcp_stream_rejects_total{reason=\"post_pin_slots\"} keeps "
-                          "climbing means slots are not being returned; alert on sustained > 0",
-                          "gauge");
+        metrics_.describe("yuzu_mcp_stream_attach_audit_failures_total",
+                          "Streamed-POST attach audits the sink REJECTED (returned false rather "
+                          "than throwing). The stream is live and correct; its evidence is not. "
+                          "Installing the content provider seals the response headers, so unlike "
+                          "the GET channel there is no Sec-Audit-Failed to set and this counter "
+                          "is the only signal. Any non-zero value is an audit-coverage gap",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_slots_reject_total",
+                          "Streamed admissions refused for want of a session slot, by which half "
+                          "of the admission sum held them: held=\"charges\" are calls genuinely "
+                          "in flight and clear as they finish; held=\"pins\" are finals already "
+                          "committed whose pins were never released. After the rule-(a) unpin a "
+                          "pins-dominant refusal should be rare, so a sustained rate there is the "
+                          "wedged-session signature - the case where the 429's own remediation "
+                          "(\"wait for one to finish\") is untrue because they already did",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
                           "release point and are RETAINED on the record until its teardown "
@@ -679,7 +687,10 @@ public:
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
-        metrics_.gauge("yuzu_mcp_bridge_sessions_at_pin_cap").set(0);
+        metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
+        for (auto held : {"charges", "pins"}) {
+            metrics_.counter("yuzu_mcp_bridge_pin_slots_reject_total", {{"held", held}});
+        }
         metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");

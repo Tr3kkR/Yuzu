@@ -1258,13 +1258,12 @@ bool McpPostPump::finish(const WriteFn& write, McpStreamClose reason) {
     // First-wins, because the first reason is the true cause; a later one is a
     // consequence of it.
     note_close_reason(reason);
-    // Publish liveness HERE, not after pump_once returns. The bridge's cancel
-    // interlock reads this flag, and the interval between "finish decided" and
-    // "flag set" contains the close-frame build AND its socket write - so a cancel
-    // landing in it would win the exchange and audit "detached the streamed
-    // response" for a response that actually ended completed/cap_expired/
-    // credential_revoked. Doing this any earlier than B1's unlock above would
-    // self-deadlock on the non-recursive sink mutex in the kCancelled path.
+    // Backstop. The bridge already flips `closed` at the DECISION point for the
+    // endings it knows about (a final handed back, or a settled cap), which is what
+    // keeps a mid-tick cancel from claiming a detach it did not perform. This covers
+    // the endings the bridge never sees - revocation, session death, a dead peer, an
+    // internal fault - and is idempotent for the ones it does. Must stay AFTER the
+    // unlock above: on the kCancelled path the sink mutex is non-recursive.
     mark_sink_closed();
     count_stream_close(metrics_, reason);
     // kCompleted EOFs after a real final: a close frame there would be a second,
@@ -1387,7 +1386,19 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         }
     }
 
-    if (revalidate_) {
+    // Credential re-validation and the session TTL touch are PER-TICK, not per wake.
+    // The poke now wakes this pump on every publication, and both of these are store
+    // round trips (the api-token cache and the session registry) - letting them ride
+    // the wake would scale auth load with the fleet's progress-frame rate instead of
+    // the 3s tick, which is the opposite of what #2367's caching exists to achieve.
+    // The DRAIN below still runs on every wake; that is the part that makes progress
+    // feel immediate.
+    const auto now_tp = clock_ ? clock_() : std::chrono::steady_clock::now();
+    const bool tick_due = now_tp >= next_check_;
+    if (tick_due) {
+        next_check_ = now_tp + cfg_.tick;
+    }
+    if (tick_due && revalidate_) {
         switch (grace_.on_verdict(revalidate_())) {
             case RevalidateGrace::Outcome::kCloseCredentialRevoked:
                 return finish(write, McpStreamClose::kCredentialRevoked);
@@ -1398,7 +1409,7 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         }
     }
     // Also the TTL slide, exactly as on the GET channel.
-    if (session_alive_ && !session_alive_()) {
+    if (tick_due && session_alive_ && !session_alive_()) {
         return finish(write, McpStreamClose::kSessionTerminated);
     }
 

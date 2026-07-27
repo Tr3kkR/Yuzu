@@ -203,24 +203,23 @@ groups:
             after 15 minutes would contradict the contract it exists to report.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
-      - alert: YuzuMcpSessionsWedgedAtPinCap
+      - alert: YuzuMcpStreamedPinSlotsWedged
         expr: |
-          yuzu_mcp_bridge_sessions_at_pin_cap > 0
-        for: 15m
+          increase(yuzu_mcp_bridge_pin_slots_reject_total{held="pins"}[15m]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "MCP session(s) have held every streamed-POST slot for 15m"
+          summary: "MCP streamed admissions refused with every slot held by a committed final"
           description: >-
-            A session legitimately running four streamed calls is indistinguishable,
-            from the reject counter alone, from one whose slots are never coming
-            back - this gauge is what separates them, and a value that does not
-            recede over 15m is the wedged case. Read it with
-            yuzu_mcp_stream_rejects_total{reason="post_pin_slots"}: if rejects climb
-            while this stays flat and non-zero, admission slots are not being
-            released and the affected client is locked out of streaming until it
-            re-initializes. Runbook:
-            docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+            A streamed request was refused for want of a session slot, and every
+            slot was held by a final the bridge had already committed rather than by
+            a call still in flight. After the rule-(a) unpin those pins are released
+            when the final reaches the wire, so this should not recur - a sustained
+            rate means slots are not coming back and the affected client stays
+            locked out of streaming until it re-initializes, while the 429 it
+            receives tells it to "wait for one to finish" when they already did.
+            Compare with held="charges", which is ordinary saturation and clears on
+            its own.
       - alert: YuzuMcpBridgeChargeReleaseDeferred
         expr: |
           yuzu_mcp_bridge_charge_release_deferred_total > 0
