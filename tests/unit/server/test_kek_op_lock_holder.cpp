@@ -37,8 +37,10 @@
 
 #include <libpq-fe.h>
 
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <thread>
@@ -92,7 +94,19 @@ std::optional<int> naive_holder_pid(PGconn* conn) {
     REQUIRE(res.status() == PGRES_TUPLES_OK);
     if (PQntuples(res.get()) < 1 || PQgetisnull(res.get(), 0, 0))
         return std::nullopt;
-    return std::atoi(PQgetvalue(res.get(), 0, 0));
+    // #2530 H2 (Hermes round 2): std::from_chars, not std::atoi — atoi
+    // silently returns 0 on a parse failure, which is a PLAUSIBLE-LOOKING
+    // pid that would let this helper pass vacuously against a malformed
+    // value instead of failing loudly. Matches the production fix in
+    // kek_op_lock.hpp's `kek_op_lock_holder` (#2530 G7-S2), which this test
+    // helper cross-checks and must not silently diverge from.
+    const char* raw = PQgetvalue(res.get(), 0, 0);
+    const char* end = raw + std::strlen(raw);
+    int pid = 0;
+    const auto parsed = std::from_chars(raw, end, pid);
+    REQUIRE(parsed.ec == std::errc{});
+    REQUIRE(parsed.ptr == end);
+    return pid;
 }
 
 /// Raw, UNFILTERED query (no `AND database = ...`) — used ONLY to

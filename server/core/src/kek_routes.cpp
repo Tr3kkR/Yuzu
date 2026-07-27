@@ -5,7 +5,9 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <cstddef>
+#include <ctime>
 #include <string>
 #include <utility>
 
@@ -17,6 +19,26 @@ using detail::error_json_a4;
 using detail::make_correlation_id;
 
 constexpr const char* kJson = "application/json";
+
+// system_clock time_point -> ISO-8601 UTC ("YYYY-MM-DDTHH:MM:SSZ"). Mirrors
+// auth_routes.cpp's iso8601_utc / guardian_ingest.cpp's ts_to_iso8601 — the
+// established per-file idiom for this codebase (no shared formatter header
+// exists yet). #2530 H1: formats KekOpResult::lock_holder_captured_at for
+// the REST /status response.
+std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+#if defined(_WIN32)
+    if (gmtime_s(&tm, &t) != 0)
+        return "invalid-time";
+#else
+    if (gmtime_r(&t, &tm) == nullptr)
+        return "invalid-time";
+#endif
+    char buf[32] = {};
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buf);
+}
 // All three operations take zero parameters; the body must be absent or
 // `{}`. Cap it defensively before parsing (mirrors ca_routes.cpp's
 // kMaxRevokeBody) — a multi-GB POST must not reach nlohmann::json::parse on
@@ -362,6 +384,16 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
                     {"lock_holder_pid", result.lock_holder_pid.has_value()
                                              ? nlohmann::json(*result.lock_holder_pid)
                                              : nlohmann::json(nullptr)},
+                    // #2530 H1: when the lock_held/lock_holder_pid snapshot
+                    // above was taken — null in lockstep with them when the
+                    // holder query was undetermined. A pid without a visible
+                    // capture instant lets a stale reading masquerade as
+                    // current; see the runbook's termination step for why a
+                    // pid must still be RE-CONFIRMED before acting on it.
+                    {"lock_holder_captured_at",
+                     result.lock_holder_captured_at.has_value()
+                         ? nlohmann::json(iso8601_utc(*result.lock_holder_captured_at))
+                         : nlohmann::json(nullptr)},
                     {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);
             });

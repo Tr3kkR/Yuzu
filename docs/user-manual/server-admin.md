@@ -1600,7 +1600,7 @@ be told to call `/rewrap`, never to retry `/rotate`.
 
 Before this, a backend wedged holding the `secrets_kek_op` advisory lock
 made every KEK operation return `409` forever, with no way to see why and no
-documented remedy. `GET /status` (`get_kek_status`) now reports three fields
+documented remedy. `GET /status` (`get_kek_status`) now reports four fields
 for exactly this:
 
 | Field | Meaning |
@@ -1608,6 +1608,7 @@ for exactly this:
 | `live_versions` | Count of non-retired KEK versions. `null` if the count query could not be determined — never a fabricated `0`. |
 | `lock_held` | `true` iff `secrets_kek_op` currently has a granted holder **in this server's own database** (the query is filtered by `current_database()`, not cluster-wide). `null` if the holder query could not be determined — **never** a fabricated `false`; a `null` here means the lock state is UNKNOWN, not "not held". |
 | `lock_holder_pid` | That holder's Postgres backend pid. **THREE possible states, not two — always read `lock_held` first to disambiguate a `null` pid:** (1) `lock_held: false` → `null`, genuinely unheld; (2) `lock_held: true` with a **non-null** pid → a normal held lock, corroborate it in `pg_stat_activity` (step 2 below); (3) `lock_held: true` with a **`null`** pid → HELD, but the holder's backend pid itself could not be read from `pg_locks` at query time — there is no pid to corroborate with, see step 1's third case below. `lock_held: null` (query itself failed) also reports `lock_holder_pid: null`, but that is a fourth, entirely separate "undetermined" case — do not conflate it with case (1) or (3). |
+| `lock_holder_captured_at` | ISO-8601 UTC instant (`YYYY-MM-DDTHH:MM:SSZ`) the `lock_held`/`lock_holder_pid` snapshot above was **taken** — `null` in lockstep with them when undetermined (#2530 H1). This exists so a stale reading is visible as stale rather than authoritative: the longer the gap between this timestamp and the moment you are about to act, the less you should trust that `lock_holder_pid` still names the same backend — Postgres **reuses** pids, so an old-enough reading can now point at a completely unrelated connection. Treat a `lock_holder_captured_at` more than a few seconds in the past as a reason to re-read `/status` (or, before anything irreversible, re-query `pg_locks` directly — see step 3) rather than act on the number in front of you. |
 
 **These are lock-free diagnostic snapshots, not one coordinated read.** Each
 is its own `SELECT`, taken at a possibly different instant from the others
@@ -1671,15 +1672,73 @@ deciding either way.
    `query_start`/`xact_start` far older than any registered-column table
    could plausibly take to scan, is the wedge.
 3. **Only a DBA terminates it, deliberately, and only after step 2 shows a
-   genuine wedge.** **Never present "kill this pid" as the first-line
-   remedy.** Blindly terminating a backend holding `secrets_kek_op` risks
-   interrupting a healthy in-progress rewrap mid-flight — which reintroduces
-   the exact half-committed state this hardening pass exists to make
-   diagnosable, not something to casually add to. If, and only if, step 2
-   shows a genuine wedge, a DBA runs `SELECT
-   pg_terminate_backend(<pid>);` deliberately — session-scoped advisory
-   locks die with their session, so terminating the backend releases the
-   lock.
+   genuine wedge.** **Read this in full before running `pg_terminate_backend`
+   on anything.**
+
+   > **The holder is very likely one of YOUR OWN Yuzu servers, mid-rotation
+   > — not an intruder or a hung process.** The `secrets_kek_op` lock is held
+   > for the ENTIRE `/rotate`/`/rewrap` call, and a large re-wrap (every
+   > registered secret row, one query) can legitimately take a long time —
+   > holding this lock for 30+ minutes on a big table is EXPECTED, not
+   > itself evidence of a wedge. Step 2's `pg_stat_activity` check exists
+   > precisely because this gauge and these fields cannot tell "healthy and
+   > slow" from "wedged" apart on their own.
+   >
+   > **Terminating the holder mid-rotation produces exactly the
+   > half-committed state this whole feature exists to help you avoid.** If
+   > you kill a backend that is genuinely a Yuzu server partway through
+   > `/rotate`, the new KEK version it already minted stays active — only
+   > the row-by-row re-wrap is interrupted. Recovery is `POST
+   > /api/v1/secrets/kek/rewrap` (or the `rewrap_secrets` MCP tool). **Do
+   > NOT retry `/rotate`** to "fix" this — see the half-committed contract
+   > above; a retried `/rotate` mints a second, spurious KEK version on top
+   > of the mess and can never be retired (#2525), it does not undo
+   > anything. In other words: the wrong call here does not just fail
+   > safely, it creates the exact incident this runbook was written to help
+   > you diagnose and avoid.
+   >
+   > **Before doing anything else, check whether the backend belongs to a
+   > Yuzu server, and prefer stopping that server cleanly over killing its
+   > backend:**
+   > ```sql
+   > SELECT pid, application_name, client_addr, client_port, backend_start
+   >   FROM pg_stat_activity
+   >  WHERE pid = <lock_holder_pid>;
+   > ```
+   > Match `client_addr`/`client_port` against your known Yuzu server hosts
+   > (Yuzu does not currently set `application_name` on its Postgres
+   > connections, so expect it blank — do not treat a blank
+   > `application_name` as evidence the holder is *not* a Yuzu server). If
+   > the pid traces to a live Yuzu server process you can reach, stop that
+   > **server** cleanly (its own shutdown path releases the advisory lock
+   > through the ordinary `KekOpLockGuard` destructor, the same clean-exit
+   > path a completed rotation takes) rather than terminating its Postgres
+   > backend out from under it mid-statement.
+
+   If, and only if, step 2 has already shown a genuine wedge (an `idle` /
+   `idle in transaction` backend still holding the lock, or a `query_start`/
+   `xact_start` implausibly old for any registered-secrets scan) **and**
+   the check above could not identify a Yuzu server you can stop cleanly:
+
+   - **Re-confirm the pid is still the granted holder, at the moment you are
+     about to act — not from the `/status` reading you captured earlier.**
+     `lock_holder_captured_at` tells you how old that reading already is,
+     and Postgres reuses backend pids, so a pid that was correct when you
+     first read it can now belong to an unrelated connection. Re-run the
+     `pg_locks` query from step 1's third case (or `/status` again) and only
+     proceed if it still names the same pid:
+     ```sql
+     SELECT pid FROM pg_locks
+      WHERE locktype = 'advisory' AND classid = 2037545589
+        AND objid = (hashtext('secrets_kek_op')::bigint & 4294967295)::oid
+        AND granted
+        AND database = (SELECT oid FROM pg_database WHERE datname = current_database());
+     ```
+   - Only then does a DBA run `SELECT pg_terminate_backend(<pid>);`
+     deliberately — session-scoped advisory locks die with their session, so
+     terminating the backend releases the lock. If the target turned out to
+     be a Yuzu server after all, be ready to call `/rewrap` afterward — never
+     `/rotate`.
 
 **Two more staleness caveats, on top of "these are lock-free snapshots":**
 the pid you read can **vanish** (the backend has already exited normally
@@ -1688,7 +1747,11 @@ such pid" in step 2 as "already resolved, no action needed", not as an
 error) and can be **reused** by an unrelated later connection (Postgres
 recycles backend pids). Always corroborate against `pg_stat_activity` in the
 same narrow window as the `/status` read that produced the pid — never a pid
-captured minutes earlier.
+captured minutes earlier. `lock_holder_captured_at` (#2530 H1) is what makes
+"minutes earlier" checkable instead of assumed: it is the wall-clock instant
+the `lock_holder_pid` snapshot was taken, so before acting on a pid you can
+see for yourself whether it is fresh or something you should re-read before
+trusting.
 
 **Retirement preconditions — and why there is no retire endpoint.** An old
 KEK version is only safe to destroy when **both** hold: (1) zero stored

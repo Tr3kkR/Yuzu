@@ -246,9 +246,11 @@ std::string tool_result(std::string_view payload, const char* output_schema_json
     return result.str();
 }
 
-std::string utc_now_iso() {
-    const auto now = std::chrono::system_clock::now();
-    const auto tt = std::chrono::system_clock::to_time_t(now);
+// #2530 H1: arbitrary-instant twin of utc_now_iso() below, for formatting a
+// PAST captured instant (e.g. KekOpResult::lock_holder_captured_at) rather
+// than "now".
+std::string utc_iso_at(std::chrono::system_clock::time_point tp) {
+    const auto tt = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
 #if defined(_WIN32)
     gmtime_s(&tm, &tt);
@@ -258,6 +260,10 @@ std::string utc_now_iso() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
+}
+
+std::string utc_now_iso() {
+    return utc_iso_at(std::chrono::system_clock::now());
 }
 
 // Epoch seconds, caller-supplied (not read internally by the stores) so
@@ -1108,10 +1114,15 @@ static const ToolDef kTools[] = {
      "lock_held are null when the underlying query could not be determined "
      "(never a fabricated 0/false) — a null lock_held MUST NOT be read as "
      "\"no lock is held\"; it means the lock state is unknown, so corroborate "
-     "via pg_stat_activity before concluding anything. Read-only. Mirrors GET "
-     "/api/v1/secrets/kek/status. Requires Security:Read.",
+     "via pg_stat_activity before concluding anything. lock_holder_captured_at "
+     "(#2530 H1) is the ISO-8601 UTC instant the lock_held/lock_holder_pid "
+     "snapshot was taken -- null in lockstep with them when undetermined; a "
+     "pid without a visible capture instant can look current when it is "
+     "actually stale (Postgres backend pids are reused), so always re-confirm "
+     "a pid in pg_locks before acting on it, never trust one captured earlier. "
+     "Read-only. Mirrors GET /api/v1/secrets/kek/status. Requires Security:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
+     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"},"lock_holder_captured_at":{"type":["string","null"],"description":"ISO-8601 UTC instant the lock_held/lock_holder_pid snapshot was taken; null when undetermined; re-confirm the pid in pg_locks before acting on it, never trust one captured earlier"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -7007,6 +7018,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload.add("lock_holder_pid", static_cast<int64_t>(*result.lock_holder_pid));
                 else
                     payload.raw("lock_holder_pid", "null");
+                // #2530 H1: when the lock_held/lock_holder_pid snapshot
+                // above was taken — null in lockstep with them when
+                // undetermined. Mirrors kek_routes.cpp's REST twin exactly
+                // (ADR-1005 parity).
+                if (result.lock_holder_captured_at.has_value())
+                    payload.add("lock_holder_captured_at", utc_iso_at(*result.lock_holder_captured_at));
+                else
+                    payload.raw("lock_holder_captured_at", "null");
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

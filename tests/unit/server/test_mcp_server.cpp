@@ -5030,6 +5030,7 @@ TEST_CASE("MCP KEK: get_kek_status output schema advertises live_versions/lock_h
         CHECK(props.contains("live_versions"));
         CHECK(props.contains("lock_held"));
         CHECK(props.contains("lock_holder_pid"));
+        CHECK(props.contains("lock_holder_captured_at"));
         // cooldown_retry_after_ms is Cooldown-only (B2 amendment) — it must
         // NEVER appear on /status's schema or payload.
         CHECK_FALSE(props.contains("cooldown_retry_after_ms"));
@@ -5053,6 +5054,9 @@ TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, i
             r.live_versions = 3;
             r.lock_held = true;
             r.lock_holder_pid = 4242;
+            // #2530 H1: the capture-instant twin of lock_held/lock_holder_pid.
+            r.lock_holder_captured_at = std::chrono::system_clock::time_point{
+                std::chrono::seconds{1735689600}}; // 2025-01-01T00:00:00Z
             return r;
         };
         ts.start(tier);
@@ -5067,6 +5071,7 @@ TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, i
         CHECK(payload["live_versions"] == 3);
         CHECK(payload["lock_held"] == true);
         CHECK(payload["lock_holder_pid"] == 4242);
+        CHECK(payload["lock_holder_captured_at"] == "2025-01-01T00:00:00Z");
         // Read-only — exactly the generic mcp.get_kek_status|success entry
         // every tool call gets; NO separate domain audit row (matches
         // kek_routes.cpp GET /status, which never calls its own AuditFn).
@@ -5125,6 +5130,10 @@ TEST_CASE("MCP KEK: get_kek_status reports live_versions/lock_held as null when 
     CHECK(payload["live_versions"].is_null());
     REQUIRE(payload.contains("lock_held"));
     CHECK(payload["lock_held"].is_null());
+    // #2530 H1: undetermined lock_held must never carry a fabricated capture
+    // instant — a snapshot that was never taken has no "when".
+    REQUIRE(payload.contains("lock_holder_captured_at"));
+    CHECK(payload["lock_holder_captured_at"].is_null());
     CHECK(payload["live_versions"] != 0);
     CHECK(payload["lock_held"] != false);
 }

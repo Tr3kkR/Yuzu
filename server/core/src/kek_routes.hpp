@@ -42,6 +42,7 @@
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -138,6 +139,20 @@ struct KekOpResult {
     // database, since no single pid identifies it. Always check `lock_held`
     // first to disambiguate which of the three states a null `pid` means.
     std::optional<int> lock_holder_pid{};
+
+    /// #2530 H1 (Hermes round 2) — wall-clock instant the `lock_held`/
+    /// `lock_holder_pid` snapshot above was TAKEN (`KekOpLockHolder::captured_at`,
+    /// kek_op_lock.hpp), so a caller can see how stale the pid it is
+    /// looking at already is instead of implicitly trusting it as current.
+    /// `nullopt` in lockstep with `lock_held`/`lock_holder_pid` being
+    /// undetermined (the holder query itself failed) — never fabricated.
+    /// This does NOT make the snapshot any less stale by the time a caller
+    /// (or a DBA acting on it) reads it; it just makes the staleness
+    /// visible. See the runbook's termination step
+    /// (docs/user-manual/server-admin.md) for why a pid must still be
+    /// RE-CONFIRMED in `pg_locks` at the moment of any consequential action
+    /// — pids are reused.
+    std::optional<std::chrono::system_clock::time_point> lock_holder_captured_at{};
 };
 
 /// The three operations. Any may be empty (unset) -> route answers 503.

@@ -1212,9 +1212,19 @@ TEST_CASE("KEK op lock: the guard leaves nothing held on the connection it relea
     // Nothing left behind in pg_locks for this key. Checked from a THIRD
     // session so a re-entrant re-acquire on `a` cannot mask a leak — that
     // masking is exactly the UP-1 failure mode.
+    //
+    // #2530 H3 (Hermes round 2): `pg_locks` is CLUSTER-WIDE, and the 4 server
+    // test shards share one Postgres container — an unfiltered count here
+    // could observe a SIBLING SHARD's still-held `secrets_kek_op` lock in
+    // its own (different) database and flake this assertion, or worse, mask
+    // a real leak on THIS database behind a nonzero count that actually came
+    // from elsewhere. `AND database = current_database()` scopes the read to
+    // this test's own ephemeral database, matching kek_op_lock.hpp's
+    // production query and test_kek_op_lock_holder.cpp's cross-check helper.
     PgResult held{PQexec(observer.get(),
                          "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
-                         "AND classid = 2037545589")};
+                         "AND classid = 2037545589 AND database = (SELECT oid FROM "
+                         "pg_database WHERE datname = current_database())")};
     REQUIRE(held.status() == PGRES_TUPLES_OK);
     CHECK(std::string(PQgetvalue(held.get(), 0, 0)) == "0");
 

@@ -448,18 +448,33 @@ groups:
         annotations:
           summary: "secrets_kek_op advisory lock has been held for 30+ minutes"
           description: >-
-            See "Diagnosing a stuck KEK op lock" in
-            docs/user-manual/server-admin.md before acting. Scoped to this
-            server's own database (current_database()), not cluster-wide. A
-            healthy, long-running rewrap is indistinguishable from a wedged
-            backend by this gauge alone -- corroborate via lock_holder_pid
-            (GET /api/v1/secrets/kek/status) against pg_stat_activity before
-            concluding anything, and only a DBA should terminate a backend,
-            deliberately. This gauge HOLDS its prior value rather than
-            publishing a fabricated 0 on a database-read degrade, so a firing
-            alert during a database outage may reflect stale last-known state
-            rather than a currently-held lock -- check the yuzu-postgres
-            alerts first.
+            THIS MAY BE A HEALTHY YUZU SERVER MID-ROTATION, NOT A WEDGE -- a
+            large re-wrap legitimately holds this lock for its whole
+            duration, and 30+ minutes is expected on a big secrets table.
+            Terminating the holder mid-rotate produces a HALF-COMMITTED
+            rotation (new KEK version already active, re-wrap incomplete),
+            whose only recovery is POST /api/v1/secrets/kek/rewrap -- a
+            retried /rotate on top of that state mints a second, spurious,
+            never-retirable version and does not fix anything. Read "Diagnosing
+            a stuck KEK op lock" in docs/user-manual/server-admin.md in full
+            before touching pg_terminate_backend. Scoped to this server's own
+            database (current_database()), not cluster-wide. A healthy,
+            long-running rewrap is indistinguishable from a wedged backend by
+            this gauge alone -- corroborate via lock_holder_pid and
+            lock_holder_captured_at (GET /api/v1/secrets/kek/status) against
+            pg_stat_activity before concluding anything, and RE-CONFIRM the
+            pid is still the granted holder in pg_locks at the moment of
+            termination (Postgres pids are reused, and the /status reading
+            you are looking at is already stale by the time you act on it).
+            Only a DBA terminates a backend, deliberately, after that
+            re-confirmation, and only after checking whether the backend
+            belongs to a Yuzu server (pg_stat_activity.client_addr /
+            application_name where set) -- prefer stopping that server
+            cleanly over killing its backend. This gauge HOLDS its prior
+            value rather than publishing a fabricated 0 on a database-read
+            degrade, so a firing alert during a database outage may reflect
+            stale last-known state rather than a currently-held lock -- check
+            the yuzu-postgres alerts first.
 
       # #2530 G7-S6: sibling of YuzuInventoryStaleCountUnavailable above —
       # same freeze-detector shape, different gauge family. The KEK gauges

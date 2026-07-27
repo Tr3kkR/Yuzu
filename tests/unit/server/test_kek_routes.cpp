@@ -29,6 +29,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -458,6 +459,42 @@ TEST_CASE("kek_routes: GET /status's 200 body carries live_versions, lock_held, 
     auto body2 = json::parse(res2->body);
     CHECK(body2["lock_held"] == false);
     CHECK(body2["lock_holder_pid"].is_null());
+}
+
+// #2530 H1 (Hermes round 2): `lock_holder_captured_at` carries the instant
+// the lock_held/lock_holder_pid snapshot was taken, so a stale reading is
+// visible as stale rather than authoritative — never fabricated when the
+// snapshot itself is undetermined.
+TEST_CASE("kek_routes: GET /status's 200 body carries lock_holder_captured_at as an ISO-8601 "
+          "string alongside a determined lock_held, and null when undetermined",
+          "[kek_routes]") {
+    Harness h;
+    h.status_result.active_version = 3;
+    h.status_result.lock_held = true;
+    h.status_result.lock_holder_pid = 4242;
+    h.status_result.lock_holder_captured_at = std::chrono::system_clock::time_point{
+        std::chrono::seconds{1735689600}}; // 2025-01-01T00:00:00Z
+    h.wire();
+    auto res = h.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = json::parse(res->body);
+    REQUIRE(body.contains("lock_holder_captured_at"));
+    CHECK(body["lock_holder_captured_at"] == "2025-01-01T00:00:00Z");
+
+    // Undetermined snapshot (query failure) — the seam never populates
+    // lock_held/lock_holder_pid/lock_holder_captured_at in that case; the
+    // route must serialise all three as JSON null, never fabricate a
+    // timestamp for a snapshot that was never taken.
+    Harness h2;
+    REQUIRE_FALSE(h2.status_result.lock_held.has_value());
+    REQUIRE_FALSE(h2.status_result.lock_holder_captured_at.has_value());
+    h2.wire();
+    auto res2 = h2.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res2);
+    auto body2 = json::parse(res2->body);
+    REQUIRE(body2.contains("lock_holder_captured_at"));
+    CHECK(body2["lock_holder_captured_at"].is_null());
 }
 
 // #2530 T5 — a seam that could NOT determine `live_versions`/`lock_held`

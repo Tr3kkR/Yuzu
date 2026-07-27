@@ -13309,6 +13309,11 @@ private:
                     // KekOpLockHolder's doc comment).
                     result.lock_held = holder.lock_held;
                     result.lock_holder_pid = holder.pid;
+                    // #2530 H1: surface WHEN this snapshot was taken, not
+                    // just what it said — a stale pid corroborated against
+                    // pg_stat_activity minutes later can already belong to
+                    // an unrelated backend (pids are reused).
+                    result.lock_holder_captured_at = holder.captured_at;
                 } else {
                     spdlog::error("KEK status: lock-holder query failed; lock_held/"
                                  "lock_holder_pid left undetermined (never fabricated false)");

@@ -167,6 +167,21 @@ struct KekOpLockHolder {
     bool determined{false};   ///< false = the pg_locks query itself failed; `lock_held`/`pid` meaningless
     bool lock_held{false};    ///< meaningful only when `determined`; true iff a granted holder row exists (even with a NULL pid)
     std::optional<int> pid{}; ///< meaningful only when `determined && lock_held`; nullopt = unheld, or held with an unreported pid
+
+    /// #2530 H1 (Hermes round 2) — wall-clock instant this observation was
+    /// taken (captured before the `SELECT` fires, so it reflects "as of
+    /// when we asked", not "as of when the answer arrived"). This exists
+    /// because `pid` alone is a snapshot with no visible age: a DBA acting
+    /// on a `/status` response minutes after it was generated has no way to
+    /// tell a fresh reading from a stale one, and Postgres backend pids are
+    /// REUSED — an OS pid that genuinely held the lock a minute ago can
+    /// belong to an entirely unrelated backend by the time someone reads it.
+    /// Surfaced on every determination (even a failed one, so a caller can
+    /// tell how stale the failed attempt itself was) — never treat this as
+    /// a substitute for re-confirming the pid against `pg_locks` at the
+    /// moment of any consequential action (see the runbook's termination
+    /// step, docs/user-manual/server-admin.md).
+    std::chrono::system_clock::time_point captured_at{};
 };
 
 /// `exclude_pid`: when non-negative, a holder whose pid equals `exclude_pid`
@@ -177,6 +192,11 @@ struct KekOpLockHolder {
 /// takes this lock itself, so exclusion is a no-op there; the parameter
 /// exists for a future caller that queries from inside its own held lock.
 [[nodiscard]] inline KekOpLockHolder kek_op_lock_holder(PGconn* conn, int exclude_pid = -1) {
+    // #2530 H1: captured BEFORE the round trip, so it reflects "as of when
+    // we asked" — the instant this observation is anchored to for staleness
+    // purposes, not the (later, and unknowable from here) instant the
+    // caller eventually reads the result.
+    const auto captured_at = std::chrono::system_clock::now();
     // #2530 G7-B3: `AND database = ...` is load-bearing, not defensive
     // polish. `pg_try_advisory_lock`/`pg_advisory_unlock` are
     // DATABASE-scoped (the same (classid, objid) pair is a distinct lock per
@@ -197,16 +217,19 @@ struct KekOpLockHolder {
     pg::PgResult res{PQexec(conn, kSql)};
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("KEK op: lock-holder query failed: {}", PQerrorMessage(conn));
-        return KekOpLockHolder{.determined = false, .lock_held = false, .pid = std::nullopt};
+        return KekOpLockHolder{
+            .determined = false, .lock_held = false, .pid = std::nullopt, .captured_at = captured_at};
     }
     // No granted holder row at all -> determined, genuinely unheld.
     if (PQntuples(res.get()) < 1)
-        return KekOpLockHolder{.determined = true, .lock_held = false, .pid = std::nullopt};
+        return KekOpLockHolder{
+            .determined = true, .lock_held = false, .pid = std::nullopt, .captured_at = captured_at};
     // #2530 G7-S1: a granted row with a NULL pid is still a HELD lock — see
     // the struct doc comment above for why this must not collapse into "no
     // holder".
     if (PQgetisnull(res.get(), 0, 0))
-        return KekOpLockHolder{.determined = true, .lock_held = true, .pid = std::nullopt};
+        return KekOpLockHolder{
+            .determined = true, .lock_held = true, .pid = std::nullopt, .captured_at = captured_at};
     // #2530 G7-S2: std::from_chars instead of std::atoi — atoi silently
     // returns 0 on a parse failure, which is a PLAUSIBLE-LOOKING pid; a
     // malformed value here must surface as "could not determine", never as
@@ -217,11 +240,14 @@ struct KekOpLockHolder {
     const auto parsed = std::from_chars(raw, end, pid);
     if (parsed.ec != std::errc{} || parsed.ptr != end) {
         spdlog::error("KEK op: lock-holder query returned an unparseable pid: '{}'", raw);
-        return KekOpLockHolder{.determined = false, .lock_held = false, .pid = std::nullopt};
+        return KekOpLockHolder{
+            .determined = false, .lock_held = false, .pid = std::nullopt, .captured_at = captured_at};
     }
     if (exclude_pid >= 0 && pid == exclude_pid)
-        return KekOpLockHolder{.determined = true, .lock_held = false, .pid = std::nullopt};
-    return KekOpLockHolder{.determined = true, .lock_held = true, .pid = pid};
+        return KekOpLockHolder{
+            .determined = true, .lock_held = false, .pid = std::nullopt, .captured_at = captured_at};
+    return KekOpLockHolder{
+        .determined = true, .lock_held = true, .pid = pid, .captured_at = captured_at};
 }
 
 } // namespace yuzu::server::detail
