@@ -9,6 +9,7 @@
 #include "mcp_policy.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
+#include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -2146,7 +2147,9 @@ McpServer::HandlerFn McpServer::build_handler(
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync) {
+    AuthDB* auth_db, DirectorySync* directory_sync,
+    yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
+    StreamPrincipalAuditFn principal_audit_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -5732,6 +5735,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto bridge_sid = req.get_header_value("Mcp-Session-Id");
                 auto bridge_token = extract_progress_token(rpc.params);
                 bool bridge_active = false;
+                // 2f PR 3b (C8): true once THIS request owns a streamed record.
+                // Distinct from bridge_active - every streamed record is a bridge
+                // record, but a GET-only bridge record must never take the SSE arm.
+                bool streamed_active = false;
+                // Held from admission until the provider install moves it into the
+                // releaser. Move-only, so a plain optional (not a captured copy);
+                // ~Lease returns the slot on EVERY early return between here and
+                // the install, which is what makes the failure paths leak-free
+                // without a guard at each one.
+                std::optional<yuzu::server::detail::StreamBudget::Lease> stream_lease;
                 const auto bridge_degrade = [&](const char* reason) {
                     if (metrics != nullptr) {
                         try {
@@ -5743,8 +5756,62 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
                 };
-                if (streaming_on && bridge != nullptr && execution_tracker != nullptr &&
-                    !bridge_sid.empty() && bridge_token.has_value()) {
+                // Answers a streamed-POST admission denial. ONE place, because the
+                // three things a denial owes - the CLOSED-set reject metric, the
+                // denial audit row, and the A4 body - drifted apart every time a
+                // sibling surface hand-rolled them. Mirrors the GET tail's `deny`.
+                //
+                // Nothing was dispatched and no execution row exists at any call
+                // site (reserve runs before create_execution precisely so this is
+                // truthful), so the detail says so rather than leaving the reader
+                // to infer it.
+                const auto streamed_reject = [&](int status, int code, std::string_view message,
+                                                 const char* metric_reason,
+                                                 std::string_view remediation,
+                                                 long retry_after_ms = -1) {
+                    const auto cid = yuzu::server::detail::make_correlation_id();
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_stream_rejects_total",
+                                          {{"reason", metric_reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                    session_audit("mcp.session.reject", "failure",
+                                  bridge_sid.substr(0, 8),
+                                  std::string("reason=") + metric_reason + " cid=" + cid +
+                                      " surface=post dispatched=false");
+                    res.status = status;
+                    if (retry_after_ms > 0) {
+                        // Whole seconds, rounded up - the platform 429 convention is
+                        // BOTH the header and the A4 body field.
+                        res.set_header("Retry-After", std::to_string((retry_after_ms + 999) / 1000));
+                    }
+                    res.set_content(a4_error(code, message, remediation, retry_after_ms, cid),
+                                    "application/json");
+                };
+                const bool bridge_eligible = streaming_on && bridge != nullptr &&
+                                             execution_tracker != nullptr && !bridge_sid.empty() &&
+                                             bridge_token.has_value();
+                // S0 vs S1. Evaluated HERE because reserve() below MOVES
+                // bridge_token, so anything derived from it must be read first.
+                //
+                // `Accept` is the client's half of the opt-in and _meta.progressToken
+                // is the real gate (a plain tool call never streams). Note
+                // accept_wants_sse treats `;q=0` as opting IN - pinned deliberately
+                // in test_mcp_transport.cpp; a client that sends a progressToken AND
+                // q=0 is contradicting itself, and honouring the token is the useful
+                // reading.
+                //
+                // The three wiring deps are part of eligibility, not assertions: a
+                // build_handler caller that omits any of them (every pre-3b test)
+                // gets today's plain path rather than a stream it cannot service.
+                const bool streamed_mode =
+                    bridge_eligible && stream_budget != nullptr && mcp_sessions != nullptr &&
+                    mcp::transport::accept_wants_sse(req.get_header_value("Accept"));
+                if (bridge_eligible) {
                     // The session id was validated (principal-bound) at handler
                     // entry; reserve re-checks it against the registry anyway
                     // (no TOCTOU widening - a dead session just degrades).
@@ -5752,11 +5819,98 @@ McpServer::HandlerFn McpServer::build_handler(
                     // bad_alloc here must degrade to the plain path, not turn a
                     // dispatchable command into a 500 (byte-identical contract).
                     try {
+                        // Admission BEFORE reservation, and only for streamed
+                        // intent: a streamed POST pins an HTTP worker for its whole
+                        // life, so it is subject to the same shared budget as a GET
+                        // SSE stream. Ordered first because a budget rejection must
+                        // not leave a bridge record behind to unwind.
+                        if (streamed_mode) {
+                            auto acquired = stream_budget->try_acquire(
+                                mcp::sse_bus::SseSurface::kMcpPost, session->username,
+                                mcp::sse_bus::kPerPrincipalMcpPost);
+                            if (!acquired.lease) {
+                                // Capacity, and honestly retryable: name the reason
+                                // in the CLOSED label set, tell the client how long
+                                // to wait, and dispatch NOTHING. Reserve was never
+                                // called, so there is no record and no execution row.
+                                const char* const why =
+                                    acquired.reject_reason != nullptr
+                                        ? acquired.reject_reason
+                                        : yuzu::server::detail::StreamBudget::kRejectGlobal;
+                                const bool per_principal =
+                                    std::string_view(why) ==
+                                    yuzu::server::detail::StreamBudget::kRejectPerPrincipal;
+                                streamed_reject(
+                                    429, mcp::kMcpStreamCap, "Concurrent stream cap reached",
+                                    per_principal ? "post_per_principal_cap" : "post_global_cap",
+                                    per_principal
+                                        ? "wait for one of your streamed calls to finish, or "
+                                          "retry without an SSE Accept for a plain response"
+                                        : "retry shortly, or retry without an SSE Accept for a "
+                                          "plain response",
+                                    mcp::kMcpStreamCapRetryAfterMs);
+                                return;
+                            }
+                            stream_lease.emplace(std::move(acquired.lease));
+                        }
                         auto rr = bridge->reserve(bridge_sid, session->username, id,
                                                   std::move(bridge_token),
-                                                  /*streamed_intent=*/false);
+                                                  /*streamed_intent=*/streamed_mode);
                         if (rr.ok) {
                             bridge_active = true;
+                            streamed_active = streamed_mode;
+                        } else if (streamed_mode) {
+                            // The streamed arm ANSWERS a rejection instead of
+                            // degrading: the client asked for a stream and must
+                            // learn it is not getting one. Every reject reason is
+                            // mapped explicitly - a new one added to reserve()
+                            // without a mapping here falls to the default and is
+                            // still answered honestly rather than silently.
+                            //
+                            // NO abandon() on any of these: the reservation did not
+                            // succeed, and on duplicate_request_id the key belongs
+                            // to the OLDER live request, which abandon would erase.
+                            const std::string_view why =
+                                rr.reject_reason != nullptr ? rr.reject_reason : "";
+                            if (why == "disabled" || why == "shutdown") {
+                                // Not the client's doing and not retry-shaped: the
+                                // server is withdrawing the capability. The plain
+                                // response is self-sufficient, so degrade to it.
+                                bridge_degrade("reserve_rejected");
+                                stream_lease.reset();
+                            } else if (why == "duplicate_request_id") {
+                                // A protocol error, not capacity - retrying cannot
+                                // help while the older request is live, so no
+                                // Retry-After. 409 over 429 for the same reason.
+                                streamed_reject(409, mcp::kInvalidRequest,
+                                                "Request id already in flight on this session",
+                                                "post_duplicate_request_id",
+                                                "resume the in-flight request on the GET stream, "
+                                                "or issue this call with a fresh id");
+                                return;
+                            } else if (why == "unknown_session") {
+                                // The session died between the entry check and here.
+                                // Same shape the entry gate uses, so a client sees
+                                // one consistent answer for one condition.
+                                streamed_reject(404, mcp::kMcpUnknownSession,
+                                                "Unknown or expired session",
+                                                "post_unknown_session",
+                                                "re-initialize: send an initialize request to "
+                                                "obtain a fresh Mcp-Session-Id");
+                                return;
+                            } else {
+                                // global_cap | pin_slots - capacity, retryable.
+                                streamed_reject(
+                                    429, mcp::kMcpStreamCap, "Streamed request capacity reached",
+                                    why == "pin_slots" ? "post_pin_slots" : "post_global_cap",
+                                    why == "pin_slots"
+                                        ? "this session already has the maximum streamed calls in "
+                                          "flight; wait for one to finish"
+                                        : "retry shortly, or retry without an SSE Accept for a "
+                                          "plain response",
+                                    mcp::kMcpStreamCapRetryAfterMs);
+                                return;
+                            }
                         } else {
                             // L1: a coarse single degrade reason - reserve()
                             // already counted the FINE reject reason into
@@ -5768,7 +5922,17 @@ McpServer::HandlerFn McpServer::build_handler(
                             bridge_degrade("reserve_rejected");
                         }
                     } catch (...) {
+                        // A THROW is not a REJECT. A rejection is the server saying
+                        // "no" and is answered; an allocation failure is answered by
+                        // doing LESS - degrade to the plain path, which is exactly
+                        // what this request would have got without an SSE Accept.
+                        // Never 429 (retry advice into an OOM is worse than useless)
+                        // and never 500 (the command is still perfectly dispatchable).
+                        // The lease unwinds with the optional.
                         bridge_degrade("reserve_threw");
+                        bridge_active = false;
+                        streamed_active = false;
+                        stream_lease.reset();
                     }
                 }
 
@@ -5926,6 +6090,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
+                // ── Post-dispatch containment envelope (2f PR 3b, C8) ─────────
+                // From here the command IS RUNNING on real agents. Everything
+                // below can throw - set_agents_targeted and refresh_counts each
+                // lock, and refresh_counts also allocates JSON and publishes bus
+                // events; the result strings allocate; arm, bind, the pump and the
+                // header work all allocate. An escaped throw here is a naked 500
+                // for a command that will keep running and keep reporting, which
+                // tells the client nothing it can act on and loses the execution_id
+                // it needs to recover.
+                //
+                // The catch is STREAMED-ONLY and RETHROWS otherwise: the plain path
+                // keeps today's behaviour byte-for-byte, including its 500. Fixing
+                // that for the plain path is a real but separate change (#2408's
+                // siblings have the same shape), and C8 does not get to alter the
+                // stop-ship surface in passing.
+                try {
                 // Update agents_targeted on the execution row now that
                 // dispatch confirmed how many agents the command went to.
                 // Mirrors workflow_routes.cpp:1461-1463.
@@ -5972,7 +6152,270 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The plain JSON below answers this POST either way - GET-only
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).
-                if (bridge_active) {
+                // ── S6 (2f PR 3b, C8): arm STREAMING and install the SSE provider ──
+                // The POST response itself becomes the progress channel: frames as
+                // they happen, the JSON-RPC result LAST, then EOF. Any outcome
+                // other than a clean arm falls through to the plain JSON below -
+                // the request is still perfectly answerable, and a degraded answer
+                // beats an error.
+                if (streamed_active) {
+                    const auto outcome =
+                        bridge->arm(bridge_sid, id, McpStreamBridge::ArmMode::kStreaming, result);
+                    if (outcome == McpStreamBridge::ArmOutcome::kArmed) {
+                        // The sink is a WAKE CHANNEL, not a frame queue: a streamed
+                        // record publishes ring-only, so the pump asks the bridge
+                        // what to write and the projector pokes this to say "now".
+                        auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+                        auto key = bridge->bind_post_sink(bridge_sid, id, sink);
+                        if (!key.has_value()) {
+                            // Nothing was installed, so the record must not stay
+                            // kStreaming waiting for a closer that will never come.
+                            // Contained: this is cleanup, and a cleanup failure must
+                            // not replace the answer we can still give.
+                            try {
+                                (void)bridge->on_post_closed(bridge_sid, id);
+                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                            }
+                            bridge_degrade("bind_post_sink_failed");
+                            stream_lease.reset();
+                        } else {
+                            // Everything from here to the install is fallible and
+                            // runs with the record already kStreaming, so its own
+                            // catch owns BOTH the park and the answer. Two arms are
+                            // needed because the key exists only inside this branch:
+                            // before bind there is no key to close by.
+                            const std::string record_key = *key;
+                            try {
+                                const std::string cid =
+                                    yuzu::server::detail::make_correlation_id();
+                                // Built BEFORE the install: once the provider is
+                                // attached the headers are sealed and a throw can no
+                                // longer be answered, so nothing that allocates may
+                                // remain after it.
+                                const std::string attach_detail =
+                                    "cid=" + cid + " surface=post execution_id=" + execution_id;
+                                const std::string audit_sid =
+                                    yuzu::server::detail::sanitize_detail_value(
+                                        bridge_sid.substr(0, 8));
+                                // Stamped, not re-derived: this row is written from
+                                // ~Response, by which time a revoked credential can
+                                // no longer be resolved - and a revocation close is
+                                // exactly the row that must still name its actor.
+                                // Derived EXACTLY as the GET handler derives it, so
+                                // the two surfaces cannot disagree about who acted.
+                                mcp::StreamAuditPrincipal audit_principal{
+                                    .id = session->username,
+                                    .role = auth::role_to_string(auth::effective_role(*session)),
+                                    .cls = session->principal_kind == "engine"
+                                               ? std::string("engine")
+                                               : std::string{}};
+                                auto req_copy = std::make_shared<httplib::Request>(req);
+
+                                auto revalidate = [req_copy, principal = session->username,
+                                                   revalidate_fn]() -> mcp::StreamRevalidate {
+                                    if (!revalidate_fn) {
+                                        return mcp::StreamRevalidate::kValid; // test seam
+                                    }
+                                    return revalidate_fn(*req_copy, principal);
+                                };
+                                // Also the TTL slide: a live streamed POST keeps its
+                                // session alive exactly as a GET tick does.
+                                auto session_alive = [mcp_sessions, bridge_sid,
+                                                      principal = session->username] {
+                                    return mcp_sessions->validate_and_touch(bridge_sid, principal) ==
+                                           McpSessionRegistry::ValidateResult::kValid;
+                                };
+                                auto take_batch = [bridge, record_key](bool cap_expired) {
+                                    return bridge->take_post_batch(record_key, cap_expired);
+                                };
+                                auto on_final_written = [bridge, record_key] {
+                                    (void)bridge->on_final_written(record_key);
+                                };
+
+                                mcp::McpPostPump::Config pump_cfg{};
+                                pump_cfg.revalidate_grace_jitter_max =
+                                    pump_cfg.revalidate_grace / 2;
+                                pump_cfg.revalidate_max_staleness =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        EnginePrincipalStore::kAuthCacheTtl);
+                                // Restated at the second install site for the same
+                                // reason it is stated at the first (#2367): raising
+                                // the cache TTL past the grace window would leave a
+                                // fully-aged entry with no grace at all. #2447: this
+                                // reads the engine-liveness half ONLY - never touch
+                                // the token half.
+                                static_assert(
+                                    EnginePrincipalStore::kAuthCacheTtl * 4 <=
+                                        mcp::kMcpRevalidateGraceDefault,
+                                    "engine liveness cache TTL must stay well under the "
+                                    "revalidate grace window (#2367) - otherwise a fully-aged "
+                                    "entry leaves no grace at all");
+                                auto pump = std::make_shared<mcp::McpPostPump>(
+                                    sink, std::move(take_batch), std::move(on_final_written),
+                                    std::move(revalidate), std::move(session_alive), pump_cfg,
+                                    mcp::McpPostPump::ClockFn{}, metrics, cid, execution_id);
+
+                                // Resolved once, here, so the releaser never has to
+                                // look a metric up in a destructor. Nullable: metrics
+                                // is an optional dependency and streaming does not
+                                // require it.
+                                yuzu::Gauge* const post_gauge =
+                                    metrics != nullptr
+                                        ? &metrics->gauge("yuzu_mcp_post_streams_active")
+                                        : nullptr;
+                                // Gauge::increment locks and is NOT noexcept, so the
+                                // releaser must only undo an increment that actually
+                                // happened - otherwise a throw here leaves the gauge
+                                // permanently negative.
+                                auto incremented = std::make_shared<bool>(false);
+                                // The lease is move-only and httplib's releaser is a
+                                // copyable std::function, so it cannot be captured
+                                // directly. The GET path dodges this by keeping the
+                                // lease inside its sink; a streamed POST sink has no
+                                // such home, so give it one here.
+                                auto lease_home =
+                                    std::make_shared<yuzu::server::detail::StreamBudget::Lease>(
+                                        std::move(*stream_lease));
+                                stream_lease.reset();
+
+                                // httplib emplaces this header rather than replacing
+                                // it, so the application/json set at handler entry
+                                // would ride along as a SECOND Content-Type (see the
+                                // note at the DELETE handler). Drop it first.
+                                res.headers.erase("Content-Type");
+                                res.set_header("X-Correlation-Id", cid);
+                                res.set_header("Cache-Control", "no-cache");
+                                res.set_header("X-Accel-Buffering", "no");
+                                res.set_header("X-Content-Type-Options", "nosniff");
+
+                                auto releaser = [bridge, record_key, pump, lease_home, post_gauge,
+                                                 incremented, req_copy, audit_principal, audit_sid,
+                                                 execution_id, principal_audit_fn,
+                                                 audit_fn](bool) noexcept {
+                                    // Ordered by what is owed to whom: the record's
+                                    // lifecycle and the admission slot FIRST, because
+                                    // they gate other requests, and only then the
+                                    // observability, which can fail without harming
+                                    // anyone. Runs inside ~Response - a throw from
+                                    // here is std::terminate (#2037's class).
+                                    try {
+                                        (void)bridge->on_post_closed_keyed(record_key);
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                    }
+                                    lease_home->release();
+                                    try {
+                                        if (post_gauge != nullptr && *incremented) {
+                                            post_gauge->decrement();
+                                        }
+                                        auto reason = pump->close_reason();
+                                        if (reason == mcp::McpStreamClose::kNone) {
+                                            // The modal case: httplib checks peer
+                                            // liveness BEFORE each tick, so a client
+                                            // that goes away is often never seen by
+                                            // the pump at all. `none` is also outside
+                                            // the closed label set.
+                                            reason = mcp::McpStreamClose::kClientGone;
+                                        }
+                                        const std::string detail =
+                                            std::string("reason=") + mcp::to_string(reason) +
+                                            " surface=post execution_id=" + execution_id;
+                                        if (principal_audit_fn) {
+                                            (void)yuzu::server::detail::
+                                                try_persist_audit_for_principal(
+                                                    principal_audit_fn, *req_copy,
+                                                    "mcp.stream.close", "success", audit_principal,
+                                                    "McpSession", audit_sid, detail);
+                                        } else {
+                                            (void)yuzu::server::detail::try_persist_audit(
+                                                audit_fn, *req_copy, "mcp.stream.close", "success",
+                                                "McpSession", audit_sid, detail);
+                                        }
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                        // The slot and the record are already home.
+                                    }
+                                };
+
+                                res.set_chunked_content_provider(
+                                    "text/event-stream",
+                                    [pump](std::size_t, httplib::DataSink& s) {
+                                        return pump->pump_once(
+                                            [&s](const char* d, std::size_t n) {
+                                                return s.write(d, n);
+                                            });
+                                    },
+                                    yuzu::server::detail::adopt_quota_slot_into_stream(
+                                        std::move(releaser)));
+
+                                if (post_gauge != nullptr) {
+                                    post_gauge->increment();
+                                    *incremented = true;
+                                }
+                                // AFTER the install, deliberately - an attach
+                                // audited before a failed install records a stream
+                                // that never existed. The cost is that the headers
+                                // are already sealed, so unlike the GET tail this
+                                // cannot answer a failed audit with Sec-Audit-Failed;
+                                // set-and-proceed is the only posture left, and the
+                                // stream is real either way.
+                                (void)yuzu::server::detail::try_persist_audit(
+                                    audit_fn, req, "mcp.stream.attach", "success", "McpSession",
+                                    audit_sid, attach_detail);
+                                mcp_audit("success", std::string("command_id=") + command_id +
+                                                         " execution_id=" + execution_id +
+                                                         " surface=post");
+                                return; // the provider IS the response
+                            } catch (...) {
+                                // Post-dispatch: park (the record keeps its
+                                // subscription and its latched terminal, so a GET
+                                // resume still gets the answer) and tell the client
+                                // where to find the result. Both cleanup calls are
+                                // contained - neither may replace the answer.
+                                try {
+                                    (void)bridge->on_post_closed_keyed(record_key);
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                                stream_lease.reset();
+                                bridge_degrade("stream_install_failed");
+                                res.status = 500;
+                                res.set_content(
+                                    a4_error(kInternalError,
+                                             "streamed response could not be established",
+                                             "the command IS running - fetch the result by "
+                                             "execution_id (get_execution_status), or retry "
+                                             "without an SSE Accept",
+                                             -1),
+                                    "application/json");
+                                return;
+                            }
+                        }
+                    } else {
+                        // Not armed, so nothing streams. Each outcome means
+                        // something different and only one of them is routine.
+                        if (outcome == McpStreamBridge::ArmOutcome::kAlreadyArmed) {
+                            // A caller-invariant violation: some other path armed
+                            // this key. It may already be kStreaming with no sink
+                            // and no provider, which nothing would close - park it
+                            // rather than leave it to the 600s backstop.
+                            try {
+                                (void)bridge->on_post_closed(bridge_sid, id);
+                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                            }
+                            bridge_degrade("arm_already_armed");
+                        } else if (outcome == McpStreamBridge::ArmOutcome::kDegradedGetOnly) {
+                            // A cancel arrived while arming and arm consumed it. The
+                            // record is GET-only now and released its own charge;
+                            // the plain response below still answers the call.
+                            bridge_degrade("arm_cancelled");
+                        } else {
+                            // kAborted | kNotFound - abandon won, or the record is
+                            // already gone. Nothing to clean up.
+                            bridge_degrade("arm_not_armed");
+                        }
+                        streamed_active = false;
+                        stream_lease.reset();
+                    }
+                }
+                if (bridge_active && !streamed_active) {
                     // GUARD (Sol code-review finding, 2026-07-23): passing the
                     // lvalue `result` to arm()'s by-value result_base copies it,
                     // and arm() builds a fallback string, both BEFORE the phase
@@ -6005,6 +6448,34 @@ McpServer::HandlerFn McpServer::build_handler(
                                          " execution_id=" + execution_id);
                 res.set_content(success_response(id, result), "application/json");
                 return;
+                } catch (...) {
+                    // Close of the post-dispatch containment envelope opened above.
+                    if (!streamed_active) {
+                        throw; // plain path keeps today's behaviour exactly
+                    }
+                    // The record never reached kStreaming (the install branch owns
+                    // that window and answers its own failures), so it is still
+                    // kArming with the command running. Park it: the subscription
+                    // and any latched terminal survive, so a GET resume still
+                    // delivers the answer. NOT abandon, which would erase them, and
+                    // NOT mark_cancelled - unlike the dispatch-throw and zero-agents
+                    // paths above, this command was dispatched and is still going.
+                    try {
+                        (void)bridge->park_after_dispatch_failure(bridge_sid, id);
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    }
+                    stream_lease.reset();
+                    bridge_degrade("post_dispatch_threw");
+                    res.status = 500;
+                    res.set_content(
+                        a4_error(kInternalError, "the command was dispatched but the response "
+                                                 "could not be completed",
+                                 "the command IS running - fetch the result by execution_id "
+                                 "(get_execution_status)",
+                                 -1),
+                        "application/json");
+                    return;
+                }
             }
 
             // ── set_tag (#289) ────────────────────────────────────────────
@@ -8867,7 +9338,13 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                            sessions, mcp_streaming_disabled, std::move(allowed_origins),
                            software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync));
+                           auth_db, directory_sync,
+                           // 2f PR 3b: the streamed-POST arm leases from the SAME
+                           // budget as the GET channel above (which COPIED these, so
+                           // moving here is safe) - one arithmetic for every
+                           // held-open worker, whichever verb pinned it.
+                           stream_budget, std::move(revalidate_fn),
+                           std::move(principal_audit_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

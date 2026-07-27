@@ -489,10 +489,18 @@ public:
         metrics_.describe("yuzu_mcp_streams_active",
                           "MCP GET SSE streams currently held open (each pins one HTTP worker)",
                           "gauge");
+        // Deliberately a SEPARATE series from the GET gauge above rather than a
+        // label on it: the two have different lifetimes (a GET channel is
+        // open-ended, a streamed POST is bounded by its response cap) and
+        // different owners, so summing them would hide which kind is saturating.
+        metrics_.describe("yuzu_mcp_post_streams_active",
+                          "MCP streamed-POST (SSE-on-POST) responses currently held open (each "
+                          "pins one HTTP worker)",
+                          "gauge");
         metrics_.describe("yuzu_http_held_open_responses",
                           "SSE responses held open right now across ALL surfaces (MCP GET, "
-                          "/api/v1/events, dashboard drawer, legacy /events) — each pins one "
-                          "HTTP worker thread",
+                          "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events) — "
+                          "each pins one HTTP worker thread",
                           "gauge");
         metrics_.describe("yuzu_http_held_open_capacity",
                           "Held-open responses this server is sized for (--max-sse-streams, "
@@ -525,7 +533,15 @@ public:
                           "cursor falls behind gets a 404 and must re-initialize",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_rejects_total",
-                          "MCP GET SSE stream attach denials by reason", "counter");
+                          // Covers the GET attach denials AND the streamed-POST
+                          // ADMISSION denials (post_* reasons). It does NOT cover
+                          // every streamed-POST refusal: a bridge-level reserve
+                          // reject is counted by the bridge's own
+                          // yuzu_mcp_bridge_reject_total. Two families, split by who
+                          // refused, not by surface.
+                          "MCP SSE stream denials by reason — GET attach denials plus "
+                          "streamed-POST admission denials",
+                          "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
         metrics_.describe("yuzu_mcp_stream_publish_failures_total",
@@ -639,6 +655,7 @@ public:
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
+        metrics_.gauge("yuzu_mcp_post_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
@@ -775,7 +792,15 @@ public:
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
-                            "stream_handover_pending", "replay_window_exceeded", "origin"}) {
+                            "stream_handover_pending", "replay_window_exceeded", "origin",
+                            // 2f PR 3b streamed-POST admission denials. Prefixed
+                            // `post_` because they answer a DIFFERENT question from
+                            // the GET labels above: which admission gate refused a
+                            // streamed tool call, not which attach check refused a
+                            // channel. The budget's own two reasons are re-labelled
+                            // rather than passed through for that reason.
+                            "post_per_principal_cap", "post_global_cap", "post_pin_slots",
+                            "post_duplicate_request_id", "post_unknown_session"}) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
         // Pre-seed both supported MCP protocol revisions to 0 so a

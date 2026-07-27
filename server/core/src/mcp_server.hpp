@@ -336,7 +336,24 @@ public:
                             // optional deps; access_review_store == nullptr leaves the
                             // whole access-review tool family answering "unavailable".
                             AccessReviewStore* access_review_store = nullptr,
-                            AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr);
+                            AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
+                            // 2f PR 3b (streamed POST): the SAME shared held-open
+                            // budget the GET channel leases from - a streamed POST
+                            // pins an HTTP worker exactly as a GET SSE stream does,
+                            // so it must be admitted by the same arithmetic. All
+                            // three are trailing-defaulted for the test seams;
+                            // PRODUCTION MUST WIRE ALL THREE when streaming is on,
+                            // for the same reasons build_get_handler states: without
+                            // the budget there is no admission control on held-open
+                            // workers, without re-validation a revoked credential
+                            // keeps its stream, and without the principal sink the
+                            // close audit cannot name an actor whose credential may
+                            // already be gone. Absent any of them the POST simply
+                            // never streams - it answers plain JSON, byte-identical
+                            // to today, which is the correct degradation.
+                            yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+                            StreamRevalidateFn revalidate_fn = {},
+                            StreamPrincipalAuditFn principal_audit_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor

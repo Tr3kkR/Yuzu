@@ -759,7 +759,16 @@ public:
     /// noexcept boundary: httplib runs providers on a bare ThreadPool task.
     bool pump_once(const WriteFn& write);
 
+    /// Why this response closed, for the releaser's `mcp.stream.close` audit.
+    /// FIRST reason wins (the first is the cause; later ones are its
+    /// consequences), and every close path records BEFORE its observability, so
+    /// the audit can never disagree with yuzu_mcp_stream_closes_total. kNone =
+    /// the pump never closed it, which the releaser reads as the client going
+    /// away - the modal case, since httplib checks liveness before each tick.
+    [[nodiscard]] McpStreamClose close_reason() const noexcept;
+
 private:
+    void note_close_reason(McpStreamClose reason) noexcept;
     bool pump_once_impl(const WriteFn& write);
     /// Writes the close frame (except for kCompleted, which EOFs after a real
     /// final) and always returns false.
@@ -777,6 +786,7 @@ private:
     ClockFn clock_;
     std::chrono::steady_clock::time_point deadline_;
     RevalidateGrace grace_;
+    std::atomic<McpStreamClose> close_reason_{McpStreamClose::kNone};
 };
 
 /// The `GET /mcp/v1/` tail, called by `McpServer::build_get_handler` after its
