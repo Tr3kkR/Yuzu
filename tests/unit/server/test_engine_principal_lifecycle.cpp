@@ -42,6 +42,7 @@
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -83,18 +84,46 @@ void setup_engine_principal_store_pg_template(const std::string& dsn) {
 yuzu::test::PgTestTemplate engine_principal_lifecycle_template{
     "engineprincipal_lc", &setup_engine_principal_store_pg_template};
 
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per test (the
+// dominant Windows [pg]-shard cost, #2354 — see test_software_inventory_store
+// .cpp's SwinvShared, the reference conversion). Built lazily; at testRunEnded
+// the pool is drained and the clone dropped (keep_until_run_end). Every test
+// in this file is CRUD-only against the store (the fail-closed arms build
+// their own garbage-DSN pools and never touch the shared clone), so there are
+// no per-case-database carve-outs.
+struct EpLcShared {
+    yuzu::test::PostgresTestDb db{engine_principal_lifecycle_template};
+    std::optional<yuzu::server::pg::PgPool> pool;
+    EpLcShared() {
+        REQUIRE(db.available());
+        pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+EpLcShared& ep_lc_shared() {
+    static EpLcShared s;
+    return s;
+}
+
+/// Same call-site interface as before; now a fresh store per fixture over the
+/// file-wide shared clone/pool, TRUNCATE-restored at construction (the ctor's
+/// migration check is a no-op on the already-migrated clone).
 class EnginePrincipalStorePg {
 public:
     EnginePrincipalStorePg() {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        db_.emplace(engine_principal_lifecycle_template);
-        INFO("[EnginePrincipalStorePg] fixture status: " << db_->error());
-        REQUIRE(db_->available());
-        pool_.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db_->dsn(), .size = 4});
-        REQUIRE(pool_->valid());
-        store_ = std::make_unique<EnginePrincipalStore>(*pool_);
+        auto lease = ep_lc_shared().pool->acquire();
+        REQUIRE(lease);
+        auto trunc = yuzu::server::pg::exec_params(
+            lease.get(),
+            "TRUNCATE engine_principal_store.engine_principals RESTART IDENTITY CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        store_ = std::make_unique<EnginePrincipalStore>(*ep_lc_shared().pool);
         REQUIRE(store_->is_open());
     }
 
@@ -104,15 +133,9 @@ public:
     [[nodiscard]] EnginePrincipalStore* get() const noexcept { return store_.get(); }
     EnginePrincipalStore* operator->() const noexcept { return store_.get(); }
 
-    void reset() noexcept {
-        store_.reset();
-        pool_.reset();
-        db_.reset();
-    }
+    void reset() noexcept { store_.reset(); }
 
 private:
-    std::optional<yuzu::test::PostgresTestDb> db_;
-    std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<EnginePrincipalStore> store_;
 };
 
@@ -142,7 +165,7 @@ struct RestEngineHarness {
     yuzu::test::TempDbFile rbac_db_file{"yuzu_test_engine_lifecycle_rbac-"};
 
     EnginePrincipalStorePg engine_store;
-    yuzu::test::ApiTokenStorePg token_store;
+    yuzu::test::ApiTokenStorePgShared token_store;
     std::unique_ptr<RbacStore> rbac_store;
 
     yuzu::server::test::TestRouteSink sink;
@@ -1249,7 +1272,7 @@ TEST_CASE("SettingsRoutes owner-delete guard: an unwired (null) store does not "
 TEST_CASE("ApiTokenStore::sweep_expired_rotations: auto-revokes an elapsed "
           "predecessor and clears the surviving successor's rotation state",
           "[pg][token][rotation][sweep]") {
-    yuzu::test::ApiTokenStorePg tokens;
+    yuzu::test::ApiTokenStorePgShared tokens;
     EnginePrincipalStorePg engine_store;
     REQUIRE(engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:sweep")
                .has_value());
@@ -1330,7 +1353,7 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: auto-revokes an elapsed "
 TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: flags an unused "
           "successor near window end, clears once used or resolved",
           "[pg][token][rotation][sweep]") {
-    yuzu::test::ApiTokenStorePg tokens;
+    yuzu::test::ApiTokenStorePgShared tokens;
     EnginePrincipalStorePg engine_store;
     REQUIRE(
         engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:sweepwarn")

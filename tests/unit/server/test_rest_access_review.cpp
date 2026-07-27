@@ -44,6 +44,7 @@
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -80,6 +81,46 @@ void setup_access_review_rest_pg_template(const std::string& dsn) {
 yuzu::test::PgTestTemplate access_review_rest_tpl{"accrevresttx",
                                                    &setup_access_review_rest_pg_template};
 
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per harness (the
+// dominant Windows [pg]-shard cost, #2354 — see test_software_inventory_store
+// .cpp's SwinvShared, the reference conversion). Built lazily; at testRunEnded
+// the pool is drained and the clone dropped (keep_until_run_end). Every test
+// in this file is CRUD-only against these stores (the store-down arms pass
+// nullptr rather than breaking the schema), so there are no per-case-database
+// carve-outs.
+struct AccRevShared {
+    yuzu::test::PostgresTestDb db{access_review_rest_tpl};
+    std::optional<yuzu::server::pg::PgPool> pool;
+    AccRevShared() {
+        REQUIRE(db.available());
+        pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 6});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+AccRevShared& acc_rev_shared() {
+    static AccRevShared s;
+    return s;
+}
+
+// Restore the shared clone to its fresh state: both stores' tables in one
+// TRUNCATE (engine_principals is referenced by attest flows; RESTART IDENTITY
+// keeps any serial ids deterministic per test). public.schema_meta is
+// deliberately untouched — the clone stays migrated, so the per-harness store
+// ctors find the schema current and skip migration.
+void acc_rev_reset() {
+    auto lease = acc_rev_shared().pool->acquire();
+    REQUIRE(lease);
+    auto trunc = yuzu::server::pg::exec_params(
+        lease.get(),
+        "TRUNCATE engine_principal_store.engine_principals, "
+        "access_review_store.access_review_campaign, "
+        "access_review_store.access_review_attestation RESTART IDENTITY CASCADE",
+        std::vector<std::string>{});
+    REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+}
+
 struct AuditRecord {
     std::string action, result, target_id, detail;
 };
@@ -94,13 +135,11 @@ struct AuditRecord {
 struct AccessReviewHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    yuzu::test::AuthDbPg auth_db;
+    yuzu::test::AuthDbPgShared auth_db;
 
     yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_rest_rbac-"};
     RbacStore rbac{rbac_file.path};
 
-    std::optional<yuzu::test::PostgresTestDb> pg_db;
-    std::optional<yuzu::server::pg::PgPool> pg_pool;
     std::unique_ptr<EnginePrincipalStore> eps;
     std::unique_ptr<AccessReviewStore> access_review_store;
 
@@ -145,13 +184,10 @@ struct AccessReviewHarness {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        pg_db.emplace(access_review_rest_tpl);
-        REQUIRE(pg_db->available());
-        pg_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = pg_db->dsn(), .size = 6});
-        REQUIRE(pg_pool->valid());
-        eps = std::make_unique<EnginePrincipalStore>(*pg_pool);
+        acc_rev_reset();
+        eps = std::make_unique<EnginePrincipalStore>(*acc_rev_shared().pool);
         REQUIRE(eps->is_open());
-        access_review_store = std::make_unique<AccessReviewStore>(*pg_pool);
+        access_review_store = std::make_unique<AccessReviewStore>(*acc_rev_shared().pool);
         REQUIRE(access_review_store->is_open());
         AccessReviewStore* ars_ptr = store_available ? access_review_store.get() : nullptr;
 
