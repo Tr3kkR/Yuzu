@@ -88,6 +88,7 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -573,6 +574,25 @@ public:
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
                           "records_active > 0 with a flat rate here means the projector is wedged",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
+                          "Progress-bridge teardown steps that could not complete on the "
+                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
+                          "out-of-memory signal: all three steps allocate nothing, so only a "
+                          "mutex failure can reach them today - use "
+                          "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
+                          "pressure. The claim is one-way, so a record that fails here is never "
+                          "retried and what it still owns is held until the process restarts; a "
+                          "retained record also pins that session's whole stream state, its "
+                          "replay ring and any pinned finals. Alert on > 0",
+                          "counter");
+        metrics_.describe("yuzu_mcp_maintenance_tick_failures_total",
+                          "MCP maintenance ticks that threw and were contained, by tick "
+                          "(#2487). The tick is skipped, not retried. bridge_sweep: pin-ack, "
+                          "session-death and pressure teardown are all stalled while it grows. "
+                          "session_gc: expired sessions keep their streams and pinned finals "
+                          "until a tick succeeds. Both are guarded separately so one failing "
+                          "cannot suppress the other",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
                           "Committed terminal frames that found no free pin slot and were published "
                           "UNPINNED (a real terminal is committed rather than lost to preserve a "
@@ -602,6 +622,14 @@ public:
                             "subscribe_failed", "arm_threw"}) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
+        // #2487: CLOSED reason set, derived from the bridge's own stage table so a
+        // fourth owned resource cannot be added without this loop following.
+        for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
+        }
+        for (auto tick : {"bridge_sweep", "session_gc"}) {
+            metrics_.counter("yuzu_mcp_maintenance_tick_failures_total", {{"tick", tick}});
+        }
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
@@ -627,6 +655,67 @@ public:
             metrics_.counter("yuzu_mcp_tool_args_too_large_total",
                              {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
         }
+        // #2500 REST targeting refusals. Deliberately NOT the MCP counter above:
+        // these are different surfaces with different gates, and folding them into
+        // one series would make `yuzu_mcp_*` count calls that never touched MCP.
+        // Both axes are closed — `route` is the REST surfaces that dispatch or
+        // narrow on caller-supplied targeting, `reason` iterates the ONE array in
+        // dispatch_target_shape.hpp — so this pre-seed is exhaustive and absent()
+        // stays meaningful. A reason added at an emit site instead of in that array
+        // is emitted-but-unseeded: it passes its own test while the dashboard reads
+        // zero and the alert never fires.
+        metrics_.describe("yuzu_server_dispatch_target_rejected_total",
+                          "REST dispatch calls refused because a supplied targeting argument "
+                          "named no device, plus dispatch-closure calls that named no target at "
+                          "all (#2500). Both labels are closed sets; every reachable pair is "
+                          "pre-seeded at boot so absent() stays meaningful.",
+                          "counter");
+        // The route-level reasons below are the literals in `kRouteRejectReasons`
+        // (dispatch_target_shape.hpp). They are spelled out here rather than
+        // iterated because each applies to a DIFFERENT route subset, and a
+        // single loop over the array would seed unreachable pairs — which is
+        // exactly what the per-route seeding fixes. `test_dispatch_target_shape.cpp`
+        // binds the two lists so a reason added at an emit site without a home
+        // in the array fails a test.
+        //
+        // Seeded PER ROUTE rather than as a cross-product: `result_set_parent`
+        // can only ever emit the two parent_id reasons, and the dispatch routes
+        // can never emit them. Seeding the full product would publish series
+        // that no code path can reach, which reads on a dashboard as "this has
+        // never happened" when the truth is "this cannot happen" (governance).
+        for (const char* route : {"command", "instruction_execute"}) {
+            for (const auto reason : yuzu::server::kTargetingShapeReasons)
+                metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", route}, {"reason", std::string(reason)}});
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonBodyType)}});
+        }
+        for (const auto reason : {yuzu::server::kReasonParentIdType,
+                                  yuzu::server::kReasonParentIdEmpty})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
+        // It refuses `scope` outright (PolicyEvaluator::remediate takes only
+        // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
+        // never be emitted there — seeding them would publish series no code
+        // path can reach, which reads on a dashboard as "never happened" when
+        // the truth is "cannot happen".
+        for (const auto reason : {yuzu::server::kReasonBodyType,
+                                  yuzu::server::kReasonScopeUnsupported,
+                                  yuzu::server::kReasonAgentIdsType,
+                                  yuzu::server::kReasonAgentIdsEmpty,
+                                  yuzu::server::kReasonAgentIdType}) {
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "policy_remediate"}, {"reason", std::string(reason)}});
+        }
+        // The shared dispatch closure's last-line-of-defence arm. Its own route
+        // label because it is not a REST surface — background runners reach it
+        // too — and a non-zero value here means a CALLER forgot to name a
+        // target, which is a code defect rather than a client one.
+        metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                         {{"route", "dispatch_closure"},
+                          {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -1028,6 +1117,45 @@ public:
         // operators that the audit chain itself is degraded.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
                           "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+        // #2360 retention clock guard. The two counters answer DIFFERENT
+        // questions and must not be collapsed: skips means the guard declined a
+        // delete that would have wiped the evidence table (this server's clock
+        // moved), failed means the cleanup pass itself errored. Both leave rows
+        // undeleted, so without the second an operator watching an audit table
+        // that never shrinks would read a broken cleanup loop as a working guard.
+        metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
+                          "Audit retention passes declined: the pass would have expired every "
+                          "datable row, the gap since the previous pass exceeded a fixed 7 days "
+                          "(an ABSOLUTE threshold, not scaled to --audit-retention-days; a "
+                          "forward clock jump OR an outage that long), the stored clock "
+                          "reading was ahead of the current clock, or there was "
+                          "no stored reading at all so the elapsed-time check "
+                          "could not run (first pass after an upgrade/restore)",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_cleanup_failed_total",
+                          "Audit retention passes that failed on a SQLite error or ran against a "
+                          "closed store",
+                          "counter");
+        // The cap that makes an allowed wipe pace out introduces its own failure
+        // mode: if it binds on EVERY pass for a sustained period, expiry is
+        // outrunning the drain and audit.db grows without bound. Neither counter
+        // above moves in that state, so this pair is the only way it is visible.
+        // Counted rather than measured with a COUNT(*) backlog gauge on purpose
+        // -- that query would scan under the same lock every audit write takes.
+        metrics_.describe("yuzu_server_audit_rows_deleted_total",
+                          "Audit rows deleted by retention", "counter");
+        metrics_.describe("yuzu_server_audit_retention_cap_reached_total",
+                          "Audit retention passes that hit the per-pass delete cap, leaving a "
+                          "backlog for the next pass",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_retention_index_ok",
+                          "1 while the audit retention index exists; 0 means every cleanup pass "
+                          "full-scans audit_events under the store lock",
+                          "gauge");
+        metrics_.describe("yuzu_server_audit_retention_persist_failed_total",
+                          "Failures to persist the audit retention clock reading, which degrades "
+                          "clock-anomaly detection across a restart",
+                          "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
         // Increments in the token-create handlers (api_token, device_token)
         // when `secure_random::fill_random` returns prng_failure (entropy
@@ -3985,6 +4113,20 @@ public:
                     // OBS-4: surface audit-pipeline persistence failures.
                     metrics_.gauge("yuzu_server_audit_emit_failed_total")
                         .set(static_cast<double>(audit_store_->emit_failed_count()));
+                    // #2360: retention clock guard. Declined-wipe passes and
+                    // failed passes are scraped separately (see describe above).
+                    metrics_.gauge("yuzu_server_audit_clock_anomaly_skips_total")
+                        .set(static_cast<double>(audit_store_->clock_anomaly_skips_count()));
+                    metrics_.gauge("yuzu_server_audit_cleanup_failed_total")
+                        .set(static_cast<double>(audit_store_->cleanup_failed_count()));
+                    metrics_.gauge("yuzu_server_audit_rows_deleted_total")
+                        .set(static_cast<double>(audit_store_->rows_deleted_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_cap_reached_total")
+                        .set(static_cast<double>(audit_store_->cap_reached_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_index_ok")
+                        .set(audit_store_->retention_index_ok() ? 1.0 : 0.0);
+                    metrics_.gauge("yuzu_server_audit_retention_persist_failed_total")
+                        .set(static_cast<double>(audit_store_->persist_failed_count()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore
@@ -4014,10 +4156,53 @@ public:
                 // calls are O(records ≤256) / O(sessions) in-memory scans placed
                 // AFTER the CRL/stale-agent sweep (no same-tick delay to it) -
                 // microseconds at the 15s cadence, no request-path contention.
+                //
+                // S-BRIDGE-TICK-GUARD (#2487): this loop is a bare std::thread body,
+                // so an exception escaping it is std::terminate - a WHOLE-PROCESS
+                // abort triggered by a transient allocation failure inside a
+                // maintenance sweep. Both calls allocate (each snapshots its map),
+                // and the bridge's teardown path allocates again beneath that.
+                //
+                // GUARDED SEPARATELY, on purpose: gc() is what actually destroys an
+                // expired session's stream and releases its memory, so sharing one
+                // try with sweep() would let a snapshot failure under memory
+                // pressure skip the call most likely to relieve that pressure. The
+                // pairing above is preserved - gc() still runs only alongside a live
+                // bridge - but neither failure now suppresses the other. A missed
+                // tick simply defers to the next one.
+                //
+                // The handlers NEST their own observability: spdlog formatting and
+                // the metric lookup both allocate, so a flat handler re-throws from
+                // inside the very catch meant to contain the failure and terminates
+                // anyway (precedent: the nested guard in mcp_stream.cpp's publish
+                // boundary). Do not collapse these into a single flat catch.
                 if (mcp_stream_bridge_) {
-                    mcp_stream_bridge_->sweep();
+                    try {
+                        mcp_stream_bridge_->sweep();
+                    } catch (...) {
+                        try {
+                            spdlog::error("MCP bridge sweep tick failed; deferring to next tick");
+                            metrics_
+                                .counter("yuzu_mcp_maintenance_tick_failures_total",
+                                         {{"tick", "bridge_sweep"}})
+                                .increment();
+                        } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
+                        }
+                    }
                     if (mcp_sessions_) {
-                        mcp_sessions_->gc();
+                        try {
+                            mcp_sessions_->gc();
+                        } catch (...) {
+                            try {
+                                spdlog::error(
+                                    "MCP session gc tick failed; deferring to next tick");
+                                metrics_
+                                    .counter("yuzu_mcp_maintenance_tick_failures_total",
+                                             {{"tick", "session_gc"}})
+                                    .increment();
+                            } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
+                            }
+                        }
                     }
                 }
                 // Guardian scalars + cumulative write/reap counters. Use
@@ -7903,6 +8088,12 @@ private:
             // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
             auto plugin = extract_json_string(req.body, "plugin");
             auto action = extract_json_string(req.body, "action");
+            // SILENT-DROP helper, kept deliberately: it returns {} for omitted,
+            // empty, non-array and parse-failure alike. That erasure is #2500's
+            // defect, and this call is safe ONLY because `check_targeting_shape`
+            // runs below on the separately-parsed `body` and refuses every shape
+            // whose erasure would matter. Moving this below that check, or
+            // removing it, requires re-reading that ordering first.
             auto agent_ids = extract_json_string_array(req.body, "agent_ids");
 
             if (plugin.empty() || action.empty()) {
@@ -7913,9 +8104,149 @@ private:
                 return;
             }
 
+            // plugin/action are IDENTIFIERS. Bounding them here is what actually
+            // closes the audit-detail forgery that a previous round only half
+            // fixed: `sanitize_for_log` normalises control bytes, but leaves
+            // space, `=`, `:` and `-` alone, so a caller could still plant
+            //     plugin = "noop reason=agent_ids_empty"
+            //     action = "noop \u2192 4000 agent(s)"
+            // and produce a durable denial row that mimics the SUCCESS format
+            // (`reason=<r> <plugin>:<action>` vs `plugin:action \u2192 N agent(s)`).
+            // Byte-shape safety is not field-structure safety. Validating the
+            // input is also what bounds the row size and keeps the column
+            // well-formed, which is three problems closed at one gate instead of
+            // three sanitisers at three sinks.
+            //
+            // Charset matches what shipped content actually uses - every
+            // `plugin`/`action` in content/definitions/*.yaml fits this, and
+            // dotted server actions (`workflow.list`) are live content, so `.`
+            // must stay legal. Length matches MCP's kExecInstrIdentMaxLen so the
+            // two execute surfaces agree on what an identifier is.
+            {
+                constexpr size_t kIdentMax = 128;
+                const auto bad_ident = [](const std::string& v) {
+                    if (v.size() > kIdentMax)
+                        return true;
+                    return std::any_of(v.begin(), v.end(), [](unsigned char c) {
+                        return !(std::isalnum(c) || c == '_' || c == '.' || c == '-');
+                    });
+                };
+                if (bad_ident(plugin) || bad_ident(action)) {
+                    res.status = 400;
+                    res.set_content(
+                        R"j({"error":{"code":400,"message":"plugin and action must be identifiers ([A-Za-z0-9_.-], max 128 bytes)"},"meta":{"api_version":"v1"}})j",
+                        "application/json");
+                    return;
+                }
+            }
+
             // All commands require Execution:Execute permission
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+
+            // ── Targeting shape: supplied-but-names-nothing is an ERROR (#2500) ──
+            // Run on the PARSED BODY, never on `agent_ids` above.
+            // `extract_json_string_array` returns {} for omitted, empty, not-an-array
+            // AND parse-failure alike, and that erasure IS this defect: a check
+            // written against its output cannot see `{"agent_ids":"dev-01"}` or
+            // `{"scope":5}` at all, and would ship half the bug with green tests.
+            //
+            // Placed AFTER require_permission so a refusal is attributable to a
+            // principal and can carry an audit row; before any dispatch-shaped work.
+            // The `plugin`/`action` emptiness check above deliberately stays where it
+            // is rather than being subsumed the way `ident_empty` subsumed MCP's: it
+            // currently runs BEFORE require_permission, and moving an auth-adjacent
+            // check is not something to do silently inside a targeting fix.
+            // Parsed with allow_exceptions=false rather than a try/catch that falls
+            // through. The earlier form set "named no target" in its catch and
+            // CONTINUED, arguing the catch was unreachable because a body that does
+            // not parse yields an empty `plugin`. That holds for parse errors — but
+            // not for std::bad_alloc: under memory pressure a body of
+            // {"agent_ids":[]} would have landed in the catch and proceeded to
+            // broadcast. A fail-OPEN catch inside the fix for a widening defect
+            // (governance, cpp-safety). A discarded value yields contains()==false
+            // on every query below, so an unparseable body is refused here rather
+            // than continuing with unknown targeting.
+            const auto body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            // `check_targeting_shape` requires an OBJECT: contains() is false for an
+            // array or scalar, so `["dev-1"]` would read as "named no target" and
+            // broadcast — the very shape this route is being fixed for. Three Gate-3
+            // reviewers found this independently; the precondition is enforced here
+            // and pinned by a route test, not left as a comment on the header.
+            if (!body.is_object()) {
+                // Counted and audited like every other refusal in this family.
+                // The fold's own argument against an uncounted refusal applies
+                // here: an invisible one cannot reach the alert this change
+                // ships, and this is the shape three reviewers had to find by
+                // reading rather than by watching a dashboard.
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", std::string(kReasonBodyType)}})
+                    .increment();
+                // Capture the audit return and surface partial-success, per the
+                // AuditFn contract (SOC 2 CC6.6, PR #883) and the
+                // instruction.import precedent. The status stays 400 — the
+                // request WAS invalid, and answering 503 because we could not
+                // record that would trade a correct refusal for an outage.
+                const bool audit_ok = audit_log(req, "command.dispatch", "denied", "command", "",
+                                                std::string("reason=") + std::string(kReasonBodyType));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 400;
+                // `audit_emitted` is omitted entirely when no audit store is
+                // configured: audit_log() returns true in that case, so
+                // reporting `true` would assert a row landed on a deployment
+                // that keeps none. Absent means "no claim", not "false".
+                nlohmann::json err{{"error",
+                                    {{"code", 400},
+                                     {"message", "request body must be a JSON object"}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (auto bv = yuzu::server::check_targeting_shape(body)) {
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", bv->reason}})
+                    .increment();
+                // The detail carries WHAT was being attempted, not just why it
+                // was refused. The success row records `plugin:action -> N
+                // agent(s)`; a denial that records only `reason=` lets an
+                // auditor show that an operator was blocked but not what they
+                // were trying to run — on a control whose whole purpose is
+                // reconstructing near-miss blast radius (governance, compliance).
+                // `plugin`/`action` are CALLER-SUPPLIED and this route bounds
+                // neither length nor charset (unlike MCP's kExecInstrIdentMaxLen).
+                // Concatenating them raw into an evidence field let a caller
+                // forge a row that mimics the success format
+                // (`plugin:action -> N agent(s)`) and write an arbitrarily large
+                // durable row before any dispatch — turning the field this fold
+                // added FOR blast-radius reconstruction into the thing an
+                // attacker writes. Sanitised through the same helper the
+                // on-behalf-of guard uses for untrusted log text: control chars
+                // and CR/LF become '?', length capped (governance, security).
+                const bool audit_ok =
+                    audit_log(req, "command.dispatch", "denied", "command", "",
+                              std::string("reason=") + bv->reason + " " +
+                                  onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                  onbehalf::sanitize_for_log(action, 128));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 400;
+                // Same gate as the body_type denial above: with no audit store
+                // configured, audit_log() returns true without writing, so an
+                // unconditional `true` here would assert a row landed on a
+                // deployment that keeps none. Absent = no claim.
+                nlohmann::json err{{"error", {{"code", 400}, {"message", bv->message}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            const bool named_target = yuzu::server::targeting_supplied(body);
 
             // Per-action securable elevation + scope confinement for DESTRUCTIVE
             // generic-dispatch actions (governance HIGH #2). /api/command otherwise
@@ -7944,7 +8275,7 @@ private:
                     if (!require_permission(req, res, it->second.first, it->second.second))
                         return;
                     // Destructive dispatch must be explicitly targeted + in scope.
-                    if (agent_ids.empty() || !extract_json_string(req.body, "scope").empty()) {
+                    if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
                         res.status = 400;
                         res.set_content(
                             R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
@@ -7993,15 +8324,15 @@ private:
 
             // Parameters: pass-through key-value pairs to the agent plugin
             {
-                auto params_map = extract_json_string_map(req.body, "params");
+                auto params_map = extract_json_string_map(body, "params");
                 for (const auto& [k, v] : params_map) {
                     (*cmd.mutable_parameters())[k] = v;
                 }
             }
 
             // Stagger/delay: prevent thundering herd on large-fleet dispatch
-            auto stagger = extract_json_int(req.body, "stagger", 0);
-            auto delay = extract_json_int(req.body, "delay", 0);
+            auto stagger = extract_json_int(body, "stagger", 0);
+            auto delay = extract_json_int(body, "delay", 0);
             if (stagger > 0)
                 cmd.set_stagger_seconds(stagger);
             if (delay > 0)
@@ -8009,11 +8340,24 @@ private:
 
             agent_service_.record_send_time(command_id);
 
-            // Check for scope-based targeting
-            auto scope_expr = extract_json_string(req.body, "scope");
+            // Check for scope-based targeting. Reuses the parsed body like the
+            // other post-auth reads; this site was missed when the rest were
+            // converted and re-parsed the whole body to read a key the handler
+            // already had (governance).
+            auto scope_expr = extract_json_string(body, "scope");
 
             int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
+            // the MCP execute_instruction schema, docs/scope-walking-design.md), and
+            // it is handled here as "no scope expression" so the ordering matches the
+            // shared closure and the MCP one exactly: an explicit agent_ids list
+            // still wins. Before #2500 this route fed `__all__` to scope::parse,
+            // which fails, so the caller got a 503 having reached nobody — while the
+            // sibling instruction-execute route broadcast on the same string. One
+            // advertised scope kind must not mean two things across sibling REST
+            // routes (governance, security MEDIUM).
+            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+            if (arm == yuzu::server::DispatchArm::Group) {
                 // Group-based dispatch — resolve group members
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
@@ -8023,7 +8367,7 @@ private:
                             ++sent;
                     }
                 }
-            } else if (!scope_expr.empty()) {
+            } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
                 // This raw path is untracked (no execution row), so read the
@@ -8058,15 +8402,72 @@ private:
                         ++sent;
                     }
                 }
-            } else if (agent_ids.empty()) {
-                // Broadcast to all agents
-                sent = registry_.send_to_all(cmd);
-            } else {
+            } else if (arm == yuzu::server::DispatchArm::Ids) {
                 for (const auto& aid : agent_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
                     }
                 }
+            } else if (arm == yuzu::server::DispatchArm::Broadcast) {
+                // Explicitly asked for the fleet by its published name.
+                sent = registry_.send_to_all(cmd);
+            } else {
+                // Broadcast ONLY when the caller named no target at all (#2500).
+                // A target that was SUPPLIED but resolved to nothing must never
+                // widen to the whole fleet — `{"agent_ids": []}` from a device
+                // filter that matched nothing is the likelier shape than the
+                // type-confused one, and it read as "no devices" to whoever sent it.
+                //
+                // The shape check ~150 lines above already refuses those bodies, so
+                // this branch is UNREACHABLE today. It is second line of defence,
+                // not the fix: the silent-drop `extract_json_string_array` call and
+                // this sink sit far apart with the permission gate, the destructive
+                // block and the params extraction between them, and this is the one
+                // place where a reorder turns a specific-looking target list into
+                // the entire fleet. Falsifiable on its own terms — neuter the shape
+                // check and `{"agent_ids": []}` is still refused here.
+                //
+                // (An earlier version of this comment said the pre-#2500 caller
+                // "got a 503"; the base code answered 400 "invalid scope". The
+                // docs and tests were corrected in an earlier fold and this
+                // comment was missed.)
+                if (named_target) {
+                    // Derive the label from which field was actually supplied,
+                    // as the MCP sink does. Hardcoding `agent_ids_empty` would
+                    // mislabel a `scope`-only violation if this arm ever became
+                    // reachable, and a wrong reason on a fleet-safety refusal is
+                    // worse than no reason.
+                    const auto sink_reason = body.contains("agent_ids")
+                                                 ? kTargetingShapeReasons[1]  // agent_ids_empty
+                                                 : kTargetingShapeReasons[4]; // scope_empty
+                    metrics_
+                        .counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", "command"}, {"reason", std::string(sink_reason)}})
+                        .increment();
+                    // Empty target_id, matching the source-side denial above: the
+                    // same verb must not carry two different target shapes, and a
+                    // command_id for a command that was never dispatched reads in
+                    // the audit trail as though one was.
+                    const bool audit_ok =
+                        audit_log(req, "command.dispatch", "denied", "command", "",
+                                  "reason=" + std::string(sink_reason) + " " +
+                                      onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                      onbehalf::sanitize_for_log(action, 128));
+                    if (!audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 400;
+                    nlohmann::json err{
+                        {"error",
+                         {{"code", 400},
+                          {"message", "a targeting argument was supplied but resolved to no "
+                                      "target; omit it entirely to target all agents"}}},
+                        {"meta", {{"api_version", "v1"}}}};
+                    if (audit_store_)
+                        err["audit_emitted"] = audit_ok;
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                sent = registry_.send_to_all(cmd);
             }
 
             // Forward commands queued for gateway agents
@@ -10635,7 +11036,23 @@ private:
                 agent_service_.record_execution_id(command_id, execution_id);
             }
             int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // Broadcast is something a caller ASKS FOR by name (#2500).
+            // `__all__` is not new vocabulary: the MCP closure below has always
+            // special-cased it, and this closure's own callers already
+            // described their untargeted path as "__all__" in their comments —
+            // they simply passed empty and relied on the fall-through.
+            //
+            // ORDERING IS LOAD-BEARING and mirrors the MCP closure exactly:
+            // `__all__` is treated as "no scope expression", NOT as a
+            // first-wins broadcast. An earlier revision of this commit put the
+            // broadcast branch at the TOP of the chain, which made
+            // {agent_ids:["a"], scope:"__all__"} reach the whole fleet here
+            // while the MCP closure reached exactly agent "a" — a widening
+            // introduced by the commit that exists to remove widenings, and a
+            // fourth dialect of a token that already had three. An explicit id
+            // list must always win over a broadcast request.
+            const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+            if (arm == DispatchArm::Group) {
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
                     auto members = mgmt_group_store_->get_members(group_id);
@@ -10643,7 +11060,7 @@ private:
                         if (registry_.send_to(m.agent_id, cmd))
                             ++sent;
                 }
-            } else if (!scope_expr.empty()) {
+            } else if (arm == DispatchArm::Scope) {
                 // from_result_set: is owner-scoped; recover the dispatching
                 // operator from the execution row (run_async / workflow /
                 // scheduled all create it with dispatched_by before dispatch).
@@ -10674,12 +11091,48 @@ private:
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                 }
-            } else if (agent_ids.empty()) {
-                sent = registry_.send_to_all(cmd);
-            } else {
+            } else if (arm == DispatchArm::Ids) {
                 for (const auto& aid : agent_ids)
                     if (registry_.send_to(aid, cmd))
                         ++sent;
+            } else if (arm == DispatchArm::Broadcast) {
+                sent = registry_.send_to_all(cmd);
+            } else {
+                // NO TARGET NAMED AT ALL — reach NOBODY, not everybody (#2500).
+                //
+                // This closure has TEN callers (governance corrected an earlier
+                // count of eight: DexRoutes and TarTreeRoutes reach it through
+                // 5-param adapters). Eight were safe only because eight authors
+                // each remembered to guard their own inputs, and the two that
+                // did not were the pair #2500 was filed about. That is a single
+                // point of failure with a ten-way surface, and the failure mode
+                // is the worst one available: an unintended fleet-wide dispatch
+                // that reports success.
+                //
+                // Inverting the default makes the eleventh caller's omission
+                // harmless. Every caller that legitimately broadcasts names
+                // kBroadcastScope — a grep-able request, not the residue of an
+                // empty vector.
+                //
+                // No behaviour changed when this landed: every existing caller
+                // either guards its inputs, passes a specific id, or was updated
+                // in the same commit to name the sentinel.
+                // COUNTED, not just logged. This branch is the actual last line
+                // of defence across all ten callers of this closure, and it had
+                // strictly weaker observability than the `/api/command` inline
+                // branch that this PR's own argument called dead code — an
+                // invisible refusal cannot reach the alert this change ships
+                // (governance, SRE). There is no `req` here, so no audit row is
+                // possible: this closure is called by background runners as well
+                // as routes, and a fabricated request context would be worse
+                // evidence than none. The counter is the durable signal.
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "dispatch_closure"}, {"reason", std::string(kReasonClosureNoTarget)}})
+                    .increment();
+                spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
+                             "no agents; pass scope \"{}\" to broadcast deliberately",
+                             plugin, norm_action, kBroadcastScope);
             }
             forward_gateway_pending();
             if (sent > 0)
@@ -10984,7 +11437,7 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
-            policy_evaluator_.get());
+            policy_evaluator_.get(), &metrics_); // #2500 targeting-refusal counter
 
         // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
         // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
@@ -11960,7 +12413,26 @@ private:
                 agent_service_.record_send_time(command_id);
 
                 int sent = 0;
-                if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                // Same classifier as the other three sinks (#2500). This
+                // closure KEEPS broadcast-on-unnamed: dashboard_routes.cpp maps
+                // its form's `__all__` selection to empty+empty before calling,
+                // so `None` here means the operator picked "all agents" in the
+                // UI. Routed through the shared function anyway so a future
+                // refactor pointing this at command_dispatch_fn — whose `None`
+                // reaches nobody — becomes a visible decision rather than a
+                // silent conversion of every dashboard fleet-execute to a no-op.
+                //
+                // ONE ARM DID CHANGE, contrary to what an earlier version of
+                // this comment claimed: a literal `scope_expr == "__all__"` used
+                // to reach the Scope arm, fail `scope::parse`, and dispatch to
+                // NOBODY. It now broadcasts, matching every other sink. That is
+                // unreachable today because dashboard_routes.cpp strips the
+                // sentinel before calling, and it is the behaviour we want if it
+                // ever becomes reachable — but "no arm changed" was not true and
+                // is exactly the kind of preservation claim this PR keeps
+                // getting wrong (governance, consistency).
+                const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+                if (arm == DispatchArm::Group) {
                     auto group_id = scope_expr.substr(6);
                     if (mgmt_group_store_) {
                         auto members = mgmt_group_store_->get_members(group_id);
@@ -11969,7 +12441,7 @@ private:
                                 ++sent;
                         }
                     }
-                } else if (!scope_expr.empty()) {
+                } else if (arm == DispatchArm::Scope) {
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
@@ -11980,13 +12452,16 @@ private:
                                 ++sent;
                         }
                     }
-                } else if (agent_ids.empty()) {
-                    sent = registry_.send_to_all(cmd);
-                } else {
+                } else if (arm == DispatchArm::Ids) {
                     for (const auto& aid : agent_ids) {
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                     }
+                } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
+                    // Explicit for the same reason as the MCP sink: a future
+                    // DispatchArm must not become a fleet broadcast by falling
+                    // through an `else`.
+                    sent = registry_.send_to_all(cmd);
                 }
 
                 forward_gateway_pending();
@@ -12085,6 +12560,7 @@ private:
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
+        wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
@@ -12849,7 +13325,8 @@ private:
                 mcp_stream_bridge_ = std::make_unique<mcp::McpStreamBridge>(
                     execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
                     [this](const std::string& action, const std::string& execution_id,
-                           const std::string& detail) {
+                           const std::string& detail,
+                           mcp::McpStreamBridge::AuditResult result) {
                         if (audit_store_ && audit_store_->is_open()) {
                             AuditEvent ev;
                             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -12860,7 +13337,12 @@ private:
                             ev.target_type = "Execution";
                             ev.target_id = execution_id;
                             ev.detail = detail;
-                            ev.result = "success";
+                            // NOT hardcoded "success" (#2487 review): a teardown that
+                            // could not complete, or a disposition that published
+                            // nothing, must not be evidenced as a successful action.
+                            ev.result =
+                                result == mcp::McpStreamBridge::AuditResult::kFailure ? "failure"
+                                                                                      : "success";
                             (void)audit_store_->log(ev);
                         }
                     });
@@ -12931,15 +13413,21 @@ private:
                     }
 
                     int sent = 0;
-                    if (!scope_expr.empty() && scope_expr != "__all__" &&
-                        scope_expr.starts_with("group:")) {
+                    // Same classifier as the other two sinks (#2500). MCP's
+                    // handler normalises an omitted target to kBroadcastScope
+                    // before dispatching (mcp_server.cpp), so `None` cannot
+                    // arrive here meaning "unnamed"; the tail maps it to
+                    // broadcast so MCP's deliberate broadcast-on-empty contract
+                    // is stated rather than left as a fallthrough.
+                    const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+                    if (arm == DispatchArm::Group) {
                         auto group_id = scope_expr.substr(6);
                         if (mgmt_group_store_) {
                             for (const auto& m : mgmt_group_store_->get_members(group_id))
                                 if (registry_.send_to(m.agent_id, cmd))
                                     ++sent;
                         }
-                    } else if (!scope_expr.empty() && scope_expr != "__all__") {
+                    } else if (arm == DispatchArm::Scope) {
                         // Owner-scoped from_result_set: recover the principal
                         // from the MCP-created execution row (review B1).
                         std::string principal;
@@ -12965,12 +13453,22 @@ private:
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }
-                    } else if (agent_ids.empty()) {
-                        sent = registry_.send_to_all(cmd);
-                    } else {
+                    } else if (arm == DispatchArm::Ids) {
                         for (const auto& aid : agent_ids)
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
+                    } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
+                        // Broadcast, or None — which mcp_server.cpp has already
+                        // normalised to kBroadcastScope, so it cannot arrive
+                        // here meaning "unnamed". MCP keeps broadcast-on-empty
+                        // deliberately: its guard is upstream at the C8 gate and
+                        // in the handler, not at this sink.
+                        //
+                        // Named explicitly rather than left as a bare `else`: a
+                        // fifth DispatchArm added later would otherwise fall
+                        // into fleet-wide broadcast at this sink and the
+                        // dashboard's, silently, at two of four sites.
+                        sent = registry_.send_to_all(cmd);
                     }
 
                     forward_gateway_pending();
@@ -13249,6 +13747,39 @@ private:
             }
         } catch (...) {}
         return {};
+    }
+
+    // ── json-taking overloads (#2500) ─────────────────────────────────────
+    // The string-taking helpers above each parse the whole body. /api/command
+    // called them eight times and this fix added a ninth parse of the same
+    // string, on a route with no size cap beyond httplib's 100 MB default.
+    // These let a handler that has ALREADY parsed reuse the object. Semantics
+    // are deliberately identical to their string twins — same key checks, same
+    // type checks, same fallbacks — so reusing the parse cannot change what a
+    // field resolves to. Consolidating the remaining pre-auth parses needs the
+    // plugin/action check moved relative to require_permission and is tracked
+    // separately.
+    static std::string extract_json_string(const nlohmann::json& j, const std::string& key) {
+        if (j.is_object() && j.contains(key) && j[key].is_string())
+            return j[key].get<std::string>();
+        return {};
+    }
+
+    static std::unordered_map<std::string, std::string>
+    extract_json_string_map(const nlohmann::json& j, const std::string& key) {
+        std::unordered_map<std::string, std::string> result;
+        if (j.is_object() && j.contains(key) && j[key].is_object()) {
+            for (auto& [k, v] : j[key].items())
+                result[k] = v.is_string() ? v.get<std::string>() : v.dump();
+        }
+        return result;
+    }
+
+    static int32_t extract_json_int(const nlohmann::json& j, const std::string& key,
+                                    int32_t default_value = 0) {
+        if (j.is_object() && j.contains(key) && j[key].is_number_integer())
+            return j[key].get<int32_t>();
+        return default_value;
     }
 
     static int32_t extract_json_int(const std::string& body, const std::string& key,

@@ -18,6 +18,22 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
+
+Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
+
+**What to do:** if you have a SIEM rule, dashboard or evidence query that treats `result` on this verb family as a constant `success` - for example "alert if any `mcp.bridge.*` row is not `success`" - update it before upgrading, or it will fire on legitimate rows. Note also that `failure` here is *self-audited*: a rule that surfaces failure branches by filtering on `denied` will not see these. Filter on `result != "success"` where you need both. `mcp.bridge.cancel` is unaffected and remains `success`.
+
+These rows are background-actor events (`principal=system`), not operator actions, and a `failure` row does **not** mean a client lost a result - executions stay durably fetchable by `execution_id`. See [`audit-log.md`](audit-log.md) for the verb family and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md) for what to do when the paired alert fires.
+
+## Behaviour change: an MCP maintenance failure degrades instead of aborting the server (#2487)
+
+A transient failure in the MCP progress-bridge sweep or the MCP session collector, which runs on the server's maintenance thread, previously escaped that thread and terminated the whole process. It is now contained: the tick is skipped and retried on the next cycle.
+
+**What to do:** be aware this is a genuine trade, not a pure win. The old failure was self-announcing - the process died, your supervisor restarted it, and uptime monitoring saw it. The new one is silent unless you are scraping metrics: a sustained failure means bridge teardown or session collection stops running, live MCP progress can degrade for the remaining life of the process, and `/readyz` will continue to report healthy throughout (MCP session state deliberately does not gate readiness). If you run Prometheus, scrape `yuzu_mcp_bridge_teardown_incomplete_total`, `yuzu_mcp_maintenance_tick_failures_total` and `yuzu_mcp_bridge_records_active`, and load the bundled rules in `docs/prometheus/yuzu-alerts.yml` - they are not applied automatically. If you do not, you will not see this condition at all.
+
+Note this narrows the crash surface rather than closing it: other work on the same maintenance thread remains unguarded, so a sufficiently severe resource exhaustion can still terminate the process from a different call site.
+
 ## Behaviour change: `yuzu-agent` no longer restart-loops forever (ADR-0021 rung 7.7a)
 
 The `yuzu-agent` systemd unit now sets `StartLimitIntervalSec=300` + `StartLimitBurst=5` in its `[Unit]` section. Previously the unit was `Restart=always` with no start limit, so an agent that could not stay up restarted every 10 seconds indefinitely. With this change, if the agent exits 5 times within 300 seconds systemd stops retrying and the unit enters `failed`.
@@ -800,6 +816,29 @@ How it works:
 - Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.
 - Multiple stores share one database connection but keep independent version counters.
 
+**Index builds are deliberately kept OUT of the migration runner.** A failed
+migration closes the store, and for `audit_store` that means every audit write
+then fails - so an `O(N log N)` index build on a multi-million-row table is not
+routed through the fail-closed path. The `audit_store` retention index
+(`idx_audit_ttl_id`, #2360) is created best-effort after migrations instead: on a
+large existing `audit_events` this is a one-time build at first boot after
+upgrade (~1.4 s and ~81 MB at 5M rows, extrapolating to ~16 s at 50M), and the
+elapsed time is logged when it exceeds a second. If it fails, retention still
+runs - each pass just scans instead of seeking, and the failure is logged as an
+error.
+
+**Container operators: check your healthcheck `start_period` before this
+upgrade if `audit_events` is large.** The build runs inside the `AuditStore`
+constructor, which completes well before the server binds its listener, so for
+its whole duration there is no `/healthz` responder. A healthcheck whose
+`start_period` is shorter than the build will kill the container mid-build - and
+because nothing was committed, the next boot starts the build again, so it
+restart-loops rather than converging. The shipped compose files use a 5-10 s
+`start_period`, which is sized for a fresh database; raise it past your expected
+build time (see the figures above) for the one upgrade boot. The stock
+365-day-retention server is unaffected until `audit_events` reaches the
+multi-million-row range.
+
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 
 **No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:
@@ -830,6 +869,53 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse)
+
+Both retention paths used to issue an unbounded `DELETE` driven by the local wall
+clock, so one forward clock step could wipe a store in a single statement. They
+are now guarded and capped. Two operator-visible consequences on upgrade:
+
+- **Audit retention is now a floor, not a ceiling.** A pass that would expire
+  every datable row declines once, and every accepted pass is capped at 25,000
+  rows, so a large backlog ages out over hours rather than in one statement.
+  Watch `yuzu_server_audit_retention_cap_reached_total` alongside
+  `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
+  Note that changing `--audit-retention-days` never re-dates existing rows
+  (`ttl_expires_at` is stamped at INSERT), so a reduction does not reclaim disk
+  retroactively. Full behaviour:
+  [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
+- **Expect a retention decline on the first pass after upgrade.** Both guards
+  decline when they find no stored clock reading to compare against, because the
+  elapsed-time check cannot run without one. It is logged, it increments the
+  decline counter, and it needs no action - the next pass proceeds normally.
+  **The count differs by store:** the audit store is one table, so it declines
+  exactly once. TAR checks per warehouse table, so on an agent upgrade every
+  enabled time-based table declines in that same pass and
+  `retention_guard_declines_total` rises by the number of those tables (5-10 on
+  a default agent), not by 1. That is still the benign bootstrap case, not a
+  fleet of separate anomalies. On a fleet upgrade expect one
+  `YuzuAuditRetentionClockAnomaly` per server if you have wired it; stand them
+  down. See [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+- **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
+  table holding the durable clock reading - one row, instant) plus the best-effort index build described
+  under Schema Migrations above.
+- **Agents surface new `tar status` lines**: `storage_state`,
+  `retention_guard_declines_total`, `retention_guard_failures_total`, and
+  per-table detail. On the healthy path `storage_state|ok` is the first line,
+  and existing consumers filter on the `config|` prefix and ignore unknown
+  lines, so nothing breaks. **On the offline path they do break**: when the TAR
+  database has been closed after a wedged rollback, `tar status` returns
+  non-zero and emits only an `error|` line followed by `storage_state|offline` -
+  no `record_count`, no `config|` lines at all. Note the order is REVERSED
+  there: `error|` comes first, because server and dashboard consumers key off
+  the output starting with `error|`. A consumer keyed on the presence of
+  `record_count` must handle that. See
+  [tar.md](tar.md#the-retention-clock-guard). TAR persists its own clock reading
+  in `tar_config` (`retention_guard_last_pass`) - no schema change.
+- **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
+  but a large excess (after a long disable, or an upgrade backlog) drains over
+  several 900 s rollup ticks rather than in one statement.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 

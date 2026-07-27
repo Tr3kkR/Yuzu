@@ -102,7 +102,9 @@ required.
 | `session.identity_mismatch` | Session | A gRPC Subscribe was rejected because the mTLS client identity (cert CN/SAN) did not overlap the identity bound at Register time (#1118 — a stolen-session signal, the mTLS sibling of `session.peer_mismatch`). `principal=agent:<agent_id>`; `target_id` is the `session_id`; `detail` carries `agent_id=<id> reason=mtls_identity_mismatch presented=[<cert CN/SANs at Subscribe>] bound=[<cert CN/SANs at Register>]` so an auditor can identify the cert used in the attempt. `result=denied`. SOC 2 CC7.2: high-signal security event. **The SIEM signal is the Prometheus counter** `yuzu_grpc_subscribe_identity_mismatch_total{event="security"}`; this audit row is the paired forensic evidence. On audit-store write failure the gRPC response carries `x-yuzu-audit-failed: true` (see **gRPC audit-failure signal** below). |
 | `tag.set` | Tag | A tag is created or updated on an agent |
 | `tag.delete` | Tag | A tag is removed from an agent |
-| `instruction.execute` | Instruction | An instruction is dispatched to one or more agents |
+| `instruction.execute` | Instruction | An instruction is dispatched to one or more agents. Also emitted with `result=denied` and `detail=reason=<reason>` when a supplied device target names nothing (#2500) |
+| `command.dispatch` | Command | A command is dispatched via `POST /api/command`. Also emitted with `result=denied` and `detail=reason=<reason> <plugin>:<action>` when a supplied device target names nothing (#2500); `plugin`/`action` are caller-supplied and are sanitised and capped at 128 bytes before storage |
+| `result_set.create` | ResultSet | A result set is created by any producer. Also emitted with `result=denied` and `detail=reason=<reason> source_kind=<kind>` when a supplied `parent_id` names no parent set (#2500) |
 | `instruction.approve` | Instruction | An instruction pending approval is approved |
 | `instruction.deny` | Instruction | An instruction pending approval is denied |
 | `instruction.import` | InstructionDefinition | An InstructionDefinition JSON envelope was submitted via `POST /api/instructions/import`. On `result=success`: `target_id` is the new definition's id; `detail` is empty. On `result=denied`: `target_id` is empty (no id assigned on rejection); `detail` carries the store-returned error string, which begins with a stable SIEM-keyable token — known tokens are `duplicate_id` (409 conflict), `signature verification failed for instruction — content may have been tampered with` (#1073 / W7.4), `instruction-import is unsigned and signature enforcement is enabled` (#1073), `instruction-import has incomplete signing metadata` (#1073), `instruction-import has signing field of wrong JSON type` (#1073 R1), `signature length invalid` / `publicKey length invalid` (#1073 R1 DoS amplification guard), `instruction-import has signature + publicKey but no yaml_source` (#1073). Permission gate: `InstructionDefinition:Write`. SOC 2 CC6.7: every import attempt is logged regardless of outcome; if the audit-store write itself fails, the response carries the `Sec-Audit-Failed: true` header AND an `audit_emitted=false` field in the JSON body (PR #883 evidence-chain pattern). |
@@ -208,9 +210,9 @@ required.
 | `server.unsigned_packs_allowed` | ProductPack | Emitted ONCE at server startup when `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS=1` is set (#802 / W7.4). `principal=system`, `target_id=signature_enforcement`, `detail` describes the flag source, `result=success`. Pairs with the `[SECURITY] product pack signature enforcement DISABLED by configuration` warn line in operator logs. SIEM rules can detect a server running with the relaxed posture even on deployments with no pack-install traffic. |
 | `server.unsigned_definitions_allowed` | InstructionDefinition | Sibling of `server.unsigned_packs_allowed`, emitted ONCE at server startup when `--allow-unsigned-definitions` / `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1` is set (#1073 / W7.4 sibling-gap closure). `principal=system`, `target_id=signature_enforcement`, `detail` describes the flag source, `result=success`. Pairs with the `InstructionStore: signature enforcement DISABLED by configuration` warn line in operator logs. Same SIEM use case: identifies servers running with the relaxed instruction-import posture. |
 | `config.admin_group_set` | AuthConfig | Emitted ONCE per configured flag at server startup when `--oidc-admin-group` and/or `--saml-admin-group` is non-empty (#1829). `principal=system`, `target_id` is `oidc` or `saml` (one row per configured provider — up to two rows on a server with both wired), `detail=provider=<oidc\|saml>;admin_group=<value>` (the already-trimmed group value — a group identifier, not a secret), `result=success`. Makes the standing "which group grants admin via SSO" posture recoverable from the audit store even on a deployment with no SSO logins yet. |
-| `mcp.bridge.*` | Execution | Server-side lifecycle events of the MCP progress bridge (track 2f PR 3a), NOT operator actions - emitted from the background sweep/projector, so `principal=system`, `target_id` is the `execution_id`, `result=success`. The verb family: `mcp.bridge.done_reap` (a settled GET-only record was reaped), `mcp.bridge.session_dead` (a record torn down because its session idle-expired), `mcp.bridge.arming_reaped` (an orphaned reserved-but-never-armed record was reclaimed by the age reaper), `mcp.bridge.cancel` (a pending cancel was consumed at arm), `mcp.bridge.pin_acked` and `mcp.bridge.forced_expire` (parked-result teardown - only reachable once the later SSE-on-`POST` rung lands). The operator action that *starts* progress streaming (`execute_instruction`) is separately audited under its own `mcp.execute_instruction` verb with the real principal - the bridge does not replace it. |
+| `mcp.bridge.*` | Execution | Server-side lifecycle events of the MCP progress bridge (track 2f PR 3a), NOT operator actions - emitted from the background sweep/projector, so `principal=system` and `target_id` is the `execution_id` - **except** for a record reaped by the arming reaper before `subscribe()` assigned an execution id, where `target_id` is empty (that row is therefore not joinable to an execution; the `detail` still identifies the disposition). `result` is normally `success`, but every verb that routes through the claimed-teardown path (all of them except `mcp.bridge.cancel`) emits **`result=failure`** when the teardown could not settle one of the three resources it owns (`detail` begins `teardown incomplete: ...` and names what is retained - see `yuzu_mcp_bridge_teardown_incomplete_total{reason}` and `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`), or when the terminal-frame publish ladder poisoned the session, threw, or was never reached (`detail` states which, and never asserts a delivery or a poisoning that did not happen - #2506). **Upgrade note:** before v0.13.0 these rows were unconditionally stamped `result=success` regardless of outcome; a SIEM rule that assumed the constant needs updating. The verb family: `mcp.bridge.done_reap` (a settled GET-only record was reaped), `mcp.bridge.session_dead` (a record torn down because its session idle-expired), `mcp.bridge.arming_reaped` (an orphaned reserved-but-never-armed record was reclaimed by the age reaper), `mcp.bridge.cancel` (a pending cancel was consumed at arm), `mcp.bridge.pin_acked` and `mcp.bridge.forced_expire` (parked-result teardown - only reachable once the later SSE-on-`POST` rung lands). The operator action that *starts* progress streaming (`execute_instruction`) is separately audited under its own `mcp.execute_instruction` verb with the real principal - the bridge does not replace it. |
 
-**Result vocabulary.** Every action above emits `result` as `success` or `denied` (with the rare `failure` reserved for internal-error paths the handler does not itself audit). `denied` is used for RBAC rejections and for every 400/404/409 branch where the handler explicitly audits the failure — including Guardian `rule.create` (400 missing fields, 409 conflict), `rule.update` (400 invalid body, 404 not found, 409 conflict), `rule.delete` (404 not found), `push` (400 non-object body), and the Phase 8.3 `offload_target.create` (400 validation_failed) / `offload_target.delete` (404 not_found) handlers. SIEM rules that filter on `result == "success"` will match every completed mutation including `guaranteed_state.push` (which returns 202 rather than 201/200 because agent fan-out is asynchronous). To surface probe/fuzz traffic on the REST surface, filter on `result == "denied"` scoped to the actions you care about — every mutating branch produces a row.
+**Result vocabulary.** `result` is predominantly `success` or `denied`, with `failure` for a failure the handler audits itself. The set is not closed in practice - `ok`, `error`, `warning` and `skipped` also appear on specific verbs. `denied` is the usual token for an authorization or validation rejection with a real principal behind it, but that is a convention rather than an invariant: `enrollment.token_consumed` and `engine_principal.credential.rotate` both use `failure` for what are really rejections, and `instruction.scope_resolution_failed` was emitting a self-audited `failure` before the `mcp.bridge.*` family existed. **So a SIEM rule that surfaces failure branches by filtering on `denied` alone will miss several families, including every background-actor row.** Filter on `result != "success"` when you want all of them. Note `GET /api/v1/audit` does not currently expose a `result` query parameter, so that filter has to be applied by the SIEM after export rather than server-side. `denied` is used for RBAC rejections and for every 400/404/409 branch where the handler explicitly audits the failure — including Guardian `rule.create` (400 missing fields, 409 conflict), `rule.update` (400 invalid body, 404 not found, 409 conflict), `rule.delete` (404 not found), `push` (400 non-object body), and the Phase 8.3 `offload_target.create` (400 validation_failed) / `offload_target.delete` (404 not_found) handlers. SIEM rules that filter on `result == "success"` will match every completed mutation including `guaranteed_state.push` (which returns 202 rather than 201/200 because agent fan-out is asynchronous). To surface probe/fuzz traffic on the REST surface, filter on `result == "denied"` scoped to the actions you care about — every mutating branch produces a row.
 
 The `/auto` pre-flight verbs add two non-denial outcomes: `no_devices` (a `preflight.run` whose scope resolved to no visible devices — an operator no-op, not a rejection) and `noop` (a `preflight.run.delete` whose run id was unknown or not owner-visible — a no-op rather than a permission denial, which keeps a non-owner from distinguishing "exists" from "doesn't exist"). Neither is a `denied`; SIEM rules counting denials should not include them.
 
@@ -330,12 +332,99 @@ configuration is required.
 ## Retention and cleanup
 
 Audit events are retained for 365 days by default. A background thread runs
-every hour and deletes events whose `timestamp` falls outside the retention
-window. Deletion is permanent --- there is no soft-delete or archive step.
+every hour and deletes events whose `ttl_expires_at` has passed. That TTL is
+stamped once, when the row is written, as `insert time + retention window` -- it
+is not derived from the event's own `timestamp`, and nothing ever rewrites it. Deletion is permanent --- there is no soft-delete or archive step.
 
 To preserve audit data beyond the retention window, export events periodically
 using the REST API or forward them to an external system (see Planned Features
 below).
+
+### The retention clock guard
+
+Retention is driven by the server's wall clock, so a clock that jumps forward
+--- a restored VM snapshot, an NTP correction after a dead CMOS battery, a
+hand-set date --- can mark the whole table expired at once. A cleanup pass
+refuses to act on that. (Triage guidance:
+[the runbook](../ops-runbooks/audit-store-clock-guard.md).)
+
+- **A pass declines, deletes nothing, logs a warning, and increments
+  `yuzu_server_audit_clock_anomaly_skips_total`** when any of these holds:
+
+  1. it would expire **every** datable row;
+  2. more than **a fixed 7 days** elapsed since the previous pass;
+  3. the stored clock reading is **ahead** of now;
+  4. there is **no stored reading at all** --- the first pass after upgrading to
+     a build with the guard, or after a restore.
+
+  **Triggers 1-3 latch**: the pass declines once, then the next resumes paced,
+  so a table that is legitimately all-expired still ages out at the cost of one
+  cleanup interval. **Trigger 4 does not latch** --- a missing comparison point
+  is not an anomaly, and spending the latch on it would let a real one on the
+  very next pass go undeclined.
+
+  **What to do:** for 4, nothing; it is expected once per database. For 2 and 3,
+  check the host's time sync AND its uptime, because elapsed time cannot tell a
+  clock jump from an outage and the warning names both causes. Triage detail is
+  in [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+
+  The 7 days is **absolute, not derived from `audit_retention_days`**: how far
+  the clock moved has nothing to do with how long rows are kept, and scaling it
+  to the window put the threshold at a full year on the 365-day default, where
+  it could never fire. The reading is persisted, so trigger 2 still fires on the
+  first pass after a restart --- including a server that *booted* with an
+  already-wrong clock.
+- **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
+  default), oldest first. A wipe the guard chose to allow therefore ages out at
+  a paced rate an operator can still catch, rather than in one statement.
+- Rows whose TTL sits implausibly far in the future --- beyond the retention
+  window plus two days, i.e. written while the clock was already skewed forward
+  --- are excluded from the "would this expire everything?" question. Without
+  that, one such row would disarm the guard permanently.
+
+**Capacity.** The drain is a fixed 25,000 rows per hourly pass -- about 600,000
+rows/day, or a sustained ceiling of roughly **6.9 audit events/second**. Above
+that, expiry outruns deletion and `audit.db` grows without bound;
+`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that
+figure against your own audit-event rate before deploying at scale. The cap is a
+compile-time constant today, so exceeding it needs an engineering change rather
+than configuration.
+
+**Retention is a floor, not a ceiling.** The guard errs toward keeping evidence
+longer than configured, which is the safe direction for an evidence store.
+Changing `--audit-retention-days` does **not** re-date existing rows:
+`ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
+expires nothing retroactively and reclaims no disk. What it does change is this
+guard's survivor horizon, which is derived from the current window -- so after a
+reduction (and a restart, per issue #483) the older long-TTL rows stop counting
+as survivors, and a single declined pass becomes more likely.
+
+**What this does and does not promise.** The cap is the half that always
+applies: it bounds the damage of any allowed wipe unconditionally. The two
+The detectors are all best-effort, and the outcome test has a known blind spot --- it is
+defeated by *any* audit row written after the clock moved, because a fresh row
+counts as a survivor. On a server that is up and serving, that is the common
+case, which is why the elapsed-time reading is persisted across restarts. Taken
+together the guard converts an instantaneous wipe into a paced one plus an
+operator signal; it does not guarantee every clock anomaly is detected.
+
+Six metrics report on this. All but `rows_deleted_total` ship with an alert
+rule in `docs/prometheus/yuzu-alerts.yml`; that one is a rate to read alongside
+the others, not an alert on its own. Do not collapse the first two:
+
+| Metric | Meaning |
+|---|---|
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Four triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; the stored reading was *ahead* of the clock; or there was no stored reading at all, so the elapsed-time check could not run (the first pass after upgrading or restoring - expected once per database). The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
+| `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
+| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
+| `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. **Evaluated once at startup**, so it will not detect an index dropped while the server is running. |
+| `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
+
+The first two both leave rows undeleted, so an audit table that never shrinks
+looks identical either way --- only the pair distinguishes "the guard is
+protecting the table" from "cleanup is broken". The third covers the failure the
+cap itself introduces, which neither of the first two would show.
 
 ## Integration patterns
 

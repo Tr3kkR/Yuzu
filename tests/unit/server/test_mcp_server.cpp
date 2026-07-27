@@ -3753,14 +3753,29 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
         const std::string scope(8192, 'x');
         const std::string val(kExecInstrParamValueMaxLen, 'y');
         const std::string key(256, 'k');
+        // Split into two calls, one per selector. #2500 refuses agent_ids +
+        // a real scope as `target_conflict`, so the caps can no longer be
+        // exercised in a single request - but the thing this case asserts is
+        // that each cap is honoured, not that both selectors may be combined.
         auto res = call_with(R"({"plugin":")" + ident + R"(","action":")" + ident +
                              R"(","scope":")" + scope + R"(","params":{")" + key + R"(":")" + val +
-                             R"("},"agent_ids":[")" + ident + R"("]})");
+                             R"("}})");
         REQUIRE(res);
         CHECK(res->status == 200);
         auto body = nlohmann::json::parse(res->body);
         INFO(res->body);
         REQUIRE(body.contains("result"));
+        CHECK(dispatched);
+
+        dispatched = false;
+        auto res_ids = call_with(R"({"plugin":")" + ident + R"(","action":")" + ident +
+                                 R"(","params":{")" + key + R"(":")" + val +
+                                 R"("},"agent_ids":[")" + ident + R"("]})");
+        REQUIRE(res_ids);
+        CHECK(res_ids->status == 200);
+        auto body_ids = nlohmann::json::parse(res_ids->body);
+        INFO(res_ids->body);
+        REQUIRE(body_ids.contains("result"));
         CHECK(dispatched);
     }
 }
@@ -3960,7 +3975,7 @@ TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamp
     // size so adding a reason without documenting it fails here rather than
     // shipping an undocumented label.
     INFO("adding a reason? update docs/user-manual/metrics.md and this count");
-    CHECK(kExecInstrBoundReasons.size() == 13);
+    CHECK(kExecInstrBoundReasons.size() == 14); // +target_conflict (#2500)
 }
 
 // ── 26d. Schema <-> handler-constant cross-check (#2437) ─────────────────
@@ -7270,6 +7285,12 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
 
         // A REALISTIC (non-minimal) execute_instruction payload — scope +
         // agent_ids + string params — passes validation and mints (-32006).
+        // The payload used to also carry `scope:"tag:web"`. That was incidental
+        // to what this case tests (params typing on the approval-gated path),
+        // and #2500 now refuses agent_ids + a real scope as `target_conflict`
+        // because the old precedence silently discarded the id list. Dropping
+        // the redundant selector preserves exactly what this case asserts; it
+        // is a fixture correction, not an assertion weakened to fit the code.
         // Deliberate tier-dependent strictness (Gate 4 happy-S1, accepted):
         // params values must be STRINGS on the approval-gated path even
         // though the handler would coerce a number via dump(); an
@@ -7278,7 +7299,7 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         // the documented product decision, not an accident.
         auto mint = nlohmann::json::parse(
             ts.call(
-                  R"({"jsonrpc":"2.0","method":"tools/call","id":323,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","scope":"tag:web","agent_ids":["agent-001","agent-002"],"params":{"verbose":"true","depth":"2"}}}})")
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":323,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["agent-001","agent-002"],"params":{"verbose":"true","depth":"2"}}}})")
                 ->body);
         REQUIRE(mint.contains("error"));
         CHECK(mint["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
