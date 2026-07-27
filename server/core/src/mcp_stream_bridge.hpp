@@ -514,6 +514,13 @@ public:
     /// TerminalRung::kNotAttempted audit path: nothing published AND the stream was
     /// not poisoned, which must not be reported as a poisoning (#2487 review).
     void inject_terminal_build_fault_for_test(int times = 1);
+    /// The NEXT `times` release_charge() calls throw AT THE LOCK, before either
+    /// half of the release runs - the same modelled mutex failure as the claim
+    /// seam. Proves #2529's both-or-neither property: a failure here must leave
+    /// the record still reading "charge held" AND the ledger still counting it,
+    /// so a later release repairs it. The split version cleared the flag first,
+    /// and a throw then stranded streamed_unpinned_[session] forever.
+    void inject_charge_lock_fault_for_test(int times = 1);
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -767,6 +774,8 @@ private:
     /// #2487: a teardown step that could not complete on the maintenance thread.
     /// `stage` is a CLOSED literal set - unsubscribe | release_charge | erase.
     void count_teardown_incomplete(TeardownStage stage) noexcept;
+    /// #2529: a charge release deferred to teardown because its lock failed.
+    void count_charge_release_deferred() noexcept;
     /// True iff a fault is armed for `stage` (consumes one). Test seam only.
     bool take_step_fault(TeardownStage stage) noexcept;
     void publish_records_gauge(std::size_t n) noexcept;  ///< never called under bridge_mu_
@@ -823,6 +832,7 @@ private:
     /// TeardownStage.
     std::array<std::atomic<int>, kTeardownStageCount> teardown_step_fault_{};
     std::atomic<int> terminal_build_fault_{0}; ///< remaining teardown frame-build throws (test seam)
+    std::atomic<int> charge_lock_fault_{0};    ///< remaining release_charge lock throws (#2529 seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
 
     std::chrono::steady_clock::time_point now() const {

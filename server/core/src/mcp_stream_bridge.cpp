@@ -31,6 +31,14 @@ constexpr const char* kMetricStreamingBackstop = "yuzu_mcp_bridge_streaming_back
 // or its bus subscription outlived its teardown and now waits for shutdown() -
 // alert on > 0.
 constexpr const char* kMetricTeardownIncomplete = "yuzu_mcp_bridge_teardown_incomplete_total";
+// #2529: a streamed admission charge that could not be released at its natural
+// release point (arm()'s cancel-degrade) and is therefore RETAINED on the record
+// until its teardown reclaims it. Distinct from kMetricTeardownIncomplete, which
+// is teardown_claimed's own steps on the maintenance thread; this one fires on a
+// request thread. Both-or-neither holds either way - the record and the ledger
+// still agree - so a nonzero value is a deferred release, never a stranded slot.
+constexpr const char* kMetricChargeReleaseDeferred =
+    "yuzu_mcp_bridge_charge_release_deferred_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -437,7 +445,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
     std::string fallback = build_fallback_final(jsonrpc_id, exec_id);
 
     bool consumed_cancel = false;
-    bool release_streamed_charge = false;
+    bool degraded = false;
     ArmOutcome outcome = ArmOutcome::kArmed;  // defensively initialised; assigned below
     {
         // The ONE record-mutex hold (H2): noexcept moves, arbitration, flip,
@@ -464,22 +472,40 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
         rec->result_base = std::move(result_base);
         consumed_cancel = rec->cancel_pending;
         rec->cancel_pending = false;
-        const bool degrade = consumed_cancel && mode == ArmMode::kStreaming;
+        degraded = consumed_cancel && mode == ArmMode::kStreaming;
         const Phase target =
-            (mode == ArmMode::kStreaming && !degrade) ? Phase::kStreaming : Phase::kArmedGetOnly;
+            (mode == ArmMode::kStreaming && !degraded) ? Phase::kStreaming : Phase::kArmedGetOnly;
         rec->phase.store(target, std::memory_order_release);
-        if (degrade && rec->streamed_charge_held) {
-            // C1: the degraded record follows the GET-only lifecycle and can
-            // never pin - its admission charge is released here, exactly once.
-            rec->streamed_charge_held = false;
-            release_streamed_charge = true;
-        }
-        outcome = degrade ? ArmOutcome::kDegradedGetOnly : ArmOutcome::kArmed;
+        outcome = degraded ? ArmOutcome::kDegradedGetOnly : ArmOutcome::kArmed;
         wake(*core_);  // the handoff - same hold
     }
-    if (release_streamed_charge) {
-        std::lock_guard<std::mutex> lk(bridge_mu_);
-        decrement_streamed_locked(session_id);
+    if (degraded) {
+        // #2529: the degraded record follows the GET-only lifecycle and can never
+        // pin, so its admission charge is owed back. This USED TO clear
+        // streamed_charge_held inside the flip hold above and take bridge_mu_ here
+        // afterwards - the split that broke release_charge and project_record, with
+        // the same consequence: a throw at the second acquisition left the record
+        // reading "not held" while streamed_unpinned_[session] still counted it, so
+        // that entry never reached 0, never got erased, and the session accumulated
+        // forever. Routing through release_charge - which takes BOTH locks in
+        // hierarchy order and re-reads the flag under them - makes it both-or-
+        // neither, and keeps ONE implementation of the release rather than a third
+        // copy. Exactly-once survives the move: the flag is the interlock, so a
+        // concurrent teardown racing this simply wins and this call no-ops.
+        //
+        // CONTAINED, and the outcome is still returned. A failure here leaves a
+        // CONSISTENT record (charge held, ledger counts it) that its own teardown
+        // repairs, whereas throwing would lose a flip that already succeeded and
+        // hand the caller an error response for a request whose plain result is
+        // perfectly good. This is also what makes the H2 property above literally
+        // true: after the flip, arm() cannot throw. Same posture as teardown step 3,
+        // which contains and counts a release_charge failure rather than abandoning
+        // the teardown.
+        try {
+            release_charge(rec);
+        } catch (...) {
+            count_charge_release_deferred();
+        }
     }
     if (consumed_cancel) {
         // C1: audit only AFTER winning the arbitration, outside every lock.
@@ -1141,11 +1167,14 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         // that entry never reaches 0, never gets erased, and the session accumulates
         // forever. run_projector's per-record catch swallows it, so nothing retries.
         // Fixing release_charge alone would have fixed the instance and left the sink.
-        // NOT the last site: arm()'s cancel-degrade path still clears the flag under
-        // rec->mu and takes bridge_mu_ afterwards. Its caller's guard stops the
-        // exception ESCAPING but does nothing about the desync - a throw there strands
-        // streamed_unpinned_[session] identically, so the sink is the same one. Out of
-        // scope here (request thread, different failure posture); tracked as #2529.
+        // This WAS the second of three; arm()'s cancel-degrade path was the third and
+        // is now routed through release_charge itself (#2529), so every clear of
+        // streamed_charge_held in this file now happens under BOTH locks or under
+        // bridge_mu_ with the ledger mutated in the same hold. Verified by sweep:
+        // shutdown clears the whole ledger map wholesale, reserve's LedgerRollback
+        // unwinds both while bridge_mu_ is still held, and abandon holds both. Keep it
+        // that way - a new split here is not a local style choice, it is a permanent
+        // per-session leak.
         std::lock_guard<std::mutex> lk(bridge_mu_);
         std::lock_guard<std::mutex> rlk(rec->mu);
         rec->terminal_projected.store(true, std::memory_order_release);
@@ -1856,6 +1885,15 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
 }
 
 void McpStreamBridge::release_charge(const std::shared_ptr<BridgeRecord>& rec) {
+    if (charge_lock_fault_.load(std::memory_order_relaxed) > 0 &&
+        charge_lock_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+        // inject_charge_lock_fault_for_test - the modelled mutex failure, thrown
+        // BEFORE either lock so it models the acquisition itself failing. It sits
+        // here, in the shared primitive, rather than at a call site: this is the
+        // one place that owns the both-or-neither property both callers depend on.
+        throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
+                                "injected release_charge lock failure");
+    }
     // BOTH halves under BOTH locks, in hierarchy order. The split version cleared
     // the flag under rec->mu and only THEN took bridge_mu_ - and that acquisition is
     // the sole throw site, so a failure left the record reading "not held" while
@@ -1904,6 +1942,12 @@ template <typename F> bool McpStreamBridge::obs_guard(F&& f) noexcept {
 void McpStreamBridge::count_reject(const char* reason) noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->counter(kMetricRejects, {{"reason", reason}}).increment(); });
+    }
+}
+
+void McpStreamBridge::count_charge_release_deferred() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricChargeReleaseDeferred).increment(); });
     }
 }
 
@@ -2130,6 +2174,10 @@ void McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, i
 
 void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {
     terminal_build_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_charge_lock_fault_for_test(int times) {
+    charge_lock_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }

@@ -2571,3 +2571,60 @@ TEST_CASE("bridge #2528 - a terminal lost to the degraded settle publishes the f
         CHECK(ok);
     }
 }
+
+// ── #2529: arm()'s cancel-degrade must return the charge both-or-neither ───────
+//
+// The degrade used to clear streamed_charge_held inside arm()'s flip hold and take
+// bridge_mu_ afterwards. That acquisition is the sole throw site, so a failure left
+// the record reading "not held" while streamed_unpinned_[session] still counted it:
+// exactly-once release is keyed on the flag, so EVERY later release path - the
+// projector settle, teardown_claimed - then found nothing to do and the session's
+// admission slot was spent for good. Routing the release through release_charge,
+// which takes both locks before mutating either half, makes the failure a DEFERRAL
+// instead: the record and the ledger still agree, so the record's own teardown
+// reclaims the slot.
+//
+// C8 is what makes this reachable at all - ArmMode::kStreaming has no production
+// caller before it, so kDegradedGetOnly cannot happen today.
+TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, the admission slot",
+          "[mcp][bridge][2f][2529]") {
+    Fx fx;
+    auto s = fx.make_session();
+    // Record 1 is the degrade victim; 2-4 spend the remaining pin slots so the cap
+    // is exactly consumed and a further reserve becomes the ledger probe (the
+    // ledger is invisible from outside - spending the cap is the only way to read it).
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2529"));
+    for (int i = 2; i <= 4; ++i) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+    }
+
+    // A cancel that lands BEFORE arm is the one path that returns a charge outside
+    // teardown: arm consumes the intent and degrades the streamed record to GET-only.
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kAcceptedPending);
+    fx.bridge->inject_charge_lock_fault_for_test(1);
+    // CONTAINED, and the outcome is still the true one: the flip already succeeded,
+    // so throwing here would lose a completed arm over a bookkeeping failure.
+    CHECK(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming, "{}") ==
+          Bridge::ArmOutcome::kDegradedGetOnly);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_charge_release_deferred_total").value() == 1.0);
+
+    // The charge was NOT returned and the ledger still counts it - they AGREE, so
+    // the cap correctly still bites. This is NOT the load-bearing assertion: the
+    // pre-fix code also rejected here (for the opposite, broken reason).
+    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
+          "pin_slots");
+
+    // THE LOAD-BEARING HALF. The record still reads "charge held", so the next
+    // release path repairs it. For a degraded record that path is its teardown: the
+    // GET-only terminal branch settles to kDone without touching the charge (a
+    // GET-only record normally holds none), and the sweep's reap releases it.
+    // Pre-fix the flag was already clear, so this teardown released nothing and the
+    // slot stayed spent for the life of the session.
+    fx.bus.publish("exec-2529", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kDone; }));
+    fx.bridge->sweep();
+    REQUIRE_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // reaped
+    CHECK(s.stream->pinned_count() == 0);  // GET-only never pins, so this reads the ledger alone
+    CHECK(fx.bridge->reserve(s.id, "alice", json(6), json("t"), true).ok);
+}

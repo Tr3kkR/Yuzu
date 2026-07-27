@@ -583,6 +583,13 @@ public:
                           "signal, not a rate: the record is still reclaimable, but a terminal "
                           "payload mid-retry is lost and answered by the fallback final",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
+                          "Streamed admission charges that could not be released at their natural "
+                          "release point and are RETAINED on the record until its teardown "
+                          "reclaims them (#2529). Needs a genuinely broken platform mutex, so ANY "
+                          "nonzero value is a signal, not a rate. The record and the ledger still "
+                          "agree, so this is a deferred release, never a stranded slot",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_streaming_backstop_total",
                           "Streamed-POST records the sweep had to park because they were still "
                           "kStreaming with a dead session or long past the cap. The pump's own "
@@ -638,6 +645,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
+        metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
