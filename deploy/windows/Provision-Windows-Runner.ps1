@@ -159,7 +159,11 @@ function Assert-RunnersDrained([string]$context){
               "to finish, then re-run. -AllowActiveRunners skips this check without stopping " +
               "anything — those jobs may then be interrupted.") -ForegroundColor Red
   Write-Host "Provisioning stopped: no further steps run." -ForegroundColor Red
-  Stop-Transcript -EA SilentlyContinue | Out-Null
+  try {
+    Stop-Transcript -EA Stop | Out-Null
+  } catch {
+    Write-Warning "Provisioning is still aborting, but the transcript could not be closed cleanly: $($_.Exception.Message)"
+  }
   exit 2
 }
 
@@ -610,13 +614,8 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
         # robocopy/icacls of agent 0..n, which can take minutes.
         Assert-RunnersDrained "refusing to restart $svc"
         Set-ItemProperty $regPath -Name ImagePath -Value $newImage -Type $imageKind
-        # Which of the two calls below threw decides whether the cluster is
-        # actually down on the recovery path — Restart-Service can fail in its
-        # STOP phase, leaving the original postmaster alive and serving.
-        $restartCompleted = $false
         try {
           Restart-Service $svc -Force -EA Stop
-          $restartCompleted = $true
           Assert-PgServing $dstbin $port "agent $n repointed service"
           Write-Host "agent ${n}: postgres.exe now private ($dstbin), svc $svc on :$port verified"
         } catch {
@@ -633,9 +632,14 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
             # ALONE completes the rollback in that case — restarting would drop
             # connections that predate the gate above and were never authorised.
             $originalBin = Split-Path $curExe -Parent
-            $stillServing = (-not $restartCompleted) -and (Test-PgServingNow $originalBin $port)
+            # Probe on EVERY forward failure. Restart-Service may have thrown
+            # before stopping the old process, or it may have returned before
+            # the later authenticated health check failed. Either way, a ready
+            # service port is enough reason not to drop possibly-live sessions.
+            $stillServing = Test-PgServingNow $originalBin $port
             if($stillServing){
-              Write-Host "agent ${n}: $svc still serving the ORIGINAL binary (the restart failed before stopping it) — ImagePath restored, no restart needed"
+              Write-Host "agent ${n}: $svc still has a ready service port — ImagePath restored for its next start; no recovery restart performed"
+              $rollbackResult = 'restored ImagePath while the service port remained ready; no recovery restart was performed'
             } else {
               # Observation for the LOG ONLY — deliberately not Assert-
               # RunnersDrained, and deliberately swallowing its failure. This is
@@ -654,12 +658,13 @@ Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster 
               # what earns this, not an assumption about how we got here.
               Restart-Service $svc -Force -EA Stop
               Assert-PgServing $originalBin $port "agent $n rollback service"
+              $rollbackResult = 'restored and verified the original service after a recovery restart'
             }
           } catch {
             $rollbackError = $_.Exception.Message
             throw "repoint of $svc failed ($forwardError); rollback to '$curExe' ALSO FAILED verification ($rollbackError)"
           }
-          throw "repoint of $svc failed ($forwardError); rollback to '$curExe' restored and verified the original service"
+          throw "repoint of $svc failed ($forwardError); rollback to '$curExe' $rollbackResult"
         }
       }
     } catch {

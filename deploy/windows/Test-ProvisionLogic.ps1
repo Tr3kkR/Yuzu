@@ -313,8 +313,8 @@ Check 'no handler pattern-matches a drain signal (the tag protocol stays dead)' 
 # serving.
 Check 'the DRAIN-EXEMPT restart is conditional on a proven-not-serving cluster' {
   ($text -match 'function Test-PgServingNow') -and
-  ($text -match '\$stillServing\s*=\s*\(-not \$restartCompleted\)\s*-and\s*\(Test-PgServingNow') -and
-  ($text -match '\$restartCompleted\s*=\s*\$true')
+  ($text -match '\$stillServing\s*=\s*Test-PgServingNow') -and
+  ($text -notmatch '\$restartCompleted')
 }
 # Every cluster restart proves it came back — the main PostgreSQL step's as well
 # as the per-agent ones. That is why Assert-PgServing is script-scoped rather
