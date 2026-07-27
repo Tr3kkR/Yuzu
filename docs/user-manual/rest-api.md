@@ -63,6 +63,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [Internal CA](#internal-ca)
+  - [KEK Rotation](#kek-rotation)
   - [Engine Principals](#engine-principals)
   - [RBAC](#rbac)
   - [Tags](#tags)
@@ -1468,6 +1469,85 @@ persistence failed), `503` (CA unavailable). A rejected import is audited
 > `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
 > the internal CA for that surface entirely — unchanged behaviour, supported and
 > independent of subordinate mode.
+
+---
+
+### KEK Rotation
+
+Rotate the secrets key-encryption-key (KEK) that wraps every envelope-encrypted
+secret column (ADR-0010). See `docs/user-manual/server-admin.md` "Key
+management (secrets KEK)" for the full runbook (half-committed recovery, DR
+drill, retirement preconditions). Each route has an MCP twin sharing the same
+failure classification and remediation wording: `rotate_kek`, `rewrap_secrets`,
+`get_kek_status`.
+
+#### `POST /api/v1/secrets/kek/rotate`
+
+Mint a new KEK version (`secrets-kek-v<N+1>`) and re-wrap every registered
+secret row's wrapped-DEK header under it (payloads untouched). **Permission:**
+`Security:Write`. No request body (empty or `{}`).
+
+```json
+{ "new_version": 2, "rotation_complete": true, "meta": { "api_version": "v1" } }
+```
+
+`rotation_complete` is the honest completion signal (ADR-0010 §3) — the
+response deliberately omits a rewrapped-row count; call `/rewrap` for one.
+Errors: `400`/`413` (non-empty/oversized body), `403` (missing
+`Security:Write`), `409` (another KEK operation holds the cluster-wide
+advisory lock — retry once it completes), `429` (rotation cooldown, below),
+`503` (codec/Postgres unavailable).
+
+> **`500` half-committed — do NOT retry this route.** If rotation registers
+> the new version but fails to finish re-wrapping every row, this returns
+> `500` with a remediation telling you to call `POST
+> /api/v1/secrets/kek/rewrap` to resume. Retrying `/rotate` instead would mint
+> a second, spurious version on top of the half-rotated state.
+
+> **`429` rotation cooldown.** Rotation *attempts* are rate-limited (5 minutes
+> between attempts, per server). A failed attempt consumes the budget too —
+> deliberately, because a failed rotation is exactly when you must not
+> immediately rotate again: automation that retries `/rotate` on a `500` would
+> otherwise mint a fresh version on every retry, and a KEK version can never be
+> retired (#2525). **`/rewrap` is NOT rate-limited** and is the correct way to
+> finish a half-committed rotation. The cooldown is a rate limiter, not a
+> correctness guarantee: it is per-process, so servers sharing one database each
+> have their own, and a restart clears it. Cluster-wide correctness comes from
+> the advisory lock, which returns `409`, not this.
+
+#### `POST /api/v1/secrets/kek/rewrap`
+
+Idempotent resume: re-wrap every row still on a non-active KEK version under
+the current active one. Safe to call repeatedly, including when there is
+nothing left to do. **Permission:** `Security:Write`. No request body.
+
+```json
+{ "rows_rewrapped": 3, "meta": { "api_version": "v1" } }
+```
+
+`rows_rewrapped: 0` is a normal outcome, not an error. Errors: `400`/`413`,
+`403` (missing `Security:Write`), `409` (advisory lock held), `503`.
+
+#### `GET /api/v1/secrets/kek/status`
+
+Current KEK rotation status. **Permission:** `Security:Read`.
+
+```json
+{ "active_version": 2, "oldest_in_use": 2, "rotation_complete": true, "meta": { "api_version": "v1" } }
+```
+
+`oldest_in_use` is `null` when no secret rows exist at all (trivially
+complete). Read-only, not audited. Errors: `403` (missing `Security:Read`),
+`409` (advisory lock held), `503`.
+
+> **No retire endpoint — by design.** Yuzu does not expose a way to destroy an
+> old KEK version, even though the codec's internal `retire_kek` exists and is
+> tested. `SecretCodec::encrypt()` snapshots the active version and releases
+> its lock before the caller persists the blob, so a retirement could pass its
+> "zero references" check and delete a key an in-flight write is about to use
+> — a permanent, unrecoverable loss (#2525). Old KEK files are expected to
+> accumulate; they are required to restore older backups and must not be
+> deleted by hand.
 
 ---
 
@@ -5274,7 +5354,7 @@ Send a command to one or more connected agents.
   "plugin": "hardware",
   "action": "cpu-info",
   "agent_ids": ["agent-01", "agent-02"],
-  "parameters": {},
+  "params": {},
   "stagger": 30,
   "delay": 5
 }
@@ -5284,13 +5364,33 @@ Send a command to one or more connected agents.
 |---|---|---|---|---|
 | `plugin` | string | Yes | -- | Target plugin name. |
 | `action` | string | Yes | -- | Action within the plugin. |
-| `agent_ids` | array of string | No | `[]` | Target agent IDs. Empty = broadcast to all. |
-| `parameters` | object | No | `{}` | Key-value parameters passed to the plugin. |
-| `scope` | string | No | `""` | Scope expression for device targeting (alternative to `agent_ids`). |
+| `agent_ids` | array of string | No | -- | Target agent IDs. **Omit the field** to broadcast. A supplied `[]`, a non-array value, or a non-string entry returns `400` (#2500). |
+| `params` | object | No | `{}` | Key-value parameters passed to the plugin. (This table previously named the field `parameters`; the handler has always read `params`, so a client written to the old text silently dispatched with no parameters at all.) |
+| `scope` | string | No | -- | Scope expression for device targeting (alternative to `agent_ids`), or `__all__` for every enrolled agent. A supplied `""` or non-string value returns `400` (#2500). |
 | `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. |
 | `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). |
 
-If `agent_ids` is empty or omitted and no `scope` is provided, the command is broadcast to all connected agents.
+**Targeting: omitted means everything, supplied-but-empty is an error (#2500).**
+Omitting **both** `agent_ids` and `scope` broadcasts to all connected agents, as does an
+explicit `"scope": "__all__"`. Supplying either field with a value that names no device is
+refused with `400` rather than widened — an empty `agent_ids`, a non-array `agent_ids`, a
+non-string entry, an empty `scope`, or a non-string `scope`. Before this, a client emitting
+numeric device ids (`"agent_ids": [1,2,3]`) or one whose device filter matched nothing
+(`"agent_ids": []`) dispatched to the **entire fleet** and received a success response.
+
+`agent_ids` and `scope` are **alternatives — supply exactly one, or neither.** Supplying
+`agent_ids` together with a real `scope` returns `400` (`reason=target_conflict`). They used to
+resolve by precedence, with the scope winning and the explicit id list silently discarded, so
+`{"agent_ids":["dev-a"],"scope":"tag:prod"}` ran on every device matching `tag:prod` rather than
+on `dev-a` — the same "the executed set is not the requested set" defect this section is about,
+reached by two selectors disagreeing instead of by one being erased.
+
+The single exception is `"scope": "__all__"` alongside `agent_ids`: `__all__` is the broadcast
+*request* rather than a narrowing selector, and the explicit id list wins.
+
+Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",reason=...}` and
+write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
+must be a JSON object; anything else is `400`.
 
 ---
 
@@ -5425,13 +5525,21 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 ```json
 {
   "agent_ids": ["agent-uuid-1"],
-  "scope": "",
   "params": {"key": "value"}
 }
 ```
 
-- `agent_ids` (optional) — array of agent IDs to target
-- `scope` (optional) — scope expression (e.g., `group:servers`). Empty string + empty `agent_ids` = broadcast
+- `agent_ids` (optional) — array of agent IDs to target. **Omit** to broadcast; a supplied `[]`,
+  a non-array value, or a non-string entry returns `400` (#2500).
+- `scope` (optional) — scope expression (e.g., `group:servers`), or `__all__` for every enrolled
+  agent. A supplied `""` or non-string value returns `400`.
+
+> **Behaviour change (#2500).** This endpoint previously documented "empty string + empty
+> `agent_ids` = broadcast", and an explicitly empty `agent_ids` did broadcast. It is now `400`.
+> **Omit both fields** (or send `"scope": "__all__"`) to target the whole fleet deliberately.
+> Refusals increment `yuzu_server_dispatch_target_rejected_total{route="instruction_execute"}`
+> and write an `instruction.execute` audit row with `result=denied`. The body must be a JSON
+> object; anything else is `400`.
 - `params` (optional) — key-value parameters passed to the plugin
 
 **Response (200):**
@@ -6418,7 +6526,7 @@ username=admin&password=secretpass
 | `202` (`mfa_required`) | Credentials valid; user **has** TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
 | `202` (`mfa_enrollment_required`) | Credentials valid; user is **un-enrolled** and `--mfa-enforcement` (`admin-only` for admins / `required` for all) requires MFA | `{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","qr_svg":"<inline SVG, or empty>","expires_in":120}` — show the QR/secret and complete enrollment via `POST /login/mfa/enroll` |
 | `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
-| `503` | Enforcement applies but `auth.db` is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
+| `503` | Enforcement applies but the auth store is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
 | `503` | The in-memory pending-challenge map is at capacity (server under a `/login` flood; transient load-shed) | `{"error":{"code":503,"message":"too many pending authentications, retry shortly"}}` — retry after a short back-off; emits `yuzu_auth_mfa_pending_load_shed_total` |
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `qr_svg` field on the enrollment variant is a server-rendered inline SVG QR code encoding `otpauth_uri` — inject it into the DOM **without** HTML-escaping (it is pure shape geometry, no user content). If `qr_svg` is the empty string, QR encoding failed; fall back to displaying `secret_base32` / `otpauth_uri` for manual entry. The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
@@ -6470,8 +6578,10 @@ Only a 6-digit TOTP code is accepted (recovery codes do not exist until enrollme
 | Status | Condition | Body |
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted; enrollment complete, session minted | `{"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", … 10 total]}` — revealed **once**; save them |
-| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, or attempts exhausted | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
-| `503` | `auth.db` unavailable | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, attempts exhausted, **or the auth store is not configured at all** (null DB) | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
+| `503` | Auth store reachable but the secret could not be verified — decrypt/store failure (e.g. KEK unresolvable) | `{"error":{"code":503,"message":"authentication store is temporarily unavailable"}}` |
+
+A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt.
 
 **Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on failure `mfa.enroll.failed`.
 
@@ -6584,7 +6694,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 **Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the auth store is unavailable.
 
 **Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 
