@@ -1290,19 +1290,53 @@ bool McpPostPump::pump_once(const WriteFn& write) {
     // (#2037's class). Mirrors McpStreamPump::pump_once, including the nested
     // guard: the handler itself allocates.
     try {
-        return pump_once_impl(write);
+        const bool keep_open = pump_once_impl(write);
+        if (!keep_open) {
+            mark_sink_closed();
+        }
+        return keep_open;
     } catch (...) {
         // Recorded FIRST, before the fallible metric/log calls - this is the one
         // close path that never reaches finish(), so without it the releaser would
         // read kNone, normalise to client_gone, and audit a disconnect for what was
         // actually an internal failure. First-wins keeps a real earlier reason.
         note_close_reason(McpStreamClose::kInternalError);
+        mark_sink_closed();
         try {
             count_stream_close(metrics_, McpStreamClose::kInternalError);
             spdlog::warn("MCP streamed-POST pump: tick failed, closing the response");
         } catch (...) {  // NOLINT(bugprone-empty-catch)
         }
         return false;
+    }
+}
+
+void McpPostPump::mark_sink_closed() noexcept {
+    // Publishes "this response is over" into the flag the BRIDGE reads, on EVERY
+    // path that ends the response - the normal finishes, and the catch above.
+    //
+    // Without it, `closed` tracked only "someone asked to cancel" rather than
+    // liveness, and the bridge's cancel interlock is that flag: in the window
+    // between this pump returning false and httplib running the releaser (which is
+    // what actually parks the record), a cancel would still find kStreaming, a
+    // bound sink and closed==false, win the exchange, and audit "detached the
+    // streamed response" for a response that had already ended as completed,
+    // cap_expired or client_disconnect. An audit row that overstates an outcome is
+    // worse than a missing one. Mirrors McpStreamState::close on the GET channel,
+    // which sets the same flag for the same reason.
+    //
+    // Under the sink mutex, like every other write to `closed` - the pump's own
+    // wait predicate reads it, and ownership of the mutex during the modification
+    // is what orders the two.
+    try {
+        {
+            std::lock_guard<std::mutex> lk(sink_->mu);
+            sink_->closed.store(true, std::memory_order_release);
+        }
+        sink_->cv.notify_all();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // pump_once is a hard noexcept boundary; a lock failure here costs a
+        // late cancel one possibly-inaccurate audit row, never the process.
     }
 }
 
