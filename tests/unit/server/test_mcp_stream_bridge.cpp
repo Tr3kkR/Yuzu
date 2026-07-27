@@ -3098,3 +3098,72 @@ TEST_CASE("CH-15: pin slots are a concurrency limit, never a lifetime quota",
         CHECK(s.stream->pinned_count() == 0);
     }
 }
+
+TEST_CASE("CH-14b: a cancel racing a completing tick must not claim a detach",
+          "[mcp][bridge][2f][chaos][ch14]") {
+    // Gate 8. The exactly-once interlock is the `closed` flip, so WHERE it happens
+    // decides what a mid-tick cancel is told. Flipping it at finish() left the whole
+    // rest of the tick exposed - revalidate is a store round trip, then
+    // session_alive, then every progress write and the final write - so a cancel
+    // landing in there won the exchange and audited "detached the streamed
+    // response" while the client received progress, its result and EOF, and the
+    // close audit recorded reason=completed. Two contradictory compliance rows for
+    // one exchange.
+    //
+    // The bridge now flips `closed` at the DECISION: the moment it hands back a
+    // final, the response IS ending and there is nothing left to detach.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch14b"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    // Take the batch WITHOUT running the pump's write half - this is precisely the
+    // mid-tick instant the old code left open, reproduced deterministically rather
+    // than raced.
+    fx.bus.publish("exec-ch14b", "execution-completed", kCompleted);
+    Bridge::PostBatch batch;
+    REQUIRE(poll_until([&] {
+        batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+        return batch.final_frame.has_value();
+    }));
+
+    // The client's result is in hand and the response is committed to ending, so a
+    // cancel arriving now has nothing to detach - and must not say otherwise.
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 0);
+}
+
+TEST_CASE("a client-driven bridge audit carries the caller, not \"system\"",
+          "[mcp][bridge][2f][audit]") {
+    // Decision 15(j) non-repudiation, and the fix for it was untested (Gate 8:
+    // both the compliance and cpp-safety re-reviews flagged that the fixture
+    // captured the actor but nothing asserted on it). An investigator has to be
+    // able to tell WHICH client detached a live response - a row stamped "system"
+    // is indistinguishable from the bridge's own housekeeping.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-actor"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1), "alice") == Bridge::CancelOutcome::kDetached);
+
+    std::lock_guard<std::mutex> lk(fx.audit_mu);
+    bool found = false;
+    for (const auto& row : fx.audits) {
+        if (row.action == "mcp.bridge.cancel") {
+            found = true;
+            CHECK(row.actor == "alice");  // NOT empty, which the sink maps to "system"
+        }
+    }
+    CHECK(found);
+}

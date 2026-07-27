@@ -291,7 +291,7 @@ public:
         "reserve_rejected", "reserve_threw", "no_execution_row", "subscribe_failed", "arm_threw",
         // 3b (streamed POST)
         "bind_post_sink_failed", "stream_install_failed", "arm_already_armed", "arm_cancelled",
-        "arm_not_armed", "post_dispatch_threw", "attach_audit_failed"};
+        "arm_not_armed", "post_dispatch_threw"};
 
     enum class CancelOutcome {
         kAcceptedPending,  ///< pre-arm: recorded; arm()/abandon() arbitrate (C1 - no audit yet)
@@ -877,8 +877,10 @@ private:
     /// True iff a fault is armed for `stage` (consumes one). Test seam only.
     bool take_step_fault(TeardownStage stage) noexcept;
     void publish_records_gauge(std::size_t n) noexcept;
-    /// Sessions holding every streamed pin slot - the "busy vs wedged" diagnostic.
-    void publish_pin_cap_gauge() noexcept;  ///< never called under bridge_mu_
+    /// Records a pin-slot refusal, labelled by which half of the admission sum was
+    /// holding the slots. Called at the reject site so it cannot drift from the
+    /// expression admission actually evaluates.
+    void count_pin_slots_reject(std::size_t pinned, std::size_t unpinned) noexcept;  ///< never called under bridge_mu_
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
     /// `detail` is a string_view, NOT a `const std::string&`: every caller passes a

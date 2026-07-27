@@ -39,12 +39,19 @@ constexpr const char* kMetricTeardownIncomplete = "yuzu_mcp_bridge_teardown_inco
 // still agree - so a nonzero value is a deferred release, never a stranded slot.
 constexpr const char* kMetricChargeReleaseDeferred =
     "yuzu_mcp_bridge_charge_release_deferred_total";
-// Sessions currently holding every streamed-POST pin slot. The diagnostic that
-// distinguishes "busy, will clear" from "leaked, never will" - without it the only
-// signal for a wedged session was a bare reject counter, and both the 429
-// remediation and the docs tell the caller to wait for calls that may already have
-// finished. Governance 2026-07-27 (enterprise-readiness).
-constexpr const char* kMetricSessionsAtPinCap = "yuzu_mcp_bridge_sessions_at_pin_cap";
+// Streamed admissions refused for want of a slot, labelled by WHICH half of the
+// admission sum was holding them. Measured at the reject site, using the same
+// expression admission evaluates, because the first attempt at this diagnostic was
+// a periodic gauge that counted only the charge ledger - and a wedged session is
+// precisely the case where the charges are gone and the PINS are held, so it read
+// zero exactly when it mattered and non-zero on healthy concurrency (governance
+// Gate 8). A signal computed anywhere other than the decision it describes can
+// drift from it; this one cannot.
+//   held="charges" - calls genuinely in flight; clears as they finish.
+//   held="pins"    - finals already committed whose pins were never released. After
+//                    the rule-(a) unpin this should be rare; a sustained rate is the
+//                    wedge signature.
+constexpr const char* kMetricPinSlotsReject = "yuzu_mcp_bridge_pin_slots_reject_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -278,6 +285,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
 
     const char* reject = nullptr;
     std::size_t active = 0;
+    std::size_t pin_reject_pinned = 0;
+    std::size_t pin_reject_unpinned = 0;
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
         if (shutdown_started_) {
@@ -293,8 +302,16 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             // commit and its ledger decrement rejects fail-closed.
             auto it = streamed_unpinned_.find(session_id);
             const std::size_t unpinned = it == streamed_unpinned_.end() ? 0 : it->second;
-            if (rec->stream->pinned_count() + unpinned >= kMaxStreamedPostsPerSession) {
+            const std::size_t pinned = rec->stream->pinned_count();
+            if (pinned + unpinned >= kMaxStreamedPostsPerSession) {
                 reject = "pin_slots";
+                // Captured, NOT emitted here: the metrics registry has its own mutex
+                // and the label map allocates, and this is inside bridge_mu_ - the
+                // global admission lock. Taking a slower shared lock under a broad
+                // one is the shape this very round removed from the pump; the
+                // sibling count_reject already defers for the same reason.
+                pin_reject_pinned = pinned;
+                pin_reject_unpinned = unpinned;
             }
         }
         if (reject == nullptr) {
@@ -343,6 +360,9 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     }
     if (reject != nullptr) {
         count_reject(reject);
+        if (std::string_view(reject) == "pin_slots") {
+            count_pin_slots_reject(pin_reject_pinned, pin_reject_unpinned);
+        }
         return {false, reject};
     }
     publish_records_gauge(active);
@@ -444,9 +464,14 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
     // self-sufficient, and both go through build_fallback_final so the bytes have
     // exactly one derivation.
     std::string exec_id;
+    std::string rec_principal;
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
         exec_id = rec->execution_id;
+        // The cancel this may consume came from an authenticated client too, so the
+        // row it produces is attributable like the streamed detach is. The session
+        // gate guarantees this equals the canceller.
+        rec_principal = rec->principal;
     }
     std::string fallback = build_fallback_final(jsonrpc_id, exec_id);
 
@@ -519,7 +544,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
                         outcome == ArmOutcome::kDegradedGetOnly
                             ? "consumed_by_arm: streamed intent degraded to get-only"
                             : "consumed_by_arm: get-only request, nothing to detach",
-                        {}, AuditResult::kSuccess);
+                        {}, AuditResult::kSuccess, rec_principal);
     }
     return outcome;
 }
@@ -883,6 +908,28 @@ McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& k
     if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
         wake(*core_);
     }
+    // COMMIT THE ENDING HERE, at the DECISION, not later at the close. Once the
+    // bridge has handed back a final or settled the cap, this response IS ending -
+    // the pump will write and EOF - so a cancel arriving from now on has nothing
+    // left to detach and must answer kNoOp.
+    //
+    // Doing it at finish() instead (the previous attempt) left the whole rest of
+    // the tick exposed: revalidate is a store round trip, then session_alive, then
+    // every progress write and the final write. A cancel landing anywhere in there
+    // still found closed==false, won close_post_sink's exchange, and audited
+    // "detached the streamed response" for an exchange the client completed
+    // normally - two contradictory compliance rows for one request. The window is
+    // now the batch handover alone.
+    //
+    // Safe against the pump's own flow: `closed` is read at the TOP of a tick, and
+    // this tick will not reach another one. Taking sink-mu under rec-mu is the
+    // sanctioned order.
+    if (out.final_frame.has_value() || out.cap_settled) {
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        if (rec->post_sink) {
+            (void)close_post_sink(rec->post_sink);
+        }
+    }
     return out;
 }
 
@@ -907,9 +954,12 @@ void McpStreamBridge::poke_post_sink(
         // rather than a lost wakeup. The pump evaluates its predicate under this
         // mutex, so a bare notify could land in the window between that
         // evaluation and the wait, and the pump would then sleep through work
-        // that was already there. Nothing is mutated under it - the predicate
-        // reads bridge state - so the acquisition IS the synchronisation. Same
-        // discipline as close_sink storing `closed` under this mutex.
+        // that was already there. The `poked` flag set below IS what the predicate
+        // reads, and holding the mutex across that store is what orders it against
+        // the pump's wait - the same discipline as storing `closed` under it. (This
+        // comment used to say nothing was mutated here, which was true and was
+        // exactly the bug: a notify with no state change cannot satisfy a
+        // predicated wait_for, so the whole wake path was inert.)
         //
         // NOT INDEPENDENTLY COVERED, and deliberately so: removing this
         // acquisition leaves the suite green, because the poke reaches here only
@@ -1382,9 +1432,6 @@ McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& re
 // ── Sweep ──────────────────────────────────────────────────────────────────
 
 void McpStreamBridge::sweep() {
-    // Refresh the busy-vs-wedged reading once per maintenance tick, before the
-    // passes below can change it.
-    publish_pin_cap_gauge();
     std::vector<std::shared_ptr<BridgeRecord>> snap;
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
@@ -2097,28 +2144,19 @@ void McpStreamBridge::publish_records_gauge(std::size_t n) noexcept {
     }
 }
 
-void McpStreamBridge::publish_pin_cap_gauge() noexcept {
-    // Counts sessions with NO streamed admission left. A session that legitimately
-    // has four calls in flight is indistinguishable, from a bare reject counter,
-    // from one wedged forever - and when it is wedged the 429 remediation ("wait
-    // for one to finish") is a lie. This is the number support needs.
-    //
-    // Called from the sweep rather than the admission path: it is a periodic health
-    // reading, not a hot-path counter, and computing it needs bridge_mu_.
+void McpStreamBridge::count_pin_slots_reject(std::size_t pinned, std::size_t unpinned) noexcept {
     if (metrics_ == nullptr) {
         return;
     }
-    std::size_t at_cap = 0;
-    {
-        std::lock_guard<std::mutex> lk(bridge_mu_);
-        for (const auto& [session, unpinned] : streamed_unpinned_) {
-            (void)session;
-            if (unpinned >= kMaxStreamedPostsPerSession) {
-                ++at_cap;
-            }
-        }
-    }
-    obs_guard([&] { metrics_->gauge(kMetricSessionsAtPinCap).set(static_cast<double>(at_cap)); });
+    // Which half dominated. Pins outstanding with no charges means every slot is
+    // held by a final that was already committed - the wedge shape.
+    // "pins" only when NO charge is outstanding - that is the wedge shape (every
+    // slot held by a final already committed). A mixed state still has work in
+    // flight that will clear, so it reads "charges" rather than overstating a wedge;
+    // a simple `pinned > unpinned` would have mislabelled ties and hidden partial
+    // wedges behind the wrong bucket either way.
+    const char* held = (pinned > 0 && unpinned == 0) ? "pins" : "charges";
+    obs_guard([&] { metrics_->counter(kMetricPinSlotsReject, {{"held", held}}).increment(); });
 }
 
 void McpStreamBridge::flush_record_obs(BridgeRecord& rec) noexcept {

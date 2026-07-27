@@ -799,6 +799,10 @@ private:
     std::string execution_id_;
     ClockFn clock_;
     std::chrono::steady_clock::time_point deadline_;
+    /// Next credential re-validation / session-touch. Separate from the wait
+    /// timeout: the poke wakes this pump per publication, but the store round trips
+    /// stay on the tick.
+    std::chrono::steady_clock::time_point next_check_{};
     RevalidateGrace grace_;
     std::atomic<McpStreamClose> close_reason_{McpStreamClose::kNone};
 };
