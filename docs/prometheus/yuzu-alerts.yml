@@ -234,6 +234,52 @@ groups:
             after 15 minutes would contradict the contract it exists to report.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpSessionsWedgedAtPinCap
+        expr: |
+          yuzu_mcp_bridge_sessions_at_pin_cap > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP session(s) have held every streamed-POST slot for 15m"
+          description: >-
+            A session legitimately running four streamed calls is indistinguishable,
+            from the reject counter alone, from one whose slots are never coming
+            back - this gauge is what separates them, and a value that does not
+            recede over 15m is the wedged case. Read it with
+            yuzu_mcp_stream_rejects_total{reason="post_pin_slots"}: if rejects climb
+            while this stays flat and non-zero, admission slots are not being
+            released and the affected client is locked out of streaming until it
+            re-initializes. Runbook:
+            docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+      - alert: YuzuMcpBridgeChargeReleaseDeferred
+        expr: |
+          yuzu_mcp_bridge_charge_release_deferred_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed admission charge could not be released at its natural point"
+          description: >-
+            A charge release could not take its locks and was deferred to the
+            record's teardown (#2529). The record and the ledger still AGREE, so
+            this is a deferral rather than a stranded slot - but it needs a
+            genuinely broken platform mutex to happen at all, so any non-zero value
+            is a signal about the host rather than a rate to tune. Read it together
+            with yuzu_mcp_bridge_projection_degraded_total, which the same fault
+            class also drives.
+      - alert: YuzuMcpBridgeStreamingBackstop
+        expr: |
+          increase(yuzu_mcp_bridge_streaming_backstop_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP sweep had to park a stranded streamed-POST record"
+          description: >-
+            The backstop only fires when a streamed record was left in kStreaming
+            past its cap - normally impossible, because the response releaser parks
+            it. A sustained rate points at a releaser or connection-teardown bug;
+            the records are parked rather than reaped, so nothing is lost, but the
+            path should not be exercised in a healthy server.
       - alert: YuzuMcpBridgeProjectionDegraded
         expr: |
           yuzu_mcp_bridge_projection_degraded_total > 0

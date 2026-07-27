@@ -436,6 +436,33 @@ After upgrading, refusals are counted by
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
 
+### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
+
+A `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and**
+an SSE-capable `Accept` now receives its progress on the POST response itself
+rather than on the session's GET stream. Opt-in and per request: a call that sends
+neither, or only one of the two, behaves exactly as before and is byte-identical on
+the wire. Plain POST clients (mcp-remote, Claude Desktop) are unaffected.
+
+Three operator-visible consequences:
+
+- **Sizing.** A streamed POST holds an HTTP worker for up to its response cap
+  (120 s). It leases from the same held-open budget as the GET channel, so total
+  concurrency is unchanged — but `TimeoutStopSec` and any container termination
+  grace period should now be sized above 120 s, not the 30 s that suited GET alone.
+  Under-sizing SIGKILLs mid-drain and silently drops in-flight streams on deploy.
+- **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
+  channel. The streamed-POST allowance is a separate, fixed 4 per session (twinned
+  to the replay ring's pin slots), so the real per-principal held-open ceiling is
+  `--mcp-max-streams-per-principal + 4`. Lowering the flag to contain a noisy
+  principal does not reduce its streamed-POST concurrency.
+- **Reverse proxies.** The response sets `X-Accel-Buffering: no`, which only nginx
+  honours. Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out,
+  or the stream is buffered and dead clients are not detected.
+
+`--mcp-no-streaming` remains the kill switch and now also degrades the streamed
+POST arm back to plain JSON, not just GET/DELETE.
+
 ### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
 
 Two operator-visible changes to held-open MCP `GET` SSE streams. Neither changes a

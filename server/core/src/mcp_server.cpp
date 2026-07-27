@@ -586,8 +586,15 @@ static const ToolDef kTools[] = {
      "+ execution_id + agents_reached; the agents run the action and report back separately. "
      "LIVE PROGRESS: on a Streamable HTTP session, include _meta.progressToken (string|int) in "
      "the tools/call params and notifications/progress frames (agents responded / targeted, with "
-     "the execution_id in _meta under \"yuzu.execution_id\") arrive on this session's GET SSE "
-     "stream as the fleet responds. Progress is always BEST-EFFORT: even after supplying a "
+     "the execution_id in _meta under \"yuzu.execution_id\") are delivered as the fleet "
+     "responds. WHERE they arrive is your choice, per request: send an SSE-capable Accept "
+     "(text/event-stream) with the token and THIS POST response is held open as the stream - "
+     "progress frames first, the JSON-RPC result last, then EOF; send the token WITHOUT an SSE "
+     "Accept and this POST answers immediately in JSON while the frames go to the session's GET "
+     "SSE stream. Streaming refusals are answered, not silent: 429 (stream/session cap, "
+     "Retry-After), 409 (this request id is already in flight), 404 (session expired). If a "
+     "stream ends early, recover with the execution_id - NEVER re-send this call, which would "
+     "run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
      "FALLBACK when not streaming: poll query_responses with the "
@@ -2315,12 +2322,13 @@ McpServer::HandlerFn McpServer::build_handler(
             // different requests, and the bridge keys on the exact value, so any
             // coercion here would cancel the wrong one or nothing at all.
             //
-            // Intent only. request_cancel RECORDS it and arm()/abandon() arbitrate,
-            // which is what keeps cancellation honest under the race that matters:
-            // a cancel landing while the request is mid-dispatch cannot half-cancel
-            // a command already on the wire. The audit fires at arbitration
-            // (mcp.bridge.cancel), not here, so a cancel is only ever recorded as
-            // having done something once it actually did.
+            // What this does depends on how far the request has got. Pre-arm it
+            // records INTENT and arm()/abandon() arbitrate, which is what keeps
+            // cancellation honest under the race that matters: a cancel landing
+            // mid-dispatch cannot half-cancel a command already on the wire. Once
+            // the request is streaming there is nothing left to arbitrate, so the
+            // cancel applies immediately - it closes the response and is audited at
+            // that site. Either way a row is written only when something happened.
             if (rpc.method == "notifications/cancelled" && streaming_on &&
                 stream_bridge_ != nullptr) {
                 const auto cancel_sid = req.get_header_value("Mcp-Session-Id");
@@ -5850,7 +5858,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto streamed_reject = [&](int status, int code, std::string_view message,
                                                  const char* metric_reason,
                                                  std::string_view remediation,
-                                                 long retry_after_ms = -1) {
+                                                 std::int64_t retry_after_ms = -1) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
                     if (metrics != nullptr) {
                         try {
@@ -5862,7 +5870,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
                     session_audit("mcp.session.reject", "failure",
-                                  bridge_sid.substr(0, 8),
+                                  yuzu::server::detail::sanitize_detail_value(
+                                      bridge_sid.substr(0, 8)),
                                   std::string("reason=") + metric_reason + " cid=" + cid +
                                       " surface=post dispatched=false");
                     res.status = status;
@@ -5871,7 +5880,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         // BOTH the header and the A4 body field.
                         res.set_header("Retry-After", std::to_string((retry_after_ms + 999) / 1000));
                     }
-                    res.set_content(a4_error(code, message, remediation, retry_after_ms, cid),
+                    res.set_content(a4_error(code, message, remediation,
+                                            static_cast<long>(retry_after_ms), cid),
                                     "application/json");
                 };
                 const bool bridge_eligible = streaming_on && bridge != nullptr &&
@@ -5930,7 +5940,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                           "retry without an SSE Accept for a plain response"
                                         : "retry shortly, or retry without an SSE Accept for a "
                                           "plain response",
-                                    mcp::kMcpStreamCapRetryAfterMs);
+                                    mcp::kMcpStreamedPostRetryAfterMs);
                                 return;
                             }
                             stream_lease.emplace(std::move(acquired.lease));
@@ -5990,7 +6000,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                           "flight; wait for one to finish"
                                         : "retry shortly, or retry without an SSE Accept for a "
                                           "plain response",
-                                    mcp::kMcpStreamCapRetryAfterMs);
+                                    mcp::kMcpStreamedPostRetryAfterMs);
                                 return;
                             }
                         } else {
@@ -6075,6 +6085,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (bridge_active && execution_id.empty()) {
                     bridge->abandon(bridge_sid, id);
                     bridge_active = false;
+                    // Keep the declared invariant (streamed_active => bridge_active).
+                    // Leaving it set let the streamed arm below run against an
+                    // abandoned record, fall through to arm_not_armed, and count a
+                    // SECOND degrade for one request - while the budget lease sat
+                    // unreleased until the handler returned.
+                    streamed_active = false;
+                    stream_lease.reset();
                     bridge_degrade("no_execution_row");
                 }
                 if (bridge_active) {
@@ -6087,6 +6104,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!subscribed) {
                         bridge->abandon(bridge_sid, id);
                         bridge_active = false;
+                        streamed_active = false;  // same invariant as above
+                        stream_lease.reset();
                         bridge_degrade("subscribe_failed");
                     }
                 }
@@ -6289,6 +6308,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // remain after it.
                                 const std::string attach_detail =
                                     "cid=" + cid + " surface=post execution_id=" + execution_id;
+                                // Built BEFORE the install too, for the same reason:
+                                // once the content provider is set httplib IGNORES
+                                // res.body, so a throw from a post-install allocation
+                                // would hand the peer a 500 status AND a live SSE
+                                // stream from a record the catch has already parked.
+                                // Nothing after set_chunked_content_provider may
+                                // allocate.
+                                const std::string success_detail =
+                                    std::string("command_id=") + command_id +
+                                    " execution_id=" + execution_id + " surface=post";
                                 const std::string audit_sid =
                                     yuzu::server::detail::sanitize_detail_value(
                                         bridge_sid.substr(0, 8));
@@ -6305,6 +6334,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                                ? std::string("engine")
                                                : std::string{}};
                                 auto req_copy = std::make_shared<httplib::Request>(req);
+                                // Headers only from here on: revalidate reads the
+                                // credential headers, the close audit reads remote_addr
+                                // and User-Agent. The BODY can be up to
+                                // kMcpMaxRequestBodyBytes and httplib already keeps the
+                                // original alive for the provider's life, so retaining a
+                                // second copy for up to the response cap is pure
+                                // duplicate footprint at fleet scale.
+                                req_copy->body.clear();
+                                req_copy->body.shrink_to_fit();
 
                                 auto revalidate = [req_copy, principal = session->username,
                                                    revalidate_fn]() -> mcp::StreamRevalidate {
@@ -6385,7 +6423,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                                 auto releaser = [bridge, record_key, pump, lease_home, post_gauge,
                                                  incremented, req_copy, audit_principal, audit_sid,
-                                                 execution_id, principal_audit_fn,
+                                                 execution_id, cid, principal_audit_fn,
                                                  audit_fn](bool) noexcept {
                                     // Ordered by what is owed to whom: the record's
                                     // lifecycle and the admission slot FIRST, because
@@ -6411,9 +6449,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                             // the closed label set.
                                             reason = mcp::McpStreamClose::kClientGone;
                                         }
+                                        // cid joins this row to the attach row and to
+                                        // the client's X-Correlation-Id; role_as_of
+                                        // records that the actor was captured at
+                                        // attach, not re-derived now (it may no longer
+                                        // resolve). The GET close row carries both.
                                         const std::string detail =
                                             std::string("reason=") + mcp::to_string(reason) +
-                                            " surface=post execution_id=" + execution_id;
+                                            " cid=" + cid + " surface=post execution_id=" +
+                                            execution_id + " role_as_of=attach";
                                         if (principal_audit_fn) {
                                             (void)yuzu::server::detail::
                                                 try_persist_audit_for_principal(
@@ -6452,12 +6496,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // cannot answer a failed audit with Sec-Audit-Failed;
                                 // set-and-proceed is the only posture left, and the
                                 // stream is real either way.
-                                (void)yuzu::server::detail::try_persist_audit(
-                                    audit_fn, req, "mcp.stream.attach", "success", "McpSession",
-                                    audit_sid, attach_detail);
-                                mcp_audit("success", std::string("command_id=") + command_id +
-                                                         " execution_id=" + execution_id +
-                                                         " surface=post");
+                                if (!yuzu::server::detail::try_persist_audit(
+                                        audit_fn, req, "mcp.stream.attach", "success",
+                                        "McpSession", audit_sid, attach_detail)) {
+                                    // The headers are sealed by the install, so
+                                    // Sec-Audit-Failed is not available here the way it
+                                    // is on GET - but a sink that returns false rather
+                                    // than throwing must not vanish silently.
+                                    bridge_degrade("attach_audit_failed");
+                                }
+                                mcp_audit("success", success_detail);
                                 return; // the provider IS the response
                             } catch (...) {
                                 // Post-dispatch: park (the record keeps its

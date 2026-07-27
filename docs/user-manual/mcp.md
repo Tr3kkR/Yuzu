@@ -228,8 +228,13 @@ change: a notification POST now answers `202` instead of `204`).
   to poll (`query_responses` / `get_execution_status`) - a reservation can silently
   degrade to the plain path under load (e.g. the 256-record cap), and zero progress
   frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
-  **not** emit progress (poll `get_bundle_result`). Progress delivery is on the `GET`
-  stream only in this release; SSE-on-`POST` arrives in a later 2f rung.
+  **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
+  ways, and the client chooses per request: send an SSE-capable `Accept` alongside
+  the `progressToken` and the POST response itself streams the progress frames and
+  then the result; send the token without an SSE `Accept` and the frames go to the
+  session's `GET` stream after the POST has already answered. See
+  `docs/mcp-server.md` "Streamed POST — SSE on the response" for the response
+  shape, the close reasons, and the recovery rules.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
@@ -1048,9 +1053,10 @@ before it could be delivered on the stream (the buffered-result population hit i
 The real result was never lost - only its *streamed* copy was dropped.
 
 **Fix**: Fetch the result durably with the supplied `execution_id`
-(`get_execution_status` / `query_responses`). This code cannot occur for
-`execute_instruction` progress in the current release (the parked-result path activates
-with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
+(`get_execution_status` / `query_responses`). The parked-result path this arises
+from is live: it activates whenever a streamed POST is parked without having
+delivered its final (the client disconnected, the response cap elapsed, or the
+server could not complete the stream).
 
 ### A streamed final can be dropped entirely
 
@@ -1069,9 +1075,9 @@ timeout and the `execution_id` you were given at dispatch, and fall back to
 supported recovery path for every streamed-result failure mode on this surface, not just
 this one.
 
-Like the `-32014` case above, this cannot occur for `execute_instruction` progress in the
-current release - the parked-result path it arises from activates with the later
-SSE-on-`POST` rung. It is documented here for forward compatibility.
+Like the `-32014` case above, this arises from the parked-result path, which is
+live: a streamed POST parked before delivering its final leaves the terminal to be
+collected by a `GET` resume or fetched durably by `execution_id`.
 
 **A related case**: if the failure happens while the server is publishing rather than
 building the frame, the session may additionally be left *poisoned* - every later attach

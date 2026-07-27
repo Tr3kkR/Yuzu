@@ -116,6 +116,15 @@ inline constexpr std::int64_t kMcpStreamCapRetryAfterMs = 5000;
 /// dutifully obeyed our own advice.
 inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 5000;
 
+/// `retry_after_ms` for a streamed-POST admission denial. Deliberately NOT the GET
+/// figure above: a GET slot frees when a dead peer is detected (one tick plus a
+/// write failure), but a streamed-POST slot is held until the WORK finishes or the
+/// response cap elapses. Advising 5 s there has a conforming client burn ~24 full
+/// auth + rate-limit + routing passes before a slot could possibly free - retry
+/// amplification on exactly the surface agentic workers hammer. A quarter of the
+/// cap is a floor that can actually be true.
+inline constexpr std::int64_t kMcpStreamedPostRetryAfterMs = 30000;
+
 /// Ring / sink frames are the shared `detail::SseEvent` (whose `id` field carries
 /// the per-session event id). Deliberately NOT a bespoke type: the id used to be
 /// packed into `data` as a `"<id>\n<payload>"` string and re-parsed in the provider,
@@ -170,7 +179,8 @@ enum class McpStreamClose {
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
     // The next three are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
     // never emits them. Declared here so to_string / close_remediation / the metric seed cover
-    // the whole closed reason set from C4, before their producers land in C6c/C7.
+    // the whole closed reason set from C4. Their producers are LIVE as of 3b: the
+    // POST pump emits all three.
     kCancelled,          ///< the client sent notifications/cancelled; the execution continues
     kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
     kCompleted,          ///< the final was delivered then EOF — no close frame is written for this
