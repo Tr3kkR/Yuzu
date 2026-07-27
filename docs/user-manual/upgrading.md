@@ -18,6 +18,22 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
+
+Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
+
+**What to do:** if you have a SIEM rule, dashboard or evidence query that treats `result` on this verb family as a constant `success` - for example "alert if any `mcp.bridge.*` row is not `success`" - update it before upgrading, or it will fire on legitimate rows. Note also that `failure` here is *self-audited*: a rule that surfaces failure branches by filtering on `denied` will not see these. Filter on `result != "success"` where you need both. `mcp.bridge.cancel` is unaffected and remains `success`.
+
+These rows are background-actor events (`principal=system`), not operator actions, and a `failure` row does **not** mean a client lost a result - executions stay durably fetchable by `execution_id`. See [`audit-log.md`](audit-log.md) for the verb family and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md) for what to do when the paired alert fires.
+
+## Behaviour change: an MCP maintenance failure degrades instead of aborting the server (#2487)
+
+A transient failure in the MCP progress-bridge sweep or the MCP session collector, which runs on the server's maintenance thread, previously escaped that thread and terminated the whole process. It is now contained: the tick is skipped and retried on the next cycle.
+
+**What to do:** be aware this is a genuine trade, not a pure win. The old failure was self-announcing - the process died, your supervisor restarted it, and uptime monitoring saw it. The new one is silent unless you are scraping metrics: a sustained failure means bridge teardown or session collection stops running, live MCP progress can degrade for the remaining life of the process, and `/readyz` will continue to report healthy throughout (MCP session state deliberately does not gate readiness). If you run Prometheus, scrape `yuzu_mcp_bridge_teardown_incomplete_total`, `yuzu_mcp_maintenance_tick_failures_total` and `yuzu_mcp_bridge_records_active`, and load the bundled rules in `docs/prometheus/yuzu-alerts.yml` - they are not applied automatically. If you do not, you will not see this condition at all.
+
+Note this narrows the crash surface rather than closing it: other work on the same maintenance thread remains unguarded, so a sufficiently severe resource exhaustion can still terminate the process from a different call site.
+
 ## Behaviour change: `yuzu-agent` no longer restart-loops forever (ADR-0021 rung 7.7a)
 
 The `yuzu-agent` systemd unit now sets `StartLimitIntervalSec=300` + `StartLimitBurst=5` in its `[Unit]` section. Previously the unit was `Restart=always` with no start limit, so an agent that could not stay up restarted every 10 seconds indefinitely. With this change, if the agent exits 5 times within 300 seconds systemd stops retrying and the unit enters `failed`.
@@ -162,11 +178,11 @@ nothing happened.
 - **Single-admin deployments:** there is no self-service unlock for the *only*
   admin (the unlock endpoint requires a second privileged principal), so either
   wait out the window or use the offline recovery procedure in
-  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. **Note:**
-  since the AuthDB → Postgres migration (see "⚠️ Breaking: local accounts + MFA
-  enrolments reset" below), that runbook's SQL-surgery steps are SQLite-era and
-  do not apply — for a PG-backed deployment there is no offline SQL fallback
-  for the sole-admin case today; wait out the window.
+  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. That
+  runbook is now Postgres-native throughout: its fallback clears
+  `failed_login_count` / `locked_until` with `psql "$YUZU_POSTGRES_DSN"`
+  against `auth.users`, which is exactly the sole-admin case. It writes no
+  audit row, so record it in your change-management system.
 
 ## Behaviour change: operator/API tags now beat agent self-report (#1411)
 
@@ -299,14 +315,17 @@ collision check above). At boot, the server now scans for any pre-existing
 it finds one — silently coexisting with (or being shadowed by) a real engine
 principal is not an acceptable outcome, so this fails closed rather than
 booting into an ambiguous state (decision log #3). Before upgrading, run
-against your `auth.db` and `rbac.db`:
+against both stores. Note they live on different substrates: local users are in
+Postgres (`auth.users`), while local RBAC groups are still SQLite (`rbac.db`):
 
-```sql
--- auth.db
-SELECT username FROM users WHERE username LIKE 'engine:%';
+```bash
+# Local users — Postgres.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username FROM auth.users WHERE username LIKE 'engine:%';"
 
--- rbac.db
-SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';
+# Local RBAC groups — SQLite, per-node. Run on every node.
+sqlite3 /var/lib/yuzu/rbac.db \
+  "SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';"
 ```
 
 If either query returns rows, rename or remove those users/groups **before**
@@ -360,9 +379,8 @@ second factor for an external identity, so **before enabling
 claim containing a recognized MFA method** (Entra: `mfa`; others:
 `otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
 unable to reach high-risk endpoints — recoverable by restarting in
-`optional` (see `docs/ops-runbooks/auth-db-recovery.md`; note that runbook's
-file-based SQL steps are SQLite-era and superseded post-AuthDB→Postgres
-migration — the restart-with-`optional` procedure itself is unaffected).
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md` § "Locked out by MFA
+enforcement misconfiguration"; that runbook is now Postgres-native throughout).
 Under `optional`, no IdP `amr` configuration is required (SSO sessions pass
 the gate).
 
@@ -375,9 +393,9 @@ the token expires, restart with `optional`, log in, enroll, then re-enable.
 **Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
 admin can't enroll): restart the server with `--mfa-enforcement=optional`
 (this re-seeds the in-memory config), log in, resolve enrollment, then
-re-enable. See `docs/ops-runbooks/auth-db-recovery.md` (SQLite-era; the
-restart procedure above works unchanged post-AuthDB→Postgres migration, but
-that runbook's SQL-surgery steps do not apply to a Postgres-backed AuthDB).
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md` — that runbook is now
+Postgres-native throughout, so both the restart procedure above and its SQL
+steps apply as written to a Postgres-backed AuthDB.
 
 ## Hardened auth mode (`--auth-mode=sso-only`) — opt-in (SOC 2 CC6.3/CC6.6)
 
@@ -408,8 +426,8 @@ the **Postgres** auth store, so `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
 **required** — point it at the same database the server uses; without it the
 command fails closed with "requires the Postgres auth store" and does nothing.
 `--data-dir` is still needed for the audit record. Full runbook:
-`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (its SQL-surgery
-sections elsewhere are SQLite-era and superseded — see its banner).
+`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (that runbook is now
+Postgres-native throughout).
 
 **Migration.** `break_glass_armed_until` is a nullable column on `auth.users`.
 It arrived as SQLite `auth.db` migration v4, but the AuthDB→Postgres cutover
@@ -510,9 +528,9 @@ and does not re-invalidate already-reissued tokens).
 See `docs/auth-architecture.md` § "AuthDB — persistent authentication store"
 for the full design rationale, and
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md)
-for lockout/break-glass recovery — note that runbook predates this cutover
-and its file-based SQL steps do not apply to the Postgres-backed store; see
-its banner.
+for lockout/break-glass recovery — that runbook has been rewritten for this
+cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
+the `auth` schema).
 
 ## Upgrade Order
 

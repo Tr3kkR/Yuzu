@@ -289,6 +289,52 @@ Operator                     Server                                  Agent
 
 **Extension seam.** PR 6 filled the renderer's `mount() → buildScene()` callouts with machine cubes + Sprite hostname labels + Raycaster hover tooltip. PR 7+ fills the same seam with process nodes (interior of the cube), edges (intra-machine + cross-machine), and a vulnerability overlay when `?include_vuln=1`. The store, REST surface, audit, and kill switch are stable; renderer ships incrementally without further surface changes.
 
+## Route Registration
+
+Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
+**route owner**: a class with a `register_routes(...)` method that the server calls once at
+startup. `server.cpp` wires those owners, *and* registers a further **~105 routes inline** on
+`web_server_->{Get,Post,Put,Delete}` — the health and readiness probes, the static-asset surface,
+much of the `/api/*` dashboard JSON, and `POST /api/command`
+(`server/core/src/server.cpp:7951`). It constructs no `HttplibRouteSink` of its own, so none of
+those inline routes is reachable from the in-process test harness.
+
+Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
+name:
+
+```bash
+grep -rnE '\b[A-Za-z_][A-Za-z0-9_]*(\.|->)(Get|Post|Put|Delete|Patch|Options)\(' server/core/src/*.cpp
+```
+
+Route owners name their receiver `svr` or `sink`; `server.cpp` names its `web_server_`. Grepping
+only for `svr\.` returns nothing from `server.cpp` and reads as "no inline routes" — a false
+negative that was published in this document and in #2542 before it was caught. `/api/command`'s
+untestability is tracked by #2557; the owner-side migration by #2542.
+
+**The registration seam.** A route owner's real `register_routes` takes `HttpRouteSink&`
+(`server/core/src/http_route_sink.hpp`), and its `httplib::Server&` overload is a thin wrapper
+that constructs a stack `HttplibRouteSink` and delegates to it. Production and tests therefore run
+the *same* handler-construction code:
+
+```cpp
+void MyRoutes::register_routes(httplib::Server& svr, /* deps... */) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, /* deps... */);   // the real body lives here
+}
+```
+
+**Why it is not optional.** A handler reachable only through the `httplib::Server&` overload
+cannot be exercised in-process, because binding a real port plus an acceptor thread in a test
+crashes under TSan with no TSan report (issue #438). Such a handler's authorization tier, CSRF
+gate, and scope checks are then untestable, which is how the TAR retention-paused purge/reenable
+fragments shipped a destructive operation with no route-handler coverage until #1786.
+
+**Invariant.** New route owners register through `HttpRouteSink&`; new routes on an existing owner
+register through the sink that owner already uses. Do not add a handler that only the
+`httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
+Registrations outside the sink are pre-existing debt, not a precedent to copy: eight route owners
+(55 registrations) plus `server.cpp`'s ~105 inline ones, roughly 160 in total.
+
 ## Storage Architecture
 
 | Component | Backend | Purpose |

@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <httplib.h>
@@ -25,6 +26,7 @@ class ResponseStore;
 class ManagementGroupStore;
 class TagStore;
 class InstructionStore;
+class HttpRouteSink; // http_route_sink.hpp — the in-process-testable seam (#438)
 struct FacetFilter;
 
 namespace detail {
@@ -56,6 +58,26 @@ public:
         const std::string& instruction_text)>;
 
     void register_routes(httplib::Server& svr,
+                         AuthFn auth_fn,
+                         PermFn perm_fn,
+                         AuditFn audit_fn,
+                         ResponseStore* response_store,
+                         ManagementGroupStore* mgmt_group_store,
+                         detail::AgentRegistry* registry,
+                         TagStore* tag_store,
+                         detail::EventBus* event_bus,
+                         AgentsJsonFn agents_json_fn,
+                         DispatchFn dispatch_fn,
+                         ResolveFn resolve_fn,
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         InstructionStore* instruction_store = nullptr);
+
+    /// HttpRouteSink overload — identical registration against the polymorphic
+    /// seam so the fragment handlers (notably the destructive TAR
+    /// retention-paused purge/reenable POSTs) are reachable from an in-process
+    /// TestRouteSink without an httplib acceptor thread (#438 TSan trap; #1786).
+    /// The httplib::Server& overload wraps + delegates here.
+    void register_routes(HttpRouteSink& sink,
                          AuthFn auth_fn,
                          PermFn perm_fn,
                          AuditFn audit_fn,
