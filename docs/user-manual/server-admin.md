@@ -191,6 +191,88 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — a device target that was supplied but names nothing is now refused, not widened to the fleet (#2500)
+
+**What changed.** Three REST surfaces treated a targeting argument the caller *supplied* that
+resolved to no devices as identical to one they never sent — and "no target named" meant
+broadcast. `POST /api/command` with `{"plugin":"service","action":"restart","agent_ids":[1,2,3]}`
+restarted the service on **every connected agent** under plain `Execution:Execute`, with no
+approval step, and returned a success response. So did `{"agent_ids": []}`, which is what any
+device filter that matched nothing produces. Each of these is now `400`.
+
+**What breaks.** Requests that previously succeeded and now fail:
+
+| Endpoint | Shape | Was | Now |
+|---|---|---|---|
+| `POST /api/command` | `agent_ids` `[]`, non-array, or containing a non-string | broadcast to all | `400` |
+| `POST /api/command` | `scope` `""` or non-string | broadcast to all | `400` |
+| `POST /api/instructions/{id}/execute` | `agent_ids` `[]`, non-array | broadcast to all | `400` |
+| `POST /api/instructions/{id}/execute` | `scope` `""` or non-string | broadcast to all | `400` |
+| `POST /api/v1/result-sets/from-*` | `parent_id` empty, non-string, or `null` | searched/dispatched unscoped | `400` |
+| `POST /api/policies/{id}/remediate` | `agent_ids` `[]`, non-array, or containing a non-string | remediated **every non-compliant agent** in the policy | `400` |
+| `POST /api/policies/{id}/remediate` | `scope` supplied at all | silently ignored, so a narrowing selector remediated every non-compliant agent | `400` — the route selects targets by `agent_ids` only |
+| `POST /api/command` | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/command` | `plugin`/`action` outside `[A-Za-z0-9_.-]` or over 128 bytes | accepted | `400` |
+| `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
+| `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
+
+The two remediation rows matter for the same reason as the rest: on that route an **absent**
+`agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
+nothing — or a `scope`, which that route cannot act on — quietly became a fleet-wide *mutating*
+remediation. Omitting `agent_ids` entirely still targets every non-compliant agent, unchanged.
+
+The instructions-execute row is the one to read twice: `"scope": "" + empty agent_ids = broadcast`
+was **documented** behaviour in `rest-api.md`, so a client written against the published contract
+is affected. The `from-*` row covers `from-tar-query`, `from-instruction-result`, `re-eval` and
+`from-inventory-query`.
+
+**One thing got LOOSER, not tighter.** `POST /api/command` previously rejected
+`"scope": "__all__"` with `400 invalid scope` — the scope parser has no rule for it — while the
+sibling instruction-execute route broadcast on the same string. It now broadcasts on both. This
+grants no new access: broadcast was already reachable on that route by omitting targeting
+entirely, under the same `Execution:Execute`, so `__all__` only gives a name to something a
+caller could already do. But if you have a script that sends `__all__` and treats the `400` as a
+no-op, it will now dispatch to the fleet.
+
+**What still works, unchanged.** **Omitting both** `agent_ids` and `scope` broadcasts to all
+connected agents, on every route. So does an explicit `"scope": "__all__"` — the ground scope kind already
+advertised by `/discover/scope-kinds` and by the MCP `execute_instruction` schema. If you have a
+client sending `"scope": ""` to mean "everything", change it to omit the field or to send
+`"__all__"`; both are supported and neither is deprecated.
+
+**Stored data — narrower than it first looks.** Only requests that **explicitly** send
+`"scope": "__all__"` record `scope_expression = "__all__"` on the execution row, and those already
+did so before this change. Broadcasting by **omitting both fields** is unchanged and still records
+`""` — the execution row is written from the raw request value, before the omitted-means-`__all__`
+mapping is applied for dispatch, and the mapped value is never written back. The one practical
+change is that the dashboard's "All agents" button now sends `__all__` explicitly, so rows created
+that way look different from before. A saved query selecting historical broadcasts by
+`scope_expression = ''` still matches everything except dashboard-initiated ones.
+
+**Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
+sends `__all__` instead of an empty string.
+
+**Detecting affected clients — and the limit of what is possible.** There is no reliable way to
+find them *before* upgrading. The audit trail records the OUTCOME of a dispatch, not the request
+shape that produced it: `command.dispatch|success` stores `plugin:action -> N agent(s)` and
+`instruction.execute|success` stores `agents=<sent>`, and neither preserves the `agent_ids` or
+`scope` the caller actually sent. So a historical broadcast that was deliberate and one that was
+an accidentally-widened three-device request are indistinguishable in existing rows. The closest
+available pre-upgrade signal is reviewing automation you believe targets a subset for dispatches
+whose agent count is suspiciously close to your full fleet size. (The stored detail uses a literal
+`\u2192` arrow, not `->`, so match on the agent count rather than the separator.)
+
+After upgrading, refusals are counted by
+`yuzu_server_dispatch_target_rejected_total{route,reason}` (all series pre-seeded at boot, so
+`absent()` stays meaningful) and audited as `command.dispatch|denied`
+(`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
+(`detail=reason=<reason>`) or `result_set.create|denied`
+(`detail=reason=<reason> source_kind=<kind>`). The
+`YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
+on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
+audit rows, not the alert, to find individual offenders.
+
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 
 Two operator-visible changes to held-open MCP/SSE streams authenticated by an
@@ -1250,9 +1332,179 @@ Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): eac
 | `provider_failure` | CSPRNG or key-storage failure during KEK generation or check-value computation (first boot / rotation). | Check the keys directory is writable and system entropy is healthy; if a prior first boot crashed, the message names the torn file to delete. |
 | `db_error` | Postgres connection/transaction failure during the `secrets` schema migration or `kek_meta` read/write. | Check the DSN and Postgres service health — triage as "DB down", not key loss. |
 
-**Rotation** mints `secrets-kek-v<N+1>` and re-wraps only the small wrapped-DEK header of each stored blob — payloads are untouched, so rotation is cheap, incremental, and interruptible (a crash resumes by re-running the re-wrap; already-rotated rows are detected by the blob header; a crash *before* the new version's fingerprint registers leaves an orphan key file that the next rotation attempt safely adopts). Rotation is complete when no stored blob references the old version (`oldest_kek_version_in_use`); only then may the old version be **retired** — the server refuses to retire a version that is active or still referenced, and records retirement in `kek_meta` as destruction evidence. Do not delete an old KEK file by hand while any backup you intend to honour still contains blobs wrapped under it — a restored backup needs the KEK versions its rows reference. The operator-facing rotation procedure (CLI/REST surface + DR drill cadence) lands with the first secret-bearing store migration and is tracked in #1341.
+**Rotation** mints `secrets-kek-v<N+1>` and re-wraps only the small wrapped-DEK header of each stored blob — payloads are untouched, so rotation is cheap, incremental, and interruptible (a crash resumes by re-running the re-wrap; already-rotated rows are detected by the blob header; a crash *before* the new version's fingerprint registers leaves an orphan key file that the next rotation attempt safely adopts). The operator-facing surface for this — REST + MCP, the half-committed contract, retirement preconditions, and a DR drill — is below.
 
-Decrypt failures are counted per store and failure class as `yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes: `tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`). **This is live as of the auth store's Postgres migration** — the auth store (`auth.users.mfa_totp_secret`, TOTP secrets) is the first secret-bearing store to ship, so `store="auth"` is the only label value today. The same wiring emits the `kek.generated`/`kek.rotated`/`kek.retired`/`secret.decrypt_failure` audit verbs. A sustained non-zero `kek_unresolvable` rate after a deployment or restore is the primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper signal and warrants investigation, not retry. Ready-made alert rules for both are in `docs/prometheus/yuzu-alerts.yml` (group `yuzu-secrets`).
+#### Rotating the KEK
+
+Three operations, mirrored on REST and MCP so both surfaces answer identically for the same failure:
+
+| REST | MCP tool | Permission | Returns |
+|---|---|---|---|
+| `POST /api/v1/secrets/kek/rotate` | `rotate_kek` | `Security:Write` | `{new_version, rotation_complete}` |
+| `POST /api/v1/secrets/kek/rewrap` | `rewrap_secrets` | `Security:Write` | `{rows_rewrapped}` |
+| `GET /api/v1/secrets/kek/status` | `get_kek_status` | `Security:Read` | `{active_version, oldest_in_use, rotation_complete}` |
+
+All three take no request parameters (an empty body or `{}`; any other field is rejected `400`). `rotate`/`rewrap` are `Security:Write` — on the MCP side that means the supervised-tier approval gate applies, same as every other write tool.
+
+```bash
+# 1. Mint a new version and re-wrap every row under it.
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  https://yuzu.example.com/api/v1/secrets/kek/rotate
+
+# 2. Confirm completion.
+curl -H "Authorization: Bearer $TOKEN" \
+  https://yuzu.example.com/api/v1/secrets/kek/status
+# → {"active_version":2,"oldest_in_use":2,"rotation_complete":true,...}
+```
+
+`/rotate`'s response deliberately omits a row count (`rotation_complete: true` is the honest signal — see below); call `/rewrap` if you want an actual `rows_rewrapped` number.
+
+> **The half-committed contract — read this before you retry anything.**
+> `rotate_kek` mints the new version and then re-wraps every row as one
+> operation. If it fails, the response tells you which of two states you are
+> in:
+> - **A plain failure** (`503`/generic `500`) — nothing changed; safe to
+>   retry `/rotate`.
+> - **Half-committed** (`500`, message *"KEK rotation did not finish
+>   re-wrapping every secret"*) — the new KEK version is **already active**;
+>   only the row-by-row re-wrap did not finish. **Call `POST
+>   /api/v1/secrets/kek/rewrap` (or the `rewrap_secrets` MCP tool) to
+>   resume. Do NOT call `/rotate` again** — it would mint a *second*,
+>   spurious new version on top of an already-half-rotated state, not fix
+>   anything. `/rewrap` is idempotent and safe to call repeatedly, including
+>   once there is genuinely nothing left to do (`rows_rewrapped: 0` is a
+>   normal, non-error outcome).
+>
+> A practical consequence: rotation **attempts** are rate-limited (5 minutes,
+> `429`), and a *failed* attempt consumes that budget too. That is deliberate —
+> it is precisely the retry-on-500 loop above that the limit exists to stop,
+> and automation that ignores the half-committed message would otherwise mint a
+> fresh, never-retirable KEK version on every retry. `/rewrap` is **not**
+> rate-limited, so the correct recovery path is never blocked. Treat a `429` on
+> `/rotate` as "you are recovering, use `/rewrap`", not as "try again shortly".
+>
+> The cooldown is a rate limiter, not a correctness guarantee: it is
+> per-process (servers sharing a database each keep their own, and a restart
+> clears it). Cluster-wide correctness comes from the advisory lock, which
+> reports `409`.
+
+**Verify completion.** `GET /status` (`get_kek_status`) is the source of
+truth: `rotation_complete` is `true` when no stored secret blob still
+references a version older than `active_version` — equivalently,
+`oldest_in_use` (null when there are no secret rows at all) is `>=
+active_version`. This is the ADR-0010 §3 completion signal; don't infer
+completion from a lack of errors alone — always confirm with `/status`
+after a `/rotate` or `/rewrap` call.
+
+**Concurrency.** Every KEK operation (including `/status`) takes a
+cluster-wide Postgres advisory lock, non-blocking. A second concurrent
+attempt gets `409` on REST ("another KEK operation is in progress") or a
+retryable MCP error with an honest `retry_after_ms` — that is expected
+behaviour under contention, not a fault. Wait for the in-flight operation to
+finish and retry.
+
+**Retirement preconditions — and why there is no retire endpoint.** An old
+KEK version is only safe to destroy when **both** hold: (1) zero stored
+blobs reference it (`GET /status`'s `oldest_in_use` has moved past it), and
+(2) no backup you intend to be able to restore still contains rows wrapped
+under it — a restored backup needs the KEK version its rows reference, so
+you must retain every version referenced by any backup inside your
+retention window. That second condition is a policy decision only you can
+make; this document will not pick a number for you:
+
+> **Operator decision — set your backup-retention window here:**
+> `<SET-ME: e.g. "90 days" / "13 monthly backups" — however long you keep a
+> backup you intend to be able to restore>`. Retain every KEK file that
+> covers that window. Set this **too short** and a restore from an older
+> backup can be permanently undecryptable; set it (or "forever") and you
+> simply keep more small key files around — annoying, never unsafe.
+
+Given that, Yuzu deliberately ships **no** retire/decommission route or MCP
+tool, even though `SecretCodec::retire_kek` exists internally and is
+tested. **#2525 documents a write race that makes exposing it unsafe:**
+`SecretCodec::encrypt()` snapshots the active KEK version, releases its
+lock, and the *caller* persists the resulting blob afterwards — so a
+retirement can pass its "zero references" check and delete the key while an
+in-flight write is still about to commit a blob wrapped under exactly that
+version, permanently bricking that row. This is not an HA-only hazard; it
+reproduces on a single server, and no lock this surface could take would
+close it, because ordinary secret writers don't participate in the KEK
+operation lock. Advertising a version as "safe to retire" without a safe way
+to retire it would be worse than saying nothing.
+
+**Consequence for you: old KEK files accumulate, and that is correct and
+safe.** They cost a few dozen bytes each and are exactly what you need to
+restore an older backup. **Do not delete a KEK file by hand** — there is no
+supported path to determine it's truly safe to remove, and doing so risks
+exactly the permanent data loss #2525 describes.
+
+**Audit evidence.** A successful rotation produces **two** audit rows by
+design, not a duplicate bug: a system-attributed `kek.rotated` (emitted
+inside the codec itself, detail `{"kek_version": <N+1>}`) and an
+operator-attributed `kek.rotate` (emitted by the REST route / MCP tool that
+invoked it, detail `new_version=<N+1>`). The codec-level event genuinely
+cannot know which operator called it — attribution rides the caller's
+session, which only the surface that received the request has (ADR-0010,
+design review "arch-7") — so an auditor correlating the audit log should
+expect the pair, not treat it as a double-count. `rewrap`/`rewrap_secrets`
+similarly audits `kek.rewrap` with `rows_rewrapped=<n>`; `GET
+/status`/`get_kek_status` is read-only and is not audited (matches the
+internal-CA read routes).
+
+Decrypt failures are counted per store and failure class as
+`yuzu_server_secret_decrypt_failures_total{store, failure_class}` (classes:
+`tag_mismatch`, `kek_unresolvable`, `malformed_blob`, `crypto_failure`).
+**This is live as of the auth store's Postgres migration** — the auth store
+(`auth.users.mfa_totp_secret`, TOTP secrets) is the first secret-bearing
+store to ship, so `store="auth"` is the only label value today. A sustained
+non-zero `kek_unresolvable` rate after a deployment or restore is the
+primary backup-skew alert signal; a single-row `tag_mismatch` is the tamper
+signal and warrants investigation, not retry. Ready-made alert rules for
+both are in `docs/prometheus/yuzu-alerts.yml` (group `yuzu-secrets`).
+
+#### DR restore-pairing drill
+
+Run this periodically against a scratch environment, alongside the
+PostgreSQL restore-verification drill in [Backing up PostgreSQL
+state](#backing-up-postgresql-state) above.
+
+This section is the source of truth for the **rotation** side of key
+management. The **recovery** side — per-symptom boot triage, the paired
+backup commands, and the post-restore verification that catches a
+wrong-keys restore before users are locked out — lives in
+`docs/ops-runbooks/auth-db-recovery.md`. Read both before running the drill;
+they are deliberately not duplicated.
+
+- **CH-1 — restore the database without the keys directory.** Restore a
+  `pg_dump` to a scratch database but deliberately withhold (or point
+  `--ca-dir` elsewhere from) the paired keys directory, then start the
+  server against it. Expect a **loud, correctly-diagnosed** failure, not
+  silence: the server fails closed at boot with a `kek_unresolvable` startup
+  error (see the failure-class table above), and any MFA-enrolled user
+  cannot complete TOTP login (the secret can't be decrypted) — but password
+  login and recovery-code MFA fallback still work, because neither needs
+  the KEK (see blast radius below). If you instead see a clean boot, the
+  drill has failed — investigate before trusting production restores.
+- **CH-2 — backup skew.** Restore a `pg_dump` paired with a keys directory
+  from a *different* rotation generation than the dump (e.g. the dump is
+  from after a rotation the keys directory predates, or vice versa).
+  Watch `yuzu_server_secret_decrypt_failures_total{failure_class}` closely:
+  a skew like this can produce a **flood** of `kek_unresolvable` events that
+  buries a genuine, low-volume `tag_mismatch` (tamper) signal in the same
+  window — alert on the *sustained rate*, not a raw count, and don't
+  dismiss a skew incident just because most of the flagged rows turn out to
+  be the benign skew case.
+- **Quantified blast radius of KEK loss** (permanent, no paired backup
+  exists to recover from): every TOTP-enrolled operator loses their TOTP
+  secret and must re-enroll — but they are **not locked out**, because MFA
+  recovery codes are PBKDF2 verify-only hashes that need no KEK to redeem
+  (this is precisely why KEK loss is not a total lockout); sign in with a
+  recovery code, then re-enroll TOTP. Password login is entirely unaffected
+  (session tokens and password hashes are not KEK-wrapped). Any future
+  secret class gated behind the same codec (webhook signing secrets,
+  offload-target credentials, the OIDC client secret, once each store
+  migrates) would need re-issuing and its downstream reconfigured — there
+  is no way to recover the old value.
 
 **Break-glass (KEK permanently lost).** KEK loss is painful, never a total lockout: admin sign-in survives by design (MFA recovery codes are verify-only hashes and need no KEK — sign in with a recovery code and re-enroll TOTP), and every gated secret class is re-enrollable/re-issuable (webhook secrets re-issued, offload credentials re-issued, OIDC client secret re-pasted). The explicit voided-secrets boot flag described in ADR-0010 ships with the first secret-bearing store migration.
 
@@ -1293,7 +1545,26 @@ The server applies retention policies to stored data to manage disk usage. Reten
 | Audit log entries | `--audit-retention-days` | 365 days | Records of who did what, when, and on which devices. |
 | Guardian (Guaranteed State) events | `--guardian-event-retention-days` | 30 days | Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See [Guaranteed State](guaranteed-state.md) for the feature context. |
 
-Reducing the TTL frees disk space; increasing it preserves history for compliance.
+Increasing a TTL preserves more history for compliance. Reducing one frees disk
+for the response and Guardian-event stores; **for the audit log it does not** --
+see the note below.
+
+> **Audit retention is a floor, not a ceiling.** A cleanup pass declines once
+> when it would expire every datable row, and every accepted pass is capped at
+> 25,000 rows, so deletion is paced rather than immediate.
+>
+> **Changing this value does not re-date existing rows.** `ttl_expires_at` is
+> stamped once, at INSERT, from the retention setting in force at the time, and
+> nothing ever rewrites it. Reducing `--audit-retention-days` therefore expires
+> nothing retroactively -- existing rows age out on their original TTLs, and only
+> rows written after the change (and, per the #483 note below, after a restart)
+> get the shorter window. Do not expect a reduction to reclaim disk.
+>
+> One side effect is worth knowing: the guard's "is any datable row still alive?"
+> horizon is derived from the CURRENT window, so after a reduction the older
+> long-TTL rows fall outside it and stop counting as survivors. That makes a
+> single declined pass more likely right after the change. It is self-healing --
+> see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
 > **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/v1/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/v1/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
 

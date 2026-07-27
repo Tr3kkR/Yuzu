@@ -28,6 +28,7 @@
 #include "tar_module_etw.hpp"
 #include "tar_db.hpp"
 #include "tar_fleet_snapshot.hpp"
+#include "tar_status_format.hpp"
 #include "tar_netconn.hpp"
 #include "tar_netqual_boot.hpp"
 #include "tar_perf.hpp"
@@ -846,6 +847,20 @@ private:
     // dedicated mutex serialises concurrent collect_software (manual vs trigger)
     // without that cross-collector coupling.
     std::mutex software_collect_mu_;
+    // Serialises whole rollup passes (#2361). do_rollup is reachable from two
+    // places at once: the 900s `tar.rollup` trigger and an operator-issued manual
+    // `tar rollup` instruction. run_retention's clock-guard state is plain
+    // in-memory maps that it reads and writes WITHOUT holding db_->mu_ (the
+    // database mutex only serialises individual statements), so two concurrent
+    // passes would race the latch and the decline counters -- exactly what TSan
+    // catches in CI. Serialising the pass is cleaner than making each map entry
+    // atomic, and rollup is a background maintenance tick where a rare wait costs
+    // nothing. Also makes the aggregate-then-retain ordering below atomic.
+    std::mutex rollup_mu_;
+    // Per-table retention clock-guard state. rollup_mu_ serialises whole PASSES;
+    // the state carries its own mutex for the brief map touches, so do_status can
+    // read the counters without waiting for a pass to finish.
+    yuzu::tar::RetentionGuardState retention_guard_;
     yuzu::tar::PerfCounters prev_perf_; // previous perf reading (guarded by collect_mu_)
     yuzu::tar::ProcSnapshot prev_proc_; // previous per-process snapshot (guarded by collect_mu_)
     // Per-app version cache, keyed by (pid, create_time): resolves each top-N
@@ -1856,6 +1871,33 @@ private:
     // ── status action ─────────────────────────────────────────────────────────
 
     int do_status(yuzu::CommandContext& ctx) {
+        // ALWAYS emitted, and first. With a closed store every getter below
+        // returns its default -- record_count 0, live_rows 0, and each source
+        // reporting its DEFAULT enabled state -- which reads as a healthy, empty
+        // database rather than a dead one. This action is the only operator- and
+        // agentic-readable surface the agent has (no /metrics), so that
+        // false-healthy report would be the whole signal (#2361 Gate 8).
+        const bool storage_ok = db_->is_open();
+        if (!storage_ok) {
+            // `error|` FIRST, before storage_state. The server-side consumers gate
+            // on `output.starts_with("error|")` (tar_tree_routes.cpp), and
+            // poll_command treats any non-empty output as success -- so leading
+            // with `storage_state|` made the dashboard fall through to the
+            // capture-sources renderer, which parses only `config|` lines. With
+            // none present it drew all ten sources blank: the one frame an
+            // operator opens to ask "why is this device's data missing" rendered
+            // identically to a healthy device (#2361 Gate 6, enterprise-readiness).
+            //
+            // Built by a free function in tar_status_format.hpp rather than
+            // inline, because the ORDER above is a contract with the server and
+            // TarPlugin is TU-local -- nothing could assert it here. See that
+            // header, and the test that pins `lines[0]` starting with `error|`.
+            for (const auto& line :
+                 yuzu::tar::format_storage_offline_lines(db_->query_engine_available()))
+                ctx.write_output(line);
+            return 1;
+        }
+        ctx.write_output("storage_state|ok");
         auto s = db_->stats();
         ctx.write_output(std::format("record_count|{}", s.record_count));
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
@@ -1909,6 +1951,21 @@ private:
             }
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
         }
+        // Retention clock-guard declines, per warehouse table (#2361). The agent
+        // has no /metrics endpoint, so this action is the ONLY fleet-readable
+        // signal that an endpoint's clock moved in a way that would have wiped
+        // its forensic window - a `spdlog::warn` on an unattended endpoint is not
+        // an operator surface. Only tables with a non-zero count are emitted, so
+        // a healthy fleet pays two lines; both totals are always present.
+        // Per-table state is in-memory and resets on agent restart, deliberately,
+        // since a reboot re-declines anyway.
+        //
+        // Reads the guard's OWN mutex (inside format_retention_guard_lines), NOT
+        // rollup_mu_. Taking rollup_mu_ here would make the diagnostic an
+        // operator runs WHEN TAR IS MISBEHAVING block for a full rollup pass.
+        for (const auto& line : yuzu::tar::format_retention_guard_lines(retention_guard_))
+            ctx.write_output(line);
+
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
         ctx.write_output(std::format("config|network_capture_method|{}", net_method));
@@ -2728,6 +2785,23 @@ private:
         for (const auto& [src_name, v] : source_toggles) {
             bool transition_ok;
             {
+                // #2361 Gate 8 (Sol): serialise against a whole RETENTION pass,
+                // outermost. run_retention decides which sources are enabled in a
+                // read phase and executes the queued deletes afterwards, so
+                // without this a pause landing between the two still deletes the
+                // rows the operator just asked to preserve -- and reports success
+                // to both sides. The pre-change code raced too (it read the flag
+                // one statement before deleting); the read/write split widened the
+                // window to the whole sweep, so the fix belongs here rather than
+                // in a narrower re-check.
+                //
+                // Lock order is rollup_mu_ ≺ collect_mu_ ≺ software_collect_mu_.
+                // do_rollup takes ONLY rollup_mu_ (then db_->mu_ -- per statement
+                // for the probes, and for the whole batch during the retention
+                // deletes) and never collect_mu_, so no cycle exists. Cost: a configure
+                // waits out an in-flight rollup, which is the correct trade for a
+                // mutation whose whole purpose is to stop data being deleted.
+                std::lock_guard rollup_lock(rollup_mu_);
                 // #538: collect_fast/slow hold collect_mu_ for their whole
                 // enumerate→diff→set_state cycle. Taking it here makes the
                 // enabled-flag write + baseline clear atomic w.r.t. a collection
@@ -2899,10 +2973,17 @@ private:
 
     int do_rollup(yuzu::CommandContext& ctx) {
         // No collect_mu_ needed — rollup operates on aggregate tables, not live-state diffs.
-        // The SQLite-level mutex (db_->mu_) provides thread safety.
+        // The SQLite-level mutex (db_->mu_) provides thread safety for individual
+        // statements. It does NOT cover run_retention's in-memory clock-guard
+        // state, which spans many statements - rollup_mu_ does (#2361), and it
+        // keeps the trigger tick and a manual `tar rollup` from interleaving.
+        std::lock_guard rollup_lock(rollup_mu_);
         auto ts = now_epoch_seconds();
+        // Ordering is load-bearing and unchanged: aggregation runs BEFORE
+        // retention so each tier consumes the tier below it before retention can
+        // delete from it.
         int total = yuzu::tar::run_aggregation(*db_, ts);
-        yuzu::tar::run_retention(*db_, ts);
+        yuzu::tar::run_retention(*db_, ts, retention_guard_);
         ctx.write_output(std::format("tar|rollup|{}|rows_aggregated", total));
         return 0;
     }

@@ -61,7 +61,9 @@ collect_slow    │ enumerate_services()            │       service_live
 rollup          │   tar_aggregator runs SQL       │
   (15min) ────► │   INSERT INTO ..._hourly        │ ───►  *_hourly / *_daily / *_monthly
                 │   from each lower tier          │
-                │ retention_sql() per table       │ ───►  prunes oldest rows
+                │ run_retention():                │
+                │   retention_sql() row-count     │ ───►  trims to a row ceiling
+                │   guarded capped DELETE (time)  │ ───►  paced, clock-guarded
                 └─────────────────────────────────┘
 ```
 
