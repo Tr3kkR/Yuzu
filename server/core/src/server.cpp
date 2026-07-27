@@ -680,8 +680,10 @@ public:
                             "global_cap", "pin_slots"}) {
             metrics_.counter("yuzu_mcp_bridge_reject_total", {{"reason", reason}});
         }
-        for (auto reason : {"reserve_rejected", "reserve_threw", "no_execution_row",
-                            "subscribe_failed", "arm_threw"}) {
+        // Derived from the bridge's own CLOSED list so a new degrade reason cannot
+        // be emitted without this seed following it - the streamed-POST rung added
+        // six and seeded none, which left valid series absent on a healthy server.
+        for (auto reason : mcp::McpStreamBridge::kDegradeReasons) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
         // #2487: CLOSED reason set, derived from the bridge's own stage table so a

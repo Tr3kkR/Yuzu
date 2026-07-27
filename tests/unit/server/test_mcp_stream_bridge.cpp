@@ -2760,14 +2760,16 @@ TEST_CASE("CH-12: cancel mid-execution detaches the response but never the execu
         return wire.contains("notifications/progress");
     }));
 
-    // The client cancels. Closing the SINK is what a cancel does to a streamed
-    // POST - it ends the RESPONSE.
-    {
-        std::lock_guard<std::mutex> lk(sink->mu);
-        sink->closed.store(true, std::memory_order_release);
-    }
-    sink->cv.notify_all();
+    // The client cancels, through the REAL production entry point. This used to
+    // set `sink->closed` by hand, which is why the adversarial review found the
+    // whole path missing: simulating the trigger proved the pump's half and
+    // silently assumed the bridge half existed. It did not - request_cancel
+    // no-oped for anything past kArming, so a live streamed POST could not be
+    // cancelled at all. Drive the seam a `notifications/cancelled` actually
+    // reaches, or this test proves nothing about cancellation.
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kDetached);
     REQUIRE_FALSE(pump.pump_once(wire.writer())); // provider ends
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 1); // audited exactly once (CH-12)
 
     // The close frame must SAY the execution continues, and name the handle that
     // reaches it - a client that is told nothing has no way back to its result.

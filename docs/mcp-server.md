@@ -222,7 +222,7 @@ Headers are `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Acc
 | `credential_revoked` | your credential stopped being valid | re-authenticate |
 | `auth_unavailable` | the auth backend could not answer within the grace window | retry |
 | `internal_error` | a server-side fault ended the response | fetch by `execution_id` |
-| `client_gone` | the peer went away (recorded server-side; you will not see this frame) | n/a |
+| `client_disconnect` | the peer went away (recorded server-side; you will not see this frame) | n/a |
 
 **The invariant behind half that table: closing a response never cancels work.** A dispatched command keeps running on real agents, and its result stays durably fetchable by `execution_id` (`get_execution_status`, `query_responses`). `notifications/cancelled` detaches *your stream*, not the fleet change you asked for.
 

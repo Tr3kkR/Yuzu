@@ -531,14 +531,74 @@ McpStreamBridge::CancelOutcome McpStreamBridge::request_cancel(const std::string
     if (!rec) {
         return CancelOutcome::kNoOp;  // no oracle: unknown == not cancellable
     }
-    std::lock_guard<std::mutex> rlk(rec->mu);
-    if (rec->phase.load(std::memory_order_acquire) != Phase::kArming || rec->cancel_pending) {
-        return CancelOutcome::kNoOp;
+    std::string exec_id;
+    {
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        const Phase ph = rec->phase.load(std::memory_order_acquire);
+        if (ph == Phase::kStreaming) {
+            // 3b: the record HAS a live streamed response, so there is nothing for
+            // a later arbiter to decide - the cancel applies NOW. Closing the sink
+            // is the whole action: the pump wakes, sees `closed`, and finishes with
+            // kCancelled, which writes the close frame carrying execution_id and
+            // partial:true; its releaser then parks the record.
+            //
+            // The EXECUTION is deliberately untouched - not unsubscribed, not
+            // abandoned, never marked cancelled. MCP cancellation withdraws the
+            // client's interest in a RESPONSE; the dispatched command keeps running
+            // on real agents and its result stays fetchable by execution_id.
+            // Cancelling the work here would let a client believe it had stopped a
+            // fleet-wide change it had not.
+            if (!rec->post_sink) {
+                return CancelOutcome::kNoOp;  // already closed, or never bound
+            }
+            close_post_sink(rec->post_sink);
+            exec_id = rec->execution_id;
+        } else if (ph == Phase::kArming && !rec->cancel_pending) {
+            // Pre-arm: intent ONLY - no audit, no transition (C1). A later
+            // pre-dispatch failure (abandon) invalidates the cancel/degrade
+            // outcome, so the win is arm()'s and the audit belongs there.
+            rec->cancel_pending = true;
+            return CancelOutcome::kAcceptedPending;
+        } else {
+            return CancelOutcome::kNoOp;
+        }
     }
-    // Intent ONLY - no audit, no transition (C1): a later pre-dispatch failure
-    // (abandon) invalidates the cancel/degrade outcome, so the win is arm()'s.
-    rec->cancel_pending = true;
-    return CancelOutcome::kAcceptedPending;
+    // Outside every lock (C1 discipline). Unlike the kArming path there is no later
+    // arbiter to audit this one, so it is audited HERE, exactly once - CH-12
+    // requires a cancellation to be auditable, and this is the only site that knows
+    // it took effect.
+    audit_contained("mcp.bridge.cancel", exec_id,
+                    "detached the streamed response; the execution continues", {},
+                    AuditResult::kSuccess);
+    return CancelOutcome::kDetached;
+}
+
+void McpStreamBridge::close_post_sink(
+    const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept {
+    if (!sink) {
+        return;
+    }
+    try {
+        // `closed` is stored UNDER the sink mutex rather than as a bare atomic
+        // write, for the same reason poke_post_sink takes it: the pump evaluates
+        // its wait predicate under this mutex, so a store outside it can land
+        // between that evaluation and the wait and leave the pump asleep on a
+        // stream the client has already given up on - a lost wakeup that costs a
+        // full tick and keeps an HTTP worker pinned meanwhile.
+        //
+        // Callers hold the record mutex, which the declared hierarchy places ABOVE
+        // this one (BridgeRecord::mu -> McpStreamState::mu_ -> SseSinkState::mu),
+        // so this nesting is the sanctioned direction.
+        {
+            std::lock_guard<std::mutex> lk(sink->mu);
+            sink->closed.store(true, std::memory_order_release);
+        }
+        sink->cv.notify_all();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // A cancel we could not deliver is not worth propagating out of a noexcept
+        // seam on a request thread: the response still ends at its cap, and the
+        // execution was never at risk either way.
+    }
 }
 
 bool McpStreamBridge::abandon(const std::string& session_id, const nlohmann::json& jsonrpc_id) {
@@ -2101,6 +2161,24 @@ void McpStreamBridge::audit_contained(const char* action, const std::string& exe
 std::size_t McpStreamBridge::record_count() const {
     std::lock_guard<std::mutex> lk(bridge_mu_);
     return records_.size();
+}
+
+std::optional<bool> McpStreamBridge::post_sink_closed_for_test(
+    const std::string& session_id, const nlohmann::json& jsonrpc_id) const {
+    std::shared_ptr<BridgeRecord> rec;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        auto it = records_.find(make_key(session_id, jsonrpc_id));
+        if (it == records_.end()) {
+            return std::nullopt;
+        }
+        rec = it->second;
+    }
+    std::lock_guard<std::mutex> rlk(rec->mu);
+    if (!rec->post_sink) {
+        return std::nullopt;
+    }
+    return rec->post_sink->closed.load(std::memory_order_acquire);
 }
 
 std::size_t McpStreamBridge::ring_only_count() const {

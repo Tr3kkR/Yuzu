@@ -256,9 +256,23 @@ public:
         kAlreadyArmed,     ///< arm called twice - caller bug, first arm stands
     };
 
+    /// Every `yuzu_mcp_bridge_degrade_total{reason}` literal the MCP handler can
+    /// emit. A CLOSED set, declared HERE rather than as a bare list in server.cpp
+    /// so the emit sites and the startup pre-seed cannot drift apart the way they
+    /// did when the streamed-POST rung added six reasons and seeded none of them
+    /// (adversarial review, 2026-07-27). Same both-or-neither shape as
+    /// kTeardownStageNames. A new degrade reason belongs in this array first.
+    static constexpr std::array<const char*, 11> kDegradeReasons{
+        // 3a (GET-only bridge)
+        "reserve_rejected", "reserve_threw", "no_execution_row", "subscribe_failed", "arm_threw",
+        // 3b (streamed POST)
+        "bind_post_sink_failed", "stream_install_failed", "arm_already_armed", "arm_cancelled",
+        "arm_not_armed", "post_dispatch_threw"};
+
     enum class CancelOutcome {
-        kAcceptedPending,  ///< recorded; arm()/abandon() will arbitrate (C1 - no audit yet)
-        kNoOp,             ///< not kArming (nothing to cancel in 3a), duplicate, or unknown
+        kAcceptedPending,  ///< pre-arm: recorded; arm()/abandon() arbitrate (C1 - no audit yet)
+        kDetached,         ///< 3b: a LIVE streamed response was closed now (audited here, once)
+        kNoOp,             ///< nothing cancellable: unknown, already cancelled, no live response
     };
 
     /// C5 (#2409): the terminal frame a claimed pressure-teardown publishes.
@@ -337,10 +351,18 @@ public:
     ArmOutcome arm(const std::string& session_id, const nlohmann::json& jsonrpc_id, ArmMode mode,
                    std::string result_base = {});
 
-    /// Record cancel INTENT (C1). Never audits, never transitions - arm() or
-    /// abandon() consume it. kNoOp for anything not kArming (a parked/GET-only
-    /// record has no POST stream to detach in 3a; 3b routes kStreaming cancel
-    /// through the pump).
+    /// Two phases can be cancelled, and they mean different things:
+    ///  - kArming (pre-arm): record cancel INTENT only (C1) - no audit, no
+    ///    transition; arm()/abandon() arbitrate, because a pre-dispatch failure
+    ///    would invalidate any outcome decided here. -> kAcceptedPending.
+    ///  - kStreaming (3b): a live streamed response EXISTS, so there is nothing to
+    ///    arbitrate - close its sink now, audited here exactly once. The pump then
+    ///    finishes kCancelled and its releaser parks the record. -> kDetached.
+    /// Anything else is kNoOp.
+    ///
+    /// NEVER touches the execution. Cancellation withdraws the client's interest in
+    /// a RESPONSE; the dispatched command keeps running and its result stays
+    /// fetchable by execution_id. (Decision 15(j); chaos CH-12.)
     CancelOutcome request_cancel(const std::string& session_id, const nlohmann::json& jsonrpc_id);
 
     /// Pre-dispatch failure unwind: kArming → kAborted, unsubscribe (waits out
@@ -450,6 +472,12 @@ public:
 
     // ── Observability / test accessors ─────────────────────────────────────
     std::size_t record_count() const;
+    /// Test seam: did this record's streamed response get closed? The in-process
+    /// test fixture never runs the content provider (no socket, #438), so a
+    /// handler-level cancel test cannot observe the pump reacting - it can only
+    /// check that the bridge did its half. nullopt = no record, or none bound.
+    std::optional<bool> post_sink_closed_for_test(const std::string& session_id,
+                                                  const nlohmann::json& jsonrpc_id) const;
     std::size_t ring_only_count() const;
     std::optional<Phase> phase_for(const std::string& session_id,
                                    const nlohmann::json& jsonrpc_id) const;
@@ -711,6 +739,10 @@ private:
     /// mutex sits below it in the hierarchy. Contained - a missed poke costs one
     /// pump tick, never correctness.
     static void poke_post_sink(const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept;
+    /// Ends a streamed response: stores `closed` UNDER the sink mutex (same
+    /// lost-wakeup discipline as poke_post_sink) and notifies. Callers hold the
+    /// record mutex; the record-mu -> sink-mu nesting is the sanctioned direction.
+    static void close_post_sink(const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept;
     /// Build the parked real final from the bus terminal payload + result_base (B5).
     static std::string build_real_final(const BridgeRecord& rec, const std::string& terminal_data);
     /// The ONE derivation of the minimal success-shaped fallback final ("terminal
