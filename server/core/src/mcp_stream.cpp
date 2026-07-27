@@ -57,6 +57,11 @@ constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures
 // streamed records per session at the pin count); the frame is kept unpinned rather than
 // lost. A non-zero value means the pin bound and the admission cap have drifted.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
+/// An older pinned terminal yielded its eviction-exemption slot to a newer one. Ordinary on a
+/// session that completes more than `kMaxStreamedPostsPerSession` calls; a HIGH rate means the
+/// replay ring is too small for that session's concurrency, so displaced terminals may be
+/// evicted before a late resume asks for them.
+constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -390,15 +395,46 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // records per session at the pin count - so commit the final unpinned rather than
         // lose a real terminal, and count it.
         if (pinned) {
-            bool slotted = false;
+            // BOUNDED LRU, not first-come-permanent. The slots are a fixed four shared by
+            // two populations: streamed-POST terminals, which admission caps at exactly
+            // this number, and GET-only terminals, which NOTHING caps. Only rule (b) (a
+            // resume cursor acking past the id) ever releases one, so a client that reads
+            // live and never reconnects holds its slots for the life of the session.
+            //
+            // First-come-permanent then inverts the promise. A pin exists so that a
+            // RECENT terminal survives a ring wrap and a late resume can still recover it
+            // (Decision 15(f)) - which is worth most for the newest result and least for
+            // the oldest. Filling the slots once meant a session's first four results
+            // stayed protected forever, long after they were consumed, while every result
+            // from the fifth on was committed evictable and could vanish from under the
+            // resume that wanted it.
+            //
+            // So when the slots are full the OLDEST pin yields to the newest. Ids are
+            // monotonic, so the smallest live id IS the oldest. That keeps the honest
+            // invariant "the four most recent terminals are recoverable" and makes a full
+            // slot set an ordinary handled state rather than the impossibility the old
+            // comment here asserted.
+            std::uint64_t* free_slot = nullptr;
+            std::uint64_t* oldest = nullptr;
             for (auto& slot : pinned_ids_) {
                 if (slot == 0) {
-                    slot = id;
-                    slotted = true;
+                    free_slot = &slot;
                     break;
                 }
+                if (oldest == nullptr || slot < *oldest) {
+                    oldest = &slot;
+                }
             }
-            if (!slotted && metrics_ != nullptr) {
+            if (free_slot != nullptr) {
+                *free_slot = id;
+            } else if (oldest != nullptr) {
+                *oldest = id;
+                if (metrics_ != nullptr) {
+                    metrics_->counter(kMetricPinDisplaced).increment();
+                }
+            } else if (metrics_ != nullptr) {
+                // Unreachable while the array is non-empty - kept as defence in depth so
+                // a future resize to zero slots is loud rather than silently unprotected.
                 metrics_->counter(kMetricFinalUnpinned).increment();
             }
         }

@@ -598,10 +598,21 @@ public:
         metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
                           "Committed terminal frames that found no free pin slot and were published "
                           "UNPINNED (a real terminal is committed rather than lost to preserve a "
-                          "pin). Not expected: the bridge caps streamed records per session at the "
-                          "pin count, so any non-zero value means that admission accounting was "
-                          "violated and the affected final is evictable from the replay ring "
-                          "(still recoverable by execution_id). Alert on > 0",
+                          "pin). Structurally unreachable while the pin array is non-empty - the "
+                          "slots are a bounded LRU, so a full set displaces its oldest pin rather "
+                          "than committing a final unprotected. Kept as defence in depth: any "
+                          "non-zero value means the pin array was resized to zero or the LRU "
+                          "path was bypassed, and the affected final is evictable from the replay "
+                          "ring (still recoverable by execution_id). Alert on > 0",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_pin_displaced_total",
+                          "An older pinned terminal yielded its eviction-exemption slot to a newer "
+                          "one. ORDINARY on any session that completes more than the pin-slot "
+                          "count of calls - the slots are a bounded LRU that keeps the most recent "
+                          "terminals recoverable, not a permanent reservation held by whichever "
+                          "results happened to come first. A HIGH rate means the replay ring is "
+                          "too small for that session's concurrency, so a displaced terminal may "
+                          "be evicted before a late resume asks for it. Not alertable on > 0",
                           "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
@@ -613,6 +624,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
+        metrics_.counter("yuzu_mcp_stream_pin_displaced_total");
         // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
         // meaningful on a healthy/idle server (observability-conventions; the
         // reason literals mirror the bridge's reject/degrade taxonomies).

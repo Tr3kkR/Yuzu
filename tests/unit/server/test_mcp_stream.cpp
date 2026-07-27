@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <type_traits>
 
 #include "../../../server/core/src/mcp_session.hpp"
@@ -1375,6 +1376,74 @@ TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decis
     CHECK(attached.sink->sse->queue.front().data == "FINAL");
 }
 
+TEST_CASE("McpStreamState: pin slots are a bounded LRU, not first-come-permanent",
+          "[mcp][stream][pins]") {
+    // THE DEFECT THIS PINS. `pinned_ids_` is a fixed 4-slot array and publish_final pins
+    // EVERY terminal, but the only release path (unpin rule (b)) fires on a GET RE-attach
+    // whose cursor has passed the id. A client that reads live and never reconnects
+    // therefore holds its slots forever, and from the fifth terminal onward every result
+    // was committed WITHOUT its eviction exemption - silently losing the ring-wrap
+    // survival that Decision 15(f) promises, on an ordinary session doing nothing wrong.
+    //
+    // The source comment claimed "a missing slot is not expected - the bridge caps
+    // streamed records per session at the pin count". That is true only of STREAMED
+    // records; GET-only terminals share the same four slots and are capped by nothing.
+    //
+    // The fix inverts the eviction order to match what the pin is FOR: the promise is that
+    // RECENT terminals survive a wrap, so when the slots are full the OLDEST pin yields to
+    // the newest rather than the newest going unprotected.
+    mcp::McpStreamState state{/*ring_cap=*/64};
+    std::vector<std::uint64_t> ids;
+    for (int i = 0; i < 6; ++i) {
+        ids.push_back(state.publish_final("message", "FINAL-" + std::to_string(i)));
+    }
+    REQUIRE(ids.size() == 6);
+
+    // Still exactly four slots - this is a bound, not a leak.
+    CHECK(state.pinned_count() == 4);
+    // The two OLDEST yielded...
+    CHECK_FALSE(state.is_pinned(ids[0]));
+    CHECK_FALSE(state.is_pinned(ids[1]));
+    // ...so that the four most recent are the ones a resume can still recover.
+    CHECK(state.is_pinned(ids[2]));
+    CHECK(state.is_pinned(ids[3]));
+    CHECK(state.is_pinned(ids[4]));
+    CHECK(state.is_pinned(ids[5]));
+}
+
+TEST_CASE("McpStreamState: the newest terminal survives a wrap even past the slot count",
+          "[mcp][stream][pins]") {
+    // The consequence that actually reaches a client. Pre-fix, a session's 5th and later
+    // terminals were evictable, so a late resume lost the very result it asked for while
+    // the session's FIRST four results - long since consumed - stayed protected forever.
+    mcp::McpStreamState state{/*ring_cap=*/5};
+    std::vector<std::uint64_t> ids;
+    for (int i = 0; i < 6; ++i) {
+        ids.push_back(state.publish_final("message", "FINAL-" + std::to_string(i)));
+    }
+    for (int i = 0; i < 20; ++i) {
+        state.publish("message", "flood-" + std::to_string(i)); // wraps the 5-frame ring 4x
+    }
+    CHECK(state.is_pinned(ids[5])); // the newest terminal is still recoverable
+
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    REQUIRE(!attached.sink->sse->queue.empty());
+
+    // NOT `queue.front()`: replay is oldest-first, and the oldest SURVIVING frame is now
+    // the oldest still-pinned terminal (FINAL-2), not the newest. What matters is which
+    // terminals a late resume can still be served.
+    const auto has = [&](std::string_view want) {
+        return std::any_of(attached.sink->sse->queue.begin(), attached.sink->sse->queue.end(),
+                           [&](const auto& ev) { return ev.data == want; });
+    };
+    CHECK(has("FINAL-5")); // the newest terminal survived the wrap
+    CHECK(has("FINAL-2")); // ...as did the rest of the retained window
+    CHECK_FALSE(has("FINAL-0")); // displaced, then evicted by the flood - the bounded cost
+    CHECK_FALSE(has("FINAL-1"));
+}
+
 TEST_CASE("McpStreamState: publish_ring_only commits to the ring but not the live sink",
           "[mcp][stream]") {
     // A streamed POST's frames ride the POST stream; publishing them onto a concurrent live
@@ -1471,23 +1540,37 @@ TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and 
     CHECK(state.next_event_id() == 1);                  // no id consumed
 }
 
-TEST_CASE("McpStreamState: a final past the pin bound commits unpinned rather than lose it",
-          "[mcp][stream]") {
-    // The pin array is sized to the per-session streamed-request cap; the bridge enforces the
-    // same cap at admission, so this is defence-in-depth. If it is ever hit, the final is kept
-    // (committed, evictable) rather than dropped, and the drift is counted.
+TEST_CASE("McpStreamState: a final past the pin bound displaces the OLDEST pin",
+          "[mcp][stream][pins]") {
+    // REPLACES an earlier test that asserted the overflow final commits UNPINNED and counts
+    // `final_unpinned_total`. That test faithfully encoded a false premise, stated in its own
+    // comment: "the pin array is sized to the per-session streamed-request cap; the bridge
+    // enforces the same cap at admission, so this is defence-in-depth." The bridge caps
+    // STREAMED records - but GET-only terminals pin the same four slots and are capped by
+    // NOTHING, so the path was ordinarily reachable, and past the fourth call every result was
+    // committed without the ring-wrap protection Decision 15(f) promises.
+    //
+    // The pin now behaves as what it is: a bounded LRU protecting the most RECENT terminals.
     yuzu::MetricsRegistry reg;
     mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    std::vector<std::uint64_t> ids;
     for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
-        REQUIRE(state.publish_final("message", "final") != 0);
+        ids.push_back(state.publish_final("message", "final"));
+        REQUIRE(ids.back() != 0);
     }
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // slots full
 
     const auto overflow_id = state.publish_final("message", "one-too-many");
-    REQUIRE(overflow_id != 0);                 // committed - never lost
-    CHECK_FALSE(state.is_pinned(overflow_id)); // but not pinned
-    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession);
-    CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 1.0);
+    REQUIRE(overflow_id != 0);            // committed - never lost
+    CHECK(state.is_pinned(overflow_id));  // AND protected, which is the point
+    CHECK_FALSE(state.is_pinned(ids[0])); // the oldest yielded its slot
+    CHECK(state.is_pinned(ids[1]));       // the rest of the window is untouched
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // still a bound
+
+    // The displacement is ordinary and is counted as such; the old counter stays at zero
+    // because committing a final unprotected is no longer reachable.
+    CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 0.0);
 }
 
 TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the tick (#2382)",
