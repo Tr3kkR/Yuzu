@@ -102,9 +102,7 @@ required.
 | `session.identity_mismatch` | Session | A gRPC Subscribe was rejected because the mTLS client identity (cert CN/SAN) did not overlap the identity bound at Register time (#1118 — a stolen-session signal, the mTLS sibling of `session.peer_mismatch`). `principal=agent:<agent_id>`; `target_id` is the `session_id`; `detail` carries `agent_id=<id> reason=mtls_identity_mismatch presented=[<cert CN/SANs at Subscribe>] bound=[<cert CN/SANs at Register>]` so an auditor can identify the cert used in the attempt. `result=denied`. SOC 2 CC7.2: high-signal security event. **The SIEM signal is the Prometheus counter** `yuzu_grpc_subscribe_identity_mismatch_total{event="security"}`; this audit row is the paired forensic evidence. On audit-store write failure the gRPC response carries `x-yuzu-audit-failed: true` (see **gRPC audit-failure signal** below). |
 | `tag.set` | Tag | A tag is created or updated on an agent |
 | `tag.delete` | Tag | A tag is removed from an agent |
-| `instruction.execute` | Instruction | An instruction is dispatched to one or more agents. Also emitted with `result=denied` and `detail=reason=<reason>` when a supplied device target names nothing (#2500) |
-| `command.dispatch` | Command | A command is dispatched via `POST /api/command`. Also emitted with `result=denied` and `detail=reason=<reason> <plugin>:<action>` when a supplied device target names nothing (#2500); `plugin`/`action` are caller-supplied and are sanitised and capped at 128 bytes before storage |
-| `result_set.create` | ResultSet | A result set is created by any producer. Also emitted with `result=denied` and `detail=reason=<reason> source_kind=<kind>` when a supplied `parent_id` names no parent set (#2500) |
+| `instruction.execute` | Instruction | An instruction is dispatched to one or more agents |
 | `instruction.approve` | Instruction | An instruction pending approval is approved |
 | `instruction.deny` | Instruction | An instruction pending approval is denied |
 | `instruction.import` | InstructionDefinition | An InstructionDefinition JSON envelope was submitted via `POST /api/instructions/import`. On `result=success`: `target_id` is the new definition's id; `detail` is empty. On `result=denied`: `target_id` is empty (no id assigned on rejection); `detail` carries the store-returned error string, which begins with a stable SIEM-keyable token — known tokens are `duplicate_id` (409 conflict), `signature verification failed for instruction — content may have been tampered with` (#1073 / W7.4), `instruction-import is unsigned and signature enforcement is enabled` (#1073), `instruction-import has incomplete signing metadata` (#1073), `instruction-import has signing field of wrong JSON type` (#1073 R1), `signature length invalid` / `publicKey length invalid` (#1073 R1 DoS amplification guard), `instruction-import has signature + publicKey but no yaml_source` (#1073). Permission gate: `InstructionDefinition:Write`. SOC 2 CC6.7: every import attempt is logged regardless of outcome; if the audit-store write itself fails, the response carries the `Sec-Audit-Failed: true` header AND an `audit_emitted=false` field in the JSON body (PR #883 evidence-chain pattern). |
@@ -334,7 +332,8 @@ configuration is required.
 Audit events are retained for 365 days by default. A background thread runs
 every hour and deletes events whose `ttl_expires_at` has passed. That TTL is
 stamped once, when the row is written, as `insert time + retention window` -- it
-is not derived from the event's own `timestamp`, and nothing ever rewrites it. Deletion is permanent --- there is no soft-delete or archive step.
+is not derived from the event's own `timestamp`, and nothing ever rewrites it.
+Deletion is permanent --- there is no soft-delete or archive step.
 
 To preserve audit data beyond the retention window, export events periodically
 using the REST API or forward them to an external system (see Planned Features
@@ -342,89 +341,226 @@ below).
 
 ### The retention clock guard
 
-Retention is driven by the server's wall clock, so a clock that jumps forward
---- a restored VM snapshot, an NTP correction after a dead CMOS battery, a
-hand-set date --- can mark the whole table expired at once. A cleanup pass
-refuses to act on that. (Triage guidance:
-[the runbook](../ops-runbooks/audit-store-clock-guard.md).)
+**Which alert sent you here?** Five point at this section and only one of them is
+about a decline.
 
-- **A pass declines, deletes nothing, logs a warning, and increments
-  `yuzu_server_audit_clock_anomaly_skips_total`** when any of these holds:
+| Alert | What it means | Go to |
+|---|---|---|
+| `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
+| `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and `audit.db` grows without bound. | `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
+| `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
 
-  1. it would expire **every** datable row;
-  2. more than **a fixed 7 days** elapsed since the previous pass;
-  3. the stored clock reading is **ahead** of now;
-  4. there is **no stored reading at all** --- the first pass after upgrading to
-     a build with the guard, or after a restore.
+Retention is driven by the server's wall clock. A cleanup pass that looks like it
+would destroy the audit trail declines instead of deleting: it logs a warning and
+adds one to `yuzu_server_audit_clock_anomaly_skips_total`. **A decline deletes
+nothing.** It is the protection working, not evidence lost. The rest of this
+section is about declines.
 
-  **Triggers 1-3 latch**: the pass declines once, then the next resumes paced,
-  so a table that is legitimately all-expired still ages out at the cost of one
-  cleanup interval. **Trigger 4 does not latch** --- a missing comparison point
-  is not an anomaly, and spending the latch on it would let a real one on the
-  very next pass go undeclined.
+**Start with the log line.** Every decline logs an `AuditStore:` warning naming
+which condition fired, and for an elapsed-time decline it prints the actual gap
+against the threshold. That answers most of the checklist below without guesswork,
+so read it before working down the list.
 
-  **What to do:** for 4, nothing; it is expected once per database. For 2 and 3,
-  check the host's time sync AND its uptime, because elapsed time cannot tell a
-  clock jump from an outage and the warning names both causes. Triage detail is
-  in [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+**Was this expected?**
 
-  The 7 days is **absolute, not derived from `audit_retention_days`**: how far
-  the clock moved has nothing to do with how long rows are kept, and scaling it
-  to the window put the threshold at a full year on the 365-day default, where
-  it could never fire. The reading is persisted, so trigger 2 still fires on the
-  first pass after a restart --- including a server that *booted* with an
-  already-wrong clock.
-- **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
-  default), oldest first. A wipe the guard chose to allow therefore ages out at
-  a paced rate an operator can still catch, rather than in one statement.
-- Rows whose TTL sits implausibly far in the future --- beyond the retention
-  window plus two days, i.e. written while the clock was already skewed forward
-  --- are excluded from the "would this expire everything?" question. Without
-  that, one such row would disarm the guard permanently.
+1. **Was `audit_retention_days` reduced recently?** Expected. Narrowing the window
+   narrows this guard's survivor horizon, so a pass declines by design. It is a
+   one-off; the backlog then drains at the capped rate.
+2. **Was the server down, suspended, or snapshot-paused for more than 7 days?**
+   Expected. Elapsed time cannot distinguish a long outage from a forward clock
+   jump, and the guard deliberately treats both alike. The log line gives you the
+   measured gap, so you do not have to reconstruct it.
+3. **Is the whole table already past its window?** Expected, once. A pass that
+   would expire every datable row declines before draining --- a restored backup
+   older than the retention window is the common way to meet this.
+4. **Does the log line say the stored reading was unusable?** The pass re-anchors
+   on the current reading and the next one proceeds. The log line names both
+   possible causes; a reading *ahead* of now is what a backward clock movement
+   looks like, so do not rule out the clock here --- continue to rung 5.
+5. **Otherwise, check host time synchronisation** --- `chronyc tracking` or
+   `w32tm /query /status` --- and look for a restored VM snapshot, a dead CMOS
+   battery, or a hand-set date. Fix the clock first: the drain resumes on its own
+   once readings are stable.
+6. **If the clock reads fine but declines keep coming, look for two things
+   setting it.** A single correction declines a pass or two and then drains. Only
+   a clock that keeps *moving* holds the guard declining --- a hypervisor sync
+   fighting the guest's NTP, two NTP sources disagreeing, a failing RTC being
+   corrected over and over. Between corrections such a host looks healthy, so
+   `chronyc tracking` alone will not show it; check for more than one time source
+   and look at the correction history.
 
-**Capacity.** The drain is a fixed 25,000 rows per hourly pass -- about 600,000
-rows/day, or a sustained ceiling of roughly **6.9 audit events/second**. Above
-that, expiry outruns deletion and `audit.db` grows without bound;
-`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that
-figure against your own audit-event rate before deploying at scale. The cap is a
-compile-time constant today, so exceeding it needs an engineering change rather
-than configuration.
+**Is retention actually stalled?** Read the counters, not this alert's firing
+state. `YuzuAuditRetentionClockAnomaly` evaluates `increase(...[1h])` against a
+pass period slightly longer than an hour, so it can resolve and re-fire on its own
+whether or not anything is wrong.
 
-**Retention is a floor, not a ceiling.** The guard errs toward keeping evidence
-longer than configured, which is the safe direction for an evidence store.
-Changing `--audit-retention-days` does **not** re-date existing rows:
-`ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
-expires nothing retroactively and reclaims no disk. What it does change is this
-guard's survivor horizon, which is derived from the current window -- so after a
-reduction (and a restart, per issue #483) the older long-TTL rows stop counting
-as survivors, and a single declined pass becomes more likely.
+Retention is stalled when, **sustained over several consecutive passes**:
 
-**What this does and does not promise.** The cap is the half that always
-applies: it bounds the damage of any allowed wipe unconditionally. The two
-The detectors are all best-effort, and the outcome test has a known blind spot --- it is
-defeated by *any* audit row written after the clock moved, because a fresh row
-counts as a survivor. On a server that is up and serving, that is the common
-case, which is why the elapsed-time reading is persisted across restarts. Taken
-together the guard converts an instantaneous wipe into a paced one plus an
-operator signal; it does not guarantee every clock anomaly is detected.
+- `yuzu_server_audit_clock_anomaly_skips_total` rises on every pass, and
+- `yuzu_server_audit_retention_passes_total` rises by the same amount over the
+  same window (so *every* pass is declining, not merely some), and
+- `yuzu_server_audit_rows_deleted_total` stays flat.
 
-Six metrics report on this. All but `rows_deleted_total` ship with an alert
-rule in `docs/prometheus/yuzu-alerts.yml`; that one is a rate to read alongside
-the others, not an alert on its own. Do not collapse the first two:
+One or two consecutive declines is normal and is not this state. Do NOT look to
+`yuzu_server_audit_retention_cap_reached_total` to confirm a backlog: it only
+moves on a pass that actually deleted, so it is flat by construction in exactly
+the state you are testing for.
+
+Whether that stall *matters* is a separate question, and there is no metric for
+it --- confirm a backlog exists by querying for events older than the retention
+window (see Protecting evidence below), or by watching `audit.db` grow on disk. A
+store with nothing to delete shows the same two counters.
+
+If skips and `yuzu_server_audit_rows_deleted_total` are **both** flat, retention
+is not declining --- it is failing or not running at all; check
+`yuzu_server_audit_cleanup_failed_total` and
+`yuzu_server_audit_retention_passes_total`.
+
+If skips rises by *less* than passes **over the same window**, some passes are
+declining and some are not. Read `yuzu_server_audit_rows_deleted_total` to see
+which: rising means the rest are draining normally, which is the ordinary
+post-reduction picture in rung 1 and is healthy; flat means the rest are failing,
+so check `yuzu_server_audit_cleanup_failed_total`. Compare `increase()` over a
+window covering several passes --- never the raw values, which are
+since-process-start and make skips smaller than passes on any healthy store.
+
+**Protecting evidence right now.**
+
+- **To export a time range, use `/api/audit`, not `/api/v1/audit`.** The v1
+  endpoint takes only `limit` (hard-capped at 1000), `principal` and `action` --
+  it cannot express a range and cannot paginate, so it will silently hand you the
+  first 1000 rows of a much larger set. (The periodic-export recipes further down
+  this page use v1 deliberately --- they forward a rolling tail on a schedule,
+  which is a different job from pulling a specific window once.) The legacy
+  endpoint takes `since`, `until`, `limit` and `offset`, and is the only way to
+  page a range out before the next cleanup interval:
+
+  ```bash
+  # Page out everything in a window, 1000 rows at a time.
+  # FROM/TO are unix seconds. Stops on the first empty page.
+  OFF=0
+  while :; do
+    if ! curl -sS -f -H "Authorization: Bearer $TOKEN" \
+         "$SERVER/api/audit?since=$FROM&until=$TO&limit=1000&offset=$OFF" \
+         -o "audit-$OFF.json"; then
+      echo "EXPORT INCOMPLETE at offset $OFF" >&2   # token expiry, 503, reset
+      exit 1
+    fi
+    grep -q '"count":0' "audit-$OFF.json" && { rm -f "audit-$OFF.json"; break; }
+    OFF=$((OFF+1000))
+  done
+  ```
+
+  Fail loudly rather than quietly: a mid-export 401 or 503 otherwise leaves a
+  directory of files that looks like a finished run. **The response's `total`
+  field cannot confirm completeness** --- it is `COUNT(*)` over the whole table,
+  not over your `since`/`until` window, so it will not match your export and is
+  not a check. Count the pages you fetched instead.
+- **If a server ran with a backward-skewed clock, export before the next pass.**
+  Rows written while the clock was behind carry an already-past TTL, so once the
+  clock is corrected they are the oldest rows in the table and the first the paced
+  delete takes --- at `info` level, indistinguishable from routine ageing-out.
+  That is the window an auditor asks about first, because it covers a host fault.
+- **Ship the `AuditStore:` warnings to your durable log store.** The alert rules
+  fire on `increase()` over a rolling window, so a one-time warning stops being
+  visible in the counter once it ages out and the process restarts. The log is the
+  evidence record; the metric is not.
+
+**Once starvation is confirmed.** Fix the clock; that is the whole remediation.
+The drain resumes on its own within a pass or two of the readings becoming
+stable, paced at the cap, and nothing needs to be deleted by hand.
+
+**Do not delete rows yourself, and do not move `audit.db` aside**, however large
+it has grown. Over-retention is the SAFE direction here and it is deliberate:
+retention is a floor, not a ceiling, and the guard errs toward keeping evidence
+longer than configured because this is an evidence store. Rows older than the
+configured window are the guard working, not a fault. If disk is the immediate
+problem, treat it as a capacity incident (see below) rather than an audit one.
+
+Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
+carry `principal`, `source_ip` and `user_agent`. If you are under a retention
+CEILING obligation as well as a floor, over-retention is a compliance exposure in
+the other direction, and stabilising the clock (which resumes the drain) is the
+fix --- not hand-deletion.
+
+**Limits.**
+
+- Detection is best-effort; the cap is the half that always applies. It bounds any
+  allowed wipe to 25,000 rows per pass unconditionally, whether or not a detector
+  fired --- an instantaneous wipe becomes a paced one plus an operator signal.
+- Changing `--audit-retention-days` does not re-date existing rows.
+  `ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
+  expires nothing retroactively and reclaims no disk.
+- `/healthz` does not report retention health: `stores.audit` reflects only whether
+  the database is open, so it reads healthy while retention is failing or not
+  running (#2509). A store running without its index is a further blind spot with
+  no metric at all (#2526). Rows written while the clock was AHEAD sit permanently
+  beyond the datable horizon --- never deleted, never reported, and retained past
+  the stated window (#2510).
+
+**Where the rule lives.** The decision rule is `classify()` in
+`server/core/src/audit_retention_rules.hpp` together with the fact construction in
+`AuditStore::cleanup_once`, pinned by an exhaustive truth table in
+`tests/unit/server/test_audit_retention_rules.cpp` and store-level cases in
+`tests/unit/server/test_audit_store.cpp`. This page deliberately does not restate
+it, and **no behavioural claim belongs in this section without a citing test**.
+Five correction rounds here produced only transcription errors between the code
+and prose paraphrases of it; the paraphrases have been removed rather than
+sharpened.
+
+Seven metrics report on the retention guard. All but
+`yuzu_server_audit_rows_deleted_total` and
+`yuzu_server_audit_retention_last_pass_unixtime` ship with an alert rule in
+`docs/prometheus/yuzu-alerts.yml`; those two are read alongside the others
+(is the backlog moving? when did the reaper last run?) rather than alerted on
+directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete. Four triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; the stored reading was *ahead* of the clock; or there was no stored reading at all, so the elapsed-time check could not run (the first pass after upgrading or restoring - expected once per database). The middle one cannot tell a forward jump from an outage that long, so read this as "the clock moved, **or** the server was down that long". |
-| `yuzu_server_audit_cleanup_failed_total` | A pass failed on a database error, or the store is closed (a failed migration closes it). The cleanup loop itself is broken. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete; nothing was deleted, and each declined pass adds exactly 1. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. For triage, see [The retention clock guard](#the-retention-clock-guard) above. |
+| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
-| `yuzu_server_audit_retention_index_ok` | `1` normally. `0` means the retention index could not be built, so every pass now full-scans the table under the store lock. Alert on `== 0`. **Evaluated once at startup**, so it will not detect an index dropped while the server is running. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other five counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if none has in this process. A pass refused for an implausible `now` counts as a pass but does not stamp this gauge, and a restart resets it to `0` for up to one cleanup interval even though the durable reading survives. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is
 protecting the table" from "cleanup is broken". The third covers the failure the
 cap itself introduces, which neither of the first two would show.
+
+### Capacity
+
+**The drain is a fixed 25,000 rows per hourly pass** -- about 600,000 rows/day, or
+a sustained ceiling of roughly **6.9 audit events/second**. Above that, expiry
+outruns deletion and `audit.db` grows without bound;
+`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that figure
+against your own audit-event rate before deploying at scale. The cap is a
+compile-time constant today, so exceeding it needs an engineering change rather
+than configuration.
+
+The **file-size** ceiling is likely to bind first, though this is an estimate
+rather than a measurement: sustaining 6.9 events/second for a 365-day retention
+window means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
+of 44 GB plus a comparable index footprint in a single SQLite file -- but row size
+varies with `principal`, `action`, `detail`, `target` and `user_agent`, so treat
+the byte figure as an order of magnitude, not a threshold. A deployment
+approaching the drain-rate ceiling has a storage problem before it has a
+retention-pacing problem. Audit rows are emitted per REQUEST rather than per
+device, but not only for operator requests: agent enrolment, fleet-topology pushes
+and rejections, and background schedule execution all write rows too, so fleet
+size does influence the rate. Measure your own `yuzu_server_audit_events_total`
+rate rather than assuming an operator-only workload.
+
+**The cap also bounds peak WAL.** The old unguarded delete cleared its whole
+backlog in one uncheckpointable transaction: measured at 152 MB of WAL for a
+337k-row backlog, extrapolating to about 2 GB at 4.5M. A capped pass writes about
+51 MB for its 25,000 rows and checkpoints between passes, so disk high-water is
+bounded too, not just lock-hold time.
+
 
 ## Integration patterns
 
