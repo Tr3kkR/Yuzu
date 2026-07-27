@@ -570,7 +570,12 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
         REQUIRE(poll_until(
             [&, i] { return s.stream->pinned_count() == static_cast<std::size_t>(i); }));
     }
-    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
+    auto pin_reject1 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+    // Null-guarded like the sibling at the C6a test: if the cap ever fails to
+    // bite, std::string(nullptr) is UB and kills the whole binary instead of
+    // failing this assertion cleanly.
+    CHECK(std::string(pin_reject1.reject_reason == nullptr ? ""
+                                                           : pin_reject1.reject_reason) ==
           "pin_slots");
 
     // Find the SMALLEST pinned id and consume exactly it via a resume cursor
@@ -1832,7 +1837,12 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
-    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
+    auto pin_reject2 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+    // Null-guarded like the sibling at the C6a test: if the cap ever fails to
+    // bite, std::string(nullptr) is UB and kills the whole binary instead of
+    // failing this assertion cleanly.
+    CHECK(std::string(pin_reject2.reject_reason == nullptr ? ""
+                                                           : pin_reject2.reject_reason) ==
           "pin_slots");
 }
 
@@ -2677,7 +2687,12 @@ TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, t
     // The charge was NOT returned and the ledger still counts it - they AGREE, so
     // the cap correctly still bites. This is NOT the load-bearing assertion: the
     // pre-fix code also rejected here (for the opposite, broken reason).
-    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
+    auto pin_reject3 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+    // Null-guarded like the sibling at the C6a test: if the cap ever fails to
+    // bite, std::string(nullptr) is UB and kills the whole binary instead of
+    // failing this assertion cleanly.
+    CHECK(std::string(pin_reject3.reject_reason == nullptr ? ""
+                                                           : pin_reject3.reject_reason) ==
           "pin_slots");
 
     // THE LOAD-BEARING HALF. The record still reads "charge held", so the next

@@ -172,7 +172,9 @@ Session state is in-memory only and deliberately does **not** gate `/readyz`. Op
 
 PR 2 gave the channel heartbeats and replayed frames; **PR 3a shipped its first producer**, the progress bridge (`notifications/progress` - see "Progress bridge (2f PR 3a)" below). Metrics: `yuzu_mcp_sessions_active`, `yuzu_mcp_sessions_opened_total`, `yuzu_mcp_streams_active`, `yuzu_mcp_streams_handover_pending`, `yuzu_mcp_streams_cap` (the EFFECTIVE cap after the boot clamp), `yuzu_mcp_stream_replay_ring_evictions_total`, `yuzu_mcp_stream_frames_dropped_total` (frames dropped before reaching a connection — usually a slow consumer's per-connection queue overflow, also a rare producer-side post-commit allocation failure (#2366); recoverable via Last-Event-ID), `yuzu_mcp_stream_frames_too_large_total` (a frame exceeded the per-frame byte cap and was truncated before entering the ring — counted rather than only logged, because an unbounded warn-per-publish is a log-flood vector), `yuzu_mcp_stream_rejects_total{reason}`, `yuzu_mcp_stream_closes_total{reason}` (alert on `auth_unavailable` and `internal_error`), `yuzu_mcp_stream_publish_failures_total` (a `publish()` call failed before the frame committed — pre-commit only; the frame was never published and no event id was consumed. A post-commit sink-enqueue failure instead counts as a normal `frames_dropped_total`/events-dropped gap. Non-fatal by construction but a near-miss for a worker-thread `std::terminate` — ticket on any `increase() > 0` over 15 m, do not page). Progress-bridge families (2f PR 3a): `yuzu_mcp_bridge_records_active`, `yuzu_mcp_bridge_reject_total{reason}`, `yuzu_mcp_bridge_degrade_total{reason}`, `yuzu_mcp_bridge_listener_failures_total`, `yuzu_mcp_bridge_mailbox_drops_total`, `yuzu_mcp_bridge_projector_cycles_total`, `yuzu_mcp_stream_terminal_publish_failures_total`, `yuzu_mcp_stream_final_unpinned_total`, plus the teardown-completeness families `yuzu_mcp_bridge_teardown_incomplete_total{reason}`, `yuzu_mcp_bridge_projection_degraded_total` (#2528 - a projection claim released without the record lock, so the settle was lossy) and `yuzu_mcp_maintenance_tick_failures_total{tick}` (#2487; on-call procedure in `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`) - each with its alerting posture in `docs/user-manual/metrics.md`.
 
-**Shutdown:** httplib re-checks its shutdown flag between provider calls, so `stop()` drains live streams within about one heartbeat tick (~3 s, in parallel). A stream whose peer has stopped reading is bounded instead by the 30 s socket write timeout — size a container termination grace period above that if you run streaming clients.
+**Shutdown:** httplib re-checks its shutdown flag between provider calls, so `stop()` drains live GET streams within about one heartbeat tick (~3 s, in parallel). A stream whose peer has stopped reading is bounded instead by the 30 s socket write timeout.
+
+**A streamed POST drains differently, and it is the figure to size against.** `stop()` closes the listening socket, but the web thread is joined only once every held-open response has ended — and a streamed POST runs to its own response cap (`kMcpStreamedPostCapDefault`, 120 s) unless its execution finishes first. Size a container termination grace period and `TimeoutStopSec` above **120 s**, not 30 s: sizing off the GET figure under-provisions by 90 s and SIGKILLs mid-drain on every deploy, which is silent connection loss for in-flight streams. Tracked for a bounded drain (a pump stop-token) in the follow-ups below.
 
 ## Progress bridge (2f PR 3a)
 
@@ -206,7 +208,9 @@ PR 2 gave the channel heartbeats and replayed frames; **PR 3a shipped its first 
 
 ### Response shape
 
-Headers are `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `X-Content-Type-Options: nosniff`, and `X-Correlation-Id`. Frames are JSON-RPC objects under the default `message` event type. Progress frames are strictly increasing (see Monotonicity above). The stream ends one of two ways:
+Headers are `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `X-Content-Type-Options: nosniff`, and `X-Correlation-Id`.
+
+`X-Accel-Buffering` is understood by nginx only. Envoy, HAProxy, ALB and Cloudflare each need their own no-buffering opt-out — without it the proxy buffers the stream, the server cannot detect that the client has gone, and the response runs to its full cap holding a worker and an admission slot. Same caveat as the GET channel (`docs/user-manual/server-admin.md`). Frames are JSON-RPC objects under the default `message` event type. Progress frames are strictly increasing (see Monotonicity above). The stream ends one of two ways:
 
 - **A result frame, then EOF.** The normal case. No close frame follows it — that would be a second, contradictory terminal on a stream that already answered.
 - **A `notifications/yuzu.stream_closed` frame, then EOF.** Everything else. It carries a `reason`, the `execution_id`, and `partial: true`.
@@ -232,14 +236,21 @@ A streamed POST holds an HTTP worker open for its lifetime, so it leases from th
 
 | Condition | Status | JSON-RPC error | Retry? |
 |---|---|---|---|
-| per-principal or global stream cap | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` |
-| this session's streamed-call cap | 429 | `-32012` | yes, once one finishes |
+| per-principal or global stream cap | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` (30s: a streamed slot is held until the work finishes, so the GET figure would just cause a retry storm) |
+| this session's streamed-call cap | 429 | `-32012` | yes, once one finishes (slots are released when a final is delivered, not when the response closes) |
 | request id already in flight | 409 | `-32600` | no — use a fresh id |
 | session unknown or expired | 404 | `-32007` | re-`initialize` |
 | streaming disabled / shutting down | 200 | — | none needed; you get the plain response |
 | server could not allocate | 200 | — | none needed; you get the plain response |
 
-The last two **degrade** rather than fail: the plain response is self-sufficient (it carries `execution_id`), so answering it beats advising a retry into a resource failure. Every refusal happens before the execution row is created, so a rejected call has dispatched nothing.
+Two further shapes are **500s raised after dispatch** — the only refusals where the work is already running. Both carry `execution_id` in `error.data` alongside the correlation id, because the recovery is to fetch that execution, never to retry a mutating call:
+
+| Condition | Status | Meaning |
+|---|---|---|
+| the stream could not be established | 500 | the command IS running; fetch by `execution_id`, or retry without an SSE `Accept` |
+| the response could not be completed after dispatch | 500 | the command IS running; fetch by `execution_id` |
+
+The last two admission conditions **degrade** rather than fail: the plain response is self-sufficient (it carries `execution_id`), so answering it beats advising a retry into a resource failure. Every refusal happens before the execution row is created, so a rejected call has dispatched nothing.
 
 ### Resuming, and the one case you cannot resume
 

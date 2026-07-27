@@ -608,6 +608,14 @@ public:
                           "signal, not a rate: the record is still reclaimable, but a terminal "
                           "payload mid-retry is lost and answered by the fallback final",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_sessions_at_pin_cap",
+                          "MCP sessions currently holding every streamed-POST admission slot. "
+                          "A session legitimately running four streamed calls looks identical, "
+                          "from the reject counter alone, to one that is wedged - this is the "
+                          "signal that separates them. A value that never recedes while "
+                          "yuzu_mcp_stream_rejects_total{reason=\"post_pin_slots\"} keeps "
+                          "climbing means slots are not being returned; alert on sustained > 0",
+                          "gauge");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
                           "release point and are RETAINED on the record until its teardown "
@@ -671,6 +679,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
+        metrics_.gauge("yuzu_mcp_bridge_sessions_at_pin_cap").set(0);
         metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");

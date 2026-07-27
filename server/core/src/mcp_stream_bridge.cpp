@@ -39,6 +39,12 @@ constexpr const char* kMetricTeardownIncomplete = "yuzu_mcp_bridge_teardown_inco
 // still agree - so a nonzero value is a deferred release, never a stranded slot.
 constexpr const char* kMetricChargeReleaseDeferred =
     "yuzu_mcp_bridge_charge_release_deferred_total";
+// Sessions currently holding every streamed-POST pin slot. The diagnostic that
+// distinguishes "busy, will clear" from "leaked, never will" - without it the only
+// signal for a wedged session was a bare reject counter, and both the 429
+// remediation and the docs tell the caller to wait for calls that may already have
+// finished. Governance 2026-07-27 (enterprise-readiness).
+constexpr const char* kMetricSessionsAtPinCap = "yuzu_mcp_bridge_sessions_at_pin_cap";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -1205,7 +1211,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                     // can never fill - and the watermark above deliberately did
                     // not advance for it either.
                     try {
-                        out->progress.push_back(frame);
+                        out->progress.push_back(std::move(frame));
                     } catch (...) {  // NOLINT(bugprone-empty-catch)
                         // The ring copy is durable; losing the live copy costs
                         // this client a frame it can still fetch by resume.
@@ -1376,6 +1382,9 @@ McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& re
 // ── Sweep ──────────────────────────────────────────────────────────────────
 
 void McpStreamBridge::sweep() {
+    // Refresh the busy-vs-wedged reading once per maintenance tick, before the
+    // passes below can change it.
+    publish_pin_cap_gauge();
     std::vector<std::shared_ptr<BridgeRecord>> snap;
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
@@ -2086,6 +2095,30 @@ void McpStreamBridge::publish_records_gauge(std::size_t n) noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->gauge(kMetricRecordsActive).set(static_cast<double>(n)); });
     }
+}
+
+void McpStreamBridge::publish_pin_cap_gauge() noexcept {
+    // Counts sessions with NO streamed admission left. A session that legitimately
+    // has four calls in flight is indistinguishable, from a bare reject counter,
+    // from one wedged forever - and when it is wedged the 429 remediation ("wait
+    // for one to finish") is a lie. This is the number support needs.
+    //
+    // Called from the sweep rather than the admission path: it is a periodic health
+    // reading, not a hot-path counter, and computing it needs bridge_mu_.
+    if (metrics_ == nullptr) {
+        return;
+    }
+    std::size_t at_cap = 0;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        for (const auto& [session, unpinned] : streamed_unpinned_) {
+            (void)session;
+            if (unpinned >= kMaxStreamedPostsPerSession) {
+                ++at_cap;
+            }
+        }
+    }
+    obs_guard([&] { metrics_->gauge(kMetricSessionsAtPinCap).set(static_cast<double>(at_cap)); });
 }
 
 void McpStreamBridge::flush_record_obs(BridgeRecord& rec) noexcept {

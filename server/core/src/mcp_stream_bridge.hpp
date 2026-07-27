@@ -187,6 +187,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace yuzu {
 class MetricsRegistry;
@@ -285,12 +286,12 @@ public:
     /// did when the streamed-POST rung added six reasons and seeded none of them
     /// (adversarial review, 2026-07-27). Same both-or-neither shape as
     /// kTeardownStageNames. A new degrade reason belongs in this array first.
-    static constexpr std::array<const char*, 11> kDegradeReasons{
+    static constexpr std::array kDegradeReasons{
         // 3a (GET-only bridge)
         "reserve_rejected", "reserve_threw", "no_execution_row", "subscribe_failed", "arm_threw",
         // 3b (streamed POST)
         "bind_post_sink_failed", "stream_install_failed", "arm_already_armed", "arm_cancelled",
-        "arm_not_armed", "post_dispatch_threw"};
+        "arm_not_armed", "post_dispatch_threw", "attach_audit_failed"};
 
     enum class CancelOutcome {
         kAcceptedPending,  ///< pre-arm: recorded; arm()/abandon() arbitrate (C1 - no audit yet)
@@ -306,15 +307,16 @@ public:
     /// `detached` to the emit site and to no seed list at all (adversarial
     /// re-review, 2026-07-27). A new CancelOutcome must appear in BOTH of these,
     /// and a test walks the enum to prove every label is seeded.
-    static constexpr std::array<const char*, 3> kCancelOutcomeLabels{"accepted", "detached",
-                                                                    "noop"};
-    /// EVERY enum value returns from its own case and there is NO `default` and no
-    /// fall-through, so adding a CancelOutcome without extending this fails the
-    /// build under -Wswitch rather than silently emitting the last label. That
-    /// matters more than it looks: the label-walk test only catches the drift if
-    /// someone remembers to extend the test, which is the same "remember to update
-    /// the other place" the closed-list refactor exists to eliminate. The trailing
-    /// return is unreachable and present only for -Wreturn-type.
+    static constexpr std::array kCancelOutcomeLabels{"accepted", "detached", "noop"};
+    /// EVERY enum value returns from its own case, with NO `default`, so adding a
+    /// CancelOutcome without extending this WARNS under -Wswitch (GCC/Clang) and
+    /// C4062 (MSVC). It does not fail the build - this project sets werror=false -
+    /// so the sentinel below is the second line of defence: an unmapped outcome
+    /// reports "unknown" rather than silently borrowing a real label, which is what
+    /// the previous version's trailing `return kCancelOutcomeLabels[2]` did. That
+    /// mattered because it reproduced, one level up, exactly the drift the closed
+    /// list exists to prevent. "unknown" is deliberately NOT in the pre-seeded set:
+    /// an unseeded series appearing in the metric is the signal.
     [[nodiscard]] static constexpr const char* cancel_outcome_label(CancelOutcome o) noexcept {
         switch (o) {
         case CancelOutcome::kAcceptedPending:
@@ -324,7 +326,7 @@ public:
         case CancelOutcome::kNoOp:
             return kCancelOutcomeLabels[2];
         }
-        return kCancelOutcomeLabels[2];
+        return "unknown";
     }
 
     /// C5 (#2409): the terminal frame a claimed pressure-teardown publishes.
@@ -874,7 +876,9 @@ private:
     void count_charge_release_deferred() noexcept;
     /// True iff a fault is armed for `stage` (consumes one). Test seam only.
     bool take_step_fault(TeardownStage stage) noexcept;
-    void publish_records_gauge(std::size_t n) noexcept;  ///< never called under bridge_mu_
+    void publish_records_gauge(std::size_t n) noexcept;
+    /// Sessions holding every streamed pin slot - the "busy vs wedged" diagnostic.
+    void publish_pin_cap_gauge() noexcept;  ///< never called under bridge_mu_
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
     /// `detail` is a string_view, NOT a `const std::string&`: every caller passes a

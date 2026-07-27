@@ -9345,9 +9345,14 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         CHECK(body["id"] == 731);
         CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
         CHECK(body["error"]["code"] != -32010);
-        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamCapRetryAfterMs);
+        // The streamed-POST figure, NOT the GET one: a GET slot frees when a dead
+        // peer is detected, but a streamed slot is held until the work finishes or
+        // the response cap elapses, so advising the GET number would have a
+        // conforming client retry ~24 times before a slot could possibly free.
+        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamedPostRetryAfterMs);
+        CHECK(body["error"]["data"]["retry_after_ms"] != smcp::kMcpStreamCapRetryAfterMs);
         CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
-        CHECK(second->get_header_value("Retry-After") == "5");
+        CHECK(second->get_header_value("Retry-After") == "30");
         // Denied, not dispatched: no execution row, and the denial is auditable.
         CHECK(tracker.query_executions({}).size() == rows_before);
         CHECK(audit_has("mcp.session.reject|failure"));
