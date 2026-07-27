@@ -1381,10 +1381,18 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         // Counter-intuitively FREQUENT pokes are harmless (each wake re-tests the
         // gate); the bad case is ONE poke just before the boundary then silence,
         // which is precisely why a poke-driven test did not catch it.
+        // ceil, NOT duration_cast. duration_cast FLOORS, so a remainder under 1ms
+        // became a zero budget: the wait returned instantly, the post-wait sample
+        // was still short of `next_check_`, the pass fell through to the
+        // unconditional heartbeat write at the bottom, and httplib re-entered - a
+        // tight spin emitting heartbeat frames at the client until real time
+        // crossed the boundary. Bounded to under a millisecond, but it is a burst
+        // of wire traffic per affected tick on every streamed response, and this
+        // fleet's standing bar is to be kind to the network. Rounding UP can
+        // overshoot the check by at most 1ms, which the one-tick bound absorbs.
         const auto until_check =
             next_check_ > now_before_wait
-                ? std::chrono::duration_cast<std::chrono::milliseconds>(next_check_ -
-                                                                        now_before_wait)
+                ? std::chrono::ceil<std::chrono::milliseconds>(next_check_ - now_before_wait)
                 : std::chrono::milliseconds{0};
         sink_->cv.wait_for(lk, std::min(cfg_.tick, until_check), [this] {
             return sink_->closed.load() || sink_->poked.load(std::memory_order_acquire);
