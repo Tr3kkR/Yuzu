@@ -420,15 +420,19 @@ and treat it as the failing case.
 
   ```bash
   # Page out everything in a window, 1000 rows at a time.
+  # FROM/TO are unix seconds. Stops on the first empty page.
   OFF=0
   while :; do
-    n=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+    curl -sf -H "Authorization: Bearer $TOKEN" \
       "$SERVER/api/audit?since=$FROM&until=$TO&limit=1000&offset=$OFF" \
-      -o "audit-$OFF.json" -w '%{size_download}')
-    grep -q '"events":\[\]' "audit-$OFF.json" && break
+      -o "audit-$OFF.json" || break
+    grep -q '"count":0' "audit-$OFF.json" && { rm -f "audit-$OFF.json"; break; }
     OFF=$((OFF+1000))
   done
   ```
+
+  The response carries `events`, `count` and `total`, so compare the sum of
+  `count` against `total` to confirm you got everything.
 - **If a server ran with a backward-skewed clock, export before the next pass.**
   Rows written while the clock was behind carry an already-past TTL, so once the
   clock is corrected they are the oldest rows in the table and the first the paced
