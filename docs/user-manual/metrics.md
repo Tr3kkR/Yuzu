@@ -101,6 +101,28 @@ Every held-open SSE stream re-validates its credential on each ~3 s pump tick. F
 
 This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
 
+## Audit-store metrics
+
+The audit store is the SOC 2 evidence chain, so both its write path and its
+retention path are scraped. The retention clock guard these describe is
+documented in `docs/user-manual/audit-log.md`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_audit_events_total{result}` | counter | Audit events written, bucketed by `result` (`success` / `failure` / `denied` / `other`). |
+| `yuzu_server_audit_emit_failed_total` | counter | Events that failed to persist. Non-zero means fail-closed behavioural-PII routes are returning `503`; see the `YuzuAuditPersistFailures` alert. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | counter | Retention passes **declined**. Four triggers: the pass would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; the stored reading was *ahead* of the clock; or there was no stored reading at all, so the elapsed-time check could not run (the first pass after upgrading or restoring - expected once per database). Elapsed time cannot separate a forward jump from an outage that long - read it as "the clock moved, **or** the server was down that long". Nothing was deleted. |
+| `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that **failed** on a database error, or ran against a closed store (a failed migration closes it), so `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
+| `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_index_ok` | gauge | `1` while the retention index exists. Evaluated once at startup, so it cannot detect an index dropped at runtime. `0` means every cleanup pass full-scans `audit_events` under the exclusive store lock, and that cost grows with the table - the one condition that makes the pass's lock hold unbounded. Alert on `== 0`. |
+| `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
+
+The skips and failed counters must be alerted on separately and never collapsed:
+both leave rows undeleted, so an audit table that never shrinks looks identical
+either way. Only the pair distinguishes "the guard is protecting the table" from
+"cleanup is broken".
+
 ## MCP transport metrics
 
 Request-body rejections at the `/mcp/` ingress (#2437). The label set is
