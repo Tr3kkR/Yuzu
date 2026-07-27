@@ -641,14 +641,18 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         //
         // NOT fixed, and tracked: any clock that yields an EVENT on every pass
         // holds the report branch and so starves the drain for as long as it
-        // lasts. Two shapes reach that. Movement at or above the floor on every
-        // pass qualifies on its own -- forward as `Step`, backward as
-        // `BadState` -- with no further precondition. Sub-floor ALTERNATION
-        // needs a standing would-wipe: `prev_unusable` flips every pass, so the
-        // fact set changes every pass and dedup never engages, which in turn
-        // needs a store with no audit write inside a whole retention window.
-        // Both raise `clock_anomaly_skips_` on every halted pass, so they are
-        // loud rather than silent, and both predate this floor.
+        // lasts. Three shapes reach that, and they do NOT share preconditions.
+        // BACKWARD movement of at least the floor qualifies on its own, via
+        // `BadState` ahead of every other test. FORWARD movement of more than
+        // the floor qualifies only through `Step`, so it inherits `window > 0`
+        // and `has_expired` -- with retention disabled a forward ratchet over
+        // legacy non-zero TTLs classifies `None` and DELETES, it does not
+        // starve. Sub-floor ALTERNATION needs a standing would-wipe:
+        // `prev_unusable` flips every pass, so the fact set changes every pass
+        // and dedup never engages, which in turn needs a store with no audit
+        // write inside a whole retention window. All three raise
+        // `clock_anomaly_skips_` on every halted pass, so they are loud rather
+        // than silent, and all three predate this floor.
         //
         // `clock_event`'s own directional symmetry -- not symmetry with
         // `big_step`, which the paragraph above rules out -- also covers the

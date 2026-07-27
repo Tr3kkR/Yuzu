@@ -333,13 +333,16 @@ private:
     // backward movement arrives via `BadState`'s `*prev > now` carrier rather
     // than the enum alone, which is why `cleanup_once` tests that carrier.
     //
-    // Which anomalies are reachable, and the PRECONDITIONS on each (the
-    // `window > 0` gate on `Step`, the `has_expired` short-circuit ahead of it,
-    // the inclusive-vs-strict floor), are stated once in `classify()` in
-    // `audit_retention_rules.hpp` and, for operators, in
+    // Which anomalies are reachable, and the PRECONDITIONS on each, are split
+    // across exactly two places in the code: `classify()` in
+    // `audit_retention_rules.hpp` owns the PRECEDENCE (`prev_unusable` first,
+    // then the `has_expired` short-circuit), and `cleanup_once` owns how the
+    // input facts are BUILT (`big_step`'s `window > 0` gate and strict `>`,
+    // against `moved_at_least`'s inclusive magnitude test). Reading only one of
+    // the two does not recover the rule. The operator-facing statement is
     // `docs/user-manual/audit-log.md#the-retention-clock-guard`. Do not restate
-    // them here: this rule was previously paraphrased across seven surfaces and
-    // drifted between them every time it was corrected.
+    // any of it here: this rule was previously paraphrased across seven
+    // surfaces and drifted between them every time it was corrected.
     //
     // A DIFFERENT condition arriving mid-anomaly is still reported by the
     // inequality half. A single bool could express none of this.

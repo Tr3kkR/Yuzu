@@ -347,8 +347,9 @@ hand-set date --- can mark the whole table expired at once. A cleanup pass
 refuses to act on that:
 
 - **It declines a pass that would expire every datable row**, logs a warning,
-  and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same
-  applies when the gap since the previous pass exceeds **a fixed 7 days**, or
+  and increments `yuzu_server_audit_clock_anomaly_skips_total`. The same applies
+  when the gap since the previous pass exceeds **a fixed 7 days** (while
+  retention is enabled and something is expired --- see the table below), or
   when the stored reading is not usable -- *ahead* of the current clock,
   negative, present but not an integer, or unreadable. Reducing
   `audit_retention_days` also declines a pass by design, because it narrows the
@@ -362,8 +363,11 @@ refuses to act on that:
   has nothing to do with how long rows are kept, and scaling it to the window
   put the threshold at a full year on the 365-day default, where it could never
   fire. Elapsed time still cannot tell a clock jump from an outage, so a server
-  that was genuinely down for more than a week declines one cleanup pass ---
-  deliberately cheap, and the warning names both causes. A repeat of the same CONDITION is not re-reported, so an audit table that is
+  that was genuinely down for more than a week can decline a cleanup pass ---
+  deliberately cheap, and the warning names both causes. How many passes it
+  costs, and whether it declines at all, depend on the preconditions tabulated
+  below: with nothing expired it does not decline, and on an all-expired store
+  it costs two passes rather than one. A repeat of the same CONDITION is not re-reported, so an audit table that is
   *legitimately* all-expired still ages out
   --- it just costs one cleanup interval first.
 - **Every accepted pass is capped** at 25,000 rows (0.6M/day at the hourly
@@ -413,11 +417,20 @@ Two boundary facts follow, and they are **not** symmetric:
 any clock that produces an EVENT on every pass halts the drain for as long as it
 lasts. Two shapes do that:
 
-- Movement at or above the 7-day floor on *every* pass, alternating or
-  ratcheting. Each leg is an event in its own right --- forward as `Step`,
-  backward as `BadState` --- so this starves whatever else is true.
+- **Backward** movement of at least 7 days on every pass. It arrives as
+  `BadState` at step 1, so it starves with no further precondition.
+- **Forward** movement of more than 7 days on every pass, but only while
+  retention is enabled and something is expired --- it needs `Step`, and carries
+  `Step`'s preconditions. With `audit_retention_days` at 0, legacy rows written
+  while retention *was* enabled still expire (their `ttl_expires_at` is stamped
+  at INSERT and never rewritten), so such a pass classifies `None` and **deletes
+  normally**. A forward ratchet does not starve that store.
 - Sub-floor alternation while a would-wipe condition stands: the fact set differs
   on every pass, so the report-once rule never engages.
+
+An alternation at or above the floor hits the first two together, which is the
+shape most likely to be seen in the field --- a failing RTC against NTP, or a
+hypervisor sync fighting the guest.
 
 Sub-floor movement is otherwise treated as a condition precisely to avoid this.
 Because a warning suppresses that pass's delete, treating a one-second drift as
