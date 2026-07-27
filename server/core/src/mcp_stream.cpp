@@ -1219,6 +1219,158 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     return true;
 }
 
+// ── McpPostPump ─────────────────────────────────────────────────────────────
+
+McpPostPump::McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                         FinalWrittenFn on_final_written,
+                         std::function<StreamRevalidate()> revalidate,
+                         std::function<bool()> session_alive)
+    : McpPostPump(std::move(sink), std::move(take_batch), std::move(on_final_written),
+                  std::move(revalidate), std::move(session_alive), Config{}) {}
+
+McpPostPump::McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                         FinalWrittenFn on_final_written,
+                         std::function<StreamRevalidate()> revalidate,
+                         std::function<bool()> session_alive, Config cfg, ClockFn clock,
+                         yuzu::MetricsRegistry* metrics, std::string correlation_id,
+                         std::string execution_id)
+    : sink_(std::move(sink)),
+      take_batch_(std::move(take_batch)),
+      on_final_written_(std::move(on_final_written)),
+      revalidate_(std::move(revalidate)),
+      session_alive_(std::move(session_alive)),
+      cfg_(cfg),
+      metrics_(metrics),
+      correlation_id_(std::move(correlation_id)),
+      execution_id_(std::move(execution_id)),
+      clock_(std::move(clock)),
+      grace_(RevalidateGrace::Config{cfg.revalidate_grace, cfg.revalidate_grace_jitter_max,
+                                     cfg.revalidate_max_staleness},
+             clock_) {
+    // The cap deadline is stamped at CONSTRUCTION, not on the first tick: the
+    // clock starts when the response is created, so a pump that never gets
+    // scheduled cannot silently extend its own budget.
+    deadline_ = (clock_ ? clock_() : std::chrono::steady_clock::now()) + cfg_.cap;
+}
+
+bool McpPostPump::finish(const WriteFn& write, McpStreamClose reason) {
+    count_stream_close(metrics_, reason);
+    // kCompleted EOFs after a real final: a close frame there would be a second,
+    // contradictory terminal on a stream that already answered. Same rule the GET
+    // pump applies, and the reason that arm was written before this producer
+    // existed.
+    if (reason != McpStreamClose::kCompleted) {
+        std::string extra;
+        try {
+            // The durable handle, so a client closed by cap/revocation/session
+            // death knows what to fetch. Values are escaped - make_stream_closed_
+            // frame takes a RAW fragment by contract.
+            if (!execution_id_.empty()) {
+                extra = R"(,"execution_id":)" + mcp::detail::json_quoted(execution_id_) +
+                        R"(,"partial":true)";
+            }
+            (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{
+                                       "message",
+                                       make_stream_closed_frame(reason, correlation_id_, extra)}));
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+            // A close frame we could not build is not worth terminating over; the
+            // response ends either way and the result stays durably fetchable.
+        }
+    }
+    return false;
+}
+
+bool McpPostPump::pump_once(const WriteFn& write) {
+    // HARD noexcept boundary - httplib runs providers on a bare ThreadPool task,
+    // outside its routing try/catch, so an escaped throw is std::terminate
+    // (#2037's class). Mirrors McpStreamPump::pump_once, including the nested
+    // guard: the handler itself allocates.
+    try {
+        return pump_once_impl(write);
+    } catch (...) {
+        try {
+            count_stream_close(metrics_, McpStreamClose::kInternalError);
+            spdlog::warn("MCP streamed-POST pump: tick failed, closing the response");
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+        return false;
+    }
+}
+
+bool McpPostPump::pump_once_impl(const WriteFn& write) {
+    {
+        std::unique_lock<std::mutex> lk(sink_->mu);
+        // The queue is NOT a source of frames here - the bridge is - but `closed`
+        // and the projector's poke both arrive through this mutex, so this is the
+        // wait. The timeout is also the backstop for a poke that raced the wait.
+        sink_->cv.wait_for(lk, cfg_.tick, [this] { return sink_->closed.load(); });
+        if (sink_->closed.load()) {
+            return finish(write, McpStreamClose::kCancelled);
+        }
+    }
+
+    if (revalidate_) {
+        switch (grace_.on_verdict(revalidate_())) {
+            case RevalidateGrace::Outcome::kCloseCredentialRevoked:
+                return finish(write, McpStreamClose::kCredentialRevoked);
+            case RevalidateGrace::Outcome::kCloseAuthUnavailable:
+                return finish(write, McpStreamClose::kAuthUnavailable);
+            case RevalidateGrace::Outcome::kContinue:
+                break;
+        }
+    }
+    // Also the TTL slide, exactly as on the GET channel.
+    if (session_alive_ && !session_alive_()) {
+        return finish(write, McpStreamClose::kSessionTerminated);
+    }
+
+    const auto now = clock_ ? clock_() : std::chrono::steady_clock::now();
+    const bool cap_expired = now >= deadline_;
+
+    // The cap is ARBITRATED BY THE BRIDGE, inside the projection claim: a terminal
+    // that latched in the same instant wins over an expired cap, because closing
+    // with kCapExpired while a real result sits latched would send the client
+    // polling for an answer the server is holding.
+    McpStreamBridge::PostBatch batch;
+    if (take_batch_) {
+        batch = take_batch_(cap_expired);
+    }
+
+    for (const auto& frame : batch.progress) {
+        if (!write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"message", frame}))) {
+            return finish(write, McpStreamClose::kClientGone);
+        }
+    }
+
+    if (batch.final_frame.has_value()) {
+        // The final goes LAST and is followed by EOF - the spec's
+        // progress-before-response ordering, which the 3a GET-after-response
+        // shape could not provide.
+        if (!write_all(write, sse_bus::format_sse(
+                                  sse_bus::SseEvent{"message", *batch.final_frame}))) {
+            return finish(write, McpStreamClose::kClientGone);
+        }
+        if (on_final_written_) {
+            on_final_written_();  // before the close, so the record settles kDone
+        }
+        return finish(write, McpStreamClose::kCompleted);
+    }
+
+    if (batch.cap_settled) {
+        // ONLY the bridge may declare this. A frame-build or write failure above
+        // returns kClientGone; stamping kCapExpired for those would poison the
+        // closed-reason taxonomy and tell the client to retry on a schedule that
+        // has nothing to do with what happened.
+        return finish(write, McpStreamClose::kCapExpired);
+    }
+
+    static constexpr std::string_view kHeartbeat = "event: heartbeat\ndata: \n\n";
+    if (!write_all(write, kHeartbeat)) {
+        return finish(write, McpStreamClose::kClientGone);
+    }
+    return true;
+}
+
 // ── GET tail ────────────────────────────────────────────────────────────────
 
 void handle_get_tail(const httplib::Request& req, httplib::Response& res,

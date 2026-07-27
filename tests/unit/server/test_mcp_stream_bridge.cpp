@@ -13,6 +13,7 @@
 #include "../../../server/core/src/mcp_jsonrpc.hpp"
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
+#include <yuzu/server/auth.hpp>  // CredentialCheck is only forward-declared by mcp_stream.hpp
 #include "../../../server/core/src/execution_tracker.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
 #include "../test_helpers.hpp"
@@ -1944,6 +1945,211 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
     }
 }
 
+// ── McpPostPump ──────────────────────────────────────────────────────────────
+//
+// The pump lives beside McpStreamPump in mcp_stream.cpp (it needs that file's
+// anonymous-namespace write_all / count_stream_close), but its tests live HERE
+// because every interesting case needs a real bridge behind take_post_batch.
+
+namespace {
+
+/// The GET pump's test wire, reused verbatim - both pumps share the WriteFn type.
+struct PostWire {
+    std::string out;
+    bool alive = true;
+    mcp::McpPostPump::WriteFn writer() {
+        return [this](const char* p, std::size_t n) {
+            if (!alive) {
+                return false;
+            }
+            out.append(p, n);
+            return true;
+        };
+    }
+    bool contains(std::string_view needle) const { return out.find(needle) != std::string::npos; }
+    std::size_t count(std::string_view needle) const {
+        std::size_t n = 0;
+        for (std::size_t i = out.find(needle); i != std::string::npos;
+             i = out.find(needle, i + needle.size())) {
+            ++n;
+        }
+        return n;
+    }
+};
+
+mcp::McpPostPump::Config fast_post_cfg() {
+    mcp::McpPostPump::Config cfg;
+    cfg.tick = std::chrono::milliseconds(10);  // never sleep a real tick in a unit test
+    return cfg;
+}
+
+}  // namespace
+
+TEST_CASE("McpPostPump: progress frames, then the final LAST, then EOF (C7)",
+          "[mcp][bridge][2f]") {
+    // The whole point of the rung: spec progress-before-response, which the 3a
+    // GET-after-response shape could not provide.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-pump"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    bool final_written = false;
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { final_written = fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(),
+        {}, nullptr, "cid-1", "exec-pump");
+
+    PostWire wire;
+    fx.bus.publish("exec-pump", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        pump.pump_once(wire.writer());
+        return wire.contains("notifications/progress");
+    }));
+
+    fx.bus.publish("exec-pump", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));  // final ends the response
+
+    CHECK(final_written);
+    const auto prog_at = wire.out.find("notifications/progress");
+    const auto final_at = wire.out.find(R"("result")");
+    REQUIRE(final_at != std::string::npos);
+    CHECK(prog_at < final_at);  // progress BEFORE the response
+    // A successful final EOFs; a close frame after it would be a contradictory
+    // second terminal on a stream that already answered.
+    CHECK_FALSE(wire.contains("notifications/yuzu.stream_closed"));
+}
+
+TEST_CASE("McpPostPump: the cap closes the response but never the execution (C7)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cap2"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    auto cfg = fast_post_cfg();
+    cfg.cap = std::chrono::milliseconds(0);  // already expired on the first tick
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {}, {}, {}, cfg,
+        {}, nullptr, "cid-2", "exec-cap2");
+
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(wire.contains("notifications/yuzu.stream_closed"));
+    CHECK(wire.contains("cap_expired"));
+    // Only the BRIDGE may declare a cap close, and it does so inside the
+    // projection claim. Let the pump decide it from its own expired deadline and
+    // this next case breaks: work that was already latched gets discarded by a
+    // close instead of delivered.
+    {
+        Fx fx2;
+        auto s2 = fx2.make_session();
+        REQUIRE(fx2.bridge->reserve(s2.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx2.bridge->subscribe(s2.id, json(1), "exec-cap3"));
+        REQUIRE(fx2.bridge->arm(s2.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        auto sink2 = std::make_shared<mcp::sse_bus::SseSinkState>();
+        auto key2 = fx2.bridge->bind_post_sink(s2.id, json(1), sink2);
+        REQUIRE(key2.has_value());
+        auto cfg2 = fast_post_cfg();
+        cfg2.cap = std::chrono::milliseconds(0);  // expired from the very first tick
+        mcp::McpPostPump pump2(
+            sink2, [&](bool cap) { return fx2.bridge->take_post_batch(*key2, cap); }, {}, {}, {},
+            cfg2, {}, nullptr, "cid-2b", "exec-cap3");
+        fx2.bus.publish("exec-cap3", "execution-progress", prog(1, 3));
+        PostWire wire2;
+        REQUIRE(poll_until([&] {
+            const bool open = pump2.pump_once(wire2.writer());
+            return wire2.contains("notifications/progress") && open;
+        }));
+        // Latched progress was DELIVERED despite the expired cap, and the
+        // response stayed open to do it.
+        CHECK_FALSE(wire2.contains("cap_expired"));
+    }
+    // The durable handle must ride the close frame - it is the whole recovery
+    // path for a client whose response was bounded out from under it.
+    CHECK(wire.contains("exec-cap2"));
+
+    // The execution is NOT cancelled: the record parks and its real terminal
+    // still reaches the ring for GET resume.
+    REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+    fx.bus.publish("exec-cap2", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+}
+
+TEST_CASE("McpPostPump: a dead peer closes as client_gone, never as cap_expired (C7)",
+          "[mcp][bridge][2f]") {
+    // A write failure must not masquerade as a cap close: that would poison the
+    // reason taxonomy and hand the client a retry schedule for something that
+    // never happened.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dead"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {}, {}, {},
+        fast_post_cfg(), {}, nullptr, "cid-3", "exec-dead");
+    PostWire wire;
+    wire.alive = false;  // the peer is gone; even the heartbeat fails
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK_FALSE(wire.contains("cap_expired"));
+}
+
+TEST_CASE("McpPostPump: revocation and session death close the response (C7)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-rev"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+    auto take = [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); };
+
+    SECTION("a revoked credential closes on the first tick") {
+        mcp::McpPostPump pump(
+            sink, take, {}, [] { return mcp::StreamRevalidate::kRevoked; }, {}, fast_post_cfg(),
+            {}, nullptr, "cid-4", "exec-rev");
+        PostWire wire;
+        CHECK_FALSE(pump.pump_once(wire.writer()));
+        CHECK(wire.contains("credential_revoked"));
+    }
+    SECTION("a dead session closes the response") {
+        mcp::McpPostPump pump(
+            sink, take, {}, std::function<mcp::StreamRevalidate()>{}, [] { return false; },
+            fast_post_cfg(), {}, nullptr, "cid-5", "exec-rev");
+        PostWire wire;
+        CHECK_FALSE(pump.pump_once(wire.writer()));
+        CHECK(wire.contains("session_terminated"));
+    }
+    SECTION("a closed sink ends the response as cancelled") {
+        sink->closed.store(true);
+        mcp::McpPostPump pump(sink, take, {}, {}, {}, fast_post_cfg(), {}, nullptr, "cid-6",
+                              "exec-rev");
+        PostWire wire;
+        CHECK_FALSE(pump.pump_once(wire.writer()));
+        CHECK(wire.contains("cancelled"));
+    }
+}
+
 TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
           "[mcp][bridge][2f]") {
     // The ring copy is the durable one (GET resume); the returned frames are the
@@ -2049,20 +2255,20 @@ TEST_CASE("bridge bind_post_sink - gates on kStreaming and hands off latched wor
         // publish path never notifies this sink - the projector is the ONLY thing
         // that can, and the record stays pump-owned meanwhile.
         //
-        // SCOPE OF THIS TEST, stated honestly: it proves the wake ARRIVES. It does
-        // NOT prove the lost-wakeup discipline inside poke_post_sink - dropping
-        // that sink-mutex acquisition leaves this green, verified by mutation,
-        // because the poke only reaches the sink after the bus listener, the
-        // projector wake and a thread switch, by which point this thread is
-        // already inside wait_for. That discipline is recorded as uncovered at
-        // its source rather than given a test that passes for the wrong reason.
-        std::unique_lock<std::mutex> lk(sink->mu);
+        // SCOPE OF THIS TEST, stated honestly: it proves the record stays
+        // PUMP-OWNED - the projector does not drain it behind the pump's back, and
+        // the work is there for take_post_batch to collect.
+        //
+        // It does NOT test the wake itself. An earlier version held the sink mutex
+        // across the publish to try to force the lost-wakeup window; that proved
+        // nothing (mutation showed removing poke_post_sink's sink-mutex
+        // acquisition left it green, because the poke only arrives after the bus
+        // listener, the projector wake and a thread switch) AND it inverted the
+        // lock order - the bus listener takes the record mutex, so holding the
+        // sink mutex across a publish builds sink->record against the projector's
+        // sanctioned record->sink, which TSan correctly flagged as a potential
+        // deadlock. The wake discipline is recorded as uncovered at its source.
         fx.bus.publish("exec-bind", "execution-progress", prog(1, 3));
-        const bool woken =
-            sink->cv.wait_for(lk, std::chrono::seconds(5)) == std::cv_status::no_timeout;
-        lk.unlock();
-        CHECK(woken);
-        // The work really was waiting for the pump, not drained behind its back.
         auto batch = poll_batch(*fx.bridge, *key);
         CHECK(batch.progress.size() == 1);
     }
