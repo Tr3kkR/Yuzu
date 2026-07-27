@@ -24,7 +24,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>  // std::find over the closed cancel-outcome label set
 #include <atomic>
+#include <set>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -2730,6 +2732,54 @@ TEST_CASE("CH-2: a parked streamed record survives a ring wrap - the pinned fina
         CHECK(s.stream->pinned_count() == 1);
         CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);
     }
+}
+
+TEST_CASE("CH-12: a duplicate cancel is a no-op - the detach is audited exactly once",
+          "[mcp][bridge][2f][chaos][ch12]") {
+    // The gap the re-review found: both cancel tests sent exactly ONE cancel, so
+    // they passed while a second cancel could close again and audit again. A
+    // retried notification is ordinary client behaviour - the interlock has to be
+    // the close TRANSITION, because the phase does not change until the pump's
+    // releaser parks the record, which is later than the duplicate arrives.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dup"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    // First cancel wins the transition.
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kDetached);
+    // Second arrives before the releaser has parked anything: same phase, same live
+    // sink, and it must NOT claim a detach it did not perform.
+    CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 1);
+}
+
+TEST_CASE("every CancelOutcome has a label, and every label is one the server pre-seeds",
+          "[mcp][bridge][2f]") {
+    // Both-or-neither, same shape as the kTeardownStageNames cross-check. `detached`
+    // shipped emitted-but-unseeded precisely because the label lived at the emit
+    // site and the seed list was hand-written somewhere else; this walks the enum so
+    // a new outcome cannot repeat that.
+    for (auto o : {Bridge::CancelOutcome::kAcceptedPending, Bridge::CancelOutcome::kDetached,
+                   Bridge::CancelOutcome::kNoOp}) {
+        const std::string label = Bridge::cancel_outcome_label(o);
+        CHECK_FALSE(label.empty());
+        CHECK(std::find(Bridge::kCancelOutcomeLabels.begin(),
+                        Bridge::kCancelOutcomeLabels.end(),
+                        label) != Bridge::kCancelOutcomeLabels.end());
+    }
+    // Distinct labels: two outcomes collapsing onto one string would silently make
+    // the metric unable to tell a real detach from a no-op.
+    std::set<std::string> uniq(Bridge::kCancelOutcomeLabels.begin(),
+                               Bridge::kCancelOutcomeLabels.end());
+    CHECK(uniq.size() == Bridge::kCancelOutcomeLabels.size());
 }
 
 TEST_CASE("CH-12: cancel mid-execution detaches the response but never the execution",

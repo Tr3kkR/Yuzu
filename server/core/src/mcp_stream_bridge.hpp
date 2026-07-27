@@ -48,12 +48,26 @@
 //                  a committed final - that pin outlives the record and is released
 //                  by resume-consumption (pin-ack) or session death.
 //
-// Cancel (C1 arbitration): request_cancel() only records PENDING intent - arm()
-// and abandon() are the sole terminal arbitrators, both under the record mutex.
-// arm() consuming the flag degrades streamed intent to kArmedGetOnly (subscription
-// retained, no pin, plain-JSON ack) and audits AFTER winning; abandon() discards
-// the pending flag silently (the request died pre-dispatch - its error path is
-// the truth). Cancel is never a phase winner on its own.
+// Cancel: what it does depends on whether a response already exists, and the two
+// halves are genuinely different mechanisms.
+//
+//   PRE-ARM (kArming, C1 arbitration): request_cancel() only records PENDING
+//   intent - arm() and abandon() are the sole arbitrators, both under the record
+//   mutex. arm() consuming the flag degrades streamed intent to kArmedGetOnly
+//   (subscription retained, no pin, plain-JSON ack) and audits AFTER winning;
+//   abandon() discards the pending flag silently (the request died pre-dispatch -
+//   its error path is the truth). Here cancel is never a phase winner on its own.
+//
+//   LIVE STREAM (kStreaming, 3b): nothing is left to arbitrate, so the cancel
+//   APPLIES immediately - it closes the bound post_sink and is audited at that
+//   site. Exactly-once comes from the close TRANSITION, not from the phase: the
+//   phase does not move until the pump's releaser parks the record, so a duplicate
+//   cancel arrives while the record still looks cancellable and is rejected by the
+//   sink's own false->true flip. See close_post_sink.
+//
+// NEITHER half touches the execution. Cancellation withdraws the client's interest
+// in a RESPONSE; the dispatched command keeps running and its result stays
+// fetchable by execution_id (Decision 15(j), chaos CH-12).
 //
 // Terminal durability (Decision 15(f)): a parked record's real final rides
 // publish_final (pinned, resume-replayable). publish_final()==0 → retry once with
@@ -271,9 +285,31 @@ public:
 
     enum class CancelOutcome {
         kAcceptedPending,  ///< pre-arm: recorded; arm()/abandon() arbitrate (C1 - no audit yet)
-        kDetached,         ///< 3b: a LIVE streamed response was closed now (audited here, once)
-        kNoOp,             ///< nothing cancellable: unknown, already cancelled, no live response
+        kDetached,         ///< 3b: a LIVE streamed response was closed BY THIS CALL (audited once)
+        kNoOp,             ///< nothing cancellable: unknown, duplicate, or no live response
     };
+
+    /// The CLOSED `yuzu_mcp_cancel_notifications_total{outcome}` label set, and the
+    /// one mapping from outcome to label. Declared together, next to the enum they
+    /// describe, for the same reason kDegradeReasons is: a hand-written seed list
+    /// somewhere else drifts the moment an outcome is added. It already did once -
+    /// the commit that introduced kDegradeReasons to stop exactly this drift added
+    /// `detached` to the emit site and to no seed list at all (adversarial
+    /// re-review, 2026-07-27). A new CancelOutcome must appear in BOTH of these,
+    /// and a test walks the enum to prove every label is seeded.
+    static constexpr std::array<const char*, 3> kCancelOutcomeLabels{"accepted", "detached",
+                                                                    "noop"};
+    [[nodiscard]] static constexpr const char* cancel_outcome_label(CancelOutcome o) noexcept {
+        switch (o) {
+        case CancelOutcome::kAcceptedPending:
+            return kCancelOutcomeLabels[0];
+        case CancelOutcome::kDetached:
+            return kCancelOutcomeLabels[1];
+        case CancelOutcome::kNoOp:
+            break;
+        }
+        return kCancelOutcomeLabels[2];
+    }
 
     /// C5 (#2409): the terminal frame a claimed pressure-teardown publishes.
     /// kNone = real final already pinned (or nothing to publish); kFallbackFinal =
@@ -739,10 +775,16 @@ private:
     /// mutex sits below it in the hierarchy. Contained - a missed poke costs one
     /// pump tick, never correctness.
     static void poke_post_sink(const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept;
-    /// Ends a streamed response: stores `closed` UNDER the sink mutex (same
+    /// Ends a streamed response: flips `closed` UNDER the sink mutex (same
     /// lost-wakeup discipline as poke_post_sink) and notifies. Callers hold the
     /// record mutex; the record-mu -> sink-mu nesting is the sanctioned direction.
-    static void close_post_sink(const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept;
+    ///
+    /// Returns TRUE only if THIS call performed the false->true transition. That
+    /// return value is what makes a caller's action exactly-once: a duplicate
+    /// close and an undeliverable one both answer false, so a caller can never
+    /// audit a detach that someone else did or that never happened.
+    [[nodiscard]] static bool close_post_sink(
+        const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept;
     /// Build the parked real final from the bus terminal payload + result_base (B5).
     static std::string build_real_final(const BridgeRecord& rec, const std::string& terminal_data);
     /// The ONE derivation of the minimal success-shaped fallback final ("terminal

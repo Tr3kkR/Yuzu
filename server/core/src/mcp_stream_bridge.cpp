@@ -549,10 +549,28 @@ McpStreamBridge::CancelOutcome McpStreamBridge::request_cancel(const std::string
             // Cancelling the work here would let a client believe it had stopped a
             // fleet-wide change it had not.
             if (!rec->post_sink) {
-                return CancelOutcome::kNoOp;  // already closed, or never bound
+                return CancelOutcome::kNoOp;  // never bound, or already parked
             }
-            close_post_sink(rec->post_sink);
+            // COPIED BEFORE THE MUTATION, deliberately: this is the only allocation
+            // on the path, and doing it after the close would let a bad_alloc
+            // propagate out of a cancel that had ALREADY ended the response - the
+            // caller catches, reports kNoOp, and a cancel that genuinely took effect
+            // goes unaudited and uncounted. Same discipline as arm(), which
+            // prebuilds its fallback before the flip.
             exec_id = rec->execution_id;
+            // The close TRANSITION is the interlock, not the phase. `post_sink` is
+            // not cleared until on_post_closed_keyed, which runs later from the
+            // pump's releaser, so two cancels arriving before that BOTH see
+            // kStreaming with a live sink - a retried notification is ordinary
+            // client behaviour, not a race anyone has to engineer. Only the caller
+            // that actually flipped `closed` may claim the detach; a duplicate is
+            // kNoOp, which is also the honest answer once there is no live response
+            // left to detach. A close that could not be delivered returns false
+            // too, so the audit below can never assert something that did not
+            // happen.
+            if (!close_post_sink(rec->post_sink)) {
+                return CancelOutcome::kNoOp;
+            }
         } else if (ph == Phase::kArming && !rec->cancel_pending) {
             // Pre-arm: intent ONLY - no audit, no transition (C1). A later
             // pre-dispatch failure (abandon) invalidates the cancel/degrade
@@ -573,10 +591,10 @@ McpStreamBridge::CancelOutcome McpStreamBridge::request_cancel(const std::string
     return CancelOutcome::kDetached;
 }
 
-void McpStreamBridge::close_post_sink(
+bool McpStreamBridge::close_post_sink(
     const std::shared_ptr<sse_bus::SseSinkState>& sink) noexcept {
     if (!sink) {
-        return;
+        return false;
     }
     try {
         // `closed` is stored UNDER the sink mutex rather than as a bare atomic
@@ -589,16 +607,23 @@ void McpStreamBridge::close_post_sink(
         // Callers hold the record mutex, which the declared hierarchy places ABOVE
         // this one (BridgeRecord::mu -> McpStreamState::mu_ -> SseSinkState::mu),
         // so this nesting is the sanctioned direction.
+        bool was_open = false;
         {
             std::lock_guard<std::mutex> lk(sink->mu);
-            sink->closed.store(true, std::memory_order_release);
+            // exchange, not store: the RETURN VALUE is what makes the caller's
+            // action exactly-once. Under the mutex so it cannot interleave with
+            // the pump's predicate evaluation.
+            was_open = !sink->closed.exchange(true, std::memory_order_acq_rel);
         }
         sink->cv.notify_all();
+        return was_open;
     } catch (...) { // NOLINT(bugprone-empty-catch)
         // A cancel we could not deliver is not worth propagating out of a noexcept
         // seam on a request thread: the response still ends at its cap, and the
-        // execution was never at risk either way.
+        // execution was never at risk either way. Reported as "not closed by me"
+        // so the caller cannot audit a detach that did not occur.
     }
+    return false;
 }
 
 bool McpStreamBridge::abandon(const std::string& session_id, const nlohmann::json& jsonrpc_id) {
