@@ -1430,10 +1430,10 @@ TEST_CASE("McpStreamState: a sink-enqueue failure keeps the committed frame and 
     // empty-queue drop is reported as events-dropped, and the ring still replays the
     // frame), NOT the notify-driven wakeup timing. The deterministic condvar handoff
     // (bump under the sink mutex; predicate includes dropped_total) is verified by
-    // cpp-safety inspection, not here. A genuine two-thread handshake test that parks the
-    // pump in wait_for first, then faults+publishes, and asserts prompt emission without a
-    // wall-clock bound is the correct exercise — filed as a track-2f PR-3 follow-up, where
-    // a real producer makes the sub-tick latency reachable.
+    // cpp-safety inspection, not here. The genuine two-thread handshake this comment
+    // once deferred to "a track-2f PR-3 follow-up" now EXISTS — the #2382 test at the
+    // end of this file parks a pump in wait_for, then faults and publishes, and asserts
+    // prompt emission with no wall-clock bound.
     mcp::McpStreamPump pump{attached.sink, state, attached.generation,
                             [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
                             fast_cfg()};

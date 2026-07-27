@@ -178,7 +178,10 @@ PR 2 gave the channel heartbeats and replayed frames; **PR 3a shipped its first 
 
 **Shipped.** When a `tools/call` for `execute_instruction` carries `_meta.progressToken`, the server correlates that request to its execution and projects `ExecutionEventBus` events onto the session's **GET** channel as `notifications/progress` (`progress`/`total` = agents responded / agents targeted), followed by the terminal result.
 
-**Interim lifecycle shape (the GET-only rung).** In this rung the progress frames are delivered on the GET channel *after* the `tools/call` JSON-RPC response has already retired the request. A strict reading of the MCP progress lifecycle expects progress *before/during* an in-flight request, so this is a deliberate, recorded deviation: it is authorized in the A5 exception ledger (`docs/agentic-first-principle.md`, issue #2439) and is closed by the 2f **3b** streamed-POST rung, which delivers progress before the response. Stock SDK clients *drop* (they do not reject) frames for a token whose request has already retired, so the documented fallback is to poll by `execution_id`.
+**Lifecycle shape — two, and the client chooses.**
+
+- **Streamed POST** (2f PR 3b, "Streamed POST" below). Send an SSE-capable `Accept` alongside the `progressToken` and the POST response *is* the progress channel: frames arrive before the result, which is the ordering the MCP progress lifecycle expects. **This closes the deviation** recorded against #2439 in the A5 exception ledger (`docs/agentic-first-principle.md`).
+- **GET channel** (the 3a shape, still fully supported). Without an SSE `Accept` the frames are delivered on the session's GET channel *after* the `tools/call` response has retired the request. Stock SDK clients *drop* (they do not reject) frames for a retired token, so the fallback there is to poll by `execution_id`. This stays the right shape for a client that keeps one GET channel open and would rather not hold a POST open per call.
 
 **Degradation is silent and safe.** If the bridge cannot correlate a request (capacity, unknown session, allocation failure), the call falls back to the plain response - which is self-sufficient, carrying `execution_id` - and counts `yuzu_mcp_bridge_degrade_total{reason}`. Live progress is an enhancement, never a dependency.
 
@@ -186,7 +189,68 @@ PR 2 gave the channel heartbeats and replayed frames; **PR 3a shipped its first 
 
 **Terminal durability.** A terminal frame is pinned in the replay ring so a reconnecting client can still receive it; the `publish_final -> fallback -> poison` ladder (Decision 15(f)), with `yuzu_mcp_stream_terminal_publish_failures_total` and `yuzu_mcp_stream_final_unpinned_total`, makes any failure to do so visible rather than silent. The exemption covers the **most recent** pinned terminals up to the per-session slot count, not an unbounded set. Exhausting the slots means admission accounting has drifted — the bridge admits streamed records against the same count the array is sized to — and in that degraded state the oldest pin yields to the newest, since the newest is the terminal a client is likeliest still waiting to resume. That is reported by `yuzu_mcp_stream_pin_displaced_total` (alertable on `> 0`); a displaced terminal is still committed and delivered, it merely becomes evictable. Results always remain durably fetchable by `execution_id`.
 
+## Streamed POST — SSE on the response (2f PR 3b)
+
+**Shipped.** A `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and** an SSE-capable `Accept` gets its POST response held open as an SSE stream: `notifications/progress` frames as the work happens, the JSON-RPC result **last**, then EOF. This is the spec's progress-before-response ordering.
+
+### Opting in
+
+| Client sends | Server answers |
+|---|---|
+| `_meta.progressToken` + `Accept: text/event-stream` | SSE stream on the POST response |
+| `_meta.progressToken`, no SSE `Accept` | plain JSON now, progress on the GET channel |
+| SSE `Accept`, no `_meta.progressToken` | plain JSON (the token is the real opt-in) |
+| neither | plain JSON — byte-identical to pre-2f |
+
+`Accept: text/event-stream;q=0` **opts in**. RFC 9110 reads `q=0` as "not acceptable", and this is a deliberate deviation: a client that sends a `progressToken` and then disclaims the media type is contradicting itself, and honouring the token is the useful reading. The token, not the header, is the gate.
+
+### Response shape
+
+Headers are `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `X-Content-Type-Options: nosniff`, and `X-Correlation-Id`. Frames are JSON-RPC objects under the default `message` event type. Progress frames are strictly increasing (see Monotonicity above). The stream ends one of two ways:
+
+- **A result frame, then EOF.** The normal case. No close frame follows it — that would be a second, contradictory terminal on a stream that already answered.
+- **A `notifications/yuzu.stream_closed` frame, then EOF.** Everything else. It carries a `reason`, the `execution_id`, and `partial: true`.
+
+### Close reasons, and what a client should do
+
+| `reason` | Meaning | Client action |
+|---|---|---|
+| `completed` | result delivered | nothing — you have the answer |
+| `cap_expired` | the response's time budget elapsed; **the execution continues** | fetch by `execution_id` |
+| `cancelled` | your `notifications/cancelled` detached the response; **the execution continues** | fetch by `execution_id` if you still want it |
+| `session_terminated` | the session ended | re-`initialize` |
+| `credential_revoked` | your credential stopped being valid | re-authenticate |
+| `auth_unavailable` | the auth backend could not answer within the grace window | retry |
+| `internal_error` | a server-side fault ended the response | fetch by `execution_id` |
+| `client_gone` | the peer went away (recorded server-side; you will not see this frame) | n/a |
+
+**The invariant behind half that table: closing a response never cancels work.** A dispatched command keeps running on real agents, and its result stays durably fetchable by `execution_id` (`get_execution_status`, `query_responses`). `notifications/cancelled` detaches *your stream*, not the fleet change you asked for.
+
+### Admission and refusals
+
+A streamed POST holds an HTTP worker open for its lifetime, so it leases from the same budget as the GET channel (ADR-1005 Decision 15(h)) and is capped per principal. Refusals are answered, not degraded — a client that asked for a stream is told it is not getting one:
+
+| Condition | Status | JSON-RPC error | Retry? |
+|---|---|---|---|
+| per-principal or global stream cap | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` |
+| this session's streamed-call cap | 429 | `-32012` | yes, once one finishes |
+| request id already in flight | 409 | `-32600` | no — use a fresh id |
+| session unknown or expired | 404 | `-32007` | re-`initialize` |
+| streaming disabled / shutting down | 200 | — | none needed; you get the plain response |
+| server could not allocate | 200 | — | none needed; you get the plain response |
+
+The last two **degrade** rather than fail: the plain response is self-sufficient (it carries `execution_id`), so answering it beats advising a retry into a resource failure. Every refusal happens before the execution row is created, so a rejected call has dispatched nothing.
+
+### Resuming, and the one case you cannot resume
+
+Streamed frames are also committed to the session's replay ring, so a dropped connection can resume on the GET channel with `Last-Event-ID`. The result frame is **pinned**: ring eviction skips it, so a client that reconnects after a long gap still collects its answer.
+
+If the ring has moved past your cursor, the server answers `kGap` rather than replaying a shortened history — a silently-short replay would leave you believing you had the lot. **Recovery from a gap is re-`initialize` plus fetch-by-`execution_id`**, not a retry of the original call: re-issuing a mutating `tools/call` would run it twice.
+
+### Metrics
+
+`yuzu_mcp_post_streams_active` (held-open streamed responses — a separate series from the GET gauge, because the two have different lifetimes), `yuzu_mcp_stream_rejects_total{reason="post_*"}` for admission denials, `yuzu_mcp_cancel_notifications_total{outcome}`, and the bridge families listed above. Alerting posture for each is in `docs/user-manual/metrics.md`.
+
 ## Phase 3 (Planned)
 
 - Cross-surface / durable approval-ticket state (today the ticket lives in the shared `ApprovalManager` store, which is durable, but the MCP recall is stateless — no per-worker session).
-- **MCP Streamable HTTP — SSE-on-POST** (track 2f PR 3b): stream `notifications/progress` on the POST response itself, restoring the spec's progress-before-response ordering and closing the interim deviation described above. Same ADR-1005 Decision 15 / track 2f ladder; chaos merge-gate map: `docs/mcp-streamable-http-chaos-design.md`.

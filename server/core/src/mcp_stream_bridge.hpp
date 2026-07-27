@@ -9,13 +9,14 @@
 // revalidation, or wire writes (those live in McpPostPump, PR 3b). In-memory,
 // non-durable, no new store.
 //
-// GET-only mode is LIVE (rung 3a.7 wires reserve/subscribe/arm(kGetOnly) into
-// execute_instruction in mcp_server.cpp + construction in server.cpp). The
-// STREAMED-POST surface is still dead: on_post_closed / park_after_dispatch_
-// failure / request_cancel / ArmMode::kStreaming and therefore the whole
-// kRingOnly lifecycle (parked finals, the pressure hatch) have no production
-// caller until the 3b pump lands - deliberately, the same zero-producer staging
-// as publish_final (3a.4).
+// BOTH modes are LIVE. execute_instruction picks between them per request: a
+// `_meta.progressToken` alone arms kGetOnly (progress on the session's GET
+// channel, 3a.7), and a progressToken WITH an SSE-capable Accept arms kStreaming
+// and holds the POST response open as the progress channel (3b C8). Every seam
+// this header once listed as deliberately dead - on_post_closed /
+// park_after_dispatch_failure / request_cancel / ArmMode::kStreaming, and with
+// them the kRingOnly lifecycle of parked finals and the pressure hatch - now has
+// a production caller.
 //
 // ── Record lifecycle ────────────────────────────────────────────────────────
 //
