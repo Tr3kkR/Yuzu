@@ -89,6 +89,51 @@ inline std::string json_escape(std::string_view in) {
     return out;
 }
 
+/// Render an agent's `error|...` reply as display text: the FIRST record only,
+/// prefix stripped, bounded, and never split mid-codepoint.
+///
+/// Agent replies are newline-separated records, so a byte-count truncation of
+/// the RAW output is wrong in both directions. Too small and it cuts the
+/// operator's recovery instruction mid-sentence; too large and it runs past the
+/// newline and renders the head of the NEXT record as debris -- `tar status`'s
+/// offline reply is `error|...` followed by `storage_state|offline`, and a
+/// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
+/// the property that holds whatever the message length becomes.
+///
+/// `max_bytes` is a display bound, so it is walked back off a UTF-8
+/// continuation byte rather than splitting the sequence.
+inline std::string agent_error_display(const std::string& output, std::size_t max_bytes = 400) {
+    static constexpr std::string_view kPrefix = "error|";
+    std::string_view v{output};
+    if (v.starts_with(kPrefix))
+        v.remove_prefix(kPrefix.size());
+    // FIRST non-empty record. A leading newline (or a reply whose first record
+    // is blank) would otherwise render as an empty message -- a regression
+    // against the byte window this replaced, which at least showed the detail.
+    while (!v.empty() && (v.front() == '\n' || v.front() == '\r'))
+        v.remove_prefix(1);
+    v = v.substr(0, v.find('\n')); // npos-safe
+    while (!v.empty() && v.back() == '\r') // CRLF replies
+        v.remove_suffix(1);
+
+    if (v.size() > max_bytes) {
+        std::size_t cut = max_bytes;
+        // 10xxxxxx is a UTF-8 continuation byte; step back to its lead byte.
+        // Bounded to 3 steps: a longer run means the input was already malformed,
+        // and walking to 0 would erase the whole message rather than truncate it.
+        std::size_t steps = 0;
+        while (cut > 0 && steps < 3 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80) {
+            --cut;
+            ++steps;
+        }
+        if (steps == 3 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80)
+            cut = max_bytes; // not a real sequence; cut where asked
+        v = v.substr(0, cut);
+    }
+    // Only now materialise, so a multi-megabyte reply is not copied whole.
+    return std::string{v};
+}
+
 /// Escape HTML special characters for safe rendering.
 inline std::string html_escape(const std::string& s) {
     std::string out;

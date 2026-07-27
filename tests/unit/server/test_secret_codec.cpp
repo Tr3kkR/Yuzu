@@ -8,6 +8,7 @@
 
 #include "key_provider.hpp"
 #include "pg/pg_raii.hpp"
+#include "kek_op_lock.hpp"
 #include "pg/secret_codec.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -880,4 +881,111 @@ TEST_CASE("SecretCodec: retire with failed key deletion records no false destruc
 // TODO(S11): exercise the GcmResult::error → FailureClass::crypto_failure
 // decrypt path; needs an OpenSSL/EVP fault-injection seam (not yet available).
 
+// #2395 track D: the KEK rotation REST/MCP seam's HalfCommitted detection
+// (server.cpp kek_ops.rotate) compares active_kek_version() before vs. after
+// one rotate_kek() call and classifies `after > before` as HalfCommitted vs.
+// Internal. That heuristic is only trustworthy if a single successful
+// rotate_kek() call ALWAYS advances the active version by exactly one — never
+// zero (a caller could then misdiagnose a successful rotate as a failure) and
+// never more than one (a caller could then miss an intermediate version and
+// under-count how far rotation actually progressed). No existing case called
+// rotate_kek() more than once in a row to pin this.
+TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per successful "
+          "rotate_kek call (the REST/MCP seam's half-committed detection depends on this)",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    upsert_secret(conn.get(), 42, *codec.encrypt(test_id(42), bytes_of("seed")));
+    REQUIRE(codec.active_kek_version() == 1);
+
+    for (std::uint32_t expected = 2; expected <= 4; ++expected) {
+        const std::uint32_t before = codec.active_kek_version();
+        auto rotated = codec.rotate_kek(conn.get());
+        INFO((rotated ? std::string{} : rotated.error()));
+        REQUIRE(rotated.has_value());
+        const std::uint32_t after = codec.active_kek_version();
+        REQUIRE(*rotated == expected);
+        REQUIRE(after == expected);
+        REQUIRE(after == before + 1); // exactly one, never zero, never more than one
+    }
+
+    // Every row landed on the final version — rotate_kek's internal
+    // rewrap_all() left nothing on a superseded version after any of the
+    // three rotations above.
+    auto oldest = codec.oldest_kek_version_in_use(conn.get());
+    REQUIRE(oldest.has_value());
+    REQUIRE(*oldest == 4);
+}
+
 #endif // YUZU_TEST_ENABLE_PG
+
+// ── The KEK-operation advisory lock (#2395, gov cpp-safety BLOCKING) ────────
+//
+// This is the highest-consequence resource in the KEK surface and had ZERO
+// coverage: the REST/MCP tests stub the seam entirely, so nothing ever took a
+// real lease or ran the guard's destructor. A leaked session-scoped advisory
+// lock wedges every future KEK operation cluster-wide, and because session
+// locks are RE-ENTRANT per backend the wedge is asymmetric — the connection
+// that leaked it keeps working while every other one 409s. These tests use two
+// REAL connections so the mutual exclusion and the release are both observed.
+
+TEST_CASE("KEK op lock: mutual exclusion across two connections, released by the guard",
+          "[pg][secrets][kek]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    PgConn a = connect(db.dsn());
+    PgConn b = connect(db.dsn());
+
+    using yuzu::server::detail::KekOpLockAttempt;
+    using yuzu::server::detail::KekOpLockGuard;
+    using yuzu::server::detail::try_lock_kek_op;
+
+    {
+        REQUIRE(try_lock_kek_op(a.get()) == KekOpLockAttempt::kAcquired);
+        KekOpLockGuard guard_a{a.get()};
+
+        // A different SESSION must be excluded — this is the whole point of
+        // using a session advisory lock rather than a per-process mutex.
+        CHECK(try_lock_kek_op(b.get()) == KekOpLockAttempt::kConflict);
+    } // guard_a releases here
+
+    // Once released, the other connection can take it.
+    REQUIRE(try_lock_kek_op(b.get()) == KekOpLockAttempt::kAcquired);
+    KekOpLockGuard guard_b{b.get()};
+    CHECK(try_lock_kek_op(a.get()) == KekOpLockAttempt::kConflict);
+}
+
+TEST_CASE("KEK op lock: the guard leaves nothing held on the connection it released",
+          "[pg][secrets][kek]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    PgConn a = connect(db.dsn());
+    PgConn observer = connect(db.dsn());
+
+    using yuzu::server::detail::KekOpLockAttempt;
+    using yuzu::server::detail::KekOpLockGuard;
+    using yuzu::server::detail::try_lock_kek_op;
+
+    {
+        REQUIRE(try_lock_kek_op(a.get()) == KekOpLockAttempt::kAcquired);
+        KekOpLockGuard guard{a.get()};
+    }
+
+    // Nothing left behind in pg_locks for this key. Checked from a THIRD
+    // session so a re-entrant re-acquire on `a` cannot mask a leak — that
+    // masking is exactly the UP-1 failure mode.
+    PgResult held{PQexec(observer.get(),
+                         "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                         "AND classid = 2037545589")};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(held.get(), 0, 0)) == "0");
+
+    // And the lock is genuinely free for anyone.
+    CHECK(try_lock_kek_op(observer.get()) == KekOpLockAttempt::kAcquired);
+    KekOpLockGuard cleanup{observer.get()};
+}

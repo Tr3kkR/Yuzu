@@ -18,6 +18,22 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
+
+Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
+
+**What to do:** if you have a SIEM rule, dashboard or evidence query that treats `result` on this verb family as a constant `success` - for example "alert if any `mcp.bridge.*` row is not `success`" - update it before upgrading, or it will fire on legitimate rows. Note also that `failure` here is *self-audited*: a rule that surfaces failure branches by filtering on `denied` will not see these. Filter on `result != "success"` where you need both. `mcp.bridge.cancel` is unaffected and remains `success`.
+
+These rows are background-actor events (`principal=system`), not operator actions, and a `failure` row does **not** mean a client lost a result - executions stay durably fetchable by `execution_id`. See [`audit-log.md`](audit-log.md) for the verb family and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md) for what to do when the paired alert fires.
+
+## Behaviour change: an MCP maintenance failure degrades instead of aborting the server (#2487)
+
+A transient failure in the MCP progress-bridge sweep or the MCP session collector, which runs on the server's maintenance thread, previously escaped that thread and terminated the whole process. It is now contained: the tick is skipped and retried on the next cycle.
+
+**What to do:** be aware this is a genuine trade, not a pure win. The old failure was self-announcing - the process died, your supervisor restarted it, and uptime monitoring saw it. The new one is silent unless you are scraping metrics: a sustained failure means bridge teardown or session collection stops running, live MCP progress can degrade for the remaining life of the process, and `/readyz` will continue to report healthy throughout (MCP session state deliberately does not gate readiness). If you run Prometheus, scrape `yuzu_mcp_bridge_teardown_incomplete_total`, `yuzu_mcp_maintenance_tick_failures_total` and `yuzu_mcp_bridge_records_active`, and load the bundled rules in `docs/prometheus/yuzu-alerts.yml` - they are not applied automatically. If you do not, you will not see this condition at all.
+
+Note this narrows the crash surface rather than closing it: other work on the same maintenance thread remains unguarded, so a sufficiently severe resource exhaustion can still terminate the process from a different call site.
+
 ## Behaviour change: `yuzu-agent` no longer restart-loops forever (ADR-0021 rung 7.7a)
 
 The `yuzu-agent` systemd unit now sets `StartLimitIntervalSec=300` + `StartLimitBurst=5` in its `[Unit]` section. Previously the unit was `Restart=always` with no start limit, so an agent that could not stay up restarted every 10 seconds indefinitely. With this change, if the agent exits 5 times within 300 seconds systemd stops retrying and the unit enters `failed`.
@@ -162,11 +178,11 @@ nothing happened.
 - **Single-admin deployments:** there is no self-service unlock for the *only*
   admin (the unlock endpoint requires a second privileged principal), so either
   wait out the window or use the offline recovery procedure in
-  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. **Note:**
-  since the AuthDB → Postgres migration (see "⚠️ Breaking: local accounts + MFA
-  enrolments reset" below), that runbook's SQL-surgery steps are SQLite-era and
-  do not apply — for a PG-backed deployment there is no offline SQL fallback
-  for the sole-admin case today; wait out the window.
+  `docs/ops-runbooks/auth-db-recovery.md` § Account lockout recovery. That
+  runbook is now Postgres-native throughout: its fallback clears
+  `failed_login_count` / `locked_until` with `psql "$YUZU_POSTGRES_DSN"`
+  against `auth.users`, which is exactly the sole-admin case. It writes no
+  audit row, so record it in your change-management system.
 
 ## Behaviour change: operator/API tags now beat agent self-report (#1411)
 
@@ -299,14 +315,17 @@ collision check above). At boot, the server now scans for any pre-existing
 it finds one — silently coexisting with (or being shadowed by) a real engine
 principal is not an acceptable outcome, so this fails closed rather than
 booting into an ambiguous state (decision log #3). Before upgrading, run
-against your `auth.db` and `rbac.db`:
+against both stores. Note they live on different substrates: local users are in
+Postgres (`auth.users`), while local RBAC groups are still SQLite (`rbac.db`):
 
-```sql
--- auth.db
-SELECT username FROM users WHERE username LIKE 'engine:%';
+```bash
+# Local users — Postgres.
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username FROM auth.users WHERE username LIKE 'engine:%';"
 
--- rbac.db
-SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';
+# Local RBAC groups — SQLite, per-node. Run on every node.
+sqlite3 /var/lib/yuzu/rbac.db \
+  "SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';"
 ```
 
 If either query returns rows, rename or remove those users/groups **before**
@@ -360,9 +379,8 @@ second factor for an external identity, so **before enabling
 claim containing a recognized MFA method** (Entra: `mfa`; others:
 `otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
 unable to reach high-risk endpoints — recoverable by restarting in
-`optional` (see `docs/ops-runbooks/auth-db-recovery.md`; note that runbook's
-file-based SQL steps are SQLite-era and superseded post-AuthDB→Postgres
-migration — the restart-with-`optional` procedure itself is unaffected).
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md` § "Locked out by MFA
+enforcement misconfiguration"; that runbook is now Postgres-native throughout).
 Under `optional`, no IdP `amr` configuration is required (SSO sessions pass
 the gate).
 
@@ -375,9 +393,9 @@ the token expires, restart with `optional`, log in, enroll, then re-enable.
 **Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
 admin can't enroll): restart the server with `--mfa-enforcement=optional`
 (this re-seeds the in-memory config), log in, resolve enrollment, then
-re-enable. See `docs/ops-runbooks/auth-db-recovery.md` (SQLite-era; the
-restart procedure above works unchanged post-AuthDB→Postgres migration, but
-that runbook's SQL-surgery steps do not apply to a Postgres-backed AuthDB).
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md` — that runbook is now
+Postgres-native throughout, so both the restart procedure above and its SQL
+steps apply as written to a Postgres-backed AuthDB.
 
 ## Hardened auth mode (`--auth-mode=sso-only`) — opt-in (SOC 2 CC6.3/CC6.6)
 
@@ -408,8 +426,8 @@ the **Postgres** auth store, so `--postgres-dsn` (or `YUZU_POSTGRES_DSN`) is
 **required** — point it at the same database the server uses; without it the
 command fails closed with "requires the Postgres auth store" and does nothing.
 `--data-dir` is still needed for the audit record. Full runbook:
-`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (its SQL-surgery
-sections elsewhere are SQLite-era and superseded — see its banner).
+`docs/ops-runbooks/auth-db-recovery.md` § Break-glass arm (that runbook is now
+Postgres-native throughout).
 
 **Migration.** `break_glass_armed_until` is a nullable column on `auth.users`.
 It arrived as SQLite `auth.db` migration v4, but the AuthDB→Postgres cutover
@@ -510,9 +528,9 @@ and does not re-invalidate already-reissued tokens).
 See `docs/auth-architecture.md` § "AuthDB — persistent authentication store"
 for the full design rationale, and
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md)
-for lockout/break-glass recovery — note that runbook predates this cutover
-and its file-based SQL steps do not apply to the Postgres-backed store; see
-its banner.
+for lockout/break-glass recovery — that runbook has been rewritten for this
+cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
+the `auth` schema).
 
 ## Upgrade Order
 
@@ -798,6 +816,39 @@ How it works:
 - Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.
 - Multiple stores share one database connection but keep independent version counters.
 
+**Indexes are normally migration entries. `audit_store`'s retention index is a
+deliberate, single exception** (`idx_audit_ttl_id`, #2360) - every other index in
+the server is created inside `MigrationRunner`, and new code should follow that
+rule, not this one. Two conditions justify the exception here and both must hold
+before it is copied: (a) a failed migration closes the store, and for
+`audit_store` that means every audit write then fails, taking the SOC 2 trail
+offline; and (b) the build is `O(N log N)` over an existing multi-million-row
+table, unlike the v1 indexes which are created on an empty one. A best-effort
+object may silently not exist, so nothing with a CORRECTNESS dependency may use
+this path - the retention guard is correct without its index, only slower.
+
+Cost on a large existing `audit_events`: a one-time build at first boot after
+upgrade, measured at ~81 MB and ~1.8-3.3 s at 5M rows on NVMe. At 50M rows the
+build reads a ~16 GB table - tens of seconds on local NVMe, and potentially
+minutes on container overlayfs or network storage.
+
+**This runs synchronously, before the server binds its listeners**, so nothing
+answers `/livez` or `/readyz` until it finishes. If your orchestrator's
+kill-before-ready budget is shorter than the build you get a CRASH LOOP rather
+than a slow boot: `CREATE INDEX` is one atomic statement, so every killed attempt
+rolls back and the next boot re-pays it in full, indefinitely. Budget at least
+**5 minutes** before the first liveness kill for an `audit_events` above ~20M
+rows on non-NVMe storage. The shipped
+`deploy/docker/docker-compose.reference.yml` sets `start_period: 30s`, which is
+fine for a fresh install and NOT enough for a large first post-upgrade boot -
+raise it before upgrading such a deployment. The
+elapsed time is logged when it exceeds a second, and subsequent boots are a
+no-op. If the build fails, retention still runs, but each pass then scans the
+table AND sorts the whole expired backlog for its `ORDER BY ... LIMIT` (measured
+2.0 s versus ~285-315 ms for the same capped pass WITH the index; the range
+reflects different benchmark runs, not two different operations) - still far better than the unguarded code it
+replaced, but the failure is logged as an error.
+
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 
 **No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:
@@ -828,6 +879,65 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse)
+
+Both retention paths used to issue an unbounded `DELETE` driven by the local wall
+clock, so one forward clock step could wipe a store in a single statement. They
+are now guarded and capped. Two operator-visible consequences on upgrade:
+
+- **Audit retention is now a floor, not a ceiling.** A pass that would expire
+  every datable row declines once, and every accepted pass is capped at 25,000
+  rows, so a large backlog ages out over hours rather than in one statement.
+  Watch `yuzu_server_audit_retention_cap_reached_total` alongside
+  `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
+  That cap is a fixed drain rate, which implies a sustained ceiling of roughly
+  6.9 audit events/second - compare it against your own event rate before
+  deploying at scale. Note that changing `--audit-retention-days` never re-dates
+  existing rows (`ttl_expires_at` is stamped at INSERT), so a reduction does not
+  reclaim disk retroactively. Operator triage when the guard declines a pass:
+  [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
+- **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
+  table holding the durable clock reading - one row, instant) plus the
+  best-effort index build described under Schema Migrations above.
+- **Expect a first-pass retention decline on the AGENT, and only conditionally on
+  the server.** The two guards differ here and the difference matters:
+  - **TAR declines on a missing anchor, by design.** It checks per warehouse
+    table, so on an agent upgrade every enabled time-based table declines in that
+    same pass and `retention_guard_declines_total` rises by the number of those
+    tables (5-10 on a default agent), not by 1. That is the benign bootstrap
+    case, not a fleet of separate anomalies, and it needs no action.
+  - **The audit store's triggers are NOT the same**, so do not carry the agent's
+    expectation across to it and do not pre-emptively stand down
+    `YuzuAuditRetentionClockAnomaly` on a fleet upgrade. If one fires, work it as
+    an alert rather than assuming a benign bootstrap:
+    [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard)
+    states when the server's guard declines, and
+    [the ops runbook](../ops-runbooks/audit-store-clock-guard.md) is the response
+    path.
+- **Agents surface new `tar status` lines**: `storage_state`,
+  `retention_guard_declines_total`, `retention_guard_failures_total`, and
+  per-table detail. On the healthy path `storage_state|ok` is the first line,
+  and existing consumers filter on the `config|` prefix and ignore unknown
+  lines, so nothing breaks. **On the offline path they do break**: when the TAR
+  database has been closed after a wedged rollback, `tar status` returns
+  non-zero and emits only an `error|` line followed by `storage_state|offline` -
+  no `record_count`, no `config|` lines at all. Note the order is REVERSED
+  there: `error|` comes first, because server and dashboard consumers key off
+  the output starting with `error|`. A consumer keyed on the presence of
+  `record_count` must handle that. See
+  [tar.md](tar.md#the-retention-clock-guard). TAR persists its own clock reading
+  in `tar_config` (`retention_guard_last_pass`) - no schema change.
+- **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
+  but a large excess (after a long disable, or an upgrade backlog) drains over
+  several 900 s rollup ticks rather than in one statement.
+
+Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
+declined-pass and failed-pass counters must be alerted on separately: both leave
+rows undeleted, so an audit table that never shrinks looks identical either way.
+One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
+state in which none of the other counter-driven rules can fire, because they all
+key on a counter rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 
