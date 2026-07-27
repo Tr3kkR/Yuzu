@@ -9272,10 +9272,14 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         CHECK(audit_has("mcp.stream.attach|success"));
         // The attach row names the surface, so a GET attach and a POST attach are
         // distinguishable in the audit log rather than both reading "a stream".
+        // ONE row must carry both, not two different rows supplying one each - the
+        // looser form passed even when the attach row lacked a correlation id
+        // entirely, which is precisely the evidence-chain break governance found.
         bool has_surface = false;
         for (const auto& d : ts.audit_details) {
             if (d.find("surface=post") != std::string::npos &&
-                d.find("cid=") != std::string::npos) {
+                d.find("cid=req-") != std::string::npos &&
+                d.find("execution_id=") != std::string::npos) {
                 has_surface = true;
             }
         }

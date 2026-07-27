@@ -293,6 +293,15 @@ public:
         "bind_post_sink_failed", "stream_install_failed", "arm_already_armed", "arm_cancelled",
         "arm_not_armed", "post_dispatch_threw"};
 
+    /// The CLOSED streamed-POST admission-denial labels for
+    /// `yuzu_mcp_stream_rejects_total{reason}`. Declared here, beside the code that
+    /// emits them, for the third time this pattern has been needed: a hand-written
+    /// copy in the startup seed drifts the moment a reason is added, which is what
+    /// let `detached` and six degrade reasons ship emitted-but-unseeded.
+    static constexpr std::array kPostRejectReasons{"post_per_principal_cap", "post_global_cap",
+                                                   "post_pin_slots", "post_duplicate_request_id",
+                                                   "post_unknown_session"};
+
     enum class CancelOutcome {
         kAcceptedPending,  ///< pre-arm: recorded; arm()/abandon() arbitrate (C1 - no audit yet)
         kDetached,         ///< 3b: a LIVE streamed response was closed BY THIS CALL (audited once)
