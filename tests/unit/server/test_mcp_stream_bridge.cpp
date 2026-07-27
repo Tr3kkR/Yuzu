@@ -2225,6 +2225,72 @@ TEST_CASE("McpPostPump: revocation and session death close the response (C7)",
     }
 }
 
+TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a fresh tick "
+          "(CH-22)",
+          "[mcp][bridge][2f][ch22]") {
+    // THE DEFECT THIS PINS. Gating revalidate behind `next_check_` stopped a
+    // poke-driven pump from scaling auth load with the progress-frame rate - but the
+    // WAIT stayed a fresh FULL tick measured from each WAKE. A poke landing just
+    // before the boundary therefore woke the pump, found the check not yet due, and
+    // waited another whole tick, pushing the credential re-check out to nearly TWO
+    // ticks after the previous one. That silently doubles the one-tick revocation
+    // bound promised by Decision 15(c) / CH-4, by mcp_stream.hpp, and by
+    // docs/mcp-server.md - a security bound weakened by a performance fix.
+    //
+    // WHY NOTHING CAUGHT IT. Every other revocation test closes on tick ONE, where
+    // the default-constructed `next_check_` is the epoch and the check is always due.
+    // The defect lives strictly on the SECOND tick, and no test drove one. Note the
+    // direction is counter-intuitive: FREQUENT pokes are harmless, because each wake
+    // re-tests the gate. The bad case is ONE poke just before the boundary, then
+    // silence - which is what a command that emits a burst and then runs quiet does.
+    //
+    // DETERMINISTIC BY CONSTRUCTION, not by timing luck. The injected clock is FROZEN
+    // 50ms short of the next check, so the correct wait is 50ms while the pre-fix
+    // wait is the full 5s tick. The 1500ms ceiling sits 30x above the correct value
+    // and 3x below the buggy one, which is what keeps it safe on a loaded shared CI
+    // runner where a wall-clock assertion would otherwise be a flake generator.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-bound"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump::Config cfg;
+    cfg.tick = std::chrono::seconds(5);  // deliberately LONG, so the two cases diverge
+    const auto base = std::chrono::steady_clock::now();
+    // Single-threaded: pump_once is called directly on this thread, so the fake clock
+    // needs no synchronisation and TSan has nothing to see.
+    auto fake = base;
+    int revalidations = 0;
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {},
+        [&] {
+            ++revalidations;
+            return mcp::StreamRevalidate::kValid;
+        },
+        {}, cfg, [&] { return fake; }, nullptr, "cid-bound", "exec-bound");
+    PostWire wire;
+
+    // Tick one: `next_check_` is the epoch, so the check is due immediately and the
+    // wait budget is zero. This is the tick every existing test stops at.
+    REQUIRE(pump.pump_once(wire.writer()));
+    REQUIRE(revalidations == 1);
+
+    // Freeze 50ms short of the next check, then take the second tick. The pump must
+    // wake in time FOR that check rather than restarting a full tick.
+    fake = base + cfg.tick - std::chrono::milliseconds(50);
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(pump.pump_once(wire.writer()));
+    const auto waited = std::chrono::steady_clock::now() - started;
+
+    CHECK(waited < std::chrono::milliseconds(1500));
+}
+
 TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
           "[mcp][bridge][2f]") {
     // The ring copy is the durable one (GET resume); the returned frames are the

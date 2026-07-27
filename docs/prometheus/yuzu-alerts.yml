@@ -206,6 +206,7 @@ groups:
       - alert: YuzuMcpStreamedPinSlotsWedged
         expr: |
           increase(yuzu_mcp_bridge_pin_slots_reject_total{held="pins"}[15m]) > 0
+        for: 15m
         labels:
           severity: warning
         annotations:
@@ -214,12 +215,19 @@ groups:
             A streamed request was refused for want of a session slot, and every
             slot was held by a final the bridge had already committed rather than by
             a call still in flight. After the rule-(a) unpin those pins are released
-            when the final reaches the wire, so this should not recur - a sustained
-            rate means slots are not coming back and the affected client stays
-            locked out of streaming until it re-initializes, while the 429 it
-            receives tells it to "wait for one to finish" when they already did.
-            Compare with held="charges", which is ordinary saturation and clears on
-            its own.
+            when the final reaches the wire, so a SUSTAINED rate means slots are not
+            coming back and the affected client stays locked out of streaming until
+            it re-initializes, while the 429 it receives tells it to "wait for one to
+            finish" when they already did. The `for` is load-bearing, not tuning: the
+            charge-to-pin handover happens at terminal projection but the unpin only
+            once the final reaches the wire, so every HEALTHY session passes through
+            pinned>0/unpinned==0 during that flush window, and a lone refusal landing
+            inside it is not a wedge. Only persistence separates the two. Note also
+            that held="charges" is NOT purely benign: it is emitted whenever ANY
+            charge is outstanding, so a partial wedge (some pins stuck, one call
+            genuinely in flight) is bucketed there and this alert cannot see it.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeChargeReleaseDeferred
         expr: |
           yuzu_mcp_bridge_charge_release_deferred_total > 0

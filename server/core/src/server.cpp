@@ -617,12 +617,18 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_pin_slots_reject_total",
                           "Streamed admissions refused for want of a session slot, by which half "
-                          "of the admission sum held them: held=\"charges\" are calls genuinely "
-                          "in flight and clear as they finish; held=\"pins\" are finals already "
-                          "committed whose pins were never released. After the rule-(a) unpin a "
-                          "pins-dominant refusal should be rare, so a sustained rate there is the "
+                          "of the admission sum held them: held=\"charges\" means at least one "
+                          "charge was outstanding; held=\"pins\" means finals already committed "
+                          "whose pins were not yet released. After the rule-(a) unpin a "
+                          "pins refusal should not PERSIST, so a sustained rate there is the "
                           "wedged-session signature - the case where the 429's own remediation "
-                          "(\"wait for one to finish\") is untrue because they already did",
+                          "(\"wait for one to finish\") is untrue because they already did. A "
+                          "single pins sample is NOT a wedge: the charge-to-pin handover happens "
+                          "at terminal projection but the unpin only once the final reaches the "
+                          "wire, so every healthy session passes through that shape during the "
+                          "flush window - which is why its alert carries a load-bearing `for`. "
+                          "And \"charges\" is not purely benign: it is emitted whenever ANY "
+                          "charge is outstanding, so a PARTIAL wedge is bucketed there unseen",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
