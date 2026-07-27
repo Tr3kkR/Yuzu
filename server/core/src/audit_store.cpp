@@ -646,8 +646,12 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // `BadState` ahead of every other test. FORWARD movement of more than
         // the floor qualifies only through `Step`, so it inherits `window > 0`
         // and `has_expired` -- with retention disabled a forward ratchet over
-        // legacy non-zero TTLs classifies `None` and DELETES, it does not
-        // starve. Sub-floor ALTERNATION needs a standing would-wipe:
+        // legacy non-zero TTLs cannot reach `Step` at all, so it does not
+        // starve. (It is not silent either: once the ratchet steps past the
+        // last legacy TTL the survivor probe finds nothing, which is `Wipe` --
+        // a CONDITION, so it declines once and the next pass drains. Pinned by
+        // `retention disabled: a forward ratchet declines ONCE as a Wipe`.)
+        // Sub-floor ALTERNATION needs a standing would-wipe:
         // `prev_unusable` flips every pass, so the fact set changes every pass
         // and dedup never engages, which in turn needs a store with no audit
         // write inside a whole retention window. All three raise

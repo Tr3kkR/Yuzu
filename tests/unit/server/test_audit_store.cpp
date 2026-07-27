@@ -813,6 +813,84 @@ TEST_CASE("AuditStore #2360: retention disabled never declines on an elapsed-tim
     CHECK(store.clock_anomaly_skips_count() == 0);
 }
 
+// ── Claims that prose kept getting wrong ─────────────────────────────────────
+//
+// Each of the three cases below pins a statement that a documentation
+// paraphrase of this rule asserted INCORRECTLY at least once across five
+// correction rounds. They exist so the next such claim is settled by a red test
+// rather than by a reviewer reading English, which is the only thing that has
+// reliably caught this class. See the "Where the rule lives" note in
+// docs/user-manual/audit-log.md.
+
+TEST_CASE("AuditStore #2360: a young store IS protected against a large forward jump",
+          "[audit_store][retention][clock-guard]") {
+    // The false claim: "on a store younger than its retention window, a forward
+    // jump of ANY size classifies None and is never counted." It is false
+    // because `has_expired` is probed against the JUMPED reading, not against
+    // real elapsed time -- a jump big enough to carry `now` past the rows' TTLs
+    // expires them, however young the store is. The jump SIZE decides this, not
+    // the store's age.
+    GuardFixture f;
+    f.seed(kNow + kWindow, 5); // written "now", nothing expired yet: a young store
+    REQUIRE(f.store.cleanup_once(kNow) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 0);
+
+    // A jump far past the rows' TTLs. Every row is now expired and no survivor
+    // sits inside the jumped horizon, so this is exactly the wipe the guard
+    // exists to refuse.
+    const std::int64_t jumped = kNow + 30 * 86400;
+    CHECK(f.store.cleanup_once(jumped) == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 1);
+    CHECK(f.store.total_count() == 5); // refused, not deleted
+}
+
+TEST_CASE("AuditStore #2360: retention disabled: a forward ratchet declines ONCE as a Wipe",
+          "[audit_store][retention][clock-guard]") {
+    // Two claims settled here. First, a forward ratchet on a retention-disabled
+    // store does NOT starve the drain -- `Step` is unreachable with `window == 0`
+    // (pinned separately by the elapsed-time-step test above). Second, and the
+    // part a code comment and a doc paragraph both got wrong: it is not silent.
+    // Once the ratchet carries `now` past the last legacy TTL the survivor probe
+    // finds nothing, which is `Wipe`. `Wipe` is a CONDITION, so it declines once
+    // and the following pass drains.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-ratchet-"}};
+    AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+
+    // Legacy rows, stamped while retention was switched ON, all already expired
+    // and with no survivor behind them.
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+
+    CHECK(store.cleanup_once(kNow) == 0);              // declines: would wipe
+    CHECK(store.clock_anomaly_skips_count() == 1);
+    CHECK(store.cleanup_once(kNow + 1) == 5);          // same facts -> dedup -> drains
+    CHECK(store.clock_anomaly_skips_count() == 1);     // and NOT counted twice
+}
+
+TEST_CASE("AuditStore #2360: a forward movement of EXACTLY the floor is not a step",
+          "[audit_store][retention][clock-guard]") {
+    // The floor is asymmetric and the docs stated it both ways at different
+    // times. `moved_at_least` is inclusive (`>=`), but `big_step` is STRICT
+    // (`>`), so a forward movement of exactly kAuditMinBigStepSec does not
+    // report and the pass deletes. One second more does report -- that case is
+    // the sub-window-forward-jump test above, which uses `+ 1`.
+    GuardFixture f;
+    f.seed(kNow - 100, 5);
+    f.seed(kNow + kWindow, 1); // survivor for pass 1
+    REQUIRE(f.store.cleanup_once(kNow) == 5);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 0);
+
+    const std::int64_t exactly = kNow + kAuditMinBigStepSec; // NOT + 1
+    f.seed(kNow - 50, 5);
+    f.seed(exactly + kWindow, 1); // survivor, so only a STEP could decline this
+    // 6, not 5: pass 1's survivor carried a TTL of kNow + kWindow, and `exactly`
+    // is seven days past kNow, so that row has expired too by this pass.
+    CHECK(f.store.cleanup_once(exactly) == 6);
+    // The assertion that matters: exactly-at-floor did not report, so the pass
+    // was allowed to delete at all.
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+}
+
 TEST_CASE("AuditStore #2360: cleanup passes race-free against concurrent writers",
           "[audit_store][retention][clock-guard]") {
     // Two claims are under test. First, the production concurrency: the hourly

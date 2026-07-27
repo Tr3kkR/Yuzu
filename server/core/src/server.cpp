@@ -1050,10 +1050,12 @@ public:
                           "the stored reading was not usable - ahead of the clock, "
                           "negative, present but not an integer, or unreadable. "
                           "Reducing audit_retention_days can also cause a decline "
-                          "by design. Which cases re-report on EVERY pass, and the "
-                          "preconditions on each, are stated once in "
-                          "docs/user-manual/audit-log.md#the-retention-clock-guard "
-                          "- this string deliberately does not restate them",
+                          "by design. Triage: "
+                          "docs/user-manual/audit-log.md#the-retention-clock-guard. "
+                          "The decision rule itself is classify() in "
+                          "audit_retention_rules.hpp plus the fact construction in "
+                          "AuditStore::cleanup_once, pinned by tests - it is "
+                          "deliberately not paraphrased here",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that did not fully do their job: an unreadable "

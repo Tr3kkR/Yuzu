@@ -16,12 +16,11 @@
   qualifying clock MOVEMENT warns every time it recurs, because each jump is a separate
   incident. Because a warning suppresses that pass's delete, a clock that keeps moving
   can hold the guard declining and starve retention for as long as it lasts; that limit
-  is tracked, not fixed, and it shows as the anomaly counter rising once per pass while
-  `yuzu_server_audit_rows_deleted_total` stays flat. Exactly which cases re-warn on
-  every pass, and the preconditions on each, are stated once in
-  `docs/user-manual/audit-log.md#the-retention-clock-guard` - deliberately in one place,
-  because this rule was previously restated across seven surfaces and drifted between
-  them. Every accepted pass is capped at 25,000 rows oldest-first. Rows
+  is tracked, not fixed. The decision rule is `classify()` plus the fact construction in
+  `AuditStore::cleanup_once`, pinned by an exhaustive truth table and store-level tests;
+  operator triage, including how to tell a stalled drain from a normal one-off decline,
+  is `docs/user-manual/audit-log.md#the-retention-clock-guard`. The rule is deliberately
+  not paraphrased in either place. Every accepted pass is capped at 25,000 rows oldest-first. Rows
   whose TTL sits implausibly far in the future are excluded from the decision, so
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe
