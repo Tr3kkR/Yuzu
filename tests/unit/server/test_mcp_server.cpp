@@ -8905,6 +8905,25 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(normalize(res_bridged->body, exec_bridged) ==
               normalize(res_plain->body, exec_plain));
 
+        // STOP-SHIP SURFACE, widened ahead of the streamed-POST rung (C8).
+        // Comparing bodies alone is not "byte-untouched": mcp-remote 0.1.37 and
+        // Claude Desktop negotiate on the status line and the headers, and the
+        // rung that lands next decides between a plain JSON response and an SSE
+        // stream by inspecting Accept. A regression there changes Content-Type
+        // and the transfer framing while leaving the body identical, which this
+        // test would have passed. Pin the whole response envelope, not its
+        // payload.
+        CHECK(res_bridged->status == res_plain->status);
+        CHECK(res_bridged->get_header_value("Content-Type") ==
+              res_plain->get_header_value("Content-Type"));
+        CHECK(res_plain->get_header_value("Content-Type") == "application/json");
+        // A plain POST must never acquire streaming framing or SSE-only headers.
+        CHECK(res_plain->get_header_value("Transfer-Encoding").empty());
+        CHECK(res_plain->get_header_value("Cache-Control").empty());
+        CHECK(res_plain->get_header_value("X-Accel-Buffering").empty());
+        CHECK(res_bridged->get_header_value("Transfer-Encoding").empty());
+        CHECK(res_bridged->get_header_value("X-Accel-Buffering").empty());
+
         // Progress reaches the session's GET ring LIVE, token echoed verbatim,
         // execution_id in _meta. NOTE (governance happy-path): S4.5's
         // refresh_counts already published an automatic "0/2" frame DURING
