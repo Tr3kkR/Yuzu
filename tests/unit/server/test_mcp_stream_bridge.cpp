@@ -156,8 +156,11 @@ struct Fx {
     std::vector<AuditRow> audits;
     std::optional<Bridge> bridge;                             // optional: dtor-order tests
 
-    explicit Fx(Bridge::Config cfg = {})
-        : sessions(mcp::McpSessionRegistry::Config{},
+    /// `scfg` defaults to the production session config, so every existing test is
+    /// unaffected; a chaos test that needs the replay ring to WRAP passes a small
+    /// ring_cap rather than publishing 500 frames to get there.
+    explicit Fx(Bridge::Config cfg = {}, mcp::McpSessionRegistry::Config scfg = {})
+        : sessions(scfg,
                    [b = base, c = clock_s] { return b + std::chrono::seconds(c->load()); }, &reg) {
         bridge.emplace(&bus, &sessions, &reg,
                        [this](const std::string& action, const std::string&,
@@ -2627,4 +2630,155 @@ TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, t
     REQUIRE_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // reaped
     CHECK(s.stream->pinned_count() == 0);  // GET-only never pins, so this reads the ledger alone
     CHECK(fx.bridge->reserve(s.id, "alice", json(6), json("t"), true).ok);
+}
+
+// ── C10: chaos P0 endpoint reproductions (docs/mcp-streamable-http-chaos-design.md) ──
+
+TEST_CASE("CH-2: a parked streamed record survives a ring wrap - the pinned final is "
+          "replayed exactly once, and an evicted cursor is a GAP not a silent skip",
+          "[mcp][bridge][2f][chaos][ch2]") {
+    // The re-run the chaos design defers to this rung: the final-frame eviction
+    // exemption only exists once the bridge does. Shape in both halves: stream
+    // progress, lose the client mid-stream, let the execution finish while nobody
+    // is listening, then resume. The halves differ only in whether the client's
+    // cursor outlived the ring - which is exactly the distinction CH-2 is about.
+    const auto drive = [](Fx& fx, Fx::Session& s, const char* exec,
+                          std::shared_ptr<mcp::sse_bus::SseSinkState>& sink,
+                          std::optional<std::string>& key) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+        key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+        REQUIRE(key.has_value());
+    };
+
+    SECTION("in-window resume replays the missed frames AND the final, exactly once") {
+        Fx fx{Bridge::Config{}, mcp::McpSessionRegistry::Config{.ring_cap = 64}};
+        auto s = fx.make_session();
+        std::shared_ptr<mcp::sse_bus::SseSinkState> sink;
+        std::optional<std::string> key;
+        drive(fx, s, "exec-ch2a", sink, key);
+
+        mcp::McpPostPump pump(
+            sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+            [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {},
+            nullptr, "cid-ch2a", "exec-ch2a");
+        PostWire wire;
+
+        fx.bus.publish("exec-ch2a", "execution-progress", prog(1, 9));
+        REQUIRE(poll_until([&] {
+            pump.pump_once(wire.writer());
+            return wire.count("notifications/progress") == 1;
+        }));
+        // What the client would send back as Last-Event-ID.
+        const auto cursor = s.stream->next_event_id() - 1;
+
+        // Client gone mid-stream. The record PARKS - subscription and any terminal
+        // it later latches survive, which is what makes a resume meaningful.
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+
+        // Execution carries on with nobody listening, then finishes.
+        for (int i = 2; i <= 5; ++i) {
+            fx.bus.publish("exec-ch2a", "execution-progress", prog(i, 9));
+        }
+        fx.bus.publish("exec-ch2a", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+        auto replayed = ring_frames(*s.stream, "alice", cursor);
+        CHECK(count_method(replayed, "notifications/progress") > 0); // the missed frames
+        CHECK(count_results(replayed) == 1); // the answer, exactly once
+    }
+
+    SECTION("a cursor the ring outran is a GAP - but the ANSWER still survives the wrap") {
+        Fx fx{Bridge::Config{}, mcp::McpSessionRegistry::Config{.ring_cap = 6}};
+        auto s = fx.make_session();
+        std::shared_ptr<mcp::sse_bus::SseSinkState> sink;
+        std::optional<std::string> key;
+        drive(fx, s, "exec-ch2b", sink, key);
+
+        mcp::McpPostPump pump(
+            sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+            [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {},
+            nullptr, "cid-ch2b", "exec-ch2b");
+        PostWire wire;
+
+        fx.bus.publish("exec-ch2b", "execution-progress", prog(1, 20));
+        REQUIRE(poll_until([&] {
+            pump.pump_once(wire.writer());
+            return wire.count("notifications/progress") == 1;
+        }));
+        const auto stale_cursor = s.stream->next_event_id() - 1;
+
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        // Comfortably more frames than the ring holds, so the cursor is outrun.
+        for (int i = 2; i <= 16; ++i) {
+            fx.bus.publish("exec-ch2b", "execution-progress", prog(i, 20));
+        }
+        fx.bus.publish("exec-ch2b", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+        // Refused as a GAP rather than served a hole: a silently-short replay is
+        // worse than an error, because the client would believe it had the lot.
+        auto att = s.stream->attach_and_replay(stale_cursor, nullptr, "alice");
+        CHECK(att.status == mcp::McpStreamState::AttachStatus::kGap);
+
+        // The history is gone; the RESULT is not. The final was pinned, so the
+        // wrap could not evict it, and a re-initialising client still collects it.
+        CHECK(s.stream->pinned_count() == 1);
+        CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);
+    }
+}
+
+TEST_CASE("CH-12: cancel mid-execution detaches the response but never the execution",
+          "[mcp][bridge][2f][chaos][ch12]") {
+    // "Cancelled != cancelled": MCP cancellation is about the CLIENT'S interest in
+    // a response, not about the work. A dispatched command keeps running on real
+    // agents and its result stays durably fetchable - anything else would let a
+    // client believe it had stopped a fleet-wide change it had not.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch12"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {}, nullptr,
+        "cid-ch12", "exec-ch12");
+    PostWire wire;
+
+    fx.bus.publish("exec-ch12", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        pump.pump_once(wire.writer());
+        return wire.contains("notifications/progress");
+    }));
+
+    // The client cancels. Closing the SINK is what a cancel does to a streamed
+    // POST - it ends the RESPONSE.
+    {
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->closed.store(true, std::memory_order_release);
+    }
+    sink->cv.notify_all();
+    REQUIRE_FALSE(pump.pump_once(wire.writer())); // provider ends
+
+    // The close frame must SAY the execution continues, and name the handle that
+    // reaches it - a client that is told nothing has no way back to its result.
+    REQUIRE(wire.contains("notifications/yuzu.stream_closed"));
+    CHECK(wire.contains(R"("execution_id":"exec-ch12")"));
+    CHECK(wire.contains(R"("partial":true)"));
+
+    // THE POINT: the execution was never touched. Its terminal still publishes,
+    // still pins, and is still replayable by a client that comes back for it.
+    REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+    fx.bus.publish("exec-ch12", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);
 }
