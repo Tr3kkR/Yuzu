@@ -598,21 +598,22 @@ public:
         metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
                           "Committed terminal frames that found no free pin slot and were published "
                           "UNPINNED (a real terminal is committed rather than lost to preserve a "
-                          "pin). Structurally unreachable while the pin array is non-empty - the "
-                          "slots are a bounded LRU, so a full set displaces its oldest pin rather "
-                          "than committing a final unprotected. Kept as defence in depth: any "
-                          "non-zero value means the pin array was resized to zero or the LRU "
-                          "path was bypassed, and the affected final is evictable from the replay "
-                          "ring (still recoverable by execution_id). Alert on > 0",
+                          "pin). Structurally unreachable while the pin array is non-empty - a "
+                          "full slot set now displaces its oldest pin rather than committing the "
+                          "NEWEST final unprotected. Kept as defence in depth: any non-zero value "
+                          "means the pin array was resized to zero or the displacement path was "
+                          "bypassed. Alert on > 0",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_pin_displaced_total",
                           "An older pinned terminal yielded its eviction-exemption slot to a newer "
-                          "one. ORDINARY on any session that completes more than the pin-slot "
-                          "count of calls - the slots are a bounded LRU that keeps the most recent "
-                          "terminals recoverable, not a permanent reservation held by whichever "
-                          "results happened to come first. A HIGH rate means the replay ring is "
-                          "too small for that session's concurrency, so a displaced terminal may "
-                          "be evicted before a late resume asks for it. Not alertable on > 0",
+                          "one. NOT expected: the bridge admits streamed records against "
+                          "pinned_count() + unpinned and the pin array is sized to exactly that "
+                          "cap, so a full slot set means ADMISSION ACCOUNTING HAS DRIFTED - this "
+                          "counter inherits the drift reading the unpinned counter used to carry. "
+                          "The displacement itself is the graceful degradation (the oldest "
+                          "terminal, likeliest already consumed, yields instead of the newest "
+                          "going unprotected); the displaced final becomes evictable from the "
+                          "replay ring, still recoverable by execution_id. Alert on > 0",
                           "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");

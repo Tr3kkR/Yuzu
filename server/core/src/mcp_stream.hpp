@@ -333,15 +333,25 @@ public:
     std::uint64_t publish_ring_only(std::string_view event_type, std::string_view data) noexcept;
 
     /// Commit a streamed request's FINAL response frame: ring-only (as publish_ring_only)
-    /// AND eviction-EXEMPT (pinned) while the session lives, so a resume always recovers the
-    /// terminal even after the ring wraps (Decision 15(f), bounded one pending per streamed
-    /// request by kMaxStreamedPostsPerSession).
+    /// AND eviction-EXEMPT (pinned), so a resume recovers the terminal even after the ring
+    /// wraps (Decision 15(f), bounded one pending per streamed request by
+    /// kMaxStreamedPostsPerSession).
+    ///
+    /// The exemption holds for the **kMaxStreamedPostsPerSession most recent** pinned
+    /// terminals, not unconditionally: see the degraded case below.
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected -
-    /// the bridge caps streamed records at the pin count) still commits, unpinned, rather
-    /// than losing a real terminal. The pin is released by unpin() (final written on the POST
-    /// wire), by attach_and_replay when a cursor proves consumption (Last-Event-ID >= its id),
+    /// ghost pin and consumes no id. A committed final with no free pin slot should be
+    /// unreachable - the bridge admits streamed records against `pinned_count() + unpinned`
+    /// and this array is sized to exactly that cap - so reaching it means ADMISSION
+    /// ACCOUNTING HAS DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
+    /// on > 0). In that state the slots degrade as an LRU: the OLDEST pin yields to the
+    /// newest, because the newest terminal is the one a client is likeliest still waiting to
+    /// resume while the oldest has almost certainly been consumed. The displaced final stays
+    /// committed and delivered - it merely loses its eviction exemption.
+    ///
+    /// The pin is released by unpin() (final written on the POST wire), by attach_and_replay
+    /// when a cursor proves consumption (Last-Event-ID >= its id), by displacement as above,
     /// or with the whole object. Same return contract and boundary as publish().
     std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
 

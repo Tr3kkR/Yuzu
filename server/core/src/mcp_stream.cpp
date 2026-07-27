@@ -57,10 +57,10 @@ constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures
 // streamed records per session at the pin count); the frame is kept unpinned rather than
 // lost. A non-zero value means the pin bound and the admission cap have drifted.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
-/// An older pinned terminal yielded its eviction-exemption slot to a newer one. Ordinary on a
-/// session that completes more than `kMaxStreamedPostsPerSession` calls; a HIGH rate means the
-/// replay ring is too small for that session's concurrency, so displaced terminals may be
-/// evicted before a late resume asks for them.
+/// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
+/// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
+/// sized to exactly that cap, so a full slot set means admission accounting has drifted. This
+/// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
@@ -391,29 +391,27 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
 
         // Pin the committed final AFTER the commit + eviction (it is the newest frame, which
         // eviction never touches). Writing the id only now means a pre-commit push_back throw
-        // leaves no ghost pin. A missing slot is not expected - the bridge caps streamed
-        // records per session at the pin count - so commit the final unpinned rather than
-        // lose a real terminal, and count it.
+        // leaves no ghost pin.
         if (pinned) {
-            // BOUNDED LRU, not first-come-permanent. The slots are a fixed four shared by
-            // two populations: streamed-POST terminals, which admission caps at exactly
-            // this number, and GET-only terminals, which NOTHING caps. Only rule (b) (a
-            // resume cursor acking past the id) ever releases one, so a client that reads
-            // live and never reconnects holds its slots for the life of the session.
+            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. Reaching this state means admission
+            // accounting has already drifted: `publish_final` runs only for a kRingOnly
+            // record (`publish_terminal_ladder`), the bridge admits streamed records against
+            // `pinned_count() + unpinned >= kMaxStreamedPostsPerSession`, and the array is
+            // sized to exactly that cap - so a full set should be unreachable. It is a
+            // DRIFT SIGNAL, not an ordinary event, and `pin_displaced_total` is alertable.
             //
-            // First-come-permanent then inverts the promise. A pin exists so that a
-            // RECENT terminal survives a ring wrap and a late resume can still recover it
-            // (Decision 15(f)) - which is worth most for the newest result and least for
-            // the oldest. Filling the slots once meant a session's first four results
-            // stayed protected forever, long after they were consumed, while every result
-            // from the fifth on was committed evictable and could vanish from under the
-            // resume that wanted it.
+            // But the old fallback made the drift worse than it needed to be: it committed
+            // the newest terminal UNPINNED, which is the wrong one to sacrifice. A pin
+            // exists so a terminal survives a ring wrap and a late resume can still recover
+            // it (Decision 15(f)) - worth most for the NEWEST result, least for the oldest,
+            // which by then is the likeliest to have been consumed already. Sacrificing the
+            // newest meant the request most likely still waiting for its answer was the one
+            // left evictable.
             //
-            // So when the slots are full the OLDEST pin yields to the newest. Ids are
-            // monotonic, so the smallest live id IS the oldest. That keeps the honest
-            // invariant "the four most recent terminals are recoverable" and makes a full
-            // slot set an ordinary handled state rather than the impossibility the old
-            // comment here asserted.
+            // So the slots degrade as an LRU: the OLDEST pin yields to the newest. Ids are
+            // monotonic, so the smallest live id IS the oldest. That keeps the strongest
+            // invariant still available under drift - "the N most recent terminals are
+            // recoverable" - while still reporting the drift that got us here.
             std::uint64_t* free_slot = nullptr;
             std::uint64_t* oldest = nullptr;
             for (auto& slot : pinned_ids_) {
@@ -958,12 +956,16 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      metrics_(metrics), clock_(clock),
+      metrics_(metrics), clock_(std::move(clock)),
       // The grace policy owns the clock + the #2367 last-authoritative seed (attach already
       // authenticated the request fully before this pump exists).
+      // Constructed from `clock_`, NOT from the parameter: initialising both from `clock`
+      // relied on `clock_` being DECLARED before `grace_` so the copy happened before the
+      // move. A member reorder would silently leave `clock_` moved-from, and production
+      // passes an empty ClockFn (both fall back to steady_clock), so no test would catch it.
       grace_(RevalidateGrace::Config{cfg.revalidate_grace, cfg.revalidate_grace_jitter_max,
                                      cfg.revalidate_max_staleness},
-             std::move(clock)) {
+             clock_) {
     // SEED the first check a full tick out rather than leaving the epoch default. Attach has
     // just authenticated this request end to end, so an immediate re-check would be a
     // redundant store round trip; and an epoch default would make the first wait budget zero,

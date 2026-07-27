@@ -1476,20 +1476,18 @@ TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decis
 
 TEST_CASE("McpStreamState: pin slots are a bounded LRU, not first-come-permanent",
           "[mcp][stream][pins]") {
-    // THE DEFECT THIS PINS. `pinned_ids_` is a fixed 4-slot array and publish_final pins
-    // EVERY terminal, but the only release path (unpin rule (b)) fires on a GET RE-attach
-    // whose cursor has passed the id. A client that reads live and never reconnects
-    // therefore holds its slots forever, and from the fifth terminal onward every result
-    // was committed WITHOUT its eviction exemption - silently losing the ring-wrap
-    // survival that Decision 15(f) promises, on an ordinary session doing nothing wrong.
+    // WHAT THIS PINS. Exhausting the four pin slots means admission accounting has already
+    // drifted - `publish_final` runs only for a kRingOnly record, and the bridge admits
+    // streamed records against `pinned_count() + unpinned` with the array sized to exactly
+    // that cap. So this is the DEGRADED path, not an ordinary one.
     //
-    // The source comment claimed "a missing slot is not expected - the bridge caps
-    // streamed records per session at the pin count". That is true only of STREAMED
-    // records; GET-only terminals share the same four slots and are capped by nothing.
+    // The old fallback sacrificed the wrong frame: it committed the NEWEST terminal
+    // unpinned. A pin exists so a terminal survives a ring wrap and a late resume can
+    // recover it (Decision 15(f)) - worth most for the newest result, least for the oldest,
+    // which by then has almost certainly been consumed. Leaving the newest evictable meant
+    // the request most likely still waiting for its answer was the one left unprotected.
     //
-    // The fix inverts the eviction order to match what the pin is FOR: the promise is that
-    // RECENT terminals survive a wrap, so when the slots are full the OLDEST pin yields to
-    // the newest rather than the newest going unprotected.
+    // The slots now degrade as an LRU: oldest yields to newest.
     mcp::McpStreamState state{/*ring_cap=*/64};
     std::vector<std::uint64_t> ids;
     for (int i = 0; i < 6; ++i) {
@@ -1511,9 +1509,10 @@ TEST_CASE("McpStreamState: pin slots are a bounded LRU, not first-come-permanent
 
 TEST_CASE("McpStreamState: the newest terminal survives a wrap even past the slot count",
           "[mcp][stream][pins]") {
-    // The consequence that actually reaches a client. Pre-fix, a session's 5th and later
-    // terminals were evictable, so a late resume lost the very result it asked for while
-    // the session's FIRST four results - long since consumed - stayed protected forever.
+    // The consequence that actually reaches a client once the slots have been exhausted.
+    // Pre-fix the 5th and later terminals were evictable, so a late resume could lose the
+    // very result it asked for while the session's FIRST four - long since consumed -
+    // stayed protected.
     mcp::McpStreamState state{/*ring_cap=*/5};
     std::vector<std::uint64_t> ids;
     for (int i = 0; i < 6; ++i) {
@@ -1640,15 +1639,13 @@ TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and 
 
 TEST_CASE("McpStreamState: a final past the pin bound displaces the OLDEST pin",
           "[mcp][stream][pins]") {
-    // REPLACES an earlier test that asserted the overflow final commits UNPINNED and counts
-    // `final_unpinned_total`. That test faithfully encoded a false premise, stated in its own
-    // comment: "the pin array is sized to the per-session streamed-request cap; the bridge
-    // enforces the same cap at admission, so this is defence-in-depth." The bridge caps
-    // STREAMED records - but GET-only terminals pin the same four slots and are capped by
-    // NOTHING, so the path was ordinarily reachable, and past the fourth call every result was
-    // committed without the ring-wrap protection Decision 15(f) promises.
-    //
-    // The pin now behaves as what it is: a bounded LRU protecting the most RECENT terminals.
+    // REPLACES an earlier test that asserted the overflow final commits UNPINNED. Its
+    // premise - that reaching this state means admission accounting drifted - is CORRECT and
+    // is preserved here; what it got wrong was which frame to sacrifice. Committing the
+    // newest terminal unprotected leaves the request most likely still waiting for its
+    // answer as the evictable one, while the oldest pin, almost certainly consumed already,
+    // keeps its exemption. The slots now degrade as an LRU, and the drift is still reported
+    // (via `pin_displaced_total`, which is alertable) rather than silently absorbed.
     yuzu::MetricsRegistry reg;
     mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
     std::vector<std::uint64_t> ids;
