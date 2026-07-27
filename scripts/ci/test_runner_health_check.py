@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Regression tests for runner-health-check.py.
+
+Run directly; no runner access or GitHub credentials are used.
+"""
+
+from __future__ import annotations
+
+from contextlib import redirect_stdout
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+SCRIPT = Path(__file__).with_name("runner-health-check.py")
+SPEC = importlib.util.spec_from_file_location("runner_health_check", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+runner_health = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = runner_health
+SPEC.loader.exec_module(runner_health)
+
+
+def runner(name: str, labels: list[str], status: str = "online") -> dict[str, object]:
+    return {
+        "name": name,
+        "status": status,
+        "busy": False,
+        "labels": [{"name": label} for label in labels],
+    }
+
+
+class QueryRunnersTests(unittest.TestCase):
+    def query(self, *, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        completed = subprocess.CompletedProcess([], returncode, stdout, stderr)
+        with mock.patch.object(runner_health.subprocess, "run", return_value=completed):
+            with redirect_stdout(io.StringIO()):
+                return runner_health.query_runners()
+
+    def test_auth_failure_is_distinct_from_api_failure(self) -> None:
+        auth = self.query(returncode=1, stderr="HTTP 403: Resource not accessible")
+        api = self.query(returncode=1, stderr="dial tcp: network unreachable")
+
+        self.assertEqual(auth.state, runner_health.QueryState.AUTH_ERROR)
+        self.assertEqual(api.state, runner_health.QueryState.API_ERROR)
+
+    def test_invalid_json_is_malformed_response(self) -> None:
+        result = self.query(stdout="not-json")
+        self.assertEqual(result.state, runner_health.QueryState.MALFORMED_RESPONSE)
+
+    def test_transport_timeout_is_api_error(self) -> None:
+        timeout = subprocess.TimeoutExpired(["gh", "api"], 30)
+        with mock.patch.object(runner_health.subprocess, "run", side_effect=timeout):
+            result = runner_health.query_runners()
+        self.assertEqual(result.state, runner_health.QueryState.API_ERROR)
+        self.assertIn("timed out", result.report)
+
+    def test_missing_runner_schema_is_malformed_response(self) -> None:
+        result = self.query(stdout=json.dumps({"total_count": 1}))
+        self.assertEqual(result.state, runner_health.QueryState.MALFORMED_RESPONSE)
+
+    def test_valid_response_is_ok(self) -> None:
+        payload = {"runners": [runner("linux-0", ["self-hosted", "Linux", "X64"])]}
+        result = self.query(stdout=json.dumps(payload))
+        self.assertEqual(result.state, runner_health.QueryState.OK)
+        self.assertEqual(result.payload, payload)
+
+    def test_invalid_field_types_and_duplicate_names_are_rejected(self) -> None:
+        malformed = {"runners": [runner("linux-0", []), runner("linux-0", [])]}
+        duplicate = self.query(stdout=json.dumps(malformed))
+        self.assertEqual(duplicate.state, runner_health.QueryState.MALFORMED_RESPONSE)
+        malformed["runners"][0]["busy"] = "false"
+        malformed["runners"].pop()
+        wrong_type = self.query(stdout=json.dumps(malformed))
+        self.assertEqual(wrong_type.state, runner_health.QueryState.MALFORMED_RESPONSE)
+
+
+class MainTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        root = Path(self.tempdir.name)
+        self.inventory = root / "inventory.json"
+        self.output = root / "github-output"
+        self.expected = [
+            {
+                "name": "linux-0",
+                "labels": ["self-hosted", "Linux", "X64", "yuzu-bigtam-linux"],
+            },
+            {
+                "name": "windows-0",
+                "labels": ["self-hosted", "Windows", "X64"],
+            },
+        ]
+        self.inventory.write_text(
+            json.dumps({"strict_unknown_runners": True, "expected_runners": self.expected}),
+            encoding="utf-8",
+        )
+
+    def run_main(self, result, *args: str) -> tuple[int, str]:
+        self.output.write_text("", encoding="utf-8")
+        env = {
+            "GITHUB_OUTPUT": str(self.output),
+            # A fork must not be treated as healthy merely because secrets are absent.
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_REPOSITORY": "Tr3kkR/Yuzu",
+            "GITHUB_HEAD_REPOSITORY": "contributor/Yuzu",
+        }
+        with (
+            mock.patch.object(runner_health, "INVENTORY_PATH", str(self.inventory)),
+            mock.patch.object(runner_health, "query_runners", return_value=result),
+            mock.patch.dict(os.environ, env, clear=True),
+            redirect_stdout(io.StringIO()),
+        ):
+            code = runner_health.main(list(args))
+        return code, self.output.read_text(encoding="utf-8")
+
+    def test_control_failure_is_red_and_emits_typed_false_outputs(self) -> None:
+        result = runner_health.QueryResult(
+            runner_health.QueryState.AUTH_ERROR,
+            report="token rejected",
+        )
+        code, output = self.run_main(result, "--mode", "preflight", "--require-pool", "bigtam")
+
+        self.assertEqual(code, 1)
+        self.assertIn("bigtam_pool_healthy=false\n", output)
+        self.assertIn("control_state=auth_error\n", output)
+        self.assertIn("failure_kind=runner_control_error\n", output)
+        self.assertIn("failure_report=token rejected\n", output)
+
+    def test_unavailable_required_pool_is_red(self) -> None:
+        payload = {
+            "runners": [
+                runner("linux-0", self.expected[0]["labels"], status="offline"),
+                runner("windows-0", self.expected[1]["labels"]),
+            ]
+        }
+        result = runner_health.QueryResult(runner_health.QueryState.OK, payload=payload)
+        code, output = self.run_main(
+            result, "--mode", "preflight", "--require-pool", "bigtam"
+        )
+
+        self.assertEqual(code, 1)
+        self.assertIn("failure_kind=required_pool_unavailable\n", output)
+        self.assertIn("bigtam_pool_healthy=false\n", output)
+
+    def test_healthy_required_pools_pass_despite_fork_environment(self) -> None:
+        payload = {
+            "runners": [
+                runner("linux-0", self.expected[0]["labels"]),
+                runner("windows-0", self.expected[1]["labels"]),
+            ]
+        }
+        result = runner_health.QueryResult(runner_health.QueryState.OK, payload=payload)
+        code, output = self.run_main(
+            result,
+            "--mode", "preflight",
+            "--require-pool", "bigtam",
+            "--require-pool", "windows",
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("bigtam_pool_healthy=true\n", output)
+        self.assertIn("windows_pool_healthy=true\n", output)
+        self.assertIn("control_state=ok\n", output)
+
+    def test_sentinel_drift_emits_issue_ready_report(self) -> None:
+        payload = {
+            "runners": [
+                runner("linux-0", self.expected[0]["labels"], status="offline"),
+                runner("windows-0", self.expected[1]["labels"]),
+            ]
+        }
+        result = runner_health.QueryResult(runner_health.QueryState.OK, payload=payload)
+        code, output = self.run_main(result, "--mode", "sentinel")
+
+        self.assertEqual(code, 1)
+        self.assertIn("failure_kind=inventory_drift\n", output)
+        self.assertIn("failure_count=1\n", output)
+        self.assertIn("OFFLINE", output)
+
+
+if __name__ == "__main__":
+    unittest.main()

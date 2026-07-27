@@ -70,7 +70,9 @@ jobs:
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam
 
   asan-ubsan:
     name: "Sanitizers (ASan+UBSan)"

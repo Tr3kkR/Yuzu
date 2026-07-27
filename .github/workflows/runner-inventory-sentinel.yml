@@ -78,19 +78,27 @@ jobs:
         # sentinel preserves this workflow's loud-failure-on-drift contract.
         run: python3 scripts/ci/runner-health-check.py --mode sentinel
 
-      - name: Open or update drift issue
-        if: failure() && steps.check.outputs.drift_count != ''
+      - name: Open or update runner-control issue
+        # `always()` is required: without a status function GitHub implicitly
+        # ANDs success(), making an outcome=='failure' predicate unsatisfiable.
+        if: ${{ always() && steps.check.outcome == 'failure' && steps.check.outputs.failure_report != '' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DRIFT_REPORT: ${{ steps.check.outputs.drift_report }}
+          FAILURE_KIND: ${{ steps.check.outputs.failure_kind }}
+          FAILURE_REPORT: ${{ steps.check.outputs.failure_report }}
         run: |
           set -euo pipefail
           existing=$(gh issue list --label runner-inventory-drift --state open --json number --jq '.[0].number // empty')
+          case "$FAILURE_KIND" in
+            inventory_drift) title="Runner inventory drift ($(date -u +%Y-%m-%d))" ;;
+            runner_control_error) title="Runner inventory sentinel cannot observe GitHub ($(date -u +%Y-%m-%d))" ;;
+            *) title="Runner inventory sentinel failure ($(date -u +%Y-%m-%d))" ;;
+          esac
           body=$(cat <<EOF
-          Runner inventory drift detected by \`runner-inventory-sentinel\` workflow run [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          Runner inventory sentinel reported **\`$FAILURE_KIND\`** in workflow run [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
 
-          **Drift report:**
-          $DRIFT_REPORT
+          **Failure report:**
+          $FAILURE_REPORT
 
           **How to resolve:**
           - If a runner is legitimately missing/offline: bring it back online (see \`docs/ci-troubleshooting.md\` for the runner restart runbook).
@@ -109,7 +117,7 @@ jobs:
           else
             echo "Creating new drift issue"
             gh issue create \
-              --title "Runner inventory drift ($(date -u +%Y-%m-%d))" \
+              --title "$title" \
               --label runner-inventory-drift \
               --label operational \
               --body "$body"

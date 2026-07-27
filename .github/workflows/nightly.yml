@@ -40,11 +40,9 @@ jobs:
   # than queueing 60 min into a stalled runner). Secrets are available on
   # schedule + workflow_dispatch, so the PAT resolves.
   #
-  # Skip semantics: if Big Tam is wholly offline, all three skip; `alert`
-  # (if: failure()) does NOT fire on a skip and `close-on-green`
-  # (if: success()) does — i.e. nightly does not block on an offline pool.
-  # That edge is covered by runner-inventory-sentinel.yml, which opens an
-  # issue on an OFFLINE/MISSING runner independently.
+  # Big Tam and Windows are required nightly pools. Missing control evidence
+  # or a wholly unavailable required pool fails this job red; it is not
+  # converted into a successful matrix skip.
   preflight:
     name: "Preflight (runner health)"
     runs-on: ubuntu-24.04
@@ -54,6 +52,8 @@ jobs:
       # Pool gate for windows-asan (the [self-hosted, Windows, X64] job pool)
       # — same output the script already emits for ci.yml's windows job.
       windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
+      failure_kind: ${{ steps.health.outputs.failure_kind }}
+      failure_report: ${{ steps.health.outputs.failure_report }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,7 +62,9 @@ jobs:
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam --require-pool windows
 
   # ── Sanitizers (ASan + UBSan) ──────────────────────────────────────────
   sanitize-asan:
@@ -785,7 +787,7 @@ jobs:
   # issue-creation pattern.
   alert:
     name: "Open nightly-broken on failure"
-    needs: [sanitize-asan, sanitize-tsan, windows-asan, coverage]
+    needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
     if: failure()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -797,6 +799,8 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           NEEDS_JSON: ${{ toJSON(needs) }}
+          PREFLIGHT_FAILURE_KIND: ${{ needs.preflight.outputs.failure_kind }}
+          PREFLIGHT_FAILURE_REPORT: ${{ needs.preflight.outputs.failure_report }}
         with:
           script: |
             const label = 'nightly-broken';
@@ -808,6 +812,13 @@ jobs:
             const summary = failedJobs.length
               ? failedJobs.join(', ')
               : 'unknown (alert fired without specific job failures)';
+            const preflightDetail = process.env.PREFLIGHT_FAILURE_REPORT
+              ? [
+                  `**Preflight failure:** \`${process.env.PREFLIGHT_FAILURE_KIND || 'unknown'}\``,
+                  process.env.PREFLIGHT_FAILURE_REPORT,
+                  ``,
+                ]
+              : [];
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
             const sha = '${{ github.sha }}';
             const refName = process.env.REF_NAME;
@@ -816,6 +827,7 @@ jobs:
               ``,
               `**Failed jobs:** ${summary}`,
               ``,
+              ...preflightDetail,
               `**Run:** ${runUrl}`,
               ``,
               `**Discipline:** no merge to main while this issue is open.`,
@@ -860,7 +872,7 @@ jobs:
   # duplicate from any prior bug doesn't linger.
   close-on-green:
     name: "Close nightly-broken on green"
-    needs: [sanitize-asan, sanitize-tsan, windows-asan, coverage]
+    needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
     if: success()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -89,10 +89,9 @@ jobs:
   #     gate on the pool, not a single named runner, so a free pool member keeps
   #     them running and a fully-offline pool still skips them fast.
   #
-  # If RUNNER_INVENTORY_TOKEN is missing, the script writes
-  # all runners as `false` and exits 0 (fail-closed): downstream jobs
-  # skip with an obvious "preflight detected unhealthy runner" reason
-  # rather than disappearing into a queue.
+  # If the runner-control query is unavailable or a required pool is wholly
+  # offline, preflight fails red. Required checks must never disappear behind
+  # a successful skip merely because their control-plane evidence is missing.
   preflight:
     name: "Preflight (runner health)"
     runs-on: ubuntu-24.04
@@ -128,11 +127,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Probe runner health
-        id: health
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+      - name: Runner-health control tests
+        run: python3 scripts/ci/test_runner_health_check.py
 
       # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
       # otherwise only runs at release time, so a regex regression would surface
@@ -186,6 +182,15 @@ jobs:
           fi
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
+
+      - name: Probe runner health for code-bearing changes
+        id: health
+        if: steps.codegate.outputs.code_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam --require-pool windows
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
