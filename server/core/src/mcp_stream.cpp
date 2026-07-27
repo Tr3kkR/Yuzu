@@ -958,12 +958,18 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      metrics_(metrics),
+      metrics_(metrics), clock_(clock),
       // The grace policy owns the clock + the #2367 last-authoritative seed (attach already
       // authenticated the request fully before this pump exists).
       grace_(RevalidateGrace::Config{cfg.revalidate_grace, cfg.revalidate_grace_jitter_max,
                                      cfg.revalidate_max_staleness},
-             std::move(clock)) {}
+             std::move(clock)) {
+    // SEED the first check a full tick out rather than leaving the epoch default. Attach has
+    // just authenticated this request end to end, so an immediate re-check would be a
+    // redundant store round trip; and an epoch default would make the first wait budget zero,
+    // turning pass one into an instant no-op.
+    next_check_ = (clock_ ? clock_() : std::chrono::steady_clock::now()) + cfg_.tick;
+}
 
 bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     sink_->set_close_reason(reason);
@@ -1029,7 +1035,25 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     std::optional<sse_bus::SseEvent> pre_emit;
     {
         std::unique_lock<std::mutex> lk(sink_->sse->mu);
-        sink_->sse->cv.wait_for(lk, cfg_.tick, [this] {
+        // Bounded by whichever comes FIRST: a full tick, or the instant the next credential
+        // check falls due. Waiting a fresh FULL tick from each WAKE is the trap: this pump is
+        // woken by every publication, so a wake landing just before the boundary would push
+        // the re-check out to nearly TWO ticks and silently double the revocation bound that
+        // Decision 15(c)/CH-4 promises. Frequent wakes are harmless - each re-tests the gate;
+        // the bad case is ONE wake just before the boundary followed by silence.
+        //
+        // `ceil`, not `duration_cast`: flooring a sub-millisecond remainder to a zero budget
+        // returns instantly and re-enters, spinning out heartbeat frames until real time
+        // crosses. Rounding up overshoots by at most 1ms, which the bound absorbs.
+        //
+        // Sampled INSIDE the lock: a contended acquisition would otherwise size the wait from
+        // a stale reading and overshoot the deadline it is meant to respect.
+        const auto now_before = clock_ ? clock_() : std::chrono::steady_clock::now();
+        const auto until_check =
+            next_check_ > now_before
+                ? std::chrono::ceil<std::chrono::milliseconds>(next_check_ - now_before)
+                : std::chrono::milliseconds{0};
+        sink_->sse->cv.wait_for(lk, std::min(cfg_.tick, until_check), [this] {
             // dropped_total is in the predicate (#2366): a producer-side containment can
             // bump dropped_total WITHOUT enqueueing a frame (the by-value copy threw after
             // the ring commit), so `queue.empty()` alone would keep the synthetic waiting a
@@ -1063,7 +1087,18 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     // machine (revoke = immediate kill, indeterminate = bounded jittered grace, stale-cache floor
     // clamp) lives in RevalidateGrace so the streamed-POST pump shares it byte-for-byte (2f PR
     // 3b); this pump owns only the wire action taken on its verdict.
-    if (revalidate_) {
+    // PER TICK, not per wake - which is what the line above has always claimed. This pump is
+    // woken by every published frame, so running these two here unconditionally meant a full
+    // auth-store round trip AND a session-registry validate_and_touch PER FRAME. The latter
+    // walks every session under one global mutex, so the cost was O(sessions) per frame on
+    // the busiest surface in the product. The DRAIN below still runs on every wake; only the
+    // store round trips ride the tick.
+    const auto now_tp = clock_ ? clock_() : std::chrono::steady_clock::now();
+    const bool tick_due = now_tp >= next_check_;
+    if (tick_due) {
+        next_check_ = now_tp + cfg_.tick;
+    }
+    if (tick_due && revalidate_) {
         switch (grace_.on_verdict(revalidate_())) {
         case RevalidateGrace::Outcome::kCloseCredentialRevoked:
             stream_->close(McpStreamClose::kCredentialRevoked);
@@ -1079,7 +1114,7 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     // Session liveness. This is also the TTL slide: a genuinely-live stream keeps
     // its session young, so the registry's idle GC needs no live-stream exemption
     // (and a zombie peer stops ticking, so the normal TTL reclaims it).
-    if (session_alive_ && !session_alive_()) {
+    if (tick_due && session_alive_ && !session_alive_()) {
         return finish(write, McpStreamClose::kSessionTerminated);
     }
 

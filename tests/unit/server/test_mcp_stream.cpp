@@ -486,6 +486,100 @@ TEST_CASE("McpStreamPump: a healthy tick emits queued frames then a heartbeat",
     CHECK(wire.contains("event: heartbeat\n"));
 }
 
+TEST_CASE("McpStreamPump: credential revalidation is once per TICK, not once per wake",
+          "[mcp][stream][tickgate]") {
+    // THE DEFECT. The comment at the revalidate site has always read "Credential
+    // re-validation, once per tick". It was not. The pump's wait predicate wakes on every
+    // PUBLISHED FRAME (a producer notifies under the sink mutex), so a busy stream ran a
+    // full auth-store round trip AND a session-registry `validate_and_touch` per frame.
+    // `validate_and_touch` walks every session under one global registry mutex, so the cost
+    // is O(sessions) per frame, fleet-wide, on the surface agentic workers hammer hardest.
+    //
+    // The tick is the contract (Decision 15(c)/(i), CH-4). The DRAIN must still run on
+    // every wake - that is what makes progress feel immediate - but the two store round
+    // trips belong on the tick, which is what the comment already promised.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    int revalidations = 0;
+    int liveness_checks = 0;
+    auto now = std::chrono::steady_clock::now();
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(30); // long: a second check can only come from the gate
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] {
+                                ++revalidations;
+                                return mcp::StreamRevalidate::kValid;
+                            },
+                            [&] {
+                                ++liveness_checks;
+                                return true;
+                            },
+                            cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // Five wakes well inside one tick. Each publish makes the predicate true on arrival,
+    // so the pump never actually sleeps - exactly the busy-stream shape.
+    for (int i = 0; i < 5; ++i) {
+        state->publish("message", "frame-" + std::to_string(i));
+        REQUIRE(pump.pump_once(wire.writer()));
+    }
+    CHECK(revalidations == 0); // pre-fix: 5
+    CHECK(liveness_checks == 0);
+    for (int i = 0; i < 5; ++i) { // ...while every frame still went out immediately
+        CHECK(wire.contains("frame-" + std::to_string(i)));
+    }
+
+    // Cross the boundary and the check fires - the bound is a tick, not a suppression.
+    now += cfg.tick;
+    state->publish("message", "past-the-boundary");
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(revalidations == 1);
+    CHECK(liveness_checks == 1);
+}
+
+TEST_CASE("McpStreamPump: the wait is bounded by the next check, so the tick cannot stretch",
+          "[mcp][stream][tickgate]") {
+    // The trap that this exact fix fell into once already, on the abandoned branch: gating
+    // the checks on a deadline while still waiting a FRESH FULL TICK from each wake. A wake
+    // arriving just before the boundary then pushed the next check out to nearly TWO ticks,
+    // silently doubling the revocation bound the gate was supposed to preserve.
+    //
+    // Counter-intuitively, frequent wakes are harmless - each re-tests the gate. The bad
+    // case is ONE wake just before the boundary followed by silence, which is what a stream
+    // that emits a burst and then goes quiet does.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    auto now = std::chrono::steady_clock::now();
+    const auto base = now;
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(5); // deliberately long, so the two cases diverge hugely
+    mcp::McpStreamPump pump{attached.sink,      state, attached.generation,
+                            {},                 [] { return true; }, cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // DRAIN FIRST. `attach_and_replay` leaves replay state queued, so the wait predicate is
+    // already true on the first pass and the pump returns without ever sleeping. Measuring
+    // that pass would pass against the unclamped code too - a false green of exactly the
+    // kind this rung exists to stop.
+    REQUIRE(pump.pump_once(wire.writer()));
+
+    // Now the queue is empty, so this pass genuinely waits. Freeze 50ms short of the check:
+    // the pump must wake FOR it rather than restarting a full tick.
+    now = base + cfg.tick - std::chrono::milliseconds(50);
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(pump.pump_once(wire.writer()));
+    const auto waited = std::chrono::steady_clock::now() - started;
+    CHECK(waited < std::chrono::milliseconds(1500)); // correct ~50ms; unclamped ~5s
+}
+
 TEST_CASE("McpStreamPump/CH-4: a revoked credential kills the stream within one tick",
           "[mcp][stream][ch4]") {
     auto state = std::make_shared<mcp::McpStreamState>();
@@ -712,6 +806,10 @@ TEST_CASE("McpStreamPump/#2367: an authoritative re-confirmation does reset the 
     clock_now += std::chrono::milliseconds(900); // budget nearly spent on cached answers
     CHECK(pump.pump_once(wire.writer()));
 
+    // Cross a tick boundary first: re-validation is once per TICK, so a second pass at the
+    // SAME instant correctly does not ask the store again. Without this the re-confirmation
+    // below never happens and the budget is never reset.
+    clock_now += fast_cfg().tick;
     verdict = mcp::StreamRevalidate::kValid; // the store was actually asked
     CHECK(pump.pump_once(wire.writer()));
 

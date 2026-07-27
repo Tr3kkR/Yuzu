@@ -661,6 +661,17 @@ private:
     std::function<bool()> session_alive_;
     Config cfg_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
+    ClockFn clock_; ///< copy of the injected clock; `grace_` owns the other one
+    /// When the next credential re-check falls due. SEEDED IN THE CTOR to
+    /// `now + cfg_.tick`, never left default-constructed: a default `time_point` is the
+    /// steady_clock EPOCH, which would make the first pass's wait budget zero and turn it
+    /// into an instant no-op pass. That is not hypothetical - it shipped on an earlier
+    /// attempt at this fix and silently invalidated the test that certified the wake path.
+    ///
+    /// This drives the GATE only. The DRAIN still runs on every wake, so progress reaches
+    /// the wire as it happens; only the two store round trips (credential re-validation and
+    /// the session TTL slide) ride the tick.
+    std::chrono::steady_clock::time_point next_check_{};
     // The credential re-validation grace policy (revoke/indeterminate/valid/stale, jitter,
     // #2367 staleness clamp). Owns all of the grace state + the injected clock; this pump keeps
     // only the wire action taken on its verdict. Constructed from cfg_ + the ClockFn.
