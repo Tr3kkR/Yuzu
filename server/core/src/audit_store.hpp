@@ -329,13 +329,17 @@ private:
     // all-expired store age out at the capped rate for the cost of one interval.
     // An EVENT is a clock MOVEMENT, and it can only be observed at all because
     // the reading is re-anchored every pass: a second jump is a second incident,
-    // never a continuation of the first, so it must report every time. Both
-    // directions count WHILE RETENTION IS ENABLED -- `Step` covers a forward
-    // jump, and `BadState` carries a backward one via `*prev > now`, which is
-    // why `cleanup_once` tests that carrier and not just the enum. With
-    // `audit_retention_days` at 0 the `Step` half is gated off entirely, so a
-    // forward jump is then seen only when it rides in on an unusable prior
-    // reading (dead CMOS, then NTP) and classifies as `BadState`.
+    // never a continuation of the first, so it must report every time. A
+    // backward movement arrives via `BadState`'s `*prev > now` carrier rather
+    // than the enum alone, which is why `cleanup_once` tests that carrier.
+    //
+    // Which anomalies are reachable, and the PRECONDITIONS on each (the
+    // `window > 0` gate on `Step`, the `has_expired` short-circuit ahead of it,
+    // the inclusive-vs-strict floor), are stated once in `classify()` in
+    // `audit_retention_rules.hpp` and, for operators, in
+    // `docs/user-manual/audit-log.md#the-retention-clock-guard`. Do not restate
+    // them here: this rule was previously paraphrased across seven surfaces and
+    // drifted between them every time it was corrected.
     //
     // A DIFFERENT condition arriving mid-anomaly is still reported by the
     // inequality half. A single bool could express none of this.

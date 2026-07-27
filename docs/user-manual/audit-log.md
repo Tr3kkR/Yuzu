@@ -374,37 +374,63 @@ refuses to act on that:
   --- are excluded from the "would this expire everything?" question. Without
   that, one such row would disarm the guard permanently.
 
-**Conditions are reported once; clock movements are reported every time.** An
-all-expired table or a corrupt stored reading is a *condition* -- it persists
-until something changes, so it warns once and the backlog then drains at the
-capped rate, provided the underlying facts stay put (see the alternating-clock
-case below, where they do not). A clock jump is an *event*: the guard re-anchors its reading every
-pass, so a jump can only be detected if the clock moved since the last pass.
-Both directions count while retention is ENABLED, against a 7-day floor:
-backward movement of at least that much, and forward movement of more than that
-much, warn on every recurrence, so a clock stepping repeatedly produces one
-warning per step rather than one in total. (The forward comparison is strict and
-the backward one is not, so a movement of exactly 7 days warns backward but not
-forward.) With `audit_retention_days` set to 0 the forward detector is gated
-off, so a forward jump is then reported only when it arrives with an unusable
-prior reading -- the dead-CMOS-then-NTP case. The directions are not symmetric
-in that configuration.
-Movement BELOW the floor is treated as a condition, not an event -- it warns
-once and then lets the backlog drain. That floor is load-bearing: because a
-warning suppresses deletion for that pass, treating a one-second drift as an
-event would stop retention permanently on any server whose clock wobbles
+**When a pass declines.** A pass either deletes (capped) or declines; a decline
+warns, deletes nothing, and adds one to
+`yuzu_server_audit_clock_anomaly_skips_total`. The decision is a pure function of
+four facts evaluated in order. `classify()` in
+`server/core/src/audit_retention_rules.hpp` is the authoritative statement of the
+rule; this section is its operator-facing description, and **this page is the
+only place the rule is written out in prose** --- the metric HELP strings, the
+alert annotations and the release notes point here rather than restating it.
+
+| # | Fact | Result | What it requires |
+|---|---|---|---|
+| 1 | The persisted prior reading is unusable: negative, *ahead* of `now`, present but not an integer, or unreadable | `BadState` | Nothing. It is tested FIRST, so it reports even with nothing expired and even with retention disabled. |
+| 2 | Nothing in the table is expired | `None` --- no decline | --- |
+| 3 | The gap since the previous pass is **more than** 7 days | `Step` | `audit_retention_days > 0`, **and** something expired |
+| 4 | The pass would expire every datable row | `Wipe` | Something expired |
+
+**A decline is reported --- and reporting is what suppresses that pass's delete
+--- when the anomaly is an EVENT, or when the fact set differs from the last one
+reported.** An EVENT is a `Step`, or a `BadState` carrying a clock movement of at
+least 7 days in either direction. Everything else is a CONDITION: it reports
+once, and an identical fact set on the next pass is deduplicated, so the backlog
+drains at the capped rate.
+
+Two boundary facts follow, and they are **not** symmetric:
+
+- **Backward** movement of **at least** 7 days is re-reported on every pass. It
+  needs neither retention enabled nor anything expired, because it arrives as
+  `BadState` at step 1.
+- **Forward** movement of **more than** 7 days is re-reported on every pass, but
+  only while retention is enabled *and* something is expired. On a store younger
+  than its retention window --- every deployment for its first year at the
+  365-day default --- a forward jump of any size classifies `None` and is never
+  counted. A forward jump that arrives with an unusable prior reading (a dead
+  CMOS, then NTP) still reports, via `BadState`.
+
+**What starves retention.** Because every report suppresses that pass's delete,
+any clock that produces an EVENT on every pass halts the drain for as long as it
+lasts. Two shapes do that:
+
+- Movement at or above the 7-day floor on *every* pass, alternating or
+  ratcheting. Each leg is an event in its own right --- forward as `Step`,
+  backward as `BadState` --- so this starves whatever else is true.
+- Sub-floor alternation while a would-wipe condition stands: the fact set differs
+  on every pass, so the report-once rule never engages.
+
+Sub-floor movement is otherwise treated as a condition precisely to avoid this.
+Because a warning suppresses that pass's delete, treating a one-second drift as
+an event would stop retention permanently on any server whose clock wobbles
 between two disagreeing time sources.
 
-That fixes the MONOTONE case, which is the common shape. It does NOT fix an
-ALTERNATING clock. If the reading flips either side of one value while a
-would-wipe condition stands, the fact set differs on every pass, the
-report-once rule never engages, and the drain starves for as long as the
-alternation lasts. That case is tracked, not fixed. It is loud rather than
-silent: `yuzu_server_audit_clock_anomaly_skips_total` rises on every halted
-pass, so `YuzuAuditRetentionClockAnomaly` stays continuously firing instead of
-clearing. **An anomaly alert that never clears is the signal for this state** --
-a flat `yuzu_server_audit_rows_deleted_total` on its own looks the same as a
-quiet, healthy store.
+Neither shape is fixed; both are tracked. **Detect them from the counters, not
+from the alert's firing state.** A starved drain shows as
+`yuzu_server_audit_clock_anomaly_skips_total` rising once per pass while
+`yuzu_server_audit_rows_deleted_total` stays flat. Do not use "the alert never
+clears" as the test: `YuzuAuditRetentionClockAnomaly` evaluates
+`increase(...[1h])` against a pass period slightly longer than an hour, so it can
+resolve and re-fire on its own even while the drain is dead.
 
 **For a report-once anomaly, your log pipeline is the durable record, not the
 metric.** The alert rules fire on `increase()` over a rolling window, so once a
@@ -486,7 +512,7 @@ directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete, counted once per reported anomaly. Repeats of the same *condition* are not re-counted; qualifying clock *movements* are -- backward movement of at least 7 days always, forward movement of more than 7 days while retention is enabled. With `audit_retention_days` at 0 a forward jump is reported only when it arrives with an unusable prior reading. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete; nothing was deleted, and each declined pass adds exactly 1. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. Which cases re-report on every pass, and their preconditions, are in [The retention clock guard](#the-retention-clock-guard) above. |
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |

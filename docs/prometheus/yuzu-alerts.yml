@@ -523,37 +523,27 @@ groups:
         annotations:
           summary: "Audit retention declined a pass - clock, outage, or a retention change"
           description: >-
-            An audit retention pass declined. Triggers: it would have expired every datable
-            row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
-            threshold, not scaled to audit_retention_days); or the stored clock reading was
-            not usable (ahead of the clock, negative, present but not an integer, or
-            unreadable). This is NOT
-            exclusively a clock signal, and it is NOT one-warning-per-incident: a repeat of
-            the same CONDITION (all-expired table, corrupt stored reading) is reported once,
-            while a qualifying clock MOVEMENT is reported every time, since each jump is a
-            distinct event: backward movement of at least 7 days always, forward movement of
-            more than 7 days while retention is ENABLED. With audit_retention_days at 0 the
-            forward detector is gated off, so a forward jump is then reported only when it
-            arrives with an unusable prior reading. A flapping clock source
-            therefore produces one warning per step. Movement UNDER 7 days is a condition,
-            reported once -- deliberately, because a warning suppresses that pass's delete,
-            so treating small drift as an event would halt retention permanently. Also note REDUCING audit_retention_days narrows the survivor
-            horizon by design, so the first pass after that change can decline, and a
-            genuinely all-expired table declines once on its first pass. Check whether
-            retention was reconfigured before investigating the clock.
-            Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
-            host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
-            uptime history before concluding the clock is at fault. Nothing was deleted on this
-            pass. Retention NORMALLY resumes within a pass or two, paced at the per-pass cap
-            (on an ALL-EXPIRED store a step decline costs two passes rather than one, because
-            the fact set still differs on the following pass; where the step alone was the
-            anomaly, the next pass drains), but do not assume it did: confirm
-            yuzu_server_audit_rows_deleted_total is actually moving.
-            A clock alternating either side of one reading holds the guard in its declining
-            state indefinitely. THIS ALERT NOT CLEARING is the signal for that state, because
-            clock_anomaly_skips_total rises on every halted pass; a flat rows_deleted is the
-            confirmation, not the discriminator -- on its own it looks like a quiet, healthy
-            store.
+            An audit retention pass declined and deleted NOTHING. Triggers: it would have
+            expired every datable row; the gap since the previous pass exceeded a fixed 7 days
+            (an ABSOLUTE threshold, not scaled to audit_retention_days); or the stored clock
+            reading was not usable (ahead of the clock, negative, present but not an integer,
+            or unreadable). This is NOT exclusively a clock signal. REDUCING
+            audit_retention_days narrows the survivor horizon by design, so the first pass
+            after that change can decline, and a genuinely all-expired table declines once on
+            its first pass - check whether retention was reconfigured before investigating the
+            clock. Elapsed time cannot distinguish a forward jump from an outage, so check
+            BOTH the host's time synchronisation (restored snapshot, dead CMOS, hand-set date)
+            and its uptime history before concluding the clock is at fault.
+            TRIAGE - is the drain still moving? A one-off decline costs a pass or two and then
+            resumes. A clock that keeps moving can hold the guard declining indefinitely and
+            starve retention entirely. Tell them apart from the COUNTERS, not from whether
+            this alert clears: the starved state is
+            yuzu_server_audit_clock_anomaly_skips_total rising once per pass while
+            yuzu_server_audit_rows_deleted_total stays flat. Do NOT use this alert's firing
+            state as the test - its 1h lookback runs against a pass period slightly longer
+            than an hour, so it can resolve and re-fire on its own even while the drain is
+            dead. Which cases re-report on every pass, and their preconditions, are in the
+            runbook; this annotation deliberately does not restate the rule.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The counterpart signal. Both a declined pass and a broken pass leave rows

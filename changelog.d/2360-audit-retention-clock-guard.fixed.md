@@ -11,20 +11,17 @@
   server that BOOTED with an already-wrong clock, and an out-of-range poisoned
   value (negative, or ahead of the clock) is reported as an anomaly rather than
   quietly accepted. Reporting distinguishes conditions from events: a repeat of the
-  same CONDITION (an all-expired table, a corrupt stored reading) is not re-warned,
-  so a legitimately all-expired store still ages out at the capped rate, while a
-  qualifying clock MOVEMENT warns every time it recurs, because each jump is a
-  separate incident: backward movement of at least 7 days always, forward movement of
-  more than 7 days while retention is enabled (with `audit_retention_days` at 0 the
-  forward detector is gated off, and a forward jump is then reported only when it
-  arrives with an unusable prior reading). Smaller drift is treated as a condition and
-  warns once, so a clock drifting MONOTONICALLY between two disagreeing time sources
-  cannot halt retention by keeping the guard permanently in its declining state. A
-  clock ALTERNATING either side of one reading is NOT covered while a would-wipe
-  condition stands: the fact set then differs on every pass, so the report-once rule
-  never engages and the drain starves for as long as the alternation lasts. That case is tracked, not fixed, and it is loud rather than
-  silent -- the anomaly counter rises on every halted pass, so the alert stays
-  continuously firing instead of clearing. Every accepted pass is capped at 25,000 rows oldest-first. Rows
+  same CONDITION (an all-expired table, a corrupt stored reading) is not re-warned, so
+  a legitimately all-expired store still ages out at the capped rate, while a
+  qualifying clock MOVEMENT warns every time it recurs, because each jump is a separate
+  incident. Because a warning suppresses that pass's delete, a clock that keeps moving
+  can hold the guard declining and starve retention for as long as it lasts; that limit
+  is tracked, not fixed, and it shows as the anomaly counter rising once per pass while
+  `yuzu_server_audit_rows_deleted_total` stays flat. Exactly which cases re-warn on
+  every pass, and the preconditions on each, are stated once in
+  `docs/user-manual/audit-log.md#the-retention-clock-guard` - deliberately in one place,
+  because this rule was previously restated across seven surfaces and drifted between
+  them. Every accepted pass is capped at 25,000 rows oldest-first. Rows
   whose TTL sits implausibly far in the future are excluded from the decision, so
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe
