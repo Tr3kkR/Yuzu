@@ -339,10 +339,14 @@ private:
     // then the `has_expired` short-circuit), and `cleanup_once` owns how the
     // input facts are BUILT (`big_step`'s `window > 0` gate and strict `>`,
     // against `moved_at_least`'s inclusive magnitude test). Reading only one of
-    // the two does not recover the rule. The operator-facing statement is
-    // `docs/user-manual/audit-log.md#the-retention-clock-guard`. Do not restate
-    // any of it here: this rule was previously paraphrased across seven
-    // surfaces and drifted between them every time it was corrected.
+    // the two does not recover the rule, and there is no third statement of it:
+    // `docs/user-manual/audit-log.md#the-retention-clock-guard` is an operator
+    // RUNBOOK and deliberately does not carry the preconditions. Do not restate
+    // them here either -- this rule was previously paraphrased across seven
+    // surfaces and drifted between them every time it was corrected. The
+    // behaviours that kept drifting are pinned in
+    // `tests/unit/server/test_audit_store.cpp`; add a test rather than a
+    // sentence.
     //
     // A DIFFERENT condition arriving mid-anomaly is still reported by the
     // inequality half. A single bool could express none of this.

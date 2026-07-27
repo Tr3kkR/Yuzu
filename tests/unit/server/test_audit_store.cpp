@@ -831,25 +831,34 @@ TEST_CASE("AuditStore #2360: a young store IS protected against a large forward 
     // expires them, however young the store is. The jump SIZE decides this, not
     // the store's age.
     GuardFixture f;
+    LogCapture log;
     f.seed(kNow + kWindow, 5); // written "now", nothing expired yet: a young store
     REQUIRE(f.store.cleanup_once(kNow) == 0);
     REQUIRE(f.store.clock_anomaly_skips_count() == 0);
 
-    // A jump far past the rows' TTLs. Every row is now expired and no survivor
-    // sits inside the jumped horizon, so this is exactly the wipe the guard
-    // exists to refuse.
+    // A jump far past the rows' TTLs, so `has_expired` becomes true on a store
+    // that had nothing expired a moment ago. That is the whole point: the probe
+    // runs against the JUMPED reading.
+    //
+    // 30 days also clears the 7-day floor, so `classify` returns Step (which
+    // outranks the wipe) -- pinned below, because without it a broken
+    // `would_wipe` would hide behind `big_step` here and this test would not
+    // notice. The wipe path on a young store is a separate scenario.
     const std::int64_t jumped = kNow + 30 * 86400;
     CHECK(f.store.cleanup_once(jumped) == 0);
     CHECK(f.store.clock_anomaly_skips_count() == 1);
     CHECK(f.store.total_count() == 5); // refused, not deleted
+    CHECK(log.says("elapsed since the last retention pass")); // the Step branch, not Wipe
 }
 
 TEST_CASE("AuditStore #2360: retention disabled: a forward ratchet declines ONCE as a Wipe",
           "[audit_store][retention][clock-guard]") {
     // Two claims settled here. First, a forward ratchet on a retention-disabled
     // store does NOT starve the drain -- `Step` is unreachable with `window == 0`
-    // (pinned separately by the elapsed-time-step test above). Second, and the
-    // part a code comment and a doc paragraph both got wrong: it is not silent.
+    // (the gate itself is pinned by the 8-day-gap case below, which is the only
+    // test in this file whose elapsed gap clears the floor with retention off).
+    // Second, and the part a code comment and a doc paragraph both got wrong:
+    // it is not silent.
     // Once the ratchet carries `now` past the last legacy TTL the survivor probe
     // finds nothing, which is `Wipe`. `Wipe` is a CONDITION, so it declines once
     // and the following pass drains.
@@ -865,6 +874,35 @@ TEST_CASE("AuditStore #2360: retention disabled: a forward ratchet declines ONCE
     CHECK(store.clock_anomaly_skips_count() == 1);
     CHECK(store.cleanup_once(kNow + 1) == 5);          // same facts -> dedup -> drains
     CHECK(store.clock_anomaly_skips_count() == 1);     // and NOT counted twice
+}
+
+TEST_CASE("AuditStore #2360: retention disabled: an 8-day gap is still not a step",
+          "[audit_store][retention][clock-guard]") {
+    // Pins the `window > 0` conjunct in `big_step`, which had NO red/green
+    // coverage before this case: every other retention-disabled test in this
+    // file uses an elapsed gap far under kAuditMinBigStepSec, so deleting the
+    // conjunct left the whole [clock-guard] suite green. The gate is what stops
+    // a retention-off store from taking a step decline it has no expiry policy
+    // to justify.
+    //
+    // A survivor is kept at BOTH readings so `would_wipe` stays false and a STEP
+    // is the only thing that could decline these passes.
+    yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-off-gap-"}};
+    AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+
+    seed_rows_with_ttl(tmp.path, kNow - 100, 5);
+    seed_rows_with_ttl(tmp.path, kNow + 3'600, 1); // inside the 2-day future slack
+    REQUIRE(store.cleanup_once(kNow) == 5);
+    REQUIRE(store.clock_anomaly_skips_count() == 0);
+
+    // Eight days on: comfortably past the 7-day floor. With the gate removed
+    // this classifies Step and declines instead of draining.
+    const std::int64_t later = kNow + 8 * 86400;
+    seed_rows_with_ttl(tmp.path, kNow - 50, 5);
+    seed_rows_with_ttl(tmp.path, later + 3'600, 1);
+    CHECK(store.cleanup_once(later) == 6); // 5 new + the first survivor, now expired
+    CHECK(store.clock_anomaly_skips_count() == 0);
 }
 
 TEST_CASE("AuditStore #2360: a forward movement of EXACTLY the floor is not a step",

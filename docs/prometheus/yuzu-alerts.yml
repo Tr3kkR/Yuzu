@@ -593,7 +593,7 @@ groups:
             pass) is below this fleet's audit volume, so audit.db grows without bound;
             the cap is a compile-time constant today, so this needs an engineering
             escalation rather than a config change.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
 
       # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
       # a counter RISING, so none of those fires when the cleanup thread never

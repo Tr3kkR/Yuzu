@@ -896,7 +896,7 @@ consequences on upgrade:
   6.9 audit events/second - compare it against your own event rate before
   deploying at scale. Note that changing `--audit-retention-days` never re-dates
   existing rows (`ttl_expires_at` is stamped at INSERT), so a reduction does not
-  reclaim disk retroactively. Full behaviour:
+  reclaim disk retroactively. Operator triage when the guard declines a pass:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
