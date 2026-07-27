@@ -816,28 +816,38 @@ How it works:
 - Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.
 - Multiple stores share one database connection but keep independent version counters.
 
-**Index builds are deliberately kept OUT of the migration runner.** A failed
-migration closes the store, and for `audit_store` that means every audit write
-then fails - so an `O(N log N)` index build on a multi-million-row table is not
-routed through the fail-closed path. The `audit_store` retention index
-(`idx_audit_ttl_id`, #2360) is created best-effort after migrations instead: on a
-large existing `audit_events` this is a one-time build at first boot after
-upgrade (~1.4 s and ~81 MB at 5M rows, extrapolating to ~16 s at 50M), and the
-elapsed time is logged when it exceeds a second. If it fails, retention still
-runs - each pass just scans instead of seeking, and the failure is logged as an
-error.
+**Indexes are normally migration entries. `audit_store`'s retention index is a
+deliberate, single exception** (`idx_audit_ttl_id`, #2360) - every other index in
+the server is created inside `MigrationRunner`, and new code should follow that
+rule, not this one. Two conditions justify the exception here and both must hold
+before it is copied: (a) a failed migration closes the store, and for
+`audit_store` that means every audit write then fails, taking the SOC 2 trail
+offline; and (b) the build is `O(N log N)` over an existing multi-million-row
+table, unlike the v1 indexes which are created on an empty one. A best-effort
+object may silently not exist, so nothing with a CORRECTNESS dependency may use
+this path - the retention guard is correct without its index, only slower.
 
-**Container operators: check your healthcheck `start_period` before this
-upgrade if `audit_events` is large.** The build runs inside the `AuditStore`
-constructor, which completes well before the server binds its listener, so for
-its whole duration there is no `/healthz` responder. A healthcheck whose
-`start_period` is shorter than the build will kill the container mid-build - and
-because nothing was committed, the next boot starts the build again, so it
-restart-loops rather than converging. The shipped compose files use a 5-10 s
-`start_period`, which is sized for a fresh database; raise it past your expected
-build time (see the figures above) for the one upgrade boot. The stock
-365-day-retention server is unaffected until `audit_events` reaches the
-multi-million-row range.
+Cost on a large existing `audit_events`: a one-time build at first boot after
+upgrade, measured at ~81 MB and ~1.8-3.3 s at 5M rows on NVMe. At 50M rows the
+build reads a ~16 GB table - tens of seconds on local NVMe, and potentially
+minutes on container overlayfs or network storage.
+
+**This runs synchronously, before the server binds its listeners**, so nothing
+answers `/livez` or `/readyz` until it finishes. If your orchestrator's
+kill-before-ready budget is shorter than the build you get a CRASH LOOP rather
+than a slow boot: `CREATE INDEX` is one atomic statement, so every killed attempt
+rolls back and the next boot re-pays it in full, indefinitely. Budget at least
+**5 minutes** before the first liveness kill for an `audit_events` above ~20M
+rows on non-NVMe storage. The shipped
+`deploy/docker/docker-compose.reference.yml` sets `start_period: 30s`, which is
+fine for a fresh install and NOT enough for a large first post-upgrade boot -
+raise it before upgrading such a deployment. The
+elapsed time is logged when it exceeds a second, and subsequent boots are a
+no-op. If the build fails, retention still runs, but each pass then scans the
+table AND sorts the whole expired backlog for its `ORDER BY ... LIMIT` (measured
+2.0 s versus ~285-315 ms for the same capped pass WITH the index; the range
+reflects different benchmark runs, not two different operations) - still far better than the unguarded code it
+replaced, but the failure is logged as an error.
 
 **Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
 
@@ -881,25 +891,30 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   rows, so a large backlog ages out over hours rather than in one statement.
   Watch `yuzu_server_audit_retention_cap_reached_total` alongside
   `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
-  Note that changing `--audit-retention-days` never re-dates existing rows
-  (`ttl_expires_at` is stamped at INSERT), so a reduction does not reclaim disk
-  retroactively. Full behaviour:
+  That cap is a fixed drain rate, which implies a sustained ceiling of roughly
+  6.9 audit events/second - compare it against your own event rate before
+  deploying at scale. Note that changing `--audit-retention-days` never re-dates
+  existing rows (`ttl_expires_at` is stamped at INSERT), so a reduction does not
+  reclaim disk retroactively. Operator triage when the guard declines a pass:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
-- **Expect a retention decline on the first pass after upgrade.** Both guards
-  decline when they find no stored clock reading to compare against, because the
-  elapsed-time check cannot run without one. It is logged, it increments the
-  decline counter, and it needs no action - the next pass proceeds normally.
-  **The count differs by store:** the audit store is one table, so it declines
-  exactly once. TAR checks per warehouse table, so on an agent upgrade every
-  enabled time-based table declines in that same pass and
-  `retention_guard_declines_total` rises by the number of those tables (5-10 on
-  a default agent), not by 1. That is still the benign bootstrap case, not a
-  fleet of separate anomalies. On a fleet upgrade expect one
-  `YuzuAuditRetentionClockAnomaly` per server if you have wired it; stand them
-  down. See [the runbook](../ops-runbooks/audit-store-clock-guard.md).
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
-  table holding the durable clock reading - one row, instant) plus the best-effort index build described
-  under Schema Migrations above.
+  table holding the durable clock reading - one row, instant) plus the
+  best-effort index build described under Schema Migrations above.
+- **Expect a first-pass retention decline on the AGENT, and only conditionally on
+  the server.** The two guards differ here and the difference matters:
+  - **TAR declines on a missing anchor, by design.** It checks per warehouse
+    table, so on an agent upgrade every enabled time-based table declines in that
+    same pass and `retention_guard_declines_total` rises by the number of those
+    tables (5-10 on a default agent), not by 1. That is the benign bootstrap
+    case, not a fleet of separate anomalies, and it needs no action.
+  - **The audit store's triggers are NOT the same**, so do not carry the agent's
+    expectation across to it and do not pre-emptively stand down
+    `YuzuAuditRetentionClockAnomaly` on a fleet upgrade. If one fires, work it as
+    an alert rather than assuming a benign bootstrap:
+    [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard)
+    states when the server's guard declines, and
+    [the ops runbook](../ops-runbooks/audit-store-clock-guard.md) is the response
+    path.
 - **Agents surface new `tar status` lines**: `storage_state`,
   `retention_guard_declines_total`, `retention_guard_failures_total`, and
   per-table detail. On the healthy path `storage_state|ok` is the first line,
@@ -916,6 +931,13 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
   but a large excess (after a long disable, or an upgrade backlog) drains over
   several 900 s rollup ticks rather than in one statement.
+
+Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
+declined-pass and failed-pass counters must be alerted on separately: both leave
+rows undeleted, so an audit table that never shrinks looks identical either way.
+One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
+state in which none of the other counter-driven rules can fire, because they all
+key on a counter rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 
