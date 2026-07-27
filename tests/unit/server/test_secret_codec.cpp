@@ -1100,13 +1100,25 @@ TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_can
 
     std::expected<std::size_t, SecretCodec::LifecycleError> result;
     std::atomic<bool> done{false};
-    // std::jthread, not std::thread: its destructor joins safely on unwind
-    // (no std::terminate on a joinable thread) — belt-and-braces alongside
+    // A plain std::thread plus an explicit join-guard, NOT std::jthread:
+    // Apple Clang's libc++ does not provide std::jthread, so the jthread
+    // form compiles on GCC/MSVC and breaks the macOS leg (caught by CI on
+    // #2580 — local Linux success proves nothing about this). The guard
+    // gives the same guarantee jthread was chosen for: ~thread on a still
+    // joinable thread calls std::terminate, killing the whole shard with no
+    // diagnostic, and the FAIL() below throws. Belt-and-braces alongside
     // keeping every REQUIRE/CHECK outside the construction-to-join window.
-    std::jthread worker([&] {
+    std::thread worker([&] {
         result = codec.live_kek_version_count(conn.get());
         done.store(true, std::memory_order_release);
     });
+    struct JoinGuard {
+        std::thread& t;
+        ~JoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{worker};
 
     bool sent_cancel = false;
     for (int attempt = 0; attempt < 100 && !done.load(std::memory_order_acquire); ++attempt) {
@@ -1143,8 +1155,8 @@ TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_can
     // vacuously true — it can never observe a cancellation/termination that
     // failed to land, because the test would already be hung at join()
     // instead of reaching that REQUIRE. FAIL loudly here instead, with the
-    // pid so a real wedge is diagnosable, before letting ~jthread's join()
-    // potentially block the rest of the shard.
+    // pid so a real wedge is diagnosable, before letting the join-guard's
+    // join() potentially block the rest of the shard.
     if (!done.load(std::memory_order_acquire)) {
         FAIL("worker did not observe cancellation or forced termination within "
              "the bound (backend pid " +
