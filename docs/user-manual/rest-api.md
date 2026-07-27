@@ -5274,7 +5274,7 @@ Send a command to one or more connected agents.
   "plugin": "hardware",
   "action": "cpu-info",
   "agent_ids": ["agent-01", "agent-02"],
-  "parameters": {},
+  "params": {},
   "stagger": 30,
   "delay": 5
 }
@@ -5284,13 +5284,33 @@ Send a command to one or more connected agents.
 |---|---|---|---|---|
 | `plugin` | string | Yes | -- | Target plugin name. |
 | `action` | string | Yes | -- | Action within the plugin. |
-| `agent_ids` | array of string | No | `[]` | Target agent IDs. Empty = broadcast to all. |
-| `parameters` | object | No | `{}` | Key-value parameters passed to the plugin. |
-| `scope` | string | No | `""` | Scope expression for device targeting (alternative to `agent_ids`). |
+| `agent_ids` | array of string | No | -- | Target agent IDs. **Omit the field** to broadcast. A supplied `[]`, a non-array value, or a non-string entry returns `400` (#2500). |
+| `params` | object | No | `{}` | Key-value parameters passed to the plugin. (This table previously named the field `parameters`; the handler has always read `params`, so a client written to the old text silently dispatched with no parameters at all.) |
+| `scope` | string | No | -- | Scope expression for device targeting (alternative to `agent_ids`), or `__all__` for every enrolled agent. A supplied `""` or non-string value returns `400` (#2500). |
 | `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. |
 | `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). |
 
-If `agent_ids` is empty or omitted and no `scope` is provided, the command is broadcast to all connected agents.
+**Targeting: omitted means everything, supplied-but-empty is an error (#2500).**
+Omitting **both** `agent_ids` and `scope` broadcasts to all connected agents, as does an
+explicit `"scope": "__all__"`. Supplying either field with a value that names no device is
+refused with `400` rather than widened — an empty `agent_ids`, a non-array `agent_ids`, a
+non-string entry, an empty `scope`, or a non-string `scope`. Before this, a client emitting
+numeric device ids (`"agent_ids": [1,2,3]`) or one whose device filter matched nothing
+(`"agent_ids": []`) dispatched to the **entire fleet** and received a success response.
+
+`agent_ids` and `scope` are **alternatives — supply exactly one, or neither.** Supplying
+`agent_ids` together with a real `scope` returns `400` (`reason=target_conflict`). They used to
+resolve by precedence, with the scope winning and the explicit id list silently discarded, so
+`{"agent_ids":["dev-a"],"scope":"tag:prod"}` ran on every device matching `tag:prod` rather than
+on `dev-a` — the same "the executed set is not the requested set" defect this section is about,
+reached by two selectors disagreeing instead of by one being erased.
+
+The single exception is `"scope": "__all__"` alongside `agent_ids`: `__all__` is the broadcast
+*request* rather than a narrowing selector, and the explicit id list wins.
+
+Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",reason=...}` and
+write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
+must be a JSON object; anything else is `400`.
 
 ---
 
@@ -5425,13 +5445,21 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 ```json
 {
   "agent_ids": ["agent-uuid-1"],
-  "scope": "",
   "params": {"key": "value"}
 }
 ```
 
-- `agent_ids` (optional) — array of agent IDs to target
-- `scope` (optional) — scope expression (e.g., `group:servers`). Empty string + empty `agent_ids` = broadcast
+- `agent_ids` (optional) — array of agent IDs to target. **Omit** to broadcast; a supplied `[]`,
+  a non-array value, or a non-string entry returns `400` (#2500).
+- `scope` (optional) — scope expression (e.g., `group:servers`), or `__all__` for every enrolled
+  agent. A supplied `""` or non-string value returns `400`.
+
+> **Behaviour change (#2500).** This endpoint previously documented "empty string + empty
+> `agent_ids` = broadcast", and an explicitly empty `agent_ids` did broadcast. It is now `400`.
+> **Omit both fields** (or send `"scope": "__all__"`) to target the whole fleet deliberately.
+> Refusals increment `yuzu_server_dispatch_target_rejected_total{route="instruction_execute"}`
+> and write an `instruction.execute` audit row with `result=denied`. The body must be a JSON
+> object; anything else is `400`.
 - `params` (optional) — key-value parameters passed to the plugin
 
 **Response (200):**

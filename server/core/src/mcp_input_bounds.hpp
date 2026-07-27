@@ -9,10 +9,13 @@
 
 #include <nlohmann/json.hpp>
 
-#include "bundle_service.hpp" // kMaxParamCountPerStep / kMaxParamKeyLen / kMaxParamValueLen
-                              // (also kMaxBundleSteps, which the sizing test reaches
-                              // through this header)
-#include "mcp_jsonrpc.hpp"    // kMcpMaxRequestBodyBytes, for the sizing static_asserts below
+#include "bundle_service.hpp"        // kMaxParamCountPerStep / kMaxParamKeyLen / kMaxParamValueLen
+                                     // (also kMaxBundleSteps, which the sizing test reaches
+                                     // through this header)
+#include "dispatch_target_shape.hpp" // BoundViolation + check_targeting_shape: the
+                                     // omitted-vs-supplied rule, shared with the REST
+                                     // twins (#2500) because it was never MCP-specific
+#include "mcp_jsonrpc.hpp"           // kMcpMaxRequestBodyBytes, for the sizing static_asserts below
 
 /// @file mcp_input_bounds.hpp
 /// The ONE home for MCP request-size bounds (#2437) — transport and handler.
@@ -63,7 +66,7 @@ inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      //
 /// `docs/user-manual/metrics.md`. The boot pre-seed follows automatically; the
 /// docs copy does not, and a test asserts this array's size so the third copy
 /// cannot be forgotten quietly.
-inline constexpr std::array<std::string_view, 13> kExecInstrBoundReasons{
+inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
     // Length/count bounds.
     "ident_len",       "scope_len",       "param_count",     "param_key_len",
     "param_value_len", "agent_ids_count", "agent_id_len",
@@ -73,6 +76,10 @@ inline constexpr std::array<std::string_view, 13> kExecInstrBoundReasons{
     // plugin/action-required guard so that rejection is counted too.
     "agent_id_type",   "agent_ids_type",  "agent_ids_empty", "scope_type",
     "scope_empty",     "ident_empty",
+    // #2500: agent_ids AND a real scope together are ambiguous - the old
+    // precedence silently discarded the explicit id list in favour of the
+    // broader scope. Same surface, same rule, so the same closed label.
+    "target_conflict",
 };
 
 // ── Sizing: the per-field caps must fit under the TRANSPORT cap ───────────
@@ -132,15 +139,39 @@ static_assert(2 * kOneSaturatedBundleStep > kMcpMaxRequestBodyBytes,
               "the bundle clamp documented in docs/mcp-server.md — if this stops holding, "
               "the clamp changed and the docs must change with it");
 
-/// One violated bound. Neither field is ever caller-derived.
-struct BoundViolation {
-    /// Closed-set metric label - stays a literal.
-    const char* reason;
-    /// Operator-facing text, formatted FROM the constants: hardcoding the
-    /// numbers here would let this path and the handler's std::format siblings
-    /// report different limits for the same bound after a change.
-    std::string message;
-};
+/// One violated bound. Defined in `dispatch_target_shape.hpp` now that the
+/// targeting rules are shared with the REST twins (#2500).
+///
+/// Kept as a compat shim, not because call sites need it: governance checked,
+/// and every consumer in `server/` and `tests/` spells it `auto`, so nothing
+/// outside these two headers names the type. An earlier version of this comment
+/// claimed the alias keeps existing call sites unchanged — it does, vacuously.
+using BoundViolation = yuzu::server::BoundViolation;
+
+/// Every reason `check_targeting_shape` can emit must ALSO be a member of
+/// `kExecInstrBoundReasons` above, because `server.cpp` pre-seeds the MCP
+/// counter by iterating that array and `check_exec_instruction_shape`
+/// delegates its targeting arm to that function. Adding a targeting reason in
+/// the shared header and forgetting this one would leave the MCP series
+/// emitted-but-unseeded — the exact `absent()`-alerting break the single-array
+/// discipline exists to prevent, reintroduced through the seam that split the
+/// arrays apart. Same both-or-neither rule as the H2/G9 enum cross-checks: a
+/// build failure, not a test failure.
+[[nodiscard]] constexpr bool targeting_reasons_are_bound() {
+    for (const auto r : yuzu::server::kTargetingShapeReasons) {
+        bool found = false;
+        for (const auto e : kExecInstrBoundReasons)
+            if (e == r)
+                found = true;
+        if (!found)
+            return false;
+    }
+    return true;
+}
+static_assert(targeting_reasons_are_bound(),
+              "a reason in kTargetingShapeReasons is missing from kExecInstrBoundReasons - the "
+              "MCP counter's boot pre-seed would not cover it, so it would be emitted but "
+              "unseeded and absent() alerting would silently break");
 
 /// The `execute_instruction` bounds the CLOSED schema subset cannot express
 /// (it has no `maxProperties` / `propertyNames`), factored out so the C8
@@ -194,35 +225,14 @@ check_exec_instruction_shape(const nlohmann::json& args) {
         }
     }
     // ── targeting: type, and supplied-but-empty ──────────────────────────
-    // Both matter for the same reason: the handler drops what it cannot use,
-    // an emptied target set falls into the `__all__` default, and `__all__`
-    // means the entire fleet. The schema can express neither rule — `items`
-    // type-checking is not applied by the operator tier (which has no C8
-    // gate at all), and there is no `minItems`. A human approving a ticket
-    // that reads `agent_ids: []` must not be approving a fleet-wide dispatch.
-    if (args.contains("agent_ids")) {
-        const auto& a = args["agent_ids"];
-        if (!a.is_array())
-            return BoundViolation{"agent_ids_type", "agent_ids must be an array of strings"};
-        if (a.empty())
-            return BoundViolation{"agent_ids_empty",
-                                  "agent_ids was supplied but is empty; omit it to target "
-                                  "all agents deliberately"};
-        for (const auto& v : a) {
-            if (!v.is_string())
-                return BoundViolation{"agent_id_type", "agent_ids entries must be strings"};
-        }
-    }
-    if (args.contains("scope")) {
-        const auto& sc = args["scope"];
-        if (!sc.is_string())
-            return BoundViolation{"scope_type", "scope must be a string"};
-        if (sc.get_ref<const std::string&>().empty())
-            return BoundViolation{"scope_empty",
-                                  "scope was supplied but is empty; omit it to target all "
-                                  "agents deliberately"};
-    }
-    return std::nullopt;
+    // Delegated to the shared `check_targeting_shape` (#2500). The rules and
+    // their messages are unchanged — they moved out of this function verbatim
+    // — but they were never MCP-specific: `POST /api/command` and
+    // `POST /api/instructions/{id}/execute` had the identical widening under a
+    // weaker gate, and a second copy over there is how the same defect would
+    // survive the fix a third time. Kept LAST so the violation order this
+    // function documents is unchanged.
+    return yuzu::server::check_targeting_shape(args);
 }
 
 } // namespace yuzu::server::mcp
