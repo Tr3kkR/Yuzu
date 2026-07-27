@@ -19,11 +19,17 @@ Background: `docs/user-manual/audit-log.md`, ADR-0006, issue #2360.
 
 `audit_events` rows expire on a TTL derived from the server's wall clock. A
 forward clock jump makes every row look expired at once, and the delete that
-follows takes the whole retained window. The guard bounds that: a pass DECLINES
-ONCE when it would expire every datable row, when more than 7 days elapsed
-since the previous pass, when the stored clock reading is ahead of now, or when
-there is no stored reading at all so the elapsed-time check cannot run. It then
-PACES - the next pass deletes, capped at 25,000 rows.
+follows takes the whole retained window. The guard bounds that: a pass declines
+when it would expire every datable row, when more than 7 days elapsed since the
+previous pass, or when the stored clock reading is unusable. Reducing
+`audit_retention_days` can also produce one, by narrowing the survivor horizon.
+It then PACES - the next pass deletes, capped at 25,000 rows.
+
+**A missing stored reading is NOT a trigger on its own.** Plain absence is the
+ordinary fresh-install case and says nothing about the clock; it becomes visible
+only as the no-previous-reading variant of the would-expire-everything decline.
+Do not read a decline as evidence that the clock moved until the log line says
+so.
 
 A repeat of the SAME condition is suppressed, so a legitimately all-expired
 store still ages out; a DIFFERENT anomaly arriving underneath a reported one is
@@ -92,7 +98,11 @@ durable state living in the same database as the evidence.
 
 ## YuzuAuditRetentionFailing - passes are erroring
 
-Retention is not running at all, so `audit.db` grows without bound. Check the
+Passes are being ATTEMPTED and are erroring or only partially healthy - one of
+the failure sites fires even after a successful delete, so this does not mean
+nothing was deleted. It is also NOT the reaper stopping: that is
+`YuzuAuditRetentionNotRunning`, a separate rule keyed on no pass being attempted
+at all. Check the
 log for the sqlite error, then disk space, file permissions on `audit.db`, and
 whether a failed migration closed the store (in which case audit WRITES are also
 failing and behavioural-PII routes are returning 503 - a much louder problem).

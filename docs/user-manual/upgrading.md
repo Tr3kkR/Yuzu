@@ -900,19 +900,22 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
-- **Expect a retention decline on the first pass after upgrade.** Both guards
-  decline when they find no stored clock reading to compare against AND there is an
-  expired backlog to act on, because the elapsed-time check cannot run without an
-  anchor. It is logged, it increments the
-  decline counter, and it needs no action - the next pass proceeds normally.
-  **The count differs by store:** the audit store is one table, so it declines
-  at most once. TAR checks per warehouse table, so on an agent upgrade every
-  enabled time-based table declines in that same pass and
-  `retention_guard_declines_total` rises by the number of those tables (5-10 on
-  a default agent), not by 1. That is still the benign bootstrap case, not a
-  fleet of separate anomalies. On a fleet upgrade expect one
-  `YuzuAuditRetentionClockAnomaly` per server if you have wired it; stand them
-  down. See [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+- **Expect a first-pass retention decline on the AGENT, and only conditionally on
+  the server.** The two guards differ here and the difference matters:
+  - **TAR declines on a missing anchor, by design.** It checks per warehouse
+    table, so on an agent upgrade every enabled time-based table declines in that
+    same pass and `retention_guard_declines_total` rises by the number of those
+    tables (5-10 on a default agent), not by 1. That is the benign bootstrap
+    case, not a fleet of separate anomalies, and it needs no action.
+  - **The audit store does NOT.** A missing stored reading is the ordinary
+    fresh-install case and is not a trigger on its own. Its first guarded pass
+    declines only if that pass would ALSO have expired every datable row - an
+    expired backlog with any surviving row deletes normally, with no decline and
+    no alert. So do not pre-emptively stand down
+    `YuzuAuditRetentionClockAnomaly` on a fleet upgrade: if one fires, the pass
+    was about to expire the whole table, which is worth confirming the clock over
+    before the next capped pass drains it. See
+    [the runbook](../ops-runbooks/audit-store-clock-guard.md).
 - **Agents surface new `tar status` lines**: `storage_state`,
   `retention_guard_declines_total`, `retention_guard_failures_total`, and
   per-table detail. On the healthy path `storage_state|ok` is the first line,
