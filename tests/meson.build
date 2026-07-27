@@ -417,6 +417,7 @@ if build_server
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
       'unit/server/test_mcp_body_cap.cpp',
+      'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',

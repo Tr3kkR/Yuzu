@@ -2,6 +2,7 @@
 
 #include "stream_budget.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include "approval_manager.hpp"
@@ -98,6 +99,11 @@ public:
         /// and the SSE handler subscribes per-connection. nullptr leaves
         /// the SSE route unregistered (test harnesses that don't need it).
         class ExecutionEventBus* execution_event_bus{nullptr};
+        /// #2500 — counts `yuzu_server_dispatch_target_rejected_total` when a
+        /// caller-supplied targeting argument names nothing and the execute
+        /// route refuses it. nullptr = no metric (test harnesses that do not
+        /// assert on it); the REFUSAL itself never depends on this being wired.
+        yuzu::MetricsRegistry* metrics{nullptr};
     };
 
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink

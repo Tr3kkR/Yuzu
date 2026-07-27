@@ -191,6 +191,88 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — a device target that was supplied but names nothing is now refused, not widened to the fleet (#2500)
+
+**What changed.** Three REST surfaces treated a targeting argument the caller *supplied* that
+resolved to no devices as identical to one they never sent — and "no target named" meant
+broadcast. `POST /api/command` with `{"plugin":"service","action":"restart","agent_ids":[1,2,3]}`
+restarted the service on **every connected agent** under plain `Execution:Execute`, with no
+approval step, and returned a success response. So did `{"agent_ids": []}`, which is what any
+device filter that matched nothing produces. Each of these is now `400`.
+
+**What breaks.** Requests that previously succeeded and now fail:
+
+| Endpoint | Shape | Was | Now |
+|---|---|---|---|
+| `POST /api/command` | `agent_ids` `[]`, non-array, or containing a non-string | broadcast to all | `400` |
+| `POST /api/command` | `scope` `""` or non-string | broadcast to all | `400` |
+| `POST /api/instructions/{id}/execute` | `agent_ids` `[]`, non-array | broadcast to all | `400` |
+| `POST /api/instructions/{id}/execute` | `scope` `""` or non-string | broadcast to all | `400` |
+| `POST /api/v1/result-sets/from-*` | `parent_id` empty, non-string, or `null` | searched/dispatched unscoped | `400` |
+| `POST /api/policies/{id}/remediate` | `agent_ids` `[]`, non-array, or containing a non-string | remediated **every non-compliant agent** in the policy | `400` |
+| `POST /api/policies/{id}/remediate` | `scope` supplied at all | silently ignored, so a narrowing selector remediated every non-compliant agent | `400` — the route selects targets by `agent_ids` only |
+| `POST /api/command` | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/command` | `plugin`/`action` outside `[A-Za-z0-9_.-]` or over 128 bytes | accepted | `400` |
+| `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
+| `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
+| `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
+
+The two remediation rows matter for the same reason as the rest: on that route an **absent**
+`agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
+nothing — or a `scope`, which that route cannot act on — quietly became a fleet-wide *mutating*
+remediation. Omitting `agent_ids` entirely still targets every non-compliant agent, unchanged.
+
+The instructions-execute row is the one to read twice: `"scope": "" + empty agent_ids = broadcast`
+was **documented** behaviour in `rest-api.md`, so a client written against the published contract
+is affected. The `from-*` row covers `from-tar-query`, `from-instruction-result`, `re-eval` and
+`from-inventory-query`.
+
+**One thing got LOOSER, not tighter.** `POST /api/command` previously rejected
+`"scope": "__all__"` with `400 invalid scope` — the scope parser has no rule for it — while the
+sibling instruction-execute route broadcast on the same string. It now broadcasts on both. This
+grants no new access: broadcast was already reachable on that route by omitting targeting
+entirely, under the same `Execution:Execute`, so `__all__` only gives a name to something a
+caller could already do. But if you have a script that sends `__all__` and treats the `400` as a
+no-op, it will now dispatch to the fleet.
+
+**What still works, unchanged.** **Omitting both** `agent_ids` and `scope` broadcasts to all
+connected agents, on every route. So does an explicit `"scope": "__all__"` — the ground scope kind already
+advertised by `/discover/scope-kinds` and by the MCP `execute_instruction` schema. If you have a
+client sending `"scope": ""` to mean "everything", change it to omit the field or to send
+`"__all__"`; both are supported and neither is deprecated.
+
+**Stored data — narrower than it first looks.** Only requests that **explicitly** send
+`"scope": "__all__"` record `scope_expression = "__all__"` on the execution row, and those already
+did so before this change. Broadcasting by **omitting both fields** is unchanged and still records
+`""` — the execution row is written from the raw request value, before the omitted-means-`__all__`
+mapping is applied for dispatch, and the mapped value is never written back. The one practical
+change is that the dashboard's "All agents" button now sends `__all__` explicitly, so rows created
+that way look different from before. A saved query selecting historical broadcasts by
+`scope_expression = ''` still matches everything except dashboard-initiated ones.
+
+**Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
+sends `__all__` instead of an empty string.
+
+**Detecting affected clients — and the limit of what is possible.** There is no reliable way to
+find them *before* upgrading. The audit trail records the OUTCOME of a dispatch, not the request
+shape that produced it: `command.dispatch|success` stores `plugin:action -> N agent(s)` and
+`instruction.execute|success` stores `agents=<sent>`, and neither preserves the `agent_ids` or
+`scope` the caller actually sent. So a historical broadcast that was deliberate and one that was
+an accidentally-widened three-device request are indistinguishable in existing rows. The closest
+available pre-upgrade signal is reviewing automation you believe targets a subset for dispatches
+whose agent count is suspiciously close to your full fleet size. (The stored detail uses a literal
+`\u2192` arrow, not `->`, so match on the agent count rather than the separator.)
+
+After upgrading, refusals are counted by
+`yuzu_server_dispatch_target_rejected_total{route,reason}` (all series pre-seeded at boot, so
+`absent()` stays meaningful) and audited as `command.dispatch|denied`
+(`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
+(`detail=reason=<reason>`) or `result_set.create|denied`
+(`detail=reason=<reason> source_kind=<kind>`). The
+`YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
+on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
+audit rows, not the alert, to find individual offenders.
+
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 
 Two operator-visible changes to held-open MCP/SSE streams authenticated by an

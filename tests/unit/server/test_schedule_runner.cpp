@@ -148,6 +148,14 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
     CHECK(h.calls[0].plugin == "procs");
     CHECK(h.calls[0].action == "list");
     REQUIRE_FALSE(h.calls[0].execution_id.empty());
+    // #2500: a schedule carries no agent_ids, so an empty scope_expression is
+    // how this path has always meant "the whole fleet" — by falling into the
+    // dispatch sink's empty-means-everybody default, which that issue INVERTED
+    // to reach nobody. The runner now names the broadcast explicitly. Without
+    // this assertion the inversion would silently turn every scope-less
+    // schedule into a no-op that still advances and still logs a fire, which is
+    // the worst shape a regression here could take: unattended and quiet.
+    CHECK(h.calls[0].scope == "__all__");
 
     // Tracked execution row, targeted count recorded.
     auto exec = h.tracker.get_execution(h.calls[0].execution_id);

@@ -1,5 +1,7 @@
 #include "dashboard_routes.hpp"
 
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -679,7 +681,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  std::string scope_expr;
                  if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
-                 } else if (!scope.empty() && scope != "__all__") {
+                 } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
                  }
                  // scope == "__all__" or empty → broadcast (empty agent_ids + empty scope)
@@ -839,7 +841,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  std::string scope_expr;
                  if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
-                 } else if (!scope.empty() && scope != "__all__") {
+                 } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
                  }
 

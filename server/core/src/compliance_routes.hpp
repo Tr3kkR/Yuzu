@@ -9,6 +9,8 @@
 
 #include "policy_store.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -48,7 +50,10 @@ public:
                          EmitEventFn emit_event_fn,
                          PolicyStore* policy_store,
                          AgentsJsonFn agents_json_fn,
-                         PolicyEvaluator* policy_evaluator = nullptr);
+                         PolicyEvaluator* policy_evaluator = nullptr,
+                         /// #2500 - counts a refused remediation target. nullptr = no metric;
+                         /// the REFUSAL never depends on this being wired.
+                         yuzu::MetricsRegistry* metrics = nullptr);
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -68,6 +73,7 @@ private:
     EmitEventFn emit_event_fn_;
     PolicyStore* policy_store_{};
     AgentsJsonFn agents_json_fn_;
+    yuzu::MetricsRegistry* metrics_{};
     PolicyEvaluator* policy_evaluator_{};
 };
 
