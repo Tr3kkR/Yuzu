@@ -49,7 +49,14 @@ param(
   [int]   $PostgresPort    = 5433,
   [int]   $PostgresMaxConnections = 400,  # PgPool fan-out headroom: the default 100 exhausts (CH-9)
   [int]   $RunnerCount     = 4,           # agents on this box; agents 1..N-1 get per-agent PG clusters (#2094)
-  [string]$ManifestPath    = 'C:\actions-runner\toolchain-manifest.json'
+  [string]$ManifestPath    = 'C:\actions-runner\toolchain-manifest.json',
+
+  # Escape hatch for the maintenance gate below. Provisioning restarts shared
+  # services and rewrites machine env under whatever is running; the gate
+  # refuses to start while any runner process is live. This switch only SKIPS
+  # the check — it stops no runner and kills no job. Pass it only when you
+  # accept that a live CI job on this box may be interrupted.
+  [switch]$AllowActiveRunners
 )
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
@@ -67,6 +74,12 @@ function Step([string]$name,[scriptblock]$body){
   # PR #2167. $script: is required: Step is a function, so a bare
   # $failedSteps assignment in the catch below would be local to that one
   # call and never accumulate across Step() invocations.
+  # NOTE for anyone adding a stop-the-world condition here: do NOT signal it by
+  # throwing something this catch is expected to recognise. That design (a
+  # string-tagged exception) shipped and produced two blockers — one handler
+  # swallowed the tag, another stripped it by re-wrapping. Abort the PROCESS
+  # from where you detect it (see Assert-RunnersDrained); `exit` is not
+  # catchable here, so it cannot be swallowed by this or any other handler.
   Write-Host "`n===== $name =====" -ForegroundColor Cyan
   try   { & $body; Write-Host "[OK]  $name" -ForegroundColor Green }
   catch {
@@ -103,6 +116,106 @@ function Find-RealEscript {
   }
   return $null
 }
+function Get-ActiveRunnerProcess {
+  # OBSERVATION ONLY — no policy. Runner.Listener.exe polls GitHub for work and
+  # spawns one Runner.Worker.exe per accepted job. Looking for the WORKER alone
+  # is a point-in-time snapshot, not a lock: a listener that is idle at the
+  # instant we look can accept a job a second later, while we are still copying
+  # trees and restarting clusters. Including the LISTENER closes that window —
+  # no listener, no job can start.
+  # Throws if WMI/DCOM/permissions make the box unobservable. Callers decide
+  # what that means; Assert-RunnersDrained treats it as fatal.
+  @(Get-CimInstance Win32_Process `
+      -Filter "Name = 'Runner.Listener.exe' OR Name = 'Runner.Worker.exe'" -EA Stop)
+}
+function Assert-RunnersDrained([string]$context){
+  # THE gate. It EXITS the process rather than throwing, deliberately: `exit` is
+  # not catchable by any enclosing try/catch (not Step()'s, not the per-agent
+  # loop's, not the rollback recovery's), so a detection here cannot be
+  # swallowed, re-wrapped, or downgraded by a handler between us and the top of
+  # the script. The previous design threw a string-tagged exception that every
+  # intervening catch had to recognise and re-throw; two of them didn't, and
+  # both were shipped blockers. Do not convert this back to a throw.
+  if($AllowActiveRunners){
+    Write-Warning "-AllowActiveRunners: skipping the drain check ($context). Nothing is stopped — any live CI job on this box may be interrupted."
+    return
+  }
+  $reason = $null
+  try {
+    $active = Get-ActiveRunnerProcess
+    if($active.Count -gt 0){
+      $detail = ($active | Sort-Object Name,ProcessId |
+                 ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', '
+      $reason = "$context while GitHub Actions runners are live on this box: $detail"
+    }
+  } catch {
+    # Fail CLOSED: "I cannot tell whether this box is busy" is not permission to
+    # mutate it. A gate that proceeds when it cannot observe is not a gate.
+    $reason = "$context — the drain check itself failed ($($_.Exception.Message)), so this box cannot be shown to be idle"
+  }
+  if($null -eq $reason){ return }
+  Write-Host "`n[ABORT] $reason" -ForegroundColor Red
+  Write-Host ("Stop all $RunnerCount Start-PinnedRunner tasks/consoles, wait for in-flight jobs " +
+              "to finish, then re-run. -AllowActiveRunners skips this check without stopping " +
+              "anything — those jobs may then be interrupted.") -ForegroundColor Red
+  Write-Host "Provisioning stopped: no further steps run." -ForegroundColor Red
+  try {
+    Stop-Transcript -EA Stop | Out-Null
+  } catch {
+    Write-Warning "Provisioning is still aborting, but the transcript could not be closed cleanly: $($_.Exception.Message)"
+  }
+  exit 2
+}
+
+function Test-PgServingNow([string]$bin,[int]$port){
+  # Single-shot liveness probe — deliberately NOT Assert-PgServing's 90s wait
+  # loop. Answers one question: is a postmaster serving this port RIGHT NOW?
+  # Used on the rollback path to tell "the cluster is down, restarting it can
+  # only help" from "the cluster is still up and a restart would drop live
+  # connections".
+  $ready = Join-Path $bin 'pg_isready.exe'
+  if(-not (Test-Path $ready)){ return $false }
+  & $ready -q -h 127.0.0.1 -p $port 2>$null
+  return ($LASTEXITCODE -eq 0)
+}
+function Assert-PgServing([string]$bin,[int]$port,[string]$context){
+  # Script-scoped so EVERY cluster restart can prove it came back — the main
+  # PostgreSQL step's as well as the per-agent ones, which is why this is not
+  # nested inside a single Step.
+  $ready = Join-Path $bin 'pg_isready.exe'
+  $psql  = Join-Path $bin 'psql.exe'
+  if(-not (Test-Path $ready)){ throw "$context missing $ready" }
+  if(-not (Test-Path $psql)){ throw "$context missing $psql" }
+  $deadline=(Get-Date).AddSeconds(90)
+  do {
+    & $ready -q -h 127.0.0.1 -p $port 2>$null
+    if($LASTEXITCODE -eq 0){ break }
+    Start-Sleep 2
+  } while((Get-Date) -lt $deadline)
+  if($LASTEXITCODE -ne 0){ throw "$context cluster on :$port not ready in 90s" }
+  $oldPassword = $env:PGPASSWORD
+  $env:PGPASSWORD='postgres'
+  try {
+    $probe = (& $psql -U postgres -h 127.0.0.1 -p $port -tAc 'SELECT 1' 2>$null | Out-String).Trim()
+    if($LASTEXITCODE -ne 0 -or $probe -ne '1'){
+      throw "$context SELECT 1 failed on :$port"
+    }
+  } finally {
+    if($null -eq $oldPassword){ Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
+    else { $env:PGPASSWORD = $oldPassword }
+  }
+}
+
+# ---- Maintenance gate: must precede EVERY Step ------------------------------
+# Wee Tam's four runner agents share ONE OS identity on ONE box (CLAUDE.md
+# standing invariant), so a service restart or machine-env rewrite here is a
+# cross-JOB mutation, not a local one. Several steps below force-restart a
+# shared PostgreSQL service and toolchain installs swap binaries under a running
+# build, so check before any of them. This is the FIRST of several checks, not
+# the only one: it can be minutes stale by the time a service actually restarts,
+# so every Restart-Service re-asserts. It is a check, not a lock — an operator
+# who starts a runner mid-run is not prevented, only detected at the next check.
+Assert-RunnersDrained 'refusing to provision'
 
 Step 'winget sanity' { "winget " + (winget --version) }
 
@@ -252,9 +365,22 @@ Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_te
   } finally {
     Remove-Item Env:\PGPASSWORD -EA SilentlyContinue
   }
-  Restart-Service $svc -Force
+  # Agent 0's cluster is shared with whatever else is on this box. The
+  # script-start gate can be arbitrarily stale by now — every winget toolchain
+  # install runs between it and here, real minutes on a cold box — so re-assert
+  # immediately before dropping this service's live connections.
+  Assert-RunnersDrained "refusing to restart $svc"
+  Restart-Service $svc -Force -EA Stop
   $deadline=(Get-Date).AddSeconds(90)
   while(((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running') -and ((Get-Date) -lt $deadline)){ Start-Sleep 2 }
+  # The wait loop used to fall through silently on timeout, reporting the
+  # cluster "ready" while the service was stopped. Match the per-agent step's
+  # posture exactly: Running is necessary but not sufficient, so prove it
+  # actually serves before calling this step OK.
+  if((Get-Service $svc -EA SilentlyContinue).Status -ne 'Running'){
+    throw "$svc did not return to Running within 90s of the restart"
+  }
+  Assert-PgServing $pgbin $PostgresPort "main PostgreSQL cluster"
   "PG $PostgresVersion on :$PostgresPort, role yuzu, db yuzu_test ready (max_connections=$PostgresMaxConnections, logging_collector=on)"
 }
 
@@ -371,6 +497,191 @@ Step "PostgreSQL per-agent clusters — agents 1..$($RunnerCount-1), ports $($Po
   }
 }
 
+Step "PostgreSQL per-agent binary copies — a private postgres.exe per cluster (#2354)" {
+  # THE residual [pg]-shard cost on Windows, root-caused 2026-07-22 (#2354).
+  # Postgres-on-Windows is EXEC_BACKEND (fork-less): every connection
+  # CreateProcess()es a fresh postgres.exe. All clusters shared ONE binary
+  # (C:\pgsql\bin\postgres.exe), so every backend spawn across all 4 CCD-pinned
+  # runner agents contended that single image file's FCB / image-section lock —
+  # ~1000-1466 ms/spawn under box-wide concurrency. It is NOT Defender (proven
+  # with real-time protection fully off) and NOT disk (zero disk reads measured):
+  # a byte-identical COPY at a different path has its own FCB and spawns in
+  # ~10-20 ms. Give each cluster a private copy of the whole install tree and
+  # repoint its service at that copy; validated live ~50-70x under all-4-agent
+  # churn. Complements the shared-DB+TRUNCATE test fixtures (which cut the spawn
+  # COUNT); this removes the per-spawn cross-cluster contention.
+  #
+  # Idempotent: on re-run the ImagePath already points at the copy (no-op) and
+  # robocopy refreshes the tree in place. Per-agent, catch-and-continue like the
+  # per-agent-clusters step: one agent's failure records + continues, and the
+  # accumulated list still throws once after the loop naming every failure.
+  function Get-PgServiceImageParts([string]$image){
+    $trimmed = $image.TrimStart()
+    $exe = if($trimmed -match '^"([^"]+)"'){ $Matches[1] } else { ($trimmed -split '\s+',2)[0] }
+    if(-not $exe){ throw "could not parse service executable from ImagePath '$image'" }
+    $data = $null
+    if($trimmed -match '(?i)(?:^|\s)-D\s*"([^"]+)"'){
+      $data = $Matches[1]
+    } elseif($trimmed -match '(?i)(?:^|\s)-D\s*([^\s"]+)'){
+      $data = $Matches[1]
+    }
+    [pscustomobject]@{ Exe=$exe; DataDir=$data }
+  }
+
+  # The script-wide gate at the top already proved the box was drained. This
+  # step is the longest-running mutation in the script (four whole-tree
+  # robocopies + recursive icacls + four restarts), so re-assert rather than
+  # trust a minutes-old observation: an operator can start a runner mid-run.
+  Assert-RunnersDrained 'refusing PostgreSQL binary reconciliation'
+
+  $major = $PostgresVersion.Split('.')[0]
+  $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
+  if(-not $pgbin){ throw "psql not found — the main PostgreSQL step must succeed before per-agent binary copies" }
+  $pgroot  = Split-Path $pgbin -Parent            # install ROOT (parent of bin): C:\pgsql or C:\Program Files\PostgreSQL\$major
+  $agent0Svc = "postgresql-x64-$major-yuzu-ci"
+  $agent0Reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$agent0Svc"
+  $agent0Image = (Get-ItemProperty $agent0Reg -Name ImagePath -EA Stop).ImagePath
+  $srcData = (Get-PgServiceImageParts $agent0Image).DataDir
+  if(-not $srcData){
+    throw "agent 0 service $agent0Svc ImagePath has no parseable -D data directory — refusing to copy the install tree without a proven live-data exclusion"
+  }
+  # robocopy /XD matches the directory by PATH STRING, so hand it a canonical
+  # one: the registry value can carry a trailing separator, a relative segment
+  # or 8.3 short names, any of which would silently fail to match and copy the
+  # LIVE data dir into the private tree. Normalize once, here.
+  $srcData = [IO.Path]::GetFullPath($srcData).TrimEnd('\')
+  $pgrootFull = [IO.Path]::GetFullPath($pgroot).TrimEnd('\')
+  if($srcData -like "$pgrootFull\*"){
+    # Inside the tree being copied: the exclusion is load-bearing, so prove the
+    # canonical path actually exists rather than excluding a name that matches
+    # nothing on disk.
+    if(-not (Test-Path -LiteralPath $srcData -PathType Container)){
+      throw "agent 0 data dir '$srcData' (from $agent0Svc -D) is under the install root but does not exist — refusing to copy without a live-data exclusion that resolves"
+    }
+  }
+  $failedAgents = @()
+  for($n=0; $n -lt $RunnerCount; $n++){
+    $svc    = if($n -eq 0){ "postgresql-x64-$major-yuzu-ci" } else { "postgresql-x64-$major-yuzu-ci-$n" }
+    $port   = $PostgresPort + $n
+    $dst    = Join-Path $CacheRoot "pgbin\agent-$n"
+    $dstbin = Join-Path $dst 'bin'
+    $newExe = Join-Path $dstbin 'pg_ctl.exe'
+    try {
+      if(-not (Get-Service $svc -EA SilentlyContinue)){
+        throw "service $svc not found — provision its cluster first (agent 0: the main PostgreSQL step; agents 1..N-1: the per-agent-clusters step)"
+      }
+      # 1) Private binary tree: the whole install root EXCEPT the live data dir.
+      #    Agent-0's data is $pgroot\data (excluded); agents 1..N-1 keep their
+      #    data at $CacheRoot\pg\agent-$n, already outside $pgroot. robocopy
+      #    exit 0-7 == success, 8+ == failure (capture before the next native
+      #    call clobbers $LASTEXITCODE).
+      New-Item -ItemType Directory -Force $dst | Out-Null
+      robocopy $pgroot $dst /E /XD $srcData /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+      $rc = $LASTEXITCODE
+      if($rc -ge 8){ throw "robocopy $pgroot -> $dst failed (exit $rc)" }
+      if(-not (Test-Path $newExe)){ throw "copy incomplete: $newExe missing after robocopy" }
+      # NETWORK SERVICE (the account every cluster's service runs as — see the
+      # per-agent-clusters step) must be able to read+execute the copied tree;
+      # robocopy /COPY:DAT does not carry source ACLs, so grant it explicitly.
+      icacls $dst /grant '*S-1-5-20:(OI)(CI)RX' /T /C /Q | Out-Null
+      # 2) Repoint ONLY the service ImagePath's pg_ctl.exe path at the private
+      #    copy; the -D datadir and every other arg are left byte-for-byte
+      #    intact. pg_ctl launches postgres.exe from its own directory, so the
+      #    copy's postgres.exe (its own FCB) is what serves.
+      $regPath  = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
+      $curImage = (Get-ItemProperty $regPath -Name ImagePath -EA Stop).ImagePath
+      $curExe   = (Get-PgServiceImageParts $curImage).Exe
+      # Preserve the ORIGINAL value kind on both the repoint and the rollback.
+      # Hardcoding ExpandString would rewrite a REG_SZ value as REG_EXPAND_SZ,
+      # so a rollback of an ImagePath containing a literal '%' would not restore
+      # the exact original this code claims to restore.
+      $imageKind = (Get-Item $regPath).GetValueKind('ImagePath')
+      if([string]::Equals($curExe, $newExe, 'OrdinalIgnoreCase')){
+        # Path equality is not health: a prior interrupted provision can leave
+        # the registry repointed while the service is dead. Prove the existing
+        # no-op state serves before accepting it.
+        Assert-PgServing $dstbin $port "agent $n existing private service"
+        Write-Host "agent ${n}: ImagePath already points at the private copy ($dstbin) — serving verified, no-op"
+      } else {
+        # Replace the parsed executable token exactly once. String.Replace()
+        # would also rewrite an argument containing the same path substring.
+        $exeOffset = $curImage.IndexOf($curExe, [StringComparison]::OrdinalIgnoreCase)
+        if($exeOffset -lt 0){ throw "parsed executable '$curExe' not found in ImagePath '$curImage'" }
+        $newImage = $curImage.Substring(0,$exeOffset) + $newExe +
+                    $curImage.Substring($exeOffset + $curExe.Length)
+        # Last check before the only destructive act in the loop: this restart
+        # drops every live connection on $svc. The gate above ran before the
+        # robocopy/icacls of agent 0..n, which can take minutes.
+        Assert-RunnersDrained "refusing to restart $svc"
+        Set-ItemProperty $regPath -Name ImagePath -Value $newImage -Type $imageKind
+        try {
+          Restart-Service $svc -Force -EA Stop
+          Assert-PgServing $dstbin $port "agent $n repointed service"
+          Write-Host "agent ${n}: postgres.exe now private ($dstbin), svc $svc on :$port verified"
+        } catch {
+          # A bad copy must never leave the cluster wedged. Restore the exact
+          # original ImagePath, restart from its bin dir, and prove SELECT 1;
+          # distinguish a clean rollback from a failed recovery in the error.
+          $forwardError = $_.Exception.Message
+          try {
+            Set-ItemProperty $regPath -Name ImagePath -Value $curImage -Type $imageKind -EA Stop
+            # Do NOT assume the cluster is down. If Restart-Service itself threw,
+            # it may have failed before stopping the old postmaster, which is
+            # then still serving live connections on the ORIGINAL binary. Since
+            # ImagePath is only read at process start, the registry restore
+            # ALONE completes the rollback in that case — restarting would drop
+            # connections that predate the gate above and were never authorised.
+            $originalBin = Split-Path $curExe -Parent
+            # Probe on EVERY forward failure. Restart-Service may have thrown
+            # before stopping the old process, or it may have returned before
+            # the later authenticated health check failed. Either way, a ready
+            # service port is enough reason not to drop possibly-live sessions.
+            $stillServing = Test-PgServingNow $originalBin $port
+            if($stillServing){
+              Write-Host "agent ${n}: $svc still has a ready service port — ImagePath restored for its next start; no recovery restart performed"
+              $rollbackResult = 'restored ImagePath while the service port remained ready; no recovery restart was performed'
+            } else {
+              # Observation for the LOG ONLY — deliberately not Assert-
+              # RunnersDrained, and deliberately swallowing its failure. This is
+              # the one place a drain observation must not stop anything: the
+              # restart below happens either way, so the answer only decides how
+              # loudly we narrate it. Not being able to observe therefore changes
+              # nothing here, unlike everywhere else in this script.
+              $activeDuringRecovery = try { (Get-ActiveRunnerProcess).Count } catch { -1 }
+              if(-not $AllowActiveRunners -and $activeDuringRecovery -ne 0){
+                Write-Warning "agent ${n}: runners may be active during recovery (found: $activeDuringRecovery, -1 = could not determine); restarting $svc anyway — it is not serving, and leaving it that way would be worse"
+              }
+              # DRAIN-EXEMPT: recovery on a cluster PROVEN not to be serving —
+              # the new binary came up unhealthy, or the restart killed the old
+              # one and nothing is answering. Refusing would strand it broken,
+              # worse for any job than the restart. The liveness probe above is
+              # what earns this, not an assumption about how we got here.
+              Restart-Service $svc -Force -EA Stop
+              Assert-PgServing $originalBin $port "agent $n rollback service"
+              $rollbackResult = 'restored and verified the original service after a recovery restart'
+            }
+          } catch {
+            $rollbackError = $_.Exception.Message
+            throw "repoint of $svc failed ($forwardError); rollback to '$curExe' ALSO FAILED verification ($rollbackError)"
+          }
+          throw "repoint of $svc failed ($forwardError); rollback to '$curExe' $rollbackResult"
+        }
+      }
+    } catch {
+      # Per-agent failures are isolated: log, record, carry on to the next agent.
+      # A drain detection never reaches here — Assert-RunnersDrained exits the
+      # process — so there is no stop-the-world case for this handler to
+      # recognise, and nothing here can downgrade one.
+      Write-Warning "agent ${n} binary-copy FAILED: $($_.Exception.Message) — continuing to the next agent; re-run this script to retry (idempotent)"
+      $failedAgents += $n
+    }
+  }
+  if($failedAgents.Count -gt 0){
+    throw "per-agent binary copy failed for agent(s) $($failedAgents -join ', ') — see the WARNING lines above"
+  }
+  "per-agent private postgres.exe copies ready under $CacheRoot\pgbin\agent-0..$($RunnerCount-1)"
+}
+
 Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   # THE dominant [pg]-shard cost on Windows: Postgres has no fork(), so it
   # CreateProcess()es a fresh postgres.exe backend PER CONNECTION, and Defender
@@ -389,6 +700,13 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     Add-MpPreference -ExclusionProcess (Join-Path $pgbin 'postgres.exe') -EA SilentlyContinue   # per-connection backend spawn (the big one)
   } else {
     Write-Warning "pgbin not found - skipping the postgres.exe Defender exclusion; the [pg]-shard perf fix this step exists for is NOT applied on this runner"
+  }
+  # Each cluster now launches its OWN private copy (the per-agent binary-copy
+  # step, #2354), so the single exclusion above — which only covers the original
+  # C:\pgsql\bin path — misses the binary actually running. Exclude every copy's
+  # postgres.exe too.
+  for($n=0; $n -lt $RunnerCount; $n++){
+    Add-MpPreference -ExclusionProcess (Join-Path $CacheRoot "pgbin\agent-$n\bin\postgres.exe") -EA SilentlyContinue
   }
   # The Catch2 test binaries drive the SQLite .db/-wal/-shm temp churn behind the
   # tar (~104x Linux) and server (~5-18x) suites. A PROCESS exclusion skips
@@ -422,11 +740,30 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     $paths += (Join-Path (Split-Path $pgbin -Parent) 'data')  # agent-0 cluster data dir
   }
   $paths += (Join-Path $CacheRoot 'pg')                       # per-agent cluster data dirs (D:\ci\pg\agent-*)
+  $paths += (Join-Path $CacheRoot 'pgbin')                    # per-agent private postgres.exe copies (#2354)
   foreach($p in $paths){ Add-MpPreference -ExclusionPath $p -EA SilentlyContinue }
   $activeExclusions = @((Get-MpPreference).ExclusionPath)
   $missingWorkPaths = @($runnerWorkPaths | Where-Object { $activeExclusions -notcontains $_ })
   if($missingWorkPaths.Count -gt 0){
     throw "Defender runner-work exclusions did not apply: $($missingWorkPaths -join ', ')"
+  }
+  # The private copies are the binaries that now actually serve every [pg]
+  # connection (#2354), so THEIR exclusions carry what the original
+  # C:\pgsql\bin one used to — and they go in with -EA SilentlyContinue above.
+  # Verify fail-closed like the runner-work paths: a GPO that blocks new
+  # exclusions must not leave provisioning reporting success while the
+  # exclusion added specifically for these copies silently never applied.
+  $pgbinRoot = Join-Path $CacheRoot 'pgbin'
+  if($activeExclusions -notcontains $pgbinRoot){
+    throw "Defender path exclusion did not apply: $pgbinRoot (private postgres.exe copies, #2354)"
+  }
+  $activeProcExclusions = @((Get-MpPreference).ExclusionProcess)
+  $missingPgProc = @(for($n=0; $n -lt $RunnerCount; $n++){
+    $procPath = Join-Path $CacheRoot "pgbin\agent-$n\bin\postgres.exe"
+    if($activeProcExclusions -notcontains $procPath){ $procPath }
+  })
+  if($missingPgProc.Count -gt 0){
+    throw "Defender process exclusions did not apply for the private postgres.exe copies: $($missingPgProc -join ', ')"
   }
   # Validate the effective child paths with Defender itself. A parent folder
   # exclusion is recursive, but this catches policy-merging or path-resolution
@@ -444,8 +781,16 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
   if($failedTempPaths.Count -gt 0){
     throw "Defender runner-temp exclusions are ineffective: $($failedTempPaths -join ', ')"
   }
+  New-Item -ItemType Directory -Force $pgbinRoot | Out-Null
+  & $mpCmdRun.FullName -CheckExclusion -Path $pgbinRoot | Out-Host
+  if($LASTEXITCODE -ne 0){
+    throw "Defender exclusion for the private postgres.exe tree is ineffective: $pgbinRoot"
+  }
   $pgExcl = if($pgbin){ Join-Path $pgbin 'postgres.exe' } else { '(postgres.exe skipped - pgbin not found)' }
-  $procExcl = @($pgExcl) + $testExes
+  # Include the private per-agent copies: they are the binaries that actually
+  # serve every [pg] connection, so omitting them understates what is protected.
+  $privateExcl = @(for($n=0; $n -lt $RunnerCount; $n++){ Join-Path $CacheRoot "pgbin\agent-$n\bin\postgres.exe" })
+  $procExcl = @($pgExcl) + $privateExcl + $testExes
   "Defender exclusions added: process=" + ($procExcl -join ', ') + "; paths=" + ($paths -join ', ')
 }
 
@@ -524,9 +869,24 @@ Step "emit toolchain manifest -> $ManifestPath" {
     @{ name='vcpkg';      path="$VcpkgRoot\vcpkg.exe"; version=(Ver { & "$VcpkgRoot\vcpkg.exe" version }); required=$true }
     @{ name='postgres';   path=(Join-Path $pgbin 'psql.exe'); version=$PostgresVersion; required=$true }
   )
+  $postgresClusters = @(for($n=0; $n -lt $RunnerCount; $n++){
+    $clusterBin = Join-Path $CacheRoot "pgbin\agent-$n\bin"
+    $clusterSvc = if($n -eq 0){ "postgresql-x64-$major-yuzu-ci" } else { "postgresql-x64-$major-yuzu-ci-$n" }
+    [ordered]@{
+      agent=$n
+      service=$clusterSvc
+      port=($PostgresPort + $n)
+      bin=$clusterBin
+      pg_ctl=(Join-Path $clusterBin 'pg_ctl.exe')
+      postgres=(Join-Path $clusterBin 'postgres.exe')
+      psql=(Join-Path $clusterBin 'psql.exe')
+      pg_isready=(Join-Path $clusterBin 'pg_isready.exe')
+    }
+  })
   $manifest = [ordered]@{
     generated = (Get-Date).ToUniversalTime().ToString('o')
     host      = $env:COMPUTERNAME
+    runner_count = $RunnerCount
     pins      = [ordered]@{ python=$PythonVersion; meson=$MesonVersion; erlang=$ErlangVersion; rebar3=$Rebar3Version; postgres=$PostgresVersion; vcpkg_baseline=$VcpkgBaseline }
     env       = [ordered]@{
       VCPKG_ROOT=$VcpkgRoot; CCACHE_DIR="$CacheRoot\ccache"; RUNNER_TOOL_CACHE="$CacheRoot\tool_cache"
@@ -540,6 +900,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
         Join-Path (Join-Path "$CacheRoot\test-runs" "yuzu-weetam-windows-$n") 'test-runs.db'
       })
     }
+    postgres_clusters = $postgresClusters
     tools     = $tools
   }
   New-Item -ItemType Directory -Force (Split-Path $ManifestPath) | Out-Null
