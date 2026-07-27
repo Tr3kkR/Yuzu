@@ -2289,6 +2289,35 @@ TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a 
     const auto waited = std::chrono::steady_clock::now() - started;
 
     CHECK(waited < std::chrono::milliseconds(1500));
+
+    // AND the check must then actually HAPPEN. The assertion above alone proves
+    // only that the pump stopped waiting sooner - it would stay green against an
+    // implementation that woke early and then skipped the credential check, which
+    // is the very regression this test exists to prevent. Both adversarial
+    // reviewers reached this gap independently, and one proved it by adding this
+    // line and watching it fail 1 == 2.
+    //
+    // The clock must be advanced to the boundary to see it: while `fake` is frozen
+    // 50ms short, the post-wait sample is still short too, so the gate is
+    // correctly closed and `revalidations` correctly stays 1.
+    fake = base + cfg.tick;
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(revalidations == 2);
+
+    // The sub-millisecond floor, which is the OTHER way this wait can go wrong. A
+    // remainder under 1ms must not round DOWN to a zero budget: that returns
+    // instantly, falls through to the unconditional heartbeat write at the bottom
+    // of the pass, and lets the caller re-enter in a tight spin that emits
+    // heartbeat frames at the client until real time crosses the boundary. `ceil`
+    // is what turns that spin back into a wait.
+    //
+    // Asserted as a LOWER bound, because that is the only direction that separates
+    // a real 1ms wait from an instant return; the upper bound is already covered
+    // above. 2x margin on a wait a condition variable will not cut short.
+    fake = base + 2 * cfg.tick - std::chrono::microseconds(500);
+    const auto spin_start = std::chrono::steady_clock::now();
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds(500));
 }
 
 TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
