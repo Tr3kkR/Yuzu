@@ -832,14 +832,15 @@ public:
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
                             "stream_handover_pending", "replay_window_exceeded", "origin",
-                            // 2f PR 3b streamed-POST admission denials. Prefixed
-                            // `post_` because they answer a DIFFERENT question from
-                            // the GET labels above: which admission gate refused a
-                            // streamed tool call, not which attach check refused a
-                            // channel. The budget's own two reasons are re-labelled
-                            // rather than passed through for that reason.
-                            "post_per_principal_cap", "post_global_cap", "post_pin_slots",
-                            "post_duplicate_request_id", "post_unknown_session"}) {
+                            }) {
+            metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
+        }
+        // 2f PR 3b streamed-POST admission denials, derived from the bridge's own
+        // closed list so the emit sites and this seed cannot drift. Prefixed `post_`
+        // because they answer a DIFFERENT question from the GET labels above: which
+        // admission gate refused a streamed tool call, not which attach check
+        // refused a channel.
+        for (auto reason : mcp::McpStreamBridge::kPostRejectReasons) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
         // Pre-seed both supported MCP protocol revisions to 0 so a
