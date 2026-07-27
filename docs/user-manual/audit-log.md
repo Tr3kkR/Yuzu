@@ -341,10 +341,22 @@ below).
 
 ### The retention clock guard
 
+**Which alert sent you here?** Five point at this section and only one of them is
+about a decline.
+
+| Alert | What it means | Go to |
+|---|---|---|
+| `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
+| `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and `audit.db` grows without bound. | `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
+| `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
+
 Retention is driven by the server's wall clock. A cleanup pass that looks like it
 would destroy the audit trail declines instead of deleting: it logs a warning and
 adds one to `yuzu_server_audit_clock_anomaly_skips_total`. **A decline deletes
-nothing.** It is the protection working, not evidence lost.
+nothing.** It is the protection working, not evidence lost. The rest of this
+section is about declines.
 
 **Start with the log line.** Every decline logs an `AuditStore:` warning naming
 which condition fired, and for an elapsed-time decline it prints the actual gap
@@ -360,14 +372,13 @@ so read it before working down the list.
    Expected. Elapsed time cannot distinguish a long outage from a forward clock
    jump, and the guard deliberately treats both alike. The log line gives you the
    measured gap, so you do not have to reconstruct it.
-3. **Is this a fresh or restored database, or one whose whole table is already
-   past its window?** Expected, once. A first pass with no prior reading, and a
-   pass on a genuinely all-expired table, both decline before draining --- a
-   restored backup older than the retention window is the common way to meet
-   this.
-4. **Does the log line say the stored reading was unusable?** That is corrupt or
-   unreadable durable state, not necessarily a clock fault. The pass re-anchors
-   on the current reading and the next one proceeds.
+3. **Is the whole table already past its window?** Expected, once. A pass that
+   would expire every datable row declines before draining --- a restored backup
+   older than the retention window is the common way to meet this.
+4. **Does the log line say the stored reading was unusable?** The pass re-anchors
+   on the current reading and the next one proceeds. The log line names both
+   possible causes; a reading *ahead* of now is what a backward clock movement
+   looks like, so do not rule out the clock here --- continue to rung 5.
 5. **Otherwise, check host time synchronisation** --- `chronyc tracking` or
    `w32tm /query /status` --- and look for a restored VM snapshot, a dead CMOS
    battery, or a hand-set date. Fix the clock first: the drain resumes on its own
@@ -405,34 +416,48 @@ store with nothing to delete shows the same two counters.
 If skips and `yuzu_server_audit_rows_deleted_total` are **both** flat, retention
 is not declining --- it is failing or not running at all; check
 `yuzu_server_audit_cleanup_failed_total` and
-`yuzu_server_audit_retention_passes_total`. If skips rises but by *less* than
-passes, some passes are declining and others failing: read both counters together
-and treat it as the failing case.
+`yuzu_server_audit_retention_passes_total`.
+
+If skips rises by *less* than passes **over the same window**, some passes are
+declining and some are not. Read `yuzu_server_audit_rows_deleted_total` to see
+which: rising means the rest are draining normally, which is the ordinary
+post-reduction picture in rung 1 and is healthy; flat means the rest are failing,
+so check `yuzu_server_audit_cleanup_failed_total`. Compare `increase()` over a
+window covering several passes --- never the raw values, which are
+since-process-start and make skips smaller than passes on any healthy store.
 
 **Protecting evidence right now.**
 
 - **To export a time range, use `/api/audit`, not `/api/v1/audit`.** The v1
   endpoint takes only `limit` (hard-capped at 1000), `principal` and `action` --
   it cannot express a range and cannot paginate, so it will silently hand you the
-  first 1000 rows of a much larger set. The legacy endpoint takes `since`,
-  `until`, `limit` and `offset`, and is the only way to page a range out before
-  the next cleanup interval:
+  first 1000 rows of a much larger set. (The periodic-export recipes further down
+  this page use v1 deliberately --- they forward a rolling tail on a schedule,
+  which is a different job from pulling a specific window once.) The legacy
+  endpoint takes `since`, `until`, `limit` and `offset`, and is the only way to
+  page a range out before the next cleanup interval:
 
   ```bash
   # Page out everything in a window, 1000 rows at a time.
   # FROM/TO are unix seconds. Stops on the first empty page.
   OFF=0
   while :; do
-    curl -sf -H "Authorization: Bearer $TOKEN" \
-      "$SERVER/api/audit?since=$FROM&until=$TO&limit=1000&offset=$OFF" \
-      -o "audit-$OFF.json" || break
+    if ! curl -sS -f -H "Authorization: Bearer $TOKEN" \
+         "$SERVER/api/audit?since=$FROM&until=$TO&limit=1000&offset=$OFF" \
+         -o "audit-$OFF.json"; then
+      echo "EXPORT INCOMPLETE at offset $OFF" >&2   # token expiry, 503, reset
+      exit 1
+    fi
     grep -q '"count":0' "audit-$OFF.json" && { rm -f "audit-$OFF.json"; break; }
     OFF=$((OFF+1000))
   done
   ```
 
-  The response carries `events`, `count` and `total`, so compare the sum of
-  `count` against `total` to confirm you got everything.
+  Fail loudly rather than quietly: a mid-export 401 or 503 otherwise leaves a
+  directory of files that looks like a finished run. **The response's `total`
+  field cannot confirm completeness** --- it is `COUNT(*)` over the whole table,
+  not over your `since`/`until` window, so it will not match your export and is
+  not a check. Count the pages you fetched instead.
 - **If a server ran with a backward-skewed clock, export before the next pass.**
   Rows written while the clock was behind carry an already-past TTL, so once the
   clock is corrected they are the oldest rows in the table and the first the paced
@@ -453,6 +478,12 @@ retention is a floor, not a ceiling, and the guard errs toward keeping evidence
 longer than configured because this is an evidence store. Rows older than the
 configured window are the guard working, not a fault. If disk is the immediate
 problem, treat it as a capacity incident (see below) rather than an audit one.
+
+Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
+carry `principal`, `source_ip` and `user_agent`. If you are under a retention
+CEILING obligation as well as a floor, over-retention is a compliance exposure in
+the other direction, and stabilising the clock (which resumes the drain) is the
+fix --- not hand-deletion.
 
 **Limits.**
 

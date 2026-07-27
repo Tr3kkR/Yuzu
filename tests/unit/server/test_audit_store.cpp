@@ -784,7 +784,7 @@ TEST_CASE("AuditStore #2360: retention disabled never declines on an elapsed-tim
           "[audit_store][retention][clock-guard]") {
     // retention_days <= 0 means "never expire": log() stamps ttl 0, so the store
     // has no expiry policy of its own to report a step against. The step check is
-    // gated on `window > 0` for that reason, and this test pins the gate.
+    // gated on `window > 0` for that reason.
     //
     // What the gate is NOT is a guard against over-firing on short gaps -- the
     // threshold is the absolute kAuditMinBigStepSec (7 days), so the 2-hour gap
