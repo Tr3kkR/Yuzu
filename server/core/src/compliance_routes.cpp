@@ -5,6 +5,8 @@
 
 #include "compliance_routes.hpp"
 
+#include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
+
 #include "policy_evaluator.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
@@ -265,11 +267,13 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                                        EmitEventFn emit_event_fn,
                                        PolicyStore* policy_store,
                                        AgentsJsonFn agents_json_fn,
-                                       PolicyEvaluator* policy_evaluator) {
+                                       PolicyEvaluator* policy_evaluator,
+                                       yuzu::MetricsRegistry* metrics) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
+    metrics_ = metrics;
     emit_event_fn_ = std::move(emit_event_fn);
     policy_store_ = policy_store;
     agents_json_fn_ = std::move(agents_json_fn);
@@ -764,14 +768,74 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                 return;
             }
             auto id = req.matches[1].str();
+
+            // ── #2500, FIFTH instance ────────────────────────────────────────
+            // An empty vector means "every non-compliant agent in this policy"
+            // (policy_evaluator.cpp, remediate()). The parse below used to drop
+            // non-string entries and accept an empty/non-array/unparseable body
+            // silently, so `{"agent_ids":[1,2,3]}` remediated the ENTIRE
+            // non-compliant set, answered 202, and audited
+            // `policy.remediate|success`. Identical to the /api/command defect
+            // this issue is about, on a MUTATING remediation path, and missed by
+            // every diff-focused review because the reviews cleared
+            // PolicyEvaluator as a DISPATCH caller and never read this route's
+            // own parsing.
+            //
+            // ABSENT body or ABSENT key still means "all non-compliant" - that
+            // is the omitted case and it is legitimate. Everything supplied that
+            // names nothing is refused.
             std::vector<std::string> agent_ids;
             if (!req.body.empty()) {
                 auto j = nlohmann::json::parse(req.body, nullptr, false);
-                if (!j.is_discarded() && j.is_object() && j.contains("agent_ids") &&
-                    j["agent_ids"].is_array()) {
+                const auto refuse = [&](std::string_view reason, const std::string& msg) {
+                    if (metrics_)
+                        metrics_
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "policy_remediate"},
+                                       {"reason", std::string(reason)}})
+                            .increment();
+                    if (audit_fn_)
+                        audit_fn_(req, "policy.remediate", "denied", "policy", id,
+                                  std::string("reason=") + std::string(reason));
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", {{"code", 400}, {"message", msg}}},
+                                                    {"meta", {{"api_version", "v1"}}}})
+                                        .dump(),
+                                    "application/json");
+                };
+                if (j.is_discarded() || !j.is_object()) {
+                    refuse(yuzu::server::kReasonBodyType,
+                           "request body must be a JSON object");
+                    return;
+                }
+                // `scope` is NOT honoured on this route: PolicyEvaluator::remediate
+                // takes only (policy_id, agent_ids). Refuse it BEFORE the shared
+                // shape check, which would otherwise type-check it, empty-check
+                // it, and then let the route discard it — so `{"scope":"tag:x"}`
+                // passed validation, left agent_ids empty, and empty here means
+                // EVERY non-compliant agent in the policy. A narrowing selector
+                // producing a wider MUTATING remediation: this PR's own defect
+                // class, arriving through the guard added to prevent it.
+                //
+                // Worse than the silent drop it replaced, until now: the shared
+                // check's `target_conflict` message tells a caller who sends both
+                // fields to "supply exactly one", steering them straight into the
+                // widening case. Refusing scope outright is the only honest
+                // answer on a route that cannot act on it. (Review finding, #2548.)
+                if (j.contains("scope")) {
+                    refuse(yuzu::server::kReasonScopeUnsupported,
+                           "scope is not supported on this route; remediation targets are "
+                           "selected by agent_ids, or by omitting it to target every "
+                           "non-compliant agent in the policy");
+                    return;
+                }
+                if (auto bv = yuzu::server::check_targeting_shape(j)) {
+                    refuse(bv->reason, bv->message);
+                    return;
+                }
+                if (j.contains("agent_ids")) {
                     for (const auto& a : j["agent_ids"])
-                        if (a.is_string())
-                            agent_ids.push_back(a.get<std::string>());
+                        agent_ids.push_back(a.get<std::string>());
                 }
             }
             auto result = policy_evaluator_->remediate(id, agent_ids);

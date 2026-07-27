@@ -1,0 +1,131 @@
+/**
+ * test_audit_retention_rules.cpp -- The retention guard's decision rule (#2360)
+ *
+ * `classify` is four bools in, one enum out, so its behaviour can be stated
+ * EXHAUSTIVELY: all 16 inputs, each with the reason it maps where it does. That
+ * is the point of extracting it. The integration tests in test_audit_store.cpp
+ * cover the guard end-to-end through a seeded database; this file covers the
+ * rule alone, which is where two mutations previously survived -- reaching the
+ * precedence order meant standing up a multi-pass fixture, so nobody did.
+ *
+ * A table this complete is a mutation detector by construction: any change to
+ * an operator, a return value, or the order of the four tests reddens at least
+ * one row.
+ */
+
+#include "audit_retention_rules.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstdint>
+
+using yuzu::server::audit_retention::Anomaly;
+using yuzu::server::audit_retention::classify;
+using yuzu::server::audit_retention::moved_at_least;
+
+TEST_CASE("audit classify: the whole truth table", "[audit_store][audit_rules]") {
+    struct Row {
+        bool has_expired;
+        bool would_wipe;
+        bool big_step;
+        bool prev_unusable;
+        Anomaly want;
+        const char* why;
+    };
+
+    // All 2^4 = 16 inputs. `prev_unusable` first (it makes the others
+    // unreliable), then `!has_expired` (nothing at risk), then step over wipe
+    // (the step EXPLAINS the wipe).
+    static constexpr Row kRows[] = {
+        // prev_unusable dominates, whatever else is true.
+        {false, false, false, true, Anomaly::BadState, "unusable reading, nothing expired"},
+        {false, false, true, true, Anomaly::BadState, "unusable reading beats step"},
+        {false, true, false, true, Anomaly::BadState, "unusable reading beats wipe"},
+        {false, true, true, true, Anomaly::BadState, "unusable reading beats both"},
+        {true, false, false, true, Anomaly::BadState, "unusable reading with rows expired"},
+        {true, false, true, true, Anomaly::BadState, "unusable + step"},
+        {true, true, false, true, Anomaly::BadState, "unusable + wipe"},
+        {true, true, true, true, Anomaly::BadState, "unusable + step + wipe"},
+
+        // Nothing expired: nothing is at risk, so nothing is reported. Note
+        // would_wipe/big_step are still passed and still ignored -- a rule that
+        // reported a step on an empty table would warn every pass on a quiet
+        // server whose clock legitimately moved.
+        {false, false, false, false, Anomaly::None, "quiet pass"},
+        {false, false, true, false, Anomaly::None, "step but nothing to delete"},
+        {false, true, false, false, Anomaly::None, "would-wipe with nothing expired: real when retention is off"},
+        {false, true, true, false, Anomaly::None, "neither matters with nothing expired"},
+
+        // Rows expired: step outranks wipe.
+        {true, false, false, false, Anomaly::None, "ordinary expiry -- the common case"},
+        {true, false, true, false, Anomaly::Step, "step with a survivor still reports"},
+        {true, true, false, false, Anomaly::Wipe, "wipe with no step"},
+        {true, true, true, false, Anomaly::Step, "step EXPLAINS the wipe, so it wins"},
+    };
+
+    static_assert(sizeof(kRows) / sizeof(kRows[0]) == 16, "the table must stay exhaustive");
+
+    for (const Row& r : kRows) {
+        INFO(r.why << " (has_expired=" << r.has_expired << " would_wipe=" << r.would_wipe
+                   << " big_step=" << r.big_step << " prev_unusable=" << r.prev_unusable << ")");
+        CHECK(classify({.has_expired = r.has_expired,
+                        .would_wipe = r.would_wipe,
+                        .big_step = r.big_step,
+                        .prev_unusable = r.prev_unusable}) == r.want);
+    }
+}
+
+TEST_CASE("audit moved_at_least: magnitude in either direction, overflow-free",
+          "[audit_store][audit_rules]") {
+    constexpr std::int64_t kFloor = 7 * 86'400;
+
+    SECTION("symmetric: the same movement counts whichever way it went") {
+        CHECK(moved_at_least(1'000'000, 1'000'000 + kFloor, kFloor));
+        CHECK(moved_at_least(1'000'000 + kFloor, 1'000'000, kFloor));
+        CHECK_FALSE(moved_at_least(1'000'000, 1'000'000 + kFloor - 1, kFloor));
+        CHECK_FALSE(moved_at_least(1'000'000 + kFloor - 1, 1'000'000, kFloor));
+    }
+
+    SECTION("a one-second regression is NOT an event") {
+        // The BLOCKING regression this floor exists to prevent: an event forces
+        // the non-deleting branch, so treating sub-floor jitter as an event
+        // halts retention permanently.
+        CHECK_FALSE(moved_at_least(1'000'000, 999'999, kFloor));
+    }
+
+    SECTION("recovery out of negative time is an event and does not overflow") {
+        // Dead CMOS reads 1969, NTP corrects to the present. The SIGNED
+        // difference of these two overflows; the magnitude must not.
+        CHECK(moved_at_least(-2'000'000'000, 1'700'000'000, kFloor));
+
+        // These are the ones that matter. INT64_MIN/2 to INT64_MAX/2 does NOT
+        // overflow, so an earlier version of this section passed against a
+        // signed-subtraction implementation and proved nothing. The stored
+        // reading is attacker- or corruption-controlled and is only sanitised
+        // AFTER this helper runs, so a genuinely extreme pair is reachable.
+        CHECK(moved_at_least(INT64_MIN, INT64_MAX, kFloor));
+        CHECK(moved_at_least(INT64_MAX, INT64_MIN, kFloor));
+        CHECK(moved_at_least(INT64_MIN, 0, kFloor));
+        CHECK(moved_at_least(INT64_MIN, INT64_MAX / 4, kFloor)); // the real bound on `now`
+    }
+
+    SECTION("no movement is not an event") {
+        CHECK_FALSE(moved_at_least(1'000'000, 1'000'000, kFloor));
+        CHECK_FALSE(moved_at_least(-5, -5, kFloor));
+    }
+
+    static_assert(moved_at_least(-2'000'000'000, 1'700'000'000, 7 * 86'400));
+    static_assert(!moved_at_least(1'000'000, 999'999, 7 * 86'400));
+}
+
+TEST_CASE("audit classify: usable at compile time", "[audit_store][audit_rules]") {
+    // `constexpr` is part of the contract, not decoration: it is what lets the
+    // table above be `static constexpr` and what proves the function reads no
+    // state. A future edit that reaches for a clock or a member breaks this.
+    static_assert(classify({.has_expired = true, .would_wipe = true, .big_step = true}) ==
+                  Anomaly::Step);
+    static_assert(classify({.has_expired = true, .would_wipe = true}) == Anomaly::Wipe);
+    static_assert(classify({.would_wipe = true, .big_step = true}) == Anomaly::None);
+    static_assert(classify({.prev_unusable = true}) == Anomaly::BadState);
+    SUCCEED("compile-time evaluation asserted above");
+}

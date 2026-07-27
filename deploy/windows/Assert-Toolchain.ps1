@@ -1,7 +1,8 @@
 <#
   Assert-Toolchain.ps1 — runner self-test. Verifies that the toolchain manifest
   emitted by Provision-Windows-Runner.ps1 still holds: every required tool is
-  present at its recorded path and every contract env var is set.
+  present at its recorded path, every contract env var is set, and every
+  per-agent PostgreSQL service points at its private binary tree and serves.
 
   Run it (a) at the end of provisioning, and (b) as a registration / preflight
   gate, so a mis-provisioned box fails in SECONDS rather than 90 minutes into a
@@ -22,6 +23,12 @@ if(-not (Test-Path $ManifestPath)){
 }
 $m = Get-Content $ManifestPath -Raw | ConvertFrom-Json
 $fail = 0
+
+function Get-ServiceExe([string]$image){
+  $trimmed = $image.TrimStart()
+  if($trimmed -match '^"([^"]+)"'){ return $Matches[1] }
+  return ($trimmed -split '\s+',2)[0]
+}
 
 Write-Host "Toolchain manifest: $ManifestPath" -ForegroundColor Cyan
 Write-Host ("  host=$($m.host)  generated=$($m.generated)")
@@ -71,6 +78,82 @@ if($m.telemetry -and $m.telemetry.databases){
   # ci-telemetry start step still initializes this runner's DB. Re-running the
   # provisioner upgrades the manifest and turns all four paths into hard checks.
   Write-Host "  [warn] manifest predates telemetry inventory — re-run provisioning" -ForegroundColor Yellow
+}
+
+Write-Host "`n-- per-agent PostgreSQL --"
+$hasClusterContract = ($m.PSObject.Properties.Name -contains 'postgres_clusters') -and
+                      (@($m.postgres_clusters).Count -gt 0)
+if(-not $hasClusterContract){
+  Write-Host "  [MISS] manifest predates the per-agent binary/service contract — re-run provisioning" -ForegroundColor Red
+  $fail++
+} else {
+  if(-not $m.runner_count -or @($m.postgres_clusters).Count -ne [int]$m.runner_count){
+    Write-Host ("  [MISS] manifest has {0} PostgreSQL cluster(s), expected runner_count={1} — re-run provisioning" -f @($m.postgres_clusters).Count, ($m.runner_count ?? '<unset>')) -ForegroundColor Red
+    $fail++
+  }
+  $oldPassword = $env:PGPASSWORD
+  $env:PGPASSWORD = 'yuzu'
+  try {
+    foreach($c in @($m.postgres_clusters)){
+      $clusterOk = $true
+      foreach($path in @($c.pg_ctl,$c.postgres,$c.psql,$c.pg_isready)){
+        if(-not $path -or -not (Test-Path -LiteralPath $path)){
+          Write-Host ("  [MISS] agent {0}: required binary {1}" -f $c.agent, ($path ?? '<unset>')) -ForegroundColor Red
+          $clusterOk = $false
+          $fail++
+        }
+      }
+
+      $svc = Get-Service -Name $c.service -EA SilentlyContinue
+      if(-not $svc){
+        Write-Host ("  [MISS] agent {0}: service {1} not registered" -f $c.agent, $c.service) -ForegroundColor Red
+        $clusterOk = $false
+        $fail++
+      } elseif($svc.Status -ne 'Running'){
+        Write-Host ("  [MISS] agent {0}: service {1} is {2}, expected Running" -f $c.agent, $c.service, $svc.Status) -ForegroundColor Red
+        $clusterOk = $false
+        $fail++
+      }
+
+      try {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($c.service)"
+        $image = (Get-ItemProperty $regPath -Name ImagePath -EA Stop).ImagePath
+        $registeredExe = Get-ServiceExe $image
+        if(-not [string]::Equals($registeredExe, $c.pg_ctl, 'OrdinalIgnoreCase')){
+          Write-Host ("  [MISS] agent {0}: ImagePath executable is {1}, expected {2}" -f $c.agent, $registeredExe, $c.pg_ctl) -ForegroundColor Red
+          $clusterOk = $false
+          $fail++
+        }
+      } catch {
+        Write-Host ("  [MISS] agent {0}: cannot read {1} ImagePath ({2})" -f $c.agent, $c.service, $_.Exception.Message) -ForegroundColor Red
+        $clusterOk = $false
+        $fail++
+      }
+
+      if($c.pg_isready -and (Test-Path -LiteralPath $c.pg_isready)){
+        & $c.pg_isready -q -h 127.0.0.1 -p $c.port 2>$null
+        if($LASTEXITCODE -ne 0){
+          Write-Host ("  [MISS] agent {0}: PostgreSQL on :{1} is not ready" -f $c.agent, $c.port) -ForegroundColor Red
+          $clusterOk = $false
+          $fail++
+        }
+      }
+      if($c.psql -and (Test-Path -LiteralPath $c.psql)){
+        $probe = (& $c.psql -w -U yuzu -d yuzu_test -h 127.0.0.1 -p $c.port -tAc 'SELECT 1' 2>$null | Out-String).Trim()
+        if($LASTEXITCODE -ne 0 -or $probe -ne '1'){
+          Write-Host ("  [MISS] agent {0}: authenticated SELECT 1 failed on :{1}" -f $c.agent, $c.port) -ForegroundColor Red
+          $clusterOk = $false
+          $fail++
+        }
+      }
+      if($clusterOk){
+        Write-Host ("  [OK]   agent {0}: {1} -> {2}, :{3} serving" -f $c.agent, $c.service, $c.pg_ctl, $c.port) -ForegroundColor Green
+      }
+    }
+  } finally {
+    if($null -eq $oldPassword){ Remove-Item Env:\PGPASSWORD -EA SilentlyContinue }
+    else { $env:PGPASSWORD = $oldPassword }
+  }
 }
 
 # MSYS2 coreutils must be reachable the way the CI bash scripts use them

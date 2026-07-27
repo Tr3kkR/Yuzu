@@ -970,13 +970,12 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 ```json
 {
   "agent_ids": ["agent-uuid-1"],
-  "scope": "",
   "params": {"path": "C:\\Windows\\System32\\notepad.exe"}
 }
 ```
 
 - `agent_ids` — optional array of specific agent IDs to target.
-- `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`). Empty string with empty `agent_ids` broadcasts to all connected agents.
+- `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`), or `__all__` for every enrolled agent. **Omit both `scope` and `agent_ids`** to broadcast. A *supplied* empty string, a non-string `scope`, an empty `agent_ids`, a non-array `agent_ids`, or a non-string entry is refused with `400` rather than widened to the whole fleet (#2500) — a target the caller named that resolves to nothing is an error, not a request for everything.
 - `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
 
 **Response (200):**
@@ -999,7 +998,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
   -H "Content-Type: application/json" \
-  -d '{"params":{"path":"C:\\Windows"},"scope":""}'
+  -d '{"params":{"path":"C:\\Windows"}}'
 ```
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.

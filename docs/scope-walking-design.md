@@ -179,6 +179,17 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `{new_id, device_count_delta}` | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). |
 | `DELETE` | `/api/v1/result-sets/{id}` | — | `204` | Pinned sets must be unpinned first. |
 
+**`parent_id` is a targeting argument, and omitted is not the same as empty (#2500).** Omit
+`parent_id` to run against `__all__` deliberately. A **supplied** `parent_id` that is an empty
+string, a non-string value, or an explicit `null` returns `400 RESULT_SET_BAD_PARENT` rather
+than silently dropping the narrowing and running unscoped — a caller who believed it was
+narrowing to one result set must not search or dispatch across the whole fleet instead.
+Explicit `null` is rejected rather than read as "absent", because a client that serialises an
+unset field as `null` and one whose parent lookup returned nothing are indistinguishable at that
+point, and only one of them wants everything. Refusals are counted as
+`yuzu_server_dispatch_target_rejected_total{route="result_set_parent"}` and audited as
+`result_set.create|denied`.
+
 Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`.
 
 ## 7. YAML DSL surface
@@ -260,7 +271,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` | Includes source_kind, parent_id, device_count |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |
