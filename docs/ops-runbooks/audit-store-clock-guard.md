@@ -64,18 +64,23 @@ cannot see it.
    suspended, or restored from a snapshot more than 7 days ago? Check
    `journalctl --list-boots` and the uptime. Elapsed time cannot distinguish a
    clock jump from an outage, which is why the warn text names both.
-3. Check the server log for the specific line - it names which trigger fired
-   (`DeclineWipe`, `DeclineStep`, `DeclineImplausible`, `DeclineFirstPass`).
-4. **Is this simply the first pass since the upgrade?** Check the log for
-   `DeclineFirstPass` -- "no stored clock reading to compare against". Every
-   existing database declines exactly once on its first pass under a build that
-   has the guard, because the elapsed-time check has no anchor yet. It is
-   expected, benign, and self-heals on the next pass. **On a fleet upgrade
-   expect one alert per server; stand them down.**
+3. Check the server log for the specific line - each decline names its own
+   trigger in prose. Grep the phrases, not enum names (the enum names are
+   internal and are never printed):
+   - `"would expire EVERY datable audit row"` - the wipe outcome test fired.
+   - `"elapsed since the last retention pass, over the"` - the elapsed-time
+     check fired; the line prints the measured gap against the threshold.
+   - `"the stored retention clock reading is not usable"` - the persisted
+     reading was ahead of now, negative, non-integer or unreadable.
+4. **Is this the first guarded pass against an existing database?** That case
+   reads `"the first retention pass against this database"`. It happens on an
+   UPGRADE or a RESTORE, never on a brand-new install - with nothing expired the
+   pass returns before the guard is reached.
 
-   Note this does NOT happen on a brand-new install: with nothing expired the
-   pass returns before the guard is reached. The case that fires is an UPGRADE
-   or a RESTORE of a database that already holds an expired backlog.
+   **Do not stand it down on sight.** It is reported only when the pass would
+   ALSO have expired every datable row, so the trigger that makes it visible is
+   the wipe outcome test, not merely a missing anchor. Treat it as the wipe case
+   above: confirm the clock before letting the next pass drain.
 
 **Action:** fix time sync. Nothing else is required - the next pass resumes,
 paced. If the clock was genuinely wrong, decide before it drains whether the
@@ -103,24 +108,34 @@ a code change and a release. Size the problem first -
 - then open an engineering ticket with that number. A 4.5M backlog takes about
 7.5 days to drain; 45M takes about 75 days.
 
-## YuzuAuditRetentionIndexMissing - the gauge reads 0
+## YuzuAuditRetentionNotRunning
 
-Every pass now full-scans `audit_events` under the exclusive lock that every
-audit write takes: roughly 1 second at 5M rows, 10 seconds at 50M, growing with
-the table. Audit writes - including the fail-closed pre-serve audit on
-behavioural-PII routes - queue behind it.
+No retention pass has been ATTEMPTED for three hours. This is the one failure the
+other rules in this family cannot report: they all key on a counter rising, and
+nothing is running to raise one, so the store looks identical to a quiet healthy
+one while `audit.db` grows without bound and the configured window stops being
+enforced.
 
-The index is built best-effort at startup and the gauge is evaluated **once, at
-startup**, so it cannot see an index dropped at runtime. Verify directly:
+Check that the store opened at boot (a failed migration closes it, and
+`start_cleanup()` then early-returns), and look for `AuditStore: retention pass
+threw` in the log. The rule carries an uptime guard because the cleanup thread
+sleeps a full interval before its first pass, so a freshly started server
+legitimately has no pass yet.
 
-```sql
-SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_audit_ttl_id';
-```
-
-Recreate it, or restart the server to rebuild it. On a large table expect the
-build to take seconds to tens of seconds, during which the server has not yet
-bound its listener - see the `start_period` note in
-`docs/user-manual/upgrading.md`.
+> There is deliberately NO metric for a missing retention index. The index is
+> built best-effort outside the migration runner and its absence degrades
+> retention to full scans rather than taking the audit trail offline; it is
+> logged as an error at startup and nowhere else (tracked in #2526). If you
+> suspect it, check directly:
+>
+> ```sql
+> SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_audit_ttl_id';
+> ```
+>
+> A missing index means every pass full-scans `audit_events` under the exclusive
+> lock every audit write takes - roughly 1 second at 5M rows, 10 at 50M. Restart
+> the server to rebuild it, and see the `start_period` note in
+> `docs/user-manual/upgrading.md` first.
 
 ## YuzuAuditRetentionStateNotPersisting
 
