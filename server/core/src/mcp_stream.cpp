@@ -1360,12 +1360,33 @@ McpStreamClose McpPostPump::close_reason() const noexcept {
 }
 
 bool McpPostPump::pump_once_impl(const WriteFn& write) {
+    // Sampled BEFORE the wait, and used ONLY to size it. The gate below needs the
+    // post-wait instant and must re-sample: testing a pre-wait sample against
+    // `next_check_` would be false by construction after waiting for exactly that
+    // deadline, and the credential check would never fire at all.
+    const auto now_before_wait = clock_ ? clock_() : std::chrono::steady_clock::now();
     {
         std::unique_lock<std::mutex> lk(sink_->mu);
         // The queue is NOT a source of frames here - the bridge is - but `closed`
         // and the projector's poke both arrive through this mutex, so this is the
         // wait. The timeout is also the backstop for a poke that raced the wait.
-        sink_->cv.wait_for(lk, cfg_.tick, [this] {
+        //
+        // Bounded by whichever comes FIRST: a full tick, or the instant the next
+        // credential check falls due. Waiting a fresh full tick from each WAKE is
+        // what a poke-driven pump must NOT do: a poke landing at
+        // `next_check_ - eps` wakes it, finds the check not yet due, and then
+        // waits another whole tick - pushing the re-check to ~2 ticks after the
+        // previous one and silently doubling the one-tick revocation bound that
+        // Decision 15(c) / CH-4 and the class comment above both promise.
+        // Counter-intuitively FREQUENT pokes are harmless (each wake re-tests the
+        // gate); the bad case is ONE poke just before the boundary then silence,
+        // which is precisely why a poke-driven test did not catch it.
+        const auto until_check =
+            next_check_ > now_before_wait
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(next_check_ -
+                                                                        now_before_wait)
+                : std::chrono::milliseconds{0};
+        sink_->cv.wait_for(lk, std::min(cfg_.tick, until_check), [this] {
             return sink_->closed.load() || sink_->poked.load(std::memory_order_acquire);
         });
         // Consumed under the same lock that set it, so a poke arriving during this
@@ -1415,8 +1436,10 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         return finish(write, McpStreamClose::kSessionTerminated);
     }
 
-    const auto now = clock_ ? clock_() : std::chrono::steady_clock::now();
-    const bool cap_expired = now >= deadline_;
+    // Reuses the post-wait sample above rather than taking a third: the cap and the
+    // credential gate are meant to read the same instant, and a fake clock that
+    // advances per call would otherwise consume the cap at twice the rate.
+    const bool cap_expired = now_tp >= deadline_;
 
     // The cap is ARBITRATED BY THE BRIDGE, inside the projection claim: a terminal
     // that latched in the same instant wins over an expired cap, because closing

@@ -2148,13 +2148,18 @@ void McpStreamBridge::count_pin_slots_reject(std::size_t pinned, std::size_t unp
     if (metrics_ == nullptr) {
         return;
     }
-    // Which half dominated. Pins outstanding with no charges means every slot is
-    // held by a final that was already committed - the wedge shape.
-    // "pins" only when NO charge is outstanding - that is the wedge shape (every
-    // slot held by a final already committed). A mixed state still has work in
-    // flight that will clear, so it reads "charges" rather than overstating a wedge;
-    // a simple `pinned > unpinned` would have mislabelled ties and hidden partial
-    // wedges behind the wrong bucket either way.
+    // "pins" only when NO charge is outstanding. That is the wedge SHAPE, but on its
+    // own it is NOT proof of a wedge: the charge-to-pin handover happens at terminal
+    // projection while the unpin happens only once the final reaches the wire, so
+    // every HEALTHY session passes through pinned>0/unpinned==0 during that flush
+    // window. Only persistence separates the two, which is why the alert on this
+    // counter carries a `for` and why that `for` is load-bearing rather than tuning.
+    // A mixed state still has work in flight that will clear, so it reads "charges"
+    // rather than overstating a wedge - at the cost of bucketing a PARTIAL wedge
+    // (some pins stuck, one call genuinely live) as ordinary saturation, where
+    // neither the alert nor the operator-facing text will see it. A simple
+    // `pinned > unpinned` would have mislabelled ties and hidden partial wedges
+    // behind the wrong bucket either way.
     const char* held = (pinned > 0 && unpinned == 0) ? "pins" : "charges";
     obs_guard([&] { metrics_->counter(kMetricPinSlotsReject, {{"held", held}}).increment(); });
 }

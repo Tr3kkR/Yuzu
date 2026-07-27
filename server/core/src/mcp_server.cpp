@@ -6302,13 +6302,30 @@ McpServer::HandlerFn McpServer::build_handler(
                             // needed because the key exists only inside this branch:
                             // before bind there is no key to close by.
                             const std::string record_key = *key;
-                            // Minted OUTSIDE the try so the catch can stamp the same
-                            // id into its audit row and its A4 body that the response
-                            // header already carries. A 500 on a still-running
-                            // mutating command with three unjoinable identifiers is
-                            // an investigation that cannot be run.
-                            const std::string cid = yuzu::server::detail::make_correlation_id();
+                            // DECLARED outside the try so the catch can stamp the
+                            // same id into its audit row and its A4 body; MINTED
+                            // inside it, because minting allocates and by this point
+                            // arm() has already moved the record to kStreaming. A
+                            // throw from the mint out here would miss this branch's
+                            // catch and land in the outer one, whose
+                            // park_after_dispatch_failure CASes from kArming and so
+                            // returns false for a kStreaming record: no park, no
+                            // lease release, and NO audit row for a 500 on a
+                            // dispatched, still-running MUTATING fleet command. The
+                            // catch reads an empty cid only in the single case where
+                            // no id was ever stamped anywhere.
+                            std::string cid;
                             try {
+                                cid = yuzu::server::detail::make_correlation_id();
+                                // Stamped on the response HERE rather than with the
+                                // SSE headers further down: every throw between the
+                                // two would otherwise answer 500 with a body and an
+                                // audit row carrying a cid the response header does
+                                // not, which is exactly the unjoinable-identifiers
+                                // problem this id exists to prevent. Set once only -
+                                // httplib EMPLACES headers into a multimap, so the
+                                // catch must not set it a second time.
+                                res.set_header("X-Correlation-Id", cid);
                                 // Built BEFORE the install: once the provider is
                                 // attached the headers are sealed and a throw can no
                                 // longer be answered, so nothing that allocates may
@@ -6423,7 +6440,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // would ride along as a SECOND Content-Type (see the
                                 // note at the DELETE handler). Drop it first.
                                 res.headers.erase("Content-Type");
-                                res.set_header("X-Correlation-Id", cid);
+                                // X-Correlation-Id was set at the mint, above.
                                 res.set_header("Cache-Control", "no-cache");
                                 res.set_header("X-Accel-Buffering", "no");
                                 res.set_header("X-Content-Type-Options", "nosniff");
