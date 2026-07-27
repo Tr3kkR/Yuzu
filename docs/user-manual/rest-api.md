@@ -1519,8 +1519,16 @@ Errors: `400`/`413` (non-empty/oversized body), `403` (missing
 > activity, and the registered-column scan size before retrying), and `"the
 > KEK rotation clock is untrustworthy"` (the newest `secrets.kek_meta` row is
 > future-dated relative to the database server's own clock — investigate the
-> database server's clock/NTP, not the KEK subsystem; self-clears once the
-> clock reads sanely). None of the three carry `retry_after_ms`.
+> database server's clock/NTP, not the KEK subsystem). The response body and
+> server log report the observed skew **magnitude** in seconds, because the
+> two possible skew directions behave differently: a **backward** skew
+> self-clears once the clock reads sanely again, but a **forward** skew
+> (the row was minted while the clock was already ahead — bad NTP, a VM
+> restore, a failover to a host that's ahead) does **not** self-clear — it
+> persists until real time catches up to the stored timestamp, blocking
+> every `/rotate` for that whole duration with **no configuration bypass at
+> all**. See server-admin.md "Clock-anomaly guard" for the full diagnostic
+> procedure. None of the three carry `retry_after_ms`.
 
 > **`500` half-committed — do NOT retry this route.** If rotation registers
 > the new version but fails to finish re-wrapping every row, this returns
@@ -1531,13 +1539,18 @@ Errors: `400`/`413` (non-empty/oversized body), `403` (missing
 > happened after the mint committed — you still get told to call `/rewrap`,
 > never `/rotate`.
 
-> **`429` rotation cooldown — now durable (#2530).** A cheap process-local
-> pre-check (5 minutes, in-memory) short-circuits an obviously-too-soon retry
-> before it costs a query, but it is **not** the authoritative control — it
-> is per-process and a restart clears it. The authoritative rate limit is
-> read from `secrets.kek_meta.created_at` on the database server's own
-> clock, cluster-wide and restart-persistent:
-> `--kek-min-rotate-interval` (seconds, default `3600` = 1h). A failed
+> **`429` rotation cooldown — durable and cluster-wide (#2530; #2530
+> G7-S9 removed a weaker second tier).** An earlier cut of this hardening
+> pass added a cheap process-local pre-check (5 minutes, in-memory)
+> alongside the durable control, but it was removed: it was never the
+> authoritative control (it was per-process and a restart cleared it), its
+> hardcoded window could not be configured below 5 minutes, and it never
+> populated an honest `retry_after_ms`. The sole authoritative rate limit
+> today is read from `secrets.kek_meta.created_at` on the database server's
+> own clock, cluster-wide and restart-persistent:
+> `--kek-min-rotate-interval` (seconds, default `3600` = 1h). A fresh
+> install's first rotate attempt is refused for up to this interval too —
+> KEK v1 is minted at boot with `created_at = now()`. A failed
 > attempt consumes the budget too — deliberately, because a failed rotation
 > is exactly when you must not immediately rotate again: automation that
 > retries `/rotate` on a `500` would otherwise mint a fresh version on every

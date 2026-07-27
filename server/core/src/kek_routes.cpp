@@ -178,17 +178,29 @@ void write_failure(httplib::Response& res, const KekOpResult& result) {
                           "the size of the registered-column rewrap scan before retrying"),
             kJson);
         return;
-    case KekOpResult::Failure::ClockAnomaly:
+    case KekOpResult::Failure::ClockAnomaly: {
         res.status = 503;
-        res.set_content(
-            error_json_a4(503, "the KEK rotation clock is untrustworthy",
-                          make_correlation_id(),
-                          "the newest kek_meta row is timestamped in the future relative to the "
-                          "database server's own clock, so the durable rotation rate limit "
-                          "cannot be computed safely; investigate the database server's clock "
-                          "before retrying"),
-            kJson);
+        // #2530 G7-B6: interpolate the observed skew MAGNITUDE into both the
+        // message and the remediation — "2 seconds of NTP jitter" and "this
+        // row is dated next year" are the same boolean condition but demand
+        // completely different operator responses, and a forward skew is
+        // NOT self-clearing the way a backward skew is (it persists until
+        // real time catches up to the stored timestamp), so this is the one
+        // 503 in this surface with no configuration escape at all — say so
+        // plainly rather than implying a routine retry will resolve it.
+        const std::string message = "the KEK rotation clock is untrustworthy: the newest "
+                                    "kek_meta row is dated " +
+                                    std::to_string(result.clock_skew_secs) +
+                                    "s in the future relative to the database server's own clock";
+        const std::string remediation =
+            "this durable rotation rate limit cannot be computed safely; investigate the "
+            "database server's clock (NTP sync, VM restore, failover to a host that is ahead) "
+            "before retrying. A forward skew like this does NOT self-clear on its own the way a "
+            "backward skew does — it persists until real time catches up to the stored "
+            "timestamp, and there is no configuration flag to bypass this refusal";
+        res.set_content(error_json_a4(503, message, make_correlation_id(), remediation), kJson);
         return;
+    }
     case KekOpResult::Failure::HalfCommitted:
         res.status = 500;
         res.set_content(

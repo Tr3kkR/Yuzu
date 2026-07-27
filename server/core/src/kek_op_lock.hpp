@@ -18,8 +18,9 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <charconv>
 #include <chrono>
-#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace yuzu::server::detail {
@@ -154,9 +155,18 @@ private:
 /// diagnose: an operator hitting 409s because the lock is wedged calls
 /// `/status` during exactly the failure that makes the holder query itself
 /// fail, and a fabricated `false` tells them the opposite of the truth.
+///
+/// #2530 G7-S1: `lock_held` is a field of its OWN, not derived by callers
+/// from `pid.has_value()`. A granted holder row with a NULL `pid` (possible
+/// in `pg_locks` — a lock can be granted to a backend whose pid column is
+/// unreadable at read time) is a HELD lock; collapsing that into "no holder"
+/// would fabricate `lock_held: false`, the one thing this whole design
+/// forbids (see `GET /status`'s `lock_held` contract, kek_routes.hpp). Only
+/// "no granted row at all" is genuinely unheld.
 struct KekOpLockHolder {
-    bool determined{false};   ///< false = the pg_locks query itself failed; `pid` is meaningless
-    std::optional<int> pid{}; ///< meaningful only when `determined`; nullopt = no granted holder
+    bool determined{false};   ///< false = the pg_locks query itself failed; `lock_held`/`pid` meaningless
+    bool lock_held{false};    ///< meaningful only when `determined`; true iff a granted holder row exists (even with a NULL pid)
+    std::optional<int> pid{}; ///< meaningful only when `determined && lock_held`; nullopt = unheld, or held with an unreported pid
 };
 
 /// `exclude_pid`: when non-negative, a holder whose pid equals `exclude_pid`
@@ -167,21 +177,51 @@ struct KekOpLockHolder {
 /// takes this lock itself, so exclusion is a no-op there; the parameter
 /// exists for a future caller that queries from inside its own held lock.
 [[nodiscard]] inline KekOpLockHolder kek_op_lock_holder(PGconn* conn, int exclude_pid = -1) {
+    // #2530 G7-B3: `AND database = ...` is load-bearing, not defensive
+    // polish. `pg_try_advisory_lock`/`pg_advisory_unlock` are
+    // DATABASE-scoped (the same (classid, objid) pair is a distinct lock per
+    // database on the same cluster), but `pg_locks` is a CLUSTER-WIDE view —
+    // without this predicate, a lock held by an entirely unrelated tenant
+    // database on the same Postgres instance is reported as OUR lock:
+    // `/status` says `lock_held: true` with a foreign pid while rotation is
+    // actually free, the gauge pins to 1, the alert fires forever, and the
+    // runbook then walks a DBA toward terminating another tenant's backend.
+    // This also matters in THIS repo's own test topology: the 4 server test
+    // shards share one Postgres container (different databases), so an
+    // unfiltered query could observe a sibling shard's lock — see
+    // test_kek_op_lock_holder.cpp's cross-database isolation case.
     constexpr const char* kSql =
         "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = 2037545589 "
-        "AND objid = (hashtext('secrets_kek_op')::bigint & 4294967295)::oid AND granted";
+        "AND objid = (hashtext('secrets_kek_op')::bigint & 4294967295)::oid AND granted "
+        "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())";
     pg::PgResult res{PQexec(conn, kSql)};
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("KEK op: lock-holder query failed: {}", PQerrorMessage(conn));
-        return KekOpLockHolder{.determined = false, .pid = std::nullopt};
+        return KekOpLockHolder{.determined = false, .lock_held = false, .pid = std::nullopt};
     }
-    // No granted holder at all -> determined, pid nullopt. Not an error.
-    if (PQntuples(res.get()) < 1 || PQgetisnull(res.get(), 0, 0))
-        return KekOpLockHolder{.determined = true, .pid = std::nullopt};
-    const int pid = std::atoi(PQgetvalue(res.get(), 0, 0));
+    // No granted holder row at all -> determined, genuinely unheld.
+    if (PQntuples(res.get()) < 1)
+        return KekOpLockHolder{.determined = true, .lock_held = false, .pid = std::nullopt};
+    // #2530 G7-S1: a granted row with a NULL pid is still a HELD lock — see
+    // the struct doc comment above for why this must not collapse into "no
+    // holder".
+    if (PQgetisnull(res.get(), 0, 0))
+        return KekOpLockHolder{.determined = true, .lock_held = true, .pid = std::nullopt};
+    // #2530 G7-S2: std::from_chars instead of std::atoi — atoi silently
+    // returns 0 on a parse failure, which is a PLAUSIBLE-LOOKING pid; a
+    // malformed value here must surface as "could not determine", never as
+    // a confident (and wrong) pid 0.
+    const char* raw = PQgetvalue(res.get(), 0, 0);
+    const char* end = raw + std::strlen(raw);
+    int pid = 0;
+    const auto parsed = std::from_chars(raw, end, pid);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) {
+        spdlog::error("KEK op: lock-holder query returned an unparseable pid: '{}'", raw);
+        return KekOpLockHolder{.determined = false, .lock_held = false, .pid = std::nullopt};
+    }
     if (exclude_pid >= 0 && pid == exclude_pid)
-        return KekOpLockHolder{.determined = true, .pid = std::nullopt};
-    return KekOpLockHolder{.determined = true, .pid = pid};
+        return KekOpLockHolder{.determined = true, .lock_held = false, .pid = std::nullopt};
+    return KekOpLockHolder{.determined = true, .lock_held = true, .pid = pid};
 }
 
 } // namespace yuzu::server::detail

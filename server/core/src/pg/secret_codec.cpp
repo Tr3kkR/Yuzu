@@ -1185,6 +1185,16 @@ SecretCodec::rotate_clock(PGconn* conn) const {
     const bool future_dated = (future_text[0] == 't') || (age_seconds < 0);
     clock.clock_anomaly = future_dated;
     clock.since_newest = std::chrono::seconds{age_seconds < 0 ? 0 : age_seconds};
+    // #2530 G7-B6: capture the skew MAGNITUDE before it is discarded above.
+    // `age_seconds` is `EXTRACT(EPOCH FROM (now() - created_at))`, so a
+    // future-dated row makes it negative; its absolute value is exactly how
+    // many seconds into the future the row is dated. The boolean-only
+    // `future_text[0] == 't'` path (with a non-negative `age_seconds`,
+    // possible only from clock jitter at the exact now()/created_at
+    // boundary) has no usable magnitude — leave it at 0 rather than fabricate
+    // one.
+    clock.future_skew_secs =
+        (age_seconds < 0) ? static_cast<std::uint64_t>(-age_seconds) : 0;
     return clock;
 }
 

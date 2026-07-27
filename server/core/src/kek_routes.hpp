@@ -87,6 +87,16 @@ struct KekOpResult {
     /// the #2530 contract: waiting does not fix any of them).
     std::uint32_t cooldown_retry_after_ms{0};
 
+    /// #2530 G7-B6: only meaningful when `failure == ClockAnomaly`. How many
+    /// seconds the newest `kek_meta.created_at` row is dated INTO THE
+    /// FUTURE relative to the database server's own clock — a forward skew
+    /// is NOT self-clearing the way a backward skew is (it stays `> now()`
+    /// until real time catches up), so this is the one number that lets an
+    /// operator tell "a few seconds of NTP jitter" from "this row is dated
+    /// next year", which demand completely different responses. Zero means
+    /// the seam did not populate it.
+    std::uint64_t clock_skew_secs{0};
+
     // ── #2530 B2: diagnostic snapshots (status only) ───────────────────────
     // The three fields below are read LOCK-FREE, each by its own SELECT, at
     // POSSIBLY DIFFERENT INSTANTS — `live_versions` and `lock_held`/

@@ -294,6 +294,28 @@ TEST_CASE("kek_routes: ClockAnomaly is distinct from Cooldown — no retry hint,
            remediation.find("clock") != std::string::npos));
 }
 
+// #2530 G7-B6: the 503 body must report the observed skew MAGNITUDE, not
+// just the boolean fact of the anomaly — this is what lets an operator tell
+// "a few seconds of jitter" (self-clears) from "dated a year out" (does
+// not) at a glance.
+TEST_CASE("kek_routes: ClockAnomaly's message interpolates the seam-provided skew magnitude",
+          "[kek_routes]") {
+    Harness h;
+    h.rotate_result.failure = KekOpResult::Failure::ClockAnomaly;
+    h.rotate_result.clock_skew_secs = 31536000; // ~1 year — the "not just jitter" case
+    h.wire();
+    auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    auto body = json::parse(res->body);
+    const std::string message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("31536000") != std::string::npos);
+    const std::string remediation = body["error"]["remediation"].get<std::string>();
+    // The remediation must say there is NO bypass for this specific failure —
+    // it is the one 503 in this surface with no configuration escape at all.
+    CHECK(remediation.find("does NOT self-clear") != std::string::npos);
+}
+
 TEST_CASE("kek_routes: VersionCeiling names --kek-max-live-versions and never implies waiting "
           "helps",
           "[kek_routes]") {

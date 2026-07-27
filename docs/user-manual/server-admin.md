@@ -99,7 +99,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--principal-max-concurrency` | `16` | **Engine principals** (ADR-1005 class, PR 4.4). Maximum in-flight requests for a single engine principal at any instant, checked at the server's single pre-routing chokepoint on both REST and MCP. A streaming/SSE request holds its slot for the stream's lifetime, not just until routing hands off. Exceeding it returns HTTP `429`. Human, device-agent, and anonymous traffic is never gated by this cap. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_MAX_CONCURRENCY`. |
 | `--principal-rate-limit` | `20.0` | **Engine principals** (ADR-1005 class, PR 4.4). Sustained request rate cap (requests/second, token bucket, burst = 2x the configured rate) for a single engine principal. Exceeding it returns HTTP `429`. Independent of `--principal-max-concurrency` — either dimension alone can reject a request. See `docs/user-manual/engine-principals.md` "Per-principal quota cap" for tuning guidance. Env: `YUZU_PRINCIPAL_RATE_LIMIT`. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
-| `--kek-min-rotate-interval` | `3600` | **KEK rotation runaway/abuse guard (#2530) — NOT a rotation-schedule setting.** A floor on how *frequently* `/api/v1/secrets/kek/rotate` may be attempted at all (seconds), read from `secrets.kek_meta.created_at` on the database server's own clock — cluster-wide and restart-persistent, unlike the pre-existing 5-minute process-local pre-check it sits alongside. A rotate inside the window gets `429` with an honest `retry_after_ms`. The default is sized to stop looping automation, not to express how often you intend to rotate; **most operators should never change it.** Raising it delays *emergency* re-rotation after a suspected KEK compromise with no bypass (`/rewrap` only resumes an in-progress rotation, it never mints a new version) — do not set it to your rotation *cadence* (e.g. a 90-day quarterly policy), that is a routine rotation followed by a compromise the next day leaving you refused for the next three months. The upper bound (365 days) is a fat-finger sanity ceiling, not an endorsement of setting it that high. See "Key management (secrets KEK)" for the full contract. Env: `YUZU_KEK_MIN_ROTATE_INTERVAL`. |
+| `--kek-min-rotate-interval` | `3600` | **KEK rotation runaway/abuse guard (#2530) — NOT a rotation-schedule setting.** A floor on how *frequently* `/api/v1/secrets/kek/rotate` may be attempted at all (seconds), read from `secrets.kek_meta.created_at` on the database server's own clock — cluster-wide and restart-persistent (the only authoritative control; a cheap process-local pre-check that used to sit alongside it was removed as a correctness bug, #2530 G7-S9 — see "Key management (secrets KEK)"). A rotate inside the window gets `429` with an honest `retry_after_ms`. The default is sized to stop looping automation, not to express how often you intend to rotate; **most operators should never change it.** Raising it delays *emergency* re-rotation after a suspected KEK compromise with no bypass (`/rewrap` only resumes an in-progress rotation, it never mints a new version) — do not set it to your rotation *cadence* (e.g. a 90-day quarterly policy), that is a routine rotation followed by a compromise the next day leaving you refused for the next three months. The upper bound (365 days) is a fat-finger sanity ceiling, not an endorsement of setting it that high. **A fresh install's first rotate attempt is refused for up to this interval** — KEK v1 is minted at boot with `created_at = now()`, so the durable clock starts counting down from install time, not from your first rotate call. See "Key management (secrets KEK)" for the full contract. Env: `YUZU_KEK_MIN_ROTATE_INTERVAL`. |
 | `--kek-max-live-versions` | `32` | **KEK rotation runaway control (#2530).** Backstop ceiling on the number of non-retired KEK versions; a rotate at or above it gets `409` with no retry hint. There is no retire route (#2525), so raising this above the default is the **supported escape hatch** that keeps rotation usable once an install hits it — a deliberate, logged (`spdlog::warn` at boot) and audited (`server.kek_ceiling_raised`) temporary risk acceptance, not a routine tuning knob; every server sharing the database needs the raised value for the ceiling to lift fleet-wide. See "Key management (secrets KEK)". Env: `YUZU_KEK_MAX_LIVE_VERSIONS`. |
 
 ### Example
@@ -455,6 +455,27 @@ Three things are visible after upgrading agents:
    the text, delete `security.firewall.state` and re-import it via
    `POST /api/instructions/import` — do not edit it in the dashboard YAML
    editor, which drops the definition's `spec.visualization` on save.
+### vNEXT — KEK rotation is now durably rate-limited (#2530) (breaking)
+
+Before this release, `POST /api/v1/secrets/kek/rotate` was rate-limited only by a 5-minute
+**process-local** cooldown — cheap, but per-process and restart-clearable, so an install could
+in practice rotate roughly every 5 minutes (or more often across a restart, or across several
+servers pointed at the same database). This release replaces that with a **durable,
+database-backed** rate limit, `--kek-min-rotate-interval` (default `3600` seconds = 1 hour, env
+`YUZU_KEK_MIN_ROTATE_INTERVAL`), read from `secrets.kek_meta.created_at` on the database
+server's own clock — it survives a restart and is shared cluster-wide by every server pointed at
+the same database. **An install that could previously rotate every ~5 minutes can now be
+durably refused (`429`) for up to an hour by default.** If your operational tooling or runbooks
+assume a short rotation cadence is always available (smoke tests immediately after install,
+scripted rotation drills, etc.), review them against the new default before upgrading — a fresh
+install's very first rotate attempt is also refused for up to this interval, because KEK v1 is
+minted at boot with `created_at = now()`. Lower `--kek-min-rotate-interval` if your operational
+model genuinely needs more frequent rotation, but read the "runaway/abuse guard, not a
+rotation-schedule setting" caveat in "Key management (secrets KEK)" first — this flag also
+bounds how quickly you can rotate in a genuine emergency. See that section and
+`docs/prometheus/yuzu-alerts.yml` (group `yuzu-secrets`) for the full contract, the new
+`VersionCeiling`/`QueryCanceled`/`ClockAnomaly` failure modes, and the new observability surface.
+
 ### vNEXT — API/MCP bearer tokens invalidated on upgrade (ApiTokenStore → Postgres, ADR-0030) (breaking)
 
 The API/MCP bearer-token store moves from SQLite (`api-tokens.db`) to the PostgreSQL substrate as
@@ -1393,20 +1414,25 @@ curl -H "Authorization: Bearer $TOKEN" \
 > on `/rotate` as "you are recovering, use `/rewrap`", not as "try again
 > shortly".
 >
-> **Two tiers of rate limit, only one authoritative (#2530).** A cheap
-> process-local pre-check (5 minutes, in-memory, no DB round trip) short-
-> circuits an obviously-too-soon retry before it costs a query. It is
-> deliberately **not** the correctness guarantee any more — it is
-> per-process, so servers sharing one database each keep their own, and a
-> restart clears it, meaning N servers pointed at one database could each
-> still mint once inside that window. The authoritative control is a
+> **One authoritative rate limit, durable and cluster-wide (#2530; #2530
+> G7-S9 removed a second, weaker tier).** An earlier cut of this hardening
+> pass added a cheap process-local pre-check (5 minutes, in-memory, no DB
+> round trip) alongside the durable control below, to short-circuit an
+> obviously-too-soon retry before it cost a query. That pre-check was
+> **removed**: its hardcoded 5-minute window could not be configured down
+> (an operator setting `--kek-min-rotate-interval` below 5 minutes was still
+> refused for the full 5 minutes on that path), and it never populated an
+> honest `retry_after_ms`, silently falling back to a fixed value on exactly
+> the requests it refused. It was also never the correctness guarantee — it
+> was per-process, so servers sharing one database each kept their own
+> state, and a restart cleared it. The sole authoritative control today is a
 > **durable** rate limit read from `secrets.kek_meta.created_at`, compared
 > against the database server's own `now()` in a single statement (so it is
 > never comparing an app-host clock to a DB clock):
 > `--kek-min-rotate-interval` (seconds, default `3600` = 1h,
-> `YUZU_KEK_MIN_ROTATE_INTERVAL`). Unlike the process-local pre-check, it
-> survives a restart and is shared cluster-wide by every server pointed at
-> the same database. A rotate refused by this durable check gets `429` with
+> `YUZU_KEK_MIN_ROTATE_INTERVAL`). It survives a restart and is shared
+> cluster-wide by every server pointed at the same database. A rotate
+> refused by this durable check gets `429` with
 > an **honest** `retry_after_ms` computed from that same durable timestamp —
 > this is the one failure in this whole surface where a numeric retry hint
 > is truthful, because waiting genuinely resolves it. (`retry_after_ms` is a
@@ -1435,6 +1461,18 @@ curl -H "Authorization: Bearer $TOKEN" \
 > Cluster-wide *correctness* (as opposed to rate limiting) still comes from
 > the advisory lock, which reports `409` — see Concurrency below. A second,
 > unrelated `409` — the live-version ceiling — is covered right after it.
+>
+> **Week-one gotcha: a fresh install's FIRST rotate is refused too (#2530
+> G7-S7).** KEK v1 is minted at boot with `created_at = now()` — it is a
+> `kek_meta` row like any other, so the durable clock above starts counting
+> down from **install time**, not from whenever you happen to first call
+> `/rotate`. If you install the server and immediately try to rotate as a
+> smoke test, you get the same `429` cooldown response an abuse-guard trip
+> would produce, with `retry_after_ms` counting down from
+> `--kek-min-rotate-interval` (default 1h) minus however long the server has
+> been up. This is expected, not a bug — treat a `429` in the first hour
+> after a fresh install as "working as designed", not as a signal something
+> is wrong with the install.
 
 **Verify completion.** `GET /status` (`get_kek_status`) is the source of
 truth: `rotation_complete` is `true` when no stored secret blob still
@@ -1492,10 +1530,47 @@ untrustworthy" — **not** a `429` cooldown, and with no retry hint at all. A
 `429` here would carry a `retry_after_ms` computed from the exact timestamp
 that has just been proven untrustworthy, which would be a lie rather than a
 hint. **What to actually do:** this means the database server's own clock
-(or its NTP sync) is wrong — investigate that, not the KEK subsystem. The
-condition is self-clearing: once the database server's clock reads sanely
-again relative to the stored row, `/rotate` proceeds normally on the very
-next attempt; there is nothing to reset by hand.
+(or its NTP sync) is wrong — investigate that, not the KEK subsystem.
+
+**The two skew directions behave DIFFERENTLY — read this before assuming
+"it'll clear itself" (#2530 G7-B6).** A **backward** clock skew (the
+database server's clock jumps or drifts BACKWARD after the row was minted)
+is transient and self-clearing: once the clock reads sanely again relative
+to the stored row, `/rotate` proceeds normally on the very next attempt,
+with nothing to reset by hand. A **forward** skew — the row was minted
+*while* the clock was already ahead (bad NTP source, a VM restore, a
+failover to a host whose clock is ahead) — is **not** self-clearing: the
+stored `created_at` stays in the future relative to `now()`, and therefore
+stays `> now()`, for the ENTIRE skew duration, blocking every `/rotate`
+attempt for as long as that lasts. Because the anomaly check runs before
+the cooldown and ceiling checks, this refusal has **no bypass at all** — no
+flag, no restart, no override — making an emergency re-rotation after a
+suspected key compromise impossible until real time catches up to the
+stored timestamp.
+
+**Diagnosing which direction you're in.** Both the `503` body and the
+server log line report the observed skew **magnitude** — how many seconds
+into the future the row is dated — specifically so you can tell "a few
+seconds of NTP jitter" (self-clears within moments) from "this row is dated
+next year" (does not self-clear on any practical timescale) at a glance,
+rather than having to query `kek_meta` by hand to find out. If the reported
+magnitude is small (seconds), it is almost certainly ordinary clock jitter
+around the `now()`/`created_at` boundary — wait a few seconds and retry. If
+it is large (hours, days, or more), treat it as a genuine incident:
+1. Confirm the database server's actual wall-clock time and NTP sync status
+   directly (not through the application).
+2. Correct the clock (or complete the VM restore / failover cutover that
+   left it skewed).
+3. Once `SELECT now()` on the database server reads a sane time again,
+   `/rotate` proceeds normally on the next attempt — there is nothing to
+   reset in `kek_meta` by hand.
+
+There is deliberately **no** flag to bypass this check even for a confirmed,
+large, persistent forward skew — a code-level escape hatch on a security
+guard is a separate design decision with its own review, not something this
+hardening pass adds. If a persistent forward skew blocks an emergency
+rotation for you in practice, file an issue describing the scenario rather
+than working around it by hand-editing `kek_meta.created_at`.
 
 **Query-cancellation classification (#2530).** Any KEK rotate/rewrap/status
 Postgres query that is canceled or exceeds `statement_timeout` (SQLSTATE
@@ -1655,25 +1730,51 @@ background thread that recomputes fleet health (`health_recompute_thread_`),
 never synchronously inside the `/metrics` handler itself — so a slow or
 unreachable database degrades a *stale* gauge value on the next scrape
 rather than stalling or failing the scrape during exactly the incident an
-operator needs it for:
+operator needs it for. **The sampler's reads run inside an explicit
+transaction with a 500ms `SET LOCAL statement_timeout` (#2530 G7-B4)** — not
+just a bounded pool acquire — because this is a SERIAL thread shared with
+the security-relevant agent-revocation teardown sweep (and joined before
+`pg_pool_.reset()` in `stop()`); an unbounded statement here previously
+could hold that shared thread for a long multiple of a healthy pass.
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_server_kek_op_lock_held` | gauge | `1` if `secrets_kek_op` currently has a granted holder, else `0`. |
 | `yuzu_server_kek_live_versions` | gauge | Count of non-retired KEK versions. Compare against `--kek-max-live-versions`. |
 | `yuzu_server_kek_active_version` | gauge | The KEK version new secrets are currently encrypted under. |
-| `yuzu_server_kek_oldest_version_in_use` | gauge | Smallest KEK version any stored secret row still references. Absent (not published) when no secret rows exist — never published as a misleading `0`, which would read as an invalid version number. |
-| `yuzu_server_kek_operations_total{op,outcome}` | counter | Rotate/rewrap/status attempts. `op` is one of `rotate`\|`rewrap`\|`status`; `outcome` is one of `success`, `conflict`, `cooldown`, `ceiling`, `query_canceled`, `clock_anomaly`, `half_committed`, `unavailable`, `internal`. |
+| `yuzu_server_kek_operations_total{op,outcome}` | counter | Rotate/rewrap/status attempts. `op` is one of `rotate`\|`rewrap`\|`status`; `outcome` is one of `success`, `conflict`, `cooldown`, `ceiling`, `query_canceled`, `clock_anomaly`, `half_committed`, `unavailable`, `internal`. Pre-seeded to 0 for every `{op,outcome}` combination at boot, so an outcome that has never fired reads as a true zero, not absent. |
+
+**`yuzu_server_kek_oldest_version_in_use` was RETIRED from this sampler
+(#2530 G7-B4)** — it was the one query here that is an UNBATCHED
+full-column scan (`SecretCodec::oldest_kek_version_in_use`), whose scale
+ceiling #2530 explicitly deferred as out of scope (see the registered-column
+trip-wire test). Running that scan every 15s instead of only on operator
+demand made the deferred problem worse, not better, so it was dropped from
+the periodic sweep and the gauge was deleted. `GET /status`'s
+`oldest_in_use` field is unaffected — it still computes this value on
+demand, which is where a full-column scan belongs.
 
 On a database-read degrade during a sampling pass, every gauge above **HOLDS
 its prior published value** rather than publishing a fabricated `0` — a
 metric nobody could read is absent, never a false "no KEK versions" /
 "lock free" reading during exactly the outage you'd want this for — and
 `yuzu_server_kek_metrics_unavailable_total` (counter) is bumped instead, so
-a sustained increase there is itself the "these KEK gauges are stale" signal.
-A ready-made alert for a persistently-held op lock is in
-`docs/prometheus/yuzu-alerts.yml` (group `yuzu-secrets`) — see "Diagnosing a
-stuck KEK op lock" above before acting on it.
+a sustained increase there is itself the "these KEK gauges are stale" signal
+(this now also fires when the KEK substrate itself — `auth_secret_codec_`/
+`pg_pool_` — is unavailable, not only on a query-level degrade, #2530
+G7-M1). A ready-made alert for a persistently-held op lock, and a second for
+a sustained metrics-unavailable rate, are in `docs/prometheus/yuzu-alerts.yml`
+(group `yuzu-secrets`) — see "Diagnosing a stuck KEK op lock" above before
+acting on the first one.
+
+**`yuzu_server_kek_operations_total`'s `{op,outcome}` accumulator is
+published even when the KEK substrate is unavailable (#2530 G7-M1).** An
+earlier cut of this pass published it only from inside the same guard that
+gates the Postgres-backed gauges above — which is the EXACT condition under
+which every KEK operation records `outcome="unavailable"`, so the counter
+went dark precisely when the outcome it exists to show was firing. It is a
+pure in-process accumulator read (no DB access), so it now publishes
+unconditionally on every sampling pass.
 
 #### DR restore-pairing drill
 

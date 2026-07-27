@@ -1873,13 +1873,24 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // only — never a seam-supplied string.
 struct KekFailureInfo {
     int code;
-    const char* message;
+    // #2530 G7-B6: std::string, not const char* — the ClockAnomaly branch
+    // interpolates the observed skew magnitude, so this can no longer be a
+    // static literal in every arm.
+    std::string message;
     const char* remediation; // nullptr only for the unreachable None fallthrough
     long retry_after_ms;     // -1 => no retry hint (not blindly retryable)
 };
 
-KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
-    switch (failure) {
+// #2530 B2/G7-B2: takes the whole `KekOpResult`, not just the `Failure` enum,
+// because `Cooldown`'s retry hint must be the honest value carried on the
+// result (`cooldown_retry_after_ms`, sourced from the durable rate-limit
+// clock) — mirrors kek_routes.cpp's write_failure() signature change. A
+// hardcoded 300000 here would tell an agentic caller to retry in 5 minutes
+// against a durable cooldown that can be up to `--kek-min-rotate-interval`
+// (1h default) — a guaranteed retry storm against the very endpoint this
+// change exists to rate-limit, each retry writing a failure audit row.
+KekFailureInfo kek_failure_info(const KekOpResult& result) {
+    switch (result.failure) {
     case KekOpResult::Failure::Unavailable:
         return {kInternalError, "KEK service unavailable",
                 "the Postgres substrate or secrets codec is not available; retry once the "
@@ -1898,15 +1909,65 @@ KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
                 "another rotation or re-wrap holds the KEK operation lock; retry once it "
                 "completes",
                 5000};
-    case KekOpResult::Failure::Cooldown:
+    case KekOpResult::Failure::Cooldown: {
         // Mirrors the REST 429. Retryable with a real wait, and the remediation
         // must point at rewrap_secrets: an agentic caller recovering a
         // half-committed rotation would otherwise sit in a retry loop against
-        // the one tool that is rate-limited.
+        // the one tool that is rate-limited. #2530 D: retry_after_ms is now
+        // the honest durable-clock value; fall back to the old fixed 5-minute
+        // hint only if the seam left the field unset (0).
+        const long retry_after_ms = result.cooldown_retry_after_ms > 0
+                                         ? static_cast<long>(result.cooldown_retry_after_ms)
+                                         : 300000;
         return {kInternalError, "KEK rotation is in its cooldown window",
                 "rotation attempts are rate-limited; if you are finishing a half-committed "
                 "rotation call rewrap_secrets instead — it is not rate-limited",
-                300000};
+                retry_after_ms};
+    }
+    case KekOpResult::Failure::VersionCeiling:
+        // #2530 G7-B1: waiting never resolves a ceiling refusal — it needs an
+        // operator config change. Name the escape hatch explicitly so an
+        // agentic caller doesn't retry-loop against a permanent condition.
+        // kInternalError, not kInvalidParams: this tool takes no parameters,
+        // so a "your input was wrong" code would be as dishonest here as the
+        // Conflict branch's doc comment above already explains it would be —
+        // this is a server-side/operator-config condition, not a client
+        // mistake.
+        return {kInternalError, "the live KEK version ceiling has been reached",
+                "rotation is blocked because the number of live KEK versions has reached "
+                "--kek-max-live-versions; there is no retire route (#2525), so waiting will "
+                "never clear this — an operator must explicitly raise the ceiling, which is a "
+                "deliberate, logged and audited risk acceptance",
+                -1};
+    case KekOpResult::Failure::QueryCanceled:
+        // #2530 G7-B1: mirrors kek_routes.cpp's QueryCanceled branch. NOT
+        // necessarily transient (may fail identically forever at scale, or
+        // was an admin pg_cancel_backend) — no retry_after_ms.
+        return {kInternalError, "a KEK query was canceled or exceeded its statement timeout",
+                "this is not necessarily transient: check statement_timeout, current database "
+                "load, whether an administrator issued pg_cancel_backend, and the size of the "
+                "registered-column rewrap scan before retrying",
+                -1};
+    case KekOpResult::Failure::ClockAnomaly:
+        // #2530 G7-B1/B6: the timestamp the cooldown math would use is the
+        // very thing proven untrustworthy — no retry_after_ms, and NOT the
+        // same remediation as Cooldown. The message interpolates the
+        // observed skew MAGNITUDE (mirrors kek_routes.cpp's REST twin) so an
+        // agentic caller (or the human reading its logs) can tell "a few
+        // seconds of NTP jitter" from "this row is dated next year" — a
+        // forward skew does NOT self-clear the way a backward one does, and
+        // there is no configuration escape for this refusal at all.
+        return {kInternalError,
+                "the KEK rotation clock is untrustworthy: the newest kek_meta row is dated " +
+                    std::to_string(result.clock_skew_secs) +
+                    "s in the future relative to the database server's own clock",
+                "the newest kek_meta row is timestamped in the future relative to the database "
+                "server's own clock, so the durable rotation rate limit cannot be computed "
+                "safely; investigate the database server's clock (NTP sync, VM restore, "
+                "failover to a host that is ahead) before retrying. A forward skew like this "
+                "does NOT self-clear on its own — it persists until real time catches up to the "
+                "stored timestamp, and there is no configuration flag to bypass this refusal",
+                -1};
     case KekOpResult::Failure::HalfCommitted:
         // Rule A (kek_routes.hpp): this instruction is the single most
         // important string in this handler family — MUST tell the caller to
@@ -1920,6 +1981,7 @@ KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
                 "spurious extra version",
                 -1};
     case KekOpResult::Failure::Internal:
+        return {kInternalError, "internal error", nullptr, -1};
     case KekOpResult::Failure::None: // unreachable on the failure-mapping path
         return {kInternalError, "internal error", nullptr, -1};
     }
@@ -1930,6 +1992,13 @@ KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
 // kek_routes.cpp's failure_tag() (REST twin) so both surfaces log the same
 // detail vocabulary for the same failure classification. Rule B applies here
 // too: never a codec-internal error string, only this static tag.
+//
+// #2530 G7-B1: `None` is deliberately split from `Internal` (rather than
+// falling through together) so a future `Failure` enum addition trips
+// `-Wswitch` here even though `werror=false` only warns — the compiler still
+// flags it in the build log, and a reviewer catches it, instead of the new
+// value silently defaulting to "failure=internal" the way VersionCeiling/
+// QueryCanceled/ClockAnomaly did before this fix.
 const char* kek_failure_tag(KekOpResult::Failure failure) {
     switch (failure) {
     case KekOpResult::Failure::Unavailable:
@@ -1938,9 +2007,16 @@ const char* kek_failure_tag(KekOpResult::Failure failure) {
         return "failure=conflict";
     case KekOpResult::Failure::Cooldown:
         return "failure=cooldown";
+    case KekOpResult::Failure::VersionCeiling:
+        return "failure=ceiling";
+    case KekOpResult::Failure::QueryCanceled:
+        return "failure=query_canceled";
+    case KekOpResult::Failure::ClockAnomaly:
+        return "failure=clock_anomaly";
     case KekOpResult::Failure::HalfCommitted:
         return "failure=half_committed";
     case KekOpResult::Failure::Internal:
+        return "failure=internal";
     case KekOpResult::Failure::None:
         return "failure=internal";
     }
@@ -6792,7 +6868,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (result.failure != KekOpResult::Failure::None) {
                     (void)audit_fn(req, "kek.rotate", "failure", "Secret", "kek",
                                    kek_failure_tag(result.failure));
-                    const auto info = kek_failure_info(result.failure);
+                    const auto info = kek_failure_info(result);
                     res.set_content(a4_error(info.code, info.message,
                                              info.remediation ? std::string_view(info.remediation)
                                                                : std::string_view{},
@@ -6841,7 +6917,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (result.failure != KekOpResult::Failure::None) {
                     (void)audit_fn(req, "kek.rewrap", "failure", "Secret", "kek",
                                    kek_failure_tag(result.failure));
-                    const auto info = kek_failure_info(result.failure);
+                    const auto info = kek_failure_info(result);
                     res.set_content(a4_error(info.code, info.message,
                                              info.remediation ? std::string_view(info.remediation)
                                                                : std::string_view{},
@@ -6884,7 +6960,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Read-only, not audited — matches kek_routes.cpp's GET
                     // /api/v1/secrets/kek/status (mirrors the CA read routes,
                     // which don't audit either).
-                    const auto info = kek_failure_info(result.failure);
+                    const auto info = kek_failure_info(result);
                     res.set_content(a4_error(info.code, info.message,
                                              info.remediation ? std::string_view(info.remediation)
                                                                : std::string_view{},

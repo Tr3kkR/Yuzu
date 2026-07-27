@@ -5375,6 +5375,84 @@ TEST_CASE("MCP KEK: REST/MCP parity on the HalfCommitted remediation string",
     sqlite3_close(raw);
 }
 
+// #2530 G7-B1: the MCP twin never learned VersionCeiling/QueryCanceled/
+// ClockAnomaly — they fell through to the generic "internal error" /
+// "failure=internal" arms (found independently by architect,
+// security-guardian AND consistency-auditor). Empty tier defers tier_allows
+// to true and requires_approval to false (mock perm always allows), so
+// these calls reach the kek_ops seam directly with no approval workflow —
+// exactly like the existing get_kek_status tests above.
+TEST_CASE("MCP KEK: VersionCeiling/QueryCanceled/ClockAnomaly are no longer generic internal "
+          "errors",
+          "[mcp][integration][kek][security]") {
+    struct Case {
+        KekOpResult::Failure failure;
+        const char* message_substr;
+        const char* remediation_substr;
+    };
+    const Case cases[] = {
+        {KekOpResult::Failure::VersionCeiling, "ceiling", "--kek-max-live-versions"},
+        {KekOpResult::Failure::QueryCanceled, "canceled", "statement_timeout"},
+        {KekOpResult::Failure::ClockAnomaly, "untrustworthy", "database server's clock"},
+    };
+    for (const auto& c : cases) {
+        INFO("failure=" << static_cast<int>(c.failure));
+        McpTestServer ts;
+        ts.kek_ops_for_test.rotate = [&]() {
+            KekOpResult r;
+            r.failure = c.failure;
+            r.clock_skew_secs = 47;
+            return r;
+        };
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"rotate_kek"}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        const std::string message = body["error"]["message"].get<std::string>();
+        const std::string remediation = body["error"]["data"]["remediation"].get<std::string>();
+        // Neither string is the old generic fallback.
+        CHECK(message != "internal error");
+        CHECK(message.find(c.message_substr) != std::string::npos);
+        CHECK(remediation.find(c.remediation_substr) != std::string::npos);
+        // #2530 D: none of these three carries a retry hint — waiting alone
+        // never resolves any of them.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        // Audit-detail parity with REST's failure_tag (kek_routes.cpp) — the
+        // #2530 G7-B1 fix also split `None` from `Internal` in
+        // kek_failure_tag so THIS assertion, not a silent default, is what
+        // would catch a regression.
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         std::string("kek.rotate|failure")) == 1);
+    }
+}
+
+// #2530 G7-B2: kek_failure_info() used to take only the Failure enum and
+// hardcode 300000 for Cooldown, discarding result.cooldown_retry_after_ms —
+// against the 1h default that tells an agentic caller to retry in 5 minutes
+// for a 60-minute wait. Prove the honest seam-provided value threads all
+// the way to the MCP wire response, not just the fallback.
+TEST_CASE("MCP KEK: rotate_kek Cooldown threads the seam's honest cooldown_retry_after_ms, "
+          "never the hardcoded fallback",
+          "[mcp][integration][kek][security]") {
+    McpTestServer ts;
+    ts.kek_ops_for_test.rotate = []() {
+        KekOpResult r;
+        r.failure = KekOpResult::Failure::Cooldown;
+        r.cooldown_retry_after_ms = 3500000; // ~58 minutes remaining of a 1h window
+        return r;
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"rotate_kek"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == 3500000);
+    CHECK(body["error"]["data"]["retry_after_ms"] != 300000);
+}
+
 // ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────
 // execute_bundle (async dispatch) + get_bundle_result (collate) wrap the SAME
 // BundleOrchestrator as POST/GET /api/v1/bundles — MCP/REST parity by

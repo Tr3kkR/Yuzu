@@ -51,9 +51,11 @@ constexpr int kKekMaxLiveVersionsDefault = 32;
 /// operator-configured limits, decides whether a rotate may proceed.
 ///
 /// `failure == KekOpResult::Failure::None` means "every precondition passed —
-/// proceed to step 4 (stamp the process-local cooldown) and step 5 (mint)".
-/// Any other value means STOP; the caller must return immediately without
-/// stamping the process-local cooldown and without calling `rotate_kek()`.
+/// proceed to step 5 (mint)". (A former step 4, stamping a process-local
+/// cooldown, was removed — #2530 G7-S9 — once it was superseded by the
+/// durable checks this function performs; see the removal comment at the
+/// `kek_ops.rotate` seam in server.cpp.) Any other value means STOP; the
+/// caller must return immediately without calling `rotate_kek()`.
 ///
 /// Order is load-bearing (contract B3): clock anomaly is checked BEFORE the
 /// durable cooldown, which is checked BEFORE the version ceiling. A future
@@ -69,6 +71,12 @@ struct RotatePreconditionOutcome {
     /// database-server timestamp `rotate_clock()` read (never the app-host
     /// clock) — this is what makes the retry hint truthful (contract D).
     std::uint32_t cooldown_retry_after_ms{0};
+    /// #2530 G7-B6: only meaningful when `failure == ClockAnomaly`. The
+    /// magnitude, in seconds, of how far into the future the newest
+    /// `kek_meta` row is dated (`RotateClock::future_skew_secs`) — carried
+    /// through so the seam can report it in the 503 body and log line rather
+    /// than only in an internal boolean.
+    std::uint64_t clock_skew_secs{0};
 };
 
 [[nodiscard]] inline RotatePreconditionOutcome evaluate_rotate_preconditions(
@@ -76,7 +84,7 @@ struct RotatePreconditionOutcome {
     std::size_t live_version_count, std::uint32_t max_live_versions) {
     // Step 1.
     if (clock.clock_anomaly)
-        return {KekOpResult::Failure::ClockAnomaly, 0};
+        return {KekOpResult::Failure::ClockAnomaly, 0, clock.future_skew_secs};
     // Step 2. `any_rows == false` means no kek_meta row exists yet (first
     // boot) — nothing to be cooling down from.
     if (clock.any_rows && clock.since_newest < min_rotate_interval) {

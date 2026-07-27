@@ -457,6 +457,33 @@ groups:
             rather than a currently-held lock -- check the yuzu-postgres
             alerts first.
 
+      # #2530 G7-S6: sibling of YuzuInventoryStaleCountUnavailable above —
+      # same freeze-detector shape, different gauge family. The KEK gauges
+      # (yuzu_server_kek_{op_lock_held,live_versions,active_version}) HOLD
+      # their prior published value on a database-read degrade rather than
+      # publish a fabricated 0/false, so a healthy-looking reading during a
+      # sustained increase here may just be stale, not genuine. Fleet-size-
+      # independent, so it ships ACTIVE.
+      - alert: YuzuKekMetricsUnavailable
+        expr: |
+          rate(yuzu_server_kek_metrics_unavailable_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEK cluster-state gauges may be frozen"
+          description: >-
+            yuzu_server_kek_metrics_unavailable_total is rising: the 15s
+            KEK-metrics sampling sweep (health_recompute_thread_) keeps
+            failing to acquire a pooled connection or hitting its bounded
+            statement_timeout, so yuzu_server_kek_op_lock_held /
+            yuzu_server_kek_live_versions are held at their last published
+            value and may read healthy during an actual outage or a
+            genuinely wedged secrets_kek_op lock. Investigate Postgres pool
+            saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds)
+            before trusting the KEK gauges above.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock"
+
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
   # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on

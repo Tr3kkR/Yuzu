@@ -45,6 +45,9 @@ TEST_CASE("evaluate_rotate_preconditions: a clock anomaly is reported as ClockAn
     // the order were ever flipped this would silently start passing as
     // Cooldown instead of failing loudly as ClockAnomaly.
     clock.since_newest = std::chrono::seconds{10};
+    // #2530 G7-B6: the skew magnitude must reach the outcome unmodified —
+    // this is what lets the seam report it in the 503 body and log line.
+    clock.future_skew_secs = 45;
 
     const auto out = evaluate_rotate_preconditions(clock, kOneHour, /*live=*/0, kMaxLive);
     CHECK(out.failure == KekOpResult::Failure::ClockAnomaly);
@@ -52,6 +55,7 @@ TEST_CASE("evaluate_rotate_preconditions: a clock anomaly is reported as ClockAn
     // timestamp a Cooldown hint would be computed from is the very thing
     // just proven untrustworthy.
     CHECK(out.cooldown_retry_after_ms == 0);
+    CHECK(out.clock_skew_secs == 45);
 }
 
 TEST_CASE("evaluate_rotate_preconditions: the durable cooldown is checked before the ceiling — "

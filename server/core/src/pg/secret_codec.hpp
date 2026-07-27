@@ -306,6 +306,16 @@ public:
         std::chrono::seconds since_newest{0}; ///< age of the newest kek_meta row
         bool clock_anomaly{false}; ///< newest row is FUTURE-dated vs now()
         bool any_rows{false};      ///< false = no kek_meta rows yet
+        /// #2530 G7-B6: magnitude of the future-dating in seconds, meaningful
+        /// only when `clock_anomaly` is true (0 otherwise). A forward clock
+        /// skew is NOT self-clearing the way a backward skew is — a
+        /// future-dated `kek_meta.created_at` stays `> now()` until real time
+        /// catches up to it, blocking every rotation for the whole skew
+        /// duration with no configuration escape (see server-admin.md). This
+        /// field is what lets an operator tell "2 seconds of NTP jitter" from
+        /// "this row is dated next year" — those demand completely different
+        /// responses, and without this the seam could not distinguish them.
+        std::uint64_t future_skew_secs{0};
     };
     [[nodiscard]] std::expected<RotateClock, LifecycleError> rotate_clock(PGconn* conn) const;
 

@@ -8,11 +8,18 @@
 // scan and can push a rewrap past `statement_timeout` on a large table — the
 // batching work (#2530 UP-10/11/12) is deliberately DEFERRED, not done here.
 // This test pins the registered set at exactly one column so that the moment
-// someone adds a second `register_secret_column` call anywhere in the
-// codebase, THIS test fails loudly and forces an explicit decision about the
-// deferred batching work, rather than the second column silently inheriting
-// whatever ceiling the first one was living under. Read this comment before
-// updating the expected set below.
+// someone adds a second `register_secret_column` call THAT REACHES THIS
+// PRODUCTION `AuthDB` CONSTRUCTION PATH (server.cpp's FileKeyProvider ->
+// SecretCodec -> AuthDB wiring), THIS test fails loudly and forces an
+// explicit decision about the deferred batching work, rather than the
+// second column silently inheriting whatever ceiling the first one was
+// living under. #2530 G7-S4: this test observes exactly one construction
+// site (AuthDB's), not "anywhere in the codebase" — a NEW secret-bearing
+// store that registers its own column via its own constructor is invisible
+// to this test unless it is added to the same production wiring this test
+// constructs. Whoever adds a second secret-bearing store must add its OWN
+// trip-wire test (or extend this one to also construct that store) — read
+// this comment before updating the expected set below.
 //
 // Do NOT "fix" this by adding a runtime guard inside SecretCodec that refuses
 // a second registration — SecretCodec is, by design, the registry for every

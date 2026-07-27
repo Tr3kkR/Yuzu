@@ -64,15 +64,41 @@ PgConn connect(const std::string& dsn) {
 /// The naive predicate from the #2530 contract, run directly (not via
 /// production code) so this test can independently confirm/deny it without
 /// depending on kek_op_lock.hpp's chosen implementation.
+///
+/// #2530 G7-B3: this now carries the SAME `AND database = ...` filter as the
+/// shipped query. Without it, this helper's "proven empirically" claim only
+/// held in a single-database cluster: `pg_locks` is a CLUSTER-WIDE view, and
+/// the 4 server test shards share one Postgres container (one database per
+/// shard) — an unfiltered query here could observe a SIBLING SHARD's held
+/// lock and either flake the "no lock held" case or, worse, report the wrong
+/// pid for the "held" case. The database filter is exactly the fix under
+/// test, so this comparison helper must carry it too or it stops being a
+/// meaningful cross-check of the production predicate.
 std::optional<int> naive_holder_pid(PGconn* conn) {
     PgResult res{PQexec(conn,
                         "SELECT pid FROM pg_locks WHERE locktype = 'advisory' "
                         "AND classid = 2037545589 AND objid = hashtext('secrets_kek_op') "
-                        "AND granted")};
+                        "AND granted "
+                        "AND database = (SELECT oid FROM pg_database WHERE datname = "
+                        "current_database())")};
     REQUIRE(res.status() == PGRES_TUPLES_OK);
     if (PQntuples(res.get()) < 1 || PQgetisnull(res.get(), 0, 0))
         return std::nullopt;
     return std::atoi(PQgetvalue(res.get(), 0, 0));
+}
+
+/// Raw, UNFILTERED query (no `AND database = ...`) — used ONLY to
+/// demonstrate the #2530 G7-B3 vulnerability directly, never as a
+/// cross-check of correct behaviour. Deliberately separate from
+/// `naive_holder_pid` above (which now carries the fix) so this file keeps
+/// one place that still reproduces the bug for the negative-proof test
+/// below.
+bool unfiltered_query_sees_any_granted_holder(PGconn* conn) {
+    PgResult res{PQexec(conn, "SELECT pid FROM pg_locks WHERE locktype = 'advisory' "
+                              "AND classid = 2037545589 AND objid = hashtext('secrets_kek_op') "
+                              "AND granted")};
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return PQntuples(res.get()) >= 1;
 }
 
 } // namespace
@@ -221,4 +247,50 @@ TEST_CASE("KEK op lock holder query: determined == false on a genuine query fail
     // `pid` is documented as meaningless when undetermined; still must not
     // spuriously carry a value.
     CHECK_FALSE(result.pid.has_value());
+}
+
+// #2530 G7-B3 — empirically proves the database-scoping fix, using two REAL,
+// independently-created ephemeral databases on the same cluster (exactly the
+// topology `pg_try_advisory_lock` is scoped by, and exactly the topology the
+// 4-shard CI Postgres container has today). Before this fix, a lock held in
+// database A was reported to an observer connected to database B — `/status`
+// would say `lock_held: true` with a FOREIGN pid while rotation was actually
+// free in B, pinning the gauge/alert forever and pointing a runbook at
+// terminating another tenant's backend.
+TEST_CASE("KEK op lock holder query: a lock held in database A is NOT reported to an observer "
+          "in database B",
+          "[pg][secrets][kek]") {
+    YUZU_REQUIRE_PG_DB(db_a);
+    YUZU_REQUIRE_PG_DB(db_b);
+
+    PgConn holder_a = connect(db_a.dsn());
+    PgConn observer_b = connect(db_b.dsn());
+
+    // Take the lock in database A.
+    REQUIRE(try_lock_kek_op(holder_a.get()) == KekOpLockAttempt::kAcquired);
+    KekOpLockGuard guard{holder_a.get()};
+    const int holder_pid = PQbackendPID(holder_a.get());
+
+    // First, prove the vulnerability is REAL against the unfiltered query —
+    // otherwise this test would only be proving something the fixture never
+    // exercised. `pg_locks` is cluster-wide, so an observer in B sees A's
+    // granted row when nothing filters by database.
+    REQUIRE(unfiltered_query_sees_any_granted_holder(observer_b.get()));
+
+    // Now prove the SHIPPED, database-filtered query from database B does
+    // NOT see it: determined (the query itself succeeded) but genuinely
+    // unheld from B's perspective.
+    auto from_b = kek_op_lock_holder(observer_b.get());
+    CHECK(from_b.determined);
+    CHECK_FALSE(from_b.lock_held);
+    CHECK_FALSE(from_b.pid.has_value());
+
+    // And, as a positive control, an observer actually connected to A sees
+    // it correctly.
+    PgConn observer_a = connect(db_a.dsn());
+    auto from_a = kek_op_lock_holder(observer_a.get());
+    CHECK(from_a.determined);
+    CHECK(from_a.lock_held);
+    REQUIRE(from_a.pid.has_value());
+    CHECK(*from_a.pid == holder_pid);
 }
