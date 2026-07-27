@@ -57,7 +57,7 @@ jobs:
   # than queueing 75 min into a stalled runner). Secrets are available on
   # workflow_dispatch (the /test --full dispatch path), so the PAT resolves.
   preflight:
-    name: "Preflight (runner health)"
+    name: "Sanitizer preflight (runner health)"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -70,7 +70,9 @@ jobs:
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam
 
   asan-ubsan:
     name: "Sanitizers (ASan+UBSan)"

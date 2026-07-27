@@ -89,10 +89,9 @@ jobs:
   #     gate on the pool, not a single named runner, so a free pool member keeps
   #     them running and a fully-offline pool still skips them fast.
   #
-  # If RUNNER_INVENTORY_TOKEN is missing, the script writes
-  # all runners as `false` and exits 0 (fail-closed): downstream jobs
-  # skip with an obvious "preflight detected unhealthy runner" reason
-  # rather than disappearing into a queue.
+  # If the runner-control query is unavailable or a required pool is wholly
+  # offline, preflight fails red. Required checks must never disappear behind
+  # a successful skip merely because their control-plane evidence is missing.
   preflight:
     name: "Preflight (runner health)"
     runs-on: ubuntu-24.04
@@ -111,10 +110,9 @@ jobs:
       # Big Tam sub-pool (yuzu-bigtam-linux) — gates the gcc-15/clang-21 compile
       # job, whose 26.04-only toolchain cannot run on the Shulgi 24.04 fallback.
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
-      # Pool gate for the [self-hosted, Windows, X64] job: true iff >=1 eligible
-      # Windows runner (any yuzu-weetam-windows-* OR the yuzu-local-windows Shulgi
-      # fallback) is online. Replaces the old single-named yuzu_local_windows gate.
-      windows_pool_healthy: ${{ steps.health.outputs.windows_pool_healthy }}
+      # Exact Wee Tam pool gate matching the Windows job's runs-on labels.
+      # Shulgi is an operator testbed, not a production scheduling fallback.
+      weetam_pool_healthy: ${{ steps.health.outputs.weetam_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -128,11 +126,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Probe runner health
-        id: health
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+      - name: Runner-health control tests
+        run: python3 scripts/ci/test_runner_health_check.py
 
       # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
       # otherwise only runs at release time, so a regex regression would surface
@@ -186,6 +181,15 @@ jobs:
           fi
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "Result: code_changed=$code_changed"
+
+      - name: Probe runner health for code-bearing changes
+        id: health
+        if: steps.codegate.outputs.code_changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam --require-pool weetam
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
@@ -579,15 +583,14 @@ jobs:
           --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
           --conclusion "$YUZU_CI_CONCLUSION"
 
-  # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
+  # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
     needs: [preflight]
-    # Skip if the self-hosted Windows job pool is unhealthy/empty. Fail-closed
-    # `== 'true'`. Pool-gated (yuzu-weetam-windows-* or the yuzu-local-windows
-    # Shulgi fallback) — mirrors the Linux pool gate.
+    # Skip if the exact Wee Tam job pool is unhealthy/empty. Fail-closed
+    # `== 'true'`; the generic Shulgi testbed label cannot satisfy this job.
     # `&& code_changed` (issue #1978): docs-only PRs skip this required job.
-    if: needs.preflight.outputs.windows_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    if: needs.preflight.outputs.weetam_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute

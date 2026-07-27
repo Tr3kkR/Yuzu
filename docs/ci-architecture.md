@@ -21,7 +21,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
   leg (`windows-asan`, agent-only, Wee Tam pool, gated on
-  `windows_pool_healthy`) covering the Windows-only spark mechanisms that the
+  `weetam_pool_healthy`) covering the Windows-only spark mechanisms that the
   Linux sanitizers can't reach (#1934a). On any leg failure, the `alert` job auto-opens or comments on a
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
@@ -258,11 +258,16 @@ and opens a `runner-inventory-drift` issue on mismatch. Both the sentinel
 and the new ci.yml `preflight` job share `scripts/ci/runner-health-check.py`
 (`--mode sentinel` vs `--mode preflight`). Preflight gates downstream
 self-hosted jobs with explicit
-`if: needs.preflight.outputs.<runner>_healthy == 'true'` — fail-closed: a
-degraded runner skips its jobs in <30 s rather than queueing 30 min into a
-stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret
-(fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight
-returns false and self-hosted jobs are skipped with a clear reason.
+`if: needs.preflight.outputs.<runner>_healthy == 'true'`. Each workflow also
+declares its required pools with `--require-pool`. A wholly unavailable
+required pool fails preflight red instead of silently turning its required
+jobs into successful skips. The control interface distinguishes observed
+runner drift from authentication, API/transport, and malformed-response
+failures; missing evidence is a failure, never an inferred healthy state.
+The query requires the `RUNNER_INVENTORY_TOKEN` PAT secret (fine-grained,
+Administration:read on Tr3kkR/Yuzu). Expected failures publish a typed
+`failure_kind` and `failure_report`; an unexpected crash before those outputs
+still takes the sentinel's fallback issue path.
 
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
