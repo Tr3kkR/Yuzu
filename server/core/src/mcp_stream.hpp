@@ -30,6 +30,11 @@
 /// mutex (a stalled peer must not block a publisher).
 
 #include "event_bus.hpp"
+// McpPostPump's tick is expressed in McpStreamBridge::PostBatch. The dependency
+// runs presentation -> core, which is the sanctioned direction (G1); the bridge
+// header forward-declares McpStreamState rather than including this one, so
+// there is no cycle.
+#include "mcp_stream_bridge.hpp"
 #include "stream_budget.hpp"
 
 #include <array>
@@ -86,6 +91,12 @@ inline constexpr std::chrono::milliseconds kMcpStreamTickDefault{3000};
 /// cached token would not have re-hit the backend within that window anyway
 /// (Decision 15(i) — no mass kill on a blip).
 inline constexpr std::chrono::milliseconds kMcpRevalidateGraceDefault{60000};
+
+/// Decision 15: how long a streamed-POST response stays open before it is closed
+/// with `kCapExpired`. The execution is NOT cancelled - it continues server-side
+/// and its result stays collectable by GET resume or by `execution_id` - so this
+/// bounds a held connection, never the work.
+inline constexpr std::chrono::milliseconds kMcpStreamedPostCapDefault{120000};
 
 /// `retry_after_ms` on a stream-cap 429. Honest, not aspirational: a slot frees
 /// only when a live stream ends, and a dead peer is detected within one tick
@@ -685,6 +696,86 @@ private:
     // The credential re-validation grace policy (revoke/indeterminate/valid/stale, jitter,
     // #2367 staleness clamp). Owns all of the grace state + the injected clock; this pump keeps
     // only the wire action taken on its verdict. Constructed from cfg_ + the ClockFn.
+    RevalidateGrace grace_;
+};
+
+/// The streamed-POST response pump (2f PR 3b): progress frames, then the
+/// JSON-RPC result LAST, then EOF. A SIBLING of McpStreamPump, not a subclass -
+/// that class has no virtuals and no protected state - and it lives in this
+/// header for one hard reason: `write_all` and `count_stream_close` are in
+/// mcp_stream.cpp's anonymous namespace, so a pump defined anywhere else could
+/// not reuse them.
+///
+/// Differences from the GET pump, all of them load-bearing:
+///  - Its frames come from the BRIDGE, not from its sink queue. A streamed
+///    record publishes ring-only (deliver_live=false), so the sink is a pure
+///    WAKE CHANNEL: the projector pokes it, and the pump then asks the bridge
+///    what to write. Nothing ever enqueues onto that queue.
+///  - It has a response CAP. The GET channel is open-ended; a POST response is
+///    a request/response exchange, so it is bounded and the execution continues
+///    server-side past the close. That needs a clock of its own, because
+///    RevalidateGrace privately owns the one injected into it.
+///  - It NEVER closes the session's stream state. The GET pump owns that stream;
+///    closing it here would kill a concurrent GET channel that this request has
+///    no authority over.
+class McpPostPump {
+public:
+    struct Config {
+        std::chrono::milliseconds tick = kMcpStreamTickDefault;
+        /// Decision 15: the streamed-POST response is bounded, then closed with
+        /// kCapExpired while the execution continues; the client collects the
+        /// result by GET resume or by execution_id. A documented SHOULD
+        /// deviation ("SHOULD NOT close before sending the response") taken as a
+        /// resource bound with a resumable escape.
+        std::chrono::milliseconds cap = kMcpStreamedPostCapDefault;
+        std::chrono::milliseconds revalidate_grace = kMcpRevalidateGraceDefault;
+        std::chrono::milliseconds revalidate_grace_jitter_max{0};
+        std::chrono::milliseconds revalidate_max_staleness{0};
+    };
+
+    /// Aliased, NOT redeclared: `write_all` is typed to McpStreamPump::WriteFn,
+    /// and a fresh std::function typedef is a distinct type that would not bind.
+    using WriteFn = McpStreamPump::WriteFn;
+    using ClockFn = McpStreamPump::ClockFn;
+    /// What the bridge hands back for one tick. Injected as a callable rather
+    /// than a bridge pointer so this half stays testable without a live bridge,
+    /// matching how the GET pump takes `revalidate` / `session_alive`.
+    using TakeBatchFn = std::function<McpStreamBridge::PostBatch(bool cap_expired)>;
+    using FinalWrittenFn = std::function<void()>;
+
+    McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                FinalWrittenFn on_final_written, std::function<StreamRevalidate()> revalidate,
+                std::function<bool()> session_alive);
+    // Two ctors rather than `Config cfg = {}` for the same reason as
+    // McpStreamPump: GCC rejects a defaulted brace-init of an incomplete
+    // enclosing class.
+    McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                FinalWrittenFn on_final_written, std::function<StreamRevalidate()> revalidate,
+                std::function<bool()> session_alive, Config cfg, ClockFn clock = {},
+                yuzu::MetricsRegistry* metrics = nullptr,
+                std::string correlation_id = {}, std::string execution_id = {});
+
+    /// true = keep the response open, false = the provider is done. Hard
+    /// noexcept boundary: httplib runs providers on a bare ThreadPool task.
+    bool pump_once(const WriteFn& write);
+
+private:
+    bool pump_once_impl(const WriteFn& write);
+    /// Writes the close frame (except for kCompleted, which EOFs after a real
+    /// final) and always returns false.
+    bool finish(const WriteFn& write, McpStreamClose reason);
+
+    std::shared_ptr<sse_bus::SseSinkState> sink_;
+    TakeBatchFn take_batch_;
+    FinalWrittenFn on_final_written_;
+    std::function<StreamRevalidate()> revalidate_;
+    std::function<bool()> session_alive_;
+    Config cfg_;
+    yuzu::MetricsRegistry* metrics_ = nullptr;
+    std::string correlation_id_;
+    std::string execution_id_;
+    ClockFn clock_;
+    std::chrono::steady_clock::time_point deadline_;
     RevalidateGrace grace_;
 };
 
