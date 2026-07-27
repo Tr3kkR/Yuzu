@@ -880,12 +880,11 @@ If a migration fails:
 
 ## Upgrade notes by release
 
-### Audit retention is clock-guarded and paced (#2360)
+### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse)
 
-The audit cleanup pass used to issue an unbounded `DELETE` driven by the local
-wall clock, so one forward clock step could empty the SOC 2 evidence table in a
-single statement. It is now guarded and capped. Two operator-visible
-consequences on upgrade:
+Both retention paths used to issue an unbounded `DELETE` driven by the local wall
+clock, so one forward clock step could wipe a store in a single statement. They
+are now guarded and capped. Two operator-visible consequences on upgrade:
 
 - **Audit retention is now a floor, not a ceiling.** A pass that would expire
   every datable row declines once, and every accepted pass is capped at 25,000
@@ -901,6 +900,35 @@ consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **Expect a retention decline on the first pass after upgrade.** Both guards
+  decline when they find no stored clock reading to compare against AND there is an
+  expired backlog to act on, because the elapsed-time check cannot run without an
+  anchor. It is logged, it increments the
+  decline counter, and it needs no action - the next pass proceeds normally.
+  **The count differs by store:** the audit store is one table, so it declines
+  at most once. TAR checks per warehouse table, so on an agent upgrade every
+  enabled time-based table declines in that same pass and
+  `retention_guard_declines_total` rises by the number of those tables (5-10 on
+  a default agent), not by 1. That is still the benign bootstrap case, not a
+  fleet of separate anomalies. On a fleet upgrade expect one
+  `YuzuAuditRetentionClockAnomaly` per server if you have wired it; stand them
+  down. See [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+- **Agents surface new `tar status` lines**: `storage_state`,
+  `retention_guard_declines_total`, `retention_guard_failures_total`, and
+  per-table detail. On the healthy path `storage_state|ok` is the first line,
+  and existing consumers filter on the `config|` prefix and ignore unknown
+  lines, so nothing breaks. **On the offline path they do break**: when the TAR
+  database has been closed after a wedged rollback, `tar status` returns
+  non-zero and emits only an `error|` line followed by `storage_state|offline` -
+  no `record_count`, no `config|` lines at all. Note the order is REVERSED
+  there: `error|` comes first, because server and dashboard consumers key off
+  the output starting with `error|`. A consumer keyed on the presence of
+  `record_count` must handle that. See
+  [tar.md](tar.md#the-retention-clock-guard). TAR persists its own clock reading
+  in `tar_config` (`retention_guard_last_pass`) - no schema change.
+- **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
+  but a large excess (after a long disable, or an upgrade backlog) drains over
+  several 900 s rollup ticks rather than in one statement.
 
 Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
 declined-pass and failed-pass counters must be alerted on separately: both leave

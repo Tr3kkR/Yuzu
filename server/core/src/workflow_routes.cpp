@@ -1,6 +1,7 @@
 #include "workflow_routes.hpp"
 
 #include "compliance_eval.hpp"
+#include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
@@ -62,6 +63,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
     auto* execution_event_bus = deps.execution_event_bus;
+    auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
 
     // -- HTMX fragments --------------------------------------------------------
@@ -1246,10 +1248,31 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             try {
                 auto j = nlohmann::json::parse(agent_ids_json);
                 if (j.is_array()) {
+                    // Build into a scratch vector and commit only on FULL
+                    // success. `get<std::string>()` throws on the first
+                    // non-string, and the bare catch below swallows it — so
+                    // pushing directly into `target_ids` left a PARTIALLY
+                    // filled list on `["a","b",3,"d"]` and this step then
+                    // dispatched to the truncated prefix, reporting
+                    // `agents_reached: 2` as success. That is #2500's defect
+                    // pointing the other way: a target the caller named,
+                    // silently NARROWED rather than widened. Both directions
+                    // are the same lie — the set that ran is not the set that
+                    // was asked for (governance, Gate 5 CH-1).
+                    std::vector<std::string> parsed_ids;
+                    parsed_ids.reserve(j.size());
                     for (const auto& a : j)
-                        target_ids.push_back(a.get<std::string>());
+                        parsed_ids.push_back(a.get<std::string>());
+                    target_ids = std::move(parsed_ids);
                 }
-            } catch (...) {}
+            } catch (...) {
+                // target_ids stays EMPTY on any malformed stored targeting.
+                // Empty reaches nobody at the shared sink (#2500), so a corrupt
+                // or legacy `agent_ids_json` fails this step loudly instead of
+                // dispatching to whatever happened to parse — or, before the
+                // inversion, to the entire fleet.
+                target_ids.clear();
+            }
 
             // Parse parameters from JSON object
             std::unordered_map<std::string, std::string> params;
@@ -1356,9 +1379,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
-                                                       execution_tracker, approval_manager](
-                                                          const httplib::Request& req,
-                                                          httplib::Response& res) {
+                                                       execution_tracker, approval_manager,
+                                                       metrics](const httplib::Request& req,
+                                                                httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
             return;
         if (!instruction_store || !instruction_store->is_open()) {
@@ -1380,11 +1403,78 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // Parse request body
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(req.body);
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        // `check_targeting_shape` requires an OBJECT: nlohmann's contains() is
+        // false for an array or scalar, so a body of `["dev-1","dev-2"]` would
+        // read as "named no target" and broadcast to the whole fleet — the exact
+        // class this route is being fixed for, arriving through the guard itself.
+        // Found independently by three Gate-3 reviewers.
+        if (!j.is_object()) {
+            if (metrics) {
+                metrics
+                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                              {{"route", "instruction_execute"}, {"reason", std::string(kReasonBodyType)}})
+                    .increment();
+            }
+            if (audit_fn) {
+                audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                         std::string("reason=") + std::string(kReasonBodyType));
+            }
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        // ── Targeting shape: supplied-but-names-nothing is an ERROR (#2500) ──
+        // The same rule, from the same function, that MCP execute_instruction
+        // enforces (#2492). Before this, `{"agent_ids": []}`, a non-array
+        // `agent_ids` and a non-string `scope` all fell through to the sink's
+        // broadcast default and dispatched to the entire fleet.
+        //
+        // It runs BEFORE the extraction below rather than after, because
+        // extraction is where a non-string entry used to be refused — by
+        // `get<std::string>()` throwing `type_error` into the generic catch and
+        // surfacing as "invalid request body". That 400 was accidental, said
+        // nothing about targeting, emitted no metric and no audit row, and was
+        // one refactor away from disappearing. Rejecting here makes it
+        // deliberate and countable, and the extraction loop below now operates
+        // on types this function has already guaranteed.
+        if (auto bv = yuzu::server::check_targeting_shape(j)) {
+            if (metrics) {
+                metrics
+                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                              {{"route", "instruction_execute"}, {"reason", bv->reason}})
+                    .increment();
+            }
+            if (audit_fn) {
+                audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                         std::string("reason=") + bv->reason);
+            }
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+
         std::vector<std::string> agent_ids;
         std::string scope_expr;
         std::unordered_map<std::string, std::string> params;
         try {
-            auto j = nlohmann::json::parse(req.body);
             if (j.contains("agent_ids") && j["agent_ids"].is_array()) {
                 for (const auto& a : j["agent_ids"])
                     agent_ids.push_back(a.get<std::string>());
@@ -1465,7 +1555,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        // Empty agent_ids + empty scope = broadcast to all agents
+        // OMITTED agent_ids + OMITTED scope = broadcast to all agents. That is
+        // still the contract and is deliberate. What changed in #2500 is the
+        // other half: a targeting argument the caller SUPPLIED can no longer
+        // arrive here having silently resolved to nothing — `{"agent_ids": []}`,
+        // a non-array `agent_ids` and a non-string `scope` are refused above, so
+        // reaching this point empty now means the caller genuinely named no
+        // target rather than named one the parser threw away.
 
         // PR 2: create the execution row BEFORE dispatch so the
         // execution_id is known when cmd_dispatch generates command_id —
@@ -1492,8 +1588,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string command_id;
         int sent = 0;
         try {
-            std::tie(command_id, sent) =
-                cmd_dispatch(def->plugin, def->action, agent_ids, scope_expr, params, execution_id);
+            // #2500: NAME the broadcast rather than expressing it as "both
+            // fields happen to be empty". The shape check above guarantees that
+            // arriving here empty means the caller OMITTED both, so this maps
+            // the deliberate case onto the sink's explicit `__all__` branch and
+            // leaves an accidental empty — from any future code path that skips
+            // the check — reaching nobody instead of everybody.
+            const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
+                                                   ? std::string(kBroadcastScope)
+                                                   : scope_expr;
+            std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
+                                                      dispatch_scope, params, execution_id);
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created

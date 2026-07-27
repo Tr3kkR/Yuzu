@@ -464,6 +464,22 @@ function onDefSelected(defId) {
 }
 )HTM"
     // Part 3: Execute + form-to-YAML JavaScript
+    //
+    // The "All agents" option sends scope='__all__', NOT an empty string. Empty
+    // meant "broadcast" only by falling through the dispatch sink's untargeted
+    // default; #2500 made a SUPPLIED-but-empty scope a 400, because a caller
+    // whose scope resolved to nothing and one who meant the whole fleet must not
+    // look identical on the wire. `__all__` is what /discover/scope-kinds and
+    // the MCP execute_instruction schema both advertise, so the dialog now sends
+    // what its own <option> value has always said.
+    //
+    // KEEP PROSE OUT OF THE LITERAL BELOW. MSVC caps a single string literal at
+    // 16 KiB (C2026) and this one runs at ~16.2 KiB. GCC and Clang have no such
+    // cap, so an over-long comment inside the JS compiles clean on Linux and
+    // macOS and breaks ONLY the Windows leg - which is exactly how it broke on
+    // the first push of this change. Explain here; keep the JS terse. If this
+    // part needs to grow, split it into another adjacent chunk (the compiler
+    // concatenates them) rather than trimming comments to buy room.
     R"HTM(
 function executeInstruction() {
   if (!selectedDef) return;
@@ -483,7 +499,7 @@ function executeInstruction() {
 
   var body = {params: params};
   if (scope === '__all__') {
-    body.scope = '';
+    body.scope = '__all__'; // #2500 - rationale in the C++ comment above
   } else if (scope.startsWith('group:')) {
     body.scope = scope;
   } else {
@@ -603,6 +619,15 @@ document.addEventListener('keydown', function(e) {
    markup (HTMX swap) doesn't strand the connection. */
 var execEventSources = (window.execEventSources = window.execEventSources || new Map());
 
+)HTM"
+    // Part 3b: execution-drawer live-update JavaScript.
+    //
+    // Split from Part 3 purely for MSVC's 16 KiB string-literal cap (C2026) —
+    // adjacent literals are concatenated by the compiler, so this is a source
+    // boundary with no runtime effect. Part 3 sat 135 bytes under the cap after
+    // the #2500 change, which is one sentence away from breaking the Windows
+    // leg again; this restores real headroom on both halves.
+    R"HTM(
 function execCssEsc(s) {
   if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
   /* Conservative fallback — escape the chars that can break attribute

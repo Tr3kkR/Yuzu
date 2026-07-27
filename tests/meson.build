@@ -419,6 +419,7 @@ if build_server
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
       'unit/server/test_mcp_body_cap.cpp',
+      'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
@@ -511,6 +512,7 @@ if build_server
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
+      'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_key_provider.cpp',
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
@@ -702,7 +704,26 @@ if build_server
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
-  test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
+  #
+  # #2395 split the non-PG '~[pg]' entry, which had reached 603/600s (101%) on
+  # Windows and tripped the #2092 unrecovered-timeout gate. The suite was already
+  # AT budget: 18 added cases (~0.5%) were the straw, not the cause — at 100% any
+  # PR adding a single test trips it. Split rather than a timeout bump, which is
+  # what the warning itself asks for.
+  #
+  # Partition is by [auth]+[mcp] vs the rest, chosen by MEASURED TIME, not case
+  # count: [auth] alone is ~14s of the ~35s local total and dominates everything
+  # else ([mcp] 4.1s, [rest] 0.8s, [dex] 0.5s, the rest <0.5s each). The result is
+  # lopsided by count (430 vs 3057 cases) and balanced by time (~17.5s vs ~26s) —
+  # a timeout cares about seconds. Verified an exact partition: 430 + 3057 = 3487,
+  # Catch2's own counts. Catch2's native --shard-count/--shard-index would be
+  # tidier but is DELIBERATELY not used: those are options, not positional specs,
+  # so flake-retry.py's _cmd_without_test_specs would keep them across an isolated
+  # case retry and silently filter out the very case being retried.
+  test('server unit tests shard A', server_test_exe,
+       args: ['~[pg][auth],~[pg][mcp]'], suite: 'server', timeout: 600)
+  test('server unit tests shard B', server_test_exe,
+       args: ['~[pg]~[auth]~[mcp]'], suite: 'server', timeout: 600)
   test('server pg unit tests shard A', server_test_exe,
        args: ['[pg][routes],[pg][store],[pg][token]'], suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,

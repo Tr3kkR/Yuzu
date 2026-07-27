@@ -1,5 +1,7 @@
 #include "schedule_runner.hpp"
 
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
+
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "execution_tracker.hpp"
@@ -197,10 +199,27 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
 
     std::string command_id;
     int sent = 0;
+    // #2500: a schedule has no agent_ids, so an empty `scope_expression` is how
+    // this path has always meant "the whole fleet" — but it meant it by falling
+    // into the dispatch sink's empty-means-everybody default, which that issue
+    // inverted. Say it explicitly so the behaviour survives the inversion and is
+    // greppable at the call site rather than implied three files away.
+    //
+    // This PRESERVES today's semantics; it does not fix them. A schedule stored
+    // with an empty scope still fires fleet-wide on every tick, unattended, and
+    // `schedule_routes.cpp`'s `j.value("scope_expression","")` still collapses
+    // omitted, supplied-but-empty and type-confused into the same empty string
+    // at CREATE time, so an operator cannot express the difference. That is a
+    // create-route validation gap with its own product decision (should a
+    // schedule have to name `__all__`?) and is tracked separately — see #2500's
+    // sibling issue. When it is fixed, this mapping is what stops being needed.
+    const std::string dispatch_scope = s.scope_expression.empty()
+                                           ? std::string(yuzu::server::kBroadcastScope)
+                                           : s.scope_expression;
     try {
-        std::tie(command_id, sent) =
-            d_.dispatch_fn(plugin, action, /*agent_ids=*/{}, s.scope_expression,
-                           /*parameters=*/{}, exec_id);
+        std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
+                                                    dispatch_scope,
+                                                    /*parameters=*/{}, exec_id);
     } catch (const std::exception& e) {
         count("yuzu_schedule_fire_failures_total");
         spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,

@@ -138,6 +138,18 @@ accepted_capture_methods_for_os(std::string_view source_name, std::string_view o
 const std::vector<CaptureSourceDef>& capture_sources();
 
 /**
+ * The timestamp column for a granularity suffix: `ts` (live), `hour_ts`,
+ * `day_ts`, `month_ts`. Unknown suffixes fall back to `ts`.
+ *
+ * This is the one mapping the warehouse DDL indexes, `retention_sql`'s
+ * time-based branch filters on, and the #2361 retention clock guard counts
+ * against. Read it from here rather than re-deriving it -- a second copy would
+ * diverge silently, and the guard would then count a different column from the
+ * one the delete acts on.
+ */
+[[nodiscard]] std::string_view ts_column_for_suffix(std::string_view suffix);
+
+/**
  * Generate DDL for all typed warehouse tables.
  * Returns a single SQL string containing CREATE TABLE IF NOT EXISTS + indexes.
  */

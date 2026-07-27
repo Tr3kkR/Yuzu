@@ -1,3 +1,15 @@
+# SAMPLE RULES - NOT WIRED UP BY ANYTHING THIS REPO SHIPS.
+#
+# `deploy/prometheus/prometheus.yml` reads `/etc/prometheus/rules/*.yml`, but no
+# compose file under `deploy/docker/` mounts this file there, and the repo ships
+# no Alertmanager configuration at all. Until an operator does both, every
+# `severity:` label below routes nowhere.
+#
+# That matters most for the audit-retention rules later in this file. The clock
+# guard bounds how fast the SOC 2 evidence chain can drain; it does NOT prevent
+# draining. The alert is the actual control and the guard is only the seatbelt,
+# so counting these rules as a detective control before wiring them up would be
+# self-deception. See docs/ops-runbooks/audit-store-clock-guard.md.
 groups:
   - name: yuzu-fleet
     rules:
@@ -277,6 +289,33 @@ groups:
             Denials are audited as mcp.<tool>|denied with detail
             "input bound exceeded: <reason>"; correlate there for the principal.
 
+  - name: yuzu-dispatch
+    rules:
+      - alert: YuzuDispatchTargetRejected
+        expr: |
+          sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total[15m])) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "A REST caller named a device target that resolved to nothing"
+          description: >-
+            yuzu_server_dispatch_target_rejected_total is non-zero on
+            {{ $labels.route }} (reason={{ $labels.reason }}). A client supplied
+            agent_ids, scope or parent_id that names no device - it believes it is
+            targeting specific machines and is not. Before #2500 these calls
+            dispatched to the ENTIRE FLEET and returned success, so any non-zero
+            rate here is a near-miss worth reading, not just a validation
+            failure - hence >3/15m rather than the MCP twin's >20. It is
+            deliberately NOT >0: a single malformed curl would page, the rule
+            would be silenced within a week, and the genuine near-miss it exists
+            for would be silenced with it. The AUDIT row is the durable
+            per-event evidence; this alert is for a client looping. Most often a
+            client emitting numeric device ids, or a device filter that matched
+            nothing. Denials are audited as
+            command.dispatch|denied, instruction.execute|denied or
+            result_set.create|denied with detail "reason=<reason>"; correlate
+            there for the principal.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon
@@ -506,7 +545,123 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # #2360 retention clock guard. The guard declines a cleanup pass that would
+      # expire every datable audit row, so the evidence table survives a forward
+      # clock jump. A decline is not itself an outage, but it means this server's
+      # clock moved in a way that WOULD have wiped audit evidence -- an
+      # unattended host whose time sync is broken is one guard away from losing
+      # its SOC 2 trail.
+      - alert: YuzuAuditRetentionClockAnomaly
+        expr: |
+          increase(yuzu_server_audit_clock_anomaly_skips_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit retention declined a pass - clock moved, or the server was down"
+          description: >-
+            An audit retention pass declined. Triggers: it would have expired every datable
+            row; the gap since the previous pass exceeded a fixed 7 days (an ABSOLUTE
+            threshold, not scaled to audit_retention_days); the stored clock reading
+            was AHEAD of the current clock; or there was NO stored reading at all, so the
+            elapsed-time check could not run. That last one normally fires ONCE per
+            database, on the first pass after upgrading to a build with the guard (or
+            after a restore) - so expect one alert per server on a fleet upgrade and
+            stand it down; the runbook says how to tell it apart.
+            Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
+            host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
+            uptime history before concluding the clock is at fault. Nothing was deleted;
+            retention resumes automatically, paced at the per-pass cap.
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # The counterpart signal. Both a declined pass and a broken pass leave rows
+      # undeleted, so an audit table that never shrinks looks identical either
+      # way - only the pair separates "the guard is working" from "cleanup is
+      # broken". Without this alert an unbounded audit.db reads as a healthy guard.
+      - alert: YuzuAuditRetentionFailing
+        expr: |
+          increase(yuzu_server_audit_cleanup_failed_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention passes are failing on a database error"
+          description: >-
+            yuzu_server_audit_cleanup_failed_total is rising: the audit retention pass
+            itself is erroring, so audit.db grows without bound. This is NOT the clock
+            guard (that is yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
+            health (/healthz stores.audit), free disk, and the server log for
+            "AuditStore: retention probe failed" / "AuditStore: cleanup error".
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # The per-pass delete cap is what turns an allowed wipe into a paced drain,
+      # but it introduces its own failure: if it binds on every pass, expiry is
+      # outrunning the drain and audit.db grows without bound. Neither counter
+      # above moves in that state, so this is the only signal for it.
+      #
+      # ASSUMES the default 60-minute cleanup interval: the threshold is "every
+      # pass in the window hit the cap", i.e. 6 passes in 6h. A server started with
+      # a different cleanup_interval_min needs this number adjusted -- PromQL
+      # cannot read the server's own interval, so it cannot be derived here.
+      - alert: YuzuAuditRetentionCapBinding
+        expr: |
+          increase(yuzu_server_audit_retention_cap_reached_total[6h]) >= 6
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention is not keeping up with expiry"
+          description: >-
+            Every audit retention pass in the last 6 hours hit the per-pass delete cap,
+            so a backlog is carried forward each hour and audit.db is growing. Check
+            yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
+            all. Sustained firing means the fixed drain rate (25,000 rows per cleanup
+            pass) is below this fleet's audit volume, so audit.db grows without bound;
+            the cap is a compile-time constant today, so this needs an engineering
+            escalation rather than a config change.
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # The docs tell operators to alert on this gauge; ship the rule so that
+      # instruction is not a dead letter. A failed index build turns the pass's
+      # bounded ~315ms hourly lock hold into an unbounded one that grows with the
+      # table -- and every audit write waits on that lock. Also reads 0 for a
+      # store closed by a failed migration, which is the same "retention is not
+      # working" conclusion.
+      - alert: YuzuAuditRetentionIndexMissing
+        expr: |
+          yuzu_server_audit_retention_index_ok == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention is running without its index"
+          description: >-
+            idx_audit_ttl_id is absent, so every hourly retention pass full-scans
+            audit_events under the exclusive store lock that every audit write needs,
+            and that cost grows with the table. Check the server log for "could not create
+            idx_audit_ttl_id" and for a migration failure. NOTE this gauge is evaluated
+            once at startup, so it does not detect an index dropped while the server runs.
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # The durable clock reading is what makes anomaly detection survive a
+      # restart. If it cannot be written, that half of the guard silently
+      # degrades to nothing on the next boot.
+      - alert: YuzuAuditRetentionStateNotPersisting
+        expr: |
+          increase(yuzu_server_audit_retention_persist_failed_total[1h]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention cannot persist its clock reading"
+          description: >-
+            The retention pass could not write its clock reading to audit_retention_meta.
+            Detection still works within this process, but will not survive a restart --
+            a server that reboots with a wrong clock would then see no elapsed-time step.
+            Usually a disk or permissions problem on the audit database.
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
       # expire every datable audit row, so the evidence table survives a forward

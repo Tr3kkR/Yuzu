@@ -1,4 +1,6 @@
 #include "rest_api_v1.hpp"
+
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
@@ -734,7 +736,26 @@ const std::string& openapi_spec() {
     },
     "/ca/import-chain": {
       "post": {"summary": "Import an enterprise-signed intermediate + parent chain (switch to subordinate mode)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["intermediate_pem", "chain_pem"], "properties": {"intermediate_pem": {"type": "string", "description": "This CA's key signed by the enterprise root (must be CA:TRUE)"}, "chain_pem": {"type": "string", "description": "Parent chain: enterprise root [+ intermediates]"}}}}}}, "responses": {"200": {"description": "Validated; issuing identity switched to subordinate, CRL republished"}, "400": {"description": "Bad JSON / missing field / unparseable intermediate"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "No existing CA to subordinate"}, "422": {"description": "Intermediate is not a CA / does not carry this CA's key / does not verify to the chain"}, "413": {"description": "Body too large"}, "503": {"description": "CA unavailable"}}}
+    })json"
+        // Split here (MSVC C2026 16,380-byte cap) — this segment was already
+        // close to the cap before adding the #2395 KEK-rotation paths, so they
+        // get their own segment rather than growing this one further;
+        // concatenated at compile time, so the emitted OpenAPI JSON is
+        // byte-identical to the unsplit form.
+        R"json(,
+    "/secrets/kek/rotate": {
+      "post": {"summary": "Mint a new KEK version and re-wrap every registered secret row under it (#2395)", "tags": ["Security"], "description": "Requires Security:Write. Serializes cluster-wide behind a Postgres session advisory lock — a concurrent rotate/rewrap/status returns 409. On a partial failure the new KEK version is ALREADY the active one (SecretCodec::rotate_kek's documented half-committed contract); the 500 response's detail directs the operator to POST /secrets/kek/rewrap to resume and explicitly warns against retrying this route, which would mint a spurious extra version.", "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "description": "Takes no parameters; body must be empty or {}"}}}}, "responses": {"200": {"description": "{new_version, rotation_complete, meta:{api_version}}"}, "400": {"description": "Non-empty or unknown-field request body (these routes take no parameters)"}, "413": {"description": "Request body exceeds the size cap"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Another KEK operation is in flight, here or on another server sharing this database"}, "429": {"description": "Rotation cooldown — a rotation was ATTEMPTED very recently. Use /secrets/kek/rewrap to finish a half-committed rotation; it is not rate-limited"}, "500": {"description": "New KEK version registered but re-wrapping did not finish — resume with POST /secrets/kek/rewrap, do NOT retry this route", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Secrets codec or Postgres substrate unavailable"}}}
     },
+    "/secrets/kek/rewrap": {
+      "post": {"summary": "Idempotent resume of a KEK rotation that advanced the active version but did not finish re-wrapping every row (#2395)", "tags": ["Security"], "description": "Requires Security:Write. Safe to call repeatedly, including when there is nothing left to do (rows_rewrapped=0 is a normal outcome, not an error). Same cluster-wide advisory-lock serialization as /secrets/kek/rotate.", "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "description": "Takes no parameters; body must be empty or {}"}}}}, "responses": {"200": {"description": "{rows_rewrapped, meta:{api_version}}"}, "400": {"description": "Non-empty or unknown-field request body (these routes take no parameters)"}, "413": {"description": "Request body exceeds the size cap"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Another KEK operation is in flight"}, "500": {"description": "Re-wrap failed (internal error; codec-internal detail is never exposed here)"}, "503": {"description": "Secrets codec or Postgres substrate unavailable"}}}
+    },
+    "/secrets/kek/status": {
+      "get": {"summary": "Current KEK active version, oldest version still referenced by a live secret row, and rotation-complete flag (#2395)", "tags": ["Security"], "description": "Requires Security:Read. Also takes the cluster-wide advisory lock (same key as rotate/rewrap) so a status read cannot interleave with an in-flight rotation and report a torn view. rotation_complete is true when oldest_in_use is null (no secret rows exist) or oldest_in_use >= active_version.", "responses": {"200": {"description": "{active_version, oldest_in_use (nullable), rotation_complete, meta:{api_version}}"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Could not read the oldest referenced KEK version (internal error; codec-internal detail is never exposed here)"}, "503": {"description": "Secrets codec or Postgres substrate unavailable"}}}
+    })json"
+        // Split again (MSVC C2026 16,380-byte cap); concatenated at compile
+        // time, so the emitted OpenAPI JSON is byte-identical to the unsplit
+        // form.
+        R"json(,
     "/quarantine": {
       "get": {"summary": "List quarantined devices", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices"}}},
       "post": {"summary": "Quarantine a device", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}}}
@@ -5892,6 +5913,50 @@ void RestApiV1::register_routes(
             // Resolve the parent scope. parent_id present → dispatch is scoped
             // to that set's CURRENT members via the `from_result_set:` scope
             // kind; absent → broadcast to all connected agents (__all__).
+            //
+            // #2500, third instance: `parent_id` IS the targeting argument on
+            // this route, and the guard below used to be
+            // `contains && is_string && !empty`, so `{"parent_id": 123}` and
+            // `{"parent_id": ""}` fell straight through to the untargeted arm —
+            // a caller who believed it was narrowing to one result set instead
+            // dispatched to every connected agent. Identical in shape to the
+            // `agent_ids` defect on the two routes this issue names, and found
+            // while auditing this call site for that fix.
+            //
+            // Same rule, stated the same way: OMIT the key to broadcast
+            // deliberately. A SUPPLIED parent_id must name a parent — including
+            // an explicit `null`, which is rejected rather than read as
+            // "absent", because a client that serialises an unset field as null
+            // and one whose parent lookup returned nothing are indistinguishable
+            // here, and only one of them wants the whole fleet.
+            if (body.contains("parent_id") &&
+                (!body["parent_id"].is_string() ||
+                 body["parent_id"].get_ref<const std::string&>().empty())) {
+                // Counted and audited on the SAME family as the other two
+                // instances. Governance: without this the third instance is
+                // "deliberately invisible to the alert the PR ships" — the
+                // dashboard would read zero while the same class of refusal
+                // fires, which is the exact absent()-alerting hole the closed
+                // label set exists to prevent.
+                const std::string_view reason =
+                    body["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_dispatch_target_rejected_total",
+                                  {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
+                        .increment();
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        std::string("reason=") + std::string(reason) +
+                                            " source_kind=" + std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 400,
+                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names no parent set; "
+                       "omit it entirely to dispatch to all agents");
+                return;
+            }
             std::optional<std::string> parent_id;
             std::string scope_expr;
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
@@ -5936,9 +6001,17 @@ void RestApiV1::register_routes(
 
             std::string command_id;
             int sent = 0;
+            // #2500: this producer has no agent_ids by construction, and an
+            // absent `parent_id` has always meant "broadcast to all connected
+            // agents (__all__)" — as the comment above already says. It said so
+            // while passing an EMPTY scope and relying on the dispatch sink's
+            // empty-means-everybody default, which that issue inverted. Pass the
+            // sentinel the comment already claims, so the behaviour survives.
+            const std::string dispatch_scope =
+                scope_expr.empty() ? std::string(kBroadcastScope) : scope_expr;
             try {
                 std::tie(command_id, sent) =
-                    command_dispatch_fn(plugin, action, {}, scope_expr, params, exec_id);
+                    command_dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 execution_tracker->mark_cancelled(exec_id, owner);
@@ -6025,8 +6098,8 @@ void RestApiV1::register_routes(
             if (!session)
                 return;
             auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                rs_err(res, 400, "invalid JSON");
+            if (body.is_discarded() || !body.is_object()) {
+                rs_err(res, 400, "invalid JSON: body must be a JSON object");
                 return;
             }
             CreateRequest cr;
@@ -6095,8 +6168,8 @@ void RestApiV1::register_routes(
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
-                      if (body.is_discarded()) {
-                          rs_err(res, 400, "invalid JSON");
+                      if (body.is_discarded() || !body.is_object()) {
+                          rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
 
@@ -6114,6 +6187,41 @@ void RestApiV1::register_routes(
                       }
 
                       // Optional parent-scope narrowing.
+                      //
+                      // #2500, FOURTH instance — the one the original fix missed.
+                      // A supplied `parent_id` that is numeric, empty or null used
+                      // to fail the `is_string() && !empty()` test below and leave
+                      // `parent_members` unset, so the query evaluated over the
+                      // UNSCOPED inventory: a caller who believed it was narrowing
+                      // to one result set searched every device instead. This is a
+                      // synchronous producer, so the consequence is a read wider
+                      // than asked for rather than a command dispatch — narrower
+                      // than /api/command's blast radius, the same defect in shape.
+                      // Caught by governance after the first fix guarded only the
+                      // shared `run_async` closure.
+                      if (body.contains("parent_id") &&
+                          (!body["parent_id"].is_string() ||
+                           body["parent_id"].get_ref<const std::string&>().empty())) {
+                          const std::string_view reason =
+                              body["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
+                                  .increment();
+                          bool audit_ok = true;
+                          if (audit_fn)
+                              audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet",
+                                                  "",
+                                                  std::string("reason=") + std::string(reason) +
+                                                      " source_kind=inventory_query");
+                          if (!audit_ok)
+                              res.set_header("Sec-Audit-Failed", "true");
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
+                                 "parent set; omit it entirely to search all devices");
+                          return;
+                      }
                       std::optional<std::unordered_set<std::string>> parent_members;
                       CreateRequest cr;
                       cr.owner_principal = session->username;
@@ -6199,8 +6307,8 @@ void RestApiV1::register_routes(
                       if (!session)
                           return;
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
-                      if (body.is_discarded()) {
-                          rs_err(res, 400, "invalid JSON");
+                      if (body.is_discarded() || !body.is_object()) {
+                          rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
                       std::string sql = body.value("sql", "");
@@ -6244,8 +6352,8 @@ void RestApiV1::register_routes(
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
-                      if (body.is_discarded()) {
-                          rs_err(res, 400, "invalid JSON");
+                      if (body.is_discarded() || !body.is_object()) {
+                          rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
                       std::string instruction_id = body.value("instruction_id", "");

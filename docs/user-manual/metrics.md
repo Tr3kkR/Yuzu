@@ -101,6 +101,28 @@ Every held-open SSE stream re-validates its credential on each ~3 s pump tick. F
 
 This cache covers only the ENGINE half of stream re-validation; the API-token half has its own (`yuzu_server_token_cache_*`).
 
+## Audit-store metrics
+
+The audit store is the SOC 2 evidence chain, so both its write path and its
+retention path are scraped. The retention clock guard these describe is
+documented in `docs/user-manual/audit-log.md`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_audit_events_total{result}` | counter | Audit events written, bucketed by `result` (`success` / `failure` / `denied` / `other`). |
+| `yuzu_server_audit_emit_failed_total` | counter | Events that failed to persist. Non-zero means fail-closed behavioural-PII routes are returning `503`; see the `YuzuAuditPersistFailures` alert. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | counter | Retention passes **declined**. Four triggers: the pass would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; the stored reading was *ahead* of the clock; or there was no stored reading at all, so the elapsed-time check could not run (the first pass after upgrading or restoring - expected once per database). Elapsed time cannot separate a forward jump from an outage that long - read it as "the clock moved, **or** the server was down that long". Nothing was deleted. |
+| `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that **failed** on a database error, or ran against a closed store (a failed migration closes it), so `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
+| `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_index_ok` | gauge | `1` while the retention index exists. Evaluated once at startup, so it cannot detect an index dropped at runtime. `0` means every cleanup pass full-scans `audit_events` under the exclusive store lock, and that cost grows with the table - the one condition that makes the pass's lock hold unbounded. Alert on `== 0`. |
+| `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
+
+The skips and failed counters must be alerted on separately and never collapsed:
+both leave rows undeleted, so an audit table that never shrinks looks identical
+either way. Only the pair distinguishes "the guard is protecting the table" from
+"cleanup is broken".
+
 ## MCP transport metrics
 
 Request-body rejections at the `/mcp/` ingress (#2437). The label set is
@@ -119,6 +141,7 @@ and pre-seeded at boot, so `absent()` alerting stays meaningful.
 |---|---|---|
 | `yuzu_mcp_tool_args_invalid_total{tool}` | counter | Calls denied by the C8 pre-approval schema gate: arguments did not match the tool's served `inputSchema`, checked before an approval ticket is minted or consumed (#2405). `tool` is bounded to the approval-gated set. |
 | `yuzu_mcp_tool_args_too_large_total{tool,reason}` | counter | Calls denied by a handler-side input bound (#2437), on every tier including operator. `reason` is a closed set: `ident_len`, `scope_len`, `scope_type`, `scope_empty`, `param_count`, `param_key_len`, `param_value_len`, `agent_ids_count`, `agent_id_len`, `agent_id_type`, `agent_ids_type`, `agent_ids_empty`, `ident_empty`. The paired audit row is `mcp.<tool>|denied` with detail `input bound exceeded: <reason> correlation_id=<cid>`, carrying the same correlation id as the client's error envelope. |
+| `yuzu_server_dispatch_target_rejected_total{route,reason}` | counter | REST dispatch calls denied because a **supplied** targeting argument named nothing (#2500) — the twin of the targeting reasons above, deliberately a separate family so `yuzu_mcp_*` never counts a call that did not touch MCP. `route` is a closed set: `command` (`POST /api/command`), `instruction_execute` (`POST /api/instructions/{id}/execute`), `result_set_parent` (the `POST /api/v1/result-sets/from-*` producers, where `parent_id` is the targeting argument), `policy_remediate` (`POST /api/policies/{id}/remediate`, where an empty target means every non-compliant agent; it also refuses `scope` outright with `scope_unsupported`, since remediation selects targets by `agent_ids` only), and `dispatch_closure` (the shared dispatch closure's last-line-of-defence arm, reached only when a CALLER — route or background runner — names no target at all; a non-zero value there is a code defect, not a client one). `reason` is a closed set with two halves, both in `dispatch_target_shape.hpp`: `kTargetingShapeReasons` (`agent_ids_type`, `agent_ids_empty`, `agent_id_type`, `scope_type`, `scope_empty`, `target_conflict`) emitted by the shared shape check, and `kRouteRejectReasons` (`body_type`, `parent_id_type`, `parent_id_empty`, `closure_no_target`, `scope_unsupported`) emitted by the routes and the shared dispatch closure. Seeding is **per route, not the cross-product** — the dispatch routes can emit the five targeting reasons plus `body_type`; `result_set_parent` can emit only the two `parent_id_*` ones. Seeding the full product would publish series no code path can reach, which reads on a dashboard as "never happened" when the truth is "cannot happen". The paired audit row is `command.dispatch\|denied` (detail `reason=<reason> <plugin>:<action>`, both caller-supplied fields sanitised and capped at 128 bytes), `instruction.execute\|denied` (detail `reason=<reason>`) or `result_set.create\|denied` (detail `reason=<reason> source_kind=<kind>`). `dispatch_closure` is **counter-only** — that arm lives inside a closure with no request context and is reached by background runners as well as routes, so there is deliberately no audit row to correlate. Alert: `YuzuDispatchTargetRejected` fires when the 15-minute increase exceeds 3 (`>3/15m`) — deliberately NOT `>0`, because a single malformed request would page and the rule would be silenced within a week, taking the genuine near-miss with it. The per-event evidence is the audit row, not the alert. A non-zero rate here means a client believes it is targeting specific devices and is not — before this counter existed those calls dispatched to the whole fleet and reported success. |
 
 ## Audit-store metrics
 

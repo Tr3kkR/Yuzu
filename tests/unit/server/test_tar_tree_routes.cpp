@@ -44,6 +44,10 @@ const char* kProcOut =
 // The two canned command ids the result route polls (must start with "tar-").
 const std::string kProcCmd = "tar-p";
 const std::string kTcpCmd = "tar-t";
+// Canned ids for the capture-sources frame's two dispatches (`tar status` and
+// `tar compatibility`), which the route polls by the scmd/ccmd query params.
+const std::string kStatusCmd = "tar-s";
+const std::string kCompatCmd = "tar-c";
 
 // A TarTreeRoutes registered over a TestRouteSink with toggleable stubs.
 struct TarHarness {
@@ -58,6 +62,9 @@ struct TarHarness {
     std::string os = "linux";
     std::string proc_output = kProcOut;
     std::string tcp_output;    // empty → tree renders without conns (best-effort TCP)
+    // Capture-sources frame: canned `tar status` / `tar compatibility` replies.
+    std::string status_output;
+    std::string compat_output = "config|dummy|1";
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
 
@@ -112,6 +119,10 @@ struct TarHarness {
                 return {resp(device, proc_output)};
             if (cmd == kTcpCmd)
                 return {resp(device, tcp_output)};
+            if (cmd == kStatusCmd)
+                return {resp(device, status_output)};
+            if (cmd == kCompatCmd)
+                return {resp(device, compat_output)};
             return {};
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
@@ -132,6 +143,13 @@ struct TarHarness {
     std::unique_ptr<httplib::Response> run_result(const std::string& extra = "") {
         return sink.Get("/fragments/tar/process-tree/result?device=" + device +
                         "&preset=10m&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + extra);
+    }
+
+    // Drive the capture-sources frame past the pending poll, the same way
+    // run_result() drives the tree: supply the canned command ids directly.
+    std::unique_ptr<httplib::Response> run_capture_sources() {
+        return sink.Get("/fragments/tar/capture-sources/load?device=" + device +
+                        "&scmd=" + kStatusCmd + "&ccmd=" + kCompatCmd + "&n=1");
     }
 
     std::unique_ptr<httplib::Response> get_detail(const std::string& token, int node = 0) {
@@ -474,4 +492,68 @@ TEST_CASE("tar routes: dropped audit row flags Sec-Audit-Failed once; clean path
         CHECK(r->get_header_value("Sec-Audit-Failed").empty());
         CHECK(is_32_hex(extract_token(r->body))); // tree rendered normally
     }
+}
+
+TEST_CASE("TAR capture-sources: an offline device shows the agent's reason, not a blank grid",
+          "[tar][tree][routes][capture-sources]") {
+    // Governance Gate 3 (quality-engineer) BLOCKING: this branch had no test at
+    // all, and it is the fix for the incident where a dead endpoint rendered
+    // identically to a healthy one.
+    //
+    // `poll_command` treats any non-empty output as success, so the ONLY thing
+    // separating "device is dead" from "device is fine" here is the
+    // `starts_with("error|")` gate. If it misses, the frame falls through to the
+    // capture-sources renderer, which parses only `config|` lines, and draws all
+    // ten sources blank.
+    TarHarness h;
+    // The REAL two-record reply, not just the error line. An earlier version of
+    // this test supplied only the first line, so it could not see that the route
+    // was truncating on a byte count and running past the newline into
+    // `storage_state|offline` -- the operator saw a trailing `storage_stat`
+    // (Sol adversarial review).
+    h.status_output =
+        "error|TAR storage is offline on this endpoint; the database was closed after a "
+        "transaction could not be rolled back. Collection and retention are both stopped. The "
+        "read-only query connection is unavailable too, so `tar sql` cannot read the historical "
+        "data either. Restart the agent to recover.\nstorage_state|offline";
+
+    auto res = h.run_capture_sources();
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+
+    // The operator is told WHY, and which read path still works -- the agent
+    // composes that sentence and it must survive the trip to the browser.
+    CHECK(res->body.find("TAR storage is offline") != std::string::npos);
+    CHECK(res->body.find("tar sql") != std::string::npos);
+    // The recovery instruction is the last thing in the record and must survive.
+    CHECK(res->body.find("Restart the agent to recover.") != std::string::npos);
+    // ...and NOTHING from the following record leaks in as debris.
+    CHECK(res->body.find("storage_state") == std::string::npos);
+    CHECK(res->body.find("storage_stat") == std::string::npos);
+    // The `error|` prefix itself is stripped, not echoed raw.
+    CHECK(res->body.find("error|") == std::string::npos);
+    // And it must NOT have rendered the sources grid for a dead store. Assert
+    // the id the renderer actually emits (`capTable`, tar_process_tree.cpp:1235)
+    // -- an earlier version of this checked for "capture-source-row", a string
+    // that exists nowhere in the codebase and so passed vacuously.
+    CHECK(res->body.find("capTable") == std::string::npos);
+}
+
+TEST_CASE("TAR capture-sources: a healthy device still renders the sources grid",
+          "[tar][tree][routes][capture-sources]") {
+    // The other half, so the test above cannot pass by the route being broken
+    // for everyone.
+    TarHarness h;
+    // Needs a real `config|` line: the renderer builds the grid from those, so a
+    // fixture without one cannot distinguish "rendered the grid" from "rendered
+    // an empty body" and the absence-assertions below would pass vacuously.
+    h.status_output = "storage_state|ok\nrecord_count|42\nconfig|process_enabled|true";
+
+    auto res = h.run_capture_sources();
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    // Positively assert the grid: `capTable` is what the renderer emits.
+    CHECK(res->body.find("capTable") != std::string::npos);
+    CHECK(res->body.find("TAR storage is offline") == std::string::npos);
+    CHECK(res->body.find("failed the status query") == std::string::npos);
 }
