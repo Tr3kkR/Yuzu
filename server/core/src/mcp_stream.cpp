@@ -1254,6 +1254,12 @@ McpPostPump::McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchF
 }
 
 bool McpPostPump::finish(const WriteFn& write, McpStreamClose reason) {
+    // BEFORE the count, and before anything else that can throw: the releaser
+    // audits whatever this records, so a metric mutex failure here must not let
+    // the pump_once catch below overwrite the real reason with kInternalError.
+    // First-wins, because the first reason is the true cause; a later one is a
+    // consequence of it.
+    note_close_reason(reason);
     count_stream_close(metrics_, reason);
     // kCompleted EOFs after a real final: a close frame there would be a second,
     // contradictory terminal on a stream that already answered. Same rule the GET
@@ -1288,6 +1294,11 @@ bool McpPostPump::pump_once(const WriteFn& write) {
     try {
         return pump_once_impl(write);
     } catch (...) {
+        // Recorded FIRST, before the fallible metric/log calls - this is the one
+        // close path that never reaches finish(), so without it the releaser would
+        // read kNone, normalise to client_gone, and audit a disconnect for what was
+        // actually an internal failure. First-wins keeps a real earlier reason.
+        note_close_reason(McpStreamClose::kInternalError);
         try {
             count_stream_close(metrics_, McpStreamClose::kInternalError);
             spdlog::warn("MCP streamed-POST pump: tick failed, closing the response");
@@ -1295,6 +1306,16 @@ bool McpPostPump::pump_once(const WriteFn& write) {
         }
         return false;
     }
+}
+
+void McpPostPump::note_close_reason(McpStreamClose reason) noexcept {
+    auto expected = McpStreamClose::kNone;
+    close_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel,
+                                          std::memory_order_relaxed);
+}
+
+McpStreamClose McpPostPump::close_reason() const noexcept {
+    return close_reason_.load(std::memory_order_acquire);
 }
 
 bool McpPostPump::pump_once_impl(const WriteFn& write) {

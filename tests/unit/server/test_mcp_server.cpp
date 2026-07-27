@@ -755,6 +755,10 @@ struct McpTestServer {
     yuzu::server::detail::StreamBudget* stream_budget_for_test{nullptr};
     yuzu::server::mcp::StreamRevalidateFn revalidate_fn_for_test{};
     yuzu::MetricsRegistry* metrics_for_test{nullptr};
+    /// 2f PR 3b: explicit-principal sink for mcp.stream.close. Empty = the
+    /// streamed releaser falls back to the generic audit_fn, which is what the
+    /// tests that only care THAT a close row was written rely on.
+    yuzu::server::mcp::StreamPrincipalAuditFn principal_audit_fn_for_test{};
 
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
@@ -960,9 +964,19 @@ private:
             /*mcp_streaming_disabled=*/&streaming_disabled_,
             /*allowed_origins=*/allowed_origins_for_test,
             /*software_licensing_store=*/software_licensing_store_for_test,
-            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
-            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-            /*exec_visible_fn=*/exec_visible_fn_for_test);
+            // Spelled out only because the streamed-POST params after them are
+            // what this call actually needs; nullptr is the pre-existing default.
+            /*engine_principal_store=*/nullptr,
+            /*access_review_store=*/nullptr,
+            /*auth_db=*/nullptr,
+            /*directory_sync=*/nullptr,
+            /*exec_visible_fn=*/exec_visible_fn_for_test,
+            // 2f PR 3b: the POST handler leases from the SAME budget as GET.
+            // Default nullptr keeps every pre-3b test on the plain path - a test
+            // that does not opt in cannot accidentally start streaming.
+            /*stream_budget=*/stream_budget_for_test,
+            /*revalidate_fn=*/revalidate_fn_for_test,
+            /*principal_audit_fn=*/principal_audit_fn_for_test);
     }
 };
 
@@ -9451,5 +9465,361 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
                   .value() == 1.0);
+    }
+}
+
+// ── 2f PR 3b (C8): streamed POST — SSE-on-POST ───────────────────────────────
+//
+// The eligibility fork and everything downstream of it. What these CAN observe is
+// the handler's decisions: status, the response envelope, bridge phase, the budget
+// ledger, metrics and audit rows. What they CANNOT observe is the wire: the
+// in-process fixture never runs the content provider (there is no socket - #438),
+// so progress-before-final, on_final_written and EOF are covered by the pump's own
+// tests in test_mcp_stream_bridge.cpp, NOT from here. Stated rather than implied,
+// because a test named "streamed happy path" reads like end-to-end proof.
+TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
+          "[mcp][integration][execute][bridge][2f][3b]") {
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    auto stream = sessions.stream_for(sid, "test-user");
+    REQUIRE(stream != nullptr);
+
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+    // The only difference between a streamed call and a plain one is this header.
+    const auto call_sse = [&](const std::string& body) {
+        return ts.call_raw("POST", body,
+                           {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    };
+    const auto call_plain = [&](const std::string& body) {
+        return ts.call_raw("POST", body, {{"Mcp-Session-Id", sid}});
+    };
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-streamed", 2};
+    };
+    const auto audit_has = [&](const std::string& row) {
+        return std::find(ts.audit_log.begin(), ts.audit_log.end(), row) != ts.audit_log.end();
+    };
+    const auto reject_count = [&](const char* reason) {
+        return metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}}).value();
+    };
+
+    SECTION("armed: SSE envelope, one Content-Type, kStreaming, gauge and attach audit") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_sse(exec_body(700, /*with_token=*/true));
+        REQUIRE(res->status == 200);
+        // ONE Content-Type: httplib emplaces headers, so the application/json set
+        // at handler entry would otherwise ride along as a second value.
+        CHECK(res->get_header_value_count("Content-Type") == 1);
+        CHECK(res->get_header_value("Content-Type") == "text/event-stream");
+        CHECK(res->get_header_value("Cache-Control") == "no-cache");
+        CHECK(res->get_header_value("X-Accel-Buffering") == "no");
+        CHECK(res->get_header_value("X-Content-Type-Options") == "nosniff");
+        CHECK(res->get_header_value("X-Correlation-Id").rfind("req-", 0) == 0);
+        // The provider IS the response - no plain JSON body was written.
+        CHECK(res->body.empty());
+
+        CHECK(bridge.phase_for(sid, nlohmann::json(700)) ==
+              smcp::McpStreamBridge::Phase::kStreaming);
+        // #2068 discipline: the gauge is OBSERVED moving, not inferred from wiring.
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 1.0);
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 1);
+        CHECK(audit_has("mcp.stream.attach|success"));
+        // The attach row names the surface, so a GET attach and a POST attach are
+        // distinguishable in the audit log rather than both reading "a stream".
+        bool has_surface = false;
+        for (const auto& d : ts.audit_details) {
+            if (d.find("surface=post") != std::string::npos &&
+                d.find("cid=") != std::string::npos) {
+                has_surface = true;
+            }
+        }
+        CHECK(has_surface);
+    }
+
+    SECTION("S0 stays plain: no token, or no SSE Accept, is byte-identical") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        // (a) SSE Accept but NO progressToken - the token is the real gate.
+        auto no_token = call_sse(exec_body(710, /*with_token=*/false));
+        REQUIRE(no_token->status == 200);
+        CHECK(no_token->get_header_value("Content-Type") == "application/json");
+        CHECK(no_token->get_header_value("Cache-Control").empty());
+        CHECK(no_token->get_header_value("X-Accel-Buffering").empty());
+        CHECK_FALSE(no_token->body.empty());
+
+        // (b) progressToken but NO SSE Accept - today's GET-only bridge path.
+        auto no_accept = call_plain(exec_body(711, /*with_token=*/true));
+        REQUIRE(no_accept->status == 200);
+        CHECK(no_accept->get_header_value("Content-Type") == "application/json");
+        CHECK(no_accept->get_header_value("X-Accel-Buffering").empty());
+        CHECK_FALSE(no_accept->body.empty());
+
+        // Neither spent an admission slot: the budget is only for real streams.
+        CHECK(budget.active() == 0);
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 0.0);
+    }
+
+    SECTION("q=0 with a progressToken STREAMS - the pinned reading of accept_wants_sse") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // `q=0` means "not acceptable" in RFC 9110 and this stack deliberately
+        // ignores it (test_mcp_transport.cpp pins the predicate). A client that
+        // sends a progressToken AND q=0 is contradicting itself; honouring the
+        // token is the useful reading. Pinned HERE too, at the decision that
+        // actually uses it, so changing the predicate breaks the behaviour test
+        // and not just the unit test.
+        auto res = ts.call_raw("POST", exec_body(720, /*with_token=*/true),
+                               {{"Mcp-Session-Id", sid},
+                                {"Accept", "application/json, text/event-stream;q=0"}});
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "text/event-stream");
+    }
+
+    SECTION("budget exhausted -> 429 that echoes the id, with Retry-After and no execution row") {
+        // A cap of 1 across the whole server: the second streamed call cannot be
+        // admitted, and admission runs before reserve, so nothing was created.
+        yuzu::server::detail::StreamBudget tiny{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 1}};
+        ts.stream_budget_for_test = &tiny;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto first = call_sse(exec_body(730, /*with_token=*/true));
+        REQUIRE(first->status == 200);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto second = call_sse(exec_body(731, /*with_token=*/true));
+        REQUIRE(second->status == 429);
+        auto body = nlohmann::json::parse(second->body);
+        // Post-parse, so the id is KNOWN and echoed. The pre-parse engine-quota
+        // 429 on this same route answers id:null with -32010
+        // (test_principal_quota_chokepoint.cpp) - a client must be able to tell
+        // the two apart, which is why this asserts both halves.
+        CHECK(body["id"] == 731);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(body["error"]["code"] != -32010);
+        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamCapRetryAfterMs);
+        CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
+        CHECK(second->get_header_value("Retry-After") == "5");
+        // Denied, not dispatched: no execution row, and the denial is auditable.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        CHECK(reject_count("post_global_cap") == 1.0);
+        // Reject-not-evict: the live stream keeps its slot.
+        CHECK(tiny.active() == 1);
+    }
+
+    SECTION("duplicate request id -> 409, and the OLDER live record is untouched") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto first = call_sse(exec_body(740, /*with_token=*/true));
+        REQUIRE(first->status == 200);
+        REQUIRE(bridge.phase_for(sid, nlohmann::json(740)) ==
+                smcp::McpStreamBridge::Phase::kStreaming);
+
+        auto dup = call_sse(exec_body(740, /*with_token=*/true));
+        REQUIRE(dup->status == 409);
+        auto body = nlohmann::json::parse(dup->body);
+        CHECK(body["id"] == 740);
+        CHECK(body["error"]["code"] == smcp::kInvalidRequest);
+        // Not capacity, so no retry advice: retrying cannot help while the first
+        // request is still live.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(dup->get_header_value("Retry-After").empty());
+        CHECK(reject_count("post_duplicate_request_id") == 1.0);
+        // THE POINT: a rejected reservation must never abandon(), because this key
+        // belongs to the OLDER request. Its record and its slot survive.
+        CHECK(bridge.phase_for(sid, nlohmann::json(740)) ==
+              smcp::McpStreamBridge::Phase::kStreaming);
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 1);
+    }
+
+    SECTION("duplicate id arriving MID-FLIGHT must not erase the in-flight record") {
+        // The dangerous window for the no-abandon rule, and the only one where it
+        // bites: abandon() structurally refuses anything past kArming, so a
+        // duplicate that arrives once the first request is armed cannot hurt it
+        // however wrong the handler is. A duplicate that arrives while the first
+        // is still BETWEEN reserve and arm finds it in kArming - and there
+        // abandon() would succeed, erasing a live request's record, its
+        // subscription and its latched progress, and answering 409 to the wrong
+        // caller. The dispatch callback runs inside exactly that window.
+        std::shared_ptr<httplib::Response> inner;
+        ts.start_with_dispatch(
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&) -> std::pair<std::string, int> {
+                inner = call_sse(exec_body(745, /*with_token=*/true)); // same id, re-entrant
+                return {"cmd-dup-inflight", 2};
+            },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto outer = call_sse(exec_body(745, /*with_token=*/true));
+        REQUIRE(inner != nullptr);
+        CHECK(inner->status == 409); // the LATE caller is the one refused
+        // The in-flight request is unharmed and still becomes a stream.
+        REQUIRE(outer->status == 200);
+        CHECK(outer->get_header_value("Content-Type") == "text/event-stream");
+        CHECK(bridge.phase_for(sid, nlohmann::json(745)) ==
+              smcp::McpStreamBridge::Phase::kStreaming);
+    }
+
+    SECTION("pin slots exhausted -> 429 naming the per-session limit") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // Reaching the bridge's pin-slot reject at all takes a specific state,
+        // because the budget's per-principal cap and the ring's pin cap are TWINS
+        // (kPerPrincipalMcpPost == kMaxStreamedPostsPerSession, static_asserted).
+        // With four streams LIVE the budget refuses the fifth first. The gap opens
+        // once the responses close: each releaser returns its lease immediately,
+        // but the record parks kRingOnly still holding its streamed charge until
+        // its terminal settles or it is torn down. So the budget reads 0 while the
+        // ring still owes four pins - and that window is exactly what pin_slots
+        // guards. Each Response below dies at the end of its iteration, which is
+        // what puts us there.
+        for (int i = 0; i < 4; ++i) {
+            auto ok = call_sse(exec_body(750 + i, /*with_token=*/true));
+            REQUIRE(ok->status == 200);
+        }
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 0);
+        CHECK(bridge.phase_for(sid, nlohmann::json(750)) ==
+              smcp::McpStreamBridge::Phase::kRingOnly);
+
+        auto fifth = call_sse(exec_body(754, /*with_token=*/true));
+        REQUIRE(fifth->status == 429);
+        auto body = nlohmann::json::parse(fifth->body);
+        CHECK(body["id"] == 754);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(reject_count("post_pin_slots") == 1.0);
+        // The lease taken for the REFUSED call went home rather than leaking - a
+        // rejected reservation must not strand the admission slot it acquired.
+        CHECK(budget.active() == 0);
+    }
+
+    SECTION("reserve THROWS -> degrade to plain, never 429 and never 500") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        bridge.inject_reserve_fault_for_test();
+
+        auto res = call_sse(exec_body(760, /*with_token=*/true));
+        // A rejection is the server saying no; an allocation failure is answered
+        // by doing LESS. The command is still dispatchable, so it is dispatched
+        // and answered plainly - the same bytes an Accept-less call would get.
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "application/json");
+        CHECK_FALSE(res->body.empty());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 1.0);
+        // The lease taken before the throw went home with the optional.
+        CHECK(budget.active() == 0);
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 0.0);
+    }
+
+    SECTION("arm THROWS post-dispatch -> parked, correlated error, execution stays RUNNING") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        bridge.inject_arm_fault_for_test();
+
+        auto res = call_sse(exec_body(770, /*with_token=*/true));
+        // Post-dispatch: the command IS running, so this must not be a naked 500
+        // from httplib - it is an A4 error that tells the client how to recover.
+        REQUIRE(res->status == 500);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["id"] == 770);
+        CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
+        CHECK(body["error"]["data"]["remediation"].get<std::string>().find("execution_id") !=
+              std::string::npos);
+        // Parked, NOT abandoned: the subscription and any latched terminal survive
+        // so a GET resume still delivers the answer.
+        CHECK(bridge.phase_for(sid, nlohmann::json(770)) ==
+              smcp::McpStreamBridge::Phase::kRingOnly);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "post_dispatch_threw"}})
+                  .value() == 1.0);
+        // The execution was dispatched and is still going, so it must NOT be
+        // marked cancelled - unlike the dispatch-throw and zero-agents paths.
+        auto rows = tracker.query_executions({});
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].status == "running");
+        CHECK(budget.active() == 0);
+    }
+
+    SECTION("cancel consumed while arming -> plain answer, no stream, slot returned") {
+        // request_cancel lands before arm, so arm degrades the streamed intent.
+        // The call is still perfectly answerable; a degraded answer beats an error.
+        ts.start_with_dispatch(
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&) -> std::pair<std::string, int> {
+                (void)bridge.request_cancel(sid, nlohmann::json(780));
+                return {"cmd-cancelled", 2};
+            },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_sse(exec_body(780, /*with_token=*/true));
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "application/json");
+        CHECK_FALSE(res->body.empty());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_cancelled"}})
+                  .value() == 1.0);
+        CHECK(budget.active() == 0);
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 0.0);
+    }
+
+    SECTION("zero agents reached -> plain response, no stream, nothing leaked") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_sse(exec_body(790, /*with_token=*/true));
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "application/json");
+        // Abandoned (not parked): nothing dispatched, so nothing is owed.
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(790)).has_value());
+        CHECK(budget.active() == 0);
     }
 }
