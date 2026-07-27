@@ -423,6 +423,40 @@ groups:
         annotations:
           summary: "Secret blob failed GCM authentication (tamper signal)"
 
+      # ── #2530 KEK rotation-runaway hardening ────────────────────────────
+      # yuzu_server_kek_op_lock_held is sampled every 15s off
+      # health_recompute_thread_ (server.cpp). A healthy long re-wrap and a
+      # genuinely wedged backend look IDENTICAL on this gauge alone — do NOT
+      # page this as "kill the pid". Corroborate via lock_holder_pid
+      # (GET /api/v1/secrets/kek/status) against pg_stat_activity before any
+      # DBA action; see docs/user-manual/server-admin.md "Diagnosing a stuck
+      # KEK op lock" for the full procedure. `for: 30m` is deliberately
+      # conservative (~120 samples at the 15s sampling cadence) — this is the
+      # only rotation-shaped condition worth paging on; the ceiling/cooldown/
+      # clock-anomaly/query-canceled failures are all self-diagnosing from
+      # the REST/MCP error body an operator already has in hand, not a
+      # background condition to detect.
+      - alert: YuzuKekOpLockHeldPersistently
+        expr: |
+          yuzu_server_kek_op_lock_held == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "secrets_kek_op advisory lock has been held for 30+ minutes"
+          description: >-
+            See "Diagnosing a stuck KEK op lock" in
+            docs/user-manual/server-admin.md before acting. A healthy,
+            long-running rewrap is indistinguishable from a wedged backend by
+            this gauge alone -- corroborate via lock_holder_pid
+            (GET /api/v1/secrets/kek/status) against pg_stat_activity before
+            concluding anything, and only a DBA should terminate a backend,
+            deliberately. This gauge HOLDS its prior value rather than
+            publishing a fabricated 0 on a database-read degrade, so a firing
+            alert during a database outage may reflect stale last-known state
+            rather than a currently-held lock -- check the yuzu-postgres
+            alerts first.
+
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
   # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on

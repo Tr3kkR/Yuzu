@@ -19,6 +19,8 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <optional>
 
 namespace yuzu::server::detail {
 
@@ -115,5 +117,71 @@ public:
 private:
     PGconn* conn_;
 };
+
+/// #2530 B6 — diagnostic-only observer of the `secrets_kek_op` advisory
+/// lock's current holder. Does NOT take the lock itself: this is the query
+/// behind `KekOpResult::lock_held`/`lock_holder_pid` (kek_routes.hpp), and
+/// `GET /status` deliberately never takes this lock (see the status route in
+/// kek_routes.cpp) — this function is how it observes cluster state instead.
+/// Read lock-free, like every #2530 B2 diagnostic snapshot: the `pg_locks`
+/// row this reads can change between the SELECT and the caller reading the
+/// return value, so treat the result as a point-in-time snapshot, never as a
+/// synchronization primitive, and never derive a "safe to retire" conclusion
+/// from it (#2525).
+///
+/// TRAP (proven by `test_kek_op_lock_holder.cpp` against a real backend, not
+/// by reasoning): `pg_locks.objid` is `oid` — internally an unsigned 32-bit
+/// value — while `hashtext()` returns a SIGNED `int4` that is negative for
+/// `hashtext('secrets_kek_op')` on every Postgres build observed so far
+/// (`hashtext('secrets_kek_op') = -1189576286`). Empirically, Postgres's
+/// `oid`-from-`integer` cast reinterprets the 32-bit pattern modulo 2^32
+/// (`(-1189576286)::oid = 3105391010`, exactly matching what `pg_locks`
+/// stores for this lock's `objid`), so comparing `objid = hashtext(...)`
+/// directly DOES match in practice. We still spell out the explicit
+/// bigint-mask-and-cast below rather than lean on that implicit
+/// comparison-operator resolution: it makes the 32-bit-wraparound intent
+/// obvious at the call site, and does not depend on Postgres continuing to
+/// resolve a bare `oid = integer` comparison via that particular implicit
+/// cast on every future version.
+///
+/// #2530 T5 — result of `kek_op_lock_holder`: distinguishes "the query told
+/// us no one holds the lock" from "we could not ask the question". Before
+/// this type existed the two collapsed to the same `nullopt`, which meant a
+/// failed query and a genuinely unheld lock were indistinguishable to every
+/// caller — including `GET /status`'s `lock_held` field, which derived
+/// straight from `has_value()` and so reported `false` ("not held") on a
+/// query failure. That is the one scenario this observability exists to
+/// diagnose: an operator hitting 409s because the lock is wedged calls
+/// `/status` during exactly the failure that makes the holder query itself
+/// fail, and a fabricated `false` tells them the opposite of the truth.
+struct KekOpLockHolder {
+    bool determined{false};   ///< false = the pg_locks query itself failed; `pid` is meaningless
+    std::optional<int> pid{}; ///< meaningful only when `determined`; nullopt = no granted holder
+};
+
+/// `exclude_pid`: when non-negative, a holder whose pid equals `exclude_pid`
+/// is reported as "no (foreign) holder" -> `pid == nullopt` (still
+/// `determined == true`, since the query itself succeeded). Pass
+/// `PQbackendPID(conn)` when a caller wants "does anyone ELSE hold it" rather
+/// than "who holds it right now" — today's only caller (`GET /status`) never
+/// takes this lock itself, so exclusion is a no-op there; the parameter
+/// exists for a future caller that queries from inside its own held lock.
+[[nodiscard]] inline KekOpLockHolder kek_op_lock_holder(PGconn* conn, int exclude_pid = -1) {
+    constexpr const char* kSql =
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = 2037545589 "
+        "AND objid = (hashtext('secrets_kek_op')::bigint & 4294967295)::oid AND granted";
+    pg::PgResult res{PQexec(conn, kSql)};
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("KEK op: lock-holder query failed: {}", PQerrorMessage(conn));
+        return KekOpLockHolder{.determined = false, .pid = std::nullopt};
+    }
+    // No granted holder at all -> determined, pid nullopt. Not an error.
+    if (PQntuples(res.get()) < 1 || PQgetisnull(res.get(), 0, 0))
+        return KekOpLockHolder{.determined = true, .pid = std::nullopt};
+    const int pid = std::atoi(PQgetvalue(res.get(), 0, 0));
+    if (exclude_pid >= 0 && pid == exclude_pid)
+        return KekOpLockHolder{.determined = true, .pid = std::nullopt};
+    return KekOpLockHolder{.determined = true, .pid = pid};
+}
 
 } // namespace yuzu::server::detail

@@ -66,7 +66,10 @@ bool validate_empty_body(const httplib::Request& req, httplib::Response& res) {
 /// Short, static (never seam-supplied) tag for the audit `detail` column —
 /// safe to log verbatim, unlike anything the seam might have classified as
 /// Internal (rule B: a codec-internal error string must never surface here
-/// either, in the audit trail or the HTTP body).
+/// either, in the audit trail or the HTTP body). Values match the #2530 B7
+/// fixed metrics outcome vocabulary (`ceiling`/`query_canceled`/
+/// `clock_anomaly`/...) even though this is a separate audit-detail string,
+/// not the Prometheus label — same vocabulary, easier to grep across both.
 const char* failure_tag(KekOpResult::Failure failure) {
     switch (failure) {
     case KekOpResult::Failure::Unavailable:
@@ -75,6 +78,12 @@ const char* failure_tag(KekOpResult::Failure failure) {
         return "failure=conflict";
     case KekOpResult::Failure::Cooldown:
         return "failure=cooldown";
+    case KekOpResult::Failure::VersionCeiling:
+        return "failure=ceiling";
+    case KekOpResult::Failure::QueryCanceled:
+        return "failure=query_canceled";
+    case KekOpResult::Failure::ClockAnomaly:
+        return "failure=clock_anomaly";
     case KekOpResult::Failure::HalfCommitted:
         return "failure=half_committed";
     case KekOpResult::Failure::Internal:
@@ -84,15 +93,23 @@ const char* failure_tag(KekOpResult::Failure failure) {
     return "failure=internal";
 }
 
-/// Map a `KekOpResult::Failure` to the A4 error envelope and write it to
-/// `res`. Rule A (#2395): HalfCommitted's remediation is the single most
-/// important string in this module — it MUST tell the operator to call
-/// `/rewrap` to resume and MUST NOT invite a `/rotate` retry (which would
-/// mint a spurious extra version on top of an already-half-rotated state).
-/// Rule B: Internal NEVER interpolates any seam-supplied string — generic
-/// message + correlation id only.
-void write_failure(httplib::Response& res, KekOpResult::Failure failure) {
-    switch (failure) {
+/// Map a `KekOpResult`'s failure to the A4 error envelope and write it to
+/// `res`. Takes the whole result (not just the `Failure` enum) because
+/// `Cooldown`'s retry hint (#2530 D) is now an honest value carried on the
+/// result rather than a hardcoded constant. Rule A (#2395): HalfCommitted's
+/// remediation is the single most important string in this module — it MUST
+/// tell the operator to call `/rewrap` to resume and MUST NOT invite a
+/// `/rotate` retry (which would mint a spurious extra version on top of an
+/// already-half-rotated state). Rule B: Internal NEVER interpolates any
+/// seam-supplied string — generic message + correlation id only.
+///
+/// #2530 D — VersionCeiling / QueryCanceled / ClockAnomaly deliberately carry
+/// NO `retry_after_ms` (waiting alone never resolves any of the three: the
+/// ceiling needs an operator config change, a canceled query may fail
+/// identically forever at scale or was an admin cancel, and the clock the
+/// cooldown math would use is the very thing proven untrustworthy).
+void write_failure(httplib::Response& res, const KekOpResult& result) {
+    switch (result.failure) {
     case KekOpResult::Failure::Unavailable:
         res.status = 503;
         res.set_content(error_json_a4(503, "KEK service unavailable", make_correlation_id(),
@@ -113,19 +130,64 @@ void write_failure(httplib::Response& res, KekOpResult::Failure failure) {
                                       "retry once it completes"),
                         kJson);
         return;
-    case KekOpResult::Failure::Cooldown:
+    case KekOpResult::Failure::Cooldown: {
         // Distinct from Conflict on purpose (Hermes pass 2, MEDIUM 2c): telling
         // an operator "another rotation holds the lock" when in fact they
         // attempted one two minutes ago is simply false, and sends them hunting
         // a concurrent operation that does not exist.
+        //
+        // #2530 D: the retry_after_ms is now honest, sourced from the seam's
+        // durable rate-limit clock (`cooldown_retry_after_ms`) rather than a
+        // hardcoded constant — waiting genuinely resolves a cooldown, so this
+        // is the ONE failure where a numeric hint is truthful. Fall back to
+        // the old fixed 5-minute hint only if the seam left the field unset
+        // (0), so a stub/older seam still answers something sane instead of
+        // an honest-looking `0`.
+        const std::int64_t retry_after_ms = result.cooldown_retry_after_ms > 0
+                                                 ? static_cast<std::int64_t>(
+                                                       result.cooldown_retry_after_ms)
+                                                 : 300000;
         res.status = 429;
         res.set_content(error_json_a4(429, "KEK rotation is in its cooldown window",
-                                      make_correlation_id(), /*retry_after_ms=*/300000,
+                                      make_correlation_id(), retry_after_ms,
                                       "a KEK rotation was attempted very recently; rotation "
                                       "attempts are rate-limited. If you are finishing a "
                                       "half-committed rotation, call the rewrap route instead — "
                                       "it is NOT rate-limited and is the correct way to resume"),
                         kJson);
+        return;
+    }
+    case KekOpResult::Failure::VersionCeiling:
+        res.status = 409;
+        res.set_content(
+            error_json_a4(409, "the live KEK version ceiling has been reached",
+                          make_correlation_id(),
+                          "rotation is blocked because the number of live KEK versions has "
+                          "reached --kek-max-live-versions; there is no retire route (#2525), so "
+                          "waiting will never clear this — an operator must explicitly raise the "
+                          "ceiling, which is a deliberate, logged and audited risk acceptance"),
+            kJson);
+        return;
+    case KekOpResult::Failure::QueryCanceled:
+        res.status = 503;
+        res.set_content(
+            error_json_a4(503, "a KEK query was canceled or exceeded its statement timeout",
+                          make_correlation_id(),
+                          "this is not necessarily transient: check statement_timeout, current "
+                          "database load, whether an administrator issued pg_cancel_backend, and "
+                          "the size of the registered-column rewrap scan before retrying"),
+            kJson);
+        return;
+    case KekOpResult::Failure::ClockAnomaly:
+        res.status = 503;
+        res.set_content(
+            error_json_a4(503, "the KEK rotation clock is untrustworthy",
+                          make_correlation_id(),
+                          "the newest kek_meta row is timestamped in the future relative to the "
+                          "database server's own clock, so the durable rotation rate limit "
+                          "cannot be computed safely; investigate the database server's clock "
+                          "before retrying"),
+            kJson);
         return;
     case KekOpResult::Failure::HalfCommitted:
         res.status = 500;
@@ -181,7 +243,7 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
                  if (result.failure != KekOpResult::Failure::None) {
                      (void)audit_fn(req, "kek.rotate", "failure", "Secret", "kek",
                                     failure_tag(result.failure));
-                     write_failure(res, result.failure);
+                     write_failure(res, result);
                      return;
                  }
                  if (!audit_fn(req, "kek.rotate", "success", "Secret", "kek",
@@ -223,7 +285,7 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
                  if (result.failure != KekOpResult::Failure::None) {
                      (void)audit_fn(req, "kek.rewrap", "failure", "Secret", "kek",
                                     failure_tag(result.failure));
-                     write_failure(res, result.failure);
+                     write_failure(res, result);
                      return;
                  }
                  if (!audit_fn(req, "kek.rewrap", "success", "Secret", "kek",
@@ -237,7 +299,18 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
     // ── GET /api/v1/secrets/kek/status ── Security:Read. ──────────────────────
     // Read-only; not audited (matches the CA read routes — GET /ca/issued
     // etc. don't audit either). `oldest_in_use` is null when no secret rows
-    // exist at all (nothing to rewrap, trivially "complete").
+    // exist at all (nothing to rewrap, trivially "complete"). #2530 B2/C1:
+    // `live_versions`/`lock_held`/`lock_holder_pid` are diagnostic snapshots
+    // taken lock-free — see the KekOpResult doc comment — and this route
+    // still deliberately never takes the `secrets_kek_op` lock itself; the
+    // MCP `get_kek_status` twin surfaces the identical three fields (REST/MCP
+    // parity, ADR-1005).
+    //
+    // #2530 T5: `live_versions` and `lock_held` serialise as JSON `null`
+    // (never `0`/`false`) when the seam could not determine them — the key
+    // is ALWAYS present, so a client can tell "unknown" (key present, value
+    // null) apart from "the server predates this field" (key absent)
+    // without a version check.
     sink.Get("/api/v1/secrets/kek/status",
             [perm_fn, ops](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Security", "Read"))
@@ -254,7 +327,7 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
                 }
                 const KekOpResult result = ops.status();
                 if (result.failure != KekOpResult::Failure::None) {
-                    write_failure(res, result.failure);
+                    write_failure(res, result);
                     return;
                 }
                 nlohmann::json out = {
@@ -263,6 +336,14 @@ void KekRoutes::register_routes(HttpRouteSink& sink, PermFn perm_fn, AuditFn aud
                                           ? nlohmann::json(*result.oldest_in_use)
                                           : nlohmann::json(nullptr)},
                     {"rotation_complete", result.rotation_complete},
+                    {"live_versions", result.live_versions.has_value()
+                                           ? nlohmann::json(*result.live_versions)
+                                           : nlohmann::json(nullptr)},
+                    {"lock_held", result.lock_held.has_value() ? nlohmann::json(*result.lock_held)
+                                                                : nlohmann::json(nullptr)},
+                    {"lock_holder_pid", result.lock_holder_pid.has_value()
+                                             ? nlohmann::json(*result.lock_holder_pid)
+                                             : nlohmann::json(nullptr)},
                     {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);
             });

@@ -60,6 +60,10 @@ struct KekOpResult {
         Unavailable,     ///< codec or pool not available -> 503
         Conflict,        ///< another KEK operation is in flight -> 409
         Cooldown,        ///< too soon after the last rotate attempt -> 429
+        // ── #2530 hardening: three new failure classes ─────────────────────
+        VersionCeiling,  ///< live KEK versions at the configured maximum -> 409, NO retry_after_ms
+        QueryCanceled,   ///< a KEK query was canceled or hit statement_timeout -> 503, NO retry_after_ms
+        ClockAnomaly,    ///< newest kek_meta row is future-dated -> 503, NO retry_after_ms
         HalfCommitted,   ///< rotate advanced the version then failed -> 500 + the resume instruction
         Internal,        ///< anything else -> 500, generic message only
     };
@@ -69,6 +73,49 @@ struct KekOpResult {
     std::uint32_t active_version{0};              ///< status
     std::optional<std::uint32_t> oldest_in_use{}; ///< status; nullopt = no secret rows exist
     bool rotation_complete{false};                ///< status
+
+    /// Only meaningful when `failure == Cooldown`. The honest number of
+    /// milliseconds remaining on the DURABLE rate limit
+    /// (`--kek-min-rotate-interval`), computed by the seam from
+    /// `SecretCodec::rotate_clock()`'s single-statement Postgres timestamps
+    /// (#2530 B3/D — "waiting genuinely resolves it" is only true if this
+    /// number is accurate). Zero means the seam did not populate it (an older seam,
+    /// or a stub in tests); `write_failure` falls back to a conservative
+    /// default in that case rather than emitting a false `0`. NEVER set this
+    /// for VersionCeiling / QueryCanceled / ClockAnomaly — those three
+    /// deliberately carry no retry hint at all (see the D mapping table in
+    /// the #2530 contract: waiting does not fix any of them).
+    std::uint32_t cooldown_retry_after_ms{0};
+
+    // ── #2530 B2: diagnostic snapshots (status only) ───────────────────────
+    // The three fields below are read LOCK-FREE, each by its own SELECT, at
+    // POSSIBLY DIFFERENT INSTANTS — `live_versions` and `lock_held`/
+    // `lock_holder_pid` are not read inside one transaction and are not
+    // read under the `secrets_kek_op` advisory lock (GET /status
+    // deliberately never takes it, see the status route below). Treat every
+    // one of them as a snapshot that can already be stale by the time the
+    // caller reads the response body — never poll them in a loop expecting
+    // monotonic or atomic behaviour, and never derive a "safe to retire"
+    // conclusion from any combination of them. #2525 documents in detail why
+    // this module still has no retire route; these three fields are pure
+    // observability and add no safety guarantee toward that problem.
+    //
+    // #2530 T5 — `live_versions` and `lock_held` are `nullopt` when the
+    // underlying query FAILED, never a fabricated `0`/`false`. Yuzu's
+    // standing rule (already honoured by the 15s metrics sampler in
+    // server.cpp) is that a value nobody could determine is ABSENT, never a
+    // confident negative. This matters most for `lock_held`: this field
+    // exists so an operator can diagnose a backend wedged holding
+    // `secrets_kek_op` — the failure mode where every KEK operation 409s
+    // forever. During exactly that incident a `false` fabricated from a
+    // failed query would tell the operator "there is no wedge", which is
+    // the one answer this field must never give when it does not actually
+    // know. A `nullopt` `lock_held` MUST NEVER be read as "no lock is
+    // held" — it means the lock state is UNKNOWN; corroborate via
+    // `pg_stat_activity` before concluding anything.
+    std::optional<std::uint32_t> live_versions{}; ///< status; live (non-retired) KEK version count; nullopt = could not be determined
+    std::optional<bool> lock_held{};      ///< status; true iff `secrets_kek_op` has a granted holder; nullopt = could not be determined (NEVER read as "not held")
+    std::optional<int> lock_holder_pid{}; ///< status; the holder's backend pid, nullopt if unheld OR undetermined (see `lock_held` to disambiguate)
 };
 
 /// The three operations. Any may be empty (unset) -> route answers 503.

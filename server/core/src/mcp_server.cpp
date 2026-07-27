@@ -1098,11 +1098,20 @@ static const ToolDef kTools[] = {
 
     {"get_kek_status",
      "Current KEK rotation status: the active version, the oldest version still "
-     "referenced by a live secret row (null when no secret rows exist), and whether "
-     "rotation is complete (every row is on the active version). Read-only. Mirrors GET "
+     "referenced by a live secret row (null when no secret rows exist), whether "
+     "rotation is complete (every row is on the active version), plus three "
+     "diagnostic snapshots added by #2530 hardening — live_versions (count of "
+     "non-retired KEK versions), lock_held / lock_holder_pid (whether the "
+     "secrets_kek_op advisory lock currently has a granted holder). The three "
+     "snapshots are read lock-free at possibly-different instants — never derive "
+     "a \"safe to retire\" conclusion from them (#2525). live_versions and "
+     "lock_held are null when the underlying query could not be determined "
+     "(never a fabricated 0/false) — a null lock_held MUST NOT be read as "
+     "\"no lock is held\"; it means the lock state is unknown, so corroborate "
+     "via pg_stat_activity before concluding anything. Read-only. Mirrors GET "
      "/api/v1/secrets/kek/status. Requires Security:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"}},"required":["active_version","rotation_complete"]})j"},
+     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -6890,6 +6899,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 else
                     payload.raw("oldest_in_use", "null");
                 payload.add("rotation_complete", result.rotation_complete);
+                // #2530 C1/T5: MCP twin of REST /status's three diagnostic
+                // snapshots — see KekOpResult::live_versions/lock_held/
+                // lock_holder_pid (kek_routes.hpp) for the lock-free,
+                // possibly-different-instant caveat. Twin parity is an
+                // ADR-1005 invariant; do not land one of these on REST only.
+                // live_versions/lock_held serialise as JSON null (never a
+                // fabricated 0/false) when the seam could not determine
+                // them — matching kek_routes.cpp exactly.
+                if (result.live_versions.has_value())
+                    payload.add("live_versions", static_cast<int64_t>(*result.live_versions));
+                else
+                    payload.raw("live_versions", "null");
+                if (result.lock_held.has_value())
+                    payload.add("lock_held", *result.lock_held);
+                else
+                    payload.raw("lock_held", "null");
+                if (result.lock_holder_pid.has_value())
+                    payload.add("lock_holder_pid", static_cast<int64_t>(*result.lock_holder_pid));
+                else
+                    payload.raw("lock_holder_pid", "null");
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

@@ -5005,6 +5005,38 @@ TEST_CASE("MCP KEK: rotate_kek, rewrap_secrets, get_kek_status are advertised in
     CHECK(names.count("decommission_kek") == 0);
 }
 
+// #2530 C1: the get_kek_status OUTPUT SCHEMA (not just the payload) must
+// carry the same three diagnostic fields REST added — twin parity is an
+// ADR-1005 invariant and the consistency gate treats a schema-only miss (the
+// payload has the field but discovery doesn't advertise it) as a real drift.
+TEST_CASE("MCP KEK: get_kek_status output schema advertises live_versions/lock_held/"
+          "lock_holder_pid",
+          "[mcp][integration][kek]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    bool found = false;
+    for (const auto& t : body["result"]["tools"]) {
+        if (t["name"] != "get_kek_status")
+            continue;
+        found = true;
+        REQUIRE(t.contains("outputSchema"));
+        const auto& props = t["outputSchema"]["properties"];
+        CHECK(props.contains("active_version"));
+        CHECK(props.contains("oldest_in_use"));
+        CHECK(props.contains("rotation_complete"));
+        CHECK(props.contains("live_versions"));
+        CHECK(props.contains("lock_held"));
+        CHECK(props.contains("lock_holder_pid"));
+        // cooldown_retry_after_ms is Cooldown-only (B2 amendment) — it must
+        // NEVER appear on /status's schema or payload.
+        CHECK_FALSE(props.contains("cooldown_retry_after_ms"));
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, including "
           "readonly",
           "[mcp][integration][kek][security]") {
@@ -5016,6 +5048,11 @@ TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, i
             r.active_version = 2;
             r.oldest_in_use = 2;
             r.rotation_complete = true;
+            // #2530 C1: the three diagnostic snapshots — MCP must carry the
+            // same fields as REST's twin (ADR-1005 twin parity).
+            r.live_versions = 3;
+            r.lock_held = true;
+            r.lock_holder_pid = 4242;
             return r;
         };
         ts.start(tier);
@@ -5027,12 +5064,69 @@ TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, i
         auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
         CHECK(payload["active_version"] == 2);
         CHECK(payload["rotation_complete"] == true);
+        CHECK(payload["live_versions"] == 3);
+        CHECK(payload["lock_held"] == true);
+        CHECK(payload["lock_holder_pid"] == 4242);
         // Read-only — exactly the generic mcp.get_kek_status|success entry
         // every tool call gets; NO separate domain audit row (matches
         // kek_routes.cpp GET /status, which never calls its own AuditFn).
         REQUIRE(ts.audit_log.size() == 1);
         CHECK(ts.audit_log.back() == "mcp.get_kek_status|success");
     }
+}
+
+TEST_CASE("MCP KEK: get_kek_status reports lock_holder_pid as null when the lock is unheld",
+          "[mcp][integration][kek]") {
+    McpTestServer ts;
+    ts.kek_ops_for_test.status = []() {
+        KekOpResult r;
+        r.active_version = 1;
+        r.rotation_complete = true;
+        r.live_versions = 1;
+        r.lock_held = false;
+        r.lock_holder_pid = std::nullopt;
+        return r;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_kek_status"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["lock_held"] == false);
+    CHECK(payload["lock_holder_pid"].is_null());
+}
+
+// #2530 T5: the MCP twin of the REST fix — live_versions/lock_held must
+// serialise as JSON null (never a fabricated 0/false, and the key must
+// stay present) when the seam left them std::nullopt, exactly matching a
+// query-failure degrade in server.cpp's status lambda.
+TEST_CASE("MCP KEK: get_kek_status reports live_versions/lock_held as null when undetermined, "
+          "never a fabricated 0/false",
+          "[mcp][integration][kek]") {
+    McpTestServer ts;
+    ts.kek_ops_for_test.status = []() {
+        KekOpResult r;
+        r.active_version = 1;
+        r.rotation_complete = true;
+        // Default-constructed: live_versions/lock_held stay std::nullopt —
+        // what the seam leaves them at when the underlying query failed.
+        return r;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_kek_status"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload.contains("live_versions"));
+    CHECK(payload["live_versions"].is_null());
+    REQUIRE(payload.contains("lock_held"));
+    CHECK(payload["lock_held"].is_null());
+    CHECK(payload["live_versions"] != 0);
+    CHECK(payload["lock_held"] != false);
 }
 
 TEST_CASE("MCP KEK: get_kek_status without a wired seam returns an error, not a crash",

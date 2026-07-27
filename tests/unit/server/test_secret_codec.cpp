@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -179,6 +182,44 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
     REQUIRE_FALSE(codec.register_secret_column({"Bad-Schema", "things", "secret", "id"}));
     REQUIRE_FALSE(codec.register_secret_column({"tstore", "things; DROP TABLE x", "secret", "id"}));
     REQUIRE_FALSE(codec.register_secret_column({"public", "things", "secret", "id"}));
+}
+
+// #2530 A3: a duplicate (store, table, column) registration is rejected —
+// duplicates would multiply the rewrap_all scan and distort the
+// registered-column trip-wire.
+TEST_CASE("SecretCodec: register_secret_column rejects a duplicate (store, table, column)",
+          "[secrets]") {
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    // Exact duplicate.
+    REQUIRE_FALSE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    // Same (store, table, column) but a different pk_column is still a
+    // duplicate registration of the same scan target — rejected too.
+    REQUIRE_FALSE(codec.register_secret_column({"tstore", "things", "secret", "other_pk"}));
+    // A genuinely different column registers fine.
+    REQUIRE(codec.register_secret_column({"tstore", "things", "other_secret", "id"}));
+    REQUIRE(codec.registered_columns().size() == 2);
+}
+
+// #2530 A2: registered_columns() is a snapshot in registration order.
+TEST_CASE("SecretCodec: registered_columns() returns a snapshot in registration order",
+          "[secrets]") {
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    REQUIRE(codec.registered_columns().empty());
+
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE(codec.register_secret_column({"tstore", "other", "secret", "id"}));
+    REQUIRE(codec.register_secret_column({"tstore", "cfg", "secret", "key"}));
+
+    const auto cols = codec.registered_columns();
+    REQUIRE(cols.size() == 3);
+    REQUIRE(cols[0].table == "things");
+    REQUIRE(cols[1].table == "other");
+    REQUIRE(cols[2].table == "cfg");
 }
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
@@ -437,7 +478,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
 
     // Rotate: mint v2, re-wrap ONLY (payload untouched).
     auto rotated = codec.rotate_kek(conn.get());
-    INFO((rotated ? std::string{} : rotated.error()));
+    INFO((rotated ? std::string{} : rotated.error().internal_message));
     REQUIRE(rotated.has_value());
     REQUIRE(*rotated == 2);
     REQUIRE(codec.active_kek_version() == 2);
@@ -507,7 +548,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
         // the key file is gone, and a v1 blob now reads as unresolvable.
         REQUIRE(codec.rewrap_all(conn.get()).has_value());
         auto retired = codec.retire_kek(conn.get(), 1);
-        INFO((retired ? std::string{} : retired.error()));
+        INFO((retired ? std::string{} : retired.error().internal_message));
         REQUIRE(retired.has_value());
         REQUIRE(std::count(audit_verbs.begin(), audit_verbs.end(), "kek.retired") == 1);
         REQUIRE_FALSE(provider.resolve_kek("secrets-kek-v1"));
@@ -568,7 +609,7 @@ TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk 
     }
 
     auto rotated = codec.rotate_kek(conn.get());
-    INFO((rotated ? std::string{} : rotated.error()));
+    INFO((rotated ? std::string{} : rotated.error().internal_message));
     REQUIRE(rotated.has_value());
 
     const char* values[] = {id.row_pk.c_str()};
@@ -908,7 +949,7 @@ TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per success
     for (std::uint32_t expected = 2; expected <= 4; ++expected) {
         const std::uint32_t before = codec.active_kek_version();
         auto rotated = codec.rotate_kek(conn.get());
-        INFO((rotated ? std::string{} : rotated.error()));
+        INFO((rotated ? std::string{} : rotated.error().internal_message));
         REQUIRE(rotated.has_value());
         const std::uint32_t after = codec.active_kek_version();
         REQUIRE(*rotated == expected);
@@ -922,6 +963,136 @@ TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per success
     auto oldest = codec.oldest_kek_version_in_use(conn.get());
     REQUIRE(oldest.has_value());
     REQUIRE(*oldest == 4);
+}
+
+// #2530 A4: live_kek_version_count() counts only non-retired kek_meta rows.
+TEST_CASE("SecretCodec: live_kek_version_count reflects retirement", "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    auto count1 = codec.live_kek_version_count(conn.get());
+    REQUIRE(count1.has_value());
+    REQUIRE(*count1 == 1);
+
+    REQUIRE(codec.rotate_kek(conn.get()).has_value()); // mints v2, both live
+    auto count2 = codec.live_kek_version_count(conn.get());
+    REQUIRE(count2.has_value());
+    REQUIRE(*count2 == 2);
+
+    REQUIRE(codec.retire_kek(conn.get(), 1).has_value()); // v1 now retired
+    auto count3 = codec.live_kek_version_count(conn.get());
+    REQUIRE(count3.has_value());
+    REQUIRE(*count3 == 1);
+}
+
+// #2530 A5: rotate_clock() — no rows, then a fresh row, then a future-dated
+// (clock-anomalous) row, each read via the single two-timestamp statement.
+TEST_CASE("SecretCodec: rotate_clock reports any_rows=false against an empty kek_meta",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    // init() deliberately NOT run: the pre-migrated template's kek_meta is
+    // empty (secrets_tpl resets it), so the `secrets` schema exists but no
+    // row does — exactly the any_rows=false case.
+    auto clock = codec.rotate_clock(conn.get());
+    REQUIRE(clock.has_value());
+    REQUIRE_FALSE(clock->any_rows);
+    REQUIRE_FALSE(clock->clock_anomaly);
+}
+
+TEST_CASE("SecretCodec: rotate_clock reports a small age and no anomaly for a fresh row",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value()); // mints v1 with created_at = now()
+
+    auto clock = codec.rotate_clock(conn.get());
+    REQUIRE(clock.has_value());
+    REQUIRE(clock->any_rows);
+    REQUIRE_FALSE(clock->clock_anomaly);
+    REQUIRE(clock->since_newest < std::chrono::minutes{1});
+}
+
+TEST_CASE("SecretCodec: rotate_clock flags a future-dated newest row as a clock anomaly",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+
+    // Construct the anomaly directly: the newest kek_meta row is future-dated.
+    PgResult upd{PQexec(conn.get(), "UPDATE secrets.kek_meta SET created_at = now() + "
+                                    "interval '1 hour' WHERE kek_version = 1")};
+    REQUIRE(upd.ok());
+
+    auto clock = codec.rotate_clock(conn.get());
+    REQUIRE(clock.has_value());
+    REQUIRE(clock->any_rows);
+    REQUIRE(clock->clock_anomaly);
+}
+
+// #2530 A1: SQLSTATE 57014 (query canceled — including a genuine
+// pg_cancel_backend, not just a statement_timeout) maps to
+// LifecycleError::Kind::query_canceled, and the raw SQLSTATE never leaves
+// the codec (only the Kind discriminant does). Constructed deterministically
+// via a real PQcancel against a query that is genuinely blocked (an ACCESS
+// EXCLUSIVE lock held by a second connection) rather than a
+// statement_timeout race, which would be flaky on a fast local database.
+TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_canceled",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+
+    PgConn blocker = connect(db.dsn());
+    REQUIRE(PgResult{PQexec(blocker.get(), "BEGIN")}.ok());
+    REQUIRE(PgResult{PQexec(blocker.get(),
+                            "LOCK TABLE secrets.kek_meta IN ACCESS EXCLUSIVE MODE")}
+                .ok());
+
+    std::expected<std::size_t, SecretCodec::LifecycleError> result;
+    std::atomic<bool> done{false};
+    std::thread worker([&] {
+        result = codec.live_kek_version_count(conn.get());
+        done.store(true, std::memory_order_release);
+    });
+
+    PGcancel* cancel = PQgetCancel(conn.get());
+    REQUIRE(cancel != nullptr);
+    bool sent_cancel = false;
+    for (int attempt = 0; attempt < 100 && !done.load(std::memory_order_acquire); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        std::array<char, 256> errbuf{};
+        if (PQcancel(cancel, errbuf.data(), static_cast<int>(errbuf.size())) == 1)
+            sent_cancel = true;
+    }
+    PQfreeCancel(cancel);
+
+    worker.join();
+    // Release the blocker's lock regardless of outcome — never leave a table
+    // lock held past this test.
+    (void)PgResult{PQexec(blocker.get(), "ROLLBACK")};
+
+    REQUIRE(sent_cancel);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().kind == SecretCodec::LifecycleError::Kind::query_canceled);
 }
 
 #endif // YUZU_TEST_ENABLE_PG
