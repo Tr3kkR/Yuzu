@@ -302,6 +302,8 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     std::uint64_t evicted = 0;
     bool oversized = false;
     bool sink_enqueue_failed = false;
+    bool pin_displaced = false; ///< an older pin yielded its slot (admission drift)
+    bool pin_unslotted = false; ///< no slot at all (only if the array is size 0)
     bool post_commit_obs_fault = false;  // test seam; tripped inside the post-commit try
     {
         // A single frame must not exceed the ring's byte budget, or the "always keep the
@@ -423,17 +425,25 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
                     oldest = &slot;
                 }
             }
+            // The counters are LATCHED, not incremented here. `MetricsRegistry::counter`
+            // builds a std::string, may insert a map node, and takes the registry lock -
+            // three throw sites. Throwing at this point would be worse than it looks: the
+            // frame is already committed, `next_id_` has already advanced, and the older
+            // pin has already been destroyed, but `publish_impl` would unwind to the
+            // boundary's catch and return 0 - so the caller never learns the id, and
+            // `unpin(id)` can never release the slot. That falsifies the guarantee stated
+            // on publish_guarded ("a throw reaching the catch proves nothing was
+            // committed"). Latching defers both to the post-commit block below, which
+            // exists for exactly this, and keeps the registry mutex out of `mu_`.
             if (free_slot != nullptr) {
                 *free_slot = id;
             } else if (oldest != nullptr) {
                 *oldest = id;
-                if (metrics_ != nullptr) {
-                    metrics_->counter(kMetricPinDisplaced).increment();
-                }
-            } else if (metrics_ != nullptr) {
+                pin_displaced = true;
+            } else {
                 // Unreachable while the array is non-empty - kept as defence in depth so
                 // a future resize to zero slots is loud rather than silently unprotected.
-                metrics_->counter(kMetricFinalUnpinned).increment();
+                pin_unslotted = true;
             }
         }
 
@@ -530,6 +540,12 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
             // vector, and a new failure mode nobody can alert on is a failure mode
             // nobody sees.
             metrics_->counter(kMetricFramesTruncated).increment();
+        }
+        if (pin_displaced && metrics_ != nullptr) {
+            metrics_->counter(kMetricPinDisplaced).increment();
+        }
+        if (pin_unslotted && metrics_ != nullptr) {
+            metrics_->counter(kMetricFinalUnpinned).increment();
         }
     } catch (...) {  // NOLINT(bugprone-empty-catch) — observability must not un-commit
     }
@@ -956,16 +972,19 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      metrics_(metrics), clock_(std::move(clock)),
+      metrics_(metrics), clock_(clock),
       // The grace policy owns the clock + the #2367 last-authoritative seed (attach already
       // authenticated the request fully before this pump exists).
-      // Constructed from `clock_`, NOT from the parameter: initialising both from `clock`
-      // relied on `clock_` being DECLARED before `grace_` so the copy happened before the
-      // move. A member reorder would silently leave `clock_` moved-from, and production
-      // passes an empty ClockFn (both fall back to steady_clock), so no test would catch it.
+      //
+      // BOTH copy the by-value parameter, deliberately. Seeding `grace_` from `clock_`
+      // instead would still depend on `clock_` being DECLARED first - and would turn a
+      // future member reorder from "silently empty clock" into reading an UNCONSTRUCTED
+      // std::function, which is UB. `-Wreorder` cannot warn when the declarations and the
+      // mem-init list move together. One extra std::function copy per GET stream (not per
+      // pass) buys order-independence outright.
       grace_(RevalidateGrace::Config{cfg.revalidate_grace, cfg.revalidate_grace_jitter_max,
                                      cfg.revalidate_max_staleness},
-             clock_) {
+             clock) {
     // SEED the first check a full tick out rather than leaving the epoch default. Attach has
     // just authenticated this request end to end, so an immediate re-check would be a
     // redundant store round trip; and an epoch default would make the first wait budget zero,
@@ -1125,7 +1144,11 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         return finish(write, McpStreamClose::kSuperseded);
     }
 
+    // Did this pass put anything real on the wire? If so the heartbeat below is redundant -
+    // the connection has just proved itself live.
+    bool wrote_frame = false;
     if (pre_emit.has_value()) {
+        wrote_frame = true;
         if (!write_all(write, sse_bus::format_sse(*pre_emit))) {
             return finish(write, McpStreamClose::kClientGone);
         }
@@ -1156,11 +1179,13 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         if (metrics_ != nullptr) {
             metrics_->counter(kMetricFramesDropped).increment(static_cast<double>(dropped));
         }
+        wrote_frame = true;
         if (!write_all(write, sse_bus::format_sse(ev))) {
             return finish(write, McpStreamClose::kClientGone);
         }
     }
     for (const auto& ev : drained) {
+        wrote_frame = true;
         // The id rides on the frame (SseEvent::id) — it is NOT parsed back out of the
         // payload. Re-parsing put a throwing stoull inside this callback, which httplib
         // runs on an unguarded worker task.
@@ -1172,6 +1197,19 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
         }
     }
 
+    // Only when this pass wrote NOTHING. The heartbeat exists to stop an intermediary
+    // idling a quiet connection out, and a pass that just delivered real frames has already
+    // done that - so a heartbeat alongside them is pure filler.
+    //
+    // This became load-bearing with the per-tick gate above. Previously every pass paid a
+    // contended global-registry acquisition, which accidentally rate-limited this loop; with
+    // that gone, a continuously-published stream re-enters bounded only by the socket write,
+    // and an unconditional heartbeat would multiply wire frames on exactly the busiest
+    // streams. Removing an accidental throttle means the thing it was throttling has to
+    // become deliberate.
+    if (wrote_frame) {
+        return true;
+    }
     static constexpr std::string_view kHeartbeat = "event: heartbeat\ndata: \n\n";
     if (!write_all(write, kHeartbeat)) {
         return finish(write, McpStreamClose::kClientGone);

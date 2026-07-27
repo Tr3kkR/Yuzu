@@ -464,8 +464,18 @@ TEST_CASE("McpStreamState: a cap hit rejects the attach and leaves the ring inta
 
 // ── Pump: heartbeats, revocation, grace window (CH-4) ───────────────────────
 
-TEST_CASE("McpStreamPump: a healthy tick emits queued frames then a heartbeat",
+TEST_CASE("McpStreamPump: a pass that delivers frames sends no redundant heartbeat",
           "[mcp][stream]") {
+    // CONTRACT CHANGE. This pass used to emit a heartbeat alongside the frames. The
+    // heartbeat exists only to stop an intermediary idling a QUIET connection out, and a
+    // pass that just delivered real frames has already proved the connection live - so the
+    // extra frame was filler.
+    //
+    // It became worth removing when re-validation moved onto the tick: every pass used to
+    // pay a contended global-registry acquisition, which accidentally rate-limited this
+    // loop to roughly one pass per tick. Without that throttle a continuously-published
+    // stream re-enters bounded only by the socket write, so an unconditional heartbeat
+    // would multiply wire frames on exactly the busiest streams.
     auto state = std::make_shared<mcp::McpStreamState>();
     state->publish("message", R"({"ok":true})");
     auto attached = state->attach_and_replay(0, nullptr, "alice");
@@ -481,9 +491,27 @@ TEST_CASE("McpStreamPump: a healthy tick emits queued frames then a heartbeat",
     CHECK(wire.contains("id: 1\n"));
     CHECK(wire.contains("event: message\n"));
     CHECK(wire.contains(R"(data: {"ok":true})"));
-    // …and the heartbeat deliberately does not (resuming onto a heartbeat's id
-    // would skip real frames).
+    // …and no heartbeat rides along with it.
+    CHECK_FALSE(wire.contains("event: heartbeat\n"));
+}
+
+TEST_CASE("McpStreamPump: an idle pass still sends the anti-idle heartbeat", "[mcp][stream]") {
+    // The other half of the contract above: with nothing to deliver, the heartbeat is the
+    // only thing keeping an intermediary from idling the connection out, so it must still
+    // go. It deliberately carries no id - resuming onto a heartbeat's id would skip real
+    // frames.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK(pump.pump_once(wire.writer()));
+
     CHECK(wire.contains("event: heartbeat\n"));
+    CHECK_FALSE(wire.contains("id: "));
 }
 
 TEST_CASE("McpStreamPump: credential revalidation is once per TICK, not once per wake",
@@ -542,6 +570,72 @@ TEST_CASE("McpStreamPump: credential revalidation is once per TICK, not once per
     CHECK(liveness_checks == 1);
 }
 
+TEST_CASE("McpStreamPump: the first pass does not re-validate - next_check_ is seeded, not epoch",
+          "[mcp][stream][tickgate]") {
+    // A default-constructed time_point is the steady_clock EPOCH, so an unseeded
+    // `next_check_` makes the check due on the very FIRST pass: a redundant auth round trip
+    // immediately after attach already authenticated the request, and - worse - a zero wait
+    // budget, turning pass one into an instant no-op. That exact defect shipped on an
+    // earlier attempt at this fix and silently invalidated the test certifying the wake
+    // path, so it gets its own assertion rather than being caught incidentally.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    int revalidations = 0;
+    const auto frozen = std::chrono::steady_clock::now();
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::milliseconds(10);
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] {
+                                ++revalidations;
+                                return mcp::StreamRevalidate::kValid;
+                            },
+                            [] { return true; },
+                            cfg,
+                            [&] { return frozen; }};
+    FakeWire wire;
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(revalidations == 0); // pre-fix (epoch default): 1
+}
+
+TEST_CASE("McpStreamPump: a sub-millisecond remainder waits rather than spinning",
+          "[mcp][stream][tickgate]") {
+    // `ceil`, not `duration_cast`. Flooring a remainder under 1ms to a zero budget makes
+    // wait_for return immediately; the pass then falls through to the heartbeat write and
+    // the caller re-enters, spinning frames at the client until real time crosses the
+    // boundary. A zero-budget wait_for is NOT free - it is a real futex syscall.
+    //
+    // Asserted as a LOWER bound AMPLIFIED over many passes: a single-call floor would be
+    // defeated by a loaded runner inflating the buggy path past the threshold, which is how
+    // a sibling assertion was found to be unfalsifiable. 20 passes are ~20ms when the wait
+    // is honoured and ~1ms when it is floored, so load would have to inflate the buggy path
+    // tenfold to produce a false pass.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    auto now = std::chrono::steady_clock::now();
+    const auto base = now;
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(5);
+    mcp::McpStreamPump pump{attached.sink,      state, attached.generation,
+                            {},                 [] { return true; }, cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // 500us short of the check: ceil rounds the budget up to 1ms, floor would make it 0.
+    now = base + cfg.tick - std::chrono::microseconds(500);
+    const auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20; ++i) {
+        REQUIRE(pump.pump_once(wire.writer()));
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed >= std::chrono::milliseconds(10)); // ~20ms honoured; ~1ms floored
+}
+
 TEST_CASE("McpStreamPump: the wait is bounded by the next check, so the tick cannot stretch",
           "[mcp][stream][tickgate]") {
     // The trap that this exact fix fell into once already, on the abandoned branch: gating
@@ -565,14 +659,13 @@ TEST_CASE("McpStreamPump: the wait is bounded by the next check, so the tick can
                             [&] { return now; }};
     FakeWire wire;
 
-    // DRAIN FIRST. `attach_and_replay` leaves replay state queued, so the wait predicate is
-    // already true on the first pass and the pump returns without ever sleeping. Measuring
-    // that pass would pass against the unclamped code too - a false green of exactly the
-    // kind this rung exists to stop.
-    REQUIRE(pump.pump_once(wire.writer()));
-
-    // Now the queue is empty, so this pass genuinely waits. Freeze 50ms short of the check:
-    // the pump must wake FOR it rather than restarting a full tick.
+    // The ring is empty and nothing has been published, so this pass genuinely sleeps -
+    // no drain pass is needed first. (An earlier version added one on the theory that
+    // `attach_and_replay` leaves replay state queued. It does not: with cursor 0 on an
+    // empty ring it enqueues nothing, so that pass just blocked for a real 5s tick and
+    // added 5 seconds to every run of the suite for no coverage.)
+    //
+    // Freeze 50ms short of the check: the pump must wake FOR it, not restart a full tick.
     now = base + cfg.tick - std::chrono::milliseconds(50);
     const auto started = std::chrono::steady_clock::now();
     REQUIRE(pump.pump_once(wire.writer()));
