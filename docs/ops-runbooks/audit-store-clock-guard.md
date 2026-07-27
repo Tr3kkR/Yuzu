@@ -19,28 +19,20 @@ Background: `docs/user-manual/audit-log.md`, ADR-0006, issue #2360.
 
 `audit_events` rows expire on a TTL derived from the server's wall clock. A
 forward clock jump makes every row look expired at once, and the delete that
-follows takes the whole retained window. The guard bounds that: a pass declines
-when it would expire every datable row, when more than 7 days elapsed since the
-previous pass, or when the stored clock reading is unusable. Reducing
-`audit_retention_days` can also produce one, by narrowing the survivor horizon.
-It then PACES - the next pass deletes, capped at 25,000 rows.
+follows takes the whole retained window. The guard bounds that: a pass it will
+not trust DECLINES and deletes nothing, and every pass it accepts is capped at
+25,000 rows.
 
-**A missing stored reading is NOT a trigger on its own.** Plain absence is the
-ordinary fresh-install case and says nothing about the clock; it becomes visible
-only as the no-previous-reading variant of the would-expire-everything decline.
-Do not read a decline as evidence that the clock moved until the log line says
-so.
-
-A repeat of the SAME condition is suppressed, so a legitimately all-expired
-store still ages out; a DIFFERENT anomaly arriving underneath a reported one is
-still declined and still counted. Which cases repeat and which are suppressed,
-and the preconditions on each, are stated in the user-manual runbook rather than
-here: [The retention clock guard](../user-manual/audit-log.md#the-retention-clock-guard).
-This page is the alert-response surface; that one is the behaviour surface.
+**When a pass declines is stated once, elsewhere:**
+[The retention clock guard](../user-manual/audit-log.md#the-retention-clock-guard),
+against `classify()` and the tests that pin it. This page deliberately does not
+restate it - restating it is what put a wrong trigger list on this page twice.
+For what actually fired on a given alert, read the log line (step 3 below); it
+names its own trigger.
 
 **It bounds the blast radius; it does not prevent loss.** A sustained clock or
-operational fault drains roughly 600k rows/day after that single decline. The
-alert is the control. The guard is the seatbelt.
+operational fault drains roughly 600k rows/day. The alert is the control. The
+guard is the seatbelt.
 
 ## YuzuAuditPersistFailures - audit WRITES are failing
 
@@ -66,7 +58,7 @@ cannot see it.
 
 1. Confirm the clock: `timedatectl status`, `chronyc tracking` (or `ntpq -p`).
    Look for a large offset, a recent step, or `System clock synchronized: no`.
-2. If the clock is fine, the other trigger is elapsed time. Was this server down,
+2. If the clock is fine, another trigger is elapsed time. Was this server down,
    suspended, or restored from a snapshot more than 7 days ago? Check
    `journalctl --list-boots` and the uptime. Elapsed time cannot distinguish a
    clock jump from an outage, which is why the warn text names both.
@@ -78,19 +70,17 @@ cannot see it.
      check fired; the line prints the measured gap against the threshold.
    - `"the stored retention clock reading is not usable"` - the persisted
      reading was ahead of now, negative, non-integer or unreadable.
-4. **Is this the first guarded pass against an existing database?** That case
-   reads `"the first retention pass against this database"`. It happens on an
-   UPGRADE or a RESTORE, never on a brand-new install - with nothing expired the
-   pass returns before the guard is reached.
+4. If the line reads `"the first retention pass against this database"`, **do NOT
+   stand it down on sight** - treat it exactly as the wipe case above and confirm
+   the clock before letting the next pass drain. Why that case surfaces at all is
+   in the user-manual section linked above.
 
-   **Do not stand it down on sight.** It is reported only when the pass would
-   ALSO have expired every datable row, so the trigger that makes it visible is
-   the wipe outcome test, not merely a missing anchor. Treat it as the wipe case
-   above: confirm the clock before letting the next pass drain.
-
-**Action:** fix time sync. Nothing else is required - the next pass resumes,
-paced. If the clock was genuinely wrong, decide before it drains whether the
-already-expired rows should be preserved (snapshot `audit.db` now).
+**Action:** address whichever cause steps 1-4 identified - a clock fault needs
+time sync; a recent `audit_retention_days` reduction needs nothing. Note the log
+line names the TRIGGER, not the root cause: a reduction and a clock jump can both
+surface as the wipe line, which is why step 1 comes first. The next pass then
+resumes, paced. If the clock was genuinely wrong, decide before it drains whether
+the already-expired rows should be preserved (snapshot `audit.db` now).
 
 **Escalate** if declines repeat on a server whose clock is verifiably correct:
 that suggests a corrupt or hand-edited `audit_retention_meta` reading, which is
@@ -98,11 +88,9 @@ durable state living in the same database as the evidence.
 
 ## YuzuAuditRetentionFailing - passes are erroring
 
-Passes are being ATTEMPTED and are erroring or only partially healthy - one of
-the failure sites fires even after a successful delete, so this does not mean
-nothing was deleted. It is also NOT the reaper stopping: that is
-`YuzuAuditRetentionNotRunning`, a separate rule keyed on no pass being attempted
-at all. Check the
+Passes are being ATTEMPTED and are erroring. This does NOT mean nothing was
+deleted, and it is NOT the reaper stopping - that is
+`YuzuAuditRetentionNotRunning`, a separate rule. Check the
 log for the sqlite error, then disk space, file permissions on `audit.db`, and
 whether a failed migration closed the store (in which case audit WRITES are also
 failing and behavioural-PII routes are returning 503 - a much louder problem).

@@ -907,15 +907,14 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
     same pass and `retention_guard_declines_total` rises by the number of those
     tables (5-10 on a default agent), not by 1. That is the benign bootstrap
     case, not a fleet of separate anomalies, and it needs no action.
-  - **The audit store does NOT.** A missing stored reading is the ordinary
-    fresh-install case and is not a trigger on its own. Its first guarded pass
-    declines only if that pass would ALSO have expired every datable row - an
-    expired backlog with any surviving row deletes normally, with no decline and
-    no alert. So do not pre-emptively stand down
-    `YuzuAuditRetentionClockAnomaly` on a fleet upgrade: if one fires, the pass
-    was about to expire the whole table, which is worth confirming the clock over
-    before the next capped pass drains it. See
-    [the runbook](../ops-runbooks/audit-store-clock-guard.md).
+  - **The audit store's triggers are NOT the same**, so do not carry the agent's
+    expectation across to it and do not pre-emptively stand down
+    `YuzuAuditRetentionClockAnomaly` on a fleet upgrade. If one fires, work it as
+    an alert rather than assuming a benign bootstrap:
+    [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard)
+    states when the server's guard declines, and
+    [the ops runbook](../ops-runbooks/audit-store-clock-guard.md) is the response
+    path.
 - **Agents surface new `tar status` lines**: `storage_state`,
   `retention_guard_declines_total`, `retention_guard_failures_total`, and
   per-table detail. On the healthy path `storage_state|ok` is the first line,
