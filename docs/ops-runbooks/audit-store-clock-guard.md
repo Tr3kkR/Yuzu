@@ -23,12 +23,12 @@ follows takes the whole retained window. The guard bounds that: a pass it will
 not trust DECLINES and deletes nothing, and every pass it accepts is capped at
 25,000 rows.
 
-**When a pass declines is stated once, elsewhere:**
-[The retention clock guard](../user-manual/audit-log.md#the-retention-clock-guard),
-against `classify()` and the tests that pin it. This page deliberately does not
-restate it - restating it is what put a wrong trigger list on this page twice.
-For what actually fired on a given alert, read the log line (step 3 below); it
-names its own trigger.
+**Why a pass declined, and whether it is expected, is answered elsewhere:** the
+"Was this expected?" ladder in
+[The retention clock guard](../user-manual/audit-log.md#the-retention-clock-guard).
+This page deliberately does not restate the rule - restating it is what put a
+wrong trigger list here twice. For what actually fired on a given alert, read the
+log line (step 3 below); it names its own trigger.
 
 **It bounds the blast radius; it does not prevent loss.** A sustained clock or
 operational fault drains roughly 600k rows/day. The alert is the control. The
@@ -72,8 +72,8 @@ cannot see it.
      reading was ahead of now, negative, non-integer or unreadable.
 4. If the line reads `"the first retention pass against this database"`, **do NOT
    stand it down on sight** - treat it exactly as the wipe case above and confirm
-   the clock before letting the next pass drain. Why that case surfaces at all is
-   in the user-manual section linked above.
+   the clock before letting the next pass drain. That line carries its own
+   caveat about what can and cannot be said about the clock; read it in full.
 
 **Action:** address whichever cause steps 1-4 identified - a clock fault needs
 time sync; a recent `audit_retention_days` reduction needs nothing. Note the log
@@ -82,9 +82,12 @@ surface as the wipe line, which is why step 1 comes first. The next pass then
 resumes, paced. If the clock was genuinely wrong, decide before it drains whether
 the already-expired rows should be preserved (snapshot `audit.db` now).
 
-**Escalate** if declines repeat on a server whose clock is verifiably correct:
-that suggests a corrupt or hand-edited `audit_retention_meta` reading, which is
-durable state living in the same database as the evidence.
+**If declines REPEAT, step 1 is not sufficient on its own.** Work the
+"Was this expected?" ladder on the canonical page before concluding the clock is
+fine: [The retention clock guard](../user-manual/audit-log.md#the-retention-clock-guard).
+**Escalate** once that ladder is exhausted: a corrupt or hand-edited
+`audit_retention_meta` reading is durable state living in the same database as
+the evidence.
 
 ## YuzuAuditRetentionFailing - passes are erroring
 
