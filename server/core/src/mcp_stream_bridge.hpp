@@ -299,6 +299,13 @@ public:
     /// and a test walks the enum to prove every label is seeded.
     static constexpr std::array<const char*, 3> kCancelOutcomeLabels{"accepted", "detached",
                                                                     "noop"};
+    /// EVERY enum value returns from its own case and there is NO `default` and no
+    /// fall-through, so adding a CancelOutcome without extending this fails the
+    /// build under -Wswitch rather than silently emitting the last label. That
+    /// matters more than it looks: the label-walk test only catches the drift if
+    /// someone remembers to extend the test, which is the same "remember to update
+    /// the other place" the closed-list refactor exists to eliminate. The trailing
+    /// return is unreachable and present only for -Wreturn-type.
     [[nodiscard]] static constexpr const char* cancel_outcome_label(CancelOutcome o) noexcept {
         switch (o) {
         case CancelOutcome::kAcceptedPending:
@@ -306,7 +313,7 @@ public:
         case CancelOutcome::kDetached:
             return kCancelOutcomeLabels[1];
         case CancelOutcome::kNoOp:
-            break;
+            return kCancelOutcomeLabels[2];
         }
         return kCancelOutcomeLabels[2];
     }

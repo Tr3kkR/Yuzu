@@ -770,6 +770,9 @@ public:
 
 private:
     void note_close_reason(McpStreamClose reason) noexcept;
+    /// Publishes "this response is over" into the sink flag the bridge's cancel
+    /// interlock reads, on every path that ends the response. See the definition.
+    void mark_sink_closed() noexcept;
     bool pump_once_impl(const WriteFn& write);
     /// Writes the close frame (except for kCompleted, which EOFs after a real
     /// final) and always returns false.

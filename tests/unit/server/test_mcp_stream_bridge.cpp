@@ -2761,6 +2761,42 @@ TEST_CASE("CH-12: a duplicate cancel is a no-op - the detach is audited exactly 
     CHECK(fx.audit_count("mcp.bridge.cancel") == 1);
 }
 
+TEST_CASE("CH-12: a cancel arriving after the pump already ended the response is a no-op",
+          "[mcp][bridge][2f][chaos][ch12]") {
+    // The window round 3 found: the pump ends the response (here by delivering the
+    // final), but httplib has not yet run the releaser that parks the record. The
+    // record therefore still LOOKS cancellable - kStreaming, sink still bound - and
+    // before the fix a cancel would win the flag and audit "detached the streamed
+    // response" for a response that had already completed. An audit row that
+    // overstates an outcome is worse than a missing one, so the pump now publishes
+    // liveness into the same flag the cancel interlock reads.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-late"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {}, nullptr,
+        "cid-late", "exec-late");
+    PostWire wire;
+
+    // Drive the pump to its natural end - the final is delivered and it returns
+    // false. The releaser has NOT run: the record is still kStreaming.
+    fx.bus.publish("exec-late", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+
+    // A cancel landing in that window must NOT claim a detach it did not perform.
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 0);
+}
+
 TEST_CASE("every CancelOutcome has a label, and every label is one the server pre-seeds",
           "[mcp][bridge][2f]") {
     // Both-or-neither, same shape as the kTeardownStageNames cross-check. `detached`
