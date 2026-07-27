@@ -2338,17 +2338,27 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     if (metrics != nullptr) {
                         try {
-                            // CLOSED two-value outcome. Worth counting because the
-                            // no-op case is otherwise invisible - it is how you see
-                            // clients cancelling ids that already finished, or
-                            // cancelling into the wrong session.
+                            // CLOSED three-value outcome, and the three are worth
+                            // telling apart: `detached` means a live streamed
+                            // response was actually ended, `accepted` means intent
+                            // was recorded pre-arm for arm()/abandon() to
+                            // arbitrate, and `noop` is otherwise invisible - it is
+                            // how you see clients cancelling ids that already
+                            // finished, or cancelling into the wrong session.
+                            const char* outcome_label = "noop";
+                            switch (outcome) {
+                            case McpStreamBridge::CancelOutcome::kDetached:
+                                outcome_label = "detached";
+                                break;
+                            case McpStreamBridge::CancelOutcome::kAcceptedPending:
+                                outcome_label = "accepted";
+                                break;
+                            case McpStreamBridge::CancelOutcome::kNoOp:
+                                break;
+                            }
                             metrics
                                 ->counter("yuzu_mcp_cancel_notifications_total",
-                                          {{"outcome",
-                                            outcome == McpStreamBridge::CancelOutcome::
-                                                           kAcceptedPending
-                                                ? "accepted"
-                                                : "noop"}})
+                                          {{"outcome", outcome_label}})
                                 .increment();
                         } catch (...) { // NOLINT(bugprone-empty-catch)
                         }

@@ -332,7 +332,25 @@ public:
     Config config() const { return cfg_; }
 
 private:
-    void release_slot(const Key& key) {
+    /// CONTAINED AT THE SOURCE, and it has to be here rather than at any call site:
+    /// this is reached from ~Lease -> an httplib content-provider releaser ->
+    /// ~Response, and a destructor is implicitly noexcept, so a throwing lock_guard
+    /// would std::terminate INSIDE the destructor, before unwinding could reach any
+    /// caller's try/catch. A guard at the call site is decorative (#2037 class).
+    /// `PrincipalQuota::release` states the same reasoning for the same shape, and
+    /// `sse_resource_release`'s header comment already ASSERTED this function
+    /// behaved this way - it did not until now.
+    ///
+    /// Leaking one slot beats aborting the process, and a mutex that cannot be
+    /// locked means the accounting is already unreliable.
+    void release_slot(const Key& key) noexcept {
+        try {
+            release_slot_locked(key);
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+        }
+    }
+
+    void release_slot_locked(const Key& key) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = per_principal_.find(key);
         if (it == per_principal_.end()) {

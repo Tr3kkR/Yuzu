@@ -9872,6 +9872,17 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
         return metrics.counter("yuzu_mcp_cancel_notifications_total", {{"outcome", outcome}})
             .value();
     };
+    // Only the live-streamed section below needs these; a streamed POST must be
+    // admitted by a real budget and must carry a progressToken.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 4}};
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
 
     SECTION("a cancel for an in-flight request is recorded, and answered 202") {
         ts.start_with_dispatch(
@@ -9955,6 +9966,49 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
         CHECK_FALSE(with_id->body.empty());
         CHECK(cancel_count("accepted") == 0.0);
         CHECK(cancel_count("noop") == 0.0);
+    }
+
+    SECTION("a cancel for a LIVE streamed POST detaches the response, not the execution") {
+        // THE path the adversarial review found missing: everything else in this
+        // TEST_CASE exercises a kArming record, where a cancel only records intent.
+        // A request that has actually been armed and is holding an SSE response
+        // open is the case a real client hits, and it went unimplemented because no
+        // test ever sent a cancel to one.
+        ts.stream_budget_for_test = &budget;
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        // Held open deliberately: the Response must stay alive so the record stays
+        // kStreaming while the cancel arrives, exactly as it would on a live wire.
+        auto streamed = ts.call_raw("POST", exec_body(910, /*with_token=*/true),
+                                    {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+        REQUIRE(streamed->status == 200);
+        REQUIRE(streamed->get_header_value("Content-Type") == "text/event-stream");
+        REQUIRE(bridge.phase_for(sid, nlohmann::json(910)) ==
+                smcp::McpStreamBridge::Phase::kStreaming);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto res = post(cancel_body("910"));
+        CHECK(res->status == 202);
+        CHECK(cancel_count("detached") == 1.0); // acted on, not merely recorded
+        CHECK(cancel_count("noop") == 0.0);
+        CHECK(cancel_count("accepted") == 0.0);
+
+        // The RESPONSE is finished with: its sink is closed, so the pump ends on
+        // its next tick and the releaser parks the record.
+        CHECK(bridge.post_sink_closed_for_test(sid, nlohmann::json(910)));
+
+        // The EXECUTION is untouched - still there, still running. A cancel that
+        // silently stopped a dispatched fleet change would be far worse than one
+        // that did nothing.
+        REQUIRE(tracker.query_executions({}).size() == rows_before);
+        auto rows = tracker.query_executions({});
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows[0].status == "running");
     }
 
     SECTION("a malformed cancel is still a notification - 202, nothing counted") {
