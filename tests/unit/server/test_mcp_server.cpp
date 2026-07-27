@@ -574,6 +574,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include <httplib.h>
 #include <libpq-fe.h> // PGRES_COMMAND_OK
+// C10 CH-6: proves the streamed arm adopts the engine quota slot at its install
+// site. Transitively pulls principal_quota.hpp (PrincipalQuota / QuotaSide).
+#include "principal_quota_gate.hpp"
 
 #include <memory>
 #include <stdexcept>
@@ -9969,5 +9972,144 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
         CHECK(no_request_id->status == 202);
         CHECK(cancel_count("accepted") == 0.0);
         CHECK(cancel_count("noop") == 0.0);
+    }
+}
+
+// ── C10: chaos P0 endpoint reproductions, handler half ───────────────────────
+TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain path alone",
+          "[mcp][integration][bridge][2f][chaos][ch5][ch6]") {
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-ch56", 2};
+    };
+
+    SECTION("CH-5: a GET channel and a streamed POST spend the SAME global budget") {
+        // Decision 15(h): ONE budget across every held-open surface, because they
+        // all pin the same worker pool. A global cap of exactly 1 makes the two
+        // surfaces compete for one slot, which is the only way to prove they are
+        // not each quietly counting their own.
+        yuzu::server::detail::StreamBudget shared{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 1}};
+        ts.stream_budget_for_test = &shared;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto get_stream = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                                  {"Accept", "text/event-stream"}});
+        REQUIRE(get_stream->status == 200);
+        REQUIRE(shared.active() == 1);
+
+        // The POST is refused by the budget the GET is holding.
+        auto streamed = ts.call_raw("POST", exec_body(800, /*with_token=*/true),
+                                    {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+        CHECK(streamed->status == 429);
+        CHECK(nlohmann::json::parse(streamed->body)["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", "post_global_cap"}})
+                  .value() == 1.0);
+        // Reject-not-evict: the GET channel keeps its slot.
+        CHECK(shared.active() == 1);
+    }
+
+    SECTION("CH-6: with the stream budget fully spent, the PLAIN path is untouched") {
+        // The starvation question: caps exist so held-open responses cannot eat
+        // the worker pool out from under ordinary request/response traffic. A
+        // plain tool call must not even consult the budget.
+        yuzu::server::detail::StreamBudget shared{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 1}};
+        ts.stream_budget_for_test = &shared;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto held = ts.call_raw("POST", exec_body(810, /*with_token=*/true),
+                                {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+        REQUIRE(held->status == 200);
+        REQUIRE(shared.active() == 1); // saturated
+
+        // Same tool, same session, no SSE Accept: served normally.
+        auto plain = ts.call_raw("POST", exec_body(811, /*with_token=*/false),
+                                 {{"Mcp-Session-Id", sid}});
+        CHECK(plain->status == 200);
+        CHECK(plain->get_header_value("Content-Type") == "application/json");
+        CHECK_FALSE(plain->body.empty());
+        // And it spent nothing: a plain response holds no worker open.
+        CHECK(shared.active() == 1);
+    }
+
+    SECTION("the streamed arm ADOPTS the engine quota slot (C8 debt, not a tautology)") {
+        // The existing chokepoint coverage calls adopt_quota_slot_into_stream by
+        // hand, so it stays green even if the handler never calls it. This drives
+        // the REAL handler and watches the thread_local: the slot leaving it is
+        // proof the adopter ran at the install site, and in_flight surviving until
+        // the Response dies is proof the slot now tracks the STREAM's lifetime
+        // rather than the request's.
+        using yuzu::server::detail::tls_quota_slot;
+        tls_quota_slot().reset();
+
+        yuzu::server::PrincipalQuota quota{
+            yuzu::server::PrincipalQuotaConfig{.max_concurrency = 4}};
+        auto slot = quota.try_acquire("engine:ch6", yuzu::server::QuotaSide::kEngine);
+        REQUIRE(slot.admitted());
+        REQUIRE(quota.in_flight("engine:ch6") == 1);
+        tls_quota_slot() = std::move(slot);
+
+        yuzu::server::detail::StreamBudget shared{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 4}};
+        ts.stream_budget_for_test = &shared;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        {
+            auto streamed = ts.call_raw("POST", exec_body(820, /*with_token=*/true),
+                                        {{"Mcp-Session-Id", sid},
+                                         {"Accept", "text/event-stream"}});
+            REQUIRE(streamed->status == 200);
+            REQUIRE(streamed->get_header_value("Content-Type") == "text/event-stream");
+            // Moved OUT of the thread_local by the adopter. Left behind, it would
+            // be released at post-routing while the stream was still running -
+            // exactly the accounting hole the registry contract warns about.
+            CHECK_FALSE(tls_quota_slot().has_value());
+            CHECK(quota.in_flight("engine:ch6") == 1); // still held, for the stream
+        }
+        // The Response died, so its releaser ran and the slot went home.
+        CHECK(quota.in_flight("engine:ch6") == 0);
+        tls_quota_slot().reset();
     }
 }
