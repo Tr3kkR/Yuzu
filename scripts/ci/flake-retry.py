@@ -629,7 +629,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 2, "meson.build: both server shard entries located")
+    check(len(_entries) >= 4, "meson.build: all four server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -648,12 +648,15 @@ def _selftest():
     # Positive pin so hollow extraction can never pass again: the shard filters
     # must come back verbatim. A shard add or rebalance updates this line
     # consciously. #2394 split the single '[pg]' entry into two balanced halves
-    # (the auth->PG cutover ~doubled the [pg] population); the non-PG '~[pg]'
-    # entry is unchanged.
-    check(("~[pg]",) in _shard_specs
+    # (the auth->PG cutover ~doubled the [pg] population). #2395 then split the
+    # non-PG '~[pg]' entry the same way, after it reached 603/600s (101%) on
+    # Windows; the partition is [auth]+[mcp] vs the rest, balanced by measured
+    # time rather than case count ([auth] alone is ~40% of the non-PG runtime).
+    check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
+          and ("~[pg]~[auth]~[mcp]",) in _shard_specs
           and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
           and ("[pg]~[routes]~[store]~[token]",) in _shard_specs,
-          "meson.build: all three shard tag filters extracted verbatim")
+          "meson.build: all four shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

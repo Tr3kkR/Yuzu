@@ -26,6 +26,8 @@
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
+#include "kek_op_lock.hpp"
+#include "kek_routes.hpp"
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
 #include "x509_ca.hpp"
@@ -56,6 +58,7 @@
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
@@ -311,6 +314,23 @@ using yuzu::server::audit_token;
 // (rest_api_v1.cpp, workflow_routes.cpp) can adopt the pending slot into
 // their own stream lifetime via `adopt_quota_slot_into_stream`. server.cpp
 // keeps only the httplib-specific, worker-thread-affine call sites below.
+
+// -- KEK rotation seam helpers (#2395) -----------------------------------------
+//
+// The three KekOps lambdas (register_routes call site below) all need to
+// serialize on a CLUSTER-WIDE session advisory lock before touching
+// `auth_secret_codec_` — a rotate racing another rotate (on this server or
+// another one pointed at the same database) must be refused, never
+// interleaved. This is a DIFFERENT key from the codec's own INTERNAL
+// transaction-scoped lock (`pg_advisory_xact_lock(2037545589,
+// hashtext('secrets_kek'))`, pg/secret_codec.cpp:30, taken inside
+// rotate_kek() itself) — reusing that key here would have our own call to
+// rotate_kek() deadlock against the very lock we are holding. Same first
+// argument (an arbitrary fixed classifier picked to match the codec's), but
+// hashtext() of a distinct second-key string ('secrets_kek_op' vs
+// 'secrets_kek'), which Postgres's two-key advisory-lock form keys on
+// jointly — so the two locks never collide.
+
 
 } // namespace detail
 
@@ -12583,6 +12603,296 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- #2395: KEK rotation REST surface (/api/v1/secrets/kek/*) -------------
+        // The crypto + Postgres access is injected as the KekOps seam so
+        // kek_routes.{hpp,cpp} links neither (kek_routes.hpp header comment).
+        // Every lambda below follows the same five-step contract: (1) null-check
+        // BOTH auth_secret_codec_ AND pg_pool_ — stop() resets them while
+        // ServerImpl still lives (~4664-4667 above); (2) lease a connection with a
+        // bounded timeout; (3) take the cluster-wide `secrets_kek_op` session
+        // advisory lock (detail::try_lock_kek_op / KekOpLockGuard above) —
+        // non-blocking, so a concurrent KEK op is a `Conflict`, never a wait; (4)
+        // call the codec; (5) classify and SANITISE any failure — a
+        // codec-internal std::expected error string (which can carry
+        // PQerrorMessage text) is spdlog::error'd server-side and NEVER copied
+        // into KekOpResult, which crosses to the HTTP boundary (kek_routes.hpp
+        // rule B).
+        kek_routes_ = std::make_unique<KekRoutes>();
+        {
+            // Built into the MEMBER, not a block-scoped local: the same three
+            // operations back BOTH the REST routes registered here and the MCP
+            // twins wired further down (mcp_server_ does not exist yet at this
+            // point). One instance means the two surfaces can never drift in
+            // failure classification or remediation wording.
+            KekOps& kek_ops = kek_ops_;
+            kek_ops.rotate = [this]() -> KekOpResult {
+                KekOpResult result;
+                if (!auth_secret_codec_ || !pg_pool_) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                auto lease = pg_pool_->try_acquire_for(detail::kKekOpAcquireTimeout);
+                if (!lease) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                switch (detail::try_lock_kek_op(lease.get())) {
+                case detail::KekOpLockAttempt::kError: {
+                    // Defensive release (gov cpp-safety BLOCKING / UP-1): we
+                    // could not read the try-lock result, so we do NOT know
+                    // whether the server granted it. Unlocking a lock we never
+                    // held is a harmless `false`; skipping the release when it
+                    // WAS granted returns a lock-holding connection to the pool
+                    // and wedges every future KEK operation cluster-wide.
+                    detail::KekOpLockGuard release_if_held{lease.get()};
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                case detail::KekOpLockAttempt::kConflict:
+                    result.failure = KekOpResult::Failure::Conflict;
+                    return result;
+                case detail::KekOpLockAttempt::kAcquired:
+                    break;
+                }
+                detail::KekOpLockGuard lock_guard{lease.get()}; // released before `lease`
+                                                                 // returns to the pool
+                                                                 // (reverse declaration
+                                                                 // order).
+
+                // Half-committed detection (#2395 rule): SecretCodec::rotate_kek
+                // (secret_codec.hpp:217-224) documents that active_version_ is
+                // ALREADY advanced by the time it can fail — the only failure
+                // path after that point is a rewrap_all() error
+                // (secret_codec.cpp:824-838); every earlier failure (init not
+                // run, version-space exhausted, KEK generation, fingerprint
+                // INSERT, BEGIN/COMMIT) returns strictly BEFORE active_version_
+                // is touched. So comparing active_kek_version() before vs. after
+                // the call is a reliable, contract-matching signal — and it is
+                // safe from a concurrent-mutation false-positive because we hold
+                // the cluster-wide `secrets_kek_op` lock for the entire call, so
+                // no OTHER KEK operation (on this server or any other pointed at
+                // the same database) can be advancing active_version_ underneath
+                // us in this window.
+                // Cooldown. Checked under the operation advisory lock, so it
+                // cannot be raced BY ANOTHER REQUEST ON THIS SERVER.
+                //
+                // Be precise about what it does NOT guarantee: the state is
+                // process-local while the advisory lock is cluster-wide, so N
+                // servers pointed at one database can each mint once inside the
+                // window. That is a real weakening, and it is acceptable only
+                // because this is a rate limiter against a runaway or
+                // malicious caller, not a correctness invariant — correctness
+                // is the advisory lock's job, and it holds cluster-wide. A
+                // restart also clears the cooldown, for the same reason.
+                //
+                // Reported as Conflict (409, retryable, honest retry_after_ms)
+                // because from the caller's side "a KEK operation you must wait
+                // behind" is exactly what this is. It does conflate "someone
+                // else is rotating right now" with "you rotated two minutes
+                // ago"; the log line below distinguishes them for the operator,
+                // and a distinct wire code is filed in #2530 rather than
+                // invented here.
+                {
+                    constexpr auto kMinRotateInterval = std::chrono::minutes{5};
+                    std::lock_guard<std::mutex> cd{kek_rotate_cooldown_mu_};
+                    const auto now = std::chrono::steady_clock::now();
+                    if (kek_last_rotate_.time_since_epoch().count() != 0 &&
+                        now - kek_last_rotate_ < kMinRotateInterval) {
+                        spdlog::warn("KEK rotate refused: minimum interval between rotation "
+                                     "ATTEMPTS is {} minutes (use /rewrap to finish a "
+                                     "half-committed rotation — it is not rate-limited)",
+                                     kMinRotateInterval.count());
+                        result.failure = KekOpResult::Failure::Cooldown;
+                        return result;
+                    }
+                    // Stamp the ATTEMPT, before we know the outcome (Hermes
+                    // pass 2, finding 3). Stamping only on success left the
+                    // cooldown blind to the one sequence it most needed to
+                    // stop: rotate fails half-committed -> automation retries
+                    // /rotate on the 500 -> because the failed attempt never
+                    // stamped, the retry passes the cooldown and mints v+2,
+                    // then v+3... Each retry leaks a KEK version that can never
+                    // be retired (#2525) and re-runs a full-table rewrap. A
+                    // failed rotation is exactly when you must NOT immediately
+                    // rotate again, so it must consume the budget too.
+                    kek_last_rotate_ = now;
+                }
+
+                const std::uint32_t before = auth_secret_codec_->active_kek_version();
+
+                // Why the try/catch, stated accurately so nobody deletes it as
+                // boilerplate (Hermes pass 1 raised it; pass 2 corrected my
+                // reasoning). It is NOT the audit hook: emit_audit
+                // (pg/secret_codec.cpp:281-288) swallows every exception, so
+                // the hook cannot throw out of rotate_kek. What CAN throw past
+                // the mint is anything in the trailing rewrap_all — allocation
+                // for a large result set being the realistic case.
+                //
+                // Either way the hazard is the same and is why the catch has to
+                // stay: active_version_ has ALREADY advanced by then
+                // (secret_codec.cpp:827), so an exception that escaped this
+                // lambda would surface as a generic 500 rather than the
+                // half-committed instruction, and an operator (or automation)
+                // following the obvious impulse would retry /rotate and mint a
+                // spurious version on top of an already-advanced one. Catching
+                // here means the before/after version check runs on EVERY
+                // failure path, thrown or returned.
+                // Catching here means the version check runs on EVERY failure
+                // path, thrown or returned.
+                std::optional<std::uint32_t> rotated_version;
+                bool rotate_threw = false;
+                try {
+                    auto rotated = auth_secret_codec_->rotate_kek(lease.get());
+                    if (rotated)
+                        rotated_version = *rotated;
+                    else
+                        spdlog::error("KEK rotate failed: {}", rotated.error());
+                } catch (const std::exception& e) {
+                    rotate_threw = true;
+                    spdlog::error("KEK rotate threw: {}", e.what());
+                } catch (...) {
+                    rotate_threw = true;
+                    spdlog::error("KEK rotate threw a non-std exception");
+                }
+                if (!rotated_version) {
+                    // Same classification for a thrown and a returned failure:
+                    // did the active version advance? If so the mint committed
+                    // and only the re-wrap is outstanding.
+                    const std::uint32_t after = auth_secret_codec_->active_kek_version();
+                    result.failure = (after > before) ? KekOpResult::Failure::HalfCommitted
+                                                       : KekOpResult::Failure::Internal;
+                    if (rotate_threw && after > before)
+                        spdlog::critical("KEK rotate threw AFTER advancing the active version to "
+                                         "v{} — the mint committed; resume with /rewrap, do NOT "
+                                         "retry /rotate",
+                                         after);
+                    return result;
+                }
+                result.new_version = *rotated_version;
+                // rotate_kek() runs its own internal rewrap_all() as part of
+                // minting (secret_codec.cpp ~824-838) but DISCARDS that call's
+                // row count, returning only the new version. Rather than
+                // report `rows_rewrapped: 0` — which would be a confidently
+                // wrong number on a rotation that in fact re-wrapped every row
+                // — the /rotate response omits the count entirely and reports
+                // `rotation_complete` instead. That is the signal an operator
+                // actually needs (the ADR-0010 §3 completion signal), and it is
+                // one we can produce truthfully: reaching here means
+                // rotate_kek's internal rewrap_all() returned success, so no
+                // row is left on a superseded version. An operator who wants a
+                // count can call /rewrap, which reports a real one (0 when
+                // there is genuinely nothing left to do).
+                result.rotation_complete = true;
+                return result;
+            };
+            kek_ops.rewrap = [this]() -> KekOpResult {
+                KekOpResult result;
+                if (!auth_secret_codec_ || !pg_pool_) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                auto lease = pg_pool_->try_acquire_for(detail::kKekOpAcquireTimeout);
+                if (!lease) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                switch (detail::try_lock_kek_op(lease.get())) {
+                case detail::KekOpLockAttempt::kError: {
+                    // Defensive release (gov cpp-safety BLOCKING / UP-1): we
+                    // could not read the try-lock result, so we do NOT know
+                    // whether the server granted it. Unlocking a lock we never
+                    // held is a harmless `false`; skipping the release when it
+                    // WAS granted returns a lock-holding connection to the pool
+                    // and wedges every future KEK operation cluster-wide.
+                    detail::KekOpLockGuard release_if_held{lease.get()};
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                case detail::KekOpLockAttempt::kConflict:
+                    result.failure = KekOpResult::Failure::Conflict;
+                    return result;
+                case detail::KekOpLockAttempt::kAcquired:
+                    break;
+                }
+                detail::KekOpLockGuard lock_guard{lease.get()};
+
+                // rewrap_all() never mints a version — it only re-wraps rows
+                // already on a non-active version under the current active one
+                // — so there is no half-committed state to distinguish here;
+                // any failure is Internal.
+                auto rewrapped = auth_secret_codec_->rewrap_all(lease.get());
+                if (!rewrapped) {
+                    spdlog::error("KEK rewrap failed: {}", rewrapped.error());
+                    result.failure = KekOpResult::Failure::Internal;
+                    return result;
+                }
+                result.rows_rewrapped = *rewrapped;
+                return result;
+            };
+            kek_ops.status = [this]() -> KekOpResult {
+                KekOpResult result;
+                if (!auth_secret_codec_ || !pg_pool_) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                auto lease = pg_pool_->try_acquire_for(detail::kKekOpAcquireTimeout);
+                if (!lease) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    return result;
+                }
+                // status deliberately does NOT take the operation lock.
+                //
+                // It did in the first cut, to avoid a "torn" read across an
+                // in-flight rotation. That was wrong twice over (gov
+                // unhappy-path UP-3, security LOW):
+                //
+                //  1. It made the ONLY diagnostic unavailable exactly while the
+                //     thing it diagnoses is running — an operator polling during
+                //     a long rewrap got 409, indistinguishable from a wedged
+                //     lock, which is the opposite of what a status endpoint is
+                //     for.
+                //  2. It let any Security:Read caller contend an exclusive lock
+                //     against a running rotation, and burn a pooled connection
+                //     waiting for it.
+                //
+                // And the "torn" read is not actually a problem: mid-rewrap we
+                // observe oldest_in_use < active_version and report
+                // rotation_complete=false, which is TRUE and is precisely the
+                // in-progress signal the operator wants. A momentarily stale
+                // read errs toward "not complete", never toward a false
+                // "complete".
+                result.active_version = auth_secret_codec_->active_kek_version();
+                auto oldest = auth_secret_codec_->oldest_kek_version_in_use(lease.get());
+                if (!oldest) {
+                    spdlog::error("KEK status: oldest_kek_version_in_use failed: {}",
+                                 oldest.error());
+                    result.failure = KekOpResult::Failure::Internal;
+                    return result;
+                }
+                result.oldest_in_use = *oldest;
+                // Completion is `== active_version`, NOT `>=` (gov unhappy-path
+                // UP-6). A row whose header references a version HIGHER than the
+                // active one is an anomaly — a restore against a newer keys dir,
+                // or a blob from another install — and `>=` would report that
+                // state as "complete", which is the worst possible false
+                // comfort: it says "every secret is on the current key" about
+                // rows whose key is not even registered here.
+                if (!result.oldest_in_use.has_value()) {
+                    result.rotation_complete = true; // no secret rows at all
+                } else if (*result.oldest_in_use > result.active_version) {
+                    spdlog::error("KEK status: oldest referenced version v{} EXCEEDS the active "
+                                  "version v{} — a secret row references a KEK this install has "
+                                  "not registered (restore skew?); reporting NOT complete",
+                                  *result.oldest_in_use, result.active_version);
+                    result.rotation_complete = false;
+                } else {
+                    result.rotation_complete = (*result.oldest_in_use == result.active_version);
+                }
+                return result;
+            };
+            kek_routes_->register_routes(*web_server_, perm_fn, audit_fn, kek_ops);
+        }
+
         // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
         // Routes + the configured bearer token are entirely inert when
         // disabled: no route table entries at all. scim_store_ itself was
@@ -13047,6 +13357,13 @@ private:
             // REST/settings wiring above. Nullable — an unwired
             // engine_principal_store_ leaves every engine-principal tool
             // answering "unavailable" rather than 503/crashing.
+            // KEK ops are wired UNCONDITIONALLY, exactly as the REST routes are
+            // (server.cpp's kek_routes_->register_routes above). This must NOT
+            // sit inside the engine-principal conditional below: doing so made
+            // the MCP tools answer "unavailable" whenever engine_principal_store_
+            // was null while the REST twins worked fine — two surfaces
+            // disagreeing about whether the same capability exists (ADR-1005 A1).
+            mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
             if (engine_principal_store_) {
                 mcp_server_->set_engine_principal_store(engine_principal_store_.get());
                 mcp_server_->set_engine_credential_store(api_token_store_.get());
@@ -13752,6 +14069,26 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
+    std::unique_ptr<KekRoutes> kek_routes_; // #2395: /api/v1/secrets/kek/*
+    // The three KEK operations, shared by the REST routes above and the MCP
+    // twins. Each lambda captures `this` and re-checks auth_secret_codec_ and
+    // pg_pool_ at CALL time, because stop() resets both while this object is
+    // still alive. Held as a member (not a local) purely so both surfaces get
+    // the same instance — see the registration site.
+    KekOps kek_ops_;
+    // Minimum interval between successful KEK mints (Hermes pass 1, HIGH).
+    // Every rotate writes a PERMANENT on-disk key file that by design is never
+    // retired (#2525) and re-wraps every secret row, and nothing else bounds
+    // it — so any Security:Write principal, including a supervised MCP token
+    // whose approver just saw "rotate the KEK", could loop it into unbounded
+    // key-material accumulation plus repeated full-table rewrap. A cooldown is
+    // the cheap half of the fix; the unbounded single-call scan is the codec's
+    // to bound and is tracked in #2530.
+    std::mutex kek_rotate_cooldown_mu_;
+    // Default-constructed (epoch) means "never attempted". Process-bound: a
+    // restart clears it, and it is per-process rather than cluster-wide.
+    // Acceptable for a rate limiter — see the check site for why.
+    std::chrono::steady_clock::time_point kek_last_rotate_{};
 
     // ── Postgres-backed AuthDB (ADR-0006 substrate migration) + its
     // dependency chain ──────────────────────────────────────────────────
