@@ -9823,3 +9823,151 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         CHECK(budget.active() == 0);
     }
 }
+
+// ── 2f PR 3b (C9): notifications/cancelled intercept ─────────────────────────
+TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR 3b C9)",
+          "[mcp][integration][bridge][2f][3b][cancel]") {
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+
+    const auto cancel_body = [](const std::string& request_id_json) {
+        return std::string(
+                   R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":)") +
+               request_id_json + "}}";
+    };
+    const auto post = [&](const std::string& body) {
+        return ts.call_raw("POST", body, {{"Mcp-Session-Id", sid}});
+    };
+    const auto cancel_count = [&](const char* outcome) {
+        return metrics.counter("yuzu_mcp_cancel_notifications_total", {{"outcome", outcome}})
+            .value();
+    };
+
+    SECTION("a cancel for an in-flight request is recorded, and answered 202") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // Reserve leaves the record kArming, which is the only phase that has
+        // anything to cancel - request_cancel records INTENT and arm()/abandon()
+        // arbitrate it later.
+        REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
+                               /*streamed_intent=*/false)
+                    .ok);
+
+        auto res = post(cancel_body("900"));
+        CHECK(res->status == 202);
+        CHECK(res->body.empty());
+        CHECK(cancel_count("accepted") == 1.0);
+        CHECK(cancel_count("noop") == 0.0);
+    }
+
+    SECTION("an unmatched cancel still answers 202 - no oracle for which ids are live") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = post(cancel_body("12345"));
+        // Byte-identical to the matched case: a notification carries no outcome,
+        // and differing here would tell a caller which request ids exist.
+        CHECK(res->status == 202);
+        CHECK(res->body.empty());
+        CHECK(cancel_count("noop") == 1.0);
+        CHECK(cancel_count("accepted") == 0.0);
+    }
+
+    SECTION("the id is taken VERBATIM - \"900\" is not 900") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
+                               /*streamed_intent=*/false)
+                    .ok);
+
+        // JSON-RPC ids are opaque: the string "900" addresses a DIFFERENT request
+        // from the number 900. Coercing them together would cancel the wrong one.
+        auto res = post(cancel_body(R"("900")"));
+        CHECK(res->status == 202);
+        CHECK(cancel_count("noop") == 1.0);
+        CHECK(cancel_count("accepted") == 0.0);
+    }
+
+    SECTION("other notifications and id-bearing requests are untouched") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        // A different notification: still 202, and nothing counted - the intercept
+        // must not widen to every notification that happens to carry params.
+        auto other = post(
+            R"({"jsonrpc":"2.0","method":"notifications/initialized","params":{"requestId":900}})");
+        CHECK(other->status == 202);
+        CHECK(other->body.empty());
+        CHECK(cancel_count("accepted") == 0.0);
+        CHECK(cancel_count("noop") == 0.0);
+
+        // An id-bearing request NAMED like the notification is a request, not a
+        // cancellation: it gets a real JSON-RPC response, never a bare 202.
+        auto with_id = post(
+            R"({"jsonrpc":"2.0","id":901,"method":"notifications/cancelled","params":{"requestId":900}})");
+        CHECK(with_id->status != 202);
+        CHECK_FALSE(with_id->body.empty());
+        CHECK(cancel_count("accepted") == 0.0);
+        CHECK(cancel_count("noop") == 0.0);
+    }
+
+    SECTION("a malformed cancel is still a notification - 202, nothing counted") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto no_params = post(R"({"jsonrpc":"2.0","method":"notifications/cancelled"})");
+        CHECK(no_params->status == 202);
+        auto no_request_id =
+            post(R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}})");
+        CHECK(no_request_id->status == 202);
+        CHECK(cancel_count("accepted") == 0.0);
+        CHECK(cancel_count("noop") == 0.0);
+    }
+}

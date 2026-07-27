@@ -2306,6 +2306,60 @@ McpServer::HandlerFn McpServer::build_handler(
 
         // ── Notification (no id → no response) ───────────────────────────
         if (!rpc.id.has_value()) {
+            // notifications/cancelled (2f PR 3b, C9): the client asking us to stop
+            // caring about a request it already sent. Only reachable here - a
+            // cancellation is a NOTIFICATION, so it never has an id of its own and
+            // every id-bearing request keeps its existing path untouched.
+            //
+            // The id is taken VERBATIM. JSON-RPC ids are opaque: 1 and "1" are
+            // different requests, and the bridge keys on the exact value, so any
+            // coercion here would cancel the wrong one or nothing at all.
+            //
+            // Intent only. request_cancel RECORDS it and arm()/abandon() arbitrate,
+            // which is what keeps cancellation honest under the race that matters:
+            // a cancel landing while the request is mid-dispatch cannot half-cancel
+            // a command already on the wire. The audit fires at arbitration
+            // (mcp.bridge.cancel), not here, so a cancel is only ever recorded as
+            // having done something once it actually did.
+            if (rpc.method == "notifications/cancelled" && streaming_on &&
+                stream_bridge_ != nullptr) {
+                const auto cancel_sid = req.get_header_value("Mcp-Session-Id");
+                if (!cancel_sid.empty() && rpc.params.is_object() &&
+                    rpc.params.contains("requestId")) {
+                    McpStreamBridge::CancelOutcome outcome =
+                        McpStreamBridge::CancelOutcome::kNoOp;
+                    try {
+                        outcome = stream_bridge_->request_cancel(cancel_sid,
+                                                                 rpc.params["requestId"]);
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // A cancel we could not record must not fail the
+                        // notification: the client is owed 202 either way, and the
+                        // request it wanted cancelled simply runs to completion.
+                    }
+                    if (metrics != nullptr) {
+                        try {
+                            // CLOSED two-value outcome. Worth counting because the
+                            // no-op case is otherwise invisible - it is how you see
+                            // clients cancelling ids that already finished, or
+                            // cancelling into the wrong session.
+                            metrics
+                                ->counter("yuzu_mcp_cancel_notifications_total",
+                                          {{"outcome",
+                                            outcome == McpStreamBridge::CancelOutcome::
+                                                           kAcceptedPending
+                                                ? "accepted"
+                                                : "noop"}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                }
+            }
+            // 202 REGARDLESS, including for a cancel that matched nothing: a
+            // notification has no response to carry an outcome, and answering
+            // differently would turn this into an oracle for which request ids are
+            // live on a session.
+            //
             // notifications/initialized — acknowledge (MCP Streamable HTTP spec:
             // an accepted notification/response POST answers 202, not 204).
             res.status = 202;

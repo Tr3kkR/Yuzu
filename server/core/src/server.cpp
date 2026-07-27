@@ -547,6 +547,12 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
+        metrics_.describe("yuzu_mcp_cancel_notifications_total",
+                          "notifications/cancelled received, by whether the intent was recorded "
+                          "against a live in-flight request (accepted) or matched nothing (noop). "
+                          "A high noop rate means clients are cancelling requests that already "
+                          "finished, or addressing the wrong session",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_publish_failures_total",
                           "publish() exception-boundary catches — a producer's frame "
                           "construction failed before commit (#2366); the frame was never "
@@ -793,6 +799,9 @@ public:
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
+        for (auto outcome : {"accepted", "noop"}) {
+            metrics_.counter("yuzu_mcp_cancel_notifications_total", {{"outcome", outcome}});
+        }
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
                             "stream_handover_pending", "replay_window_exceeded", "origin",
