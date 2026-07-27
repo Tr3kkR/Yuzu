@@ -545,10 +545,13 @@ public:
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
         metrics_.describe("yuzu_mcp_cancel_notifications_total",
-                          "notifications/cancelled received, by whether the intent was recorded "
-                          "against a live in-flight request (accepted) or matched nothing (noop). "
-                          "A high noop rate means clients are cancelling requests that already "
-                          "finished, or addressing the wrong session",
+                          "notifications/cancelled received, by outcome: `detached` - a live "
+                          "streamed response was ended by this cancel; `accepted` - intent "
+                          "recorded before the request armed, for arm()/abandon() to arbitrate; "
+                          "`noop` - nothing to cancel. A high noop rate means clients are "
+                          "cancelling requests that already finished, addressing the wrong "
+                          "session, or retrying a cancel that already landed. A cancel NEVER "
+                          "stops the execution - it detaches the response only",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_publish_failures_total",
                           "publish() exception-boundary catches — a producer's frame "
@@ -798,7 +801,9 @@ public:
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
-        for (auto outcome : {"accepted", "noop"}) {
+        // Derived from the bridge's own CLOSED list, beside the enum - a
+        // hand-written copy here is what let `detached` ship unseeded.
+        for (auto outcome : mcp::McpStreamBridge::kCancelOutcomeLabels) {
             metrics_.counter("yuzu_mcp_cancel_notifications_total", {{"outcome", outcome}});
         }
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",

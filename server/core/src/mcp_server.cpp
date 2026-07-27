@@ -2340,25 +2340,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         try {
                             // CLOSED three-value outcome, and the three are worth
                             // telling apart: `detached` means a live streamed
-                            // response was actually ended, `accepted` means intent
-                            // was recorded pre-arm for arm()/abandon() to
-                            // arbitrate, and `noop` is otherwise invisible - it is
-                            // how you see clients cancelling ids that already
-                            // finished, or cancelling into the wrong session.
-                            const char* outcome_label = "noop";
-                            switch (outcome) {
-                            case McpStreamBridge::CancelOutcome::kDetached:
-                                outcome_label = "detached";
-                                break;
-                            case McpStreamBridge::CancelOutcome::kAcceptedPending:
-                                outcome_label = "accepted";
-                                break;
-                            case McpStreamBridge::CancelOutcome::kNoOp:
-                                break;
-                            }
+                            // response was actually ended BY THIS cancel,
+                            // `accepted` means intent was recorded pre-arm for
+                            // arm()/abandon() to arbitrate, and `noop` is otherwise
+                            // invisible - it is how you see clients cancelling ids
+                            // that already finished, cancelling into the wrong
+                            // session, or retrying a cancel that already landed.
+                            //
+                            // The label comes from the bridge, beside the enum, so
+                            // this site cannot drift from the startup seed.
                             metrics
-                                ->counter("yuzu_mcp_cancel_notifications_total",
-                                          {{"outcome", outcome_label}})
+                                ->counter(
+                                    "yuzu_mcp_cancel_notifications_total",
+                                    {{"outcome",
+                                      McpStreamBridge::cancel_outcome_label(outcome)}})
                                 .increment();
                         } catch (...) { // NOLINT(bugprone-empty-catch)
                         }
