@@ -949,6 +949,27 @@ public:
                           "Count of non-retired KEK versions (secrets.kek_meta rows with "
                           "retired_at IS NULL). Compare against --kek-max-live-versions.",
                           "gauge");
+        // #2530 G8-S12: the configured --kek-max-live-versions ceiling,
+        // exported as its OWN gauge so YuzuKekCeilingApproaching (below) can
+        // alert on the RATIO yuzu_server_kek_live_versions /
+        // yuzu_server_kek_max_live_versions instead of a hardcoded 32 —
+        // retirement is impossible under #2525, so this ceiling is a
+        // lifetime cap, and without this an operator who has already raised
+        // the flag (the supported #2530 B5 escape hatch) gets no
+        // proximity warning before hitting the NEW ceiling's 409. A static
+        // config value, not sampled from Postgres — set once here, at boot,
+        // so it stays published even when the KEK substrate itself is never
+        // reachable (unlike the four gauges above, which are sampled from
+        // cluster state on health_recompute_thread_ and can legitimately be
+        // absent or frozen on a degrade).
+        metrics_.describe("yuzu_server_kek_max_live_versions",
+                          "The configured --kek-max-live-versions ceiling. A static config "
+                          "value (set once at boot), not sampled from Postgres like the other "
+                          "yuzu_server_kek_* gauges. Compare against "
+                          "yuzu_server_kek_live_versions to gauge ceiling proximity.",
+                          "gauge");
+        metrics_.gauge("yuzu_server_kek_max_live_versions")
+            .set(static_cast<double>(cfg_.kek_max_live_versions));
         metrics_.describe("yuzu_server_kek_active_version",
                           "The KEK version new secret encrypts currently use (the newest "
                           "non-retired kek_meta version).",
@@ -980,9 +1001,11 @@ public:
             }
         }
         metrics_.describe("yuzu_server_kek_metrics_unavailable_total",
-                          "KEK gauge-sampling sweeps (health_recompute_thread_) that could not "
-                          "read Postgres cluster state; on each occurrence every KEK gauge above "
-                          "HOLDS its prior published value rather than publishing a false 0.",
+                          "KEK cluster-state reads (health_recompute_thread_, #2530 G8-S2: "
+                          "short-circuited after the first failure within a sweep, so this is "
+                          "at most one increment per 15s sweep) that could not read Postgres; "
+                          "on each occurrence every KEK gauge above HOLDS its prior published "
+                          "value rather than publishing a false 0.",
                           "counter");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
@@ -4115,12 +4138,26 @@ public:
                             txn_ok = t.status() == PGRES_COMMAND_OK;
                         }
                         if (txn_ok) {
+                            // #2530 G8-S2: short-circuit after the FIRST
+                            // failed read. A 57014 (statement_timeout) on
+                            // `live_kek_version_count` doesn't just fail that
+                            // one query — it aborts the whole transaction, so
+                            // unconditionally running `kek_op_lock_holder`
+                            // next (the pre-fix shape) executed against an
+                            // already-aborted transaction: it failed too
+                            // (double-counting `..._unavailable_total` for
+                            // ONE underlying cause), AND its own
+                            // `spdlog::error("KEK op: lock-holder query
+                            // failed: ...")` logged a misleading message that
+                            // named the wrong query. `read_ok` tracks whether
+                            // it is still meaningful to keep reading in this
+                            // transaction.
+                            bool read_ok = true;
                             if (auto live = auth_secret_codec_->live_kek_version_count(kek_conn))
                                 metrics_.gauge("yuzu_server_kek_live_versions")
                                     .set(static_cast<double>(*live));
                             else
-                                metrics_.counter("yuzu_server_kek_metrics_unavailable_total")
-                                    .increment();
+                                read_ok = false;
 
                             // #2530 T5: kek_op_lock_holder distinguishes a
                             // query failure (`determined == false`) from a
@@ -4131,20 +4168,27 @@ public:
                             // G7-S1: read `lock_held` directly, never derived
                             // from `pid.has_value()` — a granted holder with
                             // a NULL pid is still held.
-                            auto holder = detail::kek_op_lock_holder(kek_conn);
-                            if (holder.determined) {
-                                metrics_.gauge("yuzu_server_kek_op_lock_held")
-                                    .set(holder.lock_held ? 1.0 : 0.0);
-                            } else {
+                            if (read_ok) {
+                                auto holder = detail::kek_op_lock_holder(kek_conn);
+                                if (holder.determined) {
+                                    metrics_.gauge("yuzu_server_kek_op_lock_held")
+                                        .set(holder.lock_held ? 1.0 : 0.0);
+                                } else {
+                                    read_ok = false;
+                                }
+                            }
+
+                            if (!read_ok)
                                 metrics_.counter("yuzu_server_kek_metrics_unavailable_total")
                                     .increment();
-                            }
+
                             // Best-effort: this is a read-only transaction —
                             // a failed COMMIT here (e.g. the connection died
-                            // mid-txn) only means the already-published
-                            // gauge/counter updates above stand as read; it
-                            // does not undo them, and the connection is
-                            // returned to the pool either way.
+                            // mid-txn, or the transaction was already aborted
+                            // by a statement_timeout above) only means the
+                            // already-published gauge/counter updates above
+                            // stand as read; it does not undo them, and the
+                            // connection is returned to the pool either way.
                             pg::PgResult commit{PQexec(kek_conn, "COMMIT")};
                             (void)commit;
                         } else {
@@ -4156,12 +4200,22 @@ public:
                     } else {
                         metrics_.counter("yuzu_server_kek_metrics_unavailable_total").increment();
                     }
-                } else {
+                } else if (!stop_requested_.load(std::memory_order_acquire)) {
                     // #2530 G7-M1: the KEK substrate is unavailable — the
                     // exact condition under which every KEK operation
                     // records outcome="unavailable" below — so say so on the
                     // metrics-unavailable side too, rather than silently
                     // skipping straight past this whole block.
+                    //
+                    // #2530 G8-S7: gated on `!stop_requested_` — `stop()`
+                    // resets `auth_secret_codec_`/`pg_pool_` strictly AFTER
+                    // `health_recompute_thread_.join()` returns, so this
+                    // branch should never observe null pointers mid-shutdown
+                    // today. This check is defense-in-depth against that
+                    // ordering ever regressing (e.g. a future teardown
+                    // reorder), so a clean shutdown can never arm
+                    // YuzuKekMetricsUnavailable on churn elsewhere in this
+                    // function.
                     metrics_.counter("yuzu_server_kek_metrics_unavailable_total").increment();
                 }
 

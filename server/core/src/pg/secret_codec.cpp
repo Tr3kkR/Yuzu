@@ -1193,8 +1193,11 @@ SecretCodec::rotate_clock(PGconn* conn) const {
     // possible only from clock jitter at the exact now()/created_at
     // boundary) has no usable magnitude — leave it at 0 rather than fabricate
     // one.
+    // #2530 G8-S6: `-age_seconds` is signed-negation UB at INT64_MIN (no
+    // representable positive counterpart). `0ULL - static_cast<uint64_t>(...)`
+    // computes the same magnitude via well-defined unsigned wraparound instead.
     clock.future_skew_secs =
-        (age_seconds < 0) ? static_cast<std::uint64_t>(-age_seconds) : 0;
+        (age_seconds < 0) ? (0ULL - static_cast<std::uint64_t>(age_seconds)) : 0;
     return clock;
 }
 

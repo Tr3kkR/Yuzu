@@ -1374,6 +1374,10 @@ diagnostic fields — see "Diagnosing a stuck KEK op lock" below for what they'r
 for and how to use them. `live_versions` and `lock_held` are `null` (never a
 fabricated `0`/`false`) when the underlying query could not be determined; a
 `null` `lock_held` means the lock state is **unknown**, not "not held".
+`lock_held`/`lock_holder_pid` report the lock **in the server's own
+database** — the query is filtered by `current_database()`, not
+cluster-wide, so a same-named advisory lock held by an unrelated tenant
+database sharing the same Postgres instance never shows up here.
 
 ```bash
 # 1. Mint a new version and re-wrap every row under it.
@@ -1602,8 +1606,8 @@ for exactly this:
 | Field | Meaning |
 |---|---|
 | `live_versions` | Count of non-retired KEK versions. `null` if the count query could not be determined — never a fabricated `0`. |
-| `lock_held` | `true` iff `secrets_kek_op` currently has a granted holder. `null` if the holder query could not be determined — **never** a fabricated `false`; a `null` here means the lock state is UNKNOWN, not "not held". |
-| `lock_holder_pid` | That holder's Postgres backend pid; `null` if unheld **or** if `lock_held` itself is `null` (undetermined) — check `lock_held` to disambiguate the two. |
+| `lock_held` | `true` iff `secrets_kek_op` currently has a granted holder **in this server's own database** (the query is filtered by `current_database()`, not cluster-wide). `null` if the holder query could not be determined — **never** a fabricated `false`; a `null` here means the lock state is UNKNOWN, not "not held". |
+| `lock_holder_pid` | That holder's Postgres backend pid. **THREE possible states, not two — always read `lock_held` first to disambiguate a `null` pid:** (1) `lock_held: false` → `null`, genuinely unheld; (2) `lock_held: true` with a **non-null** pid → a normal held lock, corroborate it in `pg_stat_activity` (step 2 below); (3) `lock_held: true` with a **`null`** pid → HELD, but the holder's backend pid itself could not be read from `pg_locks` at query time — there is no pid to corroborate with, see step 1's third case below. `lock_held: null` (query itself failed) also reports `lock_holder_pid: null`, but that is a fourth, entirely separate "undetermined" case — do not conflate it with case (1) or (3). |
 
 **These are lock-free diagnostic snapshots, not one coordinated read.** Each
 is its own `SELECT`, taken at a possibly different instant from the others
@@ -1625,13 +1629,33 @@ deciding either way.
 **The procedure — follow it in order, do not skip a step:**
 
 1. **Identify the holder.** `GET /status`'s `lock_holder_pid` is the
-   Postgres backend pid currently holding `secrets_kek_op`. If `lock_held`
-   is `false`, there is nothing to diagnose here: a `409` you're separately
-   seeing is either a genuinely in-flight operation about to finish, or the
-   pid you captured earlier has already released and moved on. **If
-   `lock_held` is `null`, do not conclude "not held"** — the query itself
-   failed; go straight to `pg_stat_activity` (step 2) and check Postgres
-   substrate health before drawing any conclusion.
+   Postgres backend pid currently holding `secrets_kek_op` **in this
+   database**. Three cases, not two:
+   - `lock_held: false` — nothing to diagnose here: a `409` you're
+     separately seeing is either a genuinely in-flight operation about to
+     finish, or the pid you captured earlier has already released and
+     moved on.
+   - `lock_held: null` — **do not conclude "not held"**; the holder query
+     itself failed. Go straight to `pg_stat_activity` (step 2) and check
+     Postgres substrate health before drawing any conclusion.
+   - `lock_held: true` with `lock_holder_pid: null` — the lock **is** held,
+     but the holder's backend pid could not be read from `pg_locks` at
+     query time, so there is no pid to plug into step 2's `WHERE pid =
+     <lock_holder_pid>`. Instead, query `pg_locks` directly for any granted
+     holder of this lock in the current database and read whatever pid it
+     reports at that moment:
+     ```sql
+     SELECT pid FROM pg_locks
+      WHERE locktype = 'advisory' AND classid = 2037545589
+        AND objid = (hashtext('secrets_kek_op')::bigint & 4294967295)::oid
+        AND granted
+        AND database = (SELECT oid FROM pg_database WHERE datname = current_database());
+     ```
+     If that also returns a null/no pid, retry `/status` once (the pid
+     column can be transiently unreadable) before escalating to a DBA
+     inspection of `pg_stat_activity` for any session in this database
+     holding an advisory lock, since the affected session cannot be
+     targeted by pid alone.
 2. **Corroborate in `pg_stat_activity` — never act on the pid alone.**
    ```sql
    SELECT pid, state, wait_event_type, wait_event, query, query_start, xact_start
@@ -1739,10 +1763,12 @@ could hold that shared thread for a long multiple of a healthy pass.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_server_kek_op_lock_held` | gauge | `1` if `secrets_kek_op` currently has a granted holder, else `0`. |
-| `yuzu_server_kek_live_versions` | gauge | Count of non-retired KEK versions. Compare against `--kek-max-live-versions`. |
+| `yuzu_server_kek_op_lock_held` | gauge | `1` if `secrets_kek_op` currently has a granted holder **in this server's own database** (filtered by `current_database()`, not cluster-wide), else `0`. |
+| `yuzu_server_kek_live_versions` | gauge | Count of non-retired KEK versions. Compare against `yuzu_server_kek_max_live_versions`. |
 | `yuzu_server_kek_active_version` | gauge | The KEK version new secrets are currently encrypted under. |
+| `yuzu_server_kek_max_live_versions` | gauge | The configured `--kek-max-live-versions` ceiling (#2530 G8-S12). Unlike the three gauges above, this is a **static config value set once at boot**, not sampled from Postgres on the 15s sweep — it stays published even when the KEK substrate itself is never reachable. `yuzu_server_kek_live_versions / yuzu_server_kek_max_live_versions` is the ceiling-proximity ratio the `YuzuKekCeilingApproaching` alert (`docs/prometheus/yuzu-alerts.yml`) fires on at 0.8 — because there is no retire route (#2525), this ceiling is a lifetime cap, and without this alert the first signal is a `409 VersionCeiling` at the moment rotation is needed. |
 | `yuzu_server_kek_operations_total{op,outcome}` | counter | Rotate/rewrap/status attempts. `op` is one of `rotate`\|`rewrap`\|`status`; `outcome` is one of `success`, `conflict`, `cooldown`, `ceiling`, `query_canceled`, `clock_anomaly`, `half_committed`, `unavailable`, `internal`. Pre-seeded to 0 for every `{op,outcome}` combination at boot, so an outcome that has never fired reads as a true zero, not absent. |
+| `yuzu_server_kek_metrics_unavailable_total` | counter | KEK cluster-state reads that could not reach Postgres (pool acquire failure, statement_timeout, or the substrate never being wired up at all) — see "Diagnosing a stuck KEK op lock" and the `YuzuKekMetricsUnavailable` alert. Short-circuits after the first failed read within a sweep (#2530 G8-S2), so this is at most one increment per 15s sweep. |
 
 **`yuzu_server_kek_oldest_version_in_use` was RETIRED from this sampler
 (#2530 G7-B4)** — it was the one query here that is an UNBATCHED

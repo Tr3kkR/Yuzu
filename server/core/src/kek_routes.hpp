@@ -47,6 +47,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -124,8 +125,19 @@ struct KekOpResult {
     // held" — it means the lock state is UNKNOWN; corroborate via
     // `pg_stat_activity` before concluding anything.
     std::optional<std::uint32_t> live_versions{}; ///< status; live (non-retired) KEK version count; nullopt = could not be determined
-    std::optional<bool> lock_held{};      ///< status; true iff `secrets_kek_op` has a granted holder; nullopt = could not be determined (NEVER read as "not held")
-    std::optional<int> lock_holder_pid{}; ///< status; the holder's backend pid, nullopt if unheld OR undetermined (see `lock_held` to disambiguate)
+    std::optional<bool> lock_held{};      ///< status; true iff `secrets_kek_op` has a granted holder IN THIS DATABASE; nullopt = could not be determined (NEVER read as "not held")
+    // #2530 G8-F3: THREE states, not two — `nullopt` alone is ambiguous
+    // between "unheld" and "undetermined", and even a non-null `lock_held`
+    // does not imply a pid: (1) lock_held=false -> pid is always nullopt
+    // (nothing to report); (2) lock_held=true with pid SET -> a normal held
+    // lock, corroborate via `pg_stat_activity WHERE pid = <lock_holder_pid>`;
+    // (3) lock_held=true with pid nullopt -> HELD but the holder's backend
+    // pid could not be read from `pg_locks` (#2530 G7-S1) — there is no pid
+    // to corroborate with; fall back to inspecting `pg_locks`/
+    // `pg_stat_activity` for ANY backend holding classid 2037545589 in this
+    // database, since no single pid identifies it. Always check `lock_held`
+    // first to disambiguate which of the three states a null `pid` means.
+    std::optional<int> lock_holder_pid{};
 };
 
 /// The three operations. Any may be empty (unset) -> route answers 503.
@@ -134,6 +146,20 @@ struct KekOps {
     std::function<KekOpResult()> rewrap;
     std::function<KekOpResult()> status;
 };
+
+namespace detail {
+/// #2530 G8-F2 — test-only, externally-linked twin of this file's file-local
+/// audit-detail switch (kek_routes.cpp's `failure_tag()`). Exposed purely so
+/// a table-driven test can assert the REST, MCP (`mcp_server.cpp`'s
+/// `kek_failure_tag()`), and metrics (`kek_rotate_control.hpp`'s
+/// `kek_op_outcome_label()`) failure vocabularies agree for all nine
+/// `Failure` values — the mapping-lock #2284 says must exist. The three
+/// switches stay independent by design (see the #2530 hardening contract's
+/// "do not collapse into one shared table" scope note); this function only
+/// forwards to the existing production one so it is callable from a test
+/// binary that does not link kek_routes.cpp's whole route-registration path.
+[[nodiscard]] std::string_view kek_route_failure_tag(KekOpResult::Failure failure);
+} // namespace detail
 
 class KekRoutes {
 public:

@@ -1993,11 +1993,17 @@ KekFailureInfo kek_failure_info(const KekOpResult& result) {
 // detail vocabulary for the same failure classification. Rule B applies here
 // too: never a codec-internal error string, only this static tag.
 //
-// #2530 G7-B1: `None` is deliberately split from `Internal` (rather than
-// falling through together) so a future `Failure` enum addition trips
-// `-Wswitch` here even though `werror=false` only warns — the compiler still
-// flags it in the build log, and a reviewer catches it, instead of the new
-// value silently defaulting to "failure=internal" the way VersionCeiling/
+// #2530 G8-S5 (corrected — an earlier version of this comment, and the
+// commit message that landed it, wrongly credited splitting `None` from
+// `Internal` with keeping `-Wswitch` armed here; `-Wswitch` fires on ANY
+// unhandled enumerator with no `default:` label regardless of which
+// existing cases fall through together, so combining them would have been
+// just as safe). What actually arms the warning is enumerating every
+// `Failure` value explicitly and never adding a `default:` — that is what
+// makes a future `Failure` enum addition trip `-Wswitch` here even though
+// `werror=false` only warns — the compiler still flags it in the build log,
+// and a reviewer catches it, instead of the new value silently defaulting
+// to "failure=internal" the way VersionCeiling/
 // QueryCanceled/ClockAnomaly did before this fix.
 const char* kek_failure_tag(KekOpResult::Failure failure) {
     switch (failure) {
@@ -2106,6 +2112,12 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
 }
 
 } // namespace
+
+namespace detail {
+std::string_view kek_mcp_failure_tag(KekOpResult::Failure failure) {
+    return kek_failure_tag(failure);
+}
+} // namespace detail
 
 McpServer::HandlerFn McpServer::build_handler(
     AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,

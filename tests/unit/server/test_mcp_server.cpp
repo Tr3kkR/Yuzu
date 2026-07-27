@@ -5389,11 +5389,15 @@ TEST_CASE("MCP KEK: VersionCeiling/QueryCanceled/ClockAnomaly are no longer gene
         KekOpResult::Failure failure;
         const char* message_substr;
         const char* remediation_substr;
+        const char* audit_detail; // the exact kek_failure_tag() tag this failure must audit
     };
     const Case cases[] = {
-        {KekOpResult::Failure::VersionCeiling, "ceiling", "--kek-max-live-versions"},
-        {KekOpResult::Failure::QueryCanceled, "canceled", "statement_timeout"},
-        {KekOpResult::Failure::ClockAnomaly, "untrustworthy", "database server's clock"},
+        {KekOpResult::Failure::VersionCeiling, "ceiling", "--kek-max-live-versions",
+         "failure=ceiling"},
+        {KekOpResult::Failure::QueryCanceled, "canceled", "statement_timeout",
+         "failure=query_canceled"},
+        {KekOpResult::Failure::ClockAnomaly, "untrustworthy", "database server's clock",
+         "failure=clock_anomaly"},
     };
     for (const auto& c : cases) {
         INFO("failure=" << static_cast<int>(c.failure));
@@ -5419,12 +5423,25 @@ TEST_CASE("MCP KEK: VersionCeiling/QueryCanceled/ClockAnomaly are no longer gene
         // #2530 D: none of these three carries a retry hint — waiting alone
         // never resolves any of them.
         CHECK(body["error"]["data"]["retry_after_ms"].is_null());
-        // Audit-detail parity with REST's failure_tag (kek_routes.cpp) — the
-        // #2530 G7-B1 fix also split `None` from `Internal` in
-        // kek_failure_tag so THIS assertion, not a silent default, is what
-        // would catch a regression.
+        // #2530 G8-F2 (corrected — an earlier version of this test asserted
+        // only `ts.audit_log`, which records `action + "|" + result` and
+        // DISCARDS `detail` entirely; that assertion could count a
+        // "kek.rotate|failure" row but could never observe WHICH failure
+        // tag it carried, so a regression straight back to
+        // `kek_failure_tag`'s "failure=internal" fallback for
+        // VersionCeiling/QueryCanceled/ClockAnomaly — the exact bug this
+        // whole test exists to catch — passed green with this assertion in
+        // place). Assert the actual `detail` string against the LITERAL
+        // expected tag (not a call into the same production function under
+        // test, which would make this tautological), AND cross-check it
+        // against the exported production twin (mcp::detail::
+        // kek_mcp_failure_tag) so a change to the tag vocabulary shows up
+        // here as a deliberate double-update rather than a silent drift.
         CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                          std::string("kek.rotate|failure")) == 1);
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back() == c.audit_detail);
+        CHECK(ts.audit_details.back() == mcp::detail::kek_mcp_failure_tag(c.failure));
     }
 }
 

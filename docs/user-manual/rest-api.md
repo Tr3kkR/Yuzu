@@ -1621,9 +1621,13 @@ version).
 > **`live_versions`, `lock_held`, `lock_holder_pid` (#2530).** Diagnostic
 > fields for diagnosing a wedged `secrets_kek_op` lock — before these
 > existed, a stuck holder made every KEK operation `409` forever with no way
-> to see why. They are **lock-free snapshots read at possibly different
-> instants**, not one coordinated read — never derive a "safe to retire"
-> conclusion from any combination of them (#2525), and never treat
+> to see why. `lock_held`/`lock_holder_pid` report the lock **in this
+> server's own database** (the underlying query is filtered by
+> `current_database()`, not cluster-wide — a same-named advisory lock held
+> by an unrelated tenant database sharing the same Postgres instance is
+> never reported here). They are **lock-free snapshots read at possibly
+> different instants**, not one coordinated read — never derive a "safe to
+> retire" conclusion from any combination of them (#2525), and never treat
 > `lock_holder_pid` alone as sufficient grounds to terminate a backend: a
 > healthy long-running re-wrap looks identical to a wedge from this field
 > alone. The full diagnosis-and-remedy procedure (corroborate against
@@ -1636,9 +1640,19 @@ version).
 > negative. This matters most for `lock_held`: a `null` here **must never be
 > read as "no lock is held"** — it means the lock state is UNKNOWN.
 > Corroborate via `pg_stat_activity` before concluding anything, exactly as
-> you would for a genuinely-held lock. When `lock_held` is `null`,
-> `lock_holder_pid` is also `null` — check `lock_held` first to tell "unheld"
-> apart from "undetermined".
+> you would for a genuinely-held lock.
+>
+> **`lock_holder_pid` is `null` in THREE distinct situations — always check
+> `lock_held` first to tell them apart:** (1) `lock_held: false` → genuinely
+> unheld, nothing to report; (2) `lock_held: null` → undetermined, the
+> holder query itself failed, the pid is meaningless (not "unheld"); (3)
+> `lock_held: true` with `lock_holder_pid: null` → the lock **is** held, but
+> the holder's backend pid could not be read from `pg_locks` at query time —
+> there is no pid to corroborate against `pg_stat_activity`; instead query
+> `pg_locks` directly for any granted holder of `secrets_kek_op` in the
+> current database (see `docs/user-manual/server-admin.md`'s runbook for the
+> exact query) and, if it also comes back empty or unreadable, escalate to a
+> DBA inspection rather than waiting on a pid that may never arrive.
 
 > **No retire endpoint — by design.** Yuzu does not expose a way to destroy an
 > old KEK version, even though the codec's internal `retire_kek` exists and is

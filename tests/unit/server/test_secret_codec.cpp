@@ -1073,24 +1073,36 @@ TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_can
                             "LOCK TABLE secrets.kek_meta IN ACCESS EXCLUSIVE MODE")}
                 .ok());
 
-    // #2530 G7-B5: assert `cancel != nullptr` BEFORE spawning the worker
-    // thread below, and use `conn`'s own backend pid captured now (needed
-    // for the fallback-severing bound further down). Before this fix, the
-    // REQUIRE sat BETWEEN the (plain std::thread) worker's construction and
-    // its join() — a Catch2 REQUIRE throws, and std::thread's destructor
-    // calls std::terminate on a still-joinable thread, so a failed
-    // assertion here killed the WHOLE test shard with no diagnostic instead
-    // of one red assertion.
-    PGcancel* cancel = PQgetCancel(conn.get());
-    REQUIRE(cancel != nullptr);
+    // #2530 G8-S8: capture the backend pid BEFORE acquiring the PGcancel
+    // handle, not after. With the pid REQUIRE between PQgetCancel and
+    // PQfreeCancel, a failed REQUIRE here (pid <= 0) would throw and unwind
+    // past the still-open `cancel` with no PQfreeCancel ever reached —
+    // reordering means a failure here never opened a PGcancel to leak.
     const int conn_pid = PQbackendPID(conn.get());
     REQUIRE(conn_pid > 0);
+    PGcancel* cancel = PQgetCancel(conn.get());
+    REQUIRE(cancel != nullptr);
+
+    // #2530 G8-F1: open the forced-termination fallback connection BEFORE
+    // spawning the worker thread below, not inside the "still not done"
+    // branch after it. NO REQUIRE/CHECK may run between the jthread's
+    // construction and its join() while the worker can still be blocked
+    // under `blocker`'s ACCESS EXCLUSIVE lock: this helper's connect()
+    // (~L45) itself REQUIREs CONNECTION_OK, and a REQUIRE failing there
+    // would throw and start unwinding while the worker is still blocked.
+    // `~jthread` would then call `request_stop()` — a no-op, because the
+    // worker lambda below takes no `stop_token` — and `join()` would
+    // deadlock forever waiting on a worker that can never finish, because
+    // `blocker`'s ROLLBACK further down is never reached either. Opening
+    // `axe` here, before the worker exists, removes that REQUIRE from the
+    // window entirely.
+    PgConn axe = connect(db.dsn());
 
     std::expected<std::size_t, SecretCodec::LifecycleError> result;
     std::atomic<bool> done{false};
     // std::jthread, not std::thread: its destructor joins safely on unwind
     // (no std::terminate on a joinable thread) — belt-and-braces alongside
-    // moving the REQUIRE above the construction.
+    // keeping every REQUIRE/CHECK outside the construction-to-join window.
     std::jthread worker([&] {
         result = codec.live_kek_version_count(conn.get());
         done.store(true, std::memory_order_release);
@@ -1109,24 +1121,36 @@ TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_can
     // this test fast with a clear message instead of hanging until the CI
     // job's outer timeout kills it with none. The loop above already gives
     // PQcancel ~2s of retries; if the worker still has not observed
-    // completion, force it: sever `conn` from a second admin connection
-    // (mirrors test_kek_op_lock_holder.cpp's severing idiom) so the blocked
-    // query is guaranteed to error out one way or another.
+    // completion, force it: sever `conn` from the pre-opened `axe`
+    // connection (mirrors test_kek_op_lock_holder.cpp's severing idiom) so
+    // the blocked query is guaranteed to error out one way or another. No
+    // connect() call here — `axe` already exists (see above).
     if (!done.load(std::memory_order_acquire)) {
-        PgConn axe = connect(db.dsn());
         const std::string kill =
             "SELECT pg_terminate_backend(" + std::to_string(conn_pid) + ")";
         (void)PgResult{PQexec(axe.get(), kill.c_str())};
         for (int i = 0; i < 100 && !done.load(std::memory_order_acquire); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
-    worker.join();
+
     // Release the blocker's lock regardless of outcome — never leave a table
-    // lock held past this test.
+    // lock held past this test, even if the worker never landed.
     (void)PgResult{PQexec(blocker.get(), "ROLLBACK")};
 
-    INFO("worker completed within the bound: " << done.load(std::memory_order_acquire));
-    REQUIRE(done.load(std::memory_order_acquire));
+    // #2530 G8-S9: gate on `done` BEFORE join(), not only after. join()
+    // only returns once the worker has already stored `done=true` as its
+    // last act, so a REQUIRE(done) placed after an unconditional join() is
+    // vacuously true — it can never observe a cancellation/termination that
+    // failed to land, because the test would already be hung at join()
+    // instead of reaching that REQUIRE. FAIL loudly here instead, with the
+    // pid so a real wedge is diagnosable, before letting ~jthread's join()
+    // potentially block the rest of the shard.
+    if (!done.load(std::memory_order_acquire)) {
+        FAIL("worker did not observe cancellation or forced termination within "
+             "the bound (backend pid " +
+             std::to_string(conn_pid) + "); the connection is presumed wedged");
+    }
+    worker.join();
 
     REQUIRE(sent_cancel);
     REQUIRE_FALSE(result.has_value());

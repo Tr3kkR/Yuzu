@@ -425,7 +425,10 @@ groups:
 
       # ── #2530 KEK rotation-runaway hardening ────────────────────────────
       # yuzu_server_kek_op_lock_held is sampled every 15s off
-      # health_recompute_thread_ (server.cpp). A healthy long re-wrap and a
+      # health_recompute_thread_ (server.cpp), filtered to THIS server's own
+      # database (current_database()) -- not cluster-wide; a same-named
+      # advisory lock held by an unrelated tenant database on the same
+      # Postgres instance never sets this gauge. A healthy long re-wrap and a
       # genuinely wedged backend look IDENTICAL on this gauge alone — do NOT
       # page this as "kill the pid". Corroborate via lock_holder_pid
       # (GET /api/v1/secrets/kek/status) against pg_stat_activity before any
@@ -446,9 +449,10 @@ groups:
           summary: "secrets_kek_op advisory lock has been held for 30+ minutes"
           description: >-
             See "Diagnosing a stuck KEK op lock" in
-            docs/user-manual/server-admin.md before acting. A healthy,
-            long-running rewrap is indistinguishable from a wedged backend by
-            this gauge alone -- corroborate via lock_holder_pid
+            docs/user-manual/server-admin.md before acting. Scoped to this
+            server's own database (current_database()), not cluster-wide. A
+            healthy, long-running rewrap is indistinguishable from a wedged
+            backend by this gauge alone -- corroborate via lock_holder_pid
             (GET /api/v1/secrets/kek/status) against pg_stat_activity before
             concluding anything, and only a DBA should terminate a backend,
             deliberately. This gauge HOLDS its prior value rather than
@@ -471,18 +475,60 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "KEK cluster-state gauges may be frozen"
+          summary: "KEK cluster-state gauges may be frozen or absent"
           description: >-
-            yuzu_server_kek_metrics_unavailable_total is rising: the 15s
-            KEK-metrics sampling sweep (health_recompute_thread_) keeps
-            failing to acquire a pooled connection or hitting its bounded
-            statement_timeout, so yuzu_server_kek_op_lock_held /
-            yuzu_server_kek_live_versions are held at their last published
+            yuzu_server_kek_metrics_unavailable_total is rising. THREE
+            distinct causes, all counted here: (1) the 15s KEK-metrics
+            sampling sweep (health_recompute_thread_) failed to acquire a
+            pooled connection, or (2) hit its bounded statement_timeout mid
+            read -- in either case yuzu_server_kek_op_lock_held /
+            yuzu_server_kek_live_versions are HELD at their last published
             value and may read healthy during an actual outage or a
-            genuinely wedged secrets_kek_op lock. Investigate Postgres pool
-            saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds)
-            before trusting the KEK gauges above.
-          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock"
+            genuinely wedged secrets_kek_op lock; OR (3) the KEK substrate
+            itself (the secrets codec / Postgres pool) is not wired up at
+            all, in which case EVERY KEK gauge in this sweep -- including
+            yuzu_server_kek_active_version, which needs no DB round trip --
+            is never published and reads as ABSENT, not merely stale.
+            Distinguish (1)/(2) from (3) via yuzu_pg_pool_waiters /
+            yuzu_pg_acquire_wait_seconds and whether the KEK gauges exist in
+            /metrics at all; investigate Postgres pool saturation for (1)/(2)
+            before trusting the KEK gauges above, or server boot/config for
+            (3) if they are missing entirely.
+          # #2530 G8-S11: the heading is "Diagnosing a stuck KEK op lock
+          # (#2530)" — GitHub-slug anchoring strips the `(`/`)`/`#` but keeps
+          # the digits, so the real anchor carries a trailing `-2530` that a
+          # bare "...-lock" URL silently drops.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock-2530"
+
+      # #2530 G8-S12 — architect-requested: because #2525 makes retirement
+      # impossible, --kek-max-live-versions is a LIFETIME cap, not a rolling
+      # one, and without this alert the first signal an operator gets is a
+      # 409 VersionCeiling at the exact moment a rotation is needed. Alerts
+      # on the RATIO of live versions to the CONFIGURED ceiling (not a
+      # hardcoded 32) so it keeps working for an operator who has already
+      # exercised the #2530 B5 escape hatch and raised the flag. Both
+      # gauges HOLD their prior published value on a sampling degrade
+      # (see YuzuKekMetricsUnavailable above) — a stale ratio can under- or
+      # over-report during an outage; corroborate against
+      # yuzu_server_kek_metrics_unavailable_total before acting.
+      - alert: YuzuKekCeilingApproaching
+        expr: |
+          yuzu_server_kek_live_versions / yuzu_server_kek_max_live_versions > 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEK live-version count is approaching --kek-max-live-versions"
+          description: >-
+            yuzu_server_kek_live_versions has crossed 80% of
+            yuzu_server_kek_max_live_versions. There is no retire route
+            (#2525), so this trend does not self-correct: rotation will
+            start returning 409 VersionCeiling once the ceiling is reached.
+            Plan ahead of that point -- raising --kek-max-live-versions is a
+            deliberate, logged and audited risk acceptance (see
+            server.kek_ceiling_raised in the audit log), not something to do
+            reactively at the moment rotation is blocked.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock-2530"
 
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is

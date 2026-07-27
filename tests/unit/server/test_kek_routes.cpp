@@ -22,12 +22,15 @@
  */
 
 #include "kek_routes.hpp"
+#include "kek_rotate_control.hpp" // detail::kek_op_outcome_label — #2530 G8-F2 mapping-lock test
+#include "mcp_server.hpp"        // detail::kek_mcp_failure_tag — #2530 G8-F2 mapping-lock test
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server;
@@ -201,6 +204,102 @@ TEST_CASE("kek_routes: every KekOpResult::Failure maps to the documented HTTP st
         auto res = h.sink.Get("/api/v1/secrets/kek/status");
         REQUIRE(res);
         CHECK(res->status == c.expected_status);
+    }
+}
+
+// #2530 G8-F2: the audit `detail` threaded to audit_fn for a failing
+// rotate/rewrap must be EXACTLY failure_tag()'s tag, for every Failure — not
+// just "some non-empty string", which is all the pre-existing audit tests
+// above check. Compared against the exported failure_tag twin
+// (detail::kek_route_failure_tag) rather than a hand-copied literal, so a
+// change to the production switch can't silently drift from what this test
+// expects.
+TEST_CASE("kek_routes: the audited failure detail is exactly failure_tag()'s tag, for every "
+          "Failure",
+          "[kek_routes][security]") {
+    struct Case {
+        KekOpResult::Failure failure;
+        const char* audit_detail; // the exact failure_tag() literal this failure must audit
+    };
+    const Case cases[] = {
+        {KekOpResult::Failure::Unavailable, "failure=unavailable"},
+        {KekOpResult::Failure::Conflict, "failure=conflict"},
+        {KekOpResult::Failure::Cooldown, "failure=cooldown"},
+        {KekOpResult::Failure::VersionCeiling, "failure=ceiling"},
+        {KekOpResult::Failure::QueryCanceled, "failure=query_canceled"},
+        {KekOpResult::Failure::ClockAnomaly, "failure=clock_anomaly"},
+        {KekOpResult::Failure::HalfCommitted, "failure=half_committed"},
+        {KekOpResult::Failure::Internal, "failure=internal"},
+    };
+    for (const auto& c : cases) {
+        INFO("rotate, failure=" << static_cast<int>(c.failure));
+        Harness h;
+        h.rotate_result.failure = c.failure;
+        h.wire();
+        auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 1);
+        // Literal, so this can't be tautological against the same production
+        // function under test, PLUS a cross-check against the exported
+        // production twin so a deliberate vocabulary change surfaces as a
+        // double-update, not a silent drift.
+        CHECK(h.audits[0].detail == c.audit_detail);
+        CHECK(h.audits[0].detail == detail::kek_route_failure_tag(c.failure));
+    }
+    for (const auto& c : cases) {
+        INFO("rewrap, failure=" << static_cast<int>(c.failure));
+        Harness h;
+        h.rewrap_result.failure = c.failure;
+        h.wire();
+        auto res = h.sink.Post("/api/v1/secrets/kek/rewrap", "");
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].detail == c.audit_detail);
+        CHECK(h.audits[0].detail == detail::kek_route_failure_tag(c.failure));
+    }
+}
+
+// #2530 G8-F2 — the mapping-lock #2284 says must exist. Three independent
+// switches classify the same nine `KekOpResult::Failure` values into
+// operator-facing tags: kek_routes.cpp's failure_tag() (REST audit detail,
+// "failure=xxx"), mcp_server.cpp's kek_failure_tag() (MCP audit detail, same
+// "failure=xxx" shape), and kek_rotate_control.hpp's kek_op_outcome_label()
+// (the bare Prometheus label value, no "failure=" prefix, plus a tenth case
+// — None -> "success" — that the other two never see since routes only call
+// them on a non-None failure). This test is deliberately NOT a refactor to
+// one shared table (out of scope for #2530 — see the hardening contract);
+// it exists so the three switches drifting apart is a red CI run, not a
+// silent metrics/audit mismatch discovered during an incident.
+TEST_CASE("kek_routes: failure_tag/kek_failure_tag/kek_op_outcome_label agree for every "
+          "Failure",
+          "[kek_routes][mcp][security]") {
+    const KekOpResult::Failure failures[] = {
+        KekOpResult::Failure::Unavailable,   KekOpResult::Failure::Conflict,
+        KekOpResult::Failure::Cooldown,      KekOpResult::Failure::VersionCeiling,
+        KekOpResult::Failure::QueryCanceled, KekOpResult::Failure::ClockAnomaly,
+        KekOpResult::Failure::HalfCommitted, KekOpResult::Failure::Internal,
+        KekOpResult::Failure::None,
+    };
+    for (auto f : failures) {
+        INFO("failure=" << static_cast<int>(f));
+        const std::string_view rest_tag = detail::kek_route_failure_tag(f);
+        const std::string_view mcp_tag = mcp::detail::kek_mcp_failure_tag(f);
+        const std::string_view outcome = detail::kek_op_outcome_label(f);
+
+        // REST and MCP agree byte-for-byte, INCLUDING the case neither
+        // route ever actually calls this on (None) — failure_tag()/
+        // kek_failure_tag() both fall back to "failure=internal" there,
+        // and the two fallbacks must still agree.
+        CHECK(rest_tag == mcp_tag);
+
+        if (f == KekOpResult::Failure::None) {
+            CHECK(outcome == "success");
+            continue;
+        }
+        // outcome is the same token as the "failure=xxx" tag, minus the
+        // "failure=" prefix — e.g. "failure=ceiling" <-> "ceiling".
+        REQUIRE(rest_tag.starts_with("failure="));
+        CHECK(rest_tag.substr(std::string_view("failure=").size()) == outcome);
     }
 }
 

@@ -222,6 +222,12 @@ void write_failure(httplib::Response& res, const KekOpResult& result) {
 
 } // namespace
 
+namespace detail {
+std::string_view kek_route_failure_tag(KekOpResult::Failure failure) {
+    return failure_tag(failure);
+}
+} // namespace detail
+
 void KekRoutes::register_routes(httplib::Server& svr, PermFn perm_fn, AuditFn audit_fn, KekOps ops) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(perm_fn), std::move(audit_fn), std::move(ops));

@@ -62,9 +62,17 @@ PgConn connect(const std::string& dsn) {
 }
 
 /// The naive predicate from the #2530 contract, run directly (not via
-/// production code) so this test can independently confirm/deny it without
-/// depending on kek_op_lock.hpp's chosen implementation.
+/// production code). #2530 G8-S10 (corrected — an earlier version of this
+/// comment claimed this helper was independent of kek_op_lock.hpp's chosen
+/// implementation; that stopped being true the moment the `AND database =
+/// ...` filter below was added, per the G7-B3 note that follows). This
+/// helper is independent of production code on the ONE question it exists
+/// to cross-check — the objid cast/sign-conversion behaviour for
+/// `hashtext('secrets_kek_op')` — but it deliberately SHARES the database
+/// filter with `kek_op_lock.hpp`'s query, because without it this cross-check
+/// would only be valid in a single-database cluster (see the G7-B3 note).
 ///
+
 /// #2530 G7-B3: this now carries the SAME `AND database = ...` filter as the
 /// shipped query. Without it, this helper's "proven empirically" claim only
 /// held in a single-database cluster: `pg_locks` is a CLUSTER-WIDE view, and
