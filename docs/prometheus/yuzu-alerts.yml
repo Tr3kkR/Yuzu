@@ -953,10 +953,24 @@ groups:
       # Threshold assumes the default 60-minute cleanup interval: no pass in 3h
       # is unambiguously broken. A deployment that lengthens cleanup_interval_min
       # must widen this window; PromQL cannot read the server's own interval.
+      #
+      # THE YOUNG-SERVER GRACE MUST NOT EXCLUDE A CRASH LOOP. run_cleanup sleeps
+      # a full interval BEFORE its first pass, so a server that has genuinely
+      # just started has no pass yet and is not broken. But a server restarting
+      # more often than this window NEVER accumulates uptime past the grace, so a
+      # bare `uptime > 10800` (equivalently `unless uptime < 10800`) excluded the
+      # rule's own motivating case on every evaluation: a reaper that completes
+      # zero passes because the process keeps dying. `resets()` separates the
+      # two -- a genuinely young server has ONE uptime segment in the window, a
+      # crash-looper has several, and only the first is excused. `unless` rather
+      # than `and` so a missing uptime series cannot silence the rule either.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
-          and on(instance) yuzu_server_uptime_seconds > 10800
+          unless on(instance) (
+            yuzu_server_uptime_seconds < 10800
+            and resets(yuzu_server_uptime_seconds[3h]) == 0
+          )
         for: 15m
         labels:
           severity: warning
@@ -968,7 +982,10 @@ groups:
             other five retention COUNTERS cannot move in this state - they all key on a
             counter rising, and nothing is running to raise one. The
             uptime guard on this rule exists because run_cleanup sleeps BEFORE its first
-            pass, so a freshly started server legitimately has no pass for one interval.
+            pass, so a freshly started server legitimately has no pass for one interval;
+            it excuses only a server with ONE uptime segment in the window, so a
+            crash-looping process - which never accumulates uptime past the grace, and is
+            a leading cause of zero completed passes - still fires.
             Check the server log for
             "AuditStore: retention pass threw", confirm the store opened at boot
             (a failed migration closes it and start_cleanup() then early-returns), and

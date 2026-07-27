@@ -145,7 +145,12 @@ Check that the store opened at boot (a failed migration closes it, and
 `start_cleanup()` then early-returns), and look for `AuditStore: retention pass
 threw` in the log. The rule carries an uptime guard because the cleanup thread
 sleeps a full interval before its first pass, so a freshly started server
-legitimately has no pass yet.
+legitimately has no pass yet. That grace excuses only a server whose uptime has
+ONE segment across the alert window - a process restarting more often than the
+window never accumulates uptime past the grace, and a crash loop is a leading
+cause of zero completed passes, so it must not be excused. If the alert is firing
+on a young server, check whether it is actually restarting: `resets(
+yuzu_server_uptime_seconds[3h])`.
 
 > There is deliberately NO metric for a missing retention index. The index is
 > built best-effort outside the migration runner and its absence degrades

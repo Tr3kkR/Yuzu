@@ -1,0 +1,97 @@
+# Unit tests for docs/prometheus/yuzu-alerts.yml, run with promtool:
+#
+#   docker run --rm -v "$PWD":/w:ro --entrypoint /bin/promtool prom/prometheus:latest \
+#     test rules /w/yuzu-alerts.test.yml
+#
+# (from docs/prometheus/. Any promtool >= 2.x works; the container is only a way
+# to get one.)
+#
+# WHY THIS FILE EXISTS. An alert rule is code that runs in production and never
+# compiles. `promtool check rules` proves only that the PromQL parses -- a rule
+# that parses perfectly and can never fire for the case it was written for
+# passes it. That is not hypothetical: YuzuAuditRetentionNotRunning shipped with
+# an uptime guard that excluded a crash-looping server, which is one of the
+# leading causes of the exact condition the rule detects. Nothing caught it,
+# because there was nothing to catch it with.
+#
+# These tests are deliberately written to FAIL against the shipped-and-wrong
+# form. Before trusting a change here, mutate the rule and watch the relevant
+# case go red -- a green run on an untested rule proves nothing.
+rule_files:
+  - yuzu-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── YuzuAuditRetentionNotRunning ──────────────────────────────────────────
+  #
+  # The rule must fire when the reaper completes no passes, and must stay quiet
+  # for the one legitimate reason a server has no pass yet: it only just
+  # started, and run_cleanup sleeps a full interval before its first pass.
+
+  # CASE 1 -- the regression case. A server crash-looping every 30 minutes
+  # completes zero retention passes, and its uptime NEVER reaches the 3h grace,
+  # so a bare `uptime > 10800` (or `unless uptime < 10800`) excluded it on every
+  # evaluation. It must fire. This case is red against that form.
+  - interval: 1m
+    name: retention not running - crash loop is not excused by the young-server grace
+    input_series:
+      # 30-minute sawtooth: 60,120..1800 then back to 60, seven times (3h30m).
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x29 60+60x29 60+60x29 60+60x29 60+60x29 60+60x29 60+60x29"
+      # The reaper never completes a pass. Flat, and flat at 0 -- a restart
+      # resets it, so a crash-looper cannot accumulate one either.
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x209"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 2 -- the grace that must survive. A server on its FIRST boot, 55
+  # minutes in, legitimately has no pass yet (the cleanup thread sleeps 60m
+  # before its first). One uptime segment, no resets. It must stay quiet, or the
+  # fix for case 1 has simply traded one wrong answer for another.
+  - interval: 1m
+    name: retention not running - a genuinely young server is still excused
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x59"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x59"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 55m
+        exp_samples: []
+
+  # CASE 3 -- the rule's original purpose, pinned so the case-1 fix cannot
+  # regress it. A long-running server whose cleanup thread died: uptime well
+  # past the grace, pass counter frozen.
+  - interval: 1m
+    name: retention not running - a stopped reaper on a long-lived server fires
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "10860+60x239"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "5x239"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 4 -- the healthy state. Reaper running hourly on a long-lived server.
+  - interval: 1m
+    name: retention not running - a healthy reaper is quiet
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "10860+60x239"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "5+1x239"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h30m
+        exp_samples: []
