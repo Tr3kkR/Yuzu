@@ -622,8 +622,13 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // Quietly accepting one is how the step check gets disabled while every
         // counter reports healthy, which is why it declines either way.
         // Was the clock MOVED, materially, since the previous pass? Computed
-        // before the sanitiser resets the reading below, and symmetric with
-        // `big_step`: the same absolute floor, in either direction.
+        // before the sanitiser resets the reading below. NOT symmetric with
+        // `big_step`, in three ways that are each load-bearing: this test has no
+        // `window > 0` gate, it compares magnitude in either direction rather
+        // than forward elapsed time, and it is inclusive of the floor where
+        // `big_step` is strict. A movement of EXACTLY the floor is a
+        // `clock_event` and is not a `big_step`. Collapsing the two re-opens the
+        // class this guard exists to catch.
         //
         // The floor is the whole point. An earlier version treated ANY backward
         // reading as an event, with no magnitude test at all, while its forward

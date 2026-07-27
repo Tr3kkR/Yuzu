@@ -330,9 +330,12 @@ private:
     // An EVENT is a clock MOVEMENT, and it can only be observed at all because
     // the reading is re-anchored every pass: a second jump is a second incident,
     // never a continuation of the first, so it must report every time. Both
-    // directions count -- `Step` covers a forward jump, and `BadState` carries a
-    // backward one via `*prev > now`, which is why `cleanup_once` tests that
-    // carrier and not just the enum.
+    // directions count WHILE RETENTION IS ENABLED -- `Step` covers a forward
+    // jump, and `BadState` carries a backward one via `*prev > now`, which is
+    // why `cleanup_once` tests that carrier and not just the enum. With
+    // `audit_retention_days` at 0 the `Step` half is gated off entirely, so a
+    // forward jump is then seen only when it rides in on an unusable prior
+    // reading (dead CMOS, then NTP) and classifies as `BadState`.
     //
     // A DIFFERENT condition arriving mid-anomaly is still reported by the
     // inequality half. A single bool could express none of this.

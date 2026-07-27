@@ -377,19 +377,34 @@ refuses to act on that:
 **Conditions are reported once; clock movements are reported every time.** An
 all-expired table or a corrupt stored reading is a *condition* -- it persists
 until something changes, so it warns once and the backlog then drains at the
-capped rate. A clock jump is an *event*: the guard re-anchors its reading every
+capped rate, provided the underlying facts stay put (see the alternating-clock
+case below, where they do not). A clock jump is an *event*: the guard re-anchors its reading every
 pass, so a jump can only be detected if the clock moved since the last pass.
-Both directions count while retention is ENABLED, and both use the same 7-day
-floor: a movement of at least that much, forward or backward, warns on every
-recurrence. (With `audit_retention_days` set to 0 the forward detector is gated
-off and only backward movement is seen -- the directions are not symmetric in
-that configuration.) A qualifying movement so a clock
-stepping repeatedly produces one warning per step rather than one in total.
+Both directions count while retention is ENABLED, against a 7-day floor:
+backward movement of at least that much, and forward movement of more than that
+much, warn on every recurrence, so a clock stepping repeatedly produces one
+warning per step rather than one in total. (The forward comparison is strict and
+the backward one is not, so a movement of exactly 7 days warns backward but not
+forward.) With `audit_retention_days` set to 0 the forward detector is gated
+off, so a forward jump is then reported only when it arrives with an unusable
+prior reading -- the dead-CMOS-then-NTP case. The directions are not symmetric
+in that configuration.
 Movement BELOW the floor is treated as a condition, not an event -- it warns
 once and then lets the backlog drain. That floor is load-bearing: because a
 warning suppresses deletion for that pass, treating a one-second drift as an
 event would stop retention permanently on any server whose clock wobbles
 between two disagreeing time sources.
+
+That fixes the MONOTONE case, which is the common shape. It does NOT fix an
+ALTERNATING clock. If the reading flips either side of one value while a
+would-wipe condition stands, the fact set differs on every pass, the
+report-once rule never engages, and the drain starves for as long as the
+alternation lasts. That case is tracked, not fixed. It is loud rather than
+silent: `yuzu_server_audit_clock_anomaly_skips_total` rises on every halted
+pass, so `YuzuAuditRetentionClockAnomaly` stays continuously firing instead of
+clearing. **An anomaly alert that never clears is the signal for this state** --
+a flat `yuzu_server_audit_rows_deleted_total` on its own looks the same as a
+quiet, healthy store.
 
 **For a report-once anomaly, your log pipeline is the durable record, not the
 metric.** The alert rules fire on `increase()` over a rolling window, so once a
@@ -471,13 +486,13 @@ directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
-| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete, counted once per reported anomaly. Repeats of the same *condition* are not re-counted; clock *movements* over the 7-day floor are, in either direction. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. |
+| `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete, counted once per reported anomaly. Repeats of the same *condition* are not re-counted; qualifying clock *movements* are -- backward movement of at least 7 days always, forward movement of more than 7 days while retention is enabled. With `audit_retention_days` at 0 a forward jump is reported only when it arrives with an unusable prior reading. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. |
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
 | `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other five counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
-| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass ran; `0` if none has in this process. |
+| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if none has in this process. A pass refused for an implausible `now` counts as a pass but does not stamp this gauge, and a restart resets it to `0` for up to one cleanup interval even though the durable reading survives. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is

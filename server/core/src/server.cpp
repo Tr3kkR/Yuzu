@@ -1042,15 +1042,20 @@ public:
         // undeleted, so without the second an operator watching an audit table
         // that never shrinks would read a broken cleanup loop as a working guard.
         metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
-                          "Audit retention passes declined, counted once per reported anomaly (a "
-                          "repeat of the same condition is not re-counted; a repeated clock movement of "
-                          "at least 7 days is. Both directions count while retention is ENABLED; with "
-                          "it disabled only backward movement is detected). Triggers: the pass would have expired "
-                          "every datable row; the gap since the previous pass exceeded a fixed "
-                          "7 days (a forward clock jump OR an outage that long); or the stored "
-                          "reading was not usable - ahead of the clock, negative, present but "
-                          "not an integer, or unreadable. Reducing audit_retention_days can also cause a "
-                          "decline by design",
+                          "Audit retention passes declined, counted once per "
+                          "reported anomaly (a repeat of the same condition is not "
+                          "re-counted; a repeated clock movement of at least 7 days "
+                          "is. Both directions count while retention is ENABLED; "
+                          "with it disabled the forward detector is gated off, so a "
+                          "forward jump is then reported only when it arrives with "
+                          "an unusable prior reading - the dead-CMOS-then-NTP "
+                          "case). Triggers: the pass would have expired every "
+                          "datable row; the gap since the previous pass exceeded a "
+                          "fixed 7 days (a forward clock jump OR an outage that "
+                          "long); or the stored reading was not usable - ahead of "
+                          "the clock, negative, present but not an integer, or "
+                          "unreadable. Reducing audit_retention_days can also cause "
+                          "a decline by design",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that did not fully do their job: an unreadable "

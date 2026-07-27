@@ -13,10 +13,18 @@
   quietly accepted. Reporting distinguishes conditions from events: a repeat of the
   same CONDITION (an all-expired table, a corrupt stored reading) is not re-warned,
   so a legitimately all-expired store still ages out at the capped rate, while a
-  clock MOVEMENT of at least 7 days warns every time it recurs, in either direction,
-  because each jump is a separate incident. Smaller drift is treated as a condition
-  and warns once, so a clock wobbling between two disagreeing time sources cannot
-  halt retention by keeping the guard permanently in its declining state. Every accepted pass is capped at 25,000 rows oldest-first. Rows
+  qualifying clock MOVEMENT warns every time it recurs, because each jump is a
+  separate incident: backward movement of at least 7 days always, forward movement of
+  more than 7 days while retention is enabled (with `audit_retention_days` at 0 the
+  forward detector is gated off, and a forward jump is then reported only when it
+  arrives with an unusable prior reading). Smaller drift is treated as a condition and
+  warns once, so a clock drifting MONOTONICALLY between two disagreeing time sources
+  cannot halt retention by keeping the guard permanently in its declining state. A
+  clock ALTERNATING either side of one reading is NOT covered while a would-wipe
+  condition stands: the fact set then differs on every pass, so the report-once rule
+  never engages and the drain starves for as long as the alternation lasts. That case is tracked, not fixed, and it is loud rather than
+  silent -- the anomaly counter rises on every halted pass, so the alert stays
+  continuously firing instead of clearing. Every accepted pass is capped at 25,000 rows oldest-first. Rows
   whose TTL sits implausibly far in the future are excluded from the decision, so
   one forward-skewed row cannot disarm the guard. The cap is the half that always
   applies; the detectors are best effort, so this converts an instantaneous wipe

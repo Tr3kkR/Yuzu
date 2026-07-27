@@ -530,8 +530,11 @@ groups:
             unreadable). This is NOT
             exclusively a clock signal, and it is NOT one-warning-per-incident: a repeat of
             the same CONDITION (all-expired table, corrupt stored reading) is reported once,
-            while a repeated clock MOVEMENT of at least 7 days is reported every time, in
-            either direction, since each jump is a distinct event. A flapping clock source
+            while a qualifying clock MOVEMENT is reported every time, since each jump is a
+            distinct event: backward movement of at least 7 days always, forward movement of
+            more than 7 days while retention is ENABLED. With audit_retention_days at 0 the
+            forward detector is gated off, so a forward jump is then reported only when it
+            arrives with an unusable prior reading. A flapping clock source
             therefore produces one warning per step. Movement UNDER 7 days is a condition,
             reported once -- deliberately, because a warning suppresses that pass's delete,
             so treating small drift as an event would halt retention permanently. Also note REDUCING audit_retention_days narrows the survivor
@@ -541,10 +544,16 @@ groups:
             Elapsed time cannot distinguish a forward jump from an outage, so check BOTH the
             host's time synchronisation (restored snapshot, dead CMOS, hand-set date) and its
             uptime history before concluding the clock is at fault. Nothing was deleted on this
-            pass. Retention NORMALLY resumes on the next one, paced at the per-pass cap, but do
-            not assume it did: confirm yuzu_server_audit_rows_deleted_total is actually moving.
+            pass. Retention NORMALLY resumes within a pass or two, paced at the per-pass cap
+            (on an ALL-EXPIRED store a step decline costs two passes rather than one, because
+            the fact set still differs on the following pass; where the step alone was the
+            anomaly, the next pass drains), but do not assume it did: confirm
+            yuzu_server_audit_rows_deleted_total is actually moving.
             A clock alternating either side of one reading holds the guard in its declining
-            state indefinitely, and a flat rows_deleted is the only thing that shows it.
+            state indefinitely. THIS ALERT NOT CLEARING is the signal for that state, because
+            clock_anomaly_skips_total rises on every halted pass; a flat rows_deleted is the
+            confirmation, not the discriminator -- on its own it looks like a quiet, healthy
+            store.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The counterpart signal. Both a declined pass and a broken pass leave rows
