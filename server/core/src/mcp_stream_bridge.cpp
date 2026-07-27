@@ -519,7 +519,8 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
 }
 
 McpStreamBridge::CancelOutcome McpStreamBridge::request_cancel(const std::string& session_id,
-                                                               const nlohmann::json& jsonrpc_id) {
+                                                               const nlohmann::json& jsonrpc_id,
+                                                               std::string_view principal) {
     std::shared_ptr<BridgeRecord> rec;
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
@@ -587,7 +588,7 @@ McpStreamBridge::CancelOutcome McpStreamBridge::request_cancel(const std::string
     // it took effect.
     audit_contained("mcp.bridge.cancel", exec_id,
                     "detached the streamed response; the execution continues", {},
-                    AuditResult::kSuccess);
+                    AuditResult::kSuccess, principal);
     return CancelOutcome::kDetached;
 }
 
@@ -669,7 +670,8 @@ bool McpStreamBridge::abandon(const std::string& session_id, const nlohmann::jso
 }
 
 bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
-                                                  const nlohmann::json& jsonrpc_id) {
+                                                  const nlohmann::json& jsonrpc_id,
+                                                  std::string_view principal) {
     std::shared_ptr<BridgeRecord> rec;
     std::uint64_t parked_seq = 0;
     std::string exec_id;
@@ -711,7 +713,7 @@ bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
     audit_contained("mcp.bridge.dispatch_failure", exec_id,
                     "parked after a post-dispatch failure: the execution continues and its "
                     "result stays fetchable by execution_id",
-                    {}, AuditResult::kSuccess);
+                    {}, AuditResult::kSuccess, principal);
     return true;
 }
 
@@ -791,6 +793,22 @@ bool McpStreamBridge::on_final_written(const std::string& key) {
         return false;  // only a live streamed wire can have written a final
     }
     rec->final_written = true;
+    // UNPIN RULE (a), the streamed-POST half: "the final was written on the POST
+    // wire" (mcp_stream.hpp). This is the rung that makes that event exist, and
+    // until now nothing called unpin() at all - so a COMPLETED streamed call left
+    // its pin behind forever, admission counted it against
+    // kMaxStreamedPostsPerSession, and four successful calls locked a session out
+    // permanently while the 429 told the client to wait for calls that had already
+    // finished. Rule (b) (a GET resume acking past the id) only ever covered the
+    // resume case; a client that received its final on the POST wire never resumes.
+    //
+    // Safe precisely here: the pump calls this ONLY after write_all succeeded, so a
+    // dead peer returns kClientGone without reaching it and correctly keeps the pin
+    // for a resuming client. Lock order holds - BridgeRecord::mu is above
+    // McpStreamState::mu_.
+    if (rec->pinned_event_id != 0 && rec->stream) {
+        rec->stream->unpin(rec->pinned_event_id);
+    }
     return true;
 }
 
@@ -900,7 +918,16 @@ void McpStreamBridge::poke_post_sink(
         // SseSinkState::mu), so this nesting is the sanctioned direction; the
         // pump holds the sink mutex only to evaluate a predicate, never across
         // a write.
-        { std::lock_guard<std::mutex> slk(sink->mu); }
+        {
+            std::lock_guard<std::mutex> slk(sink->mu);
+            // SET something the pump's predicate READS. Taking the mutex alone is
+            // not a wake: the pump waits on a predicated wait_for, so a bare notify
+            // makes it re-evaluate, find nothing, and sleep out the rest of the
+            // tick. Without this flag the whole wake path - this function and
+            // bind_post_sink's handshake - is inert, and progress arrives on a
+            // fixed grid rather than as it happens.
+            sink->poked.store(true, std::memory_order_release);
+        }
         sink->cv.notify_one();
     } catch (...) {  // NOLINT(bugprone-empty-catch) - the pump's tick timeout is the backstop
     }
@@ -2165,7 +2192,7 @@ const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
 
 void McpStreamBridge::audit_contained(const char* action, const std::string& execution_id,
                                       std::string_view stage, std::string_view disposition,
-                                      AuditResult result) noexcept {
+                                      AuditResult result, std::string_view actor) noexcept {
     if (audit_) {
         // Every owned string the AuditFn signature needs - action from a const char*,
         // and the joined detail from the two views - is constructed HERE, inside the
@@ -2176,7 +2203,7 @@ void McpStreamBridge::audit_contained(const char* action, const std::string& exe
                 detail += "; ";
             }
             detail.append(disposition);
-            audit_(action, execution_id, std::move(detail), result);
+            audit_(action, execution_id, std::move(detail), result, std::string(actor));
         });
     }
 }

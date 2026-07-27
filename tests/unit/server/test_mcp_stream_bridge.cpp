@@ -26,6 +26,7 @@
 
 #include <algorithm>  // std::find over the closed cancel-outcome label set
 #include <atomic>
+#include <condition_variable>
 #include <set>
 #include <chrono>
 #include <future>
@@ -154,6 +155,7 @@ struct Fx {
         std::string action;
         std::string detail;
         std::string result;
+        std::string actor;  ///< empty = the bridge's own background work ("system")
     };
     std::vector<AuditRow> audits;
     std::optional<Bridge> bridge;                             // optional: dtor-order tests
@@ -167,12 +169,14 @@ struct Fx {
         bridge.emplace(&bus, &sessions, &reg,
                        [this](const std::string& action, const std::string&,
                               const std::string& detail,
-                              mcp::McpStreamBridge::AuditResult result) {
+                              mcp::McpStreamBridge::AuditResult result,
+                              const std::string& actor) {
                            std::lock_guard<std::mutex> lk(audit_mu);
                            audits.push_back(
                                {action, detail,
                                 result == mcp::McpStreamBridge::AuditResult::kFailure ? "failure"
-                                                                                      : "success"});
+                                                                                      : "success",
+                                actor});
                        },
                        cfg);
     }
@@ -1988,6 +1992,62 @@ mcp::McpPostPump::Config fast_post_cfg() {
     return cfg;
 }
 
+/// A `WriteFn` that can be made to BLOCK mid-write, which is the whole point.
+///
+/// The in-process handler fixture never runs a content provider (no socket, #438),
+/// so until this existed nothing anywhere exercised the pump CONCURRENTLY with the
+/// projector, the sweep, or a cancel. That gap is not incidental - it is the reason
+/// a held-lock-across-socket-write, an inert wake channel and an incomplete
+/// close-window fix all survived TSan-clean-3x, three adversarial review rounds and
+/// 89k assertions (governance 2026-07-27, Gate 5). A harness that cannot block the
+/// writer re-verifies a fix with the same instrument that missed the bug.
+struct BlockingWire {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::string out;
+    bool blocked = false;   ///< writer parks until released
+    bool in_write = false;  ///< a writer is parked right now
+    bool alive = true;
+
+    mcp::McpPostPump::WriteFn writer() {
+        return [this](const char* p, std::size_t n) {
+            std::unique_lock<std::mutex> lk(mu);
+            if (blocked) {
+                in_write = true;
+                cv.notify_all();
+                cv.wait(lk, [this] { return !blocked; });
+                in_write = false;
+            }
+            if (!alive) {
+                return false;
+            }
+            out.append(p, n);
+            return true;
+        };
+    }
+    void block() {
+        std::lock_guard<std::mutex> lk(mu);
+        blocked = true;
+    }
+    /// Waits until a writer is actually parked inside the write - the handshake
+    /// that makes "the peer stopped reading" deterministic instead of timing-based.
+    bool await_parked(std::chrono::milliseconds d = std::chrono::seconds(5)) {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, d, [this] { return in_write; });
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            blocked = false;
+        }
+        cv.notify_all();
+    }
+    std::string snapshot() {
+        std::lock_guard<std::mutex> lk(mu);
+        return out;
+    }
+};
+
 }  // namespace
 
 TEST_CASE("McpPostPump: progress frames, then the final LAST, then EOF (C7)",
@@ -2869,4 +2929,157 @@ TEST_CASE("CH-12: cancel mid-execution detaches the response but never the execu
     fx.bus.publish("exec-ch12", "execution-completed", kCompleted);
     REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
     CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);
+}
+
+// ── Governance 2026-07-27 Gate 3/4 blockers: the concurrency set (CH-14) ──────
+
+TEST_CASE("CH-14: a stalled socket write must never block a publisher",
+          "[mcp][bridge][2f][chaos][ch14]") {
+    // safe-B1, asserted at its ROOT LINK. `finish()` writes the close frame to the
+    // socket; if that runs while the pump still holds `sink_->mu`, every other
+    // thread that needs that sink blocks for as long as the peer refuses to read
+    // (bounded only by the 30s socket write timeout in production).
+    //
+    // The downstream cascade is what makes it a bridge-wide outage - the
+    // projector's poke_post_sink wants sink-mu WHILE HOLDING rec-mu, the sweep then
+    // wants rec-mu WHILE HOLDING bridge_mu_, and reserve() on any other session
+    // queues behind that. Every link is in the sanctioned lock order, which is why
+    // TSan sees no cycle. This test pins the root link deterministically rather
+    // than racing the projector and sweep into position: fix the root and the
+    // cascade cannot form.
+    //
+    // The GET pump has always unlocked before finish, with the comment "a stalled
+    // socket write must never block a publisher". The POST pump did not.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch14"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {}, nullptr,
+        "cid-ch14", "exec-ch14");
+    BlockingWire wire;
+    wire.block();
+
+    // Cancel, so the pump wakes and enters finish(kCancelled); the peer then
+    // refuses to read, parking the pump inside the close-frame write.
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kDetached);
+    auto pumping = std::async(std::launch::async, [&] { return pump.pump_once(wire.writer()); });
+    REQUIRE(wire.await_parked());
+
+    // A retried cancel is ordinary client behaviour (the bridge says so itself),
+    // and it needs rec-mu then sink-mu. It must not wait on a stranger's socket.
+    auto second = std::async(std::launch::async,
+                             [&] { return fx.bridge->request_cancel(s.id, json(1)); });
+    const bool completed = second.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    CHECK(completed);  // pre-fix: still parked behind the blocked write
+
+    wire.release();
+    if (completed) {
+        CHECK(second.get() == Bridge::CancelOutcome::kNoOp);  // exactly-once holds
+    } else {
+        second.wait();  // do not leave the future dangling into teardown
+    }
+    CHECK_FALSE(pumping.get());  // the provider ended
+}
+
+TEST_CASE("CH-16: progress reaches the wire on publication, not on the tick",
+          "[mcp][bridge][2f][chaos][ch16]") {
+    // UP-1. The rung's headline claim is progress-before-the-response, delivered as
+    // it happens. The pump waits on a PREDICATED wait_for, so a bare notify_one
+    // re-evaluates the predicate and keeps sleeping; unless the predicate can see
+    // that the BRIDGE has work, the projector's wake-forwarding and bind_post_sink's
+    // handshake are both dead code and progress arrives on a fixed tick grid.
+    //
+    // A deliberately huge tick makes that unambiguous: if the only thing that can
+    // wake this pump is the timeout, the test waits 30s and fails. It also explains
+    // why C7's mutant 8 survived - removing the sink-mutex acquisition from an inert
+    // function changes nothing, and that was mistaken for a timing subtlety.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch16"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump::Config slow{};
+    slow.tick = std::chrono::seconds(30);  // only a real wake can beat this
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, slow, {}, nullptr, "cid-ch16",
+        "exec-ch16");
+    PostWire wire;
+
+    std::atomic<bool> about_to_pump{false};
+    auto pumping = std::async(std::launch::async, [&] {
+        about_to_pump.store(true, std::memory_order_release);
+        return pump.pump_once(wire.writer());  // parks in wait_for
+    });
+    while (!about_to_pump.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    fx.bus.publish("exec-ch16", "execution-progress", prog(1, 3));
+    pumping.wait();  // returns only when the pump actually wakes
+    const auto waited = std::chrono::steady_clock::now() - t0;
+
+    CHECK(wire.contains("notifications/progress"));
+    // Well under the tick: proves a publication woke it, not the timeout.
+    CHECK(waited < std::chrono::seconds(5));
+}
+
+TEST_CASE("CH-15: pin slots are a concurrency limit, never a lifetime quota",
+          "[mcp][bridge][2f][chaos][ch15]") {
+    // arch-A1 / UP-2. `mcp_stream.hpp` documents TWO unpin rules: (b) a GET resume
+    // whose cursor passed the final, and (a) "the final was written on the POST
+    // wire" - which is THIS rung's job and was never wired, so `unpin()` had zero
+    // callers. Admission counts `pinned_count() + streamed_unpinned_`, so four
+    // SUCCESSFUL streamed calls exhausted a session forever, answering 429 with
+    // remediation telling the client to wait for calls that had already finished.
+    //
+    // No fault injection: pure sequencing. That is why it is cheap to test and why
+    // it was missed - the existing pin-slot test drove the CHARGE path (parked
+    // records, no finals published) where pinned_count() is always 0.
+    Fx fx;
+    auto s = fx.make_session();
+
+    for (int i = 1; i <= 12; ++i) {  // 3x the cap, sequentially
+        const std::string exec = "exec-ch15-" + std::to_string(i);
+        auto rr = fx.bridge->reserve(s.id, "alice", json(i), json("t"), true);
+        INFO("sequential completed streamed call #" << i
+             << " reject=" << (rr.reject_reason == nullptr ? "" : rr.reject_reason));
+        REQUIRE(rr.ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+        auto key = fx.bridge->bind_post_sink(s.id, json(i), sink);
+        REQUIRE(key.has_value());
+
+        mcp::McpPostPump pump(
+            sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+            [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {},
+            nullptr, "cid-ch15", exec);
+        PostWire wire;
+
+        // Complete it properly: terminal published, final written to the wire, then
+        // the response closes exactly as the releaser would.
+        fx.bus.publish(exec, "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));
+        REQUIRE(wire.contains(R"("result")"));
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+
+        // The pin for a final the client has ALREADY received must not linger.
+        CHECK(s.stream->pinned_count() == 0);
+    }
 }

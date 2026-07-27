@@ -14364,13 +14364,19 @@ private:
                     execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
                     [this](const std::string& action, const std::string& execution_id,
                            const std::string& detail,
-                           mcp::McpStreamBridge::AuditResult result) {
+                           mcp::McpStreamBridge::AuditResult result,
+                           const std::string& actor) {
                         if (audit_store_ && audit_store_->is_open()) {
                             AuditEvent ev;
                             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                                std::chrono::system_clock::now().time_since_epoch())
                                                .count();
-                            ev.principal = "system";
+                            // EMPTY actor = the bridge's own background work (sweep/projector).
+                            // A non-empty one is an authenticated client whose action
+                            // produced this row - stamping those "system" would make a
+                            // client-driven cancel indistinguishable from housekeeping
+                            // and defeat Decision 15(j) non-repudiation.
+                            ev.principal = actor.empty() ? std::string("system") : actor;
                             ev.action = action;
                             ev.target_type = "Execution";
                             ev.target_id = execution_id;

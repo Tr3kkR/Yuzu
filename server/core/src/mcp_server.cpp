@@ -2329,8 +2329,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     McpStreamBridge::CancelOutcome outcome =
                         McpStreamBridge::CancelOutcome::kNoOp;
                     try {
+                        // The authenticated caller, so a streamed detach is
+                        // attributable to the client that asked for it rather than
+                        // to "system" (Decision 15(j) non-repudiation).
                         outcome = stream_bridge_->request_cancel(cancel_sid,
-                                                                 rpc.params["requestId"]);
+                                                                 rpc.params["requestId"],
+                                                                 session->username);
                     } catch (...) { // NOLINT(bugprone-empty-catch)
                         // A cancel we could not record must not fail the
                         // notification: the client is owed 202 either way, and the
@@ -2927,6 +2931,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     // json_quoted_string returns a fully-quoted, escaped JSON string.
                     data += json_quoted_string(remediation);
                 }
+                data += "}";
+                return error_response(id, code, message, data);
+            };
+
+            // A4 envelope that also carries the durable execution handle. Used by
+            // the two streamed-POST 500s, which are the only refusals raised AFTER
+            // dispatch - the work is running, so the client needs the id to find it
+            // rather than retry a mutating fleet command blind (Decision 15(g)).
+            auto a4_error_exec = [&id](int code, std::string_view message,
+                                       std::string_view remediation,
+                                       const std::string& execution_id) {
+                const std::string cid = yuzu::server::detail::make_correlation_id();
+                std::string data = R"({"correlation_id":")" + cid +
+                                   R"(","retry_after_ms":null,"execution_id":)" +
+                                   (execution_id.empty() ? std::string("null")
+                                                         : json_quoted_string(execution_id)) +
+                                   R"(,"remediation":)";
+                data += remediation.empty() ? std::string("null")
+                                            : json_quoted_string(remediation);
                 data += "}";
                 return error_response(id, code, message, data);
             };
@@ -6448,14 +6471,31 @@ McpServer::HandlerFn McpServer::build_handler(
                                 }
                                 stream_lease.reset();
                                 bridge_degrade("stream_install_failed");
+                                // A durable row, not just a counter. The command IS
+                                // dispatched and running, and `on_post_closed_keyed`
+                                // is a bare state transition that audits nothing - so
+                                // without this a mutating fleet command could fail
+                                // here and leave no evidence beyond an anonymous
+                                // metric. Its sibling 500 (post_dispatch_threw) has
+                                // always audited via park_after_dispatch_failure;
+                                // the two must be evidence-equivalent.
+                                mcp_audit("failure",
+                                          std::string("stream_install_failed execution_id=") +
+                                              execution_id + " command_id=" + command_id);
                                 res.status = 500;
+                                // The remediation names execution_id, so the body must
+                                // CARRY it - a 500 on a MUTATING fleet command that is
+                                // still running is exactly the case where "go look it
+                                // up" is useless without the handle, and a client that
+                                // cannot locate the work retries it (governance UP-3;
+                                // the C8 commit message claimed this already worked).
                                 res.set_content(
-                                    a4_error(kInternalError,
-                                             "streamed response could not be established",
-                                             "the command IS running - fetch the result by "
-                                             "execution_id (get_execution_status), or retry "
-                                             "without an SSE Accept",
-                                             -1),
+                                    a4_error_exec(kInternalError,
+                                                  "streamed response could not be established",
+                                                  "the command IS running - fetch the result by "
+                                                  "execution_id (get_execution_status), or retry "
+                                                  "without an SSE Accept",
+                                                  execution_id),
                                     "application/json");
                                 return;
                             }
@@ -6533,18 +6573,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     // NOT mark_cancelled - unlike the dispatch-throw and zero-agents
                     // paths above, this command was dispatched and is still going.
                     try {
-                        (void)bridge->park_after_dispatch_failure(bridge_sid, id);
+                        (void)bridge->park_after_dispatch_failure(bridge_sid, id,
+                                                                  session->username);
                     } catch (...) { // NOLINT(bugprone-empty-catch)
                     }
                     stream_lease.reset();
                     bridge_degrade("post_dispatch_threw");
                     res.status = 500;
                     res.set_content(
-                        a4_error(kInternalError, "the command was dispatched but the response "
-                                                 "could not be completed",
-                                 "the command IS running - fetch the result by execution_id "
-                                 "(get_execution_status)",
-                                 -1),
+                        a4_error_exec(kInternalError,
+                                      "the command was dispatched but the response could not be "
+                                      "completed",
+                                      "the command IS running - fetch the result by execution_id "
+                                      "(get_execution_status)",
+                                      execution_id),
                         "application/json");
                     return;
                 }
