@@ -2119,6 +2119,47 @@ TEST_CASE("AuditStore #2360: an arriving would-wipe is not swallowed by a standi
     CHECK(f.store.clock_anomaly_skips_count() == 2); // the wipe must be REPORTED
 }
 
+TEST_CASE("AuditStore #2360: a would-wipe arriving after an implausible-reading decline",
+          "[audit_store][retention][clock-guard]") {
+    // The sibling test above pins the dead-CMOS-then-NTP ordering. This pins the
+    // BACKWARD-then-FORWARD ordering: a different route to the same swallowed
+    // wipe, and the one that survives a latch-based guard which short-circuits
+    // on `!has_expired` (such a guard never latches on an empty store, so it
+    // passes the sibling and fails here).
+    //
+    // MEASURED against the implementation that shipped before this hardening:
+    // pass 2 returned 6 deleted with the skip counter still at 1, emitting only
+    // the routine "expired N rows" info line -- no decline, no warning, no
+    // counter for an anomaly the guard exists to report.
+    //
+    // Scope it honestly. The table emptied because the fixture holds six rows; a
+    // real pass is bounded by the 25,000-row cap, and this guard is
+    // decline-once-then-drain by design, so a CORRECT latch deletes the same
+    // rows one interval later anyway. What the defect destroys is the guard's
+    // value for THAT anomaly: the warning, the counter, and the one interval in
+    // which an operator could correct the clock -- after which expiry
+    // re-evaluates against the corrected reading and nothing is deleted at all.
+    GuardFixture f;
+    REQUIRE(f.store.cleanup_once(kNow) == 0); // anchor the reading at kNow
+
+    // Pass 1: the clock reads BEFORE the anchor, so the stored reading is ahead
+    // of now. Expired rows plus a datable survivor, so the decline is
+    // attributable to the unusable reading rather than to a wipe.
+    const std::int64_t backward = kNow - 10 * 86400;
+    f.seed(backward - 100, 5);
+    f.seed(backward + 3600, 1);
+    REQUIRE(f.store.cleanup_once(backward) == 0);
+    REQUIRE(f.store.clock_anomaly_skips_count() == 1);
+
+    // Pass 2: a forward jump far past the window. Every row is expired and no
+    // survivor remains, so a NEW would-wipe arrives underneath the
+    // already-reported condition. It must be reported, not swallowed.
+    const std::int64_t forward = kNow + 30 * 86400;
+    CHECK(f.store.cleanup_once(forward) == 0);
+    CHECK(f.store.total_count() == 6); // nothing deleted
+    CHECK(f.store.clock_anomaly_skips_count() == 2);
+}
+
 TEST_CASE("AuditStore #2360: a sub-threshold backward drift must not halt retention forever",
           "[audit_store][retention][clock-guard]") {
     // BLOCKING, found by unhappy-path. A REGRESSION introduced by 0407082b.
