@@ -900,6 +900,16 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **Verify time sync BEFORE upgrading a server whose clock may be wrong.** The
+  anchor row is new in schema v3, so every database has none on its first guarded
+  pass. An absent reading is not itself a decline trigger: it is the ordinary
+  fresh-install case. That leaves one shape unguarded on the first pass only - a
+  host whose clock is ALREADY skewed forward, where rows written after the skew
+  are still inside the retention window, so the would-expire-everything test does
+  not fire either. Such a pass deletes up to the 25,000-row cap with **no
+  decline, no counter and no warning**. Every later pass is guarded normally,
+  because the first one persists the anchor. If you cannot verify the clock,
+  snapshot `audit.db` before the upgrade. Tracked in #2579.
 - **Expect a first-pass retention decline on the AGENT, and only conditionally on
   the server.** The two guards differ here and the difference matters:
   - **TAR declines on a missing anchor, by design.** It checks per warehouse

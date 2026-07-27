@@ -490,6 +490,13 @@ fix --- not hand-deletion.
 - Detection is best-effort; the cap is the half that always applies. It bounds any
   allowed wipe to 25,000 rows per pass unconditionally, whether or not a detector
   fired --- an instantaneous wipe becomes a paced one plus an operator signal.
+- **The FIRST pass against a database with no stored reading is the weakest one.**
+  An absent reading is the ordinary fresh-install case and is not a trigger on its
+  own, so on that pass the guard rests entirely on the would-expire-everything
+  test. A host already skewed forward, whose post-skew rows are still inside the
+  window, satisfies neither test and deletes to the cap unreported. Every later
+  pass is guarded normally, because the first persists the anchor. Upgrade
+  guidance: [upgrading.md](upgrading.md). Tracked in #2579.
 - Changing `--audit-retention-days` does not re-date existing rows.
   `ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
   expires nothing retroactively and reclaims no disk.
