@@ -1258,6 +1258,14 @@ bool McpPostPump::finish(const WriteFn& write, McpStreamClose reason) {
     // First-wins, because the first reason is the true cause; a later one is a
     // consequence of it.
     note_close_reason(reason);
+    // Publish liveness HERE, not after pump_once returns. The bridge's cancel
+    // interlock reads this flag, and the interval between "finish decided" and
+    // "flag set" contains the close-frame build AND its socket write - so a cancel
+    // landing in it would win the exchange and audit "detached the streamed
+    // response" for a response that actually ended completed/cap_expired/
+    // credential_revoked. Doing this any earlier than B1's unlock above would
+    // self-deadlock on the non-recursive sink mutex in the kCancelled path.
+    mark_sink_closed();
     count_stream_close(metrics_, reason);
     // kCompleted EOFs after a real final: a close frame there would be a second,
     // contradictory terminal on a stream that already answered. Same rule the GET
@@ -1356,8 +1364,25 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         // The queue is NOT a source of frames here - the bridge is - but `closed`
         // and the projector's poke both arrive through this mutex, so this is the
         // wait. The timeout is also the backstop for a poke that raced the wait.
-        sink_->cv.wait_for(lk, cfg_.tick, [this] { return sink_->closed.load(); });
+        sink_->cv.wait_for(lk, cfg_.tick, [this] {
+            return sink_->closed.load() || sink_->poked.load(std::memory_order_acquire);
+        });
+        // Consumed under the same lock that set it, so a poke arriving during this
+        // tick is not lost - it simply wakes the next wait immediately.
+        sink_->poked.store(false, std::memory_order_release);
         if (sink_->closed.load()) {
+            // UNLOCK FIRST. finish() writes the close frame to the socket, bounded
+            // only by the server's write timeout, and takes the metrics mutex on the
+            // way. Holding sink-mu across that stalls every other thread that needs
+            // this sink - and because the projector's poke takes sink-mu while
+            // holding rec-mu, and the sweep takes rec-mu while holding bridge_mu_,
+            // one peer that stops reading becomes a bridge-wide outage. Every link
+            // is in the sanctioned lock order, so TSan never sees a cycle.
+            //
+            // NOTHING that writes, allocates, or takes another mutex may run under
+            // sink_->mu. The GET pump has always obeyed this ("a stalled socket
+            // write must never block a publisher"); this one did not until now.
+            lk.unlock();
             return finish(write, McpStreamClose::kCancelled);
         }
     }

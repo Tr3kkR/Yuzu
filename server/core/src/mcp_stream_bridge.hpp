@@ -254,8 +254,17 @@ public:
     /// including rows whose detail says the teardown did not complete or that
     /// nothing was published (#2487 review). An audit row is a compliance artifact;
     /// it must not assert an outcome that did not happen.
+    /// `actor` is the principal whose action produced the row, or EMPTY for the
+    /// bridge's own background work (sweeps, the projector), which the sink stamps
+    /// as "system". That distinction is the whole point: this range added rows
+    /// driven directly by an authenticated client (a streamed cancel, a
+    /// post-dispatch park), and auditing those as "system" makes them
+    /// indistinguishable from internal housekeeping - an investigator could not tell
+    /// WHICH client cancelled a live response, which is precisely the
+    /// non-repudiation Decision 15(j) and chaos CH-12 require.
     using AuditFn = std::function<void(const std::string& action, const std::string& execution_id,
-                                       const std::string& detail, AuditResult result)>;
+                                       const std::string& detail, AuditResult result,
+                                       const std::string& actor)>;
 
     /// Phases - see the lifecycle diagram above.
     enum class Phase : int { kArming, kStreaming, kArmedGetOnly, kRingOnly, kDone, kAborted };
@@ -406,7 +415,11 @@ public:
     /// NEVER touches the execution. Cancellation withdraws the client's interest in
     /// a RESPONSE; the dispatched command keeps running and its result stays
     /// fetchable by execution_id. (Decision 15(j); chaos CH-12.)
-    CancelOutcome request_cancel(const std::string& session_id, const nlohmann::json& jsonrpc_id);
+    /// `principal` is the authenticated caller, recorded on the audit row when this
+    /// detaches a live streamed response. Empty is accepted (tests, internal
+    /// callers) and audits as "system".
+    CancelOutcome request_cancel(const std::string& session_id, const nlohmann::json& jsonrpc_id,
+                                 std::string_view principal = {});
 
     /// Pre-dispatch failure unwind: kArming → kAborted, unsubscribe (waits out
     /// in-flight listeners), discard mailbox, release charge, erase. The caller
@@ -493,7 +506,8 @@ public:
     /// Deliberately does NOT set torn_down: that flag means "permanently excluded
     /// from reclaim", and a park is a transition, not a teardown.
     bool park_after_dispatch_failure(const std::string& session_id,
-                                     const nlohmann::json& jsonrpc_id);
+                                     const nlohmann::json& jsonrpc_id,
+                                     std::string_view principal = {});
 
     /// Reap + enforce (server tick wiring is 3a.7; public for tests):
     ///   0. kDone records → unsubscribe/unpin-bookkeeping/erase.
@@ -877,7 +891,8 @@ private:
     /// joined INSIDE the guard, so the join's allocation stays contained (#2487).
     void audit_contained(const char* action, const std::string& execution_id,
                          std::string_view stage, std::string_view disposition,
-                         AuditResult result = AuditResult::kSuccess) noexcept;
+                         AuditResult result = AuditResult::kSuccess,
+                         std::string_view actor = {}) noexcept;
 
     /// The ONE derivation of "what happened to the terminal", shared by every
     /// teardown bail site. Returns a static literal; never allocates.
