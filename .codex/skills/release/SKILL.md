@@ -52,7 +52,7 @@ Preflight checks:
 3. CHANGELOG has a `## [X.Y.Z]` section with non-empty content
 4. Working tree is clean
 5. `Dockerfile.server` includes `--data-dir`
-6. All `actions/cache@v*` steps in release.yml have `save-always: true`
+6. Release caches are restore-only: no bare `actions/cache@` and no `save-always`
 7. `docker-compose.full-uat.yml` includes `--data-dir`
 8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
 
@@ -172,8 +172,8 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `Build and push` fails with `unauthorized` on GHCR | `GITHUB_TOKEN` `packages: write` scope missing | Verify `permissions: packages: write` at workflow root. |
 | `vcpkg install` fails with version baseline mismatch | `VCPKG_COMMIT` env var in workflow drift from `vcpkg.json` baseline | Sync both — workflow env + manifest baseline must match. Tracked by `.github/workflows/vcpkg-baseline-update.yml`. |
 | `Run EUnit tests` fails with non-zero exit + "Failed: 0" in log | meck fixture cancellation false-positive (known #336/#337 class) | Workflow already has the `if grep -q "Failed: 0"` workaround — should pass with warning. If it doesn't, paste the eunit.log tail and check if a new module is leaking processes. |
-| `actions/cache` save fails with EOF | GitHub cache backend transient | `save-always: true` ensures partial saves; retry the workflow. |
-| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, re-run. Long-form: see `.codex/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `actions/cache` save fails with EOF | GitHub cache backend transient | Retry the workflow. Do not add `save-always: true`; follow the `ci-cache` skill. |
+| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, re-run. Long-form: see `docs/windows-build.md` "Windows gRPC/protobuf linkage". |
 
 For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed (re-run? skip? abort?).
 
@@ -300,7 +300,6 @@ After all verification passes:
 1. **Bump dev branch to next dev version.** On `dev`:
    ```bash
    # Update meson.build version to X.Y.(Z+1)-dev or (X+1).Y.0-dev (operator's call)
-   # Add new ## [Unreleased] section to CHANGELOG.md
    git commit -m "chore(post-release): bump dev to X.Y.Z+1-dev"
    git push origin dev
    ```

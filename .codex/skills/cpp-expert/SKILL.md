@@ -1,20 +1,21 @@
 ---
 name: cpp-expert
-description: Review Yuzu C++ source changes for C++23 correctness, idiomatic standard-library use, ABI boundaries, threading primitives, and cross-compiler portability across GCC, Clang, MSVC, and Apple Clang. Use for any governance Gate 3 review when `.cpp`, `.hpp`, or `.h` files change.
+description: Review Yuzu C++ source changes for C++23 correctness, project-native idioms, ABI boundaries, threading primitives, and portability across GCC, Clang, MSVC, and Apple Clang. Use for every governance review that changes `.cpp`, `.hpp`, or `.h` files.
 ---
 
 # C++ Expert
 
-Use this skill for general C++ language review. Pair it with `cpp-safety` for ownership and lifetime proof; this skill covers correctness, idiom, portability, and ABI shape.
+Pair with `cpp-safety`. Load `docs/cpp-conventions.md`, then inspect the owning module's adjacent implementation and tests before judging style or shape.
 
-## Review Focus
+## Review
 
-- Load `docs/cpp-conventions.md` before reviewing C++ source changes.
-- Check `std::expected`, `std::string_view`, `std::span`, `std::format`, templates, concepts, move semantics, and concurrency primitives for correct C++23 use.
-- Check plugin ABI boundaries: no C++ types, exceptions, or unstable ownership contracts cross `sdk/include/yuzu/plugin.h`.
-- Check cross-compiler behavior against the supported matrix: GCC 13+, Clang 18+, MSVC 19.38+, and Apple Clang 15+.
-- Flag undefined behavior, use-after-move, ODR hazards, narrowing conversions, missing includes, non-portable extensions, and unnecessary copies on hot paths.
+- Prove language-level correctness: undefined behavior, conversions, object lifetime, move/copy behavior, exception boundaries, templates, atomics, locks, and missing direct includes.
+- Check C++23 and library use against the supported compilers. A newer construct is not preferable when the established local construct is correct and clearer.
+- Preserve the stable C plugin ABI: no C++ types, exceptions, layout accidents, or unclear ownership cross `sdk/include/yuzu/plugin.h`.
+- Prefer an existing project helper or local pattern. Request a new abstraction only when it establishes a necessary safety boundary or removes demonstrated duplication.
+- Keep fixes narrow. Do not request drive-by modernization, cosmetic renaming, alternate-but-equivalent syntax, or use of a particular standard-library type without a concrete benefit.
+- Comments explain the invariant or external constraint, never the reviewer, finding ID, or governance round.
 
 ## Output
 
-Return findings first, with severity `BLOCKING`, `SHOULD`, or `NICE`, each grounded in `file:line` and a concrete fix. End with `PASS` or `BLOCKED`.
+Return only evidence-backed `BLOCKING` or `SHOULD` findings with `file:line`, consequence, and the smallest project-native fix. Return exactly `PASS` when there are none.
