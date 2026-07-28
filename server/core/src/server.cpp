@@ -1199,17 +1199,27 @@ public:
         // undeleted, so without the second an operator watching an audit table
         // that never shrinks would read a broken cleanup loop as a working guard.
         metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
-                          "Audit retention passes declined: the pass would have expired every "
-                          "datable row, the gap since the previous pass exceeded a fixed 7 days "
-                          "(an ABSOLUTE threshold, not scaled to --audit-retention-days; a "
-                          "forward clock jump OR an outage that long), the stored clock "
-                          "reading was ahead of the current clock, or there was "
-                          "no stored reading at all so the elapsed-time check "
-                          "could not run (first pass after an upgrade/restore)",
+                          "Audit retention passes declined. A declined pass warns "
+                          "and deletes NOTHING; one increment per declined pass. "
+                          "Triggers: the pass would have expired every datable "
+                          "row; the gap since the previous pass exceeded a fixed 7 "
+                          "days (a forward clock jump OR an outage that long); or "
+                          "the stored reading was not usable - ahead of the clock, "
+                          "negative, present but not an integer, or unreadable. "
+                          "Reducing audit_retention_days can also cause a decline "
+                          "by design. Triage: "
+                          "docs/user-manual/audit-log.md#the-retention-clock-guard. "
+                          "The decision rule itself is classify() in "
+                          "audit_retention_rules.hpp plus the fact construction in "
+                          "AuditStore::cleanup_once, pinned by tests - it is "
+                          "deliberately not paraphrased here",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
-                          "Audit retention passes that failed on a SQLite error or ran against a "
-                          "closed store",
+                          "Audit retention passes that did not fully do their job: an unreadable "
+                          "probe, a failed delete, a refused implausible clock, a closed store, or "
+                          "an exception caught at the thread boundary. Note one site fires AFTER a "
+                          "successful delete (the post-delete backlog probe), so this means "
+                          "'retention is not fully healthy', not 'nothing was deleted'",
                           "counter");
         // The cap that makes an allowed wipe pace out introduces its own failure
         // mode: if it binds on EVERY pass for a sustained period, expiry is
@@ -1223,9 +1233,21 @@ public:
                           "Audit retention passes that hit the per-pass delete cap, leaving a "
                           "backlog for the next pass",
                           "counter");
-        metrics_.describe("yuzu_server_audit_retention_index_ok",
-                          "1 while the audit retention index exists; 0 means every cleanup pass "
-                          "full-scans audit_events under the store lock",
+        // Liveness. Every other retention series is silence-means-healthy, so a
+        // cleanup thread that never runs leaves them all flat at 0 -- identical
+        // to a quiet, healthy store, while audit.db grows without bound. These
+        // two are what an operator alerts on the ABSENCE of.
+        metrics_.describe("yuzu_server_audit_retention_passes_total",
+                          "Audit retention passes attempted, including declined and failed ones. "
+                          "Flat means the cleanup thread is not running - the one condition the "
+                          "other retention counters cannot report",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
+                          "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
+                          "WAS USABLE; 0 if none has run in this process. Read WITH "
+                          "retention_passes_total: stale here while that RISES means the reaper "
+                          "is alive but refusing an implausible clock, which is a different fault "
+                          "from stopped",
                           "gauge");
         metrics_.describe("yuzu_server_audit_retention_persist_failed_total",
                           "Failures to persist the audit retention clock reading, which degrades "
@@ -4392,10 +4414,12 @@ public:
                         .set(static_cast<double>(audit_store_->rows_deleted_count()));
                     metrics_.gauge("yuzu_server_audit_retention_cap_reached_total")
                         .set(static_cast<double>(audit_store_->cap_reached_count()));
-                    metrics_.gauge("yuzu_server_audit_retention_index_ok")
-                        .set(audit_store_->retention_index_ok() ? 1.0 : 0.0);
                     metrics_.gauge("yuzu_server_audit_retention_persist_failed_total")
                         .set(static_cast<double>(audit_store_->persist_failed_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_passes_total")
+                        .set(static_cast<double>(audit_store_->retention_passes_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_last_pass_unixtime")
+                        .set(static_cast<double>(audit_store_->last_pass_unixtime()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore

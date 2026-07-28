@@ -1948,22 +1948,23 @@ The server applies retention policies to stored data to manage disk usage. Reten
 | Audit log entries | `--audit-retention-days` | 365 days | Records of who did what, when, and on which devices. |
 | Guardian (Guaranteed State) events | `--guardian-event-retention-days` | 30 days | Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See [Guaranteed State](guaranteed-state.md) for the feature context. |
 
-Increasing a TTL preserves more history for compliance. Reducing one frees disk
-for the response and Guardian-event stores; **for the audit log it does not** --
-see the note below.
+Increasing a TTL preserves more history for compliance. **Reducing one does not
+reclaim disk retroactively** -- and that is true of all three stores, not just
+the audit log. Each stamps `ttl_expires_at` once, at INSERT, from the retention
+setting in force at the time (`AuditStore::log`, `ResponseStore::store`,
+`GuaranteedStateStore::compute_ttl_epoch`), and nothing ever rewrites it, so
+existing rows always age out on their original TTLs. Only rows written after the
+change (and, per the #483 note below, after a restart) get the shorter window.
+
+What is specific to the audit log is *how* the expired rows then leave: see the
+note below.
 
 > **Audit retention is a floor, not a ceiling.** A cleanup pass declines once
 > when it would expire every datable row, and every accepted pass is capped at
 > 25,000 rows, so deletion is paced rather than immediate.
 >
-> **Changing this value does not re-date existing rows.** `ttl_expires_at` is
-> stamped once, at INSERT, from the retention setting in force at the time, and
-> nothing ever rewrites it. Reducing `--audit-retention-days` therefore expires
-> nothing retroactively -- existing rows age out on their original TTLs, and only
-> rows written after the change (and, per the #483 note below, after a restart)
-> get the shorter window. Do not expect a reduction to reclaim disk.
->
-> One side effect is worth knowing: the guard's "is any datable row still alive?"
+> One side effect of the shared insert-stamped-TTL scheme is specific to this
+> guard and worth knowing: the guard's "is any datable row still alive?"
 > horizon is derived from the CURRENT window, so after a reduction the older
 > long-TTL rows fall outside it and stop counting as survivors. That makes a
 > single declined pass more likely right after the change. It is self-healing --
