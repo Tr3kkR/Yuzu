@@ -57,6 +57,24 @@ Check existing memory that might apply — at minimum:
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
 
+### Load and MATCH the routed-concern table — do not rely on memory
+
+```bash
+# Every changed path, against every routed-concern row.
+git diff --name-only <range>
+```
+
+Open `.claude/routed-concerns.md` and walk it row by row against that path list.
+Each row names the files/change-types it covers and the agents that MUST load on
+them. Those agents are selected **unconditionally** — see the standing rule under
+the Gate 3 decision matrix. Write the matched rows into your Gate 1 summary so the
+selection is auditable, and repeat this match at **Gate 8** against the fix diff.
+
+Do this by reading the table, not from recall: it is amended often, and a row you
+remember may have been rewritten. (The clock-guarded-retention row alone has been
+rewritten twice since it landed.) Rows are also the reason a one-line change can
+require `sre` and `compliance-officer` — size never gates a routed concern.
+
 ---
 
 ## Shared preamble — inject this into EVERY agent prompt
@@ -66,28 +84,52 @@ different bars, and the operator normalises by hand. Paste this block verbatim i
 every Gate 2/3/4/6 prompt, in addition to that agent's own focus.
 
 ```
-## Severity definitions — use these exactly
+## Severity — report in YOUR OWN vocabulary, against these shared thresholds
 
-BLOCKING — would cause incorrect behaviour, data loss, a security regression, or
+Keep the severity vocabulary your own brief specifies (security-guardian:
+CRITICAL/HIGH/MEDIUM/LOW/INFO; docs-writer: BLOCKING/SHOULD-FIX/NICE-TO-HAVE;
+most others: BLOCKING/SHOULD/NICE). Do NOT switch vocabularies — the operator
+normalises with the map below, and a renamed band loses information.
+
+What is calibrated is the THRESHOLD, not the label:
+
+GATING  — would cause incorrect behaviour, data loss, a security regression, or
   misleading operator guidance in production. You must be able to name the failing
-  input or state. If you cannot, it is not BLOCKING.
-SHOULD — a real defect with bounded blast radius, or a missing test for a behaviour
-  that has one.
-NICE — everything else.
+  input or state. If you cannot, it is not gating.
+  Maps from: CRITICAL, HIGH, BLOCKING.
+SHOULD  — a real defect with bounded blast radius, or a missing test for a
+  behaviour that has one.
+  Maps from: MEDIUM, SHOULD, SHOULD-FIX.
+NICE    — everything else. Maps from: LOW, INFO, NICE, NICE-TO-HAVE.
 
-## Prose is docs-writer's
+Where your vocabulary does not map cleanly, say so and treat it as GATING. That
+default is deliberate: an unmappable finding must not be silently downgraded.
 
-`docs-writer` owns comment, doc and changelog WORDING. Report a comment or doc only
-when it CONTRADICTS the code — and say which one is wrong. A wording-only
-observation is capped at NICE: report it if you think it matters, never above.
+## Prose: docs-writer owns WORDING, the domain agent owns TRUTH
+
+Two different questions, two different owners:
+
+- Is this text WELL WRITTEN (clear, accurate to convention, not stale)? ->
+  `docs-writer`, including in-code comments and log/error-message text.
+- Is this text TRUE? -> the domain agent. Ordinary C++ comments: `cpp-expert`.
+  Lifetime / ownership / thread / callback / syscall claims: `cpp-safety`.
+  Auth, authz, crypto, control claims: `security-guardian`. Erlang:
+  `gateway-erlang`. CI / build / release: `build-ci` or `release-deploy`.
+  Normative architecture text — ADRs, invariants documents, routed-concern rows:
+  `architect`, plus `security-guardian` where the text states a security posture.
+
+So: report a comment or doc when it CONTRADICTS the code — that is a truth finding,
+at your own native severity, and it is yours to raise whatever agent you are. A
+WORDING-ONLY observation is capped at NICE; report it if you think it matters,
+never above.
 
 Exception, and it is load-bearing: a factually false comment adjacent to a security
 or control-flow branch IS a contradiction, not wording. #2202 shipped a comment
 asserting the opposite of what its function did, next to an authz branch.
 
-(Capping rather than banning is deliberate: deciding whether prose is descriptive or
-normative is exactly the disputed question, so a mis-classification should cost a
-line of noise, not a lost finding.)
+(Capping wording rather than banning it is deliberate: deciding whether prose is
+descriptive or normative is exactly the disputed question, so a mis-classification
+should cost a line of noise, not a lost finding.)
 
 ## Verify what you can, read-only
 
@@ -133,7 +175,7 @@ Launch both agents in a **single message with two tool calls** so they run in pa
 
 ```
 Full governance Gate 2 review of <N> commits on branch <branch> at
-/mnt/c/Users/natha/Yuzu: <sha1>, <sha2>, ...
+<repo-root>: <sha1>, <sha2>, ...
 
 Use `git show <sha>` to view each commit. The working tree is clean;
 what you see in <range> is the full scope.
@@ -326,7 +368,7 @@ Report in under 800 words.
 
 ```
 Full governance Gate 2 docs review of <N> commits on branch <branch>
-at /mnt/c/Users/natha/Yuzu: <sha1>, <sha2>, ...
+at <repo-root>: <sha1>, <sha2>, ...
 
 Use `git show <sha>` and `git diff <range>` to see the full scope.
 
@@ -342,8 +384,10 @@ Specifically verify:
    request/response body, error paths, permissions
 2. User manual feature sections (`docs/user-manual/*.md`) — operator
    workflow changes, new CLI flags, new env vars, upgrade notes
-3. CHANGELOG.md — the `[Unreleased]` section for Fixed/Added/Changed/
-   Breaking entries; reverse-chronological order invariant
+3. Changelog — a `changelog.d/<PR#>-<slug>.<section>.md` FRAGMENT.
+   `CHANGELOG.md` itself is FROZEN: never edited directly, enforced by a
+   hook and the `Changelog fragments` CI job. Flag any direct edit to
+   `CHANGELOG.md` as BLOCKING. (See `changelog.d/README.md`.)
 4. CLAUDE.md — new architectural invariants, new stores, new ABI
    patterns, new release gates
 5. Any audit action table, permission table, or error-code table
@@ -442,7 +486,7 @@ Each Gate 3 agent gets the same structural preamble, varying in the "Your job" s
 
 ```
 Full governance Gate 3 <agent-type> review of <N> commits on branch
-<branch> at /mnt/c/Users/natha/Yuzu: <sha1>, <sha2>, ...
+<branch> at <repo-root>: <sha1>, <sha2>, ...
 
 Read `git show <range>` for the full diff.
 
@@ -481,7 +525,7 @@ These three are the highest-value reviewers in the Yuzu pipeline. Prior runs con
 
 ```
 Full governance Gate 4 happy-path review. <N> commits on branch <branch>
-at /mnt/c/Users/natha/Yuzu: <sha1>..<shaN>.
+at <repo-root>: <sha1>..<shaN>.
 
 `git show <range>` covers the full scope.
 
@@ -609,7 +653,9 @@ state, schema, and contract consistency. Check:
    existing `unique_temp_path` helper or equivalent; shared hardcoded
    paths are a parallel-test race.
 
-7. **CHANGELOG reverse-chronological order invariant** preserved?
+7. **Changelog fragment** present and well-formed — `changelog.d/<PR#>-<slug>.<section>.md`,
+   valid section, `CHANGELOG.md` untouched. (The old `[Unreleased]`/reverse-chronological
+   invariant is ABOLISHED — the file is assembled at release from fragments.)
 
 8. **ADR-1005 headless-platform parity** — for any capability this PR
    adds or changes: is every behavior reachable by an authenticated
@@ -732,7 +778,7 @@ Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to
 
 **Watch for:** sre routinely catches pre-existing readiness-probe gaps that become BLOCKING because the PR makes an existing store more load-bearing. The HC-1 pattern (store missing from `/readyz`) reappears — always verify the new store(s) in scope are in the probe conjunction.
 
-**Watch for:** enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a CHANGELOG "Breaking" section + `docs/user-manual/server-admin.md` upgrade note is almost always required.
+**Watch for:** enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a changelog FRAGMENT carrying the Breaking entry (`changelog.d/<PR#>-<slug>.changed.md` or `.security.md`, body led with `**Breaking —**`) plus a `docs/user-manual/server-admin.md` upgrade note is almost always required. Do NOT ask for a `CHANGELOG.md` section — that file is frozen and edited only at release.
 
 ---
 
@@ -784,10 +830,22 @@ Strategy:
 ## Gate 8 — Iterate And Ledger
 
 1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
-   findings prompted the fix. Run the Gate 3 decision matrix against the **fix diff**
-   exactly as you ran it against the original. A fix that adds a language feature, a
-   dependency, a thread, or a platform-specific call re-triggers the corresponding
-   agent **even if that agent raised nothing in round 1**.
+   findings prompted the fix. A fix that adds a language feature, a dependency, a
+   thread, or a platform-specific call re-triggers the corresponding agent **even if
+   that agent raised nothing in round 1**.
+
+   Concretely, against the **fix diff** (not the original):
+   - **Gate 3** — re-run the decision matrix, including the routed-concern table.
+   - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
+     a doc, a changelog fragment, a user-facing string, or in-code prose.
+   - **Gates 4 and 6** — re-run an agent when the fix changes behaviour in its
+     domain: `happy-path`/`unhappy-path` on any logic or error-path change,
+     `consistency-auditor` on any cross-surface or contract change, `sre` on any
+     metric, alert, probe or thread change, `compliance-officer` on any audit or
+     evidence change, `enterprise-readiness` on any operator-visible behaviour or
+     upgrade-note change.
+   - When in doubt, re-run it. A skipped re-review is how the fix round ships its
+     own defect.
 
    This rule exists because the old one ("only the gates whose findings would be
    affected") shipped a broken macOS leg on #2580. Gate 8 ran the four agents whose
@@ -799,16 +857,44 @@ Strategy:
 
 2. **Don't commit until governance passes.** Per CLAUDE.md.
 
-3. **Record every finding in the ledger.** Append one row per finding to
-   `~/.local/share/yuzu/governance-findings.db` (or the run's log dir if that store
-   does not exist yet): run id, commit range, agent, severity, `file:line`, one-line
-   summary, and disposition — `fixed` / `deferred-to-issue #N` / `rejected` with the
-   reason.
+3. **Record every finding in the run ledger.** Write a JSONL file at
+   `<run-log-dir>/governance-findings.jsonl` — one object per finding. There is **no
+   database and no shared store yet**; this is a per-run file, and making it durable
+   shared change-control evidence is tracked separately. Do not describe it as more
+   than it is.
 
-   Governance is the repo's largest issue-inflow source and, until this row existed,
-   **nothing recorded what it found**. CI outcomes, durations and flakes are persisted
-   and queryable (`docs/ci-architecture.md`); governance findings were not. Without
-   the ledger, "governance is too noisy" and "governance caught the thing that
+   Fields, all required unless marked:
+
+   | field | why |
+   |---|---|
+   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it |
+   | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
+   | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
+   | `severity_native` | the agent's OWN vocabulary, unmodified |
+   | `severity_mapped` | GATING / SHOULD / NICE per the shared threshold map |
+   | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
+   | `file`, `line`, `summary` | where and what |
+   | `classification` + rationale | truth-contradiction vs wording, and why |
+   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` |
+   | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
+   | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
+   | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
+
+   The four nullable fields exist so the schema is stable when the process that
+   produces them lands. **Recording an `adjudicated_by` or `waiver_rationale` does
+   NOT establish that a signed waiver may release a gating finding** — no such
+   merge contract is adopted here. Today's rule is unchanged: gating findings are
+   resolved before the gate passes. The columns are there so a future decision
+   about waivers has somewhere to write, not because one has been made.
+
+   **Known gap, unsolved:** the absence of a finding row cannot distinguish "the
+   reviewer passed" from "the reviewer never ran". A clean-result record needs its
+   own design.
+
+   Why this exists at all: governance is the repo's largest issue-inflow source, and
+   nothing has ever recorded what it found. CI outcomes, durations and flakes are
+   persisted and queryable (`docs/ci-architecture.md`); governance findings are not.
+   Without a record, "governance is too noisy" and "governance caught the thing that
    mattered" are both unfalsifiable, and no roster change can be argued from evidence.
    See `docs/governance-skill-tuning-2026-07.md`.
 
@@ -828,7 +914,7 @@ Strategy:
 
 One full governance run on a non-trivial commit range is ~6-9 parallel agent calls plus the consolidation writeup. On the #222/#224 hardening round (5 commits, 2 hardening rounds), it caught 3 BLOCKING items I introduced myself, 2 of which would have shipped a worse vulnerability than the one I was fixing. The run takes 30-60 min of wall clock and produces a permanent artifact trail in commit messages + CHANGELOG that satisfies SOC 2 Workstream F change-management evidence.
 
-Skipping Gate 4 or Gate 5 to save time is rarely worth it. Skipping Gate 3 domain agents is sometimes fine if the change is genuinely small in scope (one file, no public API change); use the decision matrix to judge.
+Skipping Gate 4 or Gate 5 to save time is rarely worth it. **Do NOT skip Gate 3 domain agents on the grounds that a change is small** — that guidance predates the unconditional routed-trigger floor above and contradicts it. Diff size does not gate a routed concern: `.claude/routed-concerns.md` keys on file identity and change type precisely because those files carry catastrophic-if-violated invariants at any line count. Use the decision matrix to decide WHICH agents, never WHETHER.
 
 ## Post-run follow-ups — file deferred findings per the issue standard
 

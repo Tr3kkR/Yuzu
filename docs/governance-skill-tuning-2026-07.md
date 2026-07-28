@@ -4,6 +4,8 @@
 **Date:** 2026-07-28
 **Adversarial review:** `enterprise-architect` (fable) and `gpt-5.6-sol` (codex), independently. **Both returned BLOCK on the first draft.** Their objections are recorded in §5 and have been folded in — the change set below is materially smaller than what was first proposed.
 
+**Second round (2026-07-28):** a colleague responded with a larger proposal (termination protocol, finding classification, triage, record design) plus a five-item amendment list for this PR. Four amendments were accepted, one refuted; both reviewers re-ran at maximum rigour to verify before anything was changed. §7 records that exchange. Three further defects **in this PR** were found during it and fixed.
+
 ---
 
 ## 1. The complaint
@@ -34,19 +36,29 @@ On #2580 the pipeline found **9 BLOCKING across two rounds**, roughly seven of t
 
 The skill asks every agent for BLOCKING/SHOULD/NICE and **never defines them**. Twelve agents invent twelve bars; the operator normalises by hand.
 
-Add one shared definition block, injected into every preamble:
+Add one shared block, injected into every preamble. **Revised in round 2** (see §7): agents
+keep their **native** vocabulary and the block calibrates the **threshold**, because telling
+every agent to use BLOCKING/SHOULD/NICE "exactly" contradicted `security-guardian`'s
+CRITICAL/HIGH/… brief and `docs-writer`'s BLOCKING/SHOULD-FIX/… brief.
 
-> **BLOCKING** — would cause incorrect behaviour, data loss, a security regression, or misleading operator guidance in production. You must be able to name the failing input or state.
-> **SHOULD** — a real defect with bounded blast radius, or a missing test for a behaviour that has one.
-> **NICE** — everything else.
+> **GATING** — would cause incorrect behaviour, data loss, a security regression, or misleading operator guidance in production. You must be able to name the failing input or state. *Maps from: CRITICAL, HIGH, BLOCKING.*
+> **SHOULD** — a real defect with bounded blast radius, or a missing test for a behaviour that has one. *Maps from: MEDIUM, SHOULD, SHOULD-FIX.*
+> **NICE** — everything else. *Maps from: LOW, INFO, NICE, NICE-TO-HAVE.*
+>
+> Where a vocabulary does not map cleanly, say so and treat it as GATING — an unmappable finding must never be silently downgraded.
 
 ### 3.2 Cap wording-only findings at NICE — do not prohibit them
 
 *Changed after review.* The first draft said non-docs agents must **not report** wording. Both reviewers rejected that as inoperable: an agent must first classify text as descriptive or normative, and that classification is the disputed question. Sol produced two genuinely ambiguous examples from #2580's own code — a comment calling saturation the "safe failure direction" (explanatory, but it also states the clamp's safety property) and one describing a "fixed Prometheus outcome vocabulary" (descriptive-looking, but it defines cross-surface audit/metric parity).
 
-Revised rule, added to every non-`docs-writer` preamble:
+Revised rule. **Round 2 split this further** (see §7): routing prose to `docs-writer` alone
+created an ownership gap, because its brief has no mandate over in-code text at all. Two
+questions, two owners:
 
-> `docs-writer` owns prose. Report a comment or doc **only** when it contradicts the code, and say which one is wrong. A wording-only observation is capped at **NICE** — report it if you think it matters, never above NICE.
+> - Is this text **well written**? -> `docs-writer`, now including in-code comments and log/error strings.
+> - Is this text **true**? -> the **domain agent**: `cpp-expert` for ordinary C++ comments, `cpp-safety` for lifetime/ownership/thread claims, `security-guardian` for auth/authz/crypto, `gateway-erlang` for Erlang, `build-ci`/`release-deploy` for CI, `architect` for normative architecture text (ADRs, invariants, routed-concern rows).
+>
+> So a contradiction is a **truth** finding at your own native severity, raiseable by any agent. A **wording-only** observation is capped at **NICE**.
 >
 > Exception: a factually false comment adjacent to a security or control-flow branch **is** a contradiction, not wording. #2202 shipped a comment asserting the opposite of what its function did, next to an authz branch.
 
@@ -138,3 +150,81 @@ On an ordinary PR: unchanged roster, quieter output — and after a few weeks, t
 1. Should the §3.6 ledger live in the existing `~/.local/share/yuzu/test-runs.db` schema, or its own store?
 2. Is `workflow-orchestrator` the right home for the §3.4 presentation pass, or does it belong in the harness?
 3. How long a sampling window before we revisit §4.1 — a fixed number of runs, or a calendar period?
+
+---
+
+## 7. Second-round amendments (2026-07-28)
+
+A colleague reviewed this PR and returned a larger proposal plus a five-item amendment
+list. Both adversarial reviewers re-ran at maximum rigour to verify every claim from the
+repo before anything was changed. Four amendments accepted, one refuted.
+
+### Accepted
+
+| # | amendment | what changed |
+|---|---|---|
+| 1+2 | Add round ordinal and seven more fields to the ledger row | Ledger is now a specified JSONL schema with `pass_ordinal`, `finding_id`, `provenance`, `caused_by`, `adjudicated_by`, `waiver_rationale`, native **and** mapped severity. **Explicitly does not adopt** the signed-waiver merge contract — the columns exist so a future decision has somewhere to write. |
+| 3 | `docs-writer` has no mandate over in-code prose | Confirmed: its brief has zero references to comments or in-code text. The original routing created an ownership gap. Now split — **`docs-writer` owns WORDING** (extended to in-code comments and log/error strings), **the domain agent owns TRUTH**, with an explicit routing table. Normative architecture text routes to `architect`. |
+| 5 | Changelog fragment carries an unrelated issue's number | Confirmed — **#2596 is a real, open, unrelated issue** (macOS sqlite linking). Renamed to `2604-…`. |
+| §8 | Reviewer briefs that are wrong today | Three stale `CHANGELOG.md` `[Unreleased]` instructions rewritten to the fragment convention (the breaking-change *coverage* check was retargeted, not deleted). Four `/mnt/c/Users/natha/Yuzu` paths replaced with `<repo-root>`. |
+
+### Refuted — amendment 4
+
+The claim was that the routed-concern floor "keys on a file that is absent", that no row
+covers retention or reaper passes, and that "retention work is unfloored today".
+
+`.claude/routed-concerns.md` is tracked on `origin/dev` and in this branch, and its
+clock-guarded-retention row routes any retention/reaper/prune pass to
+`cpp-safety` + `sre` + `compliance-officer` — exactly the roster the kill shape cites.
+
+The description is, however, a precise account of `CLAUDE.md` **before 2026-07-11**, when
+the inline table's only retention mention was a TAR row about retention-*paused sources*:
+
+| commit | date | change |
+|---|---|---|
+| `10ad4bb5` | 07-11 | removed that phrasing |
+| `bbd2c175` | 07-18 | created `.claude/routed-concerns.md` (#2147) |
+| `1a2366ba` | 07-26 | added the clock-guard row (#2360) |
+
+So the amendment appears to have been checked against a stale working copy. Two
+consequences: no floor change is needed, and §9's "that floor does not currently exist"
+inverts into a *further* argument for its own conclusion — the floor exists, which is a
+better reason not to tier than its absence would be.
+
+One genuinely constructive thing sat inside it: the skill asserted the floor without ever
+instructing anyone to *load and match* the table. Step 0 and Gate 8 now do, by reading the
+file rather than from recall.
+
+### Defects in this PR found during the round
+
+Neither the colleague nor the first review caught these; the maximum-rigour re-run did.
+
+1. **Self-contradiction on severity.** The shared preamble told every agent to use
+   BLOCKING/SHOULD/NICE "exactly", while `security-guardian` is briefed on
+   CRITICAL/HIGH/MEDIUM/LOW/INFO and `docs-writer` on BLOCKING/SHOULD-FIX/NICE-TO-HAVE.
+   Rewritten: agents keep their **native** vocabulary, and the block now calibrates the
+   **threshold** with an explicit normalisation map. An unmappable severity defaults to
+   gating.
+2. **Self-contradiction on the floor.** The cost section still said Gate 3 domain agents
+   may be skipped when a change is "genuinely small in scope" — which the new
+   unconditional routed-trigger floor forbids. Rewritten.
+3. **The ledger overclaimed.** It named a database that does not exist, with no schema and
+   no writer, while the changelog fragment said findings are "now recorded". Now a
+   specified per-run JSONL file, described as exactly that, with durable shared storage
+   named as separate work.
+
+### Deferred, by their own sequencing
+
+Their termination protocol, finding classification and triage design are not in this PR.
+Their §6 gates those behind the record, and the record is what this PR builds. Note their
+§4 record design *is* amendments 1–2 — it is adopted here, not deferred.
+
+### On "no terminal state"
+
+Accepted in substance, corrected in wording. The pipeline does have PASS/FAIL labels and a
+three-iteration escalation convention (`workflow-orchestrator.md`). What it lacks is an
+**enforced bounded closure** — "escalate" names no adjudicator and no required outcome, so
+the practical exit is fatigue. Their own text says exactly this. What should not be
+conceded is that every subsequent finding is churn: on #2580, re-review of the fix rounds
+found three genuine BLOCKING defects introduced *by the fixes*, which is why Gate 8 is
+retained and strengthened here.
