@@ -49,6 +49,7 @@ param(
   [int]   $PostgresPort    = 5433,
   [int]   $PostgresMaxConnections = 400,  # PgPool fan-out headroom: the default 100 exhausts (CH-9)
   [int]   $RunnerCount     = 4,           # agents on this box; agents 1..N-1 get per-agent PG clusters (#2094)
+  [ValidateSet(16)][int] $BuildJobs       = 16,          # fixed 9970X CCD envelope: 8C/16T, consumed as meson compile -j
   [string]$ManifestPath    = 'C:\actions-runner\toolchain-manifest.json',
 
   # Escape hatch for the maintenance gate below. Provisioning restarts shared
@@ -829,6 +830,7 @@ Step 'machine env vars + PATH' {
   Set-MachineEnv 'CCACHE_MAXSIZE'         '30G'
   Set-MachineEnv 'CCACHE_COMPRESS'        'true'
   Set-MachineEnv 'CCACHE_COMPRESSLEVEL'   '1'
+  Set-MachineEnv 'YUZU_BUILD_JOBS'        "$BuildJobs"
   Set-MachineEnv 'YUZU_TEST_POSTGRES_DSN' "postgresql://yuzu:yuzu@127.0.0.1:$PostgresPort/yuzu_test"
   # Shared CI tool cache (P0): one machine-level dir so the 4 CCD-pinned runners
   # share ONE vcpkg binary cache instead of 4 per-runner copies. Each runner's
@@ -887,9 +889,10 @@ Step "emit toolchain manifest -> $ManifestPath" {
     generated = (Get-Date).ToUniversalTime().ToString('o')
     host      = $env:COMPUTERNAME
     runner_count = $RunnerCount
-    pins      = [ordered]@{ python=$PythonVersion; meson=$MesonVersion; erlang=$ErlangVersion; rebar3=$Rebar3Version; postgres=$PostgresVersion; vcpkg_baseline=$VcpkgBaseline }
+    pins      = [ordered]@{ python=$PythonVersion; meson=$MesonVersion; erlang=$ErlangVersion; rebar3=$Rebar3Version; postgres=$PostgresVersion; build_jobs=$BuildJobs; vcpkg_baseline=$VcpkgBaseline }
     env       = [ordered]@{
       VCPKG_ROOT=$VcpkgRoot; CCACHE_DIR="$CacheRoot\ccache"; RUNNER_TOOL_CACHE="$CacheRoot\tool_cache"
+      YUZU_BUILD_JOBS="$BuildJobs"
       YUZU_ESCRIPT=[Environment]::GetEnvironmentVariable('YUZU_ESCRIPT','Machine')
       YUZU_REBAR3=[Environment]::GetEnvironmentVariable('YUZU_REBAR3','Machine')
       YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:$PostgresPort/yuzu_test"

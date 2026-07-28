@@ -38,6 +38,8 @@ env:
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
+  # Self-hosted Big Tam and Wee Tam runners each own one 8C/16T L3 domain.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Linux x64 release build ──────────────────────────────────────────
@@ -168,7 +170,7 @@ jobs:
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C build-linux
+        run: meson compile -C build-linux -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
         if: always()
@@ -554,7 +556,7 @@ jobs:
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C build-windows
+        run: meson compile -C build-windows -j $env:YUZU_BUILD_JOBS
 
       - name: ccache stats
         if: always()
@@ -1272,6 +1274,7 @@ jobs:
           tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
           build-args: |
             TRIPLET=x64-linux
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
           provenance: false
           sbom: false
@@ -1308,6 +1311,7 @@ jobs:
           # build-arg is still safe -- unused build-args are ignored.
           build-args: |
             TRIPLET=x64-linux
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
@@ -1702,6 +1706,8 @@ jobs:
           push: false
           load: true
           tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          build-args: |
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
           provenance: false
           sbom: false
@@ -1729,6 +1735,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # NOTE: deliberately NO TRIPLET build-arg. The server/agent chisel
           # Dockerfiles derive the vcpkg triplet from buildx's per-arch
           # TARGETARCH when TRIPLET is empty
