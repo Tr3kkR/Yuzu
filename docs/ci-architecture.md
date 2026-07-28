@@ -525,6 +525,21 @@ suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
 reversible test tooling — no ADR (rationale in the wrapper header).
 
+**Triage note — shared-fixture files fail as a cluster on a PG blip.** The
+shared-DB + TRUNCATE fixture files (#2362, #2603: `test_software_inventory_store`,
+`test_software_licensing_*`, `test_product_registry_store`,
+`test_rest_access_review`, `test_engine_principal_{lifecycle,integration}`, and
+later conversions) hold one clone + one pool for the whole file. A Postgres
+blip mid-file therefore reds out *several unrelated-looking CRUD cases in one
+file* — and flake-retry's isolated re-run (fresh process, fresh clone) will
+often recover them, so the incident can masquerade as N independent "recovered
+known flakes". Before treating such a cluster as N regressions (or adding them
+to `known-flaky.json`), grep the junit failure text for
+`PGRES_COMMAND_OK`, `REQUIRE( lease )`, `is_open()`, or the bundle/reset tags
+(`[ApiTokenStorePgShared]`, `[AuthDbPgShared]`, `[EpLcShared]`,
+`[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
+one file is one PG-instance event, not a test bug.
+
 ## Workflow-PR canary
 
 `ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches
