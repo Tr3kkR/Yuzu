@@ -2252,10 +2252,8 @@ the break-glass one-shots' `--postgres-dsn`/`--ca-dir` requirements).
 Security review record: `docs/security-reviews/authdb-2026-04-30.md`
 (SQLite-era baseline).
 
-The hard invariants for AuthDB-touching changes (schema/`PgPool`
-construction, fail-closed posture, `SecretCodec` registration,
-config-as-seed-only / fresh-start, role-field ignored, gate-level audit,
-MFA fail-closed on secret-read failure, cleanup cadence, snapshot-and-release
-publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
-loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
-`auth.{hpp,cpp}`.
+AuthDB-touching changes preserve the Postgres schema and fail-closed
+construction, fresh-start seed-only behavior, `SecretCodec` handling,
+authorized role changes and audit gates, and MFA's fail-closed secret reads
+described in this section. Review the implementation and focused tests for
+the exact current behavior.

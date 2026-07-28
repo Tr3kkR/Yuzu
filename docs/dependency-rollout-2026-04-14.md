@@ -634,8 +634,8 @@ Append-only. Newest entries at the top. Format:
   if green. The full option D iteration history (12e40ae → a61a787 →
   713ae8c → 46ea61f → 220e7bd → b33f1df) demonstrates the pattern
   for adding new transitive libs to option D's `cxx.find_library()`
-  list — see `.claude/agents/build-ci.md` "Windows MSVC static-link
-  history and #375" for the long form. P1 #376 (move off gRPC to
+  list — see `docs/windows-build.md` "Windows gRPC/protobuf linkage" for
+  the current contract. P1 #376 (move off gRPC to
   QUIC) remains the strategic escape but is deferred until customer
   commitments ship.
 - **2026-04-14 ~12:40 UTC** · Claude session · **Option H failed on release
