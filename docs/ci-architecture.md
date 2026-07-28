@@ -516,6 +516,25 @@ suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
 reversible test tooling — no ADR (rationale in the wrapper header).
 
+`scripts/ci/github_output.py` is the failure-isolated interface for those
+annotations and summaries. It escapes `%`, carriage returns, and line feeds in
+workflow-command data and emits UTF-8 even when Windows exposes a legacy
+console encoding. An output encoding or I/O failure never replaces the test
+verdict: the adapter falls back where possible and emits a `CI evidence
+degraded` diagnostic. Reporting success must not be used to change pass/fail
+semantics. Under GitHub Actions, an absent or empty `GITHUB_STEP_SUMMARY` is
+also degradation; outside Actions, no summary destination is normal.
+
+All annotations and summary writes complete before `flake-retry.json` is
+finalised. The receipt carries `evidence_complete`, the total
+`evidence_degradation_count`, and at most 16 bounded
+`evidence_degradations`, so a recovered verdict cannot erase the fact that its
+human-facing evidence was incomplete. Schema-v3 `test_db.py` currently imports
+only the recovered-case rows from this receipt. A dedicated telemetry-schema
+unit must add the evidence-completeness fields to `ci_runs` and its query
+surface; until then, the JSON receipt is authoritative and an importer must
+not infer completeness when those fields are absent.
+
 ## Workflow-PR canary
 
 `ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches
