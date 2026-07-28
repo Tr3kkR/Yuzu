@@ -13,6 +13,7 @@
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "kek_routes.hpp" // KekOps / KekOpResult (#2395 track C): reused, not redefined
 #include "management_group_store.hpp"
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp" // GET SSE channel: StreamRevalidateFn, handle_get_tail (2f PR 2)
@@ -30,6 +31,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -64,6 +66,17 @@ namespace yuzu::server::mcp {
 // Progress bridge core (track 2f PR 3a). Forward-declared (pointer-only here,
 // injected via set_stream_bridge); the .cpp includes mcp_stream_bridge.hpp.
 class McpStreamBridge;
+
+namespace detail {
+/// #2530 G8-F2 — test-only, externally-linked twin of mcp_server.cpp's
+/// file-local `kek_failure_tag()` (the MCP audit-detail switch). Mirrors
+/// `yuzu::server::detail::kek_route_failure_tag` (kek_routes.hpp) so a
+/// table-driven test can assert all three failure vocabularies (REST, MCP,
+/// and `kek_rotate_control.hpp`'s `kek_op_outcome_label()`) agree for every
+/// `KekOpResult::Failure` value — the switches stay independent by design,
+/// this only forwards to the existing production one.
+[[nodiscard]] std::string_view kek_mcp_failure_tag(KekOpResult::Failure failure);
+} // namespace detail
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
 /// Mirrors the RestApiV1 pattern: receives store pointers + auth/perm/audit callbacks.
@@ -240,6 +253,17 @@ public:
     /// owned bridge; tests inject their own.
     void set_stream_bridge(McpStreamBridge* bridge) { stream_bridge_ = bridge; }
 
+    /// KEK (key-encryption-key) rotation seam (#2395 track C) — same setter
+    /// idiom as set_engine_principal_store above (the handler's `[=]` lambda
+    /// captures `this`, so the injection is a live read on the next request).
+    /// Reuses kek_routes.hpp's `KekOps`/`KekOpResult` verbatim rather than
+    /// redefining them, so the REST and MCP surfaces cannot drift. Any of the
+    /// three std::functions left unset (default-constructed `KekOps{}`) makes
+    /// the corresponding tool answer "unavailable" cleanly — never a null
+    /// std::function call. server.cpp wires the SAME KekOps instance it hands
+    /// to KekRoutes::register_routes.
+    void set_kek_ops(KekOps ops) { kek_ops_ = std::move(ops); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -404,6 +428,9 @@ private:
     OwnerExistsFn owner_exists_fn_;
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
+    // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
+    // constructed (all three std::functions empty) until server.cpp wires it.
+    KekOps kek_ops_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

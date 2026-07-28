@@ -63,6 +63,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [Internal CA](#internal-ca)
+  - [KEK Rotation](#kek-rotation)
   - [Engine Principals](#engine-principals)
   - [RBAC](#rbac)
   - [Tags](#tags)
@@ -1468,6 +1469,199 @@ persistence failed), `503` (CA unavailable). A rejected import is audited
 > `--cert`/`--key`/`--ca-cert` (or `--https-cert`/`--https-key`) flag bypasses
 > the internal CA for that surface entirely — unchanged behaviour, supported and
 > independent of subordinate mode.
+
+---
+
+### KEK Rotation
+
+Rotate the secrets key-encryption-key (KEK) that wraps every envelope-encrypted
+secret column (ADR-0010). See `docs/user-manual/server-admin.md` "Key
+management (secrets KEK)" for the full runbook (half-committed recovery,
+rotation runaway control, stuck-lock diagnosis, DR drill, retirement
+preconditions). Each route has an MCP twin sharing the same failure
+classification, remediation wording, and — for `get_kek_status` — the
+identical `live_versions`/`lock_held`/`lock_holder_pid` fields added by
+#2530 (REST/MCP twin parity, ADR-1005): `rotate_kek`, `rewrap_secrets`,
+`get_kek_status`.
+
+#### `POST /api/v1/secrets/kek/rotate`
+
+Mint a new KEK version (`secrets-kek-v<N+1>`) and re-wrap every registered
+secret row's wrapped-DEK header under it (payloads untouched). **Permission:**
+`Security:Write`. No request body (empty or `{}`).
+
+```json
+{ "new_version": 2, "rotation_complete": true, "meta": { "api_version": "v1" } }
+```
+
+`rotation_complete` is the honest completion signal (ADR-0010 §3) — the
+response deliberately omits a rewrapped-row count; call `/rewrap` for one.
+Errors: `400`/`413` (non-empty/oversized body), `403` (missing
+`Security:Write`), `409` (**two distinct causes** — see below), `429`
+(rotation cooldown, below), `503` (**three distinct causes** — see below).
+
+> **Two different `409`s.** `"another KEK operation is in progress"` means
+> another rotation or re-wrap holds the cluster-wide `secrets_kek_op`
+> advisory lock — wait for it to finish and retry. `"the live KEK version
+> ceiling has been reached"` (#2530) means `--kek-max-live-versions` has been
+> hit — waiting never resolves this one; it needs an operator to explicitly
+> raise the ceiling (documented as a deliberate, audited risk acceptance
+> pending #2525 — see server-admin.md). Distinguish them from the message
+> text, not the status code alone.
+
+> **Three different `503`s.** `"KEK service unavailable"` (codec/Postgres not
+> yet ready — retry once the server reports ready) is the original one.
+> #2530 added two more, neither retryable on a fixed delay: `"a KEK query was
+> canceled or exceeded its statement timeout"` (SQLSTATE `57014` —
+> deliberately worded that way, not "timed out": Postgres also raises this
+> for an administrator's `pg_cancel_backend`, and it is **not necessarily
+> transient** — check `statement_timeout`, database load, cancellation
+> activity, and the registered-column scan size before retrying), and `"the
+> KEK rotation clock is untrustworthy"` (the newest `secrets.kek_meta` row is
+> future-dated relative to the database server's own clock — investigate the
+> database server's clock/NTP, not the KEK subsystem). The response body and
+> server log report the observed skew **magnitude** in seconds, because the
+> two possible skew directions behave differently: a **backward** skew
+> self-clears once the clock reads sanely again, but a **forward** skew
+> (the row was minted while the clock was already ahead — bad NTP, a VM
+> restore, a failover to a host that's ahead) does **not** self-clear — it
+> persists until real time catches up to the stored timestamp, blocking
+> every `/rotate` for that whole duration with **no configuration bypass at
+> all**. See server-admin.md "Clock-anomaly guard" for the full diagnostic
+> procedure. None of the three carry `retry_after_ms`.
+
+> **`500` half-committed — do NOT retry this route.** If rotation registers
+> the new version but fails to finish re-wrapping every row, this returns
+> `500` with a remediation telling you to call `POST
+> /api/v1/secrets/kek/rewrap` to resume. Retrying `/rotate` instead would mint
+> a second, spurious version on top of the half-rotated state. This
+> classification **wins over** a `query_canceled` cause if the cancellation
+> happened after the mint committed — you still get told to call `/rewrap`,
+> never `/rotate`.
+
+> **`429` rotation cooldown — durable and cluster-wide (#2530; #2530
+> G7-S9 removed a weaker second tier).** An earlier cut of this hardening
+> pass added a cheap process-local pre-check (5 minutes, in-memory)
+> alongside the durable control, but it was removed: it was never the
+> authoritative control (it was per-process and a restart cleared it), its
+> hardcoded window could not be configured below 5 minutes, and it never
+> populated an honest `retry_after_ms`. The sole authoritative rate limit
+> today is read from `secrets.kek_meta.created_at` on the database server's
+> own clock, cluster-wide and restart-persistent:
+> `--kek-min-rotate-interval` (seconds, default `3600` = 1h). A fresh
+> install's first rotate attempt is refused for up to this interval too —
+> KEK v1 is minted at boot with `created_at = now()`. A failed
+> attempt consumes the budget too — deliberately, because a failed rotation
+> is exactly when you must not immediately rotate again: automation that
+> retries `/rotate` on a `500` would otherwise mint a fresh version on every
+> retry, and a KEK version can never be retired (#2525). **`/rewrap` is NOT
+> rate-limited** and is the correct way to finish a half-committed rotation.
+> Unlike the `409`/`503` cases above, this `429`'s `retry_after_ms` is
+> **honest** — computed from the same durable database-clock timestamp, so
+> waiting genuinely resolves it (the field is a `uint32` millisecond count
+> that **saturates** at its maximum on an oversized configured interval
+> rather than wrapping, so it can only come out over-long, never falsely
+> short). Cluster-wide *correctness* (as opposed to rate limiting) still
+> comes from the advisory lock, which returns `409`, not this.
+>
+> **`--kek-min-rotate-interval` is a runaway/abuse guard, not a rotation
+> schedule — do NOT set it to your rotation cadence.** It exists to stop a
+> looping caller (buggy automation, a compromised token) hammering
+> `/rotate`, not to express how often you intend to rotate; most operators
+> should never change the default. Raising it directly delays *emergency*
+> re-rotation after a suspected KEK compromise, with no bypass (`/rewrap`
+> only resumes an in-progress rotation, never mints a new version) — e.g.
+> setting it to 90 days to "match" a quarterly policy means a routine
+> rotation followed by a compromise the next day leaves you refused for the
+> next three months, with no escape short of a restart at a lower value
+> mid-incident. The 365-day upper bound is a fat-finger sanity ceiling, not
+> a recommendation.
+
+#### `POST /api/v1/secrets/kek/rewrap`
+
+Idempotent resume: re-wrap every row still on a non-active KEK version under
+the current active one. Safe to call repeatedly, including when there is
+nothing left to do. **Permission:** `Security:Write`. No request body.
+
+```json
+{ "rows_rewrapped": 3, "meta": { "api_version": "v1" } }
+```
+
+`rows_rewrapped: 0` is a normal outcome, not an error. Errors: `400`/`413`,
+`403` (missing `Security:Write`), `409` (advisory lock held), `503` (codec/
+Postgres unavailable, **or** `"a KEK query was canceled or exceeded its
+statement timeout"` — same #2530 SQLSTATE `57014` classification and
+non-transient caveat as `/rotate` above; `/rewrap` never returns the ceiling
+or clock-anomaly failures, those are rotate-only preconditions).
+
+#### `GET /api/v1/secrets/kek/status`
+
+Current KEK rotation status. **Permission:** `Security:Read`.
+
+```json
+{
+  "active_version": 2,
+  "oldest_in_use": 2,
+  "rotation_complete": true,
+  "live_versions": 2,
+  "lock_held": false,
+  "lock_holder_pid": null,
+  "meta": { "api_version": "v1" }
+}
+```
+
+`oldest_in_use` is `null` when no secret rows exist at all (trivially
+complete). Read-only, not audited, and — unlike `/rotate`/`/rewrap` — this
+route **deliberately never takes** the `secrets_kek_op` advisory lock, so it
+never returns `409` for lock contention. Errors: `403` (missing
+`Security:Read`), `503` (codec/Postgres unavailable, or the same
+`query_canceled` classification as above while reading the oldest-referenced
+version).
+
+> **`live_versions`, `lock_held`, `lock_holder_pid` (#2530).** Diagnostic
+> fields for diagnosing a wedged `secrets_kek_op` lock — before these
+> existed, a stuck holder made every KEK operation `409` forever with no way
+> to see why. `lock_held`/`lock_holder_pid` report the lock **in this
+> server's own database** (the underlying query is filtered by
+> `current_database()`, not cluster-wide — a same-named advisory lock held
+> by an unrelated tenant database sharing the same Postgres instance is
+> never reported here). They are **lock-free snapshots read at possibly
+> different instants**, not one coordinated read — never derive a "safe to
+> retire" conclusion from any combination of them (#2525), and never treat
+> `lock_holder_pid` alone as sufficient grounds to terminate a backend: a
+> healthy long-running re-wrap looks identical to a wedge from this field
+> alone. The full diagnosis-and-remedy procedure (corroborate against
+> `pg_stat_activity` before any DBA action) is in
+> `docs/user-manual/server-admin.md` § "Diagnosing a stuck KEK op lock".
+>
+> **`live_versions` and `lock_held` are `null` — never a fabricated `0`/
+> `false` — when the underlying query could not be determined.** The key is
+> always present; `null` means "could not be determined", not a truthful
+> negative. This matters most for `lock_held`: a `null` here **must never be
+> read as "no lock is held"** — it means the lock state is UNKNOWN.
+> Corroborate via `pg_stat_activity` before concluding anything, exactly as
+> you would for a genuinely-held lock.
+>
+> **`lock_holder_pid` is `null` in THREE distinct situations — always check
+> `lock_held` first to tell them apart:** (1) `lock_held: false` → genuinely
+> unheld, nothing to report; (2) `lock_held: null` → undetermined, the
+> holder query itself failed, the pid is meaningless (not "unheld"); (3)
+> `lock_held: true` with `lock_holder_pid: null` → the lock **is** held, but
+> the holder's backend pid could not be read from `pg_locks` at query time —
+> there is no pid to corroborate against `pg_stat_activity`; instead query
+> `pg_locks` directly for any granted holder of `secrets_kek_op` in the
+> current database (see `docs/user-manual/server-admin.md`'s runbook for the
+> exact query) and, if it also comes back empty or unreadable, escalate to a
+> DBA inspection rather than waiting on a pid that may never arrive.
+
+> **No retire endpoint — by design.** Yuzu does not expose a way to destroy an
+> old KEK version, even though the codec's internal `retire_kek` exists and is
+> tested. `SecretCodec::encrypt()` snapshots the active version and releases
+> its lock before the caller persists the blob, so a retirement could pass its
+> "zero references" check and delete a key an in-flight write is about to use
+> — a permanent, unrecoverable loss (#2525). Old KEK files are expected to
+> accumulate; they are required to restore older backups and must not be
+> deleted by hand.
 
 ---
 
@@ -5274,7 +5468,7 @@ Send a command to one or more connected agents.
   "plugin": "hardware",
   "action": "cpu-info",
   "agent_ids": ["agent-01", "agent-02"],
-  "parameters": {},
+  "params": {},
   "stagger": 30,
   "delay": 5
 }
@@ -5284,13 +5478,33 @@ Send a command to one or more connected agents.
 |---|---|---|---|---|
 | `plugin` | string | Yes | -- | Target plugin name. |
 | `action` | string | Yes | -- | Action within the plugin. |
-| `agent_ids` | array of string | No | `[]` | Target agent IDs. Empty = broadcast to all. |
-| `parameters` | object | No | `{}` | Key-value parameters passed to the plugin. |
-| `scope` | string | No | `""` | Scope expression for device targeting (alternative to `agent_ids`). |
+| `agent_ids` | array of string | No | -- | Target agent IDs. **Omit the field** to broadcast. A supplied `[]`, a non-array value, or a non-string entry returns `400` (#2500). |
+| `params` | object | No | `{}` | Key-value parameters passed to the plugin. (This table previously named the field `parameters`; the handler has always read `params`, so a client written to the old text silently dispatched with no parameters at all.) |
+| `scope` | string | No | -- | Scope expression for device targeting (alternative to `agent_ids`), or `__all__` for every enrolled agent. A supplied `""` or non-string value returns `400` (#2500). |
 | `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. |
 | `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). |
 
-If `agent_ids` is empty or omitted and no `scope` is provided, the command is broadcast to all connected agents.
+**Targeting: omitted means everything, supplied-but-empty is an error (#2500).**
+Omitting **both** `agent_ids` and `scope` broadcasts to all connected agents, as does an
+explicit `"scope": "__all__"`. Supplying either field with a value that names no device is
+refused with `400` rather than widened — an empty `agent_ids`, a non-array `agent_ids`, a
+non-string entry, an empty `scope`, or a non-string `scope`. Before this, a client emitting
+numeric device ids (`"agent_ids": [1,2,3]`) or one whose device filter matched nothing
+(`"agent_ids": []`) dispatched to the **entire fleet** and received a success response.
+
+`agent_ids` and `scope` are **alternatives — supply exactly one, or neither.** Supplying
+`agent_ids` together with a real `scope` returns `400` (`reason=target_conflict`). They used to
+resolve by precedence, with the scope winning and the explicit id list silently discarded, so
+`{"agent_ids":["dev-a"],"scope":"tag:prod"}` ran on every device matching `tag:prod` rather than
+on `dev-a` — the same "the executed set is not the requested set" defect this section is about,
+reached by two selectors disagreeing instead of by one being erased.
+
+The single exception is `"scope": "__all__"` alongside `agent_ids`: `__all__` is the broadcast
+*request* rather than a narrowing selector, and the explicit id list wins.
+
+Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",reason=...}` and
+write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
+must be a JSON object; anything else is `400`.
 
 ---
 
@@ -5425,13 +5639,21 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 ```json
 {
   "agent_ids": ["agent-uuid-1"],
-  "scope": "",
   "params": {"key": "value"}
 }
 ```
 
-- `agent_ids` (optional) — array of agent IDs to target
-- `scope` (optional) — scope expression (e.g., `group:servers`). Empty string + empty `agent_ids` = broadcast
+- `agent_ids` (optional) — array of agent IDs to target. **Omit** to broadcast; a supplied `[]`,
+  a non-array value, or a non-string entry returns `400` (#2500).
+- `scope` (optional) — scope expression (e.g., `group:servers`), or `__all__` for every enrolled
+  agent. A supplied `""` or non-string value returns `400`.
+
+> **Behaviour change (#2500).** This endpoint previously documented "empty string + empty
+> `agent_ids` = broadcast", and an explicitly empty `agent_ids` did broadcast. It is now `400`.
+> **Omit both fields** (or send `"scope": "__all__"`) to target the whole fleet deliberately.
+> Refusals increment `yuzu_server_dispatch_target_rejected_total{route="instruction_execute"}`
+> and write an `instruction.execute` audit row with `result=denied`. The body must be a JSON
+> object; anything else is `400`.
 - `params` (optional) — key-value parameters passed to the plugin
 
 **Response (200):**
@@ -6418,7 +6640,7 @@ username=admin&password=secretpass
 | `202` (`mfa_required`) | Credentials valid; user **has** TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
 | `202` (`mfa_enrollment_required`) | Credentials valid; user is **un-enrolled** and `--mfa-enforcement` (`admin-only` for admins / `required` for all) requires MFA | `{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","qr_svg":"<inline SVG, or empty>","expires_in":120}` — show the QR/secret and complete enrollment via `POST /login/mfa/enroll` |
 | `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
-| `503` | Enforcement applies but `auth.db` is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
+| `503` | Enforcement applies but the auth store is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
 | `503` | The in-memory pending-challenge map is at capacity (server under a `/login` flood; transient load-shed) | `{"error":{"code":503,"message":"too many pending authentications, retry shortly"}}` — retry after a short back-off; emits `yuzu_auth_mfa_pending_load_shed_total` |
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `qr_svg` field on the enrollment variant is a server-rendered inline SVG QR code encoding `otpauth_uri` — inject it into the DOM **without** HTML-escaping (it is pure shape geometry, no user content). If `qr_svg` is the empty string, QR encoding failed; fall back to displaying `secret_base32` / `otpauth_uri` for manual entry. The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
@@ -6470,8 +6692,10 @@ Only a 6-digit TOTP code is accepted (recovery codes do not exist until enrollme
 | Status | Condition | Body |
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted; enrollment complete, session minted | `{"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", … 10 total]}` — revealed **once**; save them |
-| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, or attempts exhausted | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
-| `503` | `auth.db` unavailable | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, attempts exhausted, **or the auth store is not configured at all** (null DB) | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
+| `503` | Auth store reachable but the secret could not be verified — decrypt/store failure (e.g. KEK unresolvable) | `{"error":{"code":503,"message":"authentication store is temporarily unavailable"}}` |
+
+A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt.
 
 **Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on failure `mfa.enroll.failed`.
 
@@ -6584,7 +6808,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
 
 **Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — no `auth.db`.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"); `403` — not eligible, eligibility read failed (fail-closed), **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), or **OIDC-amr elevation is disabled** (`--jit-oidc-amr-elevation` off); the MFA step-up itself returns the standard step-up `401` challenge envelope (see `/login/mfa/stepup`); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the auth store is unavailable.
 
 **Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / mfa_step_up_refused). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 

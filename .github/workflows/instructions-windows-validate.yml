@@ -21,6 +21,8 @@ jobs:
     name: Windows MSVC — Instructions gate
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 60
+    env:
+      YUZU_BUILD_JOBS: "16"
     defaults:
       run:
         shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
@@ -63,7 +65,7 @@ jobs:
               -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
               -Dbuild_tests=false
           fi
-          meson compile -C "$BUILDDIR"
+          meson compile -C "$BUILDDIR" -j "$YUZU_BUILD_JOBS"
 
       - name: Generate server config (PBKDF2 admin)
         run: |

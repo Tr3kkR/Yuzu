@@ -12,7 +12,8 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 | File | Role |
 |---|---|
 | `Provision-Windows-Runner.ps1` | Installs the pinned toolchain, sets machine env (incl. the gateway + shared-cache contracts), emits `toolchain-manifest.json`. |
-| `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest (every required tool present, every contract env set). Run at provision time **and** as a registration/preflight gate. |
+| `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
+| `Test-ProvisionLogic.ps1` | Regression tests for the provisioning script's decision logic (maintenance gate, `-D` handling, `ImagePath` rewrite). Safe anywhere — no elevation, no machine state. Run after editing `Provision-Windows-Runner.ps1`. |
 | `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache and selects that runner's persistent telemetry DB. |
 
 ## Standing up a new box
@@ -24,6 +25,43 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    ```
    Re-runnable; pins live in the `param()` block (bump deliberately). Open a new
    shell afterwards so machine PATH/env take effect.
+
+   **On an existing shared box, stop all four runners first.** Provisioning
+   restarts shared PostgreSQL services and rewrites machine PATH/env under
+   whatever is running. A maintenance gate at the top of the script enforces
+   this: it exits (code 2) before *any* step if a `Runner.Listener.exe` or
+   `Runner.Worker.exe` is live. It gates on the **listener**, not just the
+   worker — an idle listener can accept a job mid-run, so "no job right now" is
+   not a safe state.
+
+   That start-of-run check can be minutes stale by the time a service restart
+   happens, so it is **re-asserted immediately before every `Restart-Service`**
+   — the main PostgreSQL step's included — and on entry to the long per-agent
+   binary step. The single exception is the rollback restart, marked
+   `DRAIN-EXEMPT` in the source: it runs only after a liveness probe proves that
+   cluster is *not* serving, where refusing would strand it broken — worse than
+   the restart. It warns instead.
+
+   Wherever it fires, the gate **exits the process directly** (code 2) rather
+   than raising an error for something else to handle. That is deliberate:
+   `Step()` catches and continues by design, so anything catchable can be — and
+   twice was — swallowed or re-wrapped before reaching the top, letting the
+   later Defender, vcpkg and machine PATH/env steps run under a live job. `exit`
+   cannot be intercepted by any handler.
+
+   It is a **check, not a lock**: an operator who starts a runner mid-run is
+   detected at the next check, not prevented.
+
+   `-AllowActiveRunners` **skips the check only** — it stops no runner and kills
+   no job, so a live job may simply be interrupted. It exists for a box you know
+   is yours.
+
+   If you **edited** the provisioning script, run its regression tests first —
+   they need no elevation and touch no machine state, so run them anywhere,
+   including on a box that is busy:
+   ```powershell
+   pwsh -File deploy\windows\Test-ProvisionLogic.ps1
+   ```
 
 2. **Self-test** (must pass before registering):
    ```powershell
@@ -70,6 +108,31 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
   wrapper change is involved — re-running the provisioning script is the whole
   cutover.
+- **Per-agent PostgreSQL binaries (#2354).** Each cluster also gets a **private
+  copy of the whole PostgreSQL install tree** under `D:\ci\pgbin\agent-<n>`, and
+  its Windows-service `ImagePath` is repointed at that copy's `pg_ctl.exe` (the
+  `-D` datadir and every other argument left intact). Rationale: Postgres on
+  Windows is `EXEC_BACKEND` — every connection `CreateProcess()`es a fresh
+  `postgres.exe` — and when all four CCD-pinned agents shared one
+  `C:\pgsql\bin\postgres.exe`, every backend spawn box-wide contended that single
+  image file's FCB / image-section lock (~1000–1466 ms/spawn under concurrency;
+  root-caused 2026-07-22, **not** Defender and **not** disk). A byte-identical
+  copy at its own path has its own FCB and spawns in ~10–20 ms — validated ~50–70×
+  under all-four-agent churn. The step is idempotent (`robocopy` refreshes the
+  tree in place; an already-repointed `ImagePath` is accepted only after
+  `pg_isready` plus authenticated `SELECT 1`) and per-agent catch-and-continue.
+  A failed repoint restores the exact original `ImagePath`, restarts from the
+  original bin directory, and verifies the same two health checks; a failed
+  rollback is reported distinctly instead of claiming recovery. Both registry
+  writes preserve the value's original kind, so a rollback restores the exact
+  original bytes. Agent 0's live data exclusion comes from the service's actual
+  `-D` argument (canonicalised before it is handed to `robocopy /XD`, which
+  matches by path string), not an assumed install-root layout. `D:\ci\pgbin` and
+  each copy's `postgres.exe` join the Defender exclusions below — and, unlike
+  before, those two are verified fail-closed rather than added best-effort. The
+  manifest self-test verifies all four private binary sets, registered service
+  executables, `Running` states, and live authenticated probes, so drift fails
+  before a build starts.
 - **Shared vcpkg binary cache.** `RUNNER_TOOL_CACHE=D:\ci\tool_cache` points
   `${{ runner.tool_cache }}` (hence `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml`) at
   **one** machine-level dir, so the 4 CCD-pinned runners share one warm vcpkg
@@ -77,6 +140,12 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   `CCACHE_DIR=D:\ci\ccache`. Set in each runner's `.env` (durable) and exported
   by the wrapper. The vcpkg binary cache is content-addressed → concurrent writes
   across runners are safe.
+- **Build parallelism.** Provisioning sets machine-level
+  `YUZU_BUILD_JOBS=16`; `Start-PinnedRunner.ps1` consumes that value and refuses
+  to start if it is missing or differs from the fixed 16-thread CCD envelope.
+  `Assert-Toolchain.ps1` also compares the live machine value with the manifest.
+  CI passes it explicitly as `meson compile -j 16`; affinity controls placement
+  but does not make Ninja ignore the host-wide 64-CPU count.
 - **Persistent CI telemetry.** Each runner owns
   `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. Provisioning initializes
   all four databases; the pin wrapper exports the matching path as
@@ -112,10 +181,13 @@ verified by `Assert-Toolchain.ps1`:
 {
   "generated": "2026-06-20T13:00:00Z",
   "host": "WEETAM",
+  "runner_count": 4,
   "pins":  { "python": "3.14.6", "meson": "1.11.1", "erlang": "28.4.2",
-             "rebar3": "3.24.0", "postgres": "18.4", "vcpkg_baseline": "4b77da7..." },
+             "rebar3": "3.24.0", "postgres": "18.4", "build_jobs": 16,
+             "vcpkg_baseline": "4b77da7..." },
   "env":   { "VCPKG_ROOT": "C:\\vcpkg", "CCACHE_DIR": "D:\\ci\\ccache",
              "RUNNER_TOOL_CACHE": "D:\\ci\\tool_cache",
+             "YUZU_BUILD_JOBS": "16",
              "YUZU_ESCRIPT": "...erts-*\\bin\\escript.exe",
              "YUZU_REBAR3": "C:\\tools\\rebar3\\rebar3",
              "YUZU_TEST_POSTGRES_DSN": "postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test" },
@@ -123,6 +195,15 @@ verified by `Assert-Toolchain.ps1`:
     "root": "D:\\ci\\test-runs",
     "databases": ["D:\\ci\\test-runs\\yuzu-weetam-windows-0\\test-runs.db", "..."]
   },
+  "postgres_clusters": [
+    { "agent": 0, "service": "postgresql-x64-18-yuzu-ci", "port": 5433,
+      "bin": "D:\\ci\\pgbin\\agent-0\\bin",
+      "pg_ctl": "D:\\ci\\pgbin\\agent-0\\bin\\pg_ctl.exe",
+      "postgres": "D:\\ci\\pgbin\\agent-0\\bin\\postgres.exe",
+      "psql": "D:\\ci\\pgbin\\agent-0\\bin\\psql.exe",
+      "pg_isready": "D:\\ci\\pgbin\\agent-0\\bin\\pg_isready.exe" },
+    "..."
+  ],
   "tools": [ { "name": "vcpkg", "path": "C:\\vcpkg\\vcpkg.exe", "version": "...", "required": true }, ... ]
 }
 ```

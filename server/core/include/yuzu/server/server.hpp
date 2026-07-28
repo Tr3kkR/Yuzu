@@ -360,6 +360,39 @@ struct Config {
     /// audit event + a startup spdlog::warn — exact parity with
     /// `--allow-unsigned-packs`.
     bool allow_unsigned_definitions{false};
+
+    // KEK rotation runaway control (#2530 B5). See kek_routes.hpp and the
+    // rotate control-flow comment in server.cpp (secrets_kek_op lock
+    // section) for how these two feed the durable checks.
+    /// Durable rate limit: a rotate request is refused (`Cooldown`, 429) when
+    /// the newest `secrets.kek_meta` row is younger than this, read from the
+    /// database server's own clock (not the app host's). This is a
+    /// RUNAWAY/ABUSE GUARD against looping automation, NOT a rotation-cadence
+    /// setting — default 3600s (1h) is sized for that job and most operators
+    /// should never change it. Raising it directly delays EMERGENCY
+    /// re-rotation after a suspected key compromise, with no bypass
+    /// (`/rewrap` only resumes an already-half-committed rotation; it never
+    /// mints a new version) short of a restart with a lower value —
+    /// mid-incident. Do not set this to your rotation cadence (e.g. 90d for
+    /// "quarterly"): that would leave an operator refused for up to that
+    /// long during the one operation this whole surface exists to make fast.
+    /// CLI-bounded to [1, 31536000] (365d, main.cpp) as a sanity ceiling
+    /// against a fat-fingered value, not an endorsement of setting it that
+    /// high. The honest `cooldown_retry_after_ms` this feeds is a uint32
+    /// millisecond count; `evaluate_rotate_preconditions`
+    /// (kek_rotate_control.hpp) saturates rather than wraps past ~49.7 days,
+    /// so the 365d CLI bound is defence-in-depth, not the only thing keeping
+    /// the hint honest.
+    /// Wired via --kek-min-rotate-interval / YUZU_KEK_MIN_ROTATE_INTERVAL.
+    int kek_min_rotate_interval_secs{3600};
+    /// Backstop ceiling: a rotate request is refused (`VersionCeiling`, 409)
+    /// once the count of non-retired KEK versions reaches this. There is no
+    /// retire route (#2525), so raising this above the default is the
+    /// supported escape hatch that keeps rotation usable for an install that
+    /// has hit the ceiling — an explicit, logged and audited temporary risk
+    /// acceptance pending #2525, not a routine tuning knob. Default 32.
+    /// Wired via --kek-max-live-versions / YUZU_KEK_MAX_LIVE_VERSIONS.
+    int kek_max_live_versions{32};
 };
 
 /// Trim leading/trailing ASCII whitespace (space/tab/CR/LF). Used to
