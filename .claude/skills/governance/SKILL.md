@@ -31,8 +31,9 @@ Gate 3 — domain-triggered agents                   (parallel, decision matrix 
 Gate 4 — happy-path + unhappy-path + consistency   (parallel, mandatory)
 Gate 5 — chaos-injector                            (conditional on Gate 4)
 Gate 6 — compliance + sre + enterprise-readiness   (parallel, mandatory)
+Gate 6b — synthesis pass (presentation only, workflow-orchestrator)
 Gate 7 — address BLOCKING findings
-Gate 8 — re-review affected gates, ledger, final decision
+Gate 8 — re-review gates whose DOMAIN THE FIX TOUCHED, ledger, final decision
 ```
 
 Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.
@@ -55,6 +56,50 @@ Check existing memory that might apply — at minimum:
 - `feedback_governance_run.md` — prior-run learnings
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
+
+---
+
+## Shared preamble — inject this into EVERY agent prompt
+
+Twelve agents asked for "BLOCKING / SHOULD / NICE" with no definition invent twelve
+different bars, and the operator normalises by hand. Paste this block verbatim into
+every Gate 2/3/4/6 prompt, in addition to that agent's own focus.
+
+```
+## Severity definitions — use these exactly
+
+BLOCKING — would cause incorrect behaviour, data loss, a security regression, or
+  misleading operator guidance in production. You must be able to name the failing
+  input or state. If you cannot, it is not BLOCKING.
+SHOULD — a real defect with bounded blast radius, or a missing test for a behaviour
+  that has one.
+NICE — everything else.
+
+## Prose is docs-writer's
+
+`docs-writer` owns comment, doc and changelog WORDING. Report a comment or doc only
+when it CONTRADICTS the code — and say which one is wrong. A wording-only
+observation is capped at NICE: report it if you think it matters, never above.
+
+Exception, and it is load-bearing: a factually false comment adjacent to a security
+or control-flow branch IS a contradiction, not wording. #2202 shipped a comment
+asserting the opposite of what its function did, next to an authz branch.
+
+(Capping rather than banning is deliberate: deciding whether prose is descriptive or
+normative is exactly the disputed question, so a mis-classification should cost a
+line of noise, not a lost finding.)
+
+## Verify what you can, read-only
+
+Where a claim can be tested cheaply — a query, a compile, a one-case test — TEST IT
+and report the output. An empirically verified finding outranks a reasoned one, and
+a reasoned finding about observable behaviour should say it was not verified. The
+highest-value finding of the #2580 run came from an agent running a real query
+against a live Postgres rather than reasoning about the SQL.
+
+READ-ONLY, against disposable state only. Never mutate a live store, and never run a
+destructive statement to raise a finding's standing.
+```
 
 ---
 
@@ -345,6 +390,30 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 | Background thread or callback storing pointer/reference | **cpp-safety**, **sre** |
 | Packaging, systemd units, Dockerfiles, installer scripts | **release-deploy** |
 | New/changed REST route, MCP tool, dashboard fragment/page, or any other capability-adding operator surface | **architect**, **security-guardian** — both apply the ADR-1005 standing question (below) |
+
+### Standing rule — routed triggers are UNCONDITIONAL
+
+Do not gate any routed-concern trigger, or any "always include" rule below, on diff
+size or a materiality threshold. `.claude/routed-concerns.md` keys on **file identity
+and change type**, because those files carry catastrophic-if-violated invariants
+regardless of line count. Any roster trimming may only choose among agents those rules
+did **not** already select.
+
+A 2026-07 proposal to run a "core four" on small diffs was BLOCKed by two independent
+adversarial reviews, which produced these kill shapes — all "single-file, small, no
+public surface":
+
+- **10 lines of `gateway/config/sys.config`** weakening management-listener client-cert
+  verification. `gateway-erlang` dropped; `cpp-safety` is useless on Erlang config; the
+  PKI route calls a plaintext gateway a fleet-RCE edge.
+- **A retention/prune tweak.** The clock-guard row mandates `cpp-safety` + `sre` +
+  `compliance-officer` (#2360/#2361) — two of the three would have been dropped.
+- **A one-line `.github/workflows` `if:` guard.** The failure-path-guard invariant went
+  silently dead for two months (#1038); that is `build-ci`'s domain.
+- **Any small C++ diff**, because a "core four" contains no portability reviewer — the
+  exact gap that shipped #2580's macOS break.
+
+Rationale and the full review record: `docs/governance-skill-tuning-2026-07.md`.
 
 **Always include architect** when any public store contract or REST API surface changes — the duplicate-validation and error-mapping drift patterns recur.
 
@@ -667,6 +736,43 @@ Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to
 
 ---
 
+## Gate 6b — Synthesis pass (presentation only)
+
+A full run produces on the order of 45 non-blocking findings, each as its own block of
+prose, with the same defect frequently reported by two or three agents at full length.
+On #2580, four of six round-1 BLOCKINGs arrived 2–3 times over. All of the triage
+landed on the operator, and `workflow-orchestrator` — which exists for exactly this —
+was never invoked.
+
+Run it now, over the raw reports:
+
+```
+Agent (workflow-orchestrator): Synthesise the attached Gate 2/3/4/6 reports into a
+single severity-ordered table for the operator. Preserve EVERY source report verbatim
+as an appendix — you are changing presentation, not content.
+
+Cluster two findings ONLY when they share the same file:line AND the same defect.
+Anything else stays separate. For each cluster: list its reporting agents, take the
+MAXIMUM severity of its members, and do NOT re-adjudicate severity or dismiss a
+finding. Mark every cluster PROVISIONAL.
+```
+
+Three rules, all load-bearing:
+
+- **Same `file:line` AND same defect.** Never "same theme". On #2580, the BLOCKING for
+  the incomplete REST classifier and the BLOCKING for the hardcoded MCP retry hint
+  summarise almost identically and needed **separate fixes and separate tests** — a
+  synthesiser merging on theme would have hidden one of them.
+- **Max severity, never re-adjudicated.** The synthesiser has not read the code.
+- **Clusters are provisional; the operator confirms equivalence.** The synthesiser is
+  not the authority on whether two findings are the same finding.
+
+Convergence is the strongest confidence signal this pipeline produces — "found
+independently by three agents" is why a finding gets acted on without re-derivation.
+This pass keeps that signal and drops the re-reading; it must not launder it.
+
+---
+
 ## Gate 7 — Findings Resolution
 
 **BLOCKING** = CRITICAL / HIGH security, BLOCKING from any Gate 4-6 agent, or any finding that explicitly says "blocks merge".
@@ -677,8 +783,34 @@ Strategy:
 
 ## Gate 8 — Iterate And Ledger
 
-1. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
+1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
+   findings prompted the fix. Run the Gate 3 decision matrix against the **fix diff**
+   exactly as you ran it against the original. A fix that adds a language feature, a
+   dependency, a thread, or a platform-specific call re-triggers the corresponding
+   agent **even if that agent raised nothing in round 1**.
+
+   This rule exists because the old one ("only the gates whose findings would be
+   affected") shipped a broken macOS leg on #2580. Gate 8 ran the four agents whose
+   findings had been fixed; `cpp-expert`, the portability reviewer, had only ever seen
+   commit 1. `std::jthread` was introduced in commit 3 **as a fix for a Gate 8
+   finding** and broke Apple Clang, whose libc++ has no `std::jthread` — every other
+   use in this codebase sits behind `#ifdef __cpp_lib_jthread`. No agent was ever
+   asked whether the fix was portable.
+
 2. **Don't commit until governance passes.** Per CLAUDE.md.
+
+3. **Record every finding in the ledger.** Append one row per finding to
+   `~/.local/share/yuzu/governance-findings.db` (or the run's log dir if that store
+   does not exist yet): run id, commit range, agent, severity, `file:line`, one-line
+   summary, and disposition — `fixed` / `deferred-to-issue #N` / `rejected` with the
+   reason.
+
+   Governance is the repo's largest issue-inflow source and, until this row existed,
+   **nothing recorded what it found**. CI outcomes, durations and flakes are persisted
+   and queryable (`docs/ci-architecture.md`); governance findings were not. Without
+   the ledger, "governance is too noisy" and "governance caught the thing that
+   mattered" are both unfalsifiable, and no roster change can be argued from evidence.
+   See `docs/governance-skill-tuning-2026-07.md`.
 
 ## Known patterns from prior runs
 
