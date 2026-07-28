@@ -49,6 +49,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Docker build workers do not inherit the Big Tam runner service's cpuset.
+  YUZU_BUILD_JOBS: "16"
+
 concurrency:
   group: hc-invariants-${{ github.ref }}
   # Supersede in-flight PR runs, but let a mainline push run to completion.
@@ -196,7 +200,9 @@ jobs:
           push: false
           load: true
           tags: yuzu-hc-verify/${{ matrix.role }}:${{ github.sha }}
-          build-args: ${{ matrix.build_args }}
+          build-args: |
+            ${{ matrix.build_args }}
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # READ-ONLY reuse of release.yml's local buildcache: the expensive
           # builder stages are already there, so a runtime-stage change (the
           # kind that breaks these invariants) rebuilds in seconds.

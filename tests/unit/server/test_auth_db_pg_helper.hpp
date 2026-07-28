@@ -35,6 +35,7 @@
 // same skip-vs-fail posture as every other [pg] test (see test_helpers.hpp).
 
 #include "key_provider.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -52,6 +53,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace yuzu::test {
 
@@ -239,6 +241,145 @@ private:
     std::unique_ptr<yuzu::server::pg::SecretCodec> codec_;
     std::optional<PostgresTestDb> db_;
     std::optional<yuzu::server::pg::PgPool> pool_;
+    std::unique_ptr<yuzu::server::AuthDB> authdb_;
+};
+
+namespace detail {
+/// One migrated "authdbwire" clone + one persistent pool for the whole
+/// PROCESS, shared by every AuthDbPgShared fixture and TRUNCATE-reset between
+/// tests, instead of a fresh CREATE DATABASE + 4-conn pool + KEK mint per
+/// fixture — the dominant [pg]-shard cost on Windows EXEC_BACKEND (#2354).
+/// Built lazily; at testRunEnded the pool is drained and the clone dropped
+/// (keep_until_run_end), leaving the function-local static destructor inert.
+struct AuthDbSharedBundle {
+    PostgresTestDb db{auth_db_pg_template};
+    std::optional<yuzu::server::pg::PgPool> pool;
+    AuthDbSharedBundle() {
+        INFO("[AuthDbSharedBundle] bundle status (blank == database came up OK): " << db.error());
+        REQUIRE(db.available());
+        pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+inline AuthDbSharedBundle& auth_db_shared_bundle() {
+    static AuthDbSharedBundle b;
+    return b;
+}
+} // namespace detail
+
+/// Shared-DB sibling of AuthDbPg (same call-site interface): the
+/// provider/codec/AuthDB chain is fresh per fixture — construction order
+/// still mirrors server.cpp exactly, and every fixture still mints its own
+/// KEK into its own fresh keys TempDir — but they run over the process-wide
+/// shared clone/pool, restored to its fresh-clone state at construction:
+///
+///   1. TRUNCATE the four `auth` tables (blob holders FIRST — see 2),
+///   2. DELETE FROM secrets.kek_meta — with the blobs already gone, the S6
+///      orphan scan stays clean and this fixture's codec.init() performs
+///      first-boot KEK generation, exactly like a fresh clone's would (the
+///      same reset the template build performs; see the file header).
+///
+/// Use for CRUD-only tests. NOT for: tests that need TWO distinct AuthDB
+/// databases in one Catch2 leaf (e.g. the seeded-vs-clean collision-scan
+/// pair in test_engine_principal_integration.cpp — the second construction
+/// would TRUNCATE the first's data), or anything that alters the schema via
+/// dsn() — keep those on AuthDbPg.
+class AuthDbPgShared {
+public:
+    /// Same parameters/semantics as AuthDbPg (see its ctor doc).
+    explicit AuthDbPgShared(int cleanup_interval_secs = 0, bool inject_encrypt_faults = false) {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        auto& bundle = detail::auth_db_shared_bundle();
+        {
+            auto lease = bundle.pool->acquire();
+            REQUIRE(lease);
+            // pg::exec_params is single-statement (PQexecParams) — two calls.
+            auto trunc = yuzu::server::pg::exec_params(
+                lease.get(),
+                "TRUNCATE auth.users, auth.enrollment_tokens, auth.pending_agents, "
+                "auth.mfa_recovery_codes RESTART IDENTITY CASCADE",
+                std::vector<std::string>{});
+            INFO("[AuthDbPgShared] reset TRUNCATE: " << PQresultErrorMessage(trunc.get()));
+            REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+            // COUPLING: this DELETE is sound ONLY while every registered
+            // secret column lives in a table TRUNCATEd above (today:
+            // auth.users.mfa_totp_secret). A future secret column in a table
+            // outside that list would leave blobs whose kek_version this
+            // DELETE orphans — SecretCodec's S6 scan then fails every later
+            // fixture. Extend the TRUNCATE list in the same commit that
+            // registers any new secret column reachable from these fixtures.
+            auto kek = yuzu::server::pg::exec_params(lease.get(), "DELETE FROM secrets.kek_meta",
+                                                     std::vector<std::string>{});
+            INFO("[AuthDbPgShared] reset kek_meta: " << PQresultErrorMessage(kek.get()));
+            REQUIRE(kek.status() == PGRES_COMMAND_OK);
+        }
+
+        provider_ = std::make_unique<yuzu::server::FileKeyProvider>(keys_.path);
+        if (inject_encrypt_faults) {
+            faulty_provider_ = std::make_unique<FaultyKekProvider>(*provider_);
+            codec_ = std::make_unique<yuzu::server::pg::SecretCodec>(*faulty_provider_);
+        } else {
+            codec_ = std::make_unique<yuzu::server::pg::SecretCodec>(*provider_);
+        }
+        // Migration check is a no-op on the already-migrated clone (a cheap
+        // SELECT, no new backend); the secret-column registration re-runs
+        // idempotently, exactly as it does on every AuthDbPg clone today.
+        authdb_ =
+            std::make_unique<yuzu::server::AuthDB>(*bundle.pool, *codec_, cleanup_interval_secs);
+        REQUIRE(authdb_->is_open());
+
+        yuzu::server::pg::PgConn conn{PQconnectdb(bundle.db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto init_res = codec_->init(conn.get());
+        INFO("[AuthDbPgShared] SecretCodec::init status (blank == ok): "
+             << (init_res.has_value() ? "" : std::string(yuzu::server::pg::SecretCodec::to_string(
+                                                  init_res.error().kind))));
+        REQUIRE(init_res.has_value());
+    }
+
+    AuthDbPgShared(const AuthDbPgShared&) = delete;
+    AuthDbPgShared& operator=(const AuthDbPgShared&) = delete;
+    AuthDbPgShared(AuthDbPgShared&&) = delete;
+    AuthDbPgShared& operator=(AuthDbPgShared&&) = delete;
+
+    /// Connection string of the SHARED database backing this store — for
+    /// tests that act on its data from a second connection. DML only: DDL
+    /// through this DSN poisons every later shared-fixture test.
+    [[nodiscard]] std::string dsn() const { return detail::auth_db_shared_bundle().db.dsn(); }
+
+    [[nodiscard]] yuzu::server::AuthDB* get() const noexcept { return authdb_.get(); }
+    yuzu::server::AuthDB* operator->() const noexcept { return authdb_.get(); }
+    yuzu::server::AuthDB& operator*() const noexcept { return *authdb_; }
+    explicit operator bool() const noexcept { return authdb_ != nullptr; }
+
+    [[nodiscard]] yuzu::server::pg::SecretCodec& codec() noexcept { return *codec_; }
+    [[nodiscard]] yuzu::server::pg::PgPool& pool() noexcept {
+        return *detail::auth_db_shared_bundle().pool;
+    }
+
+    /// Non-null only when constructed with `inject_encrypt_faults = true`.
+    [[nodiscard]] FaultyKekProvider* fault_provider() noexcept { return faulty_provider_.get(); }
+
+    /// Tear down the per-fixture chain early (store, then codec/provider).
+    /// The shared pool/database deliberately outlive every fixture
+    /// (SharedPgDbRegistry owns their teardown).
+    void reset() noexcept {
+        authdb_.reset();
+        codec_.reset();
+        faulty_provider_.reset();
+        provider_.reset();
+    }
+
+private:
+    yuzu::test::TempDir keys_;
+    std::unique_ptr<yuzu::server::FileKeyProvider> provider_;
+    // Same ordering constraint as AuthDbPg: destruct codec_ before
+    // faulty_provider_ before provider_.
+    std::unique_ptr<FaultyKekProvider> faulty_provider_;
+    std::unique_ptr<yuzu::server::pg::SecretCodec> codec_;
     std::unique_ptr<yuzu::server::AuthDB> authdb_;
 };
 

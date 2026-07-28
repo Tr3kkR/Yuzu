@@ -22,12 +22,16 @@
  */
 
 #include "kek_routes.hpp"
+#include "kek_rotate_control.hpp" // detail::kek_op_outcome_label — #2530 G8-F2 mapping-lock test
+#include "mcp_server.hpp"        // detail::kek_mcp_failure_tag — #2530 G8-F2 mapping-lock test
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server;
@@ -165,6 +169,10 @@ TEST_CASE("kek_routes: every KekOpResult::Failure maps to the documented HTTP st
     const Case cases[] = {
         {KekOpResult::Failure::Unavailable, 503},
         {KekOpResult::Failure::Conflict, 409},
+        {KekOpResult::Failure::Cooldown, 429},
+        {KekOpResult::Failure::VersionCeiling, 409},
+        {KekOpResult::Failure::QueryCanceled, 503},
+        {KekOpResult::Failure::ClockAnomaly, 503},
         {KekOpResult::Failure::HalfCommitted, 500},
         {KekOpResult::Failure::Internal, 500},
     };
@@ -198,6 +206,328 @@ TEST_CASE("kek_routes: every KekOpResult::Failure maps to the documented HTTP st
         REQUIRE(res);
         CHECK(res->status == c.expected_status);
     }
+}
+
+// #2530 G8-F2: the audit `detail` threaded to audit_fn for a failing
+// rotate/rewrap must be EXACTLY failure_tag()'s tag, for every Failure — not
+// just "some non-empty string", which is all the pre-existing audit tests
+// above check. Compared against the exported failure_tag twin
+// (detail::kek_route_failure_tag) rather than a hand-copied literal, so a
+// change to the production switch can't silently drift from what this test
+// expects.
+TEST_CASE("kek_routes: the audited failure detail is exactly failure_tag()'s tag, for every "
+          "Failure",
+          "[kek_routes][security]") {
+    struct Case {
+        KekOpResult::Failure failure;
+        const char* audit_detail; // the exact failure_tag() literal this failure must audit
+    };
+    const Case cases[] = {
+        {KekOpResult::Failure::Unavailable, "failure=unavailable"},
+        {KekOpResult::Failure::Conflict, "failure=conflict"},
+        {KekOpResult::Failure::Cooldown, "failure=cooldown"},
+        {KekOpResult::Failure::VersionCeiling, "failure=ceiling"},
+        {KekOpResult::Failure::QueryCanceled, "failure=query_canceled"},
+        {KekOpResult::Failure::ClockAnomaly, "failure=clock_anomaly"},
+        {KekOpResult::Failure::HalfCommitted, "failure=half_committed"},
+        {KekOpResult::Failure::Internal, "failure=internal"},
+    };
+    for (const auto& c : cases) {
+        INFO("rotate, failure=" << static_cast<int>(c.failure));
+        Harness h;
+        h.rotate_result.failure = c.failure;
+        h.wire();
+        auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 1);
+        // Literal, so this can't be tautological against the same production
+        // function under test, PLUS a cross-check against the exported
+        // production twin so a deliberate vocabulary change surfaces as a
+        // double-update, not a silent drift.
+        CHECK(h.audits[0].detail == c.audit_detail);
+        CHECK(h.audits[0].detail == detail::kek_route_failure_tag(c.failure));
+    }
+    for (const auto& c : cases) {
+        INFO("rewrap, failure=" << static_cast<int>(c.failure));
+        Harness h;
+        h.rewrap_result.failure = c.failure;
+        h.wire();
+        auto res = h.sink.Post("/api/v1/secrets/kek/rewrap", "");
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].detail == c.audit_detail);
+        CHECK(h.audits[0].detail == detail::kek_route_failure_tag(c.failure));
+    }
+}
+
+// #2530 G8-F2 — the mapping-lock #2284 says must exist. Three independent
+// switches classify the same nine `KekOpResult::Failure` values into
+// operator-facing tags: kek_routes.cpp's failure_tag() (REST audit detail,
+// "failure=xxx"), mcp_server.cpp's kek_failure_tag() (MCP audit detail, same
+// "failure=xxx" shape), and kek_rotate_control.hpp's kek_op_outcome_label()
+// (the bare Prometheus label value, no "failure=" prefix, plus a tenth case
+// — None -> "success" — that the other two never see since routes only call
+// them on a non-None failure). This test is deliberately NOT a refactor to
+// one shared table (out of scope for #2530 — see the hardening contract);
+// it exists so the three switches drifting apart is a red CI run, not a
+// silent metrics/audit mismatch discovered during an incident.
+TEST_CASE("kek_routes: failure_tag/kek_failure_tag/kek_op_outcome_label agree for every "
+          "Failure",
+          "[kek_routes][mcp][security]") {
+    const KekOpResult::Failure failures[] = {
+        KekOpResult::Failure::Unavailable,   KekOpResult::Failure::Conflict,
+        KekOpResult::Failure::Cooldown,      KekOpResult::Failure::VersionCeiling,
+        KekOpResult::Failure::QueryCanceled, KekOpResult::Failure::ClockAnomaly,
+        KekOpResult::Failure::HalfCommitted, KekOpResult::Failure::Internal,
+        KekOpResult::Failure::None,
+    };
+    for (auto f : failures) {
+        INFO("failure=" << static_cast<int>(f));
+        const std::string_view rest_tag = detail::kek_route_failure_tag(f);
+        const std::string_view mcp_tag = mcp::detail::kek_mcp_failure_tag(f);
+        const std::string_view outcome = detail::kek_op_outcome_label(f);
+
+        // REST and MCP agree byte-for-byte, INCLUDING the case neither
+        // route ever actually calls this on (None) — failure_tag()/
+        // kek_failure_tag() both fall back to "failure=internal" there,
+        // and the two fallbacks must still agree.
+        CHECK(rest_tag == mcp_tag);
+
+        if (f == KekOpResult::Failure::None) {
+            CHECK(outcome == "success");
+            continue;
+        }
+        // outcome is the same token as the "failure=xxx" tag, minus the
+        // "failure=" prefix — e.g. "failure=ceiling" <-> "ceiling".
+        REQUIRE(rest_tag.starts_with("failure="));
+        CHECK(rest_tag.substr(std::string_view("failure=").size()) == outcome);
+    }
+}
+
+// ── #2530 D: retry_after_ms presence/absence ─────────────────────────────
+
+TEST_CASE("kek_routes: #2530 D — VersionCeiling/QueryCanceled/ClockAnomaly carry NO "
+          "retry_after_ms; Cooldown/Conflict DO",
+          "[kek_routes]") {
+    struct Case {
+        KekOpResult::Failure failure;
+        bool expect_retry_hint;
+    };
+    const Case cases[] = {
+        {KekOpResult::Failure::Cooldown, true},
+        {KekOpResult::Failure::Conflict, true},
+        {KekOpResult::Failure::VersionCeiling, false},
+        {KekOpResult::Failure::QueryCanceled, false},
+        {KekOpResult::Failure::ClockAnomaly, false},
+    };
+    for (const auto& c : cases) {
+        INFO("failure=" << static_cast<int>(c.failure));
+        Harness h;
+        h.rotate_result.failure = c.failure;
+        h.wire();
+        auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+        REQUIRE(res);
+        auto body = json::parse(res->body);
+        REQUIRE(body["error"].contains("retry_after_ms")); // A4: always a key, nullable
+        if (c.expect_retry_hint)
+            CHECK_FALSE(body["error"]["retry_after_ms"].is_null());
+        else
+            CHECK(body["error"]["retry_after_ms"].is_null());
+    }
+}
+
+TEST_CASE("kek_routes: Cooldown's retry_after_ms is the seam-provided honest value when set, "
+          "and a sane fallback when the seam left it unset",
+          "[kek_routes]") {
+    Harness h;
+    h.rotate_result.failure = KekOpResult::Failure::Cooldown;
+    h.rotate_result.cooldown_retry_after_ms = 1234;
+    h.wire();
+    auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res);
+    REQUIRE(res->status == 429);
+    auto body = json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"] == 1234);
+
+    Harness h2;
+    h2.rotate_result.failure = KekOpResult::Failure::Cooldown;
+    h2.wire(); // cooldown_retry_after_ms left at its 0 default
+    auto res2 = h2.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res2);
+    auto body2 = json::parse(res2->body);
+    CHECK_FALSE(body2["error"]["retry_after_ms"].is_null());
+    CHECK(body2["error"]["retry_after_ms"].get<std::int64_t>() > 0); // a fallback, never a false "0"
+}
+
+TEST_CASE("kek_routes: QueryCanceled's remediation names statement_timeout/load/cancellation/"
+          "scan-size and never claims the condition is transient",
+          "[kek_routes]") {
+    Harness h;
+    h.rotate_result.failure = KekOpResult::Failure::QueryCanceled;
+    h.wire();
+    auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    auto body = json::parse(res->body);
+    const std::string remediation = body["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("statement_timeout") != std::string::npos);
+    CHECK(remediation.find("load") != std::string::npos);
+    CHECK(remediation.find("cancel") != std::string::npos);
+    CHECK(remediation.find("scan") != std::string::npos);
+    CHECK(remediation.find("not necessarily transient") != std::string::npos);
+}
+
+TEST_CASE("kek_routes: ClockAnomaly is distinct from Cooldown — no retry hint, message names "
+          "the untrustworthy clock",
+          "[kek_routes]") {
+    Harness h;
+    h.rotate_result.failure = KekOpResult::Failure::ClockAnomaly;
+    h.wire();
+    auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    auto body = json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    const std::string message = body["error"]["message"].get<std::string>();
+    const std::string remediation = body["error"]["remediation"].get<std::string>();
+    CHECK((message.find("clock") != std::string::npos ||
+           remediation.find("clock") != std::string::npos));
+}
+
+// #2530 G7-B6: the 503 body must report the observed skew MAGNITUDE, not
+// just the boolean fact of the anomaly — this is what lets an operator tell
+// "a few seconds of jitter" (self-clears) from "dated a year out" (does
+// not) at a glance.
+TEST_CASE("kek_routes: ClockAnomaly's message interpolates the seam-provided skew magnitude",
+          "[kek_routes]") {
+    Harness h;
+    h.rotate_result.failure = KekOpResult::Failure::ClockAnomaly;
+    h.rotate_result.clock_skew_secs = 31536000; // ~1 year — the "not just jitter" case
+    h.wire();
+    auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    auto body = json::parse(res->body);
+    const std::string message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("31536000") != std::string::npos);
+    const std::string remediation = body["error"]["remediation"].get<std::string>();
+    // The remediation must say there is NO bypass for this specific failure —
+    // it is the one 503 in this surface with no configuration escape at all.
+    CHECK(remediation.find("does NOT self-clear") != std::string::npos);
+}
+
+TEST_CASE("kek_routes: VersionCeiling names --kek-max-live-versions and never implies waiting "
+          "helps",
+          "[kek_routes]") {
+    Harness h;
+    h.rotate_result.failure = KekOpResult::Failure::VersionCeiling;
+    h.wire();
+    auto res = h.sink.Post("/api/v1/secrets/kek/rotate", "");
+    REQUIRE(res);
+    REQUIRE(res->status == 409);
+    auto body = json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    const std::string remediation = body["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("--kek-max-live-versions") != std::string::npos);
+}
+
+// ── #2530 B2: GET /status diagnostic snapshot fields ─────────────────────
+
+TEST_CASE("kek_routes: GET /status's 200 body carries live_versions, lock_held, and "
+          "lock_holder_pid",
+          "[kek_routes]") {
+    Harness h;
+    h.status_result.active_version = 3;
+    h.status_result.live_versions = 4;
+    h.status_result.lock_held = true;
+    h.status_result.lock_holder_pid = 4242;
+    h.wire();
+    auto res = h.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = json::parse(res->body);
+    CHECK(body["live_versions"] == 4);
+    CHECK(body["lock_held"] == true);
+    CHECK(body["lock_holder_pid"] == 4242);
+
+    Harness h2;
+    h2.status_result.lock_held = false;
+    h2.status_result.lock_holder_pid = std::nullopt;
+    h2.wire();
+    auto res2 = h2.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res2);
+    auto body2 = json::parse(res2->body);
+    CHECK(body2["lock_held"] == false);
+    CHECK(body2["lock_holder_pid"].is_null());
+}
+
+// #2530 H1 (Hermes round 2): `lock_holder_captured_at` carries the instant
+// the lock_held/lock_holder_pid snapshot was taken, so a stale reading is
+// visible as stale rather than authoritative — never fabricated when the
+// snapshot itself is undetermined.
+TEST_CASE("kek_routes: GET /status's 200 body carries lock_holder_captured_at as an ISO-8601 "
+          "string alongside a determined lock_held, and null when undetermined",
+          "[kek_routes]") {
+    Harness h;
+    h.status_result.active_version = 3;
+    h.status_result.lock_held = true;
+    h.status_result.lock_holder_pid = 4242;
+    h.status_result.lock_holder_captured_at = std::chrono::system_clock::time_point{
+        std::chrono::seconds{1735689600}}; // 2025-01-01T00:00:00Z
+    h.wire();
+    auto res = h.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = json::parse(res->body);
+    REQUIRE(body.contains("lock_holder_captured_at"));
+    CHECK(body["lock_holder_captured_at"] == "2025-01-01T00:00:00Z");
+
+    // Undetermined snapshot (query failure) — the seam never populates
+    // lock_held/lock_holder_pid/lock_holder_captured_at in that case; the
+    // route must serialise all three as JSON null, never fabricate a
+    // timestamp for a snapshot that was never taken.
+    Harness h2;
+    REQUIRE_FALSE(h2.status_result.lock_held.has_value());
+    REQUIRE_FALSE(h2.status_result.lock_holder_captured_at.has_value());
+    h2.wire();
+    auto res2 = h2.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res2);
+    auto body2 = json::parse(res2->body);
+    REQUIRE(body2.contains("lock_holder_captured_at"));
+    CHECK(body2["lock_holder_captured_at"].is_null());
+}
+
+// #2530 T5 — a seam that could NOT determine `live_versions`/`lock_held`
+// (the underlying Postgres query failed) leaves them default-constructed
+// `std::nullopt`, and the route MUST serialise that as JSON `null` — never a
+// fabricated `0`/`false`, and never by omitting the key (the key stays
+// present so a client can tell "unknown" apart from "server predates this
+// field" without a version check). This is the defect this task closes:
+// `lock_held: false` on a query failure reads as "no wedge" during the
+// exact incident (a stuck secrets_kek_op lock) this field exists to
+// diagnose.
+TEST_CASE("kek_routes: GET /status serialises undetermined live_versions/lock_held as JSON "
+          "null, never a fabricated 0/false, key still present",
+          "[kek_routes]") {
+    Harness h;
+    h.status_result.active_version = 3;
+    // Default-constructed KekOpResult: live_versions/lock_held are
+    // std::nullopt — exactly what the seam leaves them at on a query
+    // failure (server.cpp's status lambda never assigns them in that case).
+    REQUIRE_FALSE(h.status_result.live_versions.has_value());
+    REQUIRE_FALSE(h.status_result.lock_held.has_value());
+    h.wire();
+    auto res = h.sink.Get("/api/v1/secrets/kek/status");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = json::parse(res->body);
+    REQUIRE(body.contains("live_versions"));
+    CHECK(body["live_versions"].is_null());
+    REQUIRE(body.contains("lock_held"));
+    CHECK(body["lock_held"].is_null());
+    // Never fabricated to the misleading truthy-negative values.
+    CHECK(body["live_versions"] != 0);
+    CHECK(body["lock_held"] != false);
 }
 
 TEST_CASE("kek_routes: an unset KekOps member answers 503 without ever being invoked",

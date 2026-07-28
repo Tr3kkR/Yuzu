@@ -423,6 +423,128 @@ groups:
         annotations:
           summary: "Secret blob failed GCM authentication (tamper signal)"
 
+      # ── #2530 KEK rotation-runaway hardening ────────────────────────────
+      # yuzu_server_kek_op_lock_held is sampled every 15s off
+      # health_recompute_thread_ (server.cpp), filtered to THIS server's own
+      # database (current_database()) -- not cluster-wide; a same-named
+      # advisory lock held by an unrelated tenant database on the same
+      # Postgres instance never sets this gauge. A healthy long re-wrap and a
+      # genuinely wedged backend look IDENTICAL on this gauge alone — do NOT
+      # page this as "kill the pid". Corroborate via lock_holder_pid
+      # (GET /api/v1/secrets/kek/status) against pg_stat_activity before any
+      # DBA action; see docs/user-manual/server-admin.md "Diagnosing a stuck
+      # KEK op lock" for the full procedure. `for: 30m` is deliberately
+      # conservative (~120 samples at the 15s sampling cadence) — this is the
+      # only rotation-shaped condition worth paging on; the ceiling/cooldown/
+      # clock-anomaly/query-canceled failures are all self-diagnosing from
+      # the REST/MCP error body an operator already has in hand, not a
+      # background condition to detect.
+      - alert: YuzuKekOpLockHeldPersistently
+        expr: |
+          yuzu_server_kek_op_lock_held == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "secrets_kek_op advisory lock has been held for 30+ minutes"
+          description: >-
+            THIS MAY BE A HEALTHY YUZU SERVER MID-ROTATION, NOT A WEDGE -- a
+            large re-wrap legitimately holds this lock for its whole
+            duration, and 30+ minutes is expected on a big secrets table.
+            Terminating the holder mid-rotate produces a HALF-COMMITTED
+            rotation (new KEK version already active, re-wrap incomplete),
+            whose only recovery is POST /api/v1/secrets/kek/rewrap -- a
+            retried /rotate on top of that state mints a second, spurious,
+            never-retirable version and does not fix anything. Read "Diagnosing
+            a stuck KEK op lock" in docs/user-manual/server-admin.md in full
+            before touching pg_terminate_backend. Scoped to this server's own
+            database (current_database()), not cluster-wide. A healthy,
+            long-running rewrap is indistinguishable from a wedged backend by
+            this gauge alone -- corroborate via lock_holder_pid and
+            lock_holder_captured_at (GET /api/v1/secrets/kek/status) against
+            pg_stat_activity before concluding anything, and RE-CONFIRM the
+            pid is still the granted holder in pg_locks at the moment of
+            termination (Postgres pids are reused, and the /status reading
+            you are looking at is already stale by the time you act on it).
+            Only a DBA terminates a backend, deliberately, after that
+            re-confirmation, and only after checking whether the backend
+            belongs to a Yuzu server (pg_stat_activity.client_addr /
+            application_name where set) -- prefer stopping that server
+            cleanly over killing its backend. This gauge HOLDS its prior
+            value rather than publishing a fabricated 0 on a database-read
+            degrade, so a firing alert during a database outage may reflect
+            stale last-known state rather than a currently-held lock -- check
+            the yuzu-postgres alerts first.
+
+      # #2530 G7-S6: sibling of YuzuInventoryStaleCountUnavailable above —
+      # same freeze-detector shape, different gauge family. The KEK gauges
+      # (yuzu_server_kek_{op_lock_held,live_versions,active_version}) HOLD
+      # their prior published value on a database-read degrade rather than
+      # publish a fabricated 0/false, so a healthy-looking reading during a
+      # sustained increase here may just be stale, not genuine. Fleet-size-
+      # independent, so it ships ACTIVE.
+      - alert: YuzuKekMetricsUnavailable
+        expr: |
+          rate(yuzu_server_kek_metrics_unavailable_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEK cluster-state gauges may be frozen or absent"
+          description: >-
+            yuzu_server_kek_metrics_unavailable_total is rising. THREE
+            distinct causes, all counted here: (1) the 15s KEK-metrics
+            sampling sweep (health_recompute_thread_) failed to acquire a
+            pooled connection, or (2) hit its bounded statement_timeout mid
+            read -- in either case yuzu_server_kek_op_lock_held /
+            yuzu_server_kek_live_versions are HELD at their last published
+            value and may read healthy during an actual outage or a
+            genuinely wedged secrets_kek_op lock; OR (3) the KEK substrate
+            itself (the secrets codec / Postgres pool) is not wired up at
+            all, in which case EVERY KEK gauge in this sweep -- including
+            yuzu_server_kek_active_version, which needs no DB round trip --
+            is never published and reads as ABSENT, not merely stale.
+            Distinguish (1)/(2) from (3) via yuzu_pg_pool_waiters /
+            yuzu_pg_acquire_wait_seconds and whether the KEK gauges exist in
+            /metrics at all; investigate Postgres pool saturation for (1)/(2)
+            before trusting the KEK gauges above, or server boot/config for
+            (3) if they are missing entirely.
+          # #2530 G8-S11: the heading is "Diagnosing a stuck KEK op lock
+          # (#2530)" — GitHub-slug anchoring strips the `(`/`)`/`#` but keeps
+          # the digits, so the real anchor carries a trailing `-2530` that a
+          # bare "...-lock" URL silently drops.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock-2530"
+
+      # #2530 G8-S12 — architect-requested: because #2525 makes retirement
+      # impossible, --kek-max-live-versions is a LIFETIME cap, not a rolling
+      # one, and without this alert the first signal an operator gets is a
+      # 409 VersionCeiling at the exact moment a rotation is needed. Alerts
+      # on the RATIO of live versions to the CONFIGURED ceiling (not a
+      # hardcoded 32) so it keeps working for an operator who has already
+      # exercised the #2530 B5 escape hatch and raised the flag. Both
+      # gauges HOLD their prior published value on a sampling degrade
+      # (see YuzuKekMetricsUnavailable above) — a stale ratio can under- or
+      # over-report during an outage; corroborate against
+      # yuzu_server_kek_metrics_unavailable_total before acting.
+      - alert: YuzuKekCeilingApproaching
+        expr: |
+          yuzu_server_kek_live_versions / yuzu_server_kek_max_live_versions > 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEK live-version count is approaching --kek-max-live-versions"
+          description: >-
+            yuzu_server_kek_live_versions has crossed 80% of
+            yuzu_server_kek_max_live_versions. There is no retire route
+            (#2525), so this trend does not self-correct: rotation will
+            start returning 409 VersionCeiling once the ceiling is reached.
+            Plan ahead of that point -- raising --kek-max-live-versions is a
+            deliberate, logged and audited risk acceptance (see
+            server.kek_ceiling_raised in the audit log), not something to do
+            reactively at the moment rotation is blocked.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock-2530"
+
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
   # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on

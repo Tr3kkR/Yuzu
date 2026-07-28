@@ -26,6 +26,7 @@ FROM ${BUILDER_IMAGE} AS builder
 # so a single multi-arch `docker buildx build --platform amd64,arm64` works.
 ARG TARGETARCH
 ARG TRIPLET=
+ARG YUZU_BUILD_JOBS=
 
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -70,7 +71,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
         -Dbuild_tests=false \
         -Dbuild_agent=false \
-    && meson compile -C builddir \
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 
 RUN echo "=== ldd yuzu-server ===" && ldd builddir/server/core/yuzu-server || true
