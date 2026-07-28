@@ -497,12 +497,17 @@ junit reporter, since meson's junit is only suite-level — then:
   **fails** (a regression *inside* a flaky test is caught too).
 
 `tests/known-flaky.json` is the static, in-repo, PR-curated source of truth —
-one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform and
-**must** carry an `issue`), `reason`, and `added`. Cross-platform flakes emit a
-loud `::warning` (they signal a genuinely nondeterministic test, not an env
-quirk); OS-scoped ones a `::notice`. Entries older than 90 days get a soft
-`::warning` nag (never a hard fail). The wrapper validates the list up front and
-fails fast on a malformed one.
+one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform),
+`reason`, tracking `issue`, accountable `owner`, and ISO-8601 `added` and
+`expires` dates. Every field is required for every entry, including entries for
+another OS. An entry expires at the end of its stated date; an expired or
+malformed list fails before `meson test` starts, so stale exemptions cannot
+silently mask a red build. Cross-platform flakes emit a loud `::warning` (they
+signal a genuinely nondeterministic test, not an env quirk); OS-scoped ones a
+`::notice`. Entries older than 90 days still get a soft `::warning` before their
+hard expiry. Case names and platform values are unique, and `all` cannot be
+combined with an OS. Expiry uses the UTC calendar date; the validator's clock is
+injectable for hermetic tests.
 
 The job summary + annotations remain the immediate signal. In addition,
 `flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
