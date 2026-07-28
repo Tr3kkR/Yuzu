@@ -31,6 +31,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -65,6 +66,17 @@ namespace yuzu::server::mcp {
 // Progress bridge core (track 2f PR 3a). Forward-declared (pointer-only here,
 // injected via set_stream_bridge); the .cpp includes mcp_stream_bridge.hpp.
 class McpStreamBridge;
+
+namespace detail {
+/// #2530 G8-F2 — test-only, externally-linked twin of mcp_server.cpp's
+/// file-local `kek_failure_tag()` (the MCP audit-detail switch). Mirrors
+/// `yuzu::server::detail::kek_route_failure_tag` (kek_routes.hpp) so a
+/// table-driven test can assert all three failure vocabularies (REST, MCP,
+/// and `kek_rotate_control.hpp`'s `kek_op_outcome_label()`) agree for every
+/// `KekOpResult::Failure` value — the switches stay independent by design,
+/// this only forwards to the existing production one.
+[[nodiscard]] std::string_view kek_mcp_failure_tag(KekOpResult::Failure failure);
+} // namespace detail
 
 /// MCP (Model Context Protocol) server — JSON-RPC 2.0 endpoint at /mcp/v1/.
 /// Mirrors the RestApiV1 pattern: receives store pointers + auth/perm/audit callbacks.
