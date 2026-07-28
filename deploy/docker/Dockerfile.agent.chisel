@@ -96,7 +96,7 @@ RUN echo "=== ldd yuzu-agent ===" \
 FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb AS chisel
 
 ARG TARGETARCH
-ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_VERSION=v1.4.2
 ARG CHISEL_RELEASE=ubuntu-26.04
 
 # ca-certificates: chisel fetches the release definitions + .debs over HTTPS.
@@ -109,8 +109,8 @@ ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chis
 # single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
-      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      amd64) want=3b3d86ea38045e54a13334e358ab8da12e6dd33342163c5c1ba13525f1070cfe ;; \
+      arm64) want=398050085cf32d7718ba1e2fad144b179e0943d0e0376b2a0614577c51d331e8 ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
