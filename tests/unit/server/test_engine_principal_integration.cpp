@@ -80,6 +80,7 @@ struct EpIntegShared {
     yuzu::test::PostgresTestDb db{engine_principal_integ_template};
     std::optional<yuzu::server::pg::PgPool> pool;
     EpIntegShared() {
+        INFO("[EpIntegShared] bundle status (blank == database came up OK): " << db.error());
         REQUIRE(db.available());
         pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
         REQUIRE(pool->valid());
@@ -100,13 +101,17 @@ public:
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        auto lease = ep_integ_shared().pool->acquire();
-        REQUIRE(lease);
-        auto trunc = yuzu::server::pg::exec_params(
-            lease.get(),
-            "TRUNCATE engine_principal_store.engine_principals RESTART IDENTITY CASCADE",
-            std::vector<std::string>{});
-        REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        {
+            // Scoped: released before the store ctor takes its own lease.
+            auto lease = ep_integ_shared().pool->acquire();
+            REQUIRE(lease);
+            auto trunc = yuzu::server::pg::exec_params(
+                lease.get(),
+                "TRUNCATE engine_principal_store.engine_principals RESTART IDENTITY CASCADE",
+                std::vector<std::string>{});
+            INFO("[EnginePrincipalStorePg] reset: " << PQresultErrorMessage(trunc.get()));
+            REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        }
         store_ = std::make_unique<EnginePrincipalStore>(*ep_integ_shared().pool);
         REQUIRE(store_->is_open());
     }

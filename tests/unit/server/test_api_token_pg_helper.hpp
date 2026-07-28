@@ -26,6 +26,8 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
+#include <libpq-fe.h>
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -123,6 +125,8 @@ struct ApiTokenSharedBundle {
     PostgresTestDb db{apitoken_pg_template};
     std::optional<yuzu::server::pg::PgPool> pool;
     ApiTokenSharedBundle() {
+        INFO("[ApiTokenSharedBundle] bundle status (blank == database came up OK): "
+             << db.error());
         REQUIRE(db.available());
         pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
         REQUIRE(pool->valid());
@@ -149,12 +153,16 @@ public:
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
         auto& bundle = detail::api_token_shared_bundle();
-        auto lease = bundle.pool->acquire();
-        REQUIRE(lease);
-        auto trunc = yuzu::server::pg::exec_params(
-            lease.get(), "TRUNCATE api_token_store.api_tokens RESTART IDENTITY CASCADE",
-            std::vector<std::string>{});
-        REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        {
+            // Scoped: released before the store ctor takes its own lease.
+            auto lease = bundle.pool->acquire();
+            REQUIRE(lease);
+            auto trunc = yuzu::server::pg::exec_params(
+                lease.get(), "TRUNCATE api_token_store.api_tokens RESTART IDENTITY CASCADE",
+                std::vector<std::string>{});
+            INFO("[ApiTokenStorePgShared] reset: " << PQresultErrorMessage(trunc.get()));
+            REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        }
         // The ctor's migration check is a no-op on the already-migrated clone
         // (a cheap SELECT, no new backend).
         store_ = std::make_unique<yuzu::server::ApiTokenStore>(*bundle.pool);

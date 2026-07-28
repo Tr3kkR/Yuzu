@@ -255,6 +255,7 @@ struct AuthDbSharedBundle {
     PostgresTestDb db{auth_db_pg_template};
     std::optional<yuzu::server::pg::PgPool> pool;
     AuthDbSharedBundle() {
+        INFO("[AuthDbSharedBundle] bundle status (blank == database came up OK): " << db.error());
         REQUIRE(db.available());
         pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
         REQUIRE(pool->valid());
@@ -301,9 +302,18 @@ public:
                 "TRUNCATE auth.users, auth.enrollment_tokens, auth.pending_agents, "
                 "auth.mfa_recovery_codes RESTART IDENTITY CASCADE",
                 std::vector<std::string>{});
+            INFO("[AuthDbPgShared] reset TRUNCATE: " << PQresultErrorMessage(trunc.get()));
             REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+            // COUPLING: this DELETE is sound ONLY while every registered
+            // secret column lives in a table TRUNCATEd above (today:
+            // auth.users.mfa_totp_secret). A future secret column in a table
+            // outside that list would leave blobs whose kek_version this
+            // DELETE orphans — SecretCodec's S6 scan then fails every later
+            // fixture. Extend the TRUNCATE list in the same commit that
+            // registers any new secret column reachable from these fixtures.
             auto kek = yuzu::server::pg::exec_params(lease.get(), "DELETE FROM secrets.kek_meta",
                                                      std::vector<std::string>{});
+            INFO("[AuthDbPgShared] reset kek_meta: " << PQresultErrorMessage(kek.get()));
             REQUIRE(kek.status() == PGRES_COMMAND_OK);
         }
 

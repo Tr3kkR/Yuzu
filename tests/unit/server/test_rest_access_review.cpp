@@ -93,6 +93,7 @@ struct AccRevShared {
     yuzu::test::PostgresTestDb db{access_review_rest_tpl};
     std::optional<yuzu::server::pg::PgPool> pool;
     AccRevShared() {
+        INFO("[AccRevShared] bundle status (blank == database came up OK): " << db.error());
         REQUIRE(db.available());
         pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 6});
         REQUIRE(pool->valid());
@@ -118,6 +119,7 @@ void acc_rev_reset() {
         "access_review_store.access_review_campaign, "
         "access_review_store.access_review_attestation RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
+    INFO("[acc_rev_reset] " << PQresultErrorMessage(trunc.get()));
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }
 
