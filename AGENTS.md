@@ -9,7 +9,7 @@ Yuzu is an agentic enterprise endpoint management platform — a single control 
 The word **agent** is overloaded; the rest of this file relies on these definitions:
 
 - **Agent daemon** — the C++ binary in `agents/core/` that runs on each managed endpoint and executes plugins. The thing the rest of this codebase usually means by "agent".
-- **Governance agent** — the `.codex/agents/*.md` review actors run during the `/governance` pipeline.
+- **Governance agent** — a bounded review subagent launched by `/governance`; the tracked role contract lives in `.codex/skills/governance/references/reviewers.md`.
 - **Agentic worker** — an external LLM-driven client (Claude, GPT, in-house) that drives Yuzu through MCP, REST, or the dashboard. The thing the agentic-first principle (`docs/agentic-first-principle.md`) is about.
 
 When in doubt in commit messages, PR descriptions, or new docs, use the disambiguated form.
@@ -65,7 +65,7 @@ The same source tree is built from multiple hosts; per-OS dirs prevent clobberin
 - **Shipped content is build-time embedded** (`embed_content.py` → `bundled_content.cpp`, seeded into `instructions.db` on first boot). The runtime never reads YAML from disk — **there is no `--content-dir` flag**. Rationale: `docs/Instruction-Engine.md` "Build-time content embedding".
 - **Every `dependency()` in meson files is marked `include_type: 'system'`** so vcpkg/gRPC/abseil/protobuf/Catch2 warnings are silenced while our code stays at `warning_level=3`. Do not remove it when adding dependencies.
 - **Windows build: never `vcvars64.bat`** (extension exit-1 corrupts wrappers) and **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). Source of truth: `docs/windows-build.md`.
-- **vcpkg** — manifest `vcpkg.json`, pinned baseline `4b77da7fed37817f124936239197833469f1b9a8` (matches CI's `vcpkgGitCommitId`); `builtin-baseline` is required by the abseil `version>=` constraint. OpenSSL is an **unconditional** dependency on every platform including Windows (`grpc.lib` has unresolved OpenSSL references; schannel was never wired — #375). Static libpq's closure (`libpgcommon`/`libpgport` + OpenSSL) is hand-wired in the meson `libpq_dep` block; on Windows libpq is a **DLL** (ADR-0008 Correction); `libpq_dep` is gated on `build_server`. The Windows grpc/protobuf/abseil static-link pairing (the `triplets/x64-windows.cmake` override **and** the hand-wired `find_library` construction) is load-bearing — **do not simplify either half** without reading `.codex/agents/build-ci.md` "Windows MSVC static-link history and #375".
+- **vcpkg** — manifest `vcpkg.json`, pinned baseline `4b77da7fed37817f124936239197833469f1b9a8` (matches CI's `vcpkgGitCommitId`); `builtin-baseline` is required by the abseil `version>=` constraint. OpenSSL is an **unconditional** dependency on every platform including Windows (`grpc.lib` has unresolved OpenSSL references; schannel was never wired — #375). Static libpq's closure (`libpgcommon`/`libpgport` + OpenSSL) is hand-wired in the meson `libpq_dep` block; on Windows libpq is a **DLL** (ADR-0008 Correction); `libpq_dep` is gated on `build_server`. The Windows grpc/protobuf/abseil static-link pairing (the `triplets/x64-windows.cmake` override **and** the hand-wired `find_library` construction) is load-bearing — **do not simplify either half** without reading `docs/windows-build.md` "Windows gRPC/protobuf linkage".
 
 ## Test
 
@@ -113,7 +113,7 @@ Domain docs: `CONTEXT.md` at the repo root, ADRs under `docs/adr/` (see `docs/ag
 
 ## Workflows
 
-- **Governance** — specialized review agents live in `.codex/agents/`; the `/governance` skill (`.codex/skills/governance/SKILL.md`) runs the 8-gate pipeline on a commit range (CRITICAL/HIGH findings block merge). Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
+- **Governance** — the `/governance` skill (`.codex/skills/governance/SKILL.md`) owns the reviewer prompts and runs the bounded 8-gate pipeline on a commit range. Security and docs review are mandatory; CRITICAL/HIGH findings block merge. Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
 - **Pre-commit/pre-push testing** — the `/test` skill (`.codex/skills/test/SKILL.md`): `--quick` (~10 min), default (~30–45 min), `--full` (~60–120 min). Results persist to `~/.local/share/yuzu/test-runs.db` (override with `YUZU_TEST_DB`); query via `scripts/test/test-db-query.sh`. CI runner test-DB topology and provisioning: `docs/ci-architecture.md`.
 - **CI** — three tiers: PR fast-path (`ci.yml`), push to dev/main (full matrix, no sanitizers/coverage per #410), nightly cron (`nightly.yml`, sanitizers + coverage; failure auto-opens `nightly-broken` — **no merge to main while that issue is open**). New workflows fire only once merged to main. Reference: `docs/ci-architecture.md`; cache rules: `.codex/skills/ci-cache/SKILL.md`.
 - **Release** — before tagging, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify with `bash scripts/check-compose-versions.sh X.Y.Z`; the `release:` job runs that script first and fails after ~30–60 min of wasted matrix builds otherwise. New compose files must be added to the script's `FILES` array (opt-in, no auto-discovery).
@@ -140,7 +140,7 @@ Rows are discriminators — **trigger → what to read first → who loads it**.
 |---|---|---|
 | Authentication, RBAC, headers, tokens | `docs/auth-architecture.md` | `security-guardian` on auth/RBAC/crypto/header/token change |
 | PKI / internal CA | `docs/pki-architecture.md` | `security-guardian` + `cpp-safety` + `docs-writer` on `x509_ca.*`, `key_provider.*`, `secure_buffer.hpp`, `aes_gcm.hpp`, `pg/secret_codec.*`, `ca_store.*`, `agent_csr.*`, `ca_routes.*`, `/api/v1/ca/`, or any new `KeyProvider`/`KekProvider` subclass; `gateway-erlang` on gateway TLS config / `*_pb.erl` |
-| AuthDB invariants | `.codex/agents/authdb.md` | `authdb` agent on `auth_db.*` / `auth_routes.*` / `auth.*` change |
+| AuthDB invariants | `docs/auth-architecture.md` "AuthDB — persistent authentication store" | `authdb` reviewer on `auth_db.*` / `auth_routes.*` / `auth.*` change |
 | Enterprise A&A (OIDC, SAML, SCIM, MFA, AD/Entra) | `.codex/skills/auth-and-authz/SKILL.md` | invoke `/auth-and-authz` for any A&A planning, audit, or implementation work |
 | MCP server | `docs/mcp-server.md` | `security-guardian` on `/mcp/v1/`, `mcp_server.*`, `mcp_jsonrpc.hpp`, `mcp_policy.hpp` change |
 | Executions-history ladder | `docs/executions-history-ladder.md` | any change to `agent_service_impl.cpp` `cmd_execution_ids_`, `response_store` execution queries, `execution_event_bus.*`, `execution_tracker.*`, `rest_a4_envelope.*`, the `/api/v1/events` handler, MCP `execute_instruction`, or executions-drawer markup |
@@ -152,7 +152,7 @@ Rows are discriminators — **trigger → what to read first → who loads it**.
 | Instruction engine (YAML content plane) | `docs/Instruction-Engine.md` + `docs/yaml-dsl-spec.md` | any instruction-definition / DSL / content change |
 | Prometheus metrics, audit envelope, event format | `docs/observability-conventions.md` | `sre` and `architect` on any metrics/audit/event change |
 | Response data types, inventory analytics | `docs/data-architecture.md` | `architect` and `sre` when designing schemas |
-| User manual / YAML defs / REST API docs | `.codex/agents/docs-writer.md` | `docs-writer` on every change as part of governance gate 2 |
+| User manual / YAML defs / REST API docs | `.codex/skills/governance/references/reviewers.md` "docs-writer" | `docs-writer` on every change and on any remediated final baseline |
 | Guardian / Guaranteed State + DEX | `docs/yuzu-guardian-design-v1.1.md` (§9.1 schema, §24 invariants) + `docs/guardian-baseline-model.md` + `docs/dex-signal-catalog.md` + `docs/user-manual/guaranteed-state.md` + `docs/user-manual/dex.md` | `security-guardian` + `docs-writer` on any `guaranteed_state*`, `guardian_*`, `guard_*.{hpp,cpp}`, `dex_*`, `tar_proc_perf`, `/api/v1/dex/perf`, `__guard__`, or `__observation__` change |
 | TAR dashboard | `docs/tar-dashboard.md` + `docs/tar-implementer.md` + `docs/tar-module-loads.md` | `architect` on `/tar` or `/fragments/tar/...`; `plugin-developer` on the TAR action surface; `cross-platform` + `cpp-safety` on `tar_proc_{stream,etw,es}.*`; `cpp-safety` + `docs-writer` on `tar_db.cpp` or `canonical_source_enabled` |
 | Scope walking (result sets) | `docs/scope-walking-design.md` | `architect` + `dsl-engineer` on scope-engine/DSL/result-set change; `consistency-auditor` on the audit chain; `security-guardian` on cross-operator authz |

@@ -1970,8 +1970,27 @@ on-config-flush model that lost users on every restart (#618, #388, #527).
 Operator recovery: `docs/ops-runbooks/auth-db-recovery.md`. Security review
 record: `docs/security-reviews/authdb-2026-04-30.md`.
 
-The hard invariants for AuthDB-touching changes (file-mode, migration
-pattern, lifetime, config-as-seed-only, role-field ignored, gate-level audit,
-cleanup cadence, snapshot-and-release publishing) live in
-`.claude/agents/authdb.md` — the AuthDB review agent loads them on any
-change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth.{hpp,cpp}`.
+AuthDB-touching changes preserve these invariants:
+
+- On POSIX, tighten the data directory to `0700` and `auth.db` to `0600` on
+  open; the directory mode protects SQLite's WAL sidecars. On Windows,
+  `std::filesystem::permissions` does not install an ACL, so deployment must
+  restrict the data directory to the service account until an explicit ACL
+  implementation lands.
+- Apply schema changes through `MigrationRunner`; do not bypass the store's
+  migration sequence with ad-hoc multi-statement setup.
+- Keep the owning `AuthDB` alive longer than every injected non-owning use in
+  `AuthManager` and the server.
+- Treat `yuzu-server.cfg` as a first-boot seed. Live user state comes from
+  `auth.db` and its authenticated mutation routes.
+- User creation cannot choose an elevated role. Role changes use the
+  dedicated authorized route and preserve its audit evidence.
+- Every privileged-route denial flows through the common admin gate so the
+  denied audit event is not handler-dependent.
+- Publish to sibling subsystems after releasing `AuthDB`'s mutex; snapshot
+  the payload under lock, then call out.
+- Keep cleanup timing, session/token ownership, parameterized SQL, and the
+  recovery runbook consistent with the behavior actually shipped.
+
+Review the implementation and focused tests for the exact current names and
+cadence; do not copy line numbers or past governance findings into code.

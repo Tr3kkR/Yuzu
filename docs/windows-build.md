@@ -68,3 +68,25 @@ meson test -C build-windows --suite server --print-errorlogs
 
 The release zip is unaffected — its vcpkg-DLL sweep bundles `libpq.dll`
 next to the binaries, same as `sqlite3.dll` and the OpenSSL DLLs.
+
+## Windows gRPC/protobuf linkage
+
+Two pieces are one build contract and must change together:
+
+1. `triplets/x64-windows.cmake` keeps the gRPC/protobuf/abseil family static.
+2. The Windows branch in root `meson.build` constructs `protobuf_dep` and
+   `grpcpp_dep` with `find_library()` from the build-type-specific vcpkg
+   directory. Linux and macOS continue through Meson's normal dependency
+   lookup.
+
+Removing the triplet override mixes static gRPC objects with abseil DLL
+exports and has produced LNK2005 duplicate symbols. Keeping the override but
+using Meson's CMake dependency translation has selected release libraries for
+a debug build and produced LNK2038 CRT mismatches. Review the live comments in
+both files and validate Windows debug and release before changing either half.
+
+The static abseil copy also gives each Windows image a distinct protobuf-map
+hash seed. A test must not populate a protobuf `Map` in an EXE and rely on a
+DLL to look it up. Serialize across the image boundary or construct and read
+the map in the consuming DLL; follow the existing exported test helper near
+`guardian_dispatch_push_bytes_for_test`.

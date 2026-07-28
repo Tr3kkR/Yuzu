@@ -73,7 +73,7 @@ Migrate last because they require `SecretCodec` (or a verify-only-hash schema) i
 |---|---|---|---|
 | `CaStore` | `ca_store` | key_ref-only (**unblocked**) | private key behind `KeyProvider`, never in a column. |
 | `DeviceTokenStore` | `device_token_store` | verify/hash (confirm in ADR) | classify in its per-store ADR. |
-| auth DB (`auth_db.{hpp,cpp}`) | `auth` | `SecretCodec` (TOTP); sessions → SHA-256 verify-only | not a `*Store` class; see `.claude/agents/authdb.md`. |
+| auth DB (`auth_db.{hpp,cpp}`) | `auth` | `SecretCodec` (TOTP); sessions → SHA-256 verify-only | not a `*Store` class; see `docs/auth-architecture.md` "AuthDB — persistent authentication store". |
 | `WebhookStore` | `webhook_store` | `SecretCodec` | shared secrets. |
 | `OffloadTargetStore` | `offload_target_store` | `SecretCodec` | target credentials. |
 | `RuntimeConfigStore` | `runtime_config_store` | `SecretCodec` | secret-valued config keys. |

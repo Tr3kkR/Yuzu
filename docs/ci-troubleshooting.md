@@ -15,11 +15,9 @@ Companion docs:
 - `docs/ci-cpp23-troubleshooting.md` — C++23 / cross-compiler issues
   (Clang 18 + libstdc++, Apple Clang version drift, MSVC-only failures).
   Read that one first if you suspect a compile-time problem.
-- `.claude/agents/build-ci.md` — full Windows MSVC static-link history,
-  including the option D LNK2038 fix and the four failed approaches that
-  preceded it.
 - `docs/windows-build.md` — the canonical Windows build path
-  (MSYS2 bash + `setup_msvc_env.sh` + `scripts/ensure-erlang.sh`).
+  (MSYS2 bash + `setup_msvc_env.sh` + `scripts/ensure-erlang.sh`) and the
+  current gRPC/protobuf linkage contract.
 
 ---
 
@@ -390,15 +388,14 @@ The fix is "option D" — combination of:
 **Both halves are load-bearing.** Removing either the triplet override
 OR the hand-rolled `find_library()` wiring re-introduces the failure.
 
-**Full history** including every failed approach
-(per-build-type triplets → explicit `CMAKE_BUILD_TYPE` → drop static
-override → option H hybrid) and the strategic escape path (#376 QUIC
-migration if option D ever rots) lives in
-`.claude/agents/build-ci.md` under **"Windows MSVC static-link history
-and #375"**. **Read that file before touching the Windows build wiring.**
+The current contract and its two failure mechanisms live in
+`docs/windows-build.md` under **"Windows gRPC/protobuf linkage"**. Read it
+and the live comments in the triplet and root `meson.build` before touching
+the wiring; discarded alternatives belong in git and issue history, not a
+reviewer prompt.
 
 **Reference fix:** PR #373 merged as `bf95d3b` on 2026-04-15. Don't
-simplify either half without reading the agent doc first.
+simplify either half without reading the build reference first.
 
 ---
 

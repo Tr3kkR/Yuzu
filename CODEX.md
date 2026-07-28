@@ -17,8 +17,8 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 
 ## Operational Workflows
 
-- `/governance` may use Codex subagents because the slash command is an explicit request for delegated review. Keep review agents bounded, read-only, and role-specific. Store role prompts in `.codex/skills/governance/SKILL.md`; do not create `.codex/agents`.
-- C++ governance requires a Resource Ledger in Gate 1 plus `cpp-expert` and `cpp-safety` in Gate 3 for any C++ diff. The ledger names every new or modified raw resource, owner type, acquisition, release, transfer behavior, and failure cleanup. New manual cleanup in touched C++ code is blocking unless wrapped by RAII/scope guard or explicitly justified.
+- `/governance` may use Codex subagents because the slash command is an explicit request for delegated review. Keep reviewers bounded, read-only, and role-specific. The tracked prompts live in `.codex/skills/governance/references/reviewers.md`; do not depend on or create an ignored `.codex/agents` mirror.
+- C++ governance always runs `cpp-expert` and `cpp-safety`. Gate 1 records an ownership note only when the range adds a resource boundary or changes acquisition, transfer, release, callback, or thread lifetime. Prefer existing RAII owners and the smallest project-native fix; a concrete unsafe cleanup path blocks, not the mere presence of legacy manual cleanup.
 - `/test` is the high-level validation orchestrator. It may run long-lived scripts and must preserve `~/.local/share/yuzu/test-runs.db` behavior. Do not stop the native UAT stack at the end of default/full test runs unless the user explicitly asks.
 - `/tdd` and `/diagnose` should read `CONTEXT.md` and relevant ADRs before naming domain concepts or selecting a regression seam.
 - `/grill-with-docs` is the ADR-adjacent workflow. ADRs live in `docs/adr/` and are created lazily only for hard-to-reverse, surprising, real trade-off decisions.

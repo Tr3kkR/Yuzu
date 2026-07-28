@@ -1,83 +1,67 @@
 ---
 name: governance
-description: Run Yuzu's Codex governance review pipeline on a commit range with slash-name parity to Claude `/governance`. Use when the user says `/governance <range>`, "full governance", or asks for the multi-gate security/docs/domain/ops review on commits or a PR.
+description: Run or maintain Yuzu's bounded Codex governance review on a commit range. Produces evidence-backed security, documentation, domain, correctness, and operational findings with a compact ledger. Use for `/governance RANGE`, "full governance", a multi-gate PR review, or an audit of the governance workflow and reviewer prompts.
 ---
 
 # Governance
 
-Run Yuzu governance as a Codex-native review fanout. This skill may use Codex subagents because invoking `/governance` is an explicit request for delegated review. Keep each delegated role bounded to review only; do not let review agents edit files.
+Review the exact range with bounded, read-only reviewer fanout. The primary agent owns scope, deduplication, adjudication, and the final decision. Do not expose raw reviewer transcripts.
+
+Before launching reviewers, read [references/reviewers.md](references/reviewers.md) completely. Use its shared contract in every reviewer prompt and append only the matching role focus.
+
+Give each reviewer the resolved range, the compact Gate 1 facts, changed paths, and only prior finding IDs relevant to that role. Do not paste another reviewer's prose.
 
 ## Range
 
-- Default range: `dev..HEAD`.
-- Treat a bare commit like `HEAD` as `HEAD~1..HEAD`.
-- If `dev..HEAD` is empty on branch `dev`, ask whether `origin/dev..HEAD` is intended.
+- Default to `dev..HEAD`.
+- Treat a bare commit as `<commit>~1..<commit>`.
+- If `dev..HEAD` is empty on `dev`, ask whether `origin/dev..HEAD` is intended.
+- Resolve and record the base and head SHAs before review. A later fix changes the reviewed baseline and triggers only the re-review described below.
+
+## Review Standard
+
+- Review changed behavior and directly affected call paths, not unrelated backlog.
+- Load the documents routed by `AGENTS.md`; durable invariants belong there, not in reviewer prompts.
+- Compare adjacent production code and tests before proposing a pattern. Prefer the smallest change that fits the owning module. Do not request a rename, abstraction, helper, or modernization without a concrete correctness, safety, duplication, or contract reason.
+- For C++ changes, always run `cpp-expert` and `cpp-safety`. Prefer automatic ownership and existing RAII helpers. Add an ownership note only when the range adds a resource boundary or changes acquisition, transfer, release, callback, or thread lifetime.
+- Production comments explain the invariant or failure mode. They do not cite governance rounds, agents, or finding IDs.
+- Treat wording as a finding only when it is factually wrong, contradicts a normative term or public contract, or is materially ambiguous to its intended reader. Existing nearby terminology wins when several phrasings are equivalent.
 
 ## Gates
 
-1. Change Summary: write this locally from `git log`, `git diff --stat`, and targeted diffs.
-2. Mandatory review: launch `security-guardian` and `docs-writer` in parallel.
-3. Domain review: select roles by changed files and launch them in parallel.
-4. Correctness review: launch `happy-path`, `unhappy-path`, and `consistency-auditor` in parallel.
-5. Chaos analysis: run only if Gate 4 produced unhappy-path or consistency findings.
-6. Operational review: launch `compliance-officer`, `sre`, and `enterprise-readiness` in parallel.
-7. Findings resolution: consolidate findings and fix blocking items.
-8. Iteration and ledger: re-run affected gates, record deferrals, and make the blocking decision.
+1. **Summary** — Record range and intent, changed contracts or risks, validation already run, triggered roles, and either `Ownership changes: none` or a compact ownership note.
+2. **Mandatory** — Run `security-guardian` and `docs-writer` in parallel on every changed file. Neither role may be skipped.
+3. **Domain** — Run only roles triggered by `AGENTS.md`, changed files, or affected contracts. C++ always triggers both C++ roles; a feature or bug fix triggers `quality-engineer`.
+4. **Correctness** — Run `happy-path`, `unhappy-path`, and `consistency-auditor` in parallel.
+5. **Chaos** — Run `chaos-injector` only for an unresolved Gate 4 finding where a reproducible fault test would change the merge decision. Do not generate a general chaos backlog.
+6. **Operations** — Run `compliance-officer`, `sre`, and `enterprise-readiness` in parallel. A role with no affected surface returns `PASS`.
+7. **Resolution** — Merge duplicates, reject inadmissible findings, and decide blockers. Modify files only when the user's request authorizes fixes; otherwise return `BLOCKED` with the smallest required fix.
+8. **Final baseline** — If fixes changed the baseline, re-run `docs-writer`, any security role affected by the fix, and only the original owners of still-relevant findings. Produce the ledger and decision.
 
-Blocking contract: CRITICAL/HIGH security findings block. Any `BLOCKING` docs finding blocks user-facing changes. `BLOCKING` from Gate 4-6 blocks. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
+## Blocking
 
-## Gate 1 Output
+- Security `CRITICAL` and `HIGH` findings block.
+- A docs finding blocks when changed user-visible, operational, API, configuration, permission, audit, compatibility, or upgrade behavior is missing or inaccurate in its required documentation or changelog fragment.
+- Other roles use `BLOCKING` only for a demonstrated correctness, safety, compatibility, data, test-validity, or operability defect in scope.
+- `SHOULD` requires a concrete in-scope defect but does not block. Fix it when local and low risk; otherwise record a concise rationale or an existing issue. Do not create issues without user authorization.
+- Omit style preferences, generic hardening, praise, `LOW`, `INFO`, and `NICE` observations from the ledger.
 
-Include:
+## Convergence
 
-- commits in scope: sha, subject, branch/push state if known
-- files touched: path and behavioral delta
-- interfaces affected: REST, stores, proto, plugin ABI, CLI/env, CI, docs
-- security surface: opened, closed, or net neutral
-- Resource Ledger for C++ changes: every new or modified fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL object, BCrypt handle, allocated C string, mapped library, temp path, subprocess, callback context, and thread; for each, name the owner type, acquisition point, release point, transfer behavior, and failure cleanup
-- user-facing impact and compatibility notes
-- validation already performed with exact commands and exit status
-- Gate 3 roles selected and why
+- Consolidate accepted fixes into one coherent remediation round, then perform one targeted re-review.
+- Never re-run a role against an unchanged baseline and unchanged evidence.
+- A reviewer may keep a finding open only with evidence that its original consequence remains. It may open a new finding only for a regression introduced by the remediation or newly inspected changed code.
+- Do not reopen a finding under a new ID, raise severity, or argue alternate wording without new evidence.
+- Resolve reviewer disagreement from tests, code behavior, routed docs, and established neighboring patterns. If those sources do not decide a material product or contract question, stop and ask the user; reviewers do not debate each other.
+- Allow at most two remediation rounds. If a blocker remains after the second targeted re-review, stop with `BLOCKED`; do not launch the same loop again.
 
-## Role Prompts
+## Final Output
 
-Use compact role prompts and include the Gate 1 summary plus prior gate findings as context.
+Lead with findings. For each accepted finding, emit its ID, severity, `file:line`, consequence, evidence, and smallest fix once. Then include:
 
-- `security-guardian`: read every modified file; check authz, ownership, validation, audit, command execution, path handling, crypto, secret handling, sibling handler parity, and new error branches. For C++ diffs, also require an ownership proof for every raw resource boundary: fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL/BCrypt object, allocated C string, thread, callback context, subprocess, mapped library, and temp path must have exactly one owner; manual cleanup in new/touched code is blocking unless wrapped in a small RAII/scope guard or justified as impossible; every early return between acquire and release must be checked. Findings use CRITICAL/HIGH/MEDIUM/LOW/INFO with file:line and recommended fix.
-- `docs-writer`: check REST docs, user manual, CHANGELOG, upgrade notes, permission/audit/error tables, and operator workflow docs. Findings use BLOCKING/SHOULD-FIX/NICE-TO-HAVE.
-- `architect`: public contracts, stores, REST boundaries, schema, lifecycle, coupling, and hard-to-reverse design.
-- `cpp-expert`: C++23 correctness, idioms, standard-library use, ABI boundaries, threading primitives, and cross-compiler portability across GCC, Clang, MSVC, and Apple Clang.
-- `cpp-safety`: RAII ownership, lifetime, move/copy semantics, C ABI boundaries, `std::string_view`/`std::span` validity, cast safety, thread lifetime, syscall/process boundaries, shell execution, and sanitizer coverage. BLOCKING for leaks, double-close risk, UAF risk, unjoined/detached thread ambiguity, unsafe shell construction, or borrowed data escaping its owner.
-- `quality-engineer`: test seams, integration coverage, fixture isolation, flaky patterns, temp DB/path hygiene, weak assertions. For C++ safety-sensitive changes, require coverage for cleanup paths, partial failure, short read/write, EINTR, failed `pclose`, failed `CloseHandle`, failed `sqlite3_prepare`, and concurrent teardown where relevant; for new RAII wrappers, require a test or compile-time assertion covering move-only/non-copyable behavior when feasible.
-- `build-ci`: Meson, vcpkg, workflows, release scripts, runner assumptions, cache behavior.
-- `plugin-developer`: plugin descriptors, SDK boundaries, YAML definitions, plugin execution behavior.
-- `gateway-erlang`: rebar3, OTP supervision, grpcbox/gpb, gateway proto mirrors, EUnit/CT/Dialyzer implications.
-- `dsl-engineer`: CEL, scope DSL, YAML DSL, trigger templates, validation and backward compatibility.
-- `cross-platform`: Darwin, Linux, Windows/MSVC, paths, sockets, filesystem, service behavior.
-- `performance`: SQLite hot paths, BFS/graph traversals, authz loops, gateway throughput, allocations.
-- `release-deploy`: Docker, packages, systemd, installers, upgrade and rollback behavior.
-- `happy-path`: trace normal request/store/plugin/gateway flows end to end and call out idempotency.
-- `unhappy-path`: produce a risk register with ID, trigger, symptom, severity, and chaos candidate.
-- `consistency-auditor`: check sibling parity, error/audit naming, schema/docs/tests drift, and CHANGELOG ordering.
-- `chaos-injector`: convert Gate 4 risk registers into executable chaos test designs; do not run them.
-- `compliance-officer`: SOC 2 control alignment, evidence chain, audit traceability, retention, approvals.
-- `sre`: health/readiness, metrics, alerts, recovery, capacity, backpressure, runbooks.
-- `enterprise-readiness`: pilot-visible rough edges, upgrade notes, breaking changes, customer assurance.
+- validation performed, with command and result;
+- one compact role ledger: `PASS`, `FINDINGS`, or `SKIPPED` with counts;
+- unresolved blockers and accepted deferrals only;
+- `PASS`, `PASS WITH DEFERRED`, or `BLOCKED`.
 
-## Domain Routing
-
-Always include `quality-engineer` for feature or bug-fix changes. Always include `architect` for public store contracts or REST API surfaces. Always include `performance` for `get_*_ids`, SQLite BFS/graph traversal, or per-authz hot paths.
-
-Always include `cpp-expert` and `cpp-safety` when C++ files change. Also include `cpp-safety` for any diff that introduces or modifies `popen`, `system`, shell strings, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*_new`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`, or a background thread/callback that stores a pointer or reference. Run `rg` over changed C++ files for raw resource APIs and verify owning raw resource boundary hits appear in the Resource Ledger.
-
-Use `$yuzu-proto`, `$yuzu-plugin-abi`, `$yuzu-meson`, `$yuzu-windows-msvc`, and `$yuzu-build` when the changed files touch their domains.
-
-## Ledger
-
-End with a governance ledger:
-
-- Gate status table: role, result, blocking count, deferred count
-- Blocking findings with owner/fix status
-- Deferred findings with issue number or explicit rationale
-- Re-review scope and result
-- Final decision: PASS / PASS WITH DEFERRED / BLOCKED
+Keep pass entries to one line. Do not narrate gates, repeat the change summary, reproduce reviewer prose, or list speculative follow-ups.

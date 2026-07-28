@@ -1,11 +1,18 @@
 # C++ Coding Conventions — Yuzu
 
-The `cpp-expert` and `cpp-safety` agents load this document on any C++ source change. CLAUDE.md keeps a one-line pointer.
+The `cpp-expert` and `cpp-safety` reviewers load this document on any C++ source change.
 
 ## Language
 
-- **C++23 throughout.** Use `std::expected<T, E>` for errors, `std::span` for contiguous ranges, `std::string_view` for non-owning string refs, `std::format` for string formatting.
+- **C++23 throughout.** Use `std::expected`, `std::span`, `std::string_view`, and `std::format` where they fit the owning module's established interface and make ownership or behavior clearer. Do not retrofit them mechanically.
 - Cross-compiler matrix: GCC 13+, Clang 18+, MSVC 19.38+, Apple Clang 15+. See `docs/ci-cpp23-troubleshooting.md` for known feature divergences.
+
+## Project fit
+
+- Read the adjacent implementation and tests before introducing a pattern. Prefer an existing helper, owner type, error shape, and control-flow style when it is correct.
+- Make the smallest coherent change. Do not widen a patch for modernization, cosmetic renaming, or an equivalent alternate idiom.
+- Add an abstraction only when it creates a necessary ownership/contract boundary or removes demonstrated duplication. A one-use wrapper that obscures a local operation is not an improvement.
+- Comments explain invariants, failure modes, or external constraints. Do not cite a governance agent, finding ID, review round, or the fact that code was reviewed.
 
 ## Naming
 
@@ -66,9 +73,9 @@ Both the agent and the server use:
 
 ## Resource ownership and lifetime
 
-Governance is stricter than style guidance: every C++ diff must prove ownership for each resource boundary it adds or touches. The Gate 1 Resource Ledger names the owner type, acquisition point, release point, transfer behavior, and failure cleanup for every fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL object, BCrypt handle, allocated C string, mapped library, temp path, subprocess, callback context, and thread.
+For a diff that adds an owning resource boundary or changes acquisition, transfer, release, callback, or thread lifetime, the Gate 1 ownership note names the owner type, acquisition point, release point, transfer behavior, and failure cleanup. Write `Ownership changes: none` when ownership is unaffected.
 
-New or touched C++ code should use a small RAII owner, `std::unique_ptr` with a deleter, or a local scope guard. Manual cleanup is a governance finding unless the code documents why a wrapper is impossible or would be less safe. Check every early return between acquisition and release.
+New ownership paths use automatic cleanup: an existing RAII owner, value type, `std::unique_ptr` with a deleter, a move-only wrapper, or a local scope guard. Manual cleanup is blocking when a concrete return, exception, retry, transfer, or concurrency path can leak or double-release; its presence in untouched legacy code is not itself a finding.
 
 Resource owner types must be non-copyable when copying would double-release. Prefer move-only wrappers with explicit transfer semantics; any use of `release()` must immediately hand the resource to another named owner.
 
@@ -78,7 +85,7 @@ Shell/process boundaries must prefer argv-style execution. New `system()`, `pope
 
 Casts at ABI or syscall boundaries need a local aliasing/lifetime proof. `reinterpret_cast` and `const_cast` sites should explain alignment, constness, and ownership assumptions unless they are isolated behind an already-reviewed wrapper.
 
-Safety-sensitive ownership changes need targeted validation. Use ASan/UBSan when memory/resource ownership changes, TSan when thread lifetime, callback ownership, shared state, or store locking changes, and platform-specific tests for Windows HANDLE/service code or POSIX fd/socket/process code.
+Safety-sensitive ownership changes need proportionate validation. Select ASan/UBSan for memory/ownership risk, TSan for thread or shared-state risk, and platform tests for OS-resource behavior when each would exercise the changed path; do not request every sanitizer mechanically.
 
 ## Static-asset translation units
 
@@ -107,12 +114,11 @@ Use for vendored assets (Three.js r168, ECharts, Inter typeface, htmx bundles la
 
 - Symbols emitted by codegen drop the file suffix (`kThreeJs`, not `kThreeMinifiedJs`). For asset families with multiple files, name the second symbol after the upstream class or module so the link is unambiguous (`kThreeOrbitControlsJs`, not `kThreeOrbitJs`). Rename history is gated on the same architectural review as any other ABI-shaped symbol change.
 
-## Forbidden in new code
+## Reject in new code
 
-- Raw error codes or output parameters (use `std::expected`).
-- printf-family calls (use `std::format` or spdlog).
-- Raw `new`/`delete` (use RAII).
-- Manual resource cleanup (use RAII / smart pointers).
-- C++ types crossing the C ABI boundary in `plugin.h`.
-- Borrowed `std::string_view`, `std::span`, raw pointer, or callback context escaping its owner.
+- Owning raw `new`/`delete` or a manual cleanup path with an unprotected failure edge.
+- C++ types or exceptions crossing the C ABI boundary in `plugin.h`.
+- A borrowed view, raw pointer, or callback context escaping its owner.
 - Shell command construction when argv-style execution is feasible.
+- A second error, logging, ownership, or threading idiom where the owning module already has a correct one.
+- Review-process provenance in production comments.
