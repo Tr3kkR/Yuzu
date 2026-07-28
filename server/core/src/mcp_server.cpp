@@ -246,9 +246,11 @@ std::string tool_result(std::string_view payload, const char* output_schema_json
     return result.str();
 }
 
-std::string utc_now_iso() {
-    const auto now = std::chrono::system_clock::now();
-    const auto tt = std::chrono::system_clock::to_time_t(now);
+// #2530 H1: arbitrary-instant twin of utc_now_iso() below, for formatting a
+// PAST captured instant (e.g. KekOpResult::lock_holder_captured_at) rather
+// than "now".
+std::string utc_iso_at(std::chrono::system_clock::time_point tp) {
+    const auto tt = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
 #if defined(_WIN32)
     gmtime_s(&tm, &tt);
@@ -258,6 +260,10 @@ std::string utc_now_iso() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
+}
+
+std::string utc_now_iso() {
+    return utc_iso_at(std::chrono::system_clock::now());
 }
 
 // Epoch seconds, caller-supplied (not read internally by the stores) so
@@ -1098,11 +1104,25 @@ static const ToolDef kTools[] = {
 
     {"get_kek_status",
      "Current KEK rotation status: the active version, the oldest version still "
-     "referenced by a live secret row (null when no secret rows exist), and whether "
-     "rotation is complete (every row is on the active version). Read-only. Mirrors GET "
-     "/api/v1/secrets/kek/status. Requires Security:Read.",
+     "referenced by a live secret row (null when no secret rows exist), whether "
+     "rotation is complete (every row is on the active version), plus three "
+     "diagnostic snapshots added by #2530 hardening — live_versions (count of "
+     "non-retired KEK versions), lock_held / lock_holder_pid (whether the "
+     "secrets_kek_op advisory lock currently has a granted holder). The three "
+     "snapshots are read lock-free at possibly-different instants — never derive "
+     "a \"safe to retire\" conclusion from them (#2525). live_versions and "
+     "lock_held are null when the underlying query could not be determined "
+     "(never a fabricated 0/false) — a null lock_held MUST NOT be read as "
+     "\"no lock is held\"; it means the lock state is unknown, so corroborate "
+     "via pg_stat_activity before concluding anything. lock_holder_captured_at "
+     "(#2530 H1) is the ISO-8601 UTC instant the lock_held/lock_holder_pid "
+     "snapshot was taken -- null in lockstep with them when undetermined; a "
+     "pid without a visible capture instant can look current when it is "
+     "actually stale (Postgres backend pids are reused), so always re-confirm "
+     "a pid in pg_locks before acting on it, never trust one captured earlier. "
+     "Read-only. Mirrors GET /api/v1/secrets/kek/status. Requires Security:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"}},"required":["active_version","rotation_complete"]})j"},
+     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"},"lock_holder_captured_at":{"type":["string","null"],"description":"ISO-8601 UTC instant the lock_held/lock_holder_pid snapshot was taken; null when undetermined; re-confirm the pid in pg_locks before acting on it, never trust one captured earlier"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -1864,13 +1884,24 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // only — never a seam-supplied string.
 struct KekFailureInfo {
     int code;
-    const char* message;
+    // #2530 G7-B6: std::string, not const char* — the ClockAnomaly branch
+    // interpolates the observed skew magnitude, so this can no longer be a
+    // static literal in every arm.
+    std::string message;
     const char* remediation; // nullptr only for the unreachable None fallthrough
     long retry_after_ms;     // -1 => no retry hint (not blindly retryable)
 };
 
-KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
-    switch (failure) {
+// #2530 B2/G7-B2: takes the whole `KekOpResult`, not just the `Failure` enum,
+// because `Cooldown`'s retry hint must be the honest value carried on the
+// result (`cooldown_retry_after_ms`, sourced from the durable rate-limit
+// clock) — mirrors kek_routes.cpp's write_failure() signature change. A
+// hardcoded 300000 here would tell an agentic caller to retry in 5 minutes
+// against a durable cooldown that can be up to `--kek-min-rotate-interval`
+// (1h default) — a guaranteed retry storm against the very endpoint this
+// change exists to rate-limit, each retry writing a failure audit row.
+KekFailureInfo kek_failure_info(const KekOpResult& result) {
+    switch (result.failure) {
     case KekOpResult::Failure::Unavailable:
         return {kInternalError, "KEK service unavailable",
                 "the Postgres substrate or secrets codec is not available; retry once the "
@@ -1889,15 +1920,65 @@ KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
                 "another rotation or re-wrap holds the KEK operation lock; retry once it "
                 "completes",
                 5000};
-    case KekOpResult::Failure::Cooldown:
+    case KekOpResult::Failure::Cooldown: {
         // Mirrors the REST 429. Retryable with a real wait, and the remediation
         // must point at rewrap_secrets: an agentic caller recovering a
         // half-committed rotation would otherwise sit in a retry loop against
-        // the one tool that is rate-limited.
+        // the one tool that is rate-limited. #2530 D: retry_after_ms is now
+        // the honest durable-clock value; fall back to the old fixed 5-minute
+        // hint only if the seam left the field unset (0).
+        const long retry_after_ms = result.cooldown_retry_after_ms > 0
+                                         ? static_cast<long>(result.cooldown_retry_after_ms)
+                                         : 300000;
         return {kInternalError, "KEK rotation is in its cooldown window",
                 "rotation attempts are rate-limited; if you are finishing a half-committed "
                 "rotation call rewrap_secrets instead — it is not rate-limited",
-                300000};
+                retry_after_ms};
+    }
+    case KekOpResult::Failure::VersionCeiling:
+        // #2530 G7-B1: waiting never resolves a ceiling refusal — it needs an
+        // operator config change. Name the escape hatch explicitly so an
+        // agentic caller doesn't retry-loop against a permanent condition.
+        // kInternalError, not kInvalidParams: this tool takes no parameters,
+        // so a "your input was wrong" code would be as dishonest here as the
+        // Conflict branch's doc comment above already explains it would be —
+        // this is a server-side/operator-config condition, not a client
+        // mistake.
+        return {kInternalError, "the live KEK version ceiling has been reached",
+                "rotation is blocked because the number of live KEK versions has reached "
+                "--kek-max-live-versions; there is no retire route (#2525), so waiting will "
+                "never clear this — an operator must explicitly raise the ceiling, which is a "
+                "deliberate, logged and audited risk acceptance",
+                -1};
+    case KekOpResult::Failure::QueryCanceled:
+        // #2530 G7-B1: mirrors kek_routes.cpp's QueryCanceled branch. NOT
+        // necessarily transient (may fail identically forever at scale, or
+        // was an admin pg_cancel_backend) — no retry_after_ms.
+        return {kInternalError, "a KEK query was canceled or exceeded its statement timeout",
+                "this is not necessarily transient: check statement_timeout, current database "
+                "load, whether an administrator issued pg_cancel_backend, and the size of the "
+                "registered-column rewrap scan before retrying",
+                -1};
+    case KekOpResult::Failure::ClockAnomaly:
+        // #2530 G7-B1/B6: the timestamp the cooldown math would use is the
+        // very thing proven untrustworthy — no retry_after_ms, and NOT the
+        // same remediation as Cooldown. The message interpolates the
+        // observed skew MAGNITUDE (mirrors kek_routes.cpp's REST twin) so an
+        // agentic caller (or the human reading its logs) can tell "a few
+        // seconds of NTP jitter" from "this row is dated next year" — a
+        // forward skew does NOT self-clear the way a backward one does, and
+        // there is no configuration escape for this refusal at all.
+        return {kInternalError,
+                "the KEK rotation clock is untrustworthy: the newest kek_meta row is dated " +
+                    std::to_string(result.clock_skew_secs) +
+                    "s in the future relative to the database server's own clock",
+                "the newest kek_meta row is timestamped in the future relative to the database "
+                "server's own clock, so the durable rotation rate limit cannot be computed "
+                "safely; investigate the database server's clock (NTP sync, VM restore, "
+                "failover to a host that is ahead) before retrying. A forward skew like this "
+                "does NOT self-clear on its own — it persists until real time catches up to the "
+                "stored timestamp, and there is no configuration flag to bypass this refusal",
+                -1};
     case KekOpResult::Failure::HalfCommitted:
         // Rule A (kek_routes.hpp): this instruction is the single most
         // important string in this handler family — MUST tell the caller to
@@ -1911,6 +1992,7 @@ KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
                 "spurious extra version",
                 -1};
     case KekOpResult::Failure::Internal:
+        return {kInternalError, "internal error", nullptr, -1};
     case KekOpResult::Failure::None: // unreachable on the failure-mapping path
         return {kInternalError, "internal error", nullptr, -1};
     }
@@ -1921,6 +2003,19 @@ KekFailureInfo kek_failure_info(KekOpResult::Failure failure) {
 // kek_routes.cpp's failure_tag() (REST twin) so both surfaces log the same
 // detail vocabulary for the same failure classification. Rule B applies here
 // too: never a codec-internal error string, only this static tag.
+//
+// #2530 G8-S5 (corrected — an earlier version of this comment, and the
+// commit message that landed it, wrongly credited splitting `None` from
+// `Internal` with keeping `-Wswitch` armed here; `-Wswitch` fires on ANY
+// unhandled enumerator with no `default:` label regardless of which
+// existing cases fall through together, so combining them would have been
+// just as safe). What actually arms the warning is enumerating every
+// `Failure` value explicitly and never adding a `default:` — that is what
+// makes a future `Failure` enum addition trip `-Wswitch` here even though
+// `werror=false` only warns — the compiler still flags it in the build log,
+// and a reviewer catches it, instead of the new value silently defaulting
+// to "failure=internal" the way VersionCeiling/
+// QueryCanceled/ClockAnomaly did before this fix.
 const char* kek_failure_tag(KekOpResult::Failure failure) {
     switch (failure) {
     case KekOpResult::Failure::Unavailable:
@@ -1929,9 +2024,16 @@ const char* kek_failure_tag(KekOpResult::Failure failure) {
         return "failure=conflict";
     case KekOpResult::Failure::Cooldown:
         return "failure=cooldown";
+    case KekOpResult::Failure::VersionCeiling:
+        return "failure=ceiling";
+    case KekOpResult::Failure::QueryCanceled:
+        return "failure=query_canceled";
+    case KekOpResult::Failure::ClockAnomaly:
+        return "failure=clock_anomaly";
     case KekOpResult::Failure::HalfCommitted:
         return "failure=half_committed";
     case KekOpResult::Failure::Internal:
+        return "failure=internal";
     case KekOpResult::Failure::None:
         return "failure=internal";
     }
@@ -2021,6 +2123,12 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
 }
 
 } // namespace
+
+namespace detail {
+std::string_view kek_mcp_failure_tag(KekOpResult::Failure failure) {
+    return kek_failure_tag(failure);
+}
+} // namespace detail
 
 McpServer::HandlerFn McpServer::build_handler(
     AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
@@ -6783,7 +6891,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (result.failure != KekOpResult::Failure::None) {
                     (void)audit_fn(req, "kek.rotate", "failure", "Secret", "kek",
                                    kek_failure_tag(result.failure));
-                    const auto info = kek_failure_info(result.failure);
+                    const auto info = kek_failure_info(result);
                     res.set_content(a4_error(info.code, info.message,
                                              info.remediation ? std::string_view(info.remediation)
                                                                : std::string_view{},
@@ -6832,7 +6940,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (result.failure != KekOpResult::Failure::None) {
                     (void)audit_fn(req, "kek.rewrap", "failure", "Secret", "kek",
                                    kek_failure_tag(result.failure));
-                    const auto info = kek_failure_info(result.failure);
+                    const auto info = kek_failure_info(result);
                     res.set_content(a4_error(info.code, info.message,
                                              info.remediation ? std::string_view(info.remediation)
                                                                : std::string_view{},
@@ -6875,7 +6983,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Read-only, not audited — matches kek_routes.cpp's GET
                     // /api/v1/secrets/kek/status (mirrors the CA read routes,
                     // which don't audit either).
-                    const auto info = kek_failure_info(result.failure);
+                    const auto info = kek_failure_info(result);
                     res.set_content(a4_error(info.code, info.message,
                                              info.remediation ? std::string_view(info.remediation)
                                                                : std::string_view{},
@@ -6890,6 +6998,34 @@ McpServer::HandlerFn McpServer::build_handler(
                 else
                     payload.raw("oldest_in_use", "null");
                 payload.add("rotation_complete", result.rotation_complete);
+                // #2530 C1/T5: MCP twin of REST /status's three diagnostic
+                // snapshots — see KekOpResult::live_versions/lock_held/
+                // lock_holder_pid (kek_routes.hpp) for the lock-free,
+                // possibly-different-instant caveat. Twin parity is an
+                // ADR-1005 invariant; do not land one of these on REST only.
+                // live_versions/lock_held serialise as JSON null (never a
+                // fabricated 0/false) when the seam could not determine
+                // them — matching kek_routes.cpp exactly.
+                if (result.live_versions.has_value())
+                    payload.add("live_versions", static_cast<int64_t>(*result.live_versions));
+                else
+                    payload.raw("live_versions", "null");
+                if (result.lock_held.has_value())
+                    payload.add("lock_held", *result.lock_held);
+                else
+                    payload.raw("lock_held", "null");
+                if (result.lock_holder_pid.has_value())
+                    payload.add("lock_holder_pid", static_cast<int64_t>(*result.lock_holder_pid));
+                else
+                    payload.raw("lock_holder_pid", "null");
+                // #2530 H1: when the lock_held/lock_holder_pid snapshot
+                // above was taken — null in lockstep with them when
+                // undetermined. Mirrors kek_routes.cpp's REST twin exactly
+                // (ADR-1005 parity).
+                if (result.lock_holder_captured_at.has_value())
+                    payload.add("lock_holder_captured_at", utc_iso_at(*result.lock_holder_captured_at));
+                else
+                    payload.raw("lock_holder_captured_at", "null");
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
