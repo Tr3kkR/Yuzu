@@ -180,6 +180,51 @@ def targets_for_cancelled(fr, tests, sections):
 
 
 # ── gdb ───────────────────────────────────────────────────────────────────────
+def replay_command(cmd, seed):
+    """Return one valid Catch2 replay command with faithful order policy.
+
+    Meson entries may already pin ``--order`` and ``--rng-seed``. Catch2 rejects
+    duplicate occurrences, so preserve the first explicit value and only supply
+    a recovered seed or randomized order when the entry omitted that option.
+    Other options and shard tag filters remain in their introspected order.
+    """
+    replay = []
+    saw_order = False
+    saw_seed = False
+    index = 0
+    while index < len(cmd):
+        arg = cmd[index]
+        if arg in ("--order", "--rng-seed"):
+            if index + 1 < len(cmd):
+                if arg == "--order" and not saw_order:
+                    replay += [arg, cmd[index + 1]]
+                    saw_order = True
+                elif arg == "--rng-seed" and not saw_seed:
+                    replay += [arg, cmd[index + 1]]
+                    saw_seed = True
+            index += 2
+            continue
+        if arg.startswith("--order="):
+            if not saw_order:
+                replay.append(arg)
+                saw_order = True
+            index += 1
+            continue
+        if arg.startswith("--rng-seed="):
+            if not saw_seed:
+                replay.append(arg)
+                saw_seed = True
+            index += 1
+            continue
+        replay.append(arg)
+        index += 1
+    if not saw_seed and seed is not None:
+        replay += ["--rng-seed", str(seed)]
+    if not saw_order:
+        replay += ["--order", "rand"]
+    return replay
+
+
 def gdb_argv(cmd, seed, budget, kill_after):
     """timeout(1) + gdb batch argv for one replay.
 
@@ -208,10 +253,7 @@ def gdb_argv(cmd, seed, budget, kill_after):
     escaping also means the shell never globs `[pg]` against the cwd. `_selftest`
     asserts this end-to-end against a real gdb wherever one exists, rather than
     trusting the Python list — asserting the list is what let this through."""
-    replay = list(cmd)
-    if seed is not None:
-        replay += ["--rng-seed", str(seed)]
-    replay += ["--order", "rand"]
+    replay = replay_command(cmd, seed)
     return [
         "timeout", "--signal=INT", f"--kill-after={kill_after}", str(budget),
         "gdb", "-batch",
@@ -587,6 +629,22 @@ ThreadSanitizer: data race
     check(argv[argv.index("--args") + 1:] ==
           ["/b/tests/yuzu_server_tests", "~[pg]", "--rng-seed", "222", "--order", "rand"],
           "replay argv keeps the shard's tag filter and appends the seed")
+    check(replay_command(
+              ["/b/tests/yuzu_tar_tests", "--order", "lex", "--rng-seed", "1"], 222) ==
+          ["/b/tests/yuzu_tar_tests", "--order", "lex", "--rng-seed", "1"],
+          "replay preserves Meson-pinned Catch2 options instead of duplicating them")
+    check(replay_command(
+              ["/b/tests/yuzu_server_tests", "~[pg]", "--order=lex", "--rng-seed=1"],
+              None) ==
+          ["/b/tests/yuzu_server_tests", "~[pg]", "--order=lex", "--rng-seed=1"],
+          "replay preserves equals-form options and the shard filter")
+    deduped = replay_command(
+        ["/b/tests/yuzu_tar_tests", "--order", "lex", "--order", "rand",
+         "--rng-seed", "1", "--rng-seed", "2"],
+        222,
+    )
+    check(deduped.count("--order") == 1 and deduped.count("--rng-seed") == 1,
+          "replay emits at most one occurrence of each Catch2 ordering option")
     # REGRESSION GUARD. `set startup-with-shell off` alongside --args is precisely
     # the bug: gdb escapes the args at --args parse time expecting its startup
     # shell to unescape them, so killing the shell delivers `\~\[pg\]` to the

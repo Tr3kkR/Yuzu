@@ -52,6 +52,7 @@ if a and a[0] == "introspect":
         cmd = [os.environ["FAKE_CATCH2_BIN"]]
         if os.environ.get("FAKE_SHARD_SPEC"):   # sharded entry (#2092): tag filter in cmd
             cmd.append(os.environ["FAKE_SHARD_SPEC"])
+        cmd += json.loads(os.environ.get("FAKE_CATCH2_OPTIONS", "[]"))
     print(json.dumps([{"name": "fake unit tests", "cmd": cmd, "env": {}, "workdir": None,
                        "suite": ["yuzu:fake"]}]))
     sys.exit(0)
@@ -77,7 +78,10 @@ import os, re, sys
 a = sys.argv[1:]
 fail = [c for c in os.environ.get("FAKE_FAIL_CASES", "").split(";") if c]
 always = [c for c in os.environ.get("FAKE_ALWAYS_FAIL", "").split(";") if c]
+expected_options = __import__("json").loads(os.environ.get("FAKE_CATCH2_OPTIONS", "[]"))
 TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
+if any(option not in a for option in expected_options):
+    sys.exit(1)
 if "--reporter" in a:                       # enumeration run -> emit Catch2 junit
     # A sharded entry's tag filter must SURVIVE into the enumeration run
     # (#2092: only the isolated retry strips it) — a missing spec means the
@@ -95,7 +99,7 @@ if "--reporter" in a:                       # enumeration run -> emit Catch2 jun
 # re-run the whole shard) -> hard fail so the recovery scenario can't pass.
 if any(TAG_SPEC.match(x) for x in a):
     sys.exit(1)
-case = a[0] if a else ""
+case = next((candidate for candidate in fail + always if candidate in a), "")
 sys.exit(1 if case in always else 0)
 """
 
@@ -411,6 +415,17 @@ def main():
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_NONCATCH2": "1"}, listed, False),
         run_scenario("sharded suite (#2092): retry replaces tag filter",
                      {"FAKE_FAIL_CASES": "FlakeA", "FAKE_SHARD_SPEC": "~[pg]"}, listed, True),
+        run_scenario(
+            "aggregate TAR retry keeps deterministic Catch2 options",
+            {
+                "FAKE_FAIL_CASES": "FlakeA",
+                "FAKE_CATCH2_OPTIONS": json.dumps(
+                    ["--order", "lex", "--rng-seed", "1"]
+                ),
+            },
+            listed,
+            True,
+        ),
         # Suite red under meson, but the solo enumeration re-run reproduces
         # ZERO failing cases (order/contention-dependent failure, or a stale
         # junit from a crashed run). Nothing is attributable to a listed

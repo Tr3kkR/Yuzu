@@ -676,7 +676,6 @@ def _selftest():
           "non-pg shard maps to itself")
     check(match_suite("server - yuzu:server pg unit tests", shards)["cmd"] == ["s", "[pg]"],
           "pg shard maps to itself")
-
     # tag-spec surgery for isolated retries (#2092): strip positional tag
     # filters, keep argv[0] and option args, never invent args.
     check(_cmd_without_test_specs(["x", "~[pg]"]) == ["x"], "strips ~[pg]")
@@ -692,6 +691,9 @@ def _selftest():
           "strips mid-spec-negation shard filter (#2394)")
     check(_cmd_without_test_specs(["x", "[pg][routes],[pg][store],[pg][token]"]) == ["x"],
           "strips comma-OR shard filter (#2394)")
+    check(_cmd_without_test_specs(["x", "--order", "lex", "--rng-seed", "1"])
+          == ["x", "--order", "lex", "--rng-seed", "1"],
+          "TAR retry keeps deterministic options")
     check(_cmd_without_test_specs(["x", "a normal, prose case name"])
           == ["x", "a normal, prose case name"],
           "prose case name with a comma is NOT a spec (kept)")

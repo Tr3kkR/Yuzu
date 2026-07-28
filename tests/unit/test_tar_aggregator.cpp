@@ -18,11 +18,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <chrono>
-#include <format>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
+#include <format>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1643,107 +1640,20 @@ TEST_CASE("TAR #2361: a NON-aborting statement error fails one table, not the wh
     CHECK(failures_of(f.guard, "tcp_hourly") == 0);
 }
 
-TEST_CASE("TAR #2361: a rolled-back retention pass does not discard another writer's work",
-          "[tar][retention][clock-guard]") {
-    // Kimi / Gate 8, and the defect that survived four rounds: driving
-    // BEGIN/COMMIT through execute_sql releases the database mutex between
-    // statements, so a concurrent collector INSERT or set_config joined
-    // retention's transaction -- and once retention rolled back on failure, that
-    // rollback discarded the other writer's work after its caller had been told
-    // it succeeded.
-    //
-    // HOW MUCH THIS TEST IS WORTH (measured, Sol round-5 review). Against a
-    // deliberately reverted implementation this catches the defect roughly 1 run
-    // in 5. Two attempts to improve that made it WORSE, not better: widening the
-    // window to a 5,000-row delete dropped detection to 0 in 6, and asserting the
-    // stronger property directly ("no writer completes while the batch is open")
-    // also passed 6 of 6 against the broken shape. The interleaving simply is not
-    // reliably reachable from outside the store.
-    //
-    // So this is an opportunistic guard, NOT a regression barrier, and it is
-    // labelled as one rather than left to look like proof. The deterministic
-    // assurance for this fix is the sibling test below (a batch rolls back as a
-    // unit and does not reach outside itself) plus the lock structure itself:
-    // execute_atomic_batch holds mu_ across the whole transaction, which is
-    // verifiable by reading it and is what two reviewers checked. The assertion
-    // here is at least sound -- a DISTINCT key per write, and every acknowledged
-    // key must survive, so a discarded write cannot be masked by a later one.
-    TarGuardFixture f;
-    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
-    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> accepted, queued
-    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
-                              "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
-
-    std::atomic<bool> stop{false};
-    std::mutex ack_mu;
-    std::condition_variable ack_cv;
-    std::vector<int> acknowledged;
-    std::thread writer([&] {
-        int n = 0;
-        while (!stop.load(std::memory_order_relaxed)) {
-            const int mine = ++n;
-            if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
-                std::lock_guard lk(ack_mu);
-                acknowledged.push_back(mine);
-                ack_cv.notify_one();
-            }
-        }
-    });
-    // Join on EVERY path: run_retention is not noexcept, and destroying a
-    // joinable thread calls std::terminate while it still holds a db reference.
-    struct Joiner {
-        std::atomic<bool>& stop;
-        std::thread& t;
-        ~Joiner() {
-            stop.store(true, std::memory_order_relaxed);
-            if (t.joinable())
-                t.join();
-        }
-    } joiner{stop, writer};
-
-    // Wait for the writer to land at least one COMMITTED write BEFORE racing it.
-    // The contract under test is "no acknowledged write is discarded", which needs
-    // an acknowledged write to exist; without this the test relied on the writer
-    // thread being scheduled during run_retention, which on a loaded box it often
-    // is not (measured: 5/10 failures under CPU contention, 0/40 idle). Both CI
-    // pools run four runner agents on ONE box, so contention is the normal
-    // condition there, not the exceptional one. The writer keeps running through
-    // run_retention below, so the race this test exists for is unchanged -- only
-    // the precondition is now waited for instead of assumed.
-    //
-    // Declared after `joiner` so a timeout here still stops and joins the writer
-    // rather than terminating on a joinable thread.
-    {
-        std::unique_lock lk(ack_mu);
-        REQUIRE(ack_cv.wait_for(lk, std::chrono::seconds(30),
-                                [&] { return !acknowledged.empty(); }));
-    }
-
-    run_retention(*f.db, kT0, f.guard);
-    stop.store(true, std::memory_order_relaxed);
-    if (writer.joinable())
-        writer.join();
-
-    std::vector<int> acked;
-    {
-        std::lock_guard lk(ack_mu);
-        acked = acknowledged;
-    }
-    REQUIRE(acked.size() > 0); // the racing writer really did commit something
-    for (int n : acked) {
-        INFO("acknowledged write " << n << " of " << acked.size());
-        CHECK(f.db->get_config(std::format("collector_probe_{}", n), "") == std::to_string(n));
-    }
-    CHECK(row_count(*f.db, "process_hourly") == 6); // retention still failed closed
-    CHECK(failures_of(f.guard, "process_hourly") >= 1);
-}
-
 TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside itself",
           "[tar][retention][clock-guard]") {
-    // The deterministic half of the isolation contract, testing
-    // execute_atomic_batch directly rather than racing it. A write made BEFORE
-    // the batch must survive its rollback, and a successful statement INSIDE the
-    // batch must not survive a later failing one.
+    // The deterministic barrier for the isolation contract tests
+    // execute_atomic_batch directly. A write made BEFORE the batch must survive
+    // its rollback, a successful statement INSIDE the batch must not survive a
+    // later failure, and the connection must return to autocommit afterwards.
+    //
+    // Do not replace this with an externally scheduled writer race. The public
+    // TarDatabase interface cannot pause after BEGIN while mu_ is held, so such a
+    // probe cannot prove that a writer reached the transaction boundary. The old
+    // opportunistic version caught a deliberately reverted implementation only
+    // about 1 run in 5 and emitted up to 81,922 writes depending on host speed.
+    // Deterministic concurrent-boundary coverage would require an explicit
+    // product test seam; that is outside this CI/test-only change.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
     for (int h = 0; h < 4; ++h) {
@@ -1761,6 +1671,7 @@ TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside i
     const auto r = f.db->execute_atomic_batch(
         {"DELETE FROM tcp_hourly", "DELETE FROM process_hourly", "DELETE FROM tcp_hourly"});
 
+    CHECK(r.began);
     CHECK_FALSE(r.committed);
     REQUIRE(r.failed.size() == 3);
     for (char c : r.failed)
@@ -1768,6 +1679,11 @@ TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside i
     CHECK(row_count(*f.db, "tcp_hourly") == 4);     // the successful delete was undone
     CHECK(row_count(*f.db, "process_hourly") == 4);
     CHECK(f.db->get_config("pre_batch_write", "") == "kept"); // rollback stayed inside the batch
+    REQUIRE(f.db->set_config("post_batch_write", "kept"));
+    f.db.reset();
+    auto reopened = TarDatabase::open(f.tmp.path);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->get_config("post_batch_write", "") == "kept"); // committed before close
 }
 
 TEST_CASE("TAR #2361: the latch is HELD through a capped drain, then released",
