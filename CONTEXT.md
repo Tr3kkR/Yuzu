@@ -26,6 +26,12 @@ A packaged set of instruction content that represents a coherent operational cap
 
 The device target expression for an instruction, policy, query, or workflow. Scopes compose filters such as tags, OS, management groups, and prior result sets; they are part of the authorization and audit boundary.
 
+## Confinement (list-read confinement)
+
+Management-group narrowing of a per-agent *list / fan-out* read (ADR-0017, the admit-then-filter list gate): **admit** an operator who holds the read securable in *any* scope — globally or via at least one management group — **then filter** the result to the agents their management groups make visible (descendant-ward). Distinct from a per-*device* ownership check (one `agent_id`) and from **Scope** (a device-set *target* expression): confinement is the read-side authorization boundary on a multi-agent result. Fails closed on a corrupt/load-failed `rbac.db` — an operator who cannot be scoped sees nothing, never the fleet. The single chokepoint is `RbacStore::authorize_list_read → DenyAll | AdmitAll | AdmitScoped(visible_set)`.
+
+The global↔management-group **combining lattice** (frozen by #1715) is *cross-boundary additive*: a global **allow** admits all and overrides a group deny; a global **deny** does **not** override a group allow (authority to read a row comes *from* the group grant); deny-overrides applies only *within* a single group's assignments. One resolver backs the admit, the batched visible-set, and per-device `check_scoped_permission`, so list and per-device authorization can never diverge.
+
 ## Guardian
 
 The Guaranteed State policy enforcement system. Guardian evaluates desired-state policy fragments, triggers checks or remediation, and can route sensitive actions through approval or quarantine flows.
