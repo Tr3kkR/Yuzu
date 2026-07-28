@@ -130,7 +130,7 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 
 | Runner | Host | Jobs |
 |---|---|---|
-| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. |
+| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `macos-15` | GitHub-hosted | macos matrix |
 
@@ -165,6 +165,15 @@ runs 4 runners on one host, so every apt step is `flock`-serialized on
 (`scripts/ci/ensure-postgres.sh`), and meson is installed per-job via
 `pip --user` (it is not a host default). Full history + per-file detail:
 **`docs/ci-ubuntu-2604-cutover.md`**.
+
+Each Big Tam runner is bounded to one kernel-reported L3 domain via a systemd
+drop-in (`CPUAffinity` plus cgroup `AllowedCPUs`) and exports
+`YUZU_BUILD_JOBS=16`. Linux's SMT numbering is split: L3 0 is
+`0-7,32-39`, not the contiguous Windows `0-15`. CI passes that cap explicitly
+to `meson compile -j`; a process affinity mask does not make Ninja's default
+processor detection affinity-aware, while `-j16` alone is not an L3 pin. The
+versioned source and verification commands are in
+[`deploy/linux/`](../deploy/linux/README.md).
 
 ### Build speed (Big Tam)
 
@@ -497,12 +506,17 @@ junit reporter, since meson's junit is only suite-level — then:
   **fails** (a regression *inside* a flaky test is caught too).
 
 `tests/known-flaky.json` is the static, in-repo, PR-curated source of truth —
-one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform and
-**must** carry an `issue`), `reason`, and `added`. Cross-platform flakes emit a
-loud `::warning` (they signal a genuinely nondeterministic test, not an env
-quirk); OS-scoped ones a `::notice`. Entries older than 90 days get a soft
-`::warning` nag (never a hard fail). The wrapper validates the list up front and
-fails fast on a malformed one.
+one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform),
+`reason`, tracking `issue`, accountable `owner`, and ISO-8601 `added` and
+`expires` dates. Every field is required for every entry, including entries for
+another OS. An entry expires at the end of its stated date; an expired or
+malformed list fails before `meson test` starts, so stale exemptions cannot
+silently mask a red build. Cross-platform flakes emit a loud `::warning` (they
+signal a genuinely nondeterministic test, not an env quirk); OS-scoped ones a
+`::notice`. Entries older than 90 days still get a soft `::warning` before their
+hard expiry. Case names and platform values are unique, and `all` cannot be
+combined with an OS. Expiry uses the UTC calendar date; the validator's clock is
+injectable for hermetic tests.
 
 The job summary + annotations remain the immediate signal. In addition,
 `flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
