@@ -125,7 +125,7 @@ public:
                 lease.get(),
                 "TRUNCATE engine_principal_store.engine_principals RESTART IDENTITY CASCADE",
                 std::vector<std::string>{});
-            INFO("[EnginePrincipalStorePg] reset: " << PQresultErrorMessage(trunc.get()));
+            INFO("[EpLcShared] reset: " << PQresultErrorMessage(trunc.get()));
             REQUIRE(trunc.status() == PGRES_COMMAND_OK);
         }
         store_ = std::make_unique<EnginePrincipalStore>(*ep_lc_shared().pool);

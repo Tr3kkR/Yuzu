@@ -521,7 +521,7 @@ file* — and flake-retry's isolated re-run (fresh process, fresh clone) will
 often recover them, so the incident can masquerade as N independent "recovered
 known flakes". Before treating such a cluster as N regressions (or adding them
 to `known-flaky.json`), grep the junit failure text for
-`PGRES_COMMAND_OK`, `pool->acquire()`, `is_open()`, or the bundle/reset tags
+`PGRES_COMMAND_OK`, `REQUIRE( lease )`, `is_open()`, or the bundle/reset tags
 (`[ApiTokenStorePgShared]`, `[AuthDbPgShared]`, `[EpLcShared]`,
 `[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
 one file is one PG-instance event, not a test bug.
