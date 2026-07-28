@@ -5005,6 +5005,39 @@ TEST_CASE("MCP KEK: rotate_kek, rewrap_secrets, get_kek_status are advertised in
     CHECK(names.count("decommission_kek") == 0);
 }
 
+// #2530 C1: the get_kek_status OUTPUT SCHEMA (not just the payload) must
+// carry the same three diagnostic fields REST added — twin parity is an
+// ADR-1005 invariant and the consistency gate treats a schema-only miss (the
+// payload has the field but discovery doesn't advertise it) as a real drift.
+TEST_CASE("MCP KEK: get_kek_status output schema advertises live_versions/lock_held/"
+          "lock_holder_pid",
+          "[mcp][integration][kek]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    bool found = false;
+    for (const auto& t : body["result"]["tools"]) {
+        if (t["name"] != "get_kek_status")
+            continue;
+        found = true;
+        REQUIRE(t.contains("outputSchema"));
+        const auto& props = t["outputSchema"]["properties"];
+        CHECK(props.contains("active_version"));
+        CHECK(props.contains("oldest_in_use"));
+        CHECK(props.contains("rotation_complete"));
+        CHECK(props.contains("live_versions"));
+        CHECK(props.contains("lock_held"));
+        CHECK(props.contains("lock_holder_pid"));
+        CHECK(props.contains("lock_holder_captured_at"));
+        // cooldown_retry_after_ms is Cooldown-only (B2 amendment) — it must
+        // NEVER appear on /status's schema or payload.
+        CHECK_FALSE(props.contains("cooldown_retry_after_ms"));
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, including "
           "readonly",
           "[mcp][integration][kek][security]") {
@@ -5016,6 +5049,14 @@ TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, i
             r.active_version = 2;
             r.oldest_in_use = 2;
             r.rotation_complete = true;
+            // #2530 C1: the three diagnostic snapshots — MCP must carry the
+            // same fields as REST's twin (ADR-1005 twin parity).
+            r.live_versions = 3;
+            r.lock_held = true;
+            r.lock_holder_pid = 4242;
+            // #2530 H1: the capture-instant twin of lock_held/lock_holder_pid.
+            r.lock_holder_captured_at = std::chrono::system_clock::time_point{
+                std::chrono::seconds{1735689600}}; // 2025-01-01T00:00:00Z
             return r;
         };
         ts.start(tier);
@@ -5027,12 +5068,74 @@ TEST_CASE("MCP KEK: get_kek_status (Security:Read) is reachable on every tier, i
         auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
         CHECK(payload["active_version"] == 2);
         CHECK(payload["rotation_complete"] == true);
+        CHECK(payload["live_versions"] == 3);
+        CHECK(payload["lock_held"] == true);
+        CHECK(payload["lock_holder_pid"] == 4242);
+        CHECK(payload["lock_holder_captured_at"] == "2025-01-01T00:00:00Z");
         // Read-only — exactly the generic mcp.get_kek_status|success entry
         // every tool call gets; NO separate domain audit row (matches
         // kek_routes.cpp GET /status, which never calls its own AuditFn).
         REQUIRE(ts.audit_log.size() == 1);
         CHECK(ts.audit_log.back() == "mcp.get_kek_status|success");
     }
+}
+
+TEST_CASE("MCP KEK: get_kek_status reports lock_holder_pid as null when the lock is unheld",
+          "[mcp][integration][kek]") {
+    McpTestServer ts;
+    ts.kek_ops_for_test.status = []() {
+        KekOpResult r;
+        r.active_version = 1;
+        r.rotation_complete = true;
+        r.live_versions = 1;
+        r.lock_held = false;
+        r.lock_holder_pid = std::nullopt;
+        return r;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_kek_status"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["lock_held"] == false);
+    CHECK(payload["lock_holder_pid"].is_null());
+}
+
+// #2530 T5: the MCP twin of the REST fix — live_versions/lock_held must
+// serialise as JSON null (never a fabricated 0/false, and the key must
+// stay present) when the seam left them std::nullopt, exactly matching a
+// query-failure degrade in server.cpp's status lambda.
+TEST_CASE("MCP KEK: get_kek_status reports live_versions/lock_held as null when undetermined, "
+          "never a fabricated 0/false",
+          "[mcp][integration][kek]") {
+    McpTestServer ts;
+    ts.kek_ops_for_test.status = []() {
+        KekOpResult r;
+        r.active_version = 1;
+        r.rotation_complete = true;
+        // Default-constructed: live_versions/lock_held stay std::nullopt —
+        // what the seam leaves them at when the underlying query failed.
+        return r;
+    };
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_kek_status"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload.contains("live_versions"));
+    CHECK(payload["live_versions"].is_null());
+    REQUIRE(payload.contains("lock_held"));
+    CHECK(payload["lock_held"].is_null());
+    // #2530 H1: undetermined lock_held must never carry a fabricated capture
+    // instant — a snapshot that was never taken has no "when".
+    REQUIRE(payload.contains("lock_holder_captured_at"));
+    CHECK(payload["lock_holder_captured_at"].is_null());
+    CHECK(payload["live_versions"] != 0);
+    CHECK(payload["lock_held"] != false);
 }
 
 TEST_CASE("MCP KEK: get_kek_status without a wired seam returns an error, not a crash",
@@ -5279,6 +5382,101 @@ TEST_CASE("MCP KEK: REST/MCP parity on the HalfCommitted remediation string",
     CHECK((prefix.find("do NOT") != std::string::npos || prefix.find("do not") != std::string::npos));
 
     sqlite3_close(raw);
+}
+
+// #2530 G7-B1: the MCP twin never learned VersionCeiling/QueryCanceled/
+// ClockAnomaly — they fell through to the generic "internal error" /
+// "failure=internal" arms (found independently by architect,
+// security-guardian AND consistency-auditor). Empty tier defers tier_allows
+// to true and requires_approval to false (mock perm always allows), so
+// these calls reach the kek_ops seam directly with no approval workflow —
+// exactly like the existing get_kek_status tests above.
+TEST_CASE("MCP KEK: VersionCeiling/QueryCanceled/ClockAnomaly are no longer generic internal "
+          "errors",
+          "[mcp][integration][kek][security]") {
+    struct Case {
+        KekOpResult::Failure failure;
+        const char* message_substr;
+        const char* remediation_substr;
+        const char* audit_detail; // the exact kek_failure_tag() tag this failure must audit
+    };
+    const Case cases[] = {
+        {KekOpResult::Failure::VersionCeiling, "ceiling", "--kek-max-live-versions",
+         "failure=ceiling"},
+        {KekOpResult::Failure::QueryCanceled, "canceled", "statement_timeout",
+         "failure=query_canceled"},
+        {KekOpResult::Failure::ClockAnomaly, "untrustworthy", "database server's clock",
+         "failure=clock_anomaly"},
+    };
+    for (const auto& c : cases) {
+        INFO("failure=" << static_cast<int>(c.failure));
+        McpTestServer ts;
+        ts.kek_ops_for_test.rotate = [&]() {
+            KekOpResult r;
+            r.failure = c.failure;
+            r.clock_skew_secs = 47;
+            return r;
+        };
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"rotate_kek"}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        const std::string message = body["error"]["message"].get<std::string>();
+        const std::string remediation = body["error"]["data"]["remediation"].get<std::string>();
+        // Neither string is the old generic fallback.
+        CHECK(message != "internal error");
+        CHECK(message.find(c.message_substr) != std::string::npos);
+        CHECK(remediation.find(c.remediation_substr) != std::string::npos);
+        // #2530 D: none of these three carries a retry hint — waiting alone
+        // never resolves any of them.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        // #2530 G8-F2 (corrected — an earlier version of this test asserted
+        // only `ts.audit_log`, which records `action + "|" + result` and
+        // DISCARDS `detail` entirely; that assertion could count a
+        // "kek.rotate|failure" row but could never observe WHICH failure
+        // tag it carried, so a regression straight back to
+        // `kek_failure_tag`'s "failure=internal" fallback for
+        // VersionCeiling/QueryCanceled/ClockAnomaly — the exact bug this
+        // whole test exists to catch — passed green with this assertion in
+        // place). Assert the actual `detail` string against the LITERAL
+        // expected tag (not a call into the same production function under
+        // test, which would make this tautological), AND cross-check it
+        // against the exported production twin (mcp::detail::
+        // kek_mcp_failure_tag) so a change to the tag vocabulary shows up
+        // here as a deliberate double-update rather than a silent drift.
+        CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                         std::string("kek.rotate|failure")) == 1);
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back() == c.audit_detail);
+        CHECK(ts.audit_details.back() == mcp::detail::kek_mcp_failure_tag(c.failure));
+    }
+}
+
+// #2530 G7-B2: kek_failure_info() used to take only the Failure enum and
+// hardcode 300000 for Cooldown, discarding result.cooldown_retry_after_ms —
+// against the 1h default that tells an agentic caller to retry in 5 minutes
+// for a 60-minute wait. Prove the honest seam-provided value threads all
+// the way to the MCP wire response, not just the fallback.
+TEST_CASE("MCP KEK: rotate_kek Cooldown threads the seam's honest cooldown_retry_after_ms, "
+          "never the hardcoded fallback",
+          "[mcp][integration][kek][security]") {
+    McpTestServer ts;
+    ts.kek_ops_for_test.rotate = []() {
+        KekOpResult r;
+        r.failure = KekOpResult::Failure::Cooldown;
+        r.cooldown_retry_after_ms = 3500000; // ~58 minutes remaining of a 1h window
+        return r;
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"rotate_kek"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == 3500000);
+    CHECK(body["error"]["data"]["retry_after_ms"] != 300000);
 }
 
 // ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────
