@@ -50,27 +50,39 @@ merged, 81 of 81 local branches predated it.
 
 ```bash
 git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
-git diff --quiet origin/dev -- \
-      .claude/skills/governance/ .claude/routed-concerns.md CLAUDE.md \
+# What does origin/dev have that this branch does NOT? Three dots, and this
+# direction only: your own edits to these files are not staleness.
+MISSING=$(git diff --name-only HEAD...origin/dev -- \
+            .claude/skills/governance/ .claude/routed-concerns.md CLAUDE.md)
+[ -z "$MISSING" ] \
   && echo "governance assets current" \
-  || echo "STALE - your copy differs from origin/dev; reconcile before running"
+  || { echo "STALE - missing from your tree:"; echo "$MISSING"; }
 ```
 
-The fetch guard matters: a bare `git fetch` whose exit status is discarded will fail
-silently offline or on expired auth, and the diff then runs against a stale cached
+Three things about that command are load-bearing.
+
+**`HEAD...origin/dev`, three dots, in that direction only.** It asks what `origin/dev` has
+since the merge-base that this tree does not. A two-dot `git diff origin/dev` conflates
+that with *your own* edits to the same files, which is not staleness - and a branch
+legitimately editing the skill would then have to be granted an exemption it asserts for
+itself. That exemption is exactly the shape this pipeline rejects elsewhere: the ledger
+requires an adjudicator who is not the change's author, and a self-declared bypass is the
+same hole wearing a different hat. The three-dot form removes the need for one, because a
+branch's own edits never appear in it. **It names the missing files rather than returning a
+bare boolean**, so the report is evidence rather than an assertion.
+
+**The fetch guard.** A bare `git fetch` whose exit status is discarded fails silently
+offline or on expired auth, and the comparison then runs against a stale cached
 `origin/dev` and reports **current** while your tree holds the old pipeline. That is the
 one direction this check exists to prevent.
 
-`CLAUDE.md` is included because it is loaded into every session, so a stale summary there
-outranks a correct skill in practice.
+**`CLAUDE.md` is included** because it is loaded into every session, so a stale summary
+there outranks a correct skill in practice.
 
 If it reports stale, reconcile before running: rebase or merge `origin/dev`, or read the
-files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. **Unless you
-are deliberately editing them** - on a branch changing the skill, the table or CLAUDE.md,
-a stale report is expected and the diff you are looking at is your own. Reconcile against
-the rest, not against your change. Do not otherwise proceed on the assumption that your
-copy is current - the same failure mode produces confident false claims about which agents
-a change routes to.
+named files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. Do not
+proceed on the assumption that your copy is current - the same failure mode produces
+confident false claims about which agents a change routes to.
 
 **The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
 `git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
@@ -898,19 +910,24 @@ Strategy:
 
    ```bash
    GOV_LOG_DIR="${YUZU_GOV_LOG_DIR:-$HOME/.local/share/yuzu/governance-runs}"
-   RUN_ID="gov-$(date +%s)-$$"          # collision-free by construction
    mkdir -p "$GOV_LOG_DIR"
-   # -> $GOV_LOG_DIR/$RUN_ID.jsonl
+   LEDGER="$(mktemp "$GOV_LOG_DIR/gov-$(date +%Y%m%d-%H%M%S)-XXXXXX")" \
+     && mv "$LEDGER" "$LEDGER.jsonl" && LEDGER="$LEDGER.jsonl"
    ```
 
    Two details are load-bearing. **`$HOME`, never `~`** - tilde does not expand inside
    double quotes, so a quoted `~/...` creates a literal `./~/.local/...` under the current
    directory, which for a governance run is the repo: committable, not ignored, and
-   destroyed by `git clean`, the exact inverse of the intent. **And the id derives from
-   epoch seconds plus PID**, matching `/test`'s `RUN_ID="$(date +%s)-$$"`: unique without
-   probing for existing files, so two runs on the same base on the same day cannot collide
-   or overwrite. The commit range is a field inside the ledger, so it does not need to be
-   in the filename.
+   destroyed by `git clean`, the exact inverse of the intent.
+
+   **And `mktemp`, not a constructed name.** `mktemp` creates the file with `O_EXCL`, so
+   uniqueness is enforced by the filesystem rather than assumed from its inputs. A
+   timestamp-plus-PID name is *not* collision-free: two evaluations in the same shell in
+   the same second are identical, and containers routinely reuse PIDs - PID 1 especially -
+   so two runs starting in the same second against a shared ledger directory would produce
+   the same path and either interleave or truncate. The X's are at the end of the template
+   and the suffix is added afterwards because BSD `mktemp` rejects them mid-template. The
+   commit range is a field inside the ledger, so it does not need to be in the filename.
 
    The location mirrors `/test`'s `test-runs.db` convention deliberately: outside the repo,
    so it survives `git clean` and never lands in a diff.
