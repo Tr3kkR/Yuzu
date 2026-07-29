@@ -5302,7 +5302,15 @@ void SettingsRoutes::register_routes(
         // Shared same-site comparison (web_utils) — one implementation across
         // settings + ca_routes (#1241 H-1). This site keeps the 403 + csrf.denied
         // audit; ca_routes' dashboard revoke calls the same helper.
-        if (origin_is_same_site(host, origin, referer)) {
+        //
+        // The operator-declared external-origin allowlist (#2537) comes straight
+        // from Config here, because this owner already holds one. CaRoutes and
+        // DashboardRoutes take theirs via set_csrf_trusted_origins() rather than
+        // acquire a Config dependency they otherwise have no use for. A null
+        // cfg_ yields an empty span — same-host only, fail-closed, never open.
+        if (origin_is_same_site(host, origin, referer,
+                                cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                     : std::span<const std::string>{})) {
             return true;
         }
         res.status = 403;

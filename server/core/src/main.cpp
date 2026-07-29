@@ -16,6 +16,7 @@
 
 #include <CLI/CLI.hpp>
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
+#include "web_utils.hpp"     // normalise_trusted_origins (#2537 CSRF allowlist)
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
@@ -186,6 +187,18 @@ int main(int argc, char* argv[]) {
     app.add_option("--web-port", cfg.web_port, "Web UI port")
         ->default_val(8080)
         ->envname("YUZU_WEB_PORT");
+    app.add_option("--csrf-trusted-origin", cfg.csrf_trusted_origins,
+                   "External origin the dashboard is served on, for the CSRF same-site check "
+                   "(repeatable; a single value may be comma-separated). Set this when a reverse "
+                   "proxy rewrites Host, otherwise every CSRF-gated dashboard action is refused "
+                   "with 403 because the browser's Origin cannot match the proxied Host. Forms: "
+                   "'https://yuzu.example' (matched on scheme AND host) or a bare 'yuzu.example' "
+                   "(host only). Wildcards are NOT supported. No forwarded header is consulted.")
+        // Comma-splitting is done ONCE, in normalise_trusted_origins (web_utils.hpp),
+        // NOT here — do NOT add CLI11 `->delimiter(',')`, or a comma-separated value
+        // would be split twice (CLI11 tokens × the parser's own comma loop) and mangle
+        // entries. Same rule, and same reason, as --cert-san (#1271).
+        ->envname("YUZU_CSRF_TRUSTED_ORIGIN");
     app.add_flag("--no-tls", "Disable TLS (insecure, for development only)")
         ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--cert", cfg.tls_server_cert, "PEM server certificate")->envname("YUZU_CERT");
@@ -711,6 +724,27 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // ── CSRF trusted origins: normalise ONCE, here (#2537) ──
+    // Comma-splitting, trimming, lowercasing and default-port stripping happen
+    // exactly once at boot rather than per request. Storing the normalised form
+    // back into cfg means every consumer compares like for like, and the gate
+    // itself stays a pure comparison.
+    cfg.csrf_trusted_origins = yuzu::server::normalise_trusted_origins(cfg.csrf_trusted_origins);
+    if (!cfg.csrf_trusted_origins.empty()) {
+        // Boot-log the accepted set as deployment evidence: an operator who
+        // mistypes an entry sees an opaque 403 at the dashboard, and this line
+        // is what turns that into a two-second diagnosis.
+        std::string joined;
+        for (const auto& o : cfg.csrf_trusted_origins) {
+            if (!joined.empty())
+                joined += ", ";
+            joined += o;
+        }
+        spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
+                     "in addition to the request Host — {}",
+                     cfg.csrf_trusted_origins.size(), joined);
+    }
 
     // ── MFA enforcement mode advisory ──
     // Surface the active enforcement mode once at startup so an auditor

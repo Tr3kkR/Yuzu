@@ -193,6 +193,76 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
+
+**Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
+Cloudflare where the proxy **rewrites the `Host` header** rather than passing the client's
+value through. Direct access, and proxies configured to preserve `Host`, are unaffected and
+need no change.
+
+**The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
+— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, and the
+gated settings POSTs. The dashboard renders fine and reads work; only the destructive actions
+fail.
+
+**Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
+the proxy substitutes its own `Host`, those two legitimately differ: the browser says
+`https://yuzu.customer.example` while the server sees `yuzu-server:8080`. The check was
+correct and the deployment was correct; there was simply no way to tell the server its
+external name.
+
+**The fix — declare the external origin:**
+
+```bash
+yuzu-server --csrf-trusted-origin https://yuzu.customer.example
+# or
+YUZU_CSRF_TRUSTED_ORIGIN=https://yuzu.customer.example
+```
+
+Repeatable, and a single value may be comma-separated:
+
+```bash
+--csrf-trusted-origin https://yuzu.example --csrf-trusted-origin https://yuzu-dr.example
+--csrf-trusted-origin "https://yuzu.example,https://yuzu-dr.example"
+```
+
+Two accepted forms, and the difference matters:
+
+| Form | Matches |
+|---|---|
+| `https://yuzu.example` | that host **over https only** — an `http://` Origin for the same host is still refused |
+| `yuzu.example` | that host over **either** scheme |
+
+Prefer the scheme-qualified form. It also closes a weaker pre-existing behaviour in the same
+check, where `http://h` satisfied a request to `https://h`.
+
+Entries are case-insensitive, may carry a port (`yuzu.example:8443`; `:80` and `:443` are
+stripped as defaults), and any path is ignored. **Wildcards are not supported** — `*.example`
+is accepted by the parser but will never match anything, deliberately.
+
+**Confirming it took.** The server logs the accepted set once at boot:
+
+```
+CSRF same-site gate: accepting 1 operator-declared external origin(s) in addition to the request Host — https://yuzu.customer.example
+```
+
+If that line is absent, or lists something other than what your users type into the address
+bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
+
+**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
+before, so an unproxied deployment sees no difference. Non-browser clients sending neither
+`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, and the two
+CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
+means same-host only, which is the previous behaviour.
+
+**Deliberately not implemented: `X-Forwarded-Host` is never consulted.** Reading it would let
+anyone able to reach the server's port declare their own external hostname and defeat the CSRF
+check outright. Gating it on a trusted-proxy CIDR does not rescue that — on the container
+networks the reference composes use, "inside the CIDR" is usually every sibling container, and
+the failure mode is silent: the dashboard keeps working while the control is dead. A config
+value cannot be set by an attacker, which is why the trust anchor here is a flag and not a
+header.
+
 ### vNEXT — a device target that was supplied but names nothing is now refused, not widened to the fleet (#2500)
 
 **What changed.** Three REST surfaces treated a targeting argument the caller *supplied* that

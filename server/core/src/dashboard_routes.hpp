@@ -92,7 +92,21 @@ public:
                          yuzu::MetricsRegistry* metrics = nullptr,
                          InstructionStore* instruction_store = nullptr);
 
+    /// Operator-declared external origins for the CSRF same-site gate (#2537),
+    /// already normalised by `normalise_trusted_origins` at boot. Set BEFORE
+    /// `register_routes` — the handlers capture `this` and read the member per
+    /// request, so a later call would not reach an already-registered route.
+    ///
+    /// A setter rather than another `register_routes` parameter because both
+    /// overloads already take eleven, and because the miss-case is safe: leaving
+    /// it unset means same-host only, which is the pre-#2537 behaviour and
+    /// refuses a proxied browser POST. Forgetting degrades to fail-closed.
+    void set_csrf_trusted_origins(std::vector<std::string> origins) {
+        csrf_trusted_origins_ = std::move(origins);
+    }
+
 private:
+    std::vector<std::string> csrf_trusted_origins_;
     AuthFn auth_fn_;
     PermFn perm_fn_;
     AuditFn audit_fn_;

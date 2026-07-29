@@ -279,6 +279,99 @@ TEST_CASE("origin_is_same_site: Origin takes precedence over Referer", "[web_uti
                                     "https://yuzu.example/ref"));
 }
 
+// ── #2537: operator-declared external origins (reverse-proxy support) ────────
+
+TEST_CASE("normalise_trusted_origins: splitting, trimming, casing, ports", "[web_utils][csrf]") {
+    SECTION("a single token may be comma-separated (the --cert-san contract)") {
+        const std::vector<std::string> raw{"https://a.example, b.example ,,https://c.example"};
+        const auto got = normalise_trusted_origins(raw);
+        REQUIRE(got.size() == 3);
+        CHECK(got[0] == "https://a.example");
+        CHECK(got[1] == "b.example");
+        CHECK(got[2] == "https://c.example");
+    }
+    SECTION("repeated flags accumulate") {
+        const std::vector<std::string> raw{"a.example", "b.example"};
+        CHECK(normalise_trusted_origins(raw).size() == 2);
+    }
+    SECTION("lowercased, path stripped, default port stripped, scheme preserved") {
+        const std::vector<std::string> raw{"HTTPS://Yuzu.Example:443/dashboard?x=1"};
+        const auto got = normalise_trusted_origins(raw);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0] == "https://yuzu.example");
+    }
+    SECTION("a non-default port is significant and kept") {
+        const auto got = normalise_trusted_origins(std::vector<std::string>{"yuzu.example:8443"});
+        REQUIRE(got.size() == 1);
+        CHECK(got[0] == "yuzu.example:8443");
+    }
+    SECTION("empty and whitespace-only entries are dropped, not kept as ''") {
+        // An '' entry would match an unparseable Origin and silently widen the gate.
+        const auto got = normalise_trusted_origins(std::vector<std::string>{" , ,\t", ""});
+        CHECK(got.empty());
+    }
+}
+
+TEST_CASE("origin_is_same_site: allowlist admits a proxied Origin", "[web_utils][csrf]") {
+    // The #2537 shape: proxy rewrote Host, so Host and Origin legitimately differ.
+    const auto trusted = normalise_trusted_origins(
+        std::vector<std::string>{"https://yuzu.customer.example"});
+    CHECK(origin_is_same_site("yuzu-server:8080", "https://yuzu.customer.example", "", trusted));
+    // ...and it is the ALLOWLIST doing it, not a general relaxation.
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "https://attacker.example", "", trusted));
+}
+
+TEST_CASE("origin_is_same_site: empty allowlist is byte-for-byte the old behaviour",
+          "[web_utils][csrf]") {
+    // Regression guard for the defaulted parameter: a caller that never learned
+    // about #2537 must behave exactly as it did before.
+    const std::vector<std::string> none;
+    CHECK(origin_is_same_site("yuzu.example", "https://yuzu.example", "", none));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "https://yuzu.customer.example", "", none));
+    CHECK(origin_is_same_site("yuzu.example", "", "", none)); // non-browser client
+}
+
+TEST_CASE("origin_is_same_site: a scheme-qualified entry is matched on scheme too",
+          "[web_utils][csrf]") {
+    const auto https_only =
+        normalise_trusted_origins(std::vector<std::string>{"https://yuzu.example"});
+    CHECK(origin_is_same_site("proxy-internal", "https://yuzu.example", "", https_only));
+    // The weaker half of #2537: http:// must NOT satisfy an https:// entry.
+    CHECK_FALSE(origin_is_same_site("proxy-internal", "http://yuzu.example", "", https_only));
+
+    // A bare-host entry is scheme-agnostic by design, for operators who do not
+    // want to pin it. Documented, and the reason the two forms both exist.
+    const auto bare = normalise_trusted_origins(std::vector<std::string>{"yuzu.example"});
+    CHECK(origin_is_same_site("proxy-internal", "http://yuzu.example", "", bare));
+    CHECK(origin_is_same_site("proxy-internal", "https://yuzu.example", "", bare));
+}
+
+TEST_CASE("origin_is_same_site: allowlist matching is case-insensitive", "[web_utils][csrf]") {
+    // A config value's case is the operator's typing; a silent no-match there is
+    // an opaque 403 that costs a support round-trip.
+    const auto trusted =
+        normalise_trusted_origins(std::vector<std::string>{"HTTPS://Yuzu.Example"});
+    CHECK(origin_is_same_site("proxy-internal", "https://YUZU.example", "", trusted));
+}
+
+TEST_CASE("origin_is_same_site: allowlist cannot rescue a malformed Origin", "[web_utils][csrf]") {
+    // userinfo fails closed BEFORE the allowlist is consulted — otherwise
+    // "https://yuzu.example@attacker.example" could be talked into matching.
+    const auto trusted =
+        normalise_trusted_origins(std::vector<std::string>{"https://yuzu.example"});
+    CHECK_FALSE(
+        origin_is_same_site("proxy-internal", "https://yuzu.example@attacker.example", "", trusted));
+}
+
+TEST_CASE("origin_is_same_site: wildcards are not supported and match nothing",
+          "[web_utils][csrf]") {
+    // Kept verbatim rather than expanded: a wildcard silently accepted into a
+    // CSRF allowlist would be the entire control undone by one character.
+    const auto star = normalise_trusted_origins(std::vector<std::string>{"*", "*.example"});
+    CHECK_FALSE(origin_is_same_site("proxy-internal", "https://anything.example", "", star));
+    CHECK_FALSE(origin_is_same_site("proxy-internal", "https://evil.example", "", star));
+}
+
 TEST_CASE("url_decode: percent at end of string (incomplete sequence)", "[web_utils][url]") {
     // '%' at end without two hex digits should be kept as-is
     auto result = url_decode("test%");

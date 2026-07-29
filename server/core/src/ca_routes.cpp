@@ -637,7 +637,12 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // Form-encoded (HTMX hx-vals); Security:Delete. Re-renders the panel fragment
     // so the HTMX swap shows the updated inventory. Shares revoke_core with the
     // JSON REST endpoint (same validation, audit, CRL republish).
-    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core](
+    // #2537: the trusted-origin allowlist is captured BY VALUE, not read through
+    // `this`. These handlers deliberately capture every dependency by value and
+    // never touch the owner, so copying the (small, boot-immutable) list keeps it
+    // that way and raises no question about CaRoutes outliving the sink.
+    const auto csrf_trusted = csrf_trusted_origins_;
+    sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted](
                                              const httplib::Request& req, httplib::Response& res) {
         // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone,
         // and SameSite=Lax does not block a top-level cross-site form POST — so a
@@ -650,8 +655,9 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // (Hermes PR4b MEDIUM). Token/Bearer automation uses the REST sibling.
         const std::string origin = req.get_header_value("Origin");
         const std::string referer = req.get_header_value("Referer");
-        const bool same_site = !(origin.empty() && referer.empty()) &&
-                               origin_is_same_site(req.get_header_value("Host"), origin, referer);
+        const bool same_site =
+            !(origin.empty() && referer.empty()) &&
+            origin_is_same_site(req.get_header_value("Host"), origin, referer, csrf_trusted);
         if (!same_site) {
             if (!audit_fn(req, "csrf.denied", "denied", "Endpoint", "ca.revoke",
                           "cross-origin or header-less dashboard revoke refused"))
@@ -705,13 +711,14 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     // the new Trust mode badge shows. The submitted PEMs are NEVER echoed back
     // into the fragment, so this wrapper adds no HTML-injection surface.
     sink.Post("/api/settings/ca/import-chain",
-              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn](
+              [perm_fn, audit_fn, ca_store, import_chain_fn, publish_crl_fn, csrf_trusted](
                   const httplib::Request& req, httplib::Response& res) {
                   const std::string origin = req.get_header_value("Origin");
                   const std::string referer = req.get_header_value("Referer");
                   const bool same_site =
                       !(origin.empty() && referer.empty()) &&
-                      origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                      origin_is_same_site(req.get_header_value("Host"), origin, referer,
+                                          csrf_trusted);
                   if (!same_site) {
                       if (!audit_fn(req, "csrf.denied", "denied", "Endpoint", "ca.import-chain",
                                     "cross-origin or header-less dashboard CA import refused"))

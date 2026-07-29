@@ -5,6 +5,7 @@
 /// Extracted here for testability.
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,8 +13,10 @@
 #include <ctime>
 #include <format>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -219,6 +222,68 @@ inline std::string url_decode(const std::string& s) {
     return out;
 }
 
+/// Normalise operator-supplied CSRF trusted origins (`--csrf-trusted-origin`,
+/// #2537) into the form `origin_is_same_site` compares against. Call ONCE at
+/// boot, not per request.
+///
+/// Each raw token may itself be comma-separated, mirroring `--cert-san`: CLI11
+/// hands the token over whole and this function owns the comma semantics, so
+/// do NOT add a CLI11 `->delimiter(',')` (that would split twice and mangle
+/// entries — the #1271 lesson on the SAN parser).
+///
+/// Normalisation is: trim, drop empties, ASCII-lowercase, drop any path/query
+/// /fragment tail, strip a default port (80/443). A scheme is PRESERVED when
+/// supplied, because an entry that carries one is compared on scheme as well as
+/// host — that is how a configured deployment also closes the weaker half of
+/// #2537, where `http://h` satisfied a request to `https://h`.
+///
+/// Wildcards are deliberately NOT supported. An entry like `*.example` is kept
+/// verbatim and will simply never match, which fails closed. Silently accepting
+/// a wildcard in a CSRF allowlist would be the whole control undone by one
+/// character.
+[[nodiscard]] inline std::vector<std::string>
+normalise_trusted_origins(std::span<const std::string> raw) {
+    std::vector<std::string> out;
+    for (const auto& token : raw) {
+        std::size_t pos = 0;
+        while (pos <= token.size()) {
+            const auto comma = token.find(',', pos);
+            auto piece = token.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                     : comma - pos);
+            pos = (comma == std::string::npos) ? token.size() + 1 : comma + 1;
+
+            const auto first = piece.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos)
+                continue; // empty / whitespace-only (e.g. a trailing comma)
+            const auto last = piece.find_last_not_of(" \t\r\n");
+            piece = piece.substr(first, last - first + 1);
+
+            for (auto& c : piece)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+            // Split scheme off so the path-strip below cannot eat "//".
+            std::string scheme;
+            if (const auto sep = piece.find("://"); sep != std::string::npos) {
+                scheme = piece.substr(0, sep + 3);
+                piece.erase(0, sep + 3);
+            }
+            for (char delim : {'/', '?', '#'}) {
+                if (const auto idx = piece.find(delim); idx != std::string::npos)
+                    piece.erase(idx);
+            }
+            if (piece.empty())
+                continue;
+            if (const auto colon = piece.rfind(':'); colon != std::string::npos) {
+                const auto port = piece.substr(colon + 1);
+                if (port == "443" || port == "80")
+                    piece.erase(colon);
+            }
+            out.push_back(scheme + piece);
+        }
+    }
+    return out;
+}
+
 /// CSRF same-site check (shared helper — #1241 H-1). Returns true when the
 /// request is safe to act on: a non-browser client (no Origin AND no Referer —
 /// curl/automation post without them) OR an Origin/Referer whose host matches
@@ -227,8 +292,29 @@ inline std::string url_decode(const std::string& s) {
 /// same way; the caller emits the 403 + `csrf.denied` audit. Default ports
 /// (80/443) are stripped for comparison; userinfo in Origin/Referer (RFC 6454
 /// forbids it) fails the check.
+///
+/// `trusted_origins` (#2537) is an operator-declared allowlist of the external
+/// origins the dashboard is served on, normalised by `normalise_trusted_origins`
+/// at boot. It exists because a reverse proxy that rewrites `Host` makes the
+/// browser's `Origin` and the server's `Host` legitimately differ, which 403'd
+/// every gated dashboard action behind nginx/Envoy/ALB.
+///
+/// NOTE what this deliberately does NOT do: it never reads `X-Forwarded-Host`
+/// or any other request header to decide what the external host is. The trust
+/// anchor is a boot-time config value, which an attacker cannot set. Trusting a
+/// forwarded header instead — even gated on a peer-address CIDR — fails OPEN
+/// when the CIDR is too wide or the port is reachable off-proxy: the dashboard
+/// keeps working while the CSRF control is silently dead. On the container
+/// networks the reference composes use, "inside the CIDR" is usually every
+/// sibling container.
+///
+/// The parameter defaults to empty ON PURPOSE, and the default is safe: a
+/// caller that forgets it gets exactly the pre-#2537 behaviour — same-host only,
+/// which refuses a proxied browser POST. Forgetting degrades to fail-closed, it
+/// never opens a hole.
 inline bool origin_is_same_site(std::string_view host, std::string_view origin,
-                                std::string_view referer) {
+                                std::string_view referer,
+                                std::span<const std::string> trusted_origins = {}) {
     auto strip_default_port = [](std::string h) -> std::string {
         auto colon = h.rfind(':');
         if (colon == std::string::npos)
@@ -251,11 +337,43 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
             return std::nullopt; // userinfo → malformed, fail closed
         return strip_default_port(std::move(url));
     };
+    // Scheme of the request origin, lowercased, "" when absent. Only consulted
+    // for allowlist entries that themselves carry a scheme.
+    auto extract_scheme = [](std::string_view url) -> std::string {
+        const auto sep = url.find("://");
+        if (sep == std::string_view::npos)
+            return {};
+        std::string s(url.substr(0, sep + 3));
+        for (auto& c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
     if (origin.empty() && referer.empty())
         return true; // non-browser client (curl/automation)
-    auto extracted =
-        origin.empty() ? extract_host(std::string(referer)) : extract_host(std::string(origin));
-    return extracted && *extracted == strip_default_port(std::string(host));
+    const std::string_view source = origin.empty() ? referer : origin;
+    auto extracted = extract_host(std::string(source));
+    if (!extracted)
+        return false; // userinfo → fail closed, before any allowlist consideration
+    if (*extracted == strip_default_port(std::string(host)))
+        return true; // same-host: unchanged pre-#2537 behaviour
+
+    // Allowlist. Compare lowercased, since a config value's case is the
+    // operator's typing and a silent no-match there is an opaque 403.
+    std::string want = *extracted;
+    for (auto& c : want)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const std::string want_scheme = extract_scheme(source);
+    for (const auto& entry : trusted_origins) {
+        if (const auto sep = entry.find("://"); sep != std::string::npos) {
+            // Scheme-qualified entry: BOTH must match, so https:// in config
+            // refuses an http:// Origin for the same host.
+            if (entry.compare(0, sep + 3, want_scheme) == 0 && entry.compare(sep + 3, std::string::npos, want) == 0)
+                return true;
+        } else if (entry == want) {
+            return true; // bare host entry: host-only match
+        }
+    }
+    return false;
 }
 
 /// The MCP transport body-cap decision for the server's pre-routing handler
