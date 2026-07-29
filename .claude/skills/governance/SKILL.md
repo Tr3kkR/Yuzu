@@ -42,7 +42,56 @@ Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed
 
 ## Step 0 — Before you launch anything
 
-Run these in parallel to size the change and pick domain agents:
+### First: confirm you are running the current pipeline
+
+This skill and the routed-concern table are read **from your working tree**, so a branch
+that predates a change to either silently runs the old pipeline. At the time #2604
+merged, 81 of 81 local branches predated it.
+
+```bash
+git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
+# What does origin/dev have that this branch does NOT? Three dots, and this
+# direction only: your own edits to these files are not staleness.
+MISSING=$(git diff --name-only HEAD...origin/dev -- \
+            .claude/skills/governance/ .claude/routed-concerns.md CLAUDE.md)
+[ -z "$MISSING" ] \
+  && echo "governance assets current" \
+  || { echo "STALE - missing from your tree:"; echo "$MISSING"; }
+```
+
+Three things about that command are load-bearing.
+
+**`HEAD...origin/dev`, three dots, in that direction only.** It asks what `origin/dev` has
+since the merge-base that this tree does not. A two-dot `git diff origin/dev` conflates
+that with *your own* edits to the same files, which is not staleness - and a branch
+legitimately editing the skill would then have to be granted an exemption it asserts for
+itself. That exemption is exactly the shape this pipeline rejects elsewhere: the ledger
+requires an adjudicator who is not the change's author, and a self-declared bypass is the
+same hole wearing a different hat. The three-dot form removes the need for one, because a
+branch's own edits never appear in it. **It names the missing files rather than returning a
+bare boolean**, so the report is evidence rather than an assertion.
+
+**The fetch guard.** A bare `git fetch` whose exit status is discarded fails silently
+offline or on expired auth, and the comparison then runs against a stale cached
+`origin/dev` and reports **current** while your tree holds the old pipeline. That is the
+one direction this check exists to prevent.
+
+**`CLAUDE.md` is included** because it is loaded into every session, so a stale summary
+there outranks a correct skill in practice.
+
+If it reports stale, reconcile before running: rebase or merge `origin/dev`, or read the
+named files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. Do not
+proceed on the assumption that your copy is current - the same failure mode produces
+confident false claims about which agents a change routes to.
+
+**The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
+`git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
+claims, and an external reviewer pointed at your tree inherits the error rather than
+catching it.
+
+### Then: size the change and pick domain agents
+
+Run these in parallel:
 
 ```bash
 git log --oneline <range>
