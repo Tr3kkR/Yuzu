@@ -362,6 +362,13 @@ Exception, and it is load-bearing: a factually false comment adjacent to a secur
 or control-flow branch IS a contradiction, not wording. #2202 shipped a comment
 asserting the opposite of what its function did, next to an authz branch.
 
+**Absence is a third category, and it is NOT wording.** A behaviour change with no
+doc at all contradicts nothing, so the cap does not reach it: a missing required doc
+is a TRUTH finding, derived per standing rule 2 as `I7` (SHOULD by default, BLOCKING
+where the omission conceals a breaking change, security-relevant behaviour, a
+data-loss risk, a migration step, or an irreversible operation). Never file a
+missing-doc finding as NICE on the grounds that it is "documentation".
+
 (Capping wording rather than banning it is deliberate: deciding whether prose is
 descriptive or normative is exactly the disputed question, so a mis-classification
 should cost a line of noise, not a lost finding.)
@@ -625,6 +632,14 @@ BLOCKING when the omission conceals a breaking change, security-relevant
 behaviour, data-loss risk, migration step, or an irreversible operation.
 Do not assert a blanket BLOCKING.
 
+You own WORDING everywhere prose appears, not only in documentation
+FILES: in-code comments and log/error-message text are yours too
+(standing rule 3). The DOMAIN agent owns whether that prose is TRUE —
+a comment that contradicts the code is theirs to raise, at native
+severity. A wording-only observation is capped at NICE, whoever raises
+it. A required doc that is MISSING is neither: absence contradicts
+nothing, so it is a truth finding derived as `I7` above, never capped.
+
 Specifically verify:
 1. REST API docs (`docs/user-manual/rest-api.md`) — endpoint signature,
    request/response body, error paths, permissions
@@ -638,6 +653,11 @@ Specifically verify:
    patterns, new release gates
 5. Any audit action table, permission table, or error-code table
    that the REST/store/plugin API contract touches
+6. In-code prose in the diff — comments, log lines, error and
+   user-facing strings: clarity, staleness, spelling, and house
+   convention. Report a wording problem as NICE; if the text asserts
+   something the code does not do, say so and hand the truth call to
+   the owning domain agent rather than sizing it yourself
 
 ## Output format
 
@@ -1172,6 +1192,7 @@ Strategy:
    | field | why |
    |---|---|
    | `run_id`, `commit_range`, `agent` | which run, which diff, who found it |
+   | `source` | `agent` / `collaborator` / `external-model` — WHAT KIND of reviewer, distinct from `agent`'s who. A finding raised by a human colleague or a non-Claude model is the highest-signal kind available and had nowhere to be written; see the working-copy note below |
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
@@ -1185,7 +1206,8 @@ Strategy:
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |
-   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` |
+   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` / `refuted`. `rejected` = we chose not to act. `refuted` = the claim was factually WRONG, and `refuted_by` carries the evidence — a different outcome with a different downstream use, so never collapse the two |
+   | `refuted_by` (required iff `disposition` is `refuted`) | the evidence that killed the claim — the command run and its output, the `git show origin/dev:<path>` that disproved an absence, the file:line that contradicts it. A `refuted` row with no evidence is a `rejected` row wearing a stronger word |
    | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
@@ -1197,9 +1219,28 @@ Strategy:
    resolved before the gate passes. The columns are there so a future decision
    about waivers has somewhere to write, not because one has been made.
 
+   **Which sources a run is expected to record.** A `/governance` run records
+   `source: "agent"` rows only. Rows with `source: "collaborator"` or
+   `"external-model"` are written when a PR review, an `/adversarial-review`, or an
+   equivalent external pass actually happens — so **an absent `collaborator` row
+   means nothing was recorded, NOT that no external review occurred**, and it must
+   never be read as evidence that none was sought. Adding those rows to an existing
+   fragment is a normal, expected append; a run does not own its file exclusively
+   once it has finished.
+
+   **Why `source` is worth a column.** Independent review is only independent if the
+   WORKING COPIES are. On #2604 two external models independently confirmed a claim
+   that was wrong — all three reviewers were reading one working copy whose merge-base
+   predated the file in question by ten days, so the agreement measured the checkout,
+   not the code. A colleague with a current checkout killed it in a single pass.
+   `source` is what makes that visible after the fact, and it is the same reason
+   `independent_reporters` counts only reporters who were not shown the finding.
+
    **Known gap, unsolved:** the absence of a finding row cannot distinguish "the
    reviewer passed" from "the reviewer never ran". A clean-result record needs its
-   own design.
+   own design. `source` narrows this for external review — an absent `collaborator`
+   row is now explicitly uninformative rather than ambiguously so — but does not
+   close it.
 
    Why this exists at all: governance is the repo's largest issue-inflow source, and
    nothing has ever recorded what it found. CI outcomes, durations and flakes are

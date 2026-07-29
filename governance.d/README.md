@@ -18,6 +18,12 @@ governance.d/<PR-or-issue-number>-<short-slug>.<random>.jsonl
 One file per **run**, not per PR. Gate 8 iterates, and `pass_ordinal` distinguishes rounds
 *inside* a file; a fresh run gets a fresh fragment.
 
+A fragment is not sealed when the run ends. Findings from a PR review, an
+`/adversarial-review`, or another external pass are appended to it with
+`source: "collaborator"` / `"external-model"`, and a finding already recorded may later gain
+a `refuted` disposition. An absent `collaborator` row means nothing was recorded — it is not
+evidence that no external review happened.
+
 ## Why these are committed
 
 The ledger is evidence for whoever reviews the pull request: which findings were raised,
