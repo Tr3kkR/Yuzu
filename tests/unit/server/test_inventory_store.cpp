@@ -8,12 +8,19 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "inventory_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 #include <sqlite3.h>
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -24,6 +31,7 @@ using yuzu::server::InventoryQuery;
 using yuzu::server::InventoryRecord;
 using yuzu::server::InventoryStore;
 using yuzu::server::pg::PgPool;
+namespace pg = yuzu::server::pg;
 
 namespace {
 // Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every
@@ -67,6 +75,15 @@ void seed_legacy_db(const std::filesystem::path& path,
     sqlite3_close(db);
 }
 
+// Wall-clock now, mirroring the store's internal `now_secs()` — used only to
+// bound assertions on the store's own clamping, never to construct fixture
+// data that would itself need clamping.
+std::int64_t test_now_secs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 } // namespace
 
 TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]") {
@@ -80,6 +97,14 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     CHECK(!store.query({}).has_value());
     CHECK(!store.get_agent_inventory("a").has_value());
     CHECK(!store.count().has_value());
+
+    // Governance M1: the `truncated` out-param must be reset on the early
+    // degrade return, not left at whatever the caller pre-set it to — a
+    // stale `true` here would wrongly tell a from-inventory-query caller
+    // "capped, refuse to materialise" on top of the already-reported degrade.
+    bool truncated = true;
+    CHECK(!store.query({}, &truncated).has_value());
+    CHECK_FALSE(truncated);
     auto g = store.get("a", "p");
     CHECK(!g.has_value());
     CHECK(g.error() == yuzu::server::InventoryReadError::kDegraded);
@@ -215,6 +240,104 @@ TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][
     }
 }
 
+TEST_CASE("InventoryStore upsert clamps a far-future collected_at to server receipt "
+          "time and does not freeze the row (H2)",
+          "[pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    InventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::int64_t now_before = test_now_secs();
+    const std::int64_t far_future = now_before + 10'000'000;
+
+    store.upsert("agent-clamp", "installed_software", R"({"n":1})", far_future);
+    const std::int64_t now_after = test_now_secs();
+
+    // Read via both single-record `get` and the list-shaped
+    // `get_agent_inventory` — the clamp must hold on both read paths.
+    auto found = store.get("agent-clamp", "installed_software");
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    CHECK((*found)->data_json == R"({"n":1})");
+    CHECK((*found)->collected_at >= now_before);
+    CHECK((*found)->collected_at <= now_after); // clamped, NOT the far-future value supplied
+
+    auto rows = store.get_agent_inventory("agent-clamp");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().collected_at <= now_after);
+
+    // The pre-clamp defect: a future-skewed row pinned itself forever because
+    // every later HONEST report failed the stale-overwrite conflict
+    // predicate (its real collected_at could never reach the far-future
+    // stored value). With the clamp, an honest report at ~now for the same
+    // (agent, plugin) must still land.
+    store.upsert("agent-clamp", "installed_software", R"({"n":2})", 0 /* now */);
+    auto landed = store.get("agent-clamp", "installed_software");
+    REQUIRE(landed.has_value());
+    REQUIRE(landed->has_value());
+    CHECK((*landed)->data_json == R"({"n":2})"); // lands — the regression net for the freeze bug
+}
+
+TEST_CASE("InventoryStore upsert: an older report after a fresh one is suppressed and "
+          "counted stale (H2 observability)",
+          "[pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    InventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    store.upsert("agent-stale", "installed_software", R"({"n":"fresh"})", 10'000); // T
+    store.upsert("agent-stale", "installed_software", R"({"n":"older"})", 9'900); // T-100: rejected
+
+    auto row = store.get("agent-stale", "installed_software");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->data_json == R"({"n":"fresh"})"); // unchanged
+    CHECK((*row)->collected_at == 10'000);
+
+    CHECK(metrics.counter("yuzu_inventory_ingest_dropped_total", {{"reason", "stale"}}).value() ==
+          1.0);
+}
+
+TEST_CASE("InventoryStore query: the truncated out-param signals a capped read (M1)",
+          "[pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    InventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    store.upsert("agent-t1", "installed_software", R"({"n":1})", 1000);
+    store.upsert("agent-t2", "installed_software", R"({"n":2})", 2000);
+    store.upsert("agent-t3", "installed_software", R"({"n":3})", 3000);
+
+    SECTION("limit below the row count returns the cap and sets truncated=true") {
+        InventoryQuery q;
+        q.limit = 2;
+        bool truncated = false;
+        auto rows = store.query(q, &truncated);
+        REQUIRE(rows.has_value());
+        CHECK(rows->size() == 2);
+        CHECK(truncated);
+    }
+
+    SECTION("limit at/above the row count returns everything and resets truncated=false") {
+        InventoryQuery q;
+        q.limit = 5;
+        bool truncated = true; // pre-set true to prove query() resets it, not just leaves it
+        auto rows = store.query(q, &truncated);
+        REQUIRE(rows.has_value());
+        CHECK(rows->size() == 3);
+        CHECK_FALSE(truncated);
+    }
+}
+
 TEST_CASE("InventoryStore migrate_from_sqlite: no legacy file is a clean no-op", "[pg][inventory]") {
     YUZU_REQUIRE_PG_DB_TPL(db, inventory_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -251,7 +374,18 @@ TEST_CASE("InventoryStore migrate_from_sqlite: backfills legacy rows, idempotent
     r2.plugin = "device_ci";
     r2.data_json = R"({"legacy":true})";
     r2.collected_at = 600;
-    seed_legacy_db(legacy.path, {r1, r2});
+    // Round-2 governance LOW: a legacy row written by a pre-clamp deployment
+    // carries a far-future collected_at — the backfill's own INSERT must
+    // clamp it too (`std::min(r.collected_at, now_secs())`), or this row
+    // would survive the backfill and freeze out every later honest upsert
+    // exactly like the pre-clamp ingest bug (H2).
+    const std::int64_t now_before = test_now_secs();
+    InventoryRecord r3;
+    r3.agent_id = "legacy-agent-3";
+    r3.plugin = "app_perf";
+    r3.data_json = R"({"legacy":true})";
+    r3.collected_at = now_before + 10'000'000;
+    seed_legacy_db(legacy.path, {r1, r2, r3});
 
     // A live agent has already reported for (legacy-agent-1, installed_software)
     // BEFORE the backfill runs — the backfill must never clobber it.
@@ -270,12 +404,22 @@ TEST_CASE("InventoryStore migrate_from_sqlite: backfills legacy rows, idempotent
     CHECK((*backfilled)->data_json == R"({"legacy":true})");
     CHECK((*backfilled)->collected_at == 600);
 
+    const std::int64_t now_after = test_now_secs();
+    auto clamped = store.get("legacy-agent-3", "app_perf");
+    REQUIRE(clamped.has_value());
+    REQUIRE(clamped->has_value());
+    CHECK((*clamped)->data_json == R"({"legacy":true})");
+    CHECK((*clamped)->collected_at <= now_after); // clamped, NOT the far-future value seeded
+    CHECK((*clamped)->collected_at >= now_before);
+
     // Idempotent: a second call is a cheap no-op (already stamped) and does not
     // error or duplicate rows.
     REQUIRE(store.migrate_from_sqlite(legacy.path));
     auto c = store.count();
     REQUIRE(c.has_value());
-    CHECK(*c == 2); // legacy-agent-1/installed_software + legacy-agent-2/device_ci
+    // legacy-agent-1/installed_software + legacy-agent-2/device_ci +
+    // legacy-agent-3/app_perf (future-clamped)
+    CHECK(*c == 3);
 }
 
 TEST_CASE("InventoryStore migrate_from_sqlite fails closed on an unreadable legacy file",
@@ -369,6 +513,24 @@ TEST_CASE("InventoryStore migrate_from_sqlite skips a bad row (invalid UTF-8) an
     auto c = store.count();
     REQUIRE(c.has_value());
     CHECK(*c == 2); // only the two good rows — bad + both blank-key rows skipped
+
+    // Governance H1: `skipped_bad` makes the row-data skip AUDITABLE after the
+    // fact via `backfill_state`, independent of the in-memory counters above —
+    // read it back over a second connection the way an operator/tool would.
+    // Only the invalid-UTF-8 row increments skipped_bad; the two blank-key
+    // rows take the separate GDPR-orphan-guard skip path (not counted here).
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult stamp = pg::exec_params(
+            lease.get(),
+            "SELECT legacy_rows, skipped_bad FROM inventory_store.backfill_state WHERE id = 1",
+            std::vector<std::string>{});
+        REQUIRE(stamp.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(stamp.get()) == 1);
+        CHECK(std::string(PQgetvalue(stamp.get(), 0, 0)) == "2"); // legacy_rows == good-row count
+        CHECK(std::string(PQgetvalue(stamp.get(), 0, 1)) == "1"); // skipped_bad == 1
+    }
 
     // Idempotent: a second call is a cheap no-op (already stamped).
     REQUIRE(store.migrate_from_sqlite(legacy.path));
