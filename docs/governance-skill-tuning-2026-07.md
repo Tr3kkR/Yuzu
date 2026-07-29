@@ -325,15 +325,21 @@ after seeing it would be overfitting, and the disagreements are the useful outpu
    under-banded; Sol holds that read-only privilege expansion is not admin/RCE and HIGH was
    right. Gate-identical either way, so this is reporting signal, not merge control — but
    the team should decide, because it sets whether every cross-scope read is CRITICAL.
-2. **#2202 B4 — the two reviewers do not agree, and the disagreement is recorded rather
-   than resolved.** Fable holds that the `I6` escalator's second prong is principled:
-   dormant authorisation code ships and goes live later without re-review, which is a real
-   forward risk independent of today's behaviour. Sol holds that B4's missing route failed
-   *closed* — a denial of capability, not a bypass — so it derives `I6`/MEDIUM and should
-   be recorded as a third mismatch rather than escalated. Both agree the first wording was
-   wrong (it claimed an under-enforced control, and that resolver over-enforces). The
-   escalator ships with Fable's prong (b) and Sol's dissent noted here; if the team sides
-   with Sol, delete prong (b) and restore the row to a mismatch.
+2. **#2202 B4 — reviewers split; DECIDED for Fable (2026-07-29).** Fable held that the
+   `I6` escalator's second prong is principled: dormant authorisation code ships and goes
+   live later without re-review, which is a real forward risk independent of today's
+   behaviour. Sol held that B4's missing route failed *closed* — a denial of capability,
+   not a bypass — so it derives `I6`/MEDIUM and belongs in the table as a third mismatch.
+   Both agreed the first wording was wrong: it claimed an under-enforced control, and that
+   resolver over-enforces.
+
+   **Prong (b) stands.** The forward-risk argument is the stronger one for this codebase:
+   an authz branch that ships dormant is reviewed once, at a point when nothing can
+   exercise it, and is live later with no gate between. Sol's objection is correct about
+   B4's *present* failure mode and does not address that. Recorded here because the row
+   remains **calibrated rather than validated** either way — the escalator was written
+   after seeing B4 derive MEDIUM, and deciding the argument does not convert it into
+   evidence that the rule works.
 
 ### One deliberate gate change, named
 
