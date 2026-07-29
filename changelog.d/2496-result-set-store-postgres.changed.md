@@ -9,3 +9,4 @@
   silently expanded to the entire fleet by a database hiccup or a missing operator
   identity. Every such abort is now audited (`scope.evaluation_aborted`) and counted
   (`yuzu_scope_eval_degraded_total{reason}`).
+- A scoped dispatch (`from_result_set:`) referencing a result set that is absent, expired, or not owned by the operator now aborts the **entire** dispatch (previously it proceeded with only that reference treated as zero-match) — closing a `NOT`-combinator fleet-wide-match inversion. Audited as `scope.evaluation_aborted`, `reason=owner_check_failed`.

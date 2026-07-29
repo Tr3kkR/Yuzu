@@ -118,7 +118,7 @@ All shapes carry enough information to **re-evaluate the query against the curre
 | Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning restores `ttl_at = max(now + 3600, original_ttl_at)` |
 | Use as input scope | Touching a set as the scope of a new query or action extends `ttl_at` to `max(ttl_at, now + 3600)` so an operator working a chain does not lose the head of the chain mid-investigation |
 | Pin storm guard | Per-operator cap of 50 pinned result sets; further pins return `409 PIN_LIMIT`. Operator must unpin or delete before pinning more |
-| GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets |
+| GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets. Post-ADR-0036: one replica sweeps per pass (Postgres advisory lock); a retention-clock anomaly (unusable prior reading, big step, would-wipe) declines the pass once per distinct anomaly fact-set (routed-concern "Clock-guarded retention"); every accepted pass is capped (5,000 deletes) |
 
 Hard maximum cap: **10,000 result sets per operator** (enforced at create time, returns `429 RESULT_SET_QUOTA`). Prevents a runaway script from filling the table.
 
