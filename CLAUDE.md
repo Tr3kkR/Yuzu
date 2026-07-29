@@ -51,9 +51,9 @@ Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
 3. **Prose: `docs-writer` owns WORDING** (including in-code comments and log/error strings); **the DOMAIN agent owns TRUTH**. A comment that *contradicts* the code is a truth finding at native severity and any agent may raise it; wording-only is capped at NICE.
 4. **Gate 8 re-runs every gate whose DOMAIN THE FIX DIFF TOUCHES**, not only those whose findings prompted the fix - the old rule shipped a broken macOS leg on #2580.
 
-Every finding is recorded to a per-run JSONL ledger (`${YUZU_GOV_LOG_DIR:-~/.local/share/yuzu/governance-runs}/<run_id>.jsonl`) with `pass_ordinal`, stable `finding_id`, `provenance` and `disposition`. It is a per-run file, not a database, and not a signed-waiver merge contract - gating findings are still resolved before the gate passes.
+Every finding is recorded to a per-run JSONL ledger (`${YUZU_GOV_LOG_DIR:-$HOME/.local/share/yuzu/governance-runs}/<run_id>.jsonl`) with `pass_ordinal`, stable `finding_id`, `provenance` and `disposition`. It is a per-run file, not a database, and not a signed-waiver merge contract - gating findings are still resolved before the gate passes.
 
-**The skill is read from your working tree.** A branch predating a change to it, or to `.claude/routed-concerns.md`, silently runs the old pipeline; Step 0 opens with a currency check against `origin/dev`. The same rule governs any claim that a file or row is *absent* - verify with `git show origin/dev:<path>`, never a working-tree `ls`.
+**The skill is read from your working tree.** A branch predating a change to it, or to `.claude/routed-concerns.md`, silently runs the old pipeline; Step 0 opens with a currency check against `origin/dev` covering all three files. The same rule governs any claim that a file or row is *absent* - verify with `git show origin/dev:<path>`, never a working-tree `ls`.
 
 ## Darwin Compatibility
 

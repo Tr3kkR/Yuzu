@@ -49,16 +49,28 @@ that predates a change to either silently runs the old pipeline. At the time #26
 merged, 81 of 81 local branches predated it.
 
 ```bash
-git fetch origin dev -q
-git diff --quiet origin/dev -- .claude/skills/governance/ .claude/routed-concerns.md \
+git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
+git diff --quiet origin/dev -- \
+      .claude/skills/governance/ .claude/routed-concerns.md CLAUDE.md \
   && echo "governance assets current" \
   || echo "STALE - your copy differs from origin/dev; reconcile before running"
 ```
 
+The fetch guard matters: a bare `git fetch` whose exit status is discarded will fail
+silently offline or on expired auth, and the diff then runs against a stale cached
+`origin/dev` and reports **current** while your tree holds the old pipeline. That is the
+one direction this check exists to prevent.
+
+`CLAUDE.md` is included because it is loaded into every session, so a stale summary there
+outranks a correct skill in practice.
+
 If it reports stale, reconcile before running: rebase or merge `origin/dev`, or read the
-two files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. Do not
-proceed on the assumption that your copy is current - the same failure mode produces
-confident false claims about which agents a change routes to.
+files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. **Unless you
+are deliberately editing them** - on a branch changing the skill, the table or CLAUDE.md,
+a stale report is expected and the diff you are looking at is your own. Reconcile against
+the rest, not against your change. Do not otherwise proceed on the assumption that your
+copy is current - the same failure mode produces confident false claims about which agents
+a change routes to.
 
 **The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
 `git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
@@ -884,14 +896,24 @@ Strategy:
 
 3. **Record every finding in the run ledger.** Write one JSONL object per finding to:
 
-   ```
-   ${YUZU_GOV_LOG_DIR:-~/.local/share/yuzu/governance-runs}/<run_id>.jsonl
+   ```bash
+   GOV_LOG_DIR="${YUZU_GOV_LOG_DIR:-$HOME/.local/share/yuzu/governance-runs}"
+   RUN_ID="gov-$(date +%s)-$$"          # collision-free by construction
+   mkdir -p "$GOV_LOG_DIR"
+   # -> $GOV_LOG_DIR/$RUN_ID.jsonl
    ```
 
-   `run_id` is `gov-<UTC date>-<short base sha>-<n>`, e.g. `gov-2026-07-29-01455cd1-1`.
-   Create the directory if absent. The path mirrors the `/test` skill's `test-runs.db`
-   convention deliberately: outside the repo, so it survives `git clean` and never lands
-   in a diff.
+   Two details are load-bearing. **`$HOME`, never `~`** - tilde does not expand inside
+   double quotes, so a quoted `~/...` creates a literal `./~/.local/...` under the current
+   directory, which for a governance run is the repo: committable, not ignored, and
+   destroyed by `git clean`, the exact inverse of the intent. **And the id derives from
+   epoch seconds plus PID**, matching `/test`'s `RUN_ID="$(date +%s)-$$"`: unique without
+   probing for existing files, so two runs on the same base on the same day cannot collide
+   or overwrite. The commit range is a field inside the ledger, so it does not need to be
+   in the filename.
+
+   The location mirrors `/test`'s `test-runs.db` convention deliberately: outside the repo,
+   so it survives `git clean` and never lands in a diff.
 
    There is **no database and no shared store yet** - this is a per-run file, and making
    it durable shared change-control evidence is tracked separately. Do not describe it as
