@@ -73,15 +73,20 @@ sight:
 - A new config key lacking documentation in server-admin.md
 - A DSL syntax change lacking specification in yaml-dsl-spec.md
 
-A doc counts as **required** only per the six-item definition in the governance
-shared preamble (`.claude/skills/governance/SKILL.md`, under "Prose") — the REST
-reference, a user-manual section, a `changelog.d/` fragment, CLAUDE.md or a
-routed-concern row for a new invariant, a contract table, or a doc a routed-concern
-row names as the operator-facing reference **for the changed surface**. That last
-one is an update obligation, not a reading list: `docs/cpp-conventions.md` is named
-for any C++ change so the reviewer loads it, and that is not a requirement to edit
-it. In-code prose never generates a missing-doc finding — an uncommented function is
-not an undocumented feature.
+A doc counts as **required** only per the closed six-item definition in the
+governance shared preamble (`.claude/skills/governance/SKILL.md`, under "Prose").
+That list governs; this file is a pointer and loses on conflict.
+
+Everything else in this file — the Documentation Domains, the deep-dive list, the
+bullets above, the Review Checklist — enumerates where to LOOK, not what is
+required. A gap you find there is a candidate finding, sized by derivation; it is a
+missing *required* doc only if it also lands in one of the six. The YAML
+InstructionDefinition, `yaml-dsl-spec.md` §14 and roadmap/capability-map cases
+usually do, via item 6 (a routed-concern row names them as an update obligation for
+that surface) — check, do not assume.
+
+In-code prose never generates a missing-doc finding — an uncommented function is not
+an undocumented feature.
 
 Two things DO gate regardless of derivation, as policy floors: a direct edit to
 `CHANGELOG.md`, and a missing mandated `changelog.d/` fragment.

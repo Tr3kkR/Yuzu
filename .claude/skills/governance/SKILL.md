@@ -389,13 +389,14 @@ and nothing else:
   4. `CLAUDE.md` or a routed-concern row, for a new architectural invariant, store,
      ABI pattern or release gate
   5. an audit-action, permission or error-code table the change's contract touches
-  6. a doc a `.claude/routed-concerns.md` row names as the **operator-facing
-     reference for the changed surface** — its update obligation, not its reading
-     list. The Doc column is mostly the latter: `docs/cpp-conventions.md` is named
-     for *any* C++ change, and reading "names the doc" literally would make every
-     C++ PR that does not edit `cpp-conventions.md` a missing-doc finding. If the
-     row names the doc so the reviewing agent LOADS it, that is not an obligation
-     to change it.
+  6. a doc a `.claude/routed-concerns.md` row names as an **update obligation for
+     the changed surface** — whether operator-facing (a user-manual page for a
+     changed feature) or author-facing (a migration ladder, a capability registry,
+     a per-surface invariants doc that records each change as it lands). What it is
+     NOT is the row's **reading list**: `docs/cpp-conventions.md` is named for *any*
+     C++ change so the reviewing agent LOADS it, and reading "names the doc"
+     literally would make every C++ PR that does not edit it a missing-doc finding.
+     The test is whether the doc accrues an entry per change, not who reads it.
 
 **In-code prose never qualifies.** An uncommented function is not a missing required
 doc. Without that boundary the rule becomes a laundering route: any wording nit
@@ -1259,9 +1260,19 @@ Strategy:
 
    **A row is SUPERSEDED, never edited.** A disposition that changes after the fact
    — a finding later fixed, deferred, or refuted — is a NEW row carrying the same
-   `finding_id`. **The row with the latest `recorded_at` for a `finding_id` is the
-   live one; earlier rows are history, not open findings.** Ties, which should not
-   occur, break on the higher `pass_ordinal`.
+   `finding_id`.
+
+   **The live view of a finding is FIELD-WISE last-write-wins across every row
+   sharing its `finding_id`, ordered by `recorded_at`** — not the latest row alone.
+   That distinction is load-bearing: a superseding row restates only what changed,
+   so "the latest row is the live one" would make a floored, gating finding read as
+   ungated and unclassified the moment a `fixed` row omitted `severity_mapped` and
+   `policy_floor`. Merge; do not replace. Ties, which should not occur, break on the
+   higher `pass_ordinal`.
+
+   A supersession may never LOWER `severity_mapped` or clear `policy_floor` by
+   omission — to change either, restate it explicitly with the reason. Silence
+   inherits; it does not downgrade.
 
    Precedence is `recorded_at`, NOT `pass_ordinal`, and the difference is
    load-bearing: a post-run row carries `pass_ordinal: 0`, so under an
@@ -1287,10 +1298,27 @@ Strategy:
    level — `cat` shows only the final state — so the append convention is chosen.
 
    Only the fields that CHANGE need restating on a superseding row, plus
-   `schema_version`, `run_id`, `finding_id`, `reporter`, `source`, `recorded_at`,
-   `pass_ordinal` and `disposition`. A supersession is not a re-derivation: the
-   original row keeps the TRIGGER/IMPACT/EXPOSURE facts unless the supersession is
-   what changed them.
+   `schema_version`, `run_id`, `finding_id`, `recorded_by`, `recorded_at`,
+   `pass_ordinal`, `reviewed_at_sha` and `disposition`. A supersession is not a
+   re-derivation: the original row keeps the TRIGGER/IMPACT/EXPOSURE facts unless
+   the supersession is what changed them.
+
+   **A supersession carries `recorded_by`, NOT `reporter`.** `reporter` is who FOUND
+   the finding and never changes once written; whoever appends a later row is the
+   recorder, and conflating the two misattributes the finding. Getting this wrong
+   also breaks `source`: the first supersession ever written labelled a human
+   appender `source: "governance-agent"` with no `reporter_ref`, which is precisely
+   the "small forgery" the derivation note below warns about, and it escaped the
+   `reporter_ref` requirement by claiming to be a pipeline row. `source` describes
+   the REPORTER. If a human appends the row, `recorded_by` is their handle and
+   `reporter`/`source` stay as originally recorded.
+
+   `recorded_at` is self-declared and nothing validates it, which matters more now
+   that it is the precedence key: an author who dislikes a collaborator's post-run
+   refutation can append a later-timestamped `fixed` row and outrank it. The commit
+   carrying the row is the corroborating witness — a `recorded_at` inconsistent with
+   its commit time is suspect, and git is the substrate that makes that checkable.
+   `pass_ordinal` was no better: equally author-typed, and broken as well.
 
    **Why in the repo.** The record is evidence for whoever reviews the PR — which
    findings were raised, which fixed, which deferred and by whom. A path under
@@ -1309,14 +1337,17 @@ Strategy:
    assembled, or kept indefinitely as the access-review campaigns are — is a
    separate decision and is NOT made here. Do not describe it as more than it is.
 
-   Fields, all required unless marked:
+   Fields, all required unless marked — on the row that FIRST raises a finding. A
+   superseding row carries only the minimum set above plus what changed; the live
+   view merges them, so "required" is a property of the finding, not of every row:
 
    | field | why |
    |---|---|
    | `schema_version` | integer, currently `1`. Per ROW, never per file: appends are permitted, so one fragment can legitimately hold rows written under two versions of this table. A row without it predates #2619 |
    | `run_id` | which run. `basename "${LEDGER%.jsonl}"` — the fragment's filename without its extension, e.g. `2619-ledger-provenance.sW31cX`. Stated as a command because "the mktemp stem" reads three ways: the random suffix alone, the basename, and the full path passed to `mktemp -u` (which varies with `YUZU_GOV_LOG_DIR`) |
    | `commit_range` | which diff |
-   | `reporter` | WHO found it — a governance-agent name, a person's handle, or a model id. Named `agent` before #2619; renamed because `source` below admits reporters that are not agents, and a required field with no honest value for two of its three cases is a schema defect, not a naming quibble |
+   | `reporter` | WHO found it — a governance-agent name, a person's handle, or a model id. ONE value, never a joined list: convergence is `independent_reporters`, and a `+`-joined string is an encoding no reader parses. Never changes once written. Named `agent` before #2619; renamed because `source` below admits reporters that are not agents, and a required field with no honest value for two of its three cases is a schema defect, not a naming quibble |
+   | `recorded_by` (nullable on the row that first raises a finding, required on a supersession) | WHO wrote this row, as distinct from who found the finding. Null means reporter and recorder are the same |
    | `source` | `governance-agent` / `collaborator` / `external-model` — WHAT KIND of reporter, distinct from `reporter`'s who. Spelled `governance-agent`, not `agent`, per CLAUDE.md's three-meanings glossary. A Codex or Kimi run driven by `.codex/skills/governance` is a `governance-agent` row — `external-model` is for a model reviewing OUTSIDE this pipeline. A non-`governance-agent` row MUST carry `reporter_ref` |
    | `reporter_ref` (required iff `source` is not `governance-agent`) | a THIRD-PARTY-RETRIEVABLE reference: a PR review URL or id, a comment permalink, a transcript path. Not a bare name — a name is a string the author types freely, which is precisely the self-declared claim this field exists to replace. `source` is otherwise an assertion of independent review recorded by the party under review, and that is the one property this artefact most needs to be checkable |
    | `reviewed_at_sha` | the HEAD the reporter actually read, and its merge-base with `origin/dev` where that is knowable (`unresolved` for the merge-base half when it is not — a GitHub review records the reviewed SHA but not what it was branched from). This is the field that closes the failure `source` is justified by: reviewer KIND does not detect three reviewers sharing one stale checkout, the merge-base does |
@@ -1363,6 +1394,12 @@ Strategy:
    are resolved before the gate passes — expressed in the schema; `open` exists so a
    finding can be recorded when it is RAISED rather than only once it is settled,
    not so a run can end with unresolved rows in the ledger.
+
+   Nothing validates that, and nothing can: a `fixed` row is a CLAIM, not closure
+   evidence. **The ledger records; Gate 8 tests.** Appending `fixed` to every open
+   row costs nothing and proves nothing — what actually closes a finding is the
+   re-review of the fix diff, and the ledger's value is that the claim is written
+   down next to who made it and when.
 
    **Which sources a run is expected to record.** A `/governance` run records
    `source: "governance-agent"` rows only. Rows with `source: "collaborator"` or
