@@ -176,11 +176,17 @@ them into one choice is what let severity be chosen:
 1. TRIGGER — the concrete input, state, or configuration that produces it. Name
    it. "Under load" and "in some cases" are not triggers. If you cannot isolate
    one, write `unresolved` — do NOT downgrade IMPACT to compensate.
-2. IMPACT — what goes wrong if this ships. Closed list. Gives the base band.
+2. IMPACT — what goes wrong if this ships. Closed list. **List EVERY value that
+   applies**; the strongest gives the base band. A crash that also corrupts is
+   `I2` AND `I5`, and it derives from `I2`. Recording only the weaker one is how
+   severity gets chosen.
 3. EXPOSURE — what is required for it to happen. Closed list. **List EVERY value
    that applies**; the strongest modifier is the one that counts.
-4. EPISTEMIC STATUS — `verified` (you ran something and observed it), `likely`
-   (reasoned from code you read), or `speculative`.
+4. EPISTEMIC STATUS — `verified` (you ran something and observed the outcome),
+   `likely` (reasoned from code you actually read), or `speculative` (you can
+   name neither the code path nor a candidate trigger — a hypothesis about code
+   you have not read). `likely` is the normal case and gates normally. Only
+   `speculative` is exempt, and it is the narrow case, not the humble one.
 
 ### IMPACT — gives the base band
 
@@ -212,9 +218,14 @@ I6 raises to HIGH in exactly two cases:
       a grant no production route could author. It is (b), NOT (a) — that
       resolver fails CLOSED, so nothing was under-enforced.
 
-I5 raises to HIGH when the unavailability is unbounded or persistent AND falls on
-a serialised path shared with a security or data-integrity operation (revocation,
-enforcement, audit, retention), or when it wedges a state machine. Delaying a
+I5 raises to HIGH in any of three cases:
+  (a) it is REPRODUCIBLE unavailability of the server or agent process reached on
+      an ordinary request path — a triggerable control-plane crash gates, and
+      does not need an unauthenticated reporter to do so;
+  (b) it is unbounded or persistent AND falls on a serialised path shared with a
+      security or data-integrity operation (revocation, enforcement, audit,
+      retention);
+  (c) it wedges a state machine. Delaying a
 security operation at scale is a security outcome, not a performance one. #2580's
 15s unbatched sampler on the agent-revocation thread is the reference case, and
 the class also covers #2284's state-machine wedges.
@@ -230,6 +241,8 @@ is not reached by an attacker, so EXPOSURE cannot promote it to CRITICAL.
   E2  an actor operating BEYOND the privilege it starts with
       (escalation, confinement escape). Judge by the privilege
       REQUIRED to begin, never the privilege gained                   raise one band
+  E0  no actor required — it fires unconditionally in production: a timer, a
+      background thread, a boot path, a scheduled sweep                no change
   E3  any authenticated actor within its own privilege, default
       configuration — including the ordinary operator                 no change
   E4  requires a non-default configuration                            no change
@@ -272,15 +285,28 @@ IMPACT/EXPOSURE and they always gate:
   - a direct edit to `CHANGELOG.md`, or a missing mandated `changelog.d/` fragment
   - a broken build or test leg on any supported platform that this change
     INTRODUCED or newly exposed — not a pre-existing or environmental failure
-  - manual resource cleanup in NEW C++ that is not RAII-wrapped, absent a
-    documented impossibility. Pre-existing cleanup in a file this change merely
-    touches is SHOULD, not a floor
-  - a violation of an explicit MUST / never / catastrophic-if-violated invariant
-    stated in CLAUDE.md, `.claude/routed-concerns.md`, or an accepted ADR — a
+  - manual resource cleanup in NEW C++ that is not RAII-wrapped. The
+    "documented impossibility" exception is NOT self-granted: it must be
+    adjudicated by an agent other than the one proposing it and recorded in the
+    ledger with `adjudicated_by`. Pre-existing cleanup in a file this change
+    merely touches is SHOULD, not a floor — a deliberate narrowing, see the
+    tuning doc
+  - a violation of an explicit MUST / never / catastrophic-if-violated invariant.
+    CLOSED to three sources, so floor membership is not a judgement call: a
+    catastrophic-if-violated clause in a `.claude/routed-concerns.md` row; a
+    CLAUDE.md sentence inside a standing-rule or invariant block; an accepted
+    ADR's normative requirements. NARRATIVE prose does not qualify — an ADR
+    saying a thing "never landed" is history, not a contract. If you cannot
+    point at one of those three, it is not a floor — a
     second copy of a single-chokepoint rule, a forked dangerous-op gate, an
     approval gate outside the core primitive, a new server SQLite store with no
     exception ADR. These have no wrong outcome TODAY, which is exactly why the
     derivation cannot see them
+  - an ownership or lifetime defect of the kind `cpp-safety`'s blocking contract
+    enumerates: a leak, a double-close/double-free, a use-after-free or
+    borrowed-data escape, an unjoined or ambiguously-owned thread, unsafe shell
+    string construction, or a cast resting on undocumented aliasing/lifetime.
+    These derive `I5`/MEDIUM on an ordinary path and would otherwise stop gating
   - a FALSE-GREEN test offered as closure evidence for a blocking finding — a
     test that cannot observe what it asserts. Ordinary missing coverage stays
     SHOULD; this is a floor because it is evidence of resolution that is not
@@ -292,10 +318,18 @@ floor.
 ### Absences — and which way each one points
 
 - TRIGGER unresolved → keep IMPACT honest, set EPISTEMIC STATUS `speculative`.
-  A speculative finding does not gate on its own. Never record a lower IMPACT
-  than you actually observed in order to express low confidence.
-  If a finding is BOTH speculative AND has unresolved EXPOSURE, it GATES:
-  a schema failure outranks weak evidence, because the unknown may be `E1`.
+  Never record a lower IMPACT than you observed in order to express low
+  confidence.
+
+  EPISTEMIC STATUS is an operation on the GATE, not on the band. Derive and
+  report the band normally; `speculative` then converts the finding into a
+  MANDATORY INVESTIGATION rather than a merge blocker: it is recorded at its
+  derived band, it must be resolved to `verified` or `likely` before the gate
+  passes, and resolving it may confirm the band and block. It is a deferral of
+  the decision, never a dismissal of it. `verified` and `likely` gate normally.
+  If a finding is BOTH speculative AND has unresolved EXPOSURE, it GATES
+  outright: a schema failure outranks weak evidence, because the unknown may
+  be `E1`.
 - EXPOSURE undeterminable → record `unresolved`. It does NOT default to E3, and
   it GATES pending adjudication. Defaulting an unknown to "no change" is a silent
   downgrade of a possible E1.
@@ -563,8 +597,10 @@ round.
 ## Output format
 
 Findings table with severity (CRITICAL / HIGH / MEDIUM / LOW / INFO),
-file:line, description, recommended fix. CRITICAL and HIGH block
-merge. Also note any invariants the changes *strengthen* that should
+file:line, description, recommended fix, and the four derivation facts.
+Blocking is decided by the derived band per the shared preamble — do not
+assert it from your own label. Also note any invariants the changes
+*strengthen* that should
 be preserved against future regression.
 
 Report in under 800 words.
@@ -603,7 +639,7 @@ Specifically verify:
 
 ## Output format
 
-BLOCKING = user-facing behavior changed and no doc reflects it.
+Severity per standing rule 2: a user-facing behaviour change with no doc is `I7` — MEDIUM by default, HIGH (blocking) only when the omission conceals a breaking change, security-relevant behaviour, a data-loss risk, a migration step, or an irreversible operation.
 SHOULD-FIX = doc drift that would confuse an operator.
 NICE-TO-HAVE = style/precision improvements.
 
@@ -889,7 +925,7 @@ state, schema, and contract consistency. Check:
    the same PR. Contract text: `docs/agentic-first-principle.md` §A5.
    security-guardian co-checks `readOnlyHint`/`destructiveHint`/
    `idempotentHint` truthfulness against tier + dispatch behavior —
-   a false safe-direction hint is a BLOCKING (HIGH) finding.
+   a false safe-direction hint derives `I4` (harmful operator guidance).
 
 10. **Published-contract vs code, and classifier completeness** (see the
    security preamble's "Design-contract & state-machine tracing" check).
@@ -986,7 +1022,7 @@ Each agent gets the same Gate 1-5 context and focuses on a different aspect:
 
 Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to the agent's domain.
 
-**Watch for:** sre routinely catches pre-existing readiness-probe gaps that become BLOCKING because the PR makes an existing store more load-bearing. The HC-1 pattern (store missing from `/readyz`) reappears — always verify the new store(s) in scope are in the probe conjunction.
+**Watch for:** sre routinely catches pre-existing readiness-probe gaps that become gating because the PR makes an existing store more load-bearing (they derive `I5`/`I1` once the store is on a live path). The HC-1 pattern (store missing from `/readyz`) reappears — always verify the new store(s) in scope are in the probe conjunction.
 
 **Watch for:** enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a changelog FRAGMENT carrying the Breaking entry (`changelog.d/<PR#>-<slug>.changed.md` or `.security.md`, body led with `**Breaking —**`) plus a `docs/user-manual/server-admin.md` upgrade note is almost always required. Do NOT ask for a `CHANGELOG.md` section — that file is frozen and edited only at release.
 
@@ -1104,7 +1140,7 @@ Strategy:
    | `severity_native` | the agent's OWN vocabulary, unmodified |
    | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule |
    | `trigger` | the concrete input/state/config, or `unresolved` |
-   | `impact` | `I1`…`I9` from the closed list |
+   | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
    | `exposure` | every applicable `E1`…`E6`, or `unresolved` — a list, not one value |
    | `epistemic_status` | `verified` / `likely` / `speculative` |
    | `independent_reporters` | how many agents raised it WITHOUT having been shown it — downstream echoes are not confirmations |

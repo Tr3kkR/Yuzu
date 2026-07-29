@@ -288,12 +288,17 @@ between them established that the shape — not the wording — was the defect:
 Applied to findings whose bands the team already agreed on. Counted honestly, after two
 rounds of re-review forced the count down twice:
 
-- **Three reproduce unaided:** #2202 B2, #2202 B3, the `std::jthread` macOS break.
+- **Two reproduce unaided:** #2202 B2, #2202 B3.
 - **One matches on band with incomplete facts:** the `pg_locks` runbook (`I3` and `I4` both
   apply, and `E5` — a rare multi-database collision — belongs in the record).
-- **Three are CALIBRATED, not validated** — the model was changed after seeing them derive
+- **Four are CALIBRATED, not validated** — the model was changed after seeing them derive
   the wrong band: #2202 B4 (`I6` escalator), the #2580 parity test (false-green floor), the
-  #2580 sampler (`I5` shared-path escalator). Each is marked in the table.
+  #2580 sampler (`I5` prong (b)), and the `std::jthread` macOS break (the broken-build
+  floor did not exist in the first cut and was added with the corpus row already on the
+  table). Each is marked in the table. The `jthread` row was counted "unaided" through two
+  successive corrections of this tally before the third review round caught it — the count
+  has been wrong in the flattering direction every single time it has been restated, which
+  is worth more as a caution than the number itself.
 - **One acknowledged mismatch remains:** #2202 B1.
 
 A calibrated row is not evidence the rule works; it is the rule being taught. The three of
@@ -305,13 +310,15 @@ distinction has to stay visible or the corpus becomes a mirror.
 | #2202 B2 — namespace scan boots clean on corrupt `rbac.db` | I1 + E5 → HIGH | HIGH | match |
 | #2202 B3 — engine actions stamped `principal_class=agent` | I1 + E3 → HIGH | HIGH | match |
 | #2202 B4 — RBAC resolver with no production grant author | I6→HIGH + E3 | HIGH | match **(calibrated: the escalator was added for this class after observing it derive MEDIUM)** |
-| #2580 — `pg_locks` runbook terminates another tenant's backend | I4 + E3 → HIGH | BLOCKING | match |
+| #2580 — `pg_locks` runbook terminates another tenant's backend | I3 + I4 + E3 + E5 → HIGH | BLOCKING | match |
 | #2580 — parity test cannot observe the field it asserts on | policy floor (false-green closure evidence) | BLOCKING | match **(calibrated: floor added for this class)** |
 | #2580 — `std::jthread` breaks the macOS leg | policy floor | BLOCKING | match |
 | #2202 B1 — engine credential gains fleet-wide Read, RBAC off | I1 + E2 → **CRITICAL** | HIGH | **promotion, gate-neutral** |
-| #2580 — 15s sampler unbatched full-column scan | I5→HIGH via the shared-path escalator | BLOCKING | match **(calibrated: escalator added for this class)** |
+| #2580 — 15s sampler unbatched full-column scan | I5 + **E0** → HIGH via prong (b) | BLOCKING | match **(calibrated: escalator added for this class)** |
 
-The B4 escalator is the one place the model was changed to fit the corpus. Re-review
+Four of the eight rows changed the model. Earlier revisions of this section claimed it was
+one, then three; both were wrong, and both were wrong in the direction that made the rule
+look better tested than it is. Re-review
 established that its first wording was also wrong — it claimed the absent capability was an
 under-enforced control, but that resolver fails CLOSED, so nothing was under-enforced. The
 escalator now names two distinct prongs, and B4 is the reference case for the second
@@ -340,6 +347,30 @@ after seeing it would be overfitting, and the disagreements are the useful outpu
    remains **calibrated rather than validated** either way — the escalator was written
    after seeing B4 derive MEDIUM, and deciding the argument does not convert it into
    evidence that the rule works.
+
+### Four deliberate gate changes, named
+
+Two more, both found in the third review round rather than disclosed by the author:
+
+**Resource-safety defects.** `.claude/agents/cpp-safety.md` blocks leaks, use-after-free,
+unjoined threads and unsafe shell construction unconditionally. A verified fd leak on an
+ordinary authenticated path derives `I5` + `E3` = MEDIUM, so the derivation would have
+stopped gating a class that gates today. Restored as a policy floor rather than an
+escalator, because the existing contract is unconditional and should stay that way.
+
+**Touched-versus-new C++ cleanup.** The floor covers manual cleanup in NEW C++ only;
+`.claude/agents/security-guardian.md:35` and the Gate 2 template block "new **or touched**".
+This narrowing is deliberate — "touched" can force an unrelated legacy rewrite on any PR
+that opens the file — and it came out of the second review round, but it is a real gate
+change and was not named until now.
+
+`I5`'s prong (a) exists because without it a **reproducible authenticated crash of the
+control plane** derived MEDIUM — `I5` base, no exposure raise — and stopped gating. Every
+agent blocks a triggerable control-plane crash today. That was an undisclosed demotion in
+the first cut of this model, found in the third review round, and it is fixed rather than
+disclosed; prong (a) restores the status quo gate.
+
+The one that IS a disclosed change:
 
 ### One deliberate gate change, named
 
@@ -378,6 +409,15 @@ The same thread produced a second, cheaper lesson: a shell `patsub_replacement` 
 silently rewrote every `&` in a review payload, so one reviewer analysed corrupted source
 and produced confident findings about the corruption rather than an error. Reviewing input
 integrity is now part of the empiricism rule.
+
+### The corpus's own blind spot
+
+Every row is a historical HIGH or BLOCKING. Nothing in it validates that a **non-gating**
+finding stays non-gating — so the rule is calibrated only against under-gating, on a
+project whose originating complaint was *over*-gating. Every escalator added during review
+pushed in the same direction, and none was checked against a finding that should have
+stayed quiet. Adding a handful of historical NICE/LOW findings to the corpus is the obvious
+next step and is not done here.
 
 ### What this does and does not claim
 
