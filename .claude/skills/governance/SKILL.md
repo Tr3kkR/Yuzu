@@ -1213,9 +1213,13 @@ actionable outcome per issue, split multi-finding bundles, and dedupe is the onl
 inflow filter. This section changes which findings reach that procedure; it does
 not change the procedure.
 
-**Parity:** `.codex/skills/governance/SKILL.md` is the Codex-side runner for the
-same pipeline and states its own disposition rule for MEDIUM/SHOULD findings. A
-change here that is not mirrored there silently forks the two. Update both.
+**This file is the canonical runbook.** A separate Codex-side runner exists at
+`.codex/skills/governance/SKILL.md`. For the blocking contract it already defers
+here ("identical to the Claude runner — load it, do not restate it"), which is the
+right shape. It does, however, RESTATE a disposition rule for MEDIUM/SHOULD
+findings rather than deferring, so it can drift from this section without anyone
+noticing. Closing that by deferring instead of restating is for whoever owns that
+runner; editing this file carries no obligation to maintain it.
 
 ## Gate 8 — Iterate And Ledger
 
