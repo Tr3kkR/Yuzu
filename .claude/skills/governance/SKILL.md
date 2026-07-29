@@ -906,35 +906,11 @@ Strategy:
 
 2. **Don't commit until governance passes.** Per CLAUDE.md.
 
-3. **Record every finding in the run ledger.** Write one JSONL object per finding to:
-
-   ```bash
-   GOV_LOG_DIR="${YUZU_GOV_LOG_DIR:-$HOME/.local/share/yuzu/governance-runs}"
-   mkdir -p "$GOV_LOG_DIR"
-   LEDGER="$(mktemp "$GOV_LOG_DIR/gov-$(date +%Y%m%d-%H%M%S)-XXXXXX")" \
-     && mv "$LEDGER" "$LEDGER.jsonl" && LEDGER="$LEDGER.jsonl"
-   ```
-
-   Two details are load-bearing. **`$HOME`, never `~`** - tilde does not expand inside
-   double quotes, so a quoted `~/...` creates a literal `./~/.local/...` under the current
-   directory, which for a governance run is the repo: committable, not ignored, and
-   destroyed by `git clean`, the exact inverse of the intent.
-
-   **And `mktemp`, not a constructed name.** `mktemp` creates the file with `O_EXCL`, so
-   uniqueness is enforced by the filesystem rather than assumed from its inputs. A
-   timestamp-plus-PID name is *not* collision-free: two evaluations in the same shell in
-   the same second are identical, and containers routinely reuse PIDs - PID 1 especially -
-   so two runs starting in the same second against a shared ledger directory would produce
-   the same path and either interleave or truncate. The X's are at the end of the template
-   and the suffix is added afterwards because BSD `mktemp` rejects them mid-template. The
-   commit range is a field inside the ledger, so it does not need to be in the filename.
-
-   The location mirrors `/test`'s `test-runs.db` convention deliberately: outside the repo,
-   so it survives `git clean` and never lands in a diff.
-
-   There is **no database and no shared store yet** - this is a per-run file, and making
-   it durable shared change-control evidence is tracked separately. Do not describe it as
-   more than it is.
+3. **Record every finding in the run ledger.** Write a JSONL file at
+   `<run-log-dir>/governance-findings.jsonl` — one object per finding. There is **no
+   database and no shared store yet**; this is a per-run file, and making it durable
+   shared change-control evidence is tracked separately. Do not describe it as more
+   than it is.
 
    Fields, all required unless marked:
 
